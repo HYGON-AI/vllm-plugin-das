@@ -24,7 +24,9 @@ vllm_hcu
     ├── model_executor
     │   ├── __init__.py
     │   ├── layers
+    │       ├── linear.py        # Custom linear
     │   └── models               # Custom models
+    │   └── parameter.py         # Custom parameter
     ├── ops                      # Custom operators (rotary_embedding)
     │   ├── __init__.py
     │   ├── rotary_embedding.py

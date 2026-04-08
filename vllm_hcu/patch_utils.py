@@ -32,16 +32,23 @@ OLD_IMPORT_HOOK = builtins.__import__
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
     try:
         module_mappings = {  
-            #"vllm.attention.ops.merge_attn_states": "vllm_hcu.ops.attention.merge_attn_states",
+            "vllm.model_executor.parameter": "vllm_hcu.model_executor.parameter",
+            "vllm.model_executor.layers.linear": "vllm_hcu.model_executor.layers.linear",
         }
         
         if module_name in module_mappings:
-            if module_name in sys.modules:
-                return sys.modules[module_name]
             target_module = module_mappings[module_name]
+            
+            if module_name in sys.modules:
+                module = importlib.import_module(target_module)
+                sys.modules[module_name] = module
+                sys.modules[target_module] = module
+                return module
+            
             module = importlib.import_module(target_module)
             sys.modules[module_name] = module
             sys.modules[target_module] = module
+            return module
             
     except Exception:
         pass
