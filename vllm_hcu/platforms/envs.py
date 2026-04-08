@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    VLLM_USE_NN : bool = False
+
+def maybe_convert_int(value: Optional[str]) -> Optional[int]:
+    """
+    如果值是None，则返回None；否则将字符串转换为整数并返回。
+    
+    Args:
+        value (Optional[str], optional): 要转换的可选字符串. Defaults to None.
+    
+    Returns:
+        Optional[int]: 如果值是None，则返回None；否则将字符串转换为整数并返回.
+    """
+    if value is None:
+        return None
+    return int(value)
+
+hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
+    # path to the logs of redirect-output, abstrac of related are ok
+
+    # If set, vLLM will transpose weight to use nn layout
+    "VLLM_USE_NN":
+    lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in 
+             ("true", "1")),
+}
+
+# end-env-vars-definition
+
+def __getattr__(name: str):
+    """
+    当调用不存在的属性时，该函数被调用。如果属性是hcu_vllm_environment_variables中的一个，则返回相应的值。否则引发AttributeError异常。
+    
+    Args:
+        name (str): 要获取的属性名称。
+    
+    Raises:
+        AttributeError (Exception): 如果属性不是hcu_vllm_environment_variables中的一个，则会引发此异常。
+    
+    Returns:
+        Any, optional: 如果属性是hcu_vllm_environment_variables中的一个，则返回相应的值；否则返回None。
+    """
+    # lazy evaluation of environment variables
+    if name in hcu_vllm_environment_variables:
+        return hcu_vllm_environment_variables[name]()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    """
+    返回一个包含所有可见的变量名称的列表。
+    
+    返回值（list）：一个包含所有可见的变量名称的列表，这些变量是通过`xhcu_vllm_environment_variables`字典定义的。
+    
+    Returns:
+        List[str]: 一个包含所有可见的变量名称的列表。
+                   这些变量是通过`hcu_vllm_environment_variables`字典定义的。
+    """
+    return list(hcu_vllm_environment_variables.keys())
+
+
+def is_set(name: str):
+    """Check if an environment variable is explicitly set."""
+    if name in hcu_vllm_environment_variables:
+        return name in os.environ
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
