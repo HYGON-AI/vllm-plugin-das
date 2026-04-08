@@ -64,3 +64,43 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
 def import_hook():
     """Apply import hook for VLLM hcu"""
     builtins.__import__ = _custom_import
+
+#自定义函数或者类的补丁
+def patch_fuction_class(custom_function)
+    # 配置需要 patch 的模块和对应的 patch 函数
+    PATCH_CONFIG = {
+        # 'vllm.model_executor.model_loader.weight_utils': {
+        #     'another_function': custom_function,
+        #     # 可以添加更多要替换的属性
+        #     # 'another_function': custom_function,
+        # },
+    }
+
+    # 使用标志避免重复 patch
+    _patched_modules = set()
+    original_import = __import__
+
+    def patched_import(name, *args, **kwargs):
+        module = original_import(name, *args, **kwargs)
+
+        # 检查是否在配置中
+        if name in PATCH_CONFIG:
+            if id(module) not in _patched_modules:
+                _patched_modules.add(id(module))
+                # 应用所有 patch
+                for attr_name, patch_func in PATCH_CONFIG[name].items():
+                    setattr(module, attr_name, patch_func)
+
+        return module
+
+    # 替换 __import__
+    __builtins__['__import__'] = patched_import
+
+    # 如果已经导入过了，直接替换
+    for module_name, patches in PATCH_CONFIG.items():
+        if module_name in sys.modules:
+            module = sys.modules[module_name]
+            if id(module) not in _patched_modules:
+                _patched_modules.add(id(module))
+                for attr_name, patch_func in patches.items():
+                    setattr(module, attr_name, patch_func)
