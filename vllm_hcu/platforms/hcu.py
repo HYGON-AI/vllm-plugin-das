@@ -77,7 +77,7 @@ def register_attention_backends() -> None:
 
 class HCUPlatform(Platform):
     #这个地方会管理custom_ops
-    _enum = PlatformEnum.OOT
+    _enum = PlatformEnum.ROCM
     device_name: str = "hip"
     device_type: str = "cuda"
     dispatch_key: str = "CUDA"

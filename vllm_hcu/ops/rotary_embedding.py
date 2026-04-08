@@ -9,5 +9,5 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 class HcuRotaryEmbedding(RotaryEmbedding):
     """Original rotary positional embedding."""
 
-    def forward_oot(self, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_hip(self, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_cuda(*args, **kwargs)
