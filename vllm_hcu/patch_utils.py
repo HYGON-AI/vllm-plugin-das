@@ -66,7 +66,7 @@ def import_hook():
     builtins.__import__ = _custom_import
 
 #自定义函数或者类的补丁
-def patch_fuction_class(custom_function)
+def patch_fuction_class(custom_function):
     # 配置需要 patch 的模块和对应的 patch 函数
     PATCH_CONFIG = {
         # 'vllm.model_executor.model_loader.weight_utils': {
