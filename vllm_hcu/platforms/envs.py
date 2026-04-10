@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
+    VLLM_HCU_USE_FA_UNIFIED_ATTENTION: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -26,6 +27,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, vLLM will transpose weight to use nn layout
     "VLLM_USE_NN":
     lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in 
+             ("true", "1")),
+    # vLLM will use FlashAttention Backend on hcu
+    "VLLM_HCU_USE_FA_UNIFIED_ATTENTION":
+    lambda: (os.environ.get("VLLM_HCU_USE_FA_UNIFIED_ATTENTION", "False").lower() in
              ("true", "1")),
 }
 

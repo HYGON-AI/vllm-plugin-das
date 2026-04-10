@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
+import vllm_hcu.platforms.envs as henvs 
+
 logger = init_logger(__name__)
 
 try:
@@ -58,10 +60,14 @@ def _get_backend_priorities(
             AttentionBackendEnum.TRITON_MLA,
         ]
     else:
-        return [
-            AttentionBackendEnum.TRITON_ATTN,
-            AttentionBackendEnum.FLASH_ATTN,
-        ]
+        if henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION:
+            return [
+                AttentionBackendEnum.FLASH_ATTN,
+            ]
+        else:
+            return [
+                AttentionBackendEnum.TRITON_ATTN,
+            ]
 
 def register_attention_backends() -> None:
     # Pre-register all attention backends
@@ -347,6 +353,11 @@ class HCUPlatform(Platform):
                 cache_config.block_size = 64
                 logger.warning(
                     "[ROCM_AITER_UNIFIED_ATTN]: Setting kv cache block size to 64."
+                )
+            elif henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION:
+                cache_config.block_size = 64
+                logger.warning(
+                    "[HCU_FA_UNIFIED_ATTN]: Setting kv cache block size to 64."
                 )
             else:
                 cache_config.block_size = 16

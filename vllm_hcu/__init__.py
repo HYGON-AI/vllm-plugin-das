@@ -13,4 +13,5 @@ def hcu_platform_plugin():
 #     _reg()
     
 def hcu_platform_register_ops():
+    _register_patches()
     import vllm_hcu.ops

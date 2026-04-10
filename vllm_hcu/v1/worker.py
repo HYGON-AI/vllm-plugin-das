@@ -146,7 +146,7 @@ class HcuGPUWorker(Worker):
                 self.vllm_config, self.device
             )
         else:
-            from vllm.v1.worker.gpu_model_runner import (
+            from vllm_hcu.v1.hcu_model_runner import (
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
