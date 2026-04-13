@@ -48,12 +48,14 @@ def flash_attn_triton_available() -> bool:
 @cache
 def _get_backend_priorities(
     use_mla: bool,
-    device_capability: DeviceCapability,
-    num_heads: int | None = None,
+    use_sparse: bool,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
-    # MUSA platform prioritizes Triton-based backends since FlashAttention
+    # HCU platform prioritizes Triton-based backends since FlashAttention
     # and other CUDA-specific backends may not be available.
+    if use_sparse:
+        return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
+
     if use_mla:
         return [
             AttentionBackendEnum.FLASHMLA,
