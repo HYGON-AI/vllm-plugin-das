@@ -16,7 +16,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     is_quantized_kv_cache,
 )
-from vllm_hcu.v1.attention.backends.hcu_fa_utils import (
+from vllm_hcu.v1.attention.backends.fa_utils import (
     flash_attn_supports_fp8,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
@@ -27,7 +27,7 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from vllm.platforms import current_platform
 if is_flash_attn_varlen_func_available():
-    from vllm_hcu.v1.attention.backends.hcu_fa_utils import (
+    from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
         vllm_flash_attn_varlen_func,
         hcu_cache_ops,

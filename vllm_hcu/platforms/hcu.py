@@ -73,11 +73,11 @@ def register_attention_backends() -> None:
     # Pre-register all attention backends
     register_backend(
         AttentionBackendEnum.TRITON_ATTN,
-        class_path="vllm_hcu.v1.attention.backends.hcu_triton_attn.HcuTritonAttentionBackend",
+        class_path="vllm_hcu.v1.attention.backends.triton_attn.HcuTritonAttentionBackend",
     )
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
-        class_path="vllm_hcu.v1.attention.backends.hcu_flash_attn.HcuFlashAttentionBackend",
+        class_path="vllm_hcu.v1.attention.backends.flash_attn.HcuFlashAttentionBackend",
     )
 
 
