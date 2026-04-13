@@ -40,9 +40,9 @@ vllm_hcu
     ├── v1
     │   ├── attention             # hcu backend attention     
     │   ├── __init__.py
-    │   ├── backends              # hcu attention backends
-    │      ├── hcu_flash_attn     # hcu flash_attn    
-    │      ├── hcu_triton_attn    # hcu triton_attn 
+    │   ├── backends              # attention backends
+    │      ├── flash_attn         # flash_attn    
+    │      ├── triton_attn        # triton_attn 
     │   └── worker.py             # hcu work   
     │   └── hcu_model_runner.py   # hcu model runner  
     └── version.py
