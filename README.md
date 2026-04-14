@@ -41,8 +41,15 @@ vllm_hcu
     │   ├── attention             # hcu backend attention     
     │   ├── __init__.py
     │   ├── backends              # attention backends
-    │      ├── flash_attn         # flash_attn    
-    │      ├── triton_attn        # triton_attn 
+    │      ├── mla                # mla backends
+    │          ├── __init__.py
+    │          ├── triton_mla.py  # triton mla  
+    │          ├── flashmla.py    # flashmla  
+    │      ├── flash_attn.py      # flash_attn    
+    │      ├── triton_attn.py     # triton_attn 
+    │   ├── ops                   # attention ops
+    │      ├── __init__.py       
+    │      ├── flashmla.py        
     │   └── worker.py             # hcu work   
     │   └── hcu_model_runner.py   # hcu model runner  
     └── version.py

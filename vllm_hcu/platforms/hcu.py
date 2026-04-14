@@ -45,6 +45,19 @@ def flash_attn_triton_available() -> bool:
     except ImportError:
         return False
 
+
+@cache
+def _get_gcn_arch_name() -> str:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return GPU_ARCH.split(':')[0]
+
+
+_ON_GFX938 = "gfx938" in _get_gcn_arch_name()
+
+
+def on_gfx938() -> bool:
+    return _ON_GFX938
+
 @cache
 def _get_backend_priorities(
     use_mla: bool,
@@ -57,10 +70,14 @@ def _get_backend_priorities(
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
 
     if use_mla:
-        return [
-            AttentionBackendEnum.FLASHMLA,
-            AttentionBackendEnum.TRITON_MLA,
-        ]
+        if henvs.VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION:
+            return [
+                AttentionBackendEnum.FLASHMLA,
+            ]
+        else:
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+            ]
     else:
         if henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION:
             return [
@@ -80,6 +97,14 @@ def register_attention_backends() -> None:
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
         class_path="vllm_hcu.v1.attention.backends.flash_attn.HcuFlashAttentionBackend",
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHMLA,
+        class_path="vllm_hcu.v1.attention.backends.mla.flashmla.HcuFlashMLABackend",
+    )
+    register_backend(
+        AttentionBackendEnum.TRITON_MLA,
+        class_path="vllm_hcu.v1.attention.backends.mla.triton_mla.HcuTritonMLABackend",
     )
 
 
@@ -322,8 +347,8 @@ class HCUPlatform(Platform):
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
-        if cache_config and cache_config.block_size is None:
-            cache_config.block_size = 64
+        # if cache_config and cache_config.block_size is None:
+        #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
@@ -356,10 +381,10 @@ class HCUPlatform(Platform):
                 logger.warning(
                     "[ROCM_AITER_UNIFIED_ATTN]: Setting kv cache block size to 64."
                 )
-            elif henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION:
+            elif henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION or henvs.VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION:
                 cache_config.block_size = 64
                 logger.warning(
-                    "[HCU_FA_UNIFIED_ATTN]: Setting kv cache block size to 64."
+                    "[HCU_FA/FlashMLA_UNIFIED_ATTN]: Setting kv cache block size to 64."
                 )
             else:
                 cache_config.block_size = 16
@@ -463,5 +488,3 @@ class HCUPlatform(Platform):
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
         return True
-
-
