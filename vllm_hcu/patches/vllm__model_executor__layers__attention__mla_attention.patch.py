@@ -3,7 +3,6 @@
 """
 vllm.model_executor.layers.attention.mla_attention process_weights_after_loading
 """
-import re
 
 PATCHES = [
 (
