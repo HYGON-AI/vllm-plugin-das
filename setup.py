@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, Union
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-from setuptools import find_packages, setup
+from setuptools import find_packages, setup, find_namespace_packages
 
 if "MAX_JOBS" not in os.environ:
     os.environ["MAX_JOBS"] = str(multiprocessing.cpu_count())
@@ -165,7 +165,7 @@ setup(
     version=get_version(),
     description="vLLM HCU backend plugin",
     python_requires=">=3.10",
-    packages=find_packages(),
+    packages=find_namespace_packages(),
     package_data={"vllm_hcu": ["*.so", "so/*.so", "include/*.h"]},
     ext_modules=ext_modules,
     cmdclass={
