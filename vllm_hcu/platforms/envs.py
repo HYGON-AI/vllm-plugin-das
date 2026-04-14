@@ -36,7 +36,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION":
-    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION", "True").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION", "False").lower() in
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
