@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FA_UNIFIED_ATTENTION: bool = False
     VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION: bool = False
-    VLLM_HCU_USE_CUSTOM_GEMM : bool = False
+    VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -40,8 +40,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION", "False").lower() in
              ("true", "1")),
     # If set, control hcu custom gemm including w8a8 int8/fp8 etc
-    "VLLM_HCU_USE_CUSTOM_GEMM":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_GEMM", "False").lower() in
+    "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "False").lower() in
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vllm.model_executor.models.qwen3_next _forward_core
+vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8
 """
 
 PATCHES = [
@@ -47,14 +47,14 @@ def apply_int8_linear(
 """,
 """        
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if henvs.VLLM_HCU_USE_CUSTOM_GEMM:
+        if henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM:
             layer.weight.data = layer.weight.data.T
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-        if henvs.VLLM_HCU_USE_CUSTOM_GEMM:
+        if henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM:
             return apply_int8_linear(input=x,
                                      weight=layer.weight,
                                      weight_scale=layer.weight_scale,
