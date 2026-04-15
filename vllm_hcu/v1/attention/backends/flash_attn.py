@@ -121,7 +121,7 @@ class HcuFlashAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
     
-    if henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION:
+    if henvs.VLLM_HCU_USE_FLASH_ATTN:
         @staticmethod
         def get_kv_cache_shape(
             num_blocks: int,
@@ -743,7 +743,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        if henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION:
+        if henvs.VLLM_HCU_USE_FLASH_ATTN:
             key_cache, value_cache = kv_cache
         else:
             key_cache, value_cache = kv_cache.unbind(0)

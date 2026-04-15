@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
-    VLLM_HCU_USE_FA_UNIFIED_ATTENTION: bool = False
-    VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION: bool = False
+    VLLM_HCU_USE_FLASH_ATTN: bool = False
+    VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -31,12 +31,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in 
              ("true", "1")),
     # vLLM will use FlashAttention Backend on hcu
-    "VLLM_HCU_USE_FA_UNIFIED_ATTENTION":
-    lambda: (os.environ.get("VLLM_HCU_USE_FA_UNIFIED_ATTENTION", "False").lower() in
+    "VLLM_HCU_USE_FLASH_ATTN":
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in
              ("true", "1")),
     # vLLM will use FlashMLA Backend on hcu
-    "VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION":
-    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA_UNIFIED_ATTENTION", "False").lower() in
+    "VLLM_HCU_USE_FLASHMLA":
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":

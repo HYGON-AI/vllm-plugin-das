@@ -6294,7 +6294,7 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    if henvs.VLLM_HCU_USE_FA_UNIFIED_ATTENTION and not self.vllm_config.model_config.use_mla:
+                    if henvs.VLLM_HCU_USE_FLASH_ATTN and not self.vllm_config.model_config.use_mla:
                         key_cache_shape, value_cache_shape = attn_backend.get_kv_cache_shape(
                             kernel_num_blocks,
                             kernel_block_size,
