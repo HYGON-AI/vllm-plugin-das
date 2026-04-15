@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
+    VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -37,6 +38,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
+             ("true", "1")),
+    # If set, control hcu custom gemm including w8a8 int8/fp8 etc
+    "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "False").lower() in
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
