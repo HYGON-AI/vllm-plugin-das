@@ -428,7 +428,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inplace=True,
-            activation=layer.activation,
+            activation=layer.activation.value,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             use_int8_w8a8=True,
             per_channel_quant=True,
