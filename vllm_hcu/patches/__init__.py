@@ -29,10 +29,15 @@ def _get_patch_files():
         module_name = patch_file.stem.rsplit(".patch", 1)[0]
         # Convert filename format to module format
         # vllm__attention__ops__triton_unified_attention -> vllm.attention.ops.triton_unified_attention
+        # .../quantization/__init__.py -> stem ...quantization____init[__.]patch
+        # Strip before __ -> . so "__init__" is not mangled into "..init." / "..init"
+        if module_name.endswith("____init__"):
+            module_name = module_name[: -len("____init__")]
+        elif module_name.endswith("____init"):
+            module_name = module_name[: -len("____init")]
         module_name = module_name.replace("__", ".")
         patch_files.append((module_name, patch_file))
     return patch_files
-
 
 def _load_patch_config(patch_file: Path) -> list[tuple[str, str]]:
     """Load patch configuration from a patch file.
@@ -110,7 +115,6 @@ def apply_patches():
                 
                 # 检查这个特定补丁是否已经应用
                 if patch_id in patched_source:
-                    print(f"Patch {i} already applied, skipping")
                     continue
                 
                 # 检查是否需要应用
