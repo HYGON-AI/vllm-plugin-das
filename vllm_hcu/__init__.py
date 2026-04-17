@@ -4,6 +4,7 @@ from .patch_utils import import_hook, _register_patches, patch_module_class_func
 
 def hcu_platform_plugin():
     """Register the HCU platform."""
+    _register_patches()
     import_hook()
     return "vllm_hcu.platforms.hcu.HCUPlatform"
 
@@ -13,6 +14,5 @@ def hcu_platform_plugin():
 #     _reg()
     
 def hcu_platform_register_ops():
-    _register_patches()
     patch_module_class_function()
     import vllm_hcu.ops
