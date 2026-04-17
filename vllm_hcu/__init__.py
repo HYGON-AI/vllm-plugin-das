@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .patch_utils import import_hook, _register_patches
+from .patch_utils import import_hook, _register_patches, patch_module_class_function
 
 def hcu_platform_plugin():
     """Register the HCU platform."""
@@ -14,4 +14,5 @@ def hcu_platform_plugin():
     
 def hcu_platform_register_ops():
     _register_patches()
+    patch_module_class_function()
     import vllm_hcu.ops

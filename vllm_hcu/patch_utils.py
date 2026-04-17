@@ -65,6 +65,13 @@ def import_hook():
     """Apply import hook for VLLM hcu"""
     builtins.__import__ = _custom_import
 
+
+#补丁替换类中函数
+from .patches.patch_w8a8_channelwise_blaslt_apply_scaled_mm import patch_fp8_scaled_mm
+
+def patch_module_class_function():
+    patch_fp8_scaled_mm()
+
 #自定义函数或者类的补丁
 def patch_fuction_class(custom_function):
     # 配置需要 patch 的模块和对应的 patch 函数
