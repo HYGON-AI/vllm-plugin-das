@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
+    VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -46,6 +47,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "False").lower() in
+             ("true", "1")),
+    # If set, control hcu custom silu and mul op
+    "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "False").lower() in
              ("true", "1")),
 }
 
