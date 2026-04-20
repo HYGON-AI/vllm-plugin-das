@@ -75,10 +75,13 @@ def patch_module_class_function():
         patch_quantization_platform_support,
     )
     from .patches.patch_register_slimquant import patch_register_slimquant
-
+    from .patches.patch_weight_utils_skip_debug import (
+        patch_safetensors_weights_iterator,
+    )
     patch_quantization_platform_support()
     patch_register_slimquant()
     patch_fp8_scaled_mm()
+    patch_safetensors_weights_iterator()
 
 #自定义函数或者类的补丁
 def patch_fuction_class(custom_function):
