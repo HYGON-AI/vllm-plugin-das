@@ -1,15 +1,48 @@
-#vllm.model_executor.kernels.linear.scaled_mm.pytorch.ChannelWiseTorchFP8ScaledMMLinearKernel apply_scaled_mm
+# vllm.model_executor.kernels.linear.scaled_mm.pytorch.
+# ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm
+from math import prod
+
 def patch_fp8_scaled_mm():
     from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
-        ChannelWiseTorchFP8ScaledMMLinearKernel
+        ChannelWiseTorchFP8ScaledMMLinearKernel,
     )
+    from vllm_hcu.platforms import envs as henvs
 
-    def new_apply_scaled_mm(self, A, B, As, Bs, out_dtype, bias, output_shape):
+    if getattr(ChannelWiseTorchFP8ScaledMMLinearKernel, "_hcu_fp8_patch_applied", False):
+        return
+
+    original_apply_scaled_mm = ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm
+
+    def new_apply_scaled_mm(
+        self,
+        *,
+        A,
+        B,
+        As,
+        Bs,
+        out_dtype,
+        bias,
+        output_shape,
+    ):
+        if not henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM:
+            return original_apply_scaled_mm(
+                self,
+                A=A,
+                B=B,
+                As=As,
+                Bs=Bs,
+                out_dtype=out_dtype,
+                bias=bias,
+                output_shape=output_shape,
+            )
+
         from lmslim.quantize.quant_ops import hipblaslt_w8a8_channelwise_gemm
 
         m = A.shape[0]
         k = A.shape[1]
         n = B.shape[0]
+        result_shape = [*output_shape[:-1], n]
+        num_output_rows = prod(result_shape[:-1]) if len(result_shape) > 1 else result_shape[0]
 
         _, output = hipblaslt_w8a8_channelwise_gemm(
             a=A,
@@ -24,7 +57,9 @@ def patch_fp8_scaled_mm():
             bias=bias,
         )
 
-        return output.view(m, n)
+        output = output.reshape(-1, n)
+        output = output.narrow(0, 0, num_output_rows)
+        return output.view(*result_shape)
 
-    # 打 patch
     ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm = new_apply_scaled_mm
+    ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_patch_applied = True
