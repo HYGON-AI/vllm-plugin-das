@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
+    VLLM_HCU_USE_DEFAULT_GEMM : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
@@ -33,6 +34,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, vLLM will transpose weight to use nn layout
     "VLLM_USE_NN":
     lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in 
+             ("true", "1")),
+    # If set, vLLM will use default gemm for lm_head
+    "VLLM_HCU_USE_DEFAULT_GEMM":
+    lambda: (os.environ.get("VLLM_HCU_USE_DEFAULT_GEMM", "False").lower() in 
              ("true", "1")),
     # vLLM will use FlashAttention Backend on hcu
     "VLLM_HCU_USE_FLASH_ATTN":
