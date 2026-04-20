@@ -58,7 +58,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM", "False").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_SKIP_WEIGHT_DEBUG":
-    lambda: (os.environ.get("VLLM_HCU_USE_SKIP_WIGHT_DEBUG", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_SKIP_WEIGHT_DEBUG", "False").lower() in
              ("true", "1")),
 }
 
