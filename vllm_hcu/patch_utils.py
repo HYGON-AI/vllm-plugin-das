@@ -68,6 +68,9 @@ def import_hook():
 
 def patch_module_class_function():
     # Lazy import so plugin loading does not eagerly import optional deps.
+    from .patches.patch_unified_kv_cache_update import (
+        patch_unified_kv_cache_update,
+    )
     from .patches.patch_w8a8_channelwise_blaslt_apply_scaled_mm import (
         patch_fp8_scaled_mm,
     )
@@ -82,6 +85,7 @@ def patch_module_class_function():
     patch_register_slimquant()
     patch_fp8_scaled_mm()
     patch_safetensors_weights_iterator()
+    patch_unified_kv_cache_update()
 
 #自定义函数或者类的补丁
 def patch_fuction_class(custom_function):
