@@ -159,7 +159,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.sample.sampler import Sampler
+from vllm_hcu.ops.topk_topp_sample import HcuSampler 
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -474,7 +474,7 @@ class GPUModelRunner(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.sampler = HcuSampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self.eplb_state: EplbState | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
