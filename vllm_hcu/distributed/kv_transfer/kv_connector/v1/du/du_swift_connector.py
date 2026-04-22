@@ -442,10 +442,9 @@ class DuSwiftConnector(KVConnectorBase_V1):
                 logger.error("Error: not support!!!!!!")
                 
     def wait_for_save(self):
-        pass
-        # if self.is_producer:
-        #     assert self.du_swift_engine is not None
-        #     self.du_swift_engine.wait_for_sent()
+        if self.is_producer:
+            assert self.du_swift_engine is not None
+            self.du_swift_engine.wait_for_sent()
 
     def get_finished(
         self, finished_req_ids: set[str], **kwargs: Any
