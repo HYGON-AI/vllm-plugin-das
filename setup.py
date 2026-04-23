@@ -1,6 +1,7 @@
 """Setup script for vLLM HCU plugin."""
 
 import os
+import sys
 import shutil
 import subprocess
 import multiprocessing
@@ -9,6 +10,7 @@ from typing import Optional, Union
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 from setuptools import find_packages, setup, find_namespace_packages
+from setuptools.command.install import install
 
 if "MAX_JOBS" not in os.environ:
     os.environ["MAX_JOBS"] = str(multiprocessing.cpu_count())
@@ -128,6 +130,43 @@ ext_modules = [
     )
 ]
 
+class CustomInstall(install):
+    def run(self):
+        # 执行标准安装
+        super().run()
+        
+        # 执行 post_install.py
+        self._run_post_install()
+    
+    def _run_post_install(self):
+        """Execute post_install.py script."""
+        post_install_script = ROOT / "post_install.py"
+        
+        if not post_install_script.exists():
+            print("[CustomInstall] Warning: post_install.py not found")
+            return
+        
+        try:
+            # 使用当前 Python 解释器执行
+            result = subprocess.run(
+                [sys.executable, str(post_install_script)],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=str(ROOT)
+            )
+            
+            if result.returncode == 0:
+                print("[CustomInstall] Post-install script executed successfully")
+                if result.stdout:
+                    print(result.stdout)
+            else:
+                print(f"[CustomInstall] Warning: post_install.py failed with code {result.returncode}")
+                if result.stderr:
+                    print(f"Error: {result.stderr}")
+                    
+        except Exception as e:
+            print(f"[CustomInstall] Failed to run post_install.py: {e}")
 # =========================================================
 # --- 3. 自定义并行编译并拷贝的类 ---
 # =========================================================
@@ -169,7 +208,8 @@ setup(
     package_data={"vllm_hcu": ["*.so", "so/*.so", "include/*.h"]},
     ext_modules=ext_modules,
     cmdclass={
-        'build_ext': CustomBuildExt
+        'build_ext': CustomBuildExt,
+        'install': CustomInstall,
     },
     entry_points={
         "vllm.platform_plugins": [
