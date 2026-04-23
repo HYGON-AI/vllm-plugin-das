@@ -30,7 +30,7 @@ if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
         vllm_flash_attn_varlen_func,
-        hcu_cache_ops,
+        hcu_ops,
     )
  
 from vllm.config import (
@@ -865,7 +865,7 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
-        hcu_cache_ops.reshape_and_cache(
+        torch.ops.hcu_ops.reshape_and_cache(
             key,
             value,
             key_cache,

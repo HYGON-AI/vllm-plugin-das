@@ -120,9 +120,12 @@ def get_version() -> str:
 # 建议将生成的 .so 放到包名路径下，例如 vllm_hcu.cache_ops
 ext_modules = [
     CUDAExtension(
-        name='vllm_hcu.hcu_cache_ops', 
-        sources=['vllm_hcu/csrc/hcu_cache_kernel.cu'], 
-        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_cache_ops')], 
+        name='vllm_hcu.hcu_ops', 
+        sources=['vllm_hcu/csrc/hcu_cache_kernel.cu',
+                 'vllm_hcu/csrc/torch_bindings.cpp',
+                 'vllm_hcu/csrc/custom_all_reduce.cu'
+                 ], 
+        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')], 
         extra_compile_args={
             'cxx': ['-O3'],
             'nvcc': ['-O3', '-D__HIP_PLATFORM_AMD__=1', '-fno-gpu-rdc']

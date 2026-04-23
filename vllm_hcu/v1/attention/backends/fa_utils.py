@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Any
 
-import vllm_hcu.hcu_cache_ops as hcu_cache_ops
+import vllm_hcu.hcu_ops as hcu_ops
 from flash_attn import flash_attn_varlen_func, vllm_flash_attn_varlen_func
 
 # Hcu doesn't use scheduler metadata (FA3 feature), provide stub

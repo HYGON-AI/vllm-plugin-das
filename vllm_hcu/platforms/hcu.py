@@ -22,9 +22,39 @@ import vllm_hcu.platforms.envs as henvs
 logger = init_logger(__name__)
 
 try:
+    from amdsmi import (
+        AmdSmiException,
+        amdsmi_get_gpu_asic_info,
+        amdsmi_get_processor_handles,
+        amdsmi_init,
+        amdsmi_shut_down,
+        amdsmi_topo_get_link_type,
+    )
+except ImportError as e:
+    logger.warning("Failed to import from amdsmi with %r", e)
+
+try:
     import vllm._C  # noqa: F401
 except ImportError as e:
     logger.warning("Failed to import from vllm._C with %r", e)
+
+
+# AMDSMI utils
+# Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
+# all the related functions work on real physical device ids.
+# the major benefit of using AMDSMI is that it will not initialize CUDA
+
+
+def with_amdsmi_context(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        amdsmi_init()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            amdsmi_shut_down()
+
+    return wrapper
 
 @cache
 def flash_attn_triton_available() -> bool:
@@ -262,6 +292,33 @@ class HCUPlatform(Platform):
         logger.info_once("Using Torch SDPA backend for ViT model.")
         return AttentionBackendEnum.TORCH_SDPA
     
+    @classmethod
+    def use_custom_allreduce(cls) -> bool:
+        # We only enable custom allreduce for MI300 series
+        # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        return True
+
+    @classmethod
+    @with_amdsmi_context
+    def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
+        """
+        Query if the set of gpus are fully connected by xgmi (1 hop)
+        """
+        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i < j:
+                    try:
+                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
+                        # type is 2 for XGMI
+                        if link_type["hops"] != 1 or link_type["type"] != 2:
+                            return False
+                    except AmdSmiException as error:
+                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
+                        return False
+        return True
+
+
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)

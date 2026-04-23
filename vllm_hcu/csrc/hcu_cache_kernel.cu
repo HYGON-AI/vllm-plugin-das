@@ -173,6 +173,6 @@ void reshape_and_cache_hcu(
 }
 
 // 7. PyBind 绑定
-PYBIND11_MODULE(hcu_cache_ops, m) {
-    m.def("reshape_and_cache", &reshape_and_cache_hcu, "HCU reshape_and_cache kernel");
-}
+// PYBIND11_MODULE(hcu_ops, m) {
+//     m.def("reshape_and_cache", &reshape_and_cache_hcu, "HCU reshape_and_cache kernel");
+// }
