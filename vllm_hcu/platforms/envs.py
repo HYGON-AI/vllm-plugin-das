@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
+    VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -60,6 +61,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     "VLLM_HCU_USE_SKIP_WEIGHT_DEBUG":
     lambda: (os.environ.get("VLLM_HCU_USE_SKIP_WEIGHT_DEBUG", "False").lower() in
+             ("true", "1")),
+    "VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER", "False").lower() in
              ("true", "1")),
     # Pipeline stage partition strategy
     "VLLM_HCU_PP_LAYER_PARTITION_D":
