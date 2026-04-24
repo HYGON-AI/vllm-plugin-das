@@ -15,7 +15,7 @@ PATCHES = [
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 """,
 """
-    if henvs.VLLM_HCU_USE_FLASH_ATTN:
+    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
         return torch.empty(0, device=key.device, dtype=key.dtype)
     else:
         return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)

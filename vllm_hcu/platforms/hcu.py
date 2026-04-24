@@ -93,23 +93,15 @@ def _get_backend_priorities(
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
 
     if use_mla:
-        if henvs.VLLM_HCU_USE_FLASHMLA:
-            return [
-                AttentionBackendEnum.FLASHMLA,
-            ]
-        else:
-            return [
-                AttentionBackendEnum.TRITON_MLA,
-            ]
+        return [
+            AttentionBackendEnum.FLASHMLA,
+            AttentionBackendEnum.TRITON_MLA,
+        ]
     else:
-        if henvs.VLLM_HCU_USE_FLASH_ATTN:
-            return [
-                AttentionBackendEnum.FLASH_ATTN,
-            ]
-        else:
-            return [
-                AttentionBackendEnum.TRITON_ATTN,
-            ]
+        return [
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.TRITON_ATTN,
+        ]
 
 def register_attention_backends() -> None:
     # Pre-register all attention backends
@@ -431,10 +423,15 @@ class HCUPlatform(Platform):
                 logger.warning(
                     "[ROCM_AITER_UNIFIED_ATTN]: Setting kv cache block size to 64."
                 )
-            elif henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASHMLA:
+            elif henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASHMLA:
                 cache_config.block_size = 64
                 logger.warning(
-                    "[HCU_FA/FlashMLA_UNIFIED_ATTN]: Setting kv cache block size to 64."
+                    "[HCU CUSTOM_FLASH_ATTN/FLASHMLA]: Setting kv cache block size to 64."
+                )
+            elif henvs.VLLM_HCU_USE_FLASH_ATTN:
+                cache_config.block_size = 128
+                logger.warning(
+                    "[HCU FLASH_ATTN]: Setting kv cache block size to 128."
                 )
             else:
                 cache_config.block_size = 16

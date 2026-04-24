@@ -2,7 +2,8 @@
 from typing import Any
 
 import vllm_hcu.hcu_ops as hcu_ops
-from flash_attn import flash_attn_varlen_func, vllm_flash_attn_varlen_func
+from vllm._custom_ops import reshape_and_cache_flash
+from flash_attn import flash_attn_varlen_func, vllm_flash_attn_varlen_func, hg_flash_attn_varlen_func
 
 # Hcu doesn't use scheduler metadata (FA3 feature), provide stub
 def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]

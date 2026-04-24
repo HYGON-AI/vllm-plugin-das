@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
+    VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
@@ -40,6 +41,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashAttention Backend on hcu
     "VLLM_HCU_USE_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in
+             ("true", "1")),
+    # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu
+    "VLLM_HCU_USE_CUSTOM_FLASH_ATTN":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False").lower() in
              ("true", "1")),
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":

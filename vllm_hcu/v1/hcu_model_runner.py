@@ -119,6 +119,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
@@ -6294,7 +6295,9 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    if henvs.VLLM_HCU_USE_FLASH_ATTN and not self.vllm_config.model_config.use_mla:
+                    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN and \
+                        self.vllm_config.attention_config.backend != AttentionBackendEnum.TRITON_ATTN \
+                            and not self.vllm_config.model_config.use_mla:
                         key_cache_shape, value_cache_shape = attn_backend.get_kv_cache_shape(
                             kernel_num_blocks,
                             kernel_block_size,

@@ -25,12 +25,15 @@ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
+import vllm_hcu.platforms.envs as henvs 
 from vllm.platforms import current_platform
 if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
         vllm_flash_attn_varlen_func,
+        hg_flash_attn_varlen_func,
         hcu_ops,
+        reshape_and_cache_flash,
     )
  
 from vllm.config import (
@@ -58,7 +61,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 import vllm.envs as envs
-import vllm_hcu.platforms.envs as henvs 
 
 logger = init_logger(__name__)
 
@@ -89,7 +91,7 @@ class HcuFlashAttentionBackend(AttentionBackend):
             # MultipleOf(16), these are the block sizes that do not
             # suffer from the NaN propagation problem described here:
             # https://github.com/Dao-AILab/flash-attention/issues/1974
-            return [16, 32, 64]
+            return [16, 32, 64, 128]
         return [MultipleOf(16)]
 
     forward_includes_kv_cache_update: bool = False
@@ -121,7 +123,7 @@ class HcuFlashAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
     
-    if henvs.VLLM_HCU_USE_FLASH_ATTN:
+    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
         @staticmethod
         def get_kv_cache_shape(
             num_blocks: int,
@@ -743,7 +745,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        if henvs.VLLM_HCU_USE_FLASH_ATTN:
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
             key_cache, value_cache = kv_cache
         else:
             key_cache, value_cache = kv_cache.unbind(0)
@@ -764,9 +766,16 @@ class FlashAttentionImpl(AttentionImpl):
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
 
-            q_descale = None
-            k_descale = layer._k_scale
-            v_descale = layer._v_scale
+            if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+                q_descale = None
+                k_descale = layer._k_scale
+                v_descale = layer._v_scale
+            else:
+                descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+
+                q_descale = layer._q_scale.expand(descale_shape)
+                k_descale = layer._k_scale.expand(descale_shape)
+                v_descale = layer._v_scale.expand(descale_shape)
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
@@ -788,30 +797,55 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                vllm_flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    # num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
-                    is_prefix_cache=True,
-                )
+                if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+                    vllm_flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        # num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                        is_prefix_cache=True,
+                    )
+                else:
+                    hg_flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        # num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
                 return output
 
         # Cascade attention (rare case).
@@ -856,7 +890,10 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
-        key_cache, value_cache = kv_cache
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            key_cache, value_cache = kv_cache
+        else:
+            key_cache, value_cache = kv_cache.unbind(0)
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
@@ -865,16 +902,28 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
-        torch.ops.hcu_ops.reshape_and_cache(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            torch.ops.hcu_ops.reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+        else:
+            reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
 
 
     def _forward_with_dcp(
@@ -903,30 +952,55 @@ class FlashAttentionImpl(AttentionImpl):
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
-        context_attn_out, context_lse = vllm_flash_attn_varlen_func(
-            q=query_across_dcp,
-            k=key_cache,
-            v=value_cache,
-            out=None,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=attn_metadata.dcp_context_kv_lens,
-            max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
-            softmax_scale=self.scale,
-            causal=False,
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            block_table=block_table,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            scheduler_metadata=attn_metadata.scheduler_metadata,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            # num_splits=attn_metadata.max_num_splits,
-            is_prefix_cache=True,
-        )
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            context_attn_out, context_lse = vllm_flash_attn_varlen_func(
+                q=query_across_dcp,
+                k=key_cache,
+                v=value_cache,
+                out=None,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=attn_metadata.dcp_context_kv_lens,
+                max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
+                softmax_scale=self.scale,
+                causal=False,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # num_splits=attn_metadata.max_num_splits,
+                is_prefix_cache=True,
+            )
+        else:
+            context_attn_out, context_lse = hg_flash_attn_varlen_func(
+                q=query_across_dcp,
+                k=key_cache,
+                v=value_cache,
+                out=None,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=attn_metadata.dcp_context_kv_lens,
+                max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
+                softmax_scale=self.scale,
+                causal=False,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # num_splits=attn_metadata.max_num_splits,
+            )
        
         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
         context_attn_out_cor, context_lse_cor = self.dcp_combine(
@@ -937,27 +1011,51 @@ class FlashAttentionImpl(AttentionImpl):
         )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
 
-        query_attn_out, query_lse = vllm_flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            out=None,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            cu_seqlens_k=cu_seqlens_q,
-            max_seqlen_k=max_seqlen_q,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            # num_splits=attn_metadata.max_num_splits,
-        )
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            query_attn_out, query_lse = vllm_flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                out=None,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_q,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # num_splits=attn_metadata.max_num_splits,
+                is_prefix_cache=True,
+            )
+        else:
+            query_attn_out, query_lse = hg_flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                out=None,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_q,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # num_splits=attn_metadata.max_num_splits,
+            )
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape
         merge_attn_states(
@@ -1012,30 +1110,49 @@ class FlashAttentionImpl(AttentionImpl):
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
-        vllm_flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            out=output,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=False,  # Encoder attention is bidirectional
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            softcap=self.logits_soft_cap,
-            fa_version=self.vllm_flash_attn_version,
-            # q_descale=layer._q_scale.expand(descale_shape),
-            # k_descale=layer._k_scale.expand(descale_shape),
-            # v_descale=layer._v_scale.expand(descale_shape),
-            q_descale=None,
-            k_descale=layer._k_scale,
-            v_descale=layer._v_scale,
-            # num_splits=1 if self.batch_invariant_enabled else 0,
-            is_prefix_cache=False,
-        )
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            vllm_flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                out=output,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=False,  # Encoder attention is bidirectional
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=None,
+                k_descale=layer._k_scale,
+                v_descale=layer._v_scale,
+                # num_splits=1 if self.batch_invariant_enabled else 0,
+                is_prefix_cache=False,
+            )
+        else:
+            hg_flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                out=output,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=False,  # Encoder attention is bidirectional
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                # num_splits=1 if self.batch_invariant_enabled else 0,
+            )
 
         return output
 
@@ -1157,57 +1274,110 @@ def cascade_attention(
     assert num_common_kv_blocks > 0
 
     # Process shared prefix.
-    prefix_output, prefix_lse, _ = vllm_flash_attn_varlen_func(
-        q=query,
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=cu_prefix_query_lens,
-        seqused_k=prefix_kv_lens,
-        max_seqlen_q=num_tokens,
-        max_seqlen_k=common_prefix_len,
-        softmax_scale=softmax_scale,
-        causal=False,
-        window_size=list(sliding_window),
-        block_table=block_table[:1],
-        softcap=logits_soft_cap,
-        return_softmax_lse=True,
-        scheduler_metadata=prefix_scheduler_metadata,
-        fa_version=fa_version,
-        q_descale=q_descale if q_descale is not None else None,
-        k_descale=k_descale if k_descale is not None else None,
-        v_descale=v_descale if v_descale is not None else None,
-        # s_aux is incorporated into prefix_lse inside the GPU kernel,
-        # enabling its effect during the final attention merge.
-        s_aux=s_aux,
-        # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
-        is_prefix_cache=True,
-    )
+    if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
+    
+    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        prefix_output, prefix_lse, _ = vllm_flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_prefix_query_lens,
+            seqused_k=prefix_kv_lens,
+            max_seqlen_q=num_tokens,
+            max_seqlen_k=common_prefix_len,
+            softmax_scale=softmax_scale,
+            causal=False,
+            window_size=list(sliding_window),
+            block_table=block_table[:1],
+            softcap=logits_soft_cap,
+            return_softmax_lse=True,
+            scheduler_metadata=prefix_scheduler_metadata,
+            fa_version=fa_version,
+            q_descale=q_descale if q_descale is not None else None,
+            k_descale=k_descale if k_descale is not None else None,
+            v_descale=v_descale if v_descale is not None else None,
+            # s_aux is incorporated into prefix_lse inside the GPU kernel,
+            # enabling its effect during the final attention merge.
+            s_aux=s_aux,
+            # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+            is_prefix_cache=True,
+        )
+    else:
+        prefix_output, prefix_lse, _ = hg_flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_prefix_query_lens,
+            seqused_k=prefix_kv_lens,
+            max_seqlen_q=num_tokens,
+            max_seqlen_k=common_prefix_len,
+            softmax_scale=softmax_scale,
+            causal=False,
+            window_size=list(sliding_window),
+            block_table=block_table[:1],
+            softcap=logits_soft_cap,
+            return_softmax_lse=True,
+            scheduler_metadata=prefix_scheduler_metadata,
+            fa_version=fa_version,
+            q_descale=q_descale if q_descale is not None else None,
+            k_descale=k_descale if k_descale is not None else None,
+            v_descale=v_descale if v_descale is not None else None,
+            # s_aux is incorporated into prefix_lse inside the GPU kernel,
+            # enabling its effect during the final attention merge.
+            s_aux=s_aux,
+            # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+        )
         
-    descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
+    if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
 
     # Process suffix per query.
-    suffix_output, suffix_lse, _ = vllm_flash_attn_varlen_func(
-        q=query,
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=suffix_kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len - common_prefix_len,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=list(sliding_window),
-        block_table=block_table[:, num_common_kv_blocks:],
-        softcap=logits_soft_cap,
-        return_softmax_lse=True,
-        scheduler_metadata=suffix_scheduler_metadata,
-        fa_version=fa_version,
-        q_descale=q_descale if q_descale is not None else None,
-        k_descale=k_descale if k_descale is not None else None,
-        v_descale=v_descale if v_descale is not None else None,
-        # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
-        is_prefix_cache=True,
-    )
+    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        suffix_output, suffix_lse, _ = vllm_flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=suffix_kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len - common_prefix_len,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=list(sliding_window),
+            block_table=block_table[:, num_common_kv_blocks:],
+            softcap=logits_soft_cap,
+            return_softmax_lse=True,
+            scheduler_metadata=suffix_scheduler_metadata,
+            fa_version=fa_version,
+            q_descale=q_descale if q_descale is not None else None,
+            k_descale=k_descale if k_descale is not None else None,
+            v_descale=v_descale if v_descale is not None else None,
+            # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+            is_prefix_cache=True,
+        )
+    else:
+        suffix_output, suffix_lse, _ = hg_flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=suffix_kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len - common_prefix_len,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=list(sliding_window),
+            block_table=block_table[:, num_common_kv_blocks:],
+            softcap=logits_soft_cap,
+            return_softmax_lse=True,
+            scheduler_metadata=suffix_scheduler_metadata,
+            fa_version=fa_version,
+            q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
+            k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
+            v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
+            # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+        )
 
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
