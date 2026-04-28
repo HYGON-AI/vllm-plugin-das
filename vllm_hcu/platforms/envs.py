@@ -4,17 +4,17 @@ import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
-    VLLM_USE_NN : bool = True
+    VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
-    VLLM_HCU_USE_FLASHMLA: bool = True
-    VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = True
-    VLLM_HCU_USE_CUSTOM_OPS : bool = True
-    VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = True
-    VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = True
+    VLLM_HCU_USE_FLASHMLA: bool = False
+    VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
+    VLLM_HCU_USE_CUSTOM_OPS : bool = False
+    VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
+    VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
-    VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = True
-    VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = True
+    VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
+    VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -36,7 +36,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # If set, vLLM will transpose weight to use nn layout
     "VLLM_USE_NN":
-    lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in 
+    lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in 
              ("true", "1")),
     # vLLM will use FlashAttention Backend on hcu
     "VLLM_HCU_USE_FLASH_ATTN":
@@ -48,31 +48,31 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
-    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "True").lower() in
              ("true", "1")),
     # If set, control hcu custom gemm including w8a8 int8/fp8 etc
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True").lower() in
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True").lower() in
              ("true", "1")),
     # If set, control hcu custom silu and mul op
     "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "True").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM", "True").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_SKIP_WEIGHT_DEBUG":
     lambda: (os.environ.get("VLLM_HCU_USE_SKIP_WEIGHT_DEBUG", "False").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER", "True").lower() in
             ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
              ("true", "1")),
     # Pipeline stage partition strategy
     "VLLM_HCU_PP_LAYER_PARTITION_D":
