@@ -32,6 +32,7 @@ if is_flash_attn_varlen_func_available():
         flash_attn_supports_sinks,
         vllm_flash_attn_varlen_func,
         hg_flash_attn_varlen_func,
+        varlen_fwd_unified,
         hcu_ops,
         reshape_and_cache_flash,
     )
@@ -823,29 +824,49 @@ class FlashAttentionImpl(AttentionImpl):
                         is_prefix_cache=True,
                     )
                 else:
-                    hg_flash_attn_varlen_func(
+                    if henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED:
+                        varlen_fwd_unified(
                         q=query[:num_actual_tokens],
                         k=key_cache,
                         v=value_cache,
-                        out=output[:num_actual_tokens],
                         cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=max_seqlen_q,
                         seqused_k=seqused_k,
+                        block_table=block_table,
+                        max_seqlen_q=max_seqlen_q,
                         max_seqlen_k=max_seqlen_k,
                         softmax_scale=self.scale,
                         causal=attn_metadata.causal,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=block_table,
                         softcap=self.logits_soft_cap,
-                        scheduler_metadata=scheduler_metadata,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        # num_splits=attn_metadata.max_num_splits,
+                        window_size=sliding_window_size,
+                        alibi_slopes=self.alibi_slopes,
                         s_aux=self.sinks,
-                    )
+                        out=output[:num_actual_tokens],
+                        )   
+
+                    else:
+                        hg_flash_attn_varlen_func(
+                            q=query[:num_actual_tokens],
+                            k=key_cache,
+                            v=value_cache,
+                            out=output[:num_actual_tokens],
+                            cu_seqlens_q=cu_seqlens_q,
+                            max_seqlen_q=max_seqlen_q,
+                            seqused_k=seqused_k,
+                            max_seqlen_k=max_seqlen_k,
+                            softmax_scale=self.scale,
+                            causal=attn_metadata.causal,
+                            alibi_slopes=self.alibi_slopes,
+                            window_size=sliding_window_size,
+                            block_table=block_table,
+                            softcap=self.logits_soft_cap,
+                            scheduler_metadata=scheduler_metadata,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=q_descale,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                            # num_splits=attn_metadata.max_num_splits,
+                            s_aux=self.sinks,
+                        )
                 return output
 
         # Cascade attention (rare case).

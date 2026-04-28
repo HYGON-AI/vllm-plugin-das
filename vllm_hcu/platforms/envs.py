@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
+    VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
+    VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -41,6 +43,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashAttention Backend on hcu
     "VLLM_HCU_USE_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in
+             ("true", "1")),
+    # vLLM will use FlashAttention Backend (varlen_fwd_unified) on hcu 
+    "VLLM_HCU_USE_FLASH_ATTN_UNIFIED":
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "False").lower() in
              ("true", "1")),
     # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu
     "VLLM_HCU_USE_CUSTOM_FLASH_ATTN":
@@ -74,6 +80,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
              ("true", "1")),
+    "VLLM_HCU_USE_CUSTOM_AITER_FLA":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in
+             ("true", "1")),
+            
     # Pipeline stage partition strategy
     "VLLM_HCU_PP_LAYER_PARTITION_D":
     lambda: os.getenv("VLLM_HCU_PP_LAYER_PARTITION_D", None),
