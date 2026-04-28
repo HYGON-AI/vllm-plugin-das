@@ -75,7 +75,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get("VLLM_HCU_USE_SKIP_WEIGHT_DEBUG", "False").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER", "True").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER", "False").lower() in
             ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
