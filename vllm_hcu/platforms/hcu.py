@@ -93,15 +93,24 @@ def _get_backend_priorities(
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
 
     if use_mla:
-        return [
-            AttentionBackendEnum.FLASHMLA,
-            AttentionBackendEnum.TRITON_MLA,
-        ]
+        if henvs.VLLM_HCU_USE_FLASHMLA:
+            return [
+                AttentionBackendEnum.FLASHMLA,
+            ]
+        else:
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+            ]
     else:
-        return [
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.TRITON_ATTN,
-        ]
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            return [
+                AttentionBackendEnum.FLASH_ATTN,
+            ]
+        else:
+            return [
+                AttentionBackendEnum.TRITON_ATTN,
+            ]
+
 
 def register_attention_backends() -> None:
     # Pre-register all attention backends

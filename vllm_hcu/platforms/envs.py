@@ -54,7 +54,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
-    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "True").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
              ("true", "1")),
     # If set, control hcu custom gemm including w8a8 int8/fp8 etc
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
