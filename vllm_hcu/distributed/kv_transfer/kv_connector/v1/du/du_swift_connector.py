@@ -223,7 +223,7 @@ class DuSwiftConnector(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
-            if not isinstance(layer, tuple):
+            if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
                 if (isinstance(attn_metadata, MLACommonMetadata) or layer.ndim == 3 or layer.shape[1] == 2):
                     num_block = kv_cache.shape[0]
                     self.check_tensors_except_dim(layer, kv_cache, 0)
@@ -238,7 +238,7 @@ class DuSwiftConnector(KVConnectorBase_V1):
                             num_block,
                             request_id,
                         )
-                elif not henvs.VLLM_HCU_USE_FLASH_ATTN: #FlashAttention_NV
+                elif layer.shape[0] == 2: #FlashAttention_NV #FlashAttention_NV
                     self.check_tensors_except_dim(layer, kv_cache, 1)
                     if len(block_ids) == num_block:
                         layer[:, block_ids, ...] = kv_cache
@@ -379,10 +379,10 @@ class DuSwiftConnector(KVConnectorBase_V1):
                 torch.Tensor: A tensor containing the extracted KV slices.
                 Returns None if the layout is unsupported.
             """
-            if (not isinstance(kv_layer, tuple)):
+            if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
                 if (isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3 or layer.shape[1] == 2):
                     return layer[block_ids, ...]
-                elif not henvs.VLLM_HCU_USE_FLASH_ATTN: # FlashAttention_NV
+                elif layer.shape[0] == 2: # FlashAttention_NV
                     return layer[:, block_ids, ...]
                 else:
                     logger.error("🚧kv_cache not mla && gqa")
@@ -396,8 +396,6 @@ class DuSwiftConnector(KVConnectorBase_V1):
                 kv = torch.stack([k, v], dim=0).contiguous()
                 return kv[:, block_ids, ...]
 
-
-            return None
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, DuSwiftConnectorMetadata)

@@ -40,15 +40,15 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_NN":
     lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in 
              ("true", "1")),
-    # vLLM will use FlashAttention Backend on hcu
+    # vLLM will use FlashAttention Backend on hcu, office attention layerout blocksize 128
     "VLLM_HCU_USE_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in
              ("true", "1")),
-    # vLLM will use FlashAttention Backend (varlen_fwd_unified) on hcu 
+    # vLLM will use FlashAttention Backend (varlen_fwd_unified) on hcu, cutlass attention layerout blocksize 64 for qwen3.5
     "VLLM_HCU_USE_FLASH_ATTN_UNIFIED":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "False").lower() in
              ("true", "1")),
-    # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu
+    # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu,  not office attention layerout blocksize 64 
     "VLLM_HCU_USE_CUSTOM_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False").lower() in
              ("true", "1")),
