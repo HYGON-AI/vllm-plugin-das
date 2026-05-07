@@ -102,7 +102,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
     else:
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN:
             return [
                 AttentionBackendEnum.FLASH_ATTN,
             ]

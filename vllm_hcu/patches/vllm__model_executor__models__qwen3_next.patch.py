@@ -44,8 +44,6 @@ try:
    
     from aiter.ops.triton.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode,
-    )
-    from vllm.model_executor.layers.fla.ops import (
         fused_sigmoid_gating_delta_rule_update,
     )
 except ImportError:
