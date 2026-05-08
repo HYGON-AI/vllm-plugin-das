@@ -34,6 +34,7 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
         module_mappings = {  
             "vllm.model_executor.parameter": "vllm_hcu.model_executor.parameter",
             "vllm.model_executor.layers.linear": "vllm_hcu.model_executor.layers.linear",
+            "vllm.model_executor.layers.sparse_attn_indexer": "vllm_hcu.model_executor.layers.sparse_attn_indexer",
         }
         
         if module_name in module_mappings:

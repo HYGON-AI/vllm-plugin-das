@@ -7,10 +7,10 @@ def hcu_platform_plugin():
     import_hook()
     return "vllm_hcu.platforms.hcu.HCUPlatform"
 
-# def hcu_platform_register_model():
-#     """Register models for training and inference"""
-#     from .model_executor.models import register_model as _reg
-#     _reg()
+def hcu_platform_register_model():
+    """Register models for training and inference"""
+    from .models import register_model as _reg
+    _reg()
     
 def hcu_platform_register_ops():
     patch_module_class_function()

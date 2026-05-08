@@ -219,7 +219,7 @@ setup(
             "hcu = vllm_hcu:hcu_platform_plugin",
         ],
         "vllm.general_plugins": [
-            # "hcu_model = vllm_hcu:hcu_platform_register_model",
+            "hcu_model = vllm_hcu:hcu_platform_register_model",
             "hcu_ops = vllm_hcu:hcu_platform_register_ops",
         ],
     },

@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
+    VLLM_HCU_DISABLE_DSA: bool = False
+    VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
@@ -57,6 +59,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FLASHMLA":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
              ("true", "1")),
+    # If set, vllm will disable DSA
+    "VLLM_HCU_DISABLE_DSA":
+        lambda: (os.environ.get("VLLM_HCU_DISABLE_DSA", "False").lower() in
+                    ("true", "1")),  
+    # If set, vllm will use mixed P/D batch for fp8 (num_attention_heads / tp < 32)
+    "VLLM_HCU_USE_FP8_MIXED_BATCH":
+        lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
+                 ("true", "1")),  
     # If set, control hcu custom gemm including w8a8 int8/fp8 etc
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True").lower() in

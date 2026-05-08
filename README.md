@@ -8,7 +8,7 @@ vLLM HCU Plugin
 
 **Install**   python3 setup.py install
 
-**build whl package** python3 setup.py bdist_wheel (If set ADD_GIT_VERSION = 1, whl will include the git number)
+**build whl package** python3 setup.py bdist_wheel (If set ADD_GIT_VERSION=1, whl will include the git number)
 
 ---
 
@@ -24,9 +24,13 @@ vllm_hcu
     ├── model_executor
     │   ├── __init__.py
     │   ├── layers
-    │       ├── linear.py        # Custom linear
-    │   └── models               # Custom models
+    │       ├── linear.py                    # Custom linear 
+    │       ├── sparse_attn_indexer.py       # Custom sparse_attn_indexer
     │   └── parameter.py         # Custom parameter
+    ├── models                   # Custom models    
+    │   ├── __init__.py
+    │   ├── deepseek_v2.py  
+    │   ├── deepseek_mtp.py  
     ├── ops                      # Custom operators (rotary_embedding)
     │   ├── __init__.py
     │   ├── rotary_embedding.py
@@ -45,11 +49,13 @@ vllm_hcu
     │          ├── __init__.py
     │          ├── triton_mla.py  # triton mla  
     │          ├── flashmla.py    # flashmla  
+    │          ├── flashmla_sparse.py    # flashmla_sparse  
     │      ├── flash_attn.py      # flash_attn    
     │      ├── triton_attn.py     # triton_attn 
-    │   ├── ops                   # attention ops
+    │   ├── ops                   # attention ops  
     │      ├── __init__.py       
-    │      ├── flashmla.py        
+    │      ├── flashmla.py     
+    │      ├── rocm_aiter_mla_sparse.py     
     │   └── worker.py             # hcu work   
     │   └── hcu_model_runner.py   # hcu model runner  
     └── version.py

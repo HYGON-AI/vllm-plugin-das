@@ -90,7 +90,10 @@ def _get_backend_priorities(
     # HCU platform prioritizes Triton-based backends since FlashAttention
     # and other CUDA-specific backends may not be available.
     if use_sparse:
-        return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
+        return [
+            AttentionBackendEnum.FLASHMLA_SPARSE,
+            AttentionBackendEnum.ROCM_AITER_MLA_SPARSE,
+        ]
 
     if use_mla:
         if henvs.VLLM_HCU_USE_FLASHMLA:
@@ -121,6 +124,10 @@ def register_attention_backends() -> None:
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
         class_path="vllm_hcu.v1.attention.backends.flash_attn.HcuFlashAttentionBackend",
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        class_path="vllm_hcu.v1.attention.backends.mla.flashmla_sparse.HcuFlashMLASparseBackend",
     )
     register_backend(
         AttentionBackendEnum.FLASHMLA,
