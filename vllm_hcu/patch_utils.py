@@ -70,12 +70,16 @@ def import_hook():
 #补丁替换类中函数
 def patch_module_class_function():
     # Lazy import so plugin loading does not eagerly import optional deps.
+    from .patches.patch_aiter_moe_bf16_fp16 import (
+        patch_aiter_moe_asm,
+    )
     from .patches.patch_w8a8_channelwise_blaslt_apply_scaled_mm import (
         patch_fp8_scaled_mm,
     )
     from .patches.patch_weight_utils_skip_debug import (
         patch_safetensors_weights_iterator,
     )
+    patch_aiter_moe_asm()
     patch_fp8_scaled_mm()
     patch_safetensors_weights_iterator()
 
