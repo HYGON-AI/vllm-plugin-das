@@ -459,7 +459,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         ):
             cache_dtype = self.cache_config.cache_dtype
             if cache_dtype.startswith("fp8"):
-                qkv_dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
+                qkv_dtype = HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                     cache_dtype
                 )
             else:
@@ -667,8 +667,10 @@ class FlashAttentionImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer"
             )
-
-        self.supports_quant_query_input = True
+        if  henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_KVCACHE_E5M2:
+            self.supports_quant_query_input = False
+        else:
+            self.supports_quant_query_input = True
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (
@@ -753,7 +755,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
-            dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
+            dtype = HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype
             )
             key_cache = key_cache.view(dtype)

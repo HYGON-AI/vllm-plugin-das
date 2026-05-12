@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
+    VLLM_HCU_USE_KVCACHE_E5M2 : bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -104,6 +105,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", "True").lower() in
+             ("true", "1")),
+    # If use kvcache fp8_e5m2, please set True (qurey not quantization)
+    "VLLM_HCU_USE_KVCACHE_E5M2":
+    lambda: (os.environ.get("VLLM_HCU_USE_KVCACHE_E5M2", "False").lower() in
              ("true", "1")),
 }
 

@@ -15,12 +15,100 @@ enum class Fp8KVCacheDataType {
 
 // 2. 补全量化转换函数 (Device 端)
 namespace fp8 {
-// 修复点：第三个模板参数是值 (Non-type template parameter)，而不是类型 (typename)
-template <typename cache_t, typename scalar_t, Fp8KVCacheDataType kv_dt>
-__device__ __forceinline__ cache_t scaled_convert(scalar_t val, float scale) {
-    // 基础转换逻辑
-    return static_cast<cache_t>(static_cast<float>(val) / scale);
+
+// float -> fp8
+static inline __device__ uint8_t float_to_fp8_e4m3(float f) {
+  constexpr uint32_t fp8_max = UINT32_C(1087) << 20;
+  constexpr uint32_t denorm_mask = UINT32_C(141) << 23;
+  uint32_t f_bits = c10::detail::fp32_to_bits(f);
+  uint8_t result = 0u;
+  const uint32_t sign = f_bits & UINT32_C(0x80000000);
+  f_bits ^= sign;
+  if (f_bits >= fp8_max) {
+    result = 0x7f;
+  } else {
+    if (f_bits < (UINT32_C(121) << 23)) {
+      f_bits =
+        c10::detail::fp32_to_bits(c10::detail::fp32_from_bits(f_bits) + c10::detail::fp32_from_bits(denorm_mask));
+      result = static_cast<uint8_t>(f_bits - denorm_mask);
+    } else {
+      uint8_t mant_odd = (f_bits >> 20) & 1;
+      f_bits += ((uint32_t)(7 - 127) << 23) + 0x7FFFF;
+      f_bits += mant_odd;
+      result = static_cast<uint8_t>(f_bits >> 20);
+    }
+  }
+
+  result |= static_cast<uint8_t>(sign >> 24);
+  return result;
 }
+
+static inline __device__ uint8_t float_to_fp8_e5m2(float f) {
+  constexpr uint32_t fp32_inf = UINT32_C(255) << 23;
+  constexpr uint32_t fp8_max = UINT32_C(143) << 23;
+  constexpr uint32_t denorm_mask = UINT32_C(134) << 23;
+  uint32_t f_bits = c10::detail::fp32_to_bits(f);
+  uint8_t result = 0u;
+  const uint32_t sign = f_bits & UINT32_C(0x80000000);
+  f_bits ^= sign;
+  if (f_bits >= fp8_max) {
+    result = f_bits > fp32_inf ? UINT8_C(0x7F) : UINT8_C(0x7C);
+  } else {
+    if (f_bits < (UINT32_C(113) << 23)) {
+      f_bits = c10::detail::fp32_to_bits(c10::detail::fp32_from_bits(f_bits)
+               + c10::detail::fp32_from_bits(denorm_mask));
+      result = static_cast<uint8_t>(f_bits - denorm_mask);
+    } else {
+      uint32_t mant_odd = (f_bits >> 21) & 1;
+      f_bits += ((uint32_t)(15 - 127) << 23) + 0xFFFFF;
+      f_bits += mant_odd;
+      result = static_cast<uint8_t>(f_bits >> 21);
+    }
+  }
+  result |= static_cast<uint8_t>(sign >> 24);
+  return result;
+}
+
+inline __device__ float half_to_float(uint16_t h) {
+  float f;
+  asm volatile("v_cvt_f32_f16 %0, %1;" : "=v"(f) : "v"(h));
+  return f;
+}
+
+template <typename Tout, typename Tin>
+__inline__ __device__ Tout scaled_vec_conversion(const Tin& x,
+                                                 const float scale, Fp8KVCacheDataType kv_type) {
+  return x;
+}
+
+// half -> fp8
+template <>
+__inline__ __device__ uint8_t
+scaled_vec_conversion<uint8_t, uint16_t>(const uint16_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  float res_f = half_to_float(a) / scale;
+  if (kv_type == Fp8KVCacheDataType::kFp8E4M3) {
+    return float_to_fp8_e4m3(res_f);
+  } else {
+    return float_to_fp8_e5m2(res_f);
+  }
+}
+
+template <>
+__inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, __hip_bfloat16>(
+    const __nv_bfloat16& a, float scale, Fp8KVCacheDataType kv_type) {
+      float res_f = (static_cast<float>(a)) / scale;
+      if (kv_type == Fp8KVCacheDataType::kFp8E4M3) {
+        return float_to_fp8_e4m3(res_f);
+      } else {
+        return float_to_fp8_e5m2(res_f);
+      }
+}
+
+template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
+__device__ __forceinline__ Tout scaled_convert(const Tin& val, const float scale) {
+  return scaled_vec_conversion<Tout, Tin>(val, scale, kv_dt);
+}
+
 }
 
 namespace int8 {
@@ -133,6 +221,17 @@ __global__ void reshape_and_cache_kernel_hcu(
       } else {                                                                 \
         TORCH_CHECK(false, "Unsupported fp8 src type");                        \
       }                                                                        \
+    } else if (KV_DTYPE == "fp8_e5m2") {                                       \
+        if (SRC_DTYPE == at::ScalarType::Half) {                               \
+          FN(uint16_t, uint8_t, Fp8KVCacheDataType::kFp8E5M2);                 \
+        } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                    \
+          FN(__hip_bfloat16, uint8_t, Fp8KVCacheDataType::kFp8E5M2);            \
+        } else {                                                               \
+          TORCH_CHECK(false,                                                   \
+                      "Unsupported input type of kv cache: ", SRC_DTYPE);      \
+        }                                                                      \
+    } else {                                                                   \
+        TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);   \
     }
 
 // 6. Host 端函数
