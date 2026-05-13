@@ -41,7 +41,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("free_shared_buffer", &free_shared_buffer);
 
   ops.def("reshape_and_cache", &reshape_and_cache_hcu);
-
+  ops.def("concat_and_cache_mla", &concat_and_cache_mla_hcu);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

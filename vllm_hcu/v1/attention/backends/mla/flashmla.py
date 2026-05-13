@@ -288,7 +288,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             scheduler_metadata.num_splits = num_splits
 
         if self.kv_cache_dtype.startswith("fp8"):
-            if on_gfx938() and self.kv_cache_dtype == "fp8_e4m3":
+            if on_gfx938() and (self.kv_cache_dtype == "fp8_e4m3" or self.kv_cache_dtype == "fp8_ds_mla"):
                 o, lse = flash_mla_with_kvcache_fp8(
                     q=q.to(torch.float8_e4m3fn),
                     k_cache=kv_c_and_k_pe_cache.unsqueeze(-2).view(torch.float8_e4m3fn),  # Add head dim of 1
