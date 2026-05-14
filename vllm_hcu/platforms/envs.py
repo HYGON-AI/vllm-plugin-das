@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
+    VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -166,6 +167,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: maybe_convert_int(
         os.getenv("VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE", None)
     ),
+
+    # Force mamba SSM cache dtype to "auto" when enabled.
+    "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE":
+    lambda: (os.environ.get("VLLM_HCU_MAMBA_SSM_CACHE_DTYPE", "False").lower() in
+             ("true", "1")),
 }
 
 # end-env-vars-definition

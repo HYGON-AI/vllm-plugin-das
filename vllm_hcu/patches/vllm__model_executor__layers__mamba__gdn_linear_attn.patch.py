@@ -101,6 +101,26 @@ except ImportError:
 """,
 ),
 
-
+(
+"""
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+        )
+""",
+"""
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        mamba_ssm_cache_dtype = self.cache_config.mamba_ssm_cache_dtype
+        if henvs.VLLM_HCU_MAMBA_SSM_CACHE_DTYPE and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+            mamba_ssm_cache_dtype = "auto"
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            mamba_ssm_cache_dtype,
+        )
+""",
+),
 
 ]
