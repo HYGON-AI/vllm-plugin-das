@@ -10,6 +10,7 @@ PATCHES = [
         '''                "cpu_awq",
                 "slimquant_marlin",
                 "slimquant_compressed_tensors_marlin",
+                "slimquant_w4a8",
             ]'''
     ),
 ]

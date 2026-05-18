@@ -10,7 +10,8 @@ PATCHES = [
     '''    "cpu_awq",''',
     '''    "cpu_awq",
 "slimquant_marlin",
-"slimquant_compressed_tensors_marlin",''',
+"slimquant_compressed_tensors_marlin",    
+"slimquant_w4a8",''',
 ),
 (
 """
@@ -19,6 +20,7 @@ PATCHES = [
 """        
     from .cpu_wna16 import CPUAWQConfig
     from vllm_hcu.model_executor.layers.quantization.compressed_tensors.compressed_tensors_marlin import (SlimQuantCompressedTensorsMarlinConfig)
+    from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8Config
 """,
 ),
 # 添加方法到配置映射
@@ -26,6 +28,7 @@ PATCHES = [
     '''        "cpu_awq": CPUAWQConfig,''',
     '''        "cpu_awq": CPUAWQConfig,
     "slimquant_marlin": SlimQuantCompressedTensorsMarlinConfig,
-    "slimquant_compressed_tensors_marlin": SlimQuantCompressedTensorsMarlinConfig,''',
+    "slimquant_compressed_tensors_marlin": SlimQuantCompressedTensorsMarlinConfig,
+    "slimquant_w4a8": SlimQuantW4A8Int8Config,''',
 ),
 ]
