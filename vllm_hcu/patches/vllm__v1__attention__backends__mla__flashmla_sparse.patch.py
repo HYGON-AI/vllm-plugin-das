@@ -104,4 +104,26 @@ from vllm_hcu.v1.attention.ops.flashmla import (
                 q = q_padded
 """,
 ),
+
+################ lightly cp###########################
+(
+"""
+    num_actual_tokens: int  # Number of tokens excluding padding.
+""",
+"""        
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    num_kv_actual_tokens: int
+""",
+),
+
+(
+"""
+            num_actual_tokens=cm.num_actual_tokens,
+""",
+"""        
+            num_actual_tokens=cm.num_actual_tokens,
+            num_kv_actual_tokens=cm.num_kv_actual_tokens,
+""",
+),
+################ lightly cp###########################
 ]

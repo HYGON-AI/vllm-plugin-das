@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm.forward_context import get_forward_context
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -25,6 +26,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.distributed import (tensor_model_parallel_all_gather, 
+                              get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
+
 
 from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
@@ -33,7 +38,9 @@ from .deepseek_v2 import (
     get_spec_layer_idx_from_weight_name,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
 
 logger = init_logger(__name__)
 
@@ -145,6 +152,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -159,13 +170,33 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+
+        enable_lightly_cp = get_forward_context().enable_lightly_cp
+        if enable_lightly_cp:
+            previous_hidden_states, positions, _, inputs_embeds = \
+                lightly_cp_inputs_splitting(previous_hidden_states,
+                                            positions,
+                                            None,
+                                            inputs_embeds,
+                                            self.tp_size,
+                                            self.tp_rank)
+    
+        hidden_states = self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
         )
+
+        if enable_lightly_cp:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states.contiguous(), dim=0)
+            gather_indexes_tensor = get_forward_context().gather_indexes_tensor
+            if gather_indexes_tensor is not None:
+                hidden_states = torch.index_select(hidden_states, 0, gather_indexes_tensor)
+
+        return hidden_states
+
 
     def compute_logits(
         self,

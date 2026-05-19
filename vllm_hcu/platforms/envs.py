@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     VLLM_HCU_ALL2ALL_BACKEND: str | None = None
     VLLM_HCU_USE_KVCACHE_E5M2 : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
+    VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
+    VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
+
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -120,6 +123,15 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_DP_CONNECTOR":
     lambda: (os.environ.get("VLLM_HCU_USE_DP_CONNECTOR", "False").lower() in
              ("true", "1")),
+
+    # MLA_CP enable threshold
+    "VLLM_HCU_LIGHTLY_CP_THRESHOLD":
+        lambda: int(os.getenv("VLLM_HCU_LIGHTLY_CP_THRESHOLD", "2048")),
+
+    # If use lightop top_k_per_row_prefill impl, please set True
+    "VLLM_HCU_USE_LIGHTOP_TOPK":
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_TOPK", "True").lower() in
+                    ("true", "1")),
 }
 
 # end-env-vars-definition

@@ -204,6 +204,7 @@ from vllm.v1.worker.utils import (
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
+from vllm_hcu.v1.attention.lightly_cp_utils import pad_for_mla_cp, prepare_cp_metadata
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -432,10 +433,18 @@ class GPUModelRunner(
 
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
+        self.tp_size = self.parallel_config.tensor_parallel_size
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
-        self.max_num_reqs = scheduler_config.max_num_seqs
+        self.enable_lightly_cp = self.parallel_config.enable_lightly_cp
+        self.enable_lightly_cplb = self.enable_lightly_cp and self.parallel_config.enable_lightly_cplb
+        self.max_num_reqs = (
+            scheduler_config.max_num_seqs
+            if not self.enable_lightly_cplb
+            else scheduler_config.max_num_seqs * 2
+        )
+        self.lightly_cp_threshold = henvs.VLLM_HCU_LIGHTLY_CP_THRESHOLD
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -1900,13 +1909,18 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-    ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+    ) -> tuple[
+        PerLayerAttnMetadata,
+        CommonAttentionMetadata | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        ]:
         """
-        :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+        :return: tuple[attn_metadata, spec_decode_common_attn_metadata, scatter_indexes_tensor, gather_indexes_tensor]
         """
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
-            return {}, None
+            return {}, None, None, None
 
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
@@ -1956,42 +1970,69 @@ class GPUModelRunner(
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
+        scatter_indexes_tensor = None
+        gather_indexes_tensor = None
 
         if self.routed_experts_initialized:
             attn_gid = self.routed_experts_attn_gid
             slot_mapping_attn = slot_mappings[attn_gid]
             self.slot_mapping = slot_mapping_attn[:num_tokens].cpu().numpy()
-        cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens.gpu[:num_reqs_padded],
-            _seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
-            _num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[
-                :num_reqs_padded
-            ],
-            num_reqs=num_reqs_padded,
-            num_actual_tokens=num_tokens_padded,
-            max_query_len=max_query_len,
-            max_seq_len=max_seq_len,
-            block_table_tensor=block_table_gid_0,
-            slot_mapping=slot_mapping_gid_0,
-            causal=True,
-        )
 
-        if self.dcp_world_size > 1:
-            self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
-                self.seq_lens.cpu[:num_reqs],
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.parallel_config.cp_kv_cache_interleave_size,
+        enable_lightly_cp = self.enable_lightly_cp and num_tokens > self.lightly_cp_threshold
+        if not enable_lightly_cp:
+            cm_base = CommonAttentionMetadata(
+                query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+                query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
+                seq_lens=self.seq_lens.gpu[:num_reqs_padded],
+                _seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
+                _num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[
+                    :num_reqs_padded
+                ],
+                num_reqs=num_reqs_padded,
+                num_actual_tokens=num_tokens_padded,
+                num_kv_actual_tokens=num_tokens_padded,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                block_table_tensor=block_table_gid_0,
+                slot_mapping=slot_mapping_gid_0,
+                causal=True,
             )
-            self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
-            self.dcp_local_seq_lens.copy_to_gpu(num_reqs_padded)
 
-            cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
-            cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
-                :num_reqs_padded
-            ]
+            if self.dcp_world_size > 1:
+                self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
+                    self.seq_lens.cpu[:num_reqs],
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.parallel_config.cp_kv_cache_interleave_size,
+                )
+                self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
+                self.dcp_local_seq_lens.copy_to_gpu(num_reqs_padded)
+
+                cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
+                cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
+                    :num_reqs_padded
+                ]
+        else:
+            cm_base = prepare_cp_metadata(
+                num_reqs_padded,
+                max_query_len,
+                max_seq_len,
+                num_tokens,
+                block_table_gid_0,
+                slot_mapping_gid_0,
+                self.query_start_loc.gpu[: num_reqs_padded + 1],
+                self.query_start_loc.cpu[: num_reqs_padded + 1],
+                self.seq_lens.gpu[:num_reqs_padded],
+                self.seq_lens.cpu[:num_reqs_padded],
+                self.input_batch.num_computed_tokens_cpu_tensor[
+                    :num_reqs_padded
+                ],
+                self.query_start_loc,
+                self.seq_lens,
+                self.enable_lightly_cplb
+            )
+            scatter_indexes_tensor = cm_base.scatter_indexes_tensor
+            gather_indexes_tensor = cm_base.gather_indexes_tensor        
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -2089,12 +2130,21 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
+                if enable_lightly_cp and cm.seq_indexes_list is not None:
+                    cm.block_table_tensor = cm.block_table_tensor[cm.seq_indexes_list]
+
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
-                        spec_decode_common_attn_metadata = cm
+                        if enable_lightly_cp:
+                            spec_decode_common_attn_metadata = cm.cp_common_metadata
+                        else:
+                            spec_decode_common_attn_metadata = cm
                 else:
-                    spec_decode_common_attn_metadata = cm
+                    if enable_lightly_cp:
+                        spec_decode_common_attn_metadata = cm.cp_common_metadata
+                    else:
+                        spec_decode_common_attn_metadata = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
@@ -2124,8 +2174,10 @@ class GPUModelRunner(
                 for _metadata in attn_metadata.values():
                     _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
-        if spec_decode_common_attn_metadata is not None and (
-            num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
+        if (
+            (not self.enable_lightly_cp)
+            and spec_decode_common_attn_metadata is not None
+            and (num_reqs != num_reqs_padded or num_tokens != num_tokens_padded)
         ):
             # Currently the drafter still only uses piecewise cudagraphs (and modifies
             # the attention metadata in directly), and therefore does not want to use
@@ -2134,7 +2186,12 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
 
-        return attn_metadata, spec_decode_common_attn_metadata
+        return (attn_metadata,
+                spec_decode_common_attn_metadata,
+                scatter_indexes_tensor,
+                gather_indexes_tensor
+                )
+
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -2954,6 +3011,9 @@ class GPUModelRunner(
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
         # enabled collective fusion for SP
+        if self.enable_lightly_cp and num_scheduled_tokens > self.lightly_cp_threshold:
+            return pad_for_mla_cp(num_scheduled_tokens)
+
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if self.compilation_config.pass_config.enable_sp and tp_size > 1:
             return round_up(num_scheduled_tokens, tp_size)
@@ -3665,6 +3725,10 @@ class GPUModelRunner(
             )
 
             num_tokens_padded = batch_desc.num_tokens
+
+            if self.enable_lightly_cp and num_tokens_unpadded > self.lightly_cp_threshold:
+                num_tokens_padded = pad_for_mla_cp(num_tokens_unpadded)
+
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
@@ -3722,7 +3786,11 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = (
+            (attn_metadata, 
+             spec_decode_common_attn_metadata,
+             scatter_indexes_tensor,
+             gather_indexes_tensor,
+            ) = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -3780,6 +3848,10 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                scatter_indexes_tensor=scatter_indexes_tensor,
+                gather_indexes_tensor=gather_indexes_tensor,
+                enable_lightly_cp=self.enable_lightly_cp and num_tokens_unpadded > self.lightly_cp_threshold,
+                enable_lightly_cplb=self.enable_lightly_cplb
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4429,7 +4501,17 @@ class GPUModelRunner(
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
                     )
-                    total_num_tokens = common_attn_metadata.num_actual_tokens
+                    
+                    if (
+                        self.enable_lightly_cp
+                        and common_attn_metadata.cp_common_metadata is not None
+                    ):
+                        total_num_tokens = (
+                            common_attn_metadata.cp_common_metadata.num_actual_tokens
+                        )
+                    else:
+                        total_num_tokens = common_attn_metadata.num_actual_tokens
+
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
                     target_positions = self._get_positions(total_num_tokens)
@@ -5130,7 +5212,7 @@ class GPUModelRunner(
                 self.query_start_loc.copy_to_gpu()
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                attn_metadata, _ = self._build_attention_metadata(
+                attn_metadata, _, _, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs_padded,

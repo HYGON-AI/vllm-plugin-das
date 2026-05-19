@@ -20,6 +20,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -37,6 +38,122 @@ from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
 from lightop import op, gemmopt
 
 logger = init_logger(__name__)
+
+
+_GLOBAL_LOGITS_BUFFERS = {}
+
+# mqa_logits分块全局缓存大小，避免大输入打开pc时OOM
+MAX_ELEMENTS = 16384 * 16384
+
+
+def get_logits_buffer(device):
+    global _GLOBAL_LOGITS_BUFFERS
+
+    if device not in _GLOBAL_LOGITS_BUFFERS or _GLOBAL_LOGITS_BUFFERS[device].numel() < MAX_ELEMENTS:
+        _GLOBAL_LOGITS_BUFFERS[device] = torch.empty(
+            MAX_ELEMENTS,
+            dtype=torch.float32,
+            device=device
+        )
+    return _GLOBAL_LOGITS_BUFFERS[device]
+
+
+def mqa_logits_inner_chunked(
+        chunk: DeepseekV32IndexerPrefillMetadata,
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_scale: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
+        topk_tokens: int):
+    """
+    Chunked Impl of mqa_logits for avoiding oom When prefix cache is heavily hit.
+    """
+    q_all = q_fp8[chunk.token_start:chunk.token_end]
+    weights_all = weights[chunk.token_start:chunk.token_end]
+    ks_all = chunk.cu_seqlen_ks
+    ke_all = chunk.cu_seqlen_ke
+    
+    num_q = q_all.shape[0]
+    num_k = k_fp8.shape[0]
+
+    is_q_fp16_bf16 = q_all.dtype in (torch.float16, torch.bfloat16)
+    align_size = 128 if is_q_fp16_bf16 else 1
+    
+    kv_seq_len_aligned = (num_k + align_size - 1) // align_size * align_size
+
+    logits_buffer = get_logits_buffer(q_fp8.device)
+    current_capacity = logits_buffer.numel()
+    max_q_chunk_num = current_capacity // max(1, kv_seq_len_aligned)
+    if align_size > 1:
+        max_q_chunk_num = (max_q_chunk_num // align_size) * align_size
+    max_q_chunk_num = max(1, max_q_chunk_num)
+
+    slices = []
+
+    for start_idx in range(0, num_q, max_q_chunk_num):
+        end_idx = min(start_idx + max_q_chunk_num, num_q)
+        slices.append((start_idx, end_idx))
+
+    for q_start, q_end in slices:
+        if q_end <= q_start:
+            continue
+            
+        q_slice = q_all[q_start:q_end]
+        weights_slice = weights_all[q_start:q_end]
+
+        ks_slice = ks_all[q_start:q_end]
+        ke_slice = ke_all[q_start:q_end]
+
+        q_len = q_end - q_start
+        q_seq_len_aligned = (q_len + align_size - 1) // align_size * align_size
+
+        required_size = q_seq_len_aligned * kv_seq_len_aligned
+        logits_slice_view = logits_buffer[:required_size].view(q_seq_len_aligned, kv_seq_len_aligned)
+
+        if not on_gfx938():
+            weights_slice = weights_slice.to(torch.float32)
+
+        chunk_k_scale = k_scale.view(torch.float32).flatten() if on_gfx938() else None
+
+        op.mqa_logits(
+            q_slice,  
+            k_fp8, 
+            weights_slice, 
+            ks_slice, 
+            ke_slice,
+            q_slice.shape[0], # logical lengths
+            k_fp8.shape[0],
+            q_slice.shape[1],
+            q_slice.shape[2],
+            chunk_k_scale,
+            True,
+            logits_slice_view # padded properly out of box for hardware requirements
+        )
+
+        # Extract the exact logical valid window for downstream topk
+        logits_slice = logits_slice_view[:q_len, :num_k]
+
+        num_rows_slice = logits_slice.shape[0]
+                
+        topk_indices_slice = topk_indices_buffer[
+            chunk.token_start + q_start : chunk.token_start + q_end, :topk_tokens
+        ]
+        
+        top_k_per_row_prefill_impl = op.top_k_per_row_prefill if \
+            henvs.VLLM_HCU_USE_LIGHTOP_TOPK and \
+            henvs.VLLM_HCU_USE_CUSTOM_OPS \
+            else torch.ops._C.top_k_per_row_prefill
+        
+        top_k_per_row_prefill_impl(
+            logits_slice,
+            ks_slice,
+            ke_slice,
+            topk_indices_slice,
+            num_rows_slice,
+            logits_slice.stride(0), # Automatically fetches kv_seq_len_aligned stride
+            logits_slice.stride(1),
+            topk_tokens,)
 
 
 def sparse_attn_indexer(
@@ -82,7 +199,7 @@ def sparse_attn_indexer(
         )
     attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata, DeepseekV32IndexerMetadata)
-    slot_mapping = attn_metadata.slot_mapping
+    slot_mapping = attn_metadata.slot_mapping[:attn_metadata.num_kv_actual_tokens]
     has_decode = attn_metadata.num_decodes > 0
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
@@ -135,91 +252,25 @@ def sparse_attn_indexer(
                     k_fp8,
                     chunk.block_table,
                     chunk.cu_seq_lens,
-                ) 
+                )
+
             if is_deep_gemm_supported():
-                if not current_platform.is_rocm():
-                    logits = fp8_mqa_logits(
-                        q_fp8[chunk.token_start : chunk.token_end],
-                        (k_fp8, k_scale.view(torch.float32).flatten()),
-                        weights[chunk.token_start : chunk.token_end],
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
-                        clean_logits=False,
-                    )
-                elif on_gfx938():
-                    logits = op.mqa_logits(
-                        q_fp8[chunk.token_start:chunk.token_end],  
-                        k_fp8, 
-                        weights[chunk.token_start:chunk.token_end], 
-                        chunk.cu_seqlen_ks, 
-                        chunk.cu_seqlen_ke,
-                        q_fp8[chunk.token_start:chunk.token_end].shape[0],
-                        k_fp8.shape[0],
-                        q_fp8.shape[1],
-                        q_fp8.shape[2],
-                        k_scale.view(torch.float32).flatten(),
-                        True,
-                    )
-                else: 
-                    logits = op.mqa_logits(
-                        q_fp8[chunk.token_start:chunk.token_end],  
-                        k_fp8, 
-                        weights[chunk.token_start:chunk.token_end].to(torch.float32), 
-                        chunk.cu_seqlen_ks, 
-                        chunk.cu_seqlen_ke,
-                        q_fp8[chunk.token_start:chunk.token_end].shape[0],
-                        k_fp8.shape[0],
-                        q_fp8.shape[1],
-                        q_fp8.shape[2],
-                        None,
-                        True,
-                    )
-            else:
-                logits = fp8_mqa_logits_torch(
+                logits = fp8_mqa_logits(
                     q_fp8[chunk.token_start : chunk.token_end],
                     (k_fp8, k_scale.view(torch.float32).flatten()),
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                )
-                
-            num_rows = logits.shape[0]
-
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
-
-            if current_platform.is_xpu():
-                ops.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
+                    clean_logits=False,
                 )
             else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
-
-            # Compute lengths from row spans
-            # lengths = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
-            # torch.ops._C.large_context_topk(
-            #    logits,
-            #    topk_indices,
-            #    lengths,
-            #    chunk.cu_seqlen_ks,  # row_starts
-            # )
+                mqa_logits_inner_chunked(chunk,
+                                        q_fp8,
+                                        k_fp8,
+                                        weights,
+                                        k_scale,
+                                        topk_indices_buffer,
+                                        topk_tokens)
 
     if has_decode:
         decode_metadata = attn_metadata.decode
@@ -245,36 +296,27 @@ def sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
         if is_deep_gemm_supported():
-            if not current_platform.is_rocm():
-                logits = fp8_paged_mqa_logits(
-                    padded_q_fp8_decode_tokens,
-                    kv_cache,
-                    weights[:num_padded_tokens],
-                    decode_metadata.seq_lens,
-                    decode_metadata.block_table,
-                    decode_metadata.schedule_metadata,
-                    max_model_len=max_model_len,
-                    clean_logits=False,
-                )
-            else:
-                logits = gemmopt.paged_mqa_logits(
-                    padded_q_fp8_decode_tokens, 
-                    kv_cache, 
-                    weights[:num_padded_tokens] if on_gfx938() else weights[:num_padded_tokens].to(torch.float32), 
-                    decode_metadata.seq_lens, 
-                    decode_metadata.block_table, 
-                    decode_metadata.schedule_metadata, 
-                    max_model_len,
-                )
-        else:
-            logits = fp8_paged_mqa_logits_torch(
+            logits = fp8_paged_mqa_logits(
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights[:num_padded_tokens],
                 decode_metadata.seq_lens,
                 decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
+                clean_logits=False,
             )
+        else:
+            logits = gemmopt.paged_mqa_logits(
+                padded_q_fp8_decode_tokens, 
+                kv_cache, 
+                weights[:num_padded_tokens] if on_gfx938() else weights[:num_padded_tokens].to(torch.float32), 
+                decode_metadata.seq_lens, 
+                decode_metadata.block_table, 
+                decode_metadata.schedule_metadata, 
+                max_model_len,
+            )
+
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -297,28 +339,20 @@ def sparse_attn_indexer(
                 None,
             )
         else:
-            if current_platform.is_xpu():
-                ops.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    decode_metadata.seq_lens,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
-            else:
-                torch.ops._C.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    decode_metadata.seq_lens,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+            top_k_per_row_decode_impl = op.top_k_per_row_decode \
+                if henvs.VLLM_HCU_USE_LIGHTOP_TOPK \
+                and henvs.VLLM_HCU_USE_CUSTOM_OPS \
+                else torch.ops._C.top_k_per_row_decode
+            top_k_per_row_decode_impl(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

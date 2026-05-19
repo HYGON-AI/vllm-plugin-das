@@ -48,4 +48,26 @@ from lightop import gemmopt
                 )
 """,
 ),
+
+################ lightly cp###########################
+(
+"""
+    num_actual_tokens: int  # Number of tokens excluding padding.
+""",
+"""        
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    num_kv_actual_tokens: int
+""",
+),
+
+(
+"""
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+""",
+"""        
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            num_kv_actual_tokens=common_attn_metadata.num_kv_actual_tokens,
+""",
+),
+################ lightly cp###########################
 ]

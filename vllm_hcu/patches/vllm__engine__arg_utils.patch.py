@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Patch for vllm.engine.arg_utils
+"""
+
+PATCHES = [
+(
+'''
+    fail_on_environ_validation: bool = False
+''',
+'''
+    fail_on_environ_validation: bool = False
+    
+    enable_lightly_cp: bool = ParallelConfig.enable_lightly_cp
+    enable_lightly_cplb: bool = ParallelConfig.enable_lightly_cplb
+'''
+),
+
+(
+'''
+            _api_process_rank=self._api_process_rank,
+''',
+'''
+            _api_process_rank=self._api_process_rank,
+            enable_lightly_cp=self.enable_lightly_cp,
+            enable_lightly_cplb=self.enable_lightly_cplb,
+'''
+),
+
+(
+'''
+        parallel_group.add_argument(
+            "--data-parallel-backend",
+            "-dpb",
+            type=str,
+            default="mp",
+            help='Backend for data parallel, either "mp" or "ray".',
+        )
+''',
+'''
+        parallel_group.add_argument(
+            "--data-parallel-backend",
+            "-dpb",
+            type=str,
+            default="mp",
+            help='Backend for data parallel, either "mp" or "ray".',
+        )
+
+        parallel_group.add_argument(
+            "--enable-lightly-cp",
+            action="store_true",
+        )
+        parallel_group.add_argument(
+            "--enable-lightly-cplb",
+            action="store_true",
+        )
+'''
+),
+]

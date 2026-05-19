@@ -25,4 +25,80 @@ from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig""",
         and henvs.VLLM_HCU_ALL2ALL_BACKEND != "deepep_low_latency"
     ):""",
     ),
+
+################ lightly cp###########################
+(
+'''
+    additional_kwargs: dict[str, Any] = field(default_factory=dict)
+''',
+'''
+    additional_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    scatter_indexes_tensor: torch.Tensor | None = None
+    gather_indexes_tensor: torch.Tensor | None = None
+    enable_lightly_cp: bool = False
+    enable_lightly_cplb : bool = False
+'''
+),
+
+(
+'''
+    additional_kwargs: dict[str, Any] | None = None,
+    skip_compiled: bool = False,
+''',
+'''
+    additional_kwargs: dict[str, Any] | None = None,
+    skip_compiled: bool = False,
+    scatter_indexes_tensor: torch.Tensor | None = None,
+    gather_indexes_tensor: torch.Tensor | None = None,
+    enable_lightly_cp: bool = False,
+    enable_lightly_cplb: bool = False
+'''
+),
+
+(
+'''
+        ubatch_slices=ubatch_slices,
+        skip_compiled=skip_compiled,
+''',
+'''
+        ubatch_slices=ubatch_slices,
+        skip_compiled=skip_compiled,
+        scatter_indexes_tensor=scatter_indexes_tensor,
+        gather_indexes_tensor=gather_indexes_tensor,
+        enable_lightly_cp=enable_lightly_cp,
+        enable_lightly_cplb=enable_lightly_cplb,
+'''
+),
+
+(
+'''
+    slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+    skip_compiled: bool = False,
+''',
+'''
+    slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+    skip_compiled: bool = False,
+    scatter_indexes_tensor: torch.Tensor | None = None,
+    gather_indexes_tensor: torch.Tensor | None = None,
+    enable_lightly_cp: bool = False,
+    enable_lightly_cplb: bool = False,
+'''
+),
+
+(
+'''
+        additional_kwargs,
+        skip_compiled,
+''',
+'''
+        additional_kwargs,
+        skip_compiled,
+        scatter_indexes_tensor,
+        gather_indexes_tensor,
+        enable_lightly_cp,
+        enable_lightly_cplb
+'''
+),
+################ lightly cp###########################
 ]

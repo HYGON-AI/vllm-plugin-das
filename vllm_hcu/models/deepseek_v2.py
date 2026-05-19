@@ -42,7 +42,10 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_reduce_scatter,
+    tensor_model_parallel_all_reduce
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -100,8 +103,11 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
+
 
 logger = init_logger(__name__)
 
@@ -194,7 +200,7 @@ class DeepseekV2MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
-        reduce_results: bool = True,
+        reduce_results=False,
         is_sequence_parallel=False,
         prefix: str = "",
     ) -> None:
@@ -220,6 +226,63 @@ class DeepseekV2MLP(nn.Module):
             reduce_results=reduce_results,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
+        )
+        self.tp_size = get_tensor_model_parallel_world_size()
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        enable_lightly_cp = get_forward_context().enable_lightly_cp
+        if enable_lightly_cp: 
+            x = tensor_model_parallel_all_gather(x.contiguous(), 0)
+        
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+
+        if enable_lightly_cp:
+            x = tensor_model_parallel_reduce_scatter(x.contiguous(), dim=0)
+            return x
+        elif self.tp_size > 1:
+            x = tensor_model_parallel_all_reduce(x)
+        return x
+
+class DeepseekV2SharedMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        reduce_results: bool = True,
+        is_sequence_parallel=False,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        # If is_sequence_parallel, the input and output tensors are sharded
+        # across the ranks within the tp_group. In this case the weights are
+        # replicated and no collective ops are needed.
+        # Otherwise we use standard TP with an allreduce at the end.
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            disable_tp=is_sequence_parallel,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            disable_tp=is_sequence_parallel,
+            prefix=f"{prefix}.down_proj"
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -297,7 +360,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
-            self.shared_experts = DeepseekV2MLP(
+            self.shared_experts = DeepseekV2SharedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
@@ -348,6 +411,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+
+        enable_lightly_cp = get_forward_context().enable_lightly_cp
+        if enable_lightly_cp:
+            hidden_states = tensor_model_parallel_all_gather(
+                hidden_states.contiguous(), 0
+            )
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -387,7 +457,12 @@ class DeepseekV2MoE(nn.Module):
             assert shared_output is not None
             final_hidden_states += shared_output
 
-        if self.is_sequence_parallel:
+        if enable_lightly_cp:
+            final_hidden_states = tensor_model_parallel_reduce_scatter(
+                final_hidden_states.contiguous(), 0
+            )
+            return final_hidden_states
+        elif self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
@@ -714,6 +789,16 @@ class Indexer(nn.Module):
         # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
         k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
+        enable_lightly_cp = get_forward_context().enable_lightly_cp
+        if enable_lightly_cp:
+            k = tensor_model_parallel_all_gather(
+                k.contiguous(), 0
+            )
+            gather_indexes_tensor = get_forward_context().gather_indexes_tensor
+            enable_lightly_cplb = get_forward_context().enable_lightly_cplb
+            if enable_lightly_cplb and gather_indexes_tensor is not None:
+                k = torch.index_select(k, 0, gather_indexes_tensor)   
+
         # we only quant q here since k quant is fused with cache insertion
         if not current_platform.is_rocm() or on_gfx938():
             q = q.view(-1, self.head_dim)
@@ -863,7 +948,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        self.num_local_heads = num_heads // tp_size if not \
+            vllm_config.parallel_config.enable_lightly_cp else self.num_heads
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -896,6 +982,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                disable_tp=vllm_config.parallel_config.enable_lightly_cp
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -904,6 +991,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
+                disable_tp=vllm_config.parallel_config.enable_lightly_cp,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -912,6 +1000,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            disable_tp=vllm_config.parallel_config.enable_lightly_cp,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -919,6 +1008,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=vllm_config.parallel_config.enable_lightly_cp,
         )
 
         if config.rope_parameters["rope_type"] != "default":
@@ -1197,6 +1287,9 @@ class DeepseekV2Model(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1222,6 +1315,16 @@ class DeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        # lightly cp
+        enable_lightly_cp = get_forward_context().enable_lightly_cp
+        if enable_lightly_cp:
+            hidden_states, positions, residual, _ = lightly_cp_inputs_splitting(hidden_states,
+                                                                                positions,
+                                                                                residual,
+                                                                                None,
+                                                                                self.tp_size,
+                                                                                self.tp_rank)
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
@@ -1249,11 +1352,23 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
+            if enable_lightly_cp:
+                hidden_states = tensor_model_parallel_all_gather(hidden_states.contiguous(), dim=0)
+                residual = tensor_model_parallel_all_gather(residual.contiguous(), dim=0)
+
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # lightly cp
+        if enable_lightly_cp:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states.contiguous(), dim=0)
+            gather_indexes_tensor = get_forward_context().gather_indexes_tensor
+            if gather_indexes_tensor is not None:
+                hidden_states = torch.index_select(hidden_states, 0, gather_indexes_tensor)
+
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

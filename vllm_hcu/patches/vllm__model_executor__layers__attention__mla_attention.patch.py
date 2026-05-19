@@ -105,4 +105,27 @@ PATCHES = [
 #                 maybe_padded_v = maybe_padded_v[..., :-32].reshape(v.shape[0], v.shape[1],v.shape[2])
 # """,
 # ),
+
+################ lightly cp###########################
+(
+"""
+        num_actual_toks = attn_metadata.num_actual_tokens
+""",
+"""        
+        num_actual_toks = attn_metadata.num_actual_tokens
+        num_kv_actual_toks = attn_metadata.num_kv_actual_tokens
+""",
+),
+
+(
+"""
+        k_c_normed = k_c_normed[:num_actual_toks, ...]
+        k_pe = k_pe[:num_actual_toks, ...]
+""",
+"""        
+        k_c_normed = k_c_normed[:num_kv_actual_toks, ...]
+        k_pe = k_pe[:num_kv_actual_toks, ...]
+""",
+),
+################ lightly cp###########################
 ]
