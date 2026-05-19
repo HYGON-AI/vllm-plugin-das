@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
+    # EP / MoE all2all backend (same env name as upstream vLLM when registered there).
+    VLLM_HCU_ALL2ALL_BACKEND: str | None = None
     VLLM_HCU_USE_KVCACHE_E5M2 : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
 
@@ -41,6 +43,9 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
+
+    # Expert-parallel all2all backend. Unset -> None (use ParallelConfig / CLI in caller).
+    "VLLM_HCU_ALL2ALL_BACKEND": lambda: os.environ.get("VLLM_HCU_ALL2ALL_BACKEND"),
 
     # If set, vLLM will transpose weight to use nn layout
     "VLLM_USE_NN":
@@ -111,7 +116,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_KVCACHE_E5M2":
     lambda: (os.environ.get("VLLM_HCU_USE_KVCACHE_E5M2", "False").lower() in
              ("true", "1")),
-    #vllm use dp connector
+    # vllm use dp connector
     "VLLM_HCU_USE_DP_CONNECTOR":
     lambda: (os.environ.get("VLLM_HCU_USE_DP_CONNECTOR", "False").lower() in
              ("true", "1")),
