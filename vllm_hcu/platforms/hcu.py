@@ -518,10 +518,23 @@ class HCUPlatform(Platform):
                     "[HCU CUSTOM_FLASH_ATTN/FLASHMLA]: Setting kv cache block size to 64."
                 )
             elif henvs.VLLM_HCU_USE_FLASH_ATTN:
-                cache_config.block_size = 128
-                logger.warning(
-                    "[HCU FLASH_ATTN]: Setting kv cache block size to 128."
-                )
+                if henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+                    block_size = henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE
+                    if block_size <= 0 or block_size % 16 != 0:
+                        raise ValueError(
+                            f"VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE must be "
+                            f"a positive multiple of 16, got {block_size}."
+                        )
+                    cache_config.block_size = block_size
+                    logger.warning(
+                        "[HCU FLASH_ATTN]: Setting kv cache block size to %d (VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE).",
+                        cache_config.block_size,
+                    )
+                else:
+                    cache_config.block_size = 128
+                    logger.warning(
+                        "[HCU FLASH_ATTN]: Setting kv cache block size to 128."
+                    )
             else:
                 cache_config.block_size = 16
 

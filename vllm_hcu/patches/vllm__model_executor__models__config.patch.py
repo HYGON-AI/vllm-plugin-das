@@ -22,6 +22,14 @@ import vllm_hcu.platforms.envs as henvs
 """
             if henvs.VLLM_HCU_USE_FLASH_ATTN:
                 kernel_block_alignment_size = 128
+                if henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+                    value = henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE
+                    if value <= 0 or value % 16 != 0:
+                        raise ValueError(
+                            f"VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE must be "
+                            f"a positive multiple of 16, got {value}."
+                        )
+                    kernel_block_alignment_size = value
             elif henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
                 kernel_block_alignment_size = 64
             else:

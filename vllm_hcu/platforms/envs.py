@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
+    VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -159,6 +160,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE":
         lambda: (os.environ.get("VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE", "True").lower() in
                  ("true", "1")),
+
+    # Optional override for flash-attn kernel block alignment size.
+    "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE":
+    lambda: maybe_convert_int(
+        os.getenv("VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE", None)
+    ),
 }
 
 # end-env-vars-definition
