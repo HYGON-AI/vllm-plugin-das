@@ -35,10 +35,10 @@ from vllm.utils.math_utils import cdiv, round_up
 
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.model_executor.layers.activation import SiluAndMul
-from lightop import fuse_silu_mul_quant_ep
+from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_fp8_quant_ep
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 if has_deep_gemm():
-    from deepgemm import m_grouped_w8a8_gemm_nt_masked
+    from deepgemm import m_grouped_w8a8_gemm_nt_masked, m_grouped_fp8_gemm_nt_masked
 else:
     from lightop import m_grouped_w8a8_gemm_nt_masked
 
@@ -598,8 +598,8 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
-        if quant_config.use_fp8_w8a8:
-            assert self.block_shape == get_mk_alignment_for_contiguous_layout()
+        # if quant_config.use_fp8_w8a8:
+        #     assert self.block_shape == get_mk_alignment_for_contiguous_layout()
 
         self.N = N
         self.K = K
@@ -747,7 +747,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         #expected_m = self.get_expected_m()
 
         if self.quant_config.use_fp8_w8a16 or self.quant_config.use_fp8_w8a8:
-            fp8_m_grouped_gemm_nt_masked(
+            m_grouped_fp8_gemm_nt_masked(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
                 workspace1,
@@ -755,14 +755,13 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expected_m,
             )
 
-            quant_scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
-            a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
-                workspace1,
-                expert_num_tokens,
-                quant_scale_fmt=quant_scale_fmt,
+            a2q, a2q_scale = fuse_silu_mul_fp8_quant_ep(
+                input=workspace1,
+                fp8type=0,
+                tokens_per_expert=expert_num_tokens,
             )
 
-            fp8_m_grouped_gemm_nt_masked(
+            m_grouped_fp8_gemm_nt_masked(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),
                 output,

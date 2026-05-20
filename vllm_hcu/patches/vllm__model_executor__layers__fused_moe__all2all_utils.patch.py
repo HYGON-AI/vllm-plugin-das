@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vllm.model_executor.layers.fused_moe.all2all_utils: EP INT8
+vllm.model_executor.layers.fused_moe.all2all_utils: EP INT8 + FP8 dispatch
 """
 
 PATCHES = [
-(
-"""
+    (
+        """
         use_fp8_dispatch = (
             quant_config.quant_dtype == current_platform.fp8_dtype()
             and quant_config.block_shape == DEEPEP_QUANT_BLOCK_SHAPE
@@ -22,11 +22,8 @@ PATCHES = [
             local_expert_global_ids=local_expert_global_ids,
         )
 """,
-"""
-        use_fp8_dispatch = (
-            quant_config.quant_dtype == current_platform.fp8_dtype()
-            and quant_config.block_shape == DEEPEP_QUANT_BLOCK_SHAPE
-        )
+        """
+        use_fp8_dispatch = quant_config.quant_dtype == current_platform.fp8_dtype()
 
         use_int8_dispatch = quant_config.quant_dtype == torch.int8
 
@@ -41,5 +38,5 @@ PATCHES = [
             use_int8_dispatch=use_int8_dispatch,
         )
 """,
-),
+    ),
 ]

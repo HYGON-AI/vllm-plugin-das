@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vllm.model_executor.layers.fused_moe.config: EP INT8
-
+vllm.model_executor.layers.fused_moe.config: EP INT8 + FP8
 """
 
 PATCHES = [
@@ -11,7 +10,7 @@ PATCHES = [
     if block_shape is not None:
 """,
 """
-    if block_shape is not None and quant_dtype!=torch.int8:
+    if block_shape is not None and quant_dtype!=torch.int8 and quant_dtype!=current_platform.fp8_dtype():
 """,
 ),
 (
@@ -21,7 +20,7 @@ PATCHES = [
 """,
 """
         w_shape = GroupShape(row=block_shape[0], col=block_shape[1])
-    elif block_shape is not None and quant_dtype == torch.int8:
+    elif block_shape is not None and (quant_dtype == torch.int8 or quant_dtype == current_platform.fp8_dtype()):
         a_shape = GroupShape(row=block_shape[0], col=block_shape[1])
         w_shape = GroupShape(row=block_shape[0], col=block_shape[1])
     else:
@@ -59,7 +58,7 @@ PATCHES = [
         assert quant_config.block_shape == block_shape
 """,
 """
-        if quant_dtype != torch.int8:
+        if quant_dtype != torch.int8 and quant_dtype != current_platform.fp8_dtype():
             assert quant_config.per_act_token_quant == per_act_token_quant
             assert quant_config.per_out_ch_quant == per_out_ch_quant
             assert quant_config.block_shape == block_shape

@@ -4,6 +4,7 @@
 vllm.model_executor.layers.fused_moe.deepep_ll_prepare_finalize:
 - DeepEP LL int8 dispatch + expert_num_tokens in _do_quant
 - low_latency_dispatch: use quant_type / fp8_round_scale (HCU DeepEP API, v0.15 style)
+- FP8: current_platform import + recognize DeepEP-prequantized fp8 tuples in _do_quant
 """
 
 PATCHES = [
@@ -141,6 +142,24 @@ import deep_ep
             async_finish=False,
             return_recv_hook=True,
         )
+""",
+),
+    # FP8 (apply after INT8 patches above on clean vllm018)
+(
+"""
+logger = init_logger(__name__)
+""",
+"""
+from vllm.platforms import current_platform
+logger = init_logger(__name__)
+""",
+),
+(
+"""
+            if block_k == DEEPEP_QUANT_BLOCK_SIZE:
+""",
+"""
+            if block_k == DEEPEP_QUANT_BLOCK_SIZE or (isinstance(x, tuple) and x[0].dtype == current_platform.fp8_dtype()):
 """,
 ),
 ]
