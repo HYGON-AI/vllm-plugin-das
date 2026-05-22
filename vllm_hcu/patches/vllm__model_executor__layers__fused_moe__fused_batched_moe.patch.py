@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Patch for vllm.model_executor.layers.fused_moe.fused_moe  support triton fp8 kernel
+Patch for vllm.model_executor.layers.fused_moe.fused_batched_moe  support triton fp8 kernel
 """
 
 PATCHES = [
 (
 """
-logger = init_logger(__name__)
+import torch
 """,
 """
-logger = init_logger(__name__)
+import torch
 
 from vllm_hcu.platforms.hcu import on_gfx938
 """,

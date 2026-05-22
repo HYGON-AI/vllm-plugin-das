@@ -15,6 +15,7 @@ from vllm.utils.math_utils import round_up
 
 from lightop import op
 
+
 def expert_num_tokens_round_up_and_sum(
     expert_num_tokens: torch.Tensor, alignment: int
 ) -> int:
@@ -57,10 +58,12 @@ def round_up_128(x: int) -> int:
     y = 128
     return ((x + y - 1) // y) * y
 
+
 @triton.jit
 def round_up_256(x: int) -> int:
     y = 256
     return ((x + y - 1) // y) * y
+
 
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
@@ -79,7 +82,7 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    #tokens_per_expert = round_up_128(tokens_per_expert)
+    # tokens_per_expert = round_up_128(tokens_per_expert)
     tokens_per_expert = round_up_256(tokens_per_expert)
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
 
@@ -196,9 +199,8 @@ def ep_scatter(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
 ):
-    # BLOCK_E = 128  # token num of per expert is aligned to 128
-    # BLOCK_D = 128  # block size of quantization
     BLOCK_E = 256  # token num of per expert is aligned to 256
+    # BLOCK_D = 128  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
@@ -291,7 +293,6 @@ def _fwd_kernel_ep_gather(
     cur_block_int32 = tl.program_id(0)
     cur_block = cur_block_int32.to(tl.int64)
     start_cur_token_int32 = tl.program_id(1)
-
     grid_num = tl.num_programs(1)
 
     for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):

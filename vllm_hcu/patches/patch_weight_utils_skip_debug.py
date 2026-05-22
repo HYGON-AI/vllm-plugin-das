@@ -16,12 +16,18 @@ def patch_safetensors_weights_iterator() -> None:
 
     original_iterator = weight_utils.safetensors_weights_iterator
     skip_logged = False
+    
+    DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS = 8
+    DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
 
     def wrapped_safetensors_weights_iterator(
         hf_weights_files: list[str],
         use_tqdm_on_load: bool,
         safetensors_load_strategy: str = "lazy",
         local_expert_ids: set[int] | None = None,
+        *,
+        safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+        safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
     ) -> Generator[tuple[str, object], None, None]:
         import vllm_hcu.platforms.envs as henvs
 

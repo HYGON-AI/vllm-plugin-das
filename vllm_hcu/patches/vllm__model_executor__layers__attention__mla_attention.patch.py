@@ -61,51 +61,6 @@ PATCHES = [
 """,
 ),
 
-(
-"""
-            self._pad_v = self.vllm_flash_attn_version is None or not (
-                (
-                    self.vllm_flash_attn_version == 3
-                    and device_capability is not None
-                    and device_capability[0] == 9
-                )
-                or self.vllm_flash_attn_version == 4
-            )
-""",
-"""        
-            if not current_platform.is_rocm():
-                self._pad_v = self.vllm_flash_attn_version is None or not (
-                    (
-                        self.vllm_flash_attn_version == 3
-                        and device_capability is not None
-                        and device_capability[0] == 9
-                    )
-                    or self.vllm_flash_attn_version == 4
-                )
-            else:
-                self._pad_v = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count == 120
-""",
-),
-
-# (
-# """
-#             maybe_padded_v = torch.nn.functional.pad(
-#                 v, [0, q.shape[-1] - v.shape[-1]], value=0
-#             )
-# """,
-# """    
-#             if not current_platform.is_rocm():
-#                 maybe_padded_v = torch.nn.functional.pad(
-#                     v, [0, q.shape[-1] - v.shape[-1]], value=0
-#                 )
-#             else:
-#                 maybe_padded_v = torch.nn.functional.pad(
-#                     v, [0, q.shape[-1] - v.shape[-1] - 32], value=0
-#                 )
-#                 maybe_padded_v = maybe_padded_v[..., :-32].reshape(v.shape[0], v.shape[1],v.shape[2])
-# """,
-# ),
-
 ################ lightly cp###########################
 (
 """

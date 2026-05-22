@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vllm.model_executor.layers.fused_moe.deepep_ht_prepare_finalize: per-act-token + DeepEP prepare paths
+vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht: per-act-token + DeepEP prepare paths
 """
 
 PATCHES = [

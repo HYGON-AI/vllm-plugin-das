@@ -11,6 +11,7 @@ logger = init_logger(__name__)
 """,
 """
 import vllm_hcu.platforms.envs as henvs
+
 logger = init_logger(__name__)
 """,
 ),

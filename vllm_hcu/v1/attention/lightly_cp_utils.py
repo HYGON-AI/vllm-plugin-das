@@ -11,7 +11,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
-    CpCommonAttentionMetadata
+    CpCommonAttentionMetadata,
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.utils.math_utils import round_up

@@ -12,7 +12,9 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -26,15 +28,17 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.distributed import (tensor_model_parallel_all_gather, 
-                              get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
-
+from vllm.distributed import (
+    tensor_model_parallel_all_gather, 
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size
+)
 
 from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
+    _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
 from vllm.model_executor.models.utils import maybe_prefix
@@ -151,10 +155,9 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-
+        
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -170,7 +173,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
-
+        
         enable_lightly_cp = get_forward_context().enable_lightly_cp
         if enable_lightly_cp:
             previous_hidden_states, positions, _, inputs_embeds = \
@@ -180,15 +183,15 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                                             inputs_embeds,
                                             self.tp_size,
                                             self.tp_rank)
-    
-        hidden_states = self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+                
+        hidden_states =  self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
         )
-
+        
         if enable_lightly_cp:
             hidden_states = tensor_model_parallel_all_gather(hidden_states.contiguous(), dim=0)
             gather_indexes_tensor = get_forward_context().gather_indexes_tensor
@@ -196,7 +199,6 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 hidden_states = torch.index_select(hidden_states, 0, gather_indexes_tensor)
 
         return hidden_states
-
 
     def compute_logits(
         self,
@@ -216,6 +218,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self.quant_config = vllm_config.quant_config
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -275,7 +278,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
         ]
 
-        expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
+        indexer_fused_mapping = [
+            ("wk_weights_proj", "wk", 0),
+            ("wk_weights_proj", "weights_proj", 1),
+        ]
+        stacked_params_mapping.extend(indexer_fused_mapping)
+
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -290,6 +300,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -300,6 +311,12 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
             name = self._rewrite_spec_layer_name(spec_layer, name)
+
+            if _try_load_fp8_indexer_wk(
+                name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
+            ):
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:

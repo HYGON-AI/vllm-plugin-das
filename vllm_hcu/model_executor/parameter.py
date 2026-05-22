@@ -9,7 +9,6 @@ import torch
 from torch.nn import Parameter
 import vllm_hcu.platforms.envs as henvs 
 
-
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -157,13 +156,12 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         )
         if henvs.VLLM_USE_NN and not is_quantization:
             loaded_weight = loaded_weight.t()
-            
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        shard_offset = kwargs.get("shard_offset")
-        shard_size = kwargs.get("shard_size")
+        shard_offset: int = kwargs["shard_offset"]
+        shard_size: int = kwargs["shard_size"]
         is_quantization = kwargs.get("is_quantization")
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
@@ -184,18 +182,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         loaded_weight = loaded_weight.narrow(
             self.output_dim, self.tp_rank * shard_size, shard_size
         )
-        
         if henvs.VLLM_USE_NN and not is_quantization:
             loaded_weight = loaded_weight.t()
-
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        shard_offset = kwargs.get("shard_offset")
-        shard_size = kwargs.get("shard_size")
-        shard_id = kwargs.get("shard_id")
-        num_heads = kwargs.get("num_heads")
+        shard_offset: int = kwargs["shard_offset"]
+        shard_size: int = kwargs["shard_size"]
+        shard_id: str = kwargs["shard_id"]
+        num_heads: int = kwargs["num_heads"]
         is_quantization = kwargs.get("is_quantization")
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
@@ -208,13 +204,13 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
 
         param_data = self.data
-        shard_id = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
+        shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
         if not henvs.VLLM_USE_NN or len(param_data.shape)==1 or is_quantization:
             param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         else:
             param_data = param_data.narrow(int(not(self.output_dim)), shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(
-            self.output_dim, shard_id * shard_size, shard_size
+            self.output_dim, shard_id_int * shard_size, shard_size
         )
 
         if henvs.VLLM_USE_NN and not is_quantization:
@@ -634,8 +630,8 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor, marlin_tile_size
 ):
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     if marlin_tile_size is not None:
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,

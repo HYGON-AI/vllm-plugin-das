@@ -18,6 +18,7 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         indices_type: torch.dtype | None,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         condition = self._valid_grouping(router_logits) and self.e_score_correction_bias is not None and henvs.VLLM_HCU_USE_FUSE_MOE_GATE and henvs.VLLM_HCU_USE_CUSTOM_OPS
         enable_shared_experts_fusion = False
@@ -33,4 +34,4 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
             )       
             return topk_weights, topk_ids
         else:
-            return super()._compute_routing(hidden_states, router_logits, indices_type)
+            return super()._compute_routing(hidden_states, router_logits, indices_type, input_ids=input_ids)

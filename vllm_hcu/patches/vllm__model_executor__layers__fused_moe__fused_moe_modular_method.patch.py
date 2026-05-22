@@ -7,21 +7,21 @@ vllm.model_executor.layers.fused_moe.fused_moe_modular_method: N/K for kernel ct
 PATCHES = [
 (
 """
-                moe_parallel_config=moe_layer.moe_parallel_config,
+                inplace=inplace,
 """,
 """
-                moe_parallel_config=moe_layer.moe_parallel_config,
+                inplace=inplace,
                 N=old_quant_method.N if hasattr(old_quant_method, "N") else -1,
                 K=old_quant_method.K if hasattr(old_quant_method, "K") else -1,
 """,
 ),
 (
 """
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 """,
 """
         use_nn_moe: bool | None = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 """,
 ),
 ]

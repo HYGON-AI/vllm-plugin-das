@@ -30,3 +30,11 @@ def flash_attn_supports_mla():
 
 def is_flash_attn_varlen_func_available() -> bool:
     return True
+
+
+def flash_attn_supports_quant_query_input() -> bool:
+    return True
+
+
+def is_fa_version_supported(fa_version: int) -> bool:
+    return False

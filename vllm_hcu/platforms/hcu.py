@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from torch.distributed import PrefixStore, ProcessGroup
 from torch.distributed.distributed_c10d import is_nccl_available
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import cuda_device_count_stateless
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 
@@ -25,10 +24,12 @@ try:
     from amdsmi import (
         AmdSmiException,
         amdsmi_get_gpu_asic_info,
+        amdsmi_get_gpu_device_uuid,
         amdsmi_get_processor_handles,
         amdsmi_init,
         amdsmi_shut_down,
         amdsmi_topo_get_link_type,
+        amdsmi_topo_get_numa_node_number,
     )
 except ImportError as e:
     logger.warning("Failed to import from amdsmi with %r", e)
@@ -37,6 +38,38 @@ try:
     import vllm._C  # noqa: F401
 except ImportError as e:
     logger.warning("Failed to import from vllm._C with %r", e)
+
+
+@lru_cache(maxsize=8)
+def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int:
+    """Get number of ROCm devices, caching based on the value of CUDA_VISIBLE_DEVICES
+    at the time of call.
+
+    This should be used instead of torch.accelerator.device_count() unless
+    CUDA_VISIBLE_DEVICES has already been set to the desired value.
+
+    # This can be removed and simply replaced with torch.cuda.get_device_count
+    # after https://github.com/pytorch/pytorch/pull/122815 is released."""
+    # Note: cuda_visible_devices is not used, but we keep it as an argument for
+    # LRU Cache purposes.
+
+    # Code below is based on
+    # https://github.com/pytorch/pytorch/blob/
+    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
+    # torch/cuda/__init__.py#L831C1-L831C17
+    import torch.cuda
+
+    if not torch.cuda._is_compiled():
+        return 0
+    # ROCm uses amdsmi instead of nvml for stateless device count
+    # This requires a sufficiently modern version of Torch 2.4.0
+    raw_count = (
+        torch.cuda._device_count_amdsmi()
+        if (hasattr(torch.cuda, "_device_count_amdsmi"))
+        else -1
+    )
+    r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
+    return r
 
 
 # AMDSMI utils
@@ -75,8 +108,12 @@ def _get_gcn_arch_name() -> str:
     return GPU_ARCH.split(':')[0]
 
 
+_ON_GFX93X =  any(arch in _get_gcn_arch_name() for arch in ["gfx936", "gfx938"])
 _ON_GFX938 = "gfx938" in _get_gcn_arch_name()
 
+
+def on_gfx93x() -> bool:
+    return _ON_GFX93X
 
 def on_gfx938() -> bool:
     return _ON_GFX938
@@ -147,7 +184,34 @@ class HCUPlatform(Platform):
     dispatch_key: str = "CUDA"
     ray_device_key: str = "GPU"
     dist_backend: str = "nccl"
+    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
+    supported_quantization: list[str] = [
+        "awq",
+        "awq_marlin",  # will be overwritten with awq
+        "gptq",
+        "gptq_marlin",  # will be overwritten with gptq
+        "fp8",
+        "deepseek_v4_fp8",
+        "compressed-tensors",
+        "fbgemm_fp8",
+        "gguf",
+        "quark",
+        # "mxfp4",
+        "mxfp8",
+        "torchao",
+        # "bitsandbytes",
+        "modelopt",
+        # "modelopt_fp4",
+        "modelopt_mxfp8",
+        "modelopt_mixed",
+        "fp8_per_tensor",
+        "fp8_per_block",
+        "online",
+        # "gpt_oss_mxfp4",
+        "slimquant_w4a8",
+    ]
+    
     @classmethod
     def import_kernels(cls) -> None:
         """Import ROCm-specific kernels."""
@@ -171,7 +235,9 @@ class HCUPlatform(Platform):
     ]:
         valid_backends_priorities = []
         invalid_reasons = {}
+        
         register_attention_backends()
+        
         backend_priorities = _get_backend_priorities(
             attn_selector_config.use_mla,
             attn_selector_config.use_sparse,
@@ -257,12 +323,25 @@ class HCUPlatform(Platform):
         )
         selected_index = sorted_indices[0]
         selected_backend = valid_backends_priorities[selected_index][0]
-        logger.info_once(
-            "Using %s attention backend out of potential backends: %s.",
-            selected_backend.name,
-            "[" + ", ".join(f"'{b[0].name}'" for b in valid_backends_priorities) + "]",
-            scope="local",
+        valid_str = (
+            "[" + ", ".join(f"'{b[0].name}'" for b in valid_backends_priorities) + "]"
         )
+        if invalid_reasons:
+            rejected_str = ", ".join(b.name for b in invalid_reasons)
+            logger.info(
+                "Found incompatible backend(s) [%s] with %s. "
+                "Overriding with %s out of potential backends: %s.",
+                rejected_str,
+                attn_selector_config.attn_type,
+                selected_backend.name,
+                valid_str,
+            )
+        else:
+            logger.info_once(
+                "Using %s backend out of potential backends: %s.",
+                selected_backend.name,
+                valid_str,
+            )
 
         return selected_backend.get_path()
 
@@ -305,6 +384,14 @@ class HCUPlatform(Platform):
         # We only enable custom allreduce for MI300 series
         # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
         return True
+    
+    @classmethod
+    def device_count(cls) -> int:
+        return _rocm_device_count_stateless(envs.CUDA_VISIBLE_DEVICES)
+    
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        torch.cuda.manual_seed_all(seed)
 
     @classmethod
     @with_amdsmi_context
@@ -353,21 +440,11 @@ class HCUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         from vllm._aiter_ops import rocm_aiter_ops
-        from vllm.config.compilation import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
-        is_eager_execution = compilation_config.cudagraph_mode == CUDAGraphMode.NONE
         use_aiter_fused_moe = rocm_aiter_ops.is_fused_moe_enabled()
-        use_aiter_rms_norm = rocm_aiter_ops.is_rmsnorm_enabled()
         use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
         use_aiter_fused_se = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        #  Aiter rms norm perform best when CUDA Graph capture is enabled.
-        if (
-            use_aiter_rms_norm
-            and not is_eager_execution
-            and "-rms_norm" not in compilation_config.custom_ops
-        ):
-            compilation_config.custom_ops.append("+rms_norm")
 
         if use_aiter_fp8_linear and "-quant_fp8" not in compilation_config.custom_ops:
             compilation_config.custom_ops.append("+quant_fp8")
@@ -387,16 +464,10 @@ class HCUPlatform(Platform):
             and "-grouped_topk" not in compilation_config.custom_ops
         ):
             compilation_config.custom_ops.append("+grouped_topk")
-        # Enable rotary embedding customop when using AITER if not disabled by user
-        if (
-            rocm_aiter_ops.is_enabled()
-            and "+rotary_embedding" not in compilation_config.custom_ops
-            and "-rotary_embedding" not in compilation_config.custom_ops
-        ):
-            compilation_config.custom_ops.append("+rotary_embedding")
 
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
+        
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -473,6 +544,10 @@ class HCUPlatform(Platform):
         return total_mem - free_mem
 
     @classmethod
+    def supports_fp8(cls) -> bool:
+        return on_gfx938()
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         return (
             "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
@@ -486,10 +561,6 @@ class HCUPlatform(Platform):
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
         return "vllm.compilation.cuda_graph.CUDAGraphWrapper"
-
-    @classmethod
-    def device_count(cls) -> int:
-        return cuda_device_count_stateless()
 
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):

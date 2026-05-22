@@ -16,25 +16,22 @@ from vllm_hcu.platforms import envs as henvs
     ),
     (
 """
-        kv_cache_config: "KVCacheConfig | None" = None,
+        kv_cache_config: "KVCacheConfig",
 """,
 """
-        kv_cache_config: "KVCacheConfig | None" = None,
+        kv_cache_config: "KVCacheConfig",
         dp_rank: int = -1,
 """,  
     ),
     (
 """
-        if compat_sig:
-            # Old signature: __init__(self, vllm_config, role)
-            return connector_cls(config, role)
+        return connector_cls(config, role, kv_cache_config)
 """,
-"""
-        if compat_sig:
-            # Old signature: __init__(self, vllm_config, role)
-            return connector_cls(config, role)
-        elif henvs.VLLM_HCU_USE_DP_CONNECTOR:
+"""  
+        if henvs.VLLM_HCU_USE_DP_CONNECTOR:
             return connector_cls(config, role, kv_cache_config, dp_rank)
+        else:
+            return connector_cls(config, role, kv_cache_config)
 """,        
     ),
     (

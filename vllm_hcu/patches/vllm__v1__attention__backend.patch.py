@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Patch for vllm.v1.attention to extend the GFX9 arch allowlist for HCU.
+Patch for vllm.v1.attention.backend.py
 """
 
 PATCHES = [

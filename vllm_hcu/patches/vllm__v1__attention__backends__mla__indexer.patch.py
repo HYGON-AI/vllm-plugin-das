@@ -17,16 +17,7 @@ from lightop import gemmopt
 
 (
 """
-        return [1 if current_platform.is_rocm() else 64]
-""",
-"""
-        return [1 if not current_platform.is_rocm() else 64]
-""",
-),
-
-(
-"""
-            if current_platform.is_cuda() and is_deep_gemm_supported():
+            if current_platform.is_cuda() and has_deep_gemm():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.block_size,
@@ -34,7 +25,7 @@ from lightop import gemmopt
                 )
 """,
 """
-            if current_platform.is_cuda() and is_deep_gemm_supported():
+            if current_platform.is_cuda() and has_deep_gemm():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.block_size,
@@ -52,20 +43,20 @@ from lightop import gemmopt
 ################ lightly cp###########################
 (
 """
-    num_actual_tokens: int  # Number of tokens excluding padding.
+    num_prefill_tokens: int
 """,
 """        
-    num_actual_tokens: int  # Number of tokens excluding padding.
+    num_prefill_tokens: int
     num_kv_actual_tokens: int
 """,
 ),
 
 (
 """
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            max_seq_len=common_attn_metadata.max_seq_len,
 """,
 """        
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            max_seq_len=common_attn_metadata.max_seq_len,
             num_kv_actual_tokens=common_attn_metadata.num_kv_actual_tokens,
 """,
 ),

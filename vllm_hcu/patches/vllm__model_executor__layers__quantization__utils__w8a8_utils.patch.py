@@ -9,9 +9,6 @@ PATCHES = [
 (
 """
 from vllm.platforms import current_platform
-
-
-def sparse_cutlass_supported() -> bool:
 """,
 """
 from vllm.platforms import current_platform
@@ -47,9 +44,6 @@ def weight8bit_nt_kpack2_marlin2(
         q = q.permute((0, 3, 1, 4, 2, 5)).contiguous()
         q = q.reshape((E, size_n // k_tile, size_k * k_tile))
     return q
-
-
-def sparse_cutlass_supported() -> bool:
 """,
 ),
 ]

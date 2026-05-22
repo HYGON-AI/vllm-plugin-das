@@ -74,9 +74,9 @@ def write_version_file(version_suffix: str) -> None:
 
     content = f'''\
 try:
-    __version__ = "0.18.1"
-    __version_tuple__ = (0, 18, 1)
-    __hcu_version__ = "0.18.1+{version_suffix}"
+    __version__ = "0.21.0"
+    __version_tuple__ = (0, 21, 0)
+    __hcu_version__ = "0.21.0+{version_suffix}"
 
     from vllm_hcu.version import __version__, __version_tuple__, __hcu_version__
 except Exception as e:

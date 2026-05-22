@@ -7,18 +7,10 @@ vllm.model_executor.layers.fused_moe.utils: Optional, F, libdevice imports; int8
 PATCHES = [
 (
 """
-from math import prod
-
-import torch
-
 from vllm import _custom_ops as ops
 """,
 """
-from math import prod
 from typing import Optional
-
-import torch
-import torch.nn.functional as F
 from triton.language.extra import libdevice
 
 from vllm import _custom_ops as ops
@@ -192,19 +184,20 @@ def _int8_quantize(
 ) -> tuple[torch.Tensor, torch.Tensor]:
 """,
 ),
+
 (
 """
     if block_shape is None:
-        assert per_act_token, "int8 quantization only supports block or channel-wise"
-        A, A_scale = per_token_quant_int8(A)
+        if per_act_token:
+            A, A_scale = per_token_quant_int8(A)
 """,
 """
-    if block_shape is None or per_act_token:
-        assert per_act_token, "int8 quantization only supports block or channel-wise"
-        if expert_num_tokens is None:
-            A, A_scale = per_token_quant_int8(A)
-        else:
-            A, A_scale = per_token_quant_int8_triton_opt(A, expert_num_tokens)
+    if block_shape is None:
+        if per_act_token:
+            if expert_num_tokens is None:
+                A, A_scale = per_token_quant_int8(A)
+            else:
+                A, A_scale = per_token_quant_int8_triton_opt(A, expert_num_tokens)
 """,
 ),
 ]

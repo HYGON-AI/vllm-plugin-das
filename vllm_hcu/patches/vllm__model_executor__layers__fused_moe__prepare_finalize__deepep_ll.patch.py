@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vllm.model_executor.layers.fused_moe.deepep_ll_prepare_finalize:
+vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht:
 - DeepEP LL int8 dispatch + expert_num_tokens in _do_quant
 - low_latency_dispatch: use quant_type / fp8_round_scale (HCU DeepEP API, v0.15 style)
 - FP8: current_platform import + recognize DeepEP-prequantized fp8 tuples in _do_quant

@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vllm.model_executor.models.qwen3_next _forward_core
+vllm.model_executor.layers.mamba.gdn_linear_attn _forward_core
 """
 
 PATCHES = [
 (
 """
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+import torch
 """,
 """
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+import torch
 import vllm_hcu.platforms.envs as henvs
 """,
 ),
@@ -82,11 +82,13 @@ import vllm_hcu.platforms.envs as henvs
 (
 """
 from vllm.model_executor.layers.fla.ops import (
+    fused_post_conv_prep,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
 """,
 """
+from vllm.model_executor.layers.fla.ops import fused_post_conv_prep
 try:
     from aiter.ops.triton.fla.fused_recurrent import fused_recurrent_gated_delta_rule_packed_decode
     from aiter.ops.triton.fla.fused_sigmoid_gating import fused_sigmoid_gating_delta_rule_update

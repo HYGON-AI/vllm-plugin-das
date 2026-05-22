@@ -12,34 +12,14 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.utils import request_memory
 
 logger = init_logger(__name__)
 
-def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> int:
-    """
-    Calculate the amount of memory required by vLLM, then validate
-    that the current amount of free memory is sufficient for that.
-    """
-    requested_memory = math.ceil(
-        init_snapshot.total_memory * cache_config.gpu_memory_utilization
-    )
-
-    if init_snapshot.free_memory < requested_memory:
-        raise ValueError(
-            f"Free memory on device {init_snapshot.device_} "
-            f"({format_gib(init_snapshot.free_memory)}/"
-            f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
-            f"is less than desired GPU memory utilization "
-            f"({cache_config.gpu_memory_utilization}, "
-            f"{format_gib(requested_memory)} GiB). Decrease GPU memory "
-            f"utilization or reduce GPU memory used by other processes."
-        )
-
-    return requested_memory
 
 class HcuGPUWorker(Worker):
-    """A worker class that executes (a partition of) the model on a MTGPU.
-    Each worker is associated with a single MTGPU. In case of
+    """A worker class that executes (a partition of) the model on a HCU.
+    Each worker is associated with a single HCU. In case of
     distributed inference, each worker is assigned a partition of the model.
     """
 

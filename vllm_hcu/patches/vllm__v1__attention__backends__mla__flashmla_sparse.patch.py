@@ -36,10 +36,14 @@ from vllm_hcu.v1.attention.ops.flashmla import (
      
 (
 """
-        fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+        fp8_use_mixed_batch = (
+            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL and not self.is_deepseek_v4
+        )
 """,
 """
-        fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL and henvs.VLLM_HCU_USE_FP8_MIXED_BATCH
+        fp8_use_mixed_batch = (
+            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL and not self.is_deepseek_v4 and henvs.VLLM_HCU_USE_FP8_MIXED_BATCH
+        )        
 """,
 ),
 
