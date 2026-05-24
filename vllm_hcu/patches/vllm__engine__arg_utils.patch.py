@@ -7,6 +7,16 @@ Patch for vllm.engine.arg_utils
 PATCHES = [
 (
 '''
+        model_kwargs = get_kwargs(ModelConfig)
+''',
+'''
+        model_kwargs = get_kwargs(ModelConfig)
+        model_kwargs["disable_cascade_attn"]["default"] = True
+'''
+),
+
+(
+'''
     fail_on_environ_validation: bool = False
 ''',
 '''
