@@ -40,7 +40,7 @@ PATCHES = [
 """
 from vllm.distributed.parallel_state import get_pp_group
 """,
-"""        
+"""   
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 from vllm_hcu.v1.attention.lightly_cp_utils import pad_for_mla_cp, prepare_cp_metadata
 from vllm.utils.math_utils import cdiv, round_up
@@ -51,7 +51,7 @@ from vllm.utils.math_utils import cdiv, round_up
 """
 from vllm.v1.attention.backend import CommonAttentionMetadata
 """,
-"""        
+"""
 from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttentionMetadata
 """,
 ),
@@ -60,7 +60,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 """
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
 """,
-"""        
+"""     
         max_batch_size = vllm_config.scheduler_config.max_num_seqs if not vllm_config.parallel_config.enable_lightly_cplb else vllm_config.scheduler_config.max_num_seqs * 2
 """,
 ),
@@ -70,7 +70,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 """
         per_layer_attn_metadata: dict[str, object] = {}
 """,
-"""        
+"""
         per_layer_attn_metadata: dict[str, object] = {}
 
         enable_lightly_cp = self.enable_lightly_cp and num_tokens > self.runner.lightly_cp_threshold
@@ -121,7 +121,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 """
         common_attn_metadata.num_actual_tokens = batch_size
 """,
-"""        
+"""
         if enable_lightly_cp:
             common_attn_metadata = common_attn_metadata.cp_common_metadata
 

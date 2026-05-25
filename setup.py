@@ -19,7 +19,7 @@ if "MAX_JOBS" not in os.environ:
 ROOT = Path(__file__).parent.resolve()
 PWD = str(ROOT)
 
-ADD_GIT_VERSION = os.environ.get("ADD_GIT_VERSION", "0") == "1"
+ADD_GIT_VERSION = os.environ.get("ADD_GIT_VERSION", "1") == "1"
 
 
 # =========================================================

@@ -210,6 +210,8 @@ class HCUPlatform(Platform):
         "online",
         # "gpt_oss_mxfp4",
         "slimquant_w4a8",
+        "slimquant_w4a8_marlin", 
+        "slimquant_compressed_tensors_marlin",
     ]
     
     @classmethod
