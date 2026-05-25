@@ -68,11 +68,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 
 (
 """
-        per_layer_attn_metadata: dict[str, object] = {}
+        per_group_attn_metadata, per_layer_attn_metadata = (
+            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+        )
 """,
 """
-        per_layer_attn_metadata: dict[str, object] = {}
-
         enable_lightly_cp = self.enable_lightly_cp and num_tokens > self.runner.lightly_cp_threshold
         if enable_lightly_cp:
             actual_num_tokens = num_tokens
@@ -96,7 +96,10 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
             )
             self.scatter_indexes_tensor = common_attn_metadata.scatter_indexes_tensor
             self.gather_indexes_tensor = common_attn_metadata.gather_indexes_tensor
-
+            
+        per_group_attn_metadata, per_layer_attn_metadata = (
+            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+        )
 """
 ),
 
