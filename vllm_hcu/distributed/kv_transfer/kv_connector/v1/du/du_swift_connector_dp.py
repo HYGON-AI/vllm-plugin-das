@@ -335,7 +335,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
                 if kv_cache is None:
                     continue
 
-                layer = kv_cache[forward_context.virtual_engine]
+                layer = kv_cache
                 kv_cache = self.du_swift_engine.recv_tensor(
                     request.request_id + "#" + layer_name)
 
