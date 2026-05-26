@@ -18,6 +18,15 @@ PATCHES = [
 
 (
  '''
+        quant_cfg = self.model_arch_config.quantization_config
+ ''',
+ '''
+        quant_cfg = self.model_arch_config.quantization_config
+ ''',
+),
+
+(
+ '''
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization, hf_config=self.hf_config
                 )

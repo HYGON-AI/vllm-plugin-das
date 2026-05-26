@@ -84,17 +84,16 @@ PATCHES = [
 
 (
 """
-                else:
                     if is_pp_missing_parameter(name, self):
                         continue
-
+                    param = params_dict[name]
 """,
 """
-                else:
                     if is_pp_missing_parameter(name, self):
                         continue
                     if name not in params_dict:
                         name = maybe_remap_compressed_tensors_scale_name(name)
+                    param = params_dict[name]
 """,
 ),
 ]
