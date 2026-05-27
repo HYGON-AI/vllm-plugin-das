@@ -42,17 +42,6 @@ PATCHES = [
 ),
 (
 """
-    def block_shape(self) -> list[int] | None:
-""",
-"""
-    def block_shape(self) -> list[int] | None:
-        if self.use_int8_w8a8:
-            return [256, 256]
-
-""",
-),
-(
-"""
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
         assert quant_config.block_shape == block_shape
