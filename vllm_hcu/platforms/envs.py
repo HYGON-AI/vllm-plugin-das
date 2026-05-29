@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
+    VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -136,6 +137,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # W8A8 fp8 moe use aiter 
     "VLLM_HCU_USE_AITER_W8A8_FP8_MOE":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_W8A8_FP8_MOE", "True").lower() in
+                    ("true", "1")),
+    "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "True").lower() in
                     ("true", "1")),
 }
 
