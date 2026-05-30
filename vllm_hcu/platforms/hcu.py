@@ -142,7 +142,11 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
     else:
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN:
+        if (
+            henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN
+            or henvs.VLLM_HCU_USE_FLASH_ATTN
+            or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED
+        ):
             return [
                 AttentionBackendEnum.FLASH_ATTN,
             ]
@@ -517,7 +521,7 @@ class HCUPlatform(Platform):
                 logger.warning(
                     "[HCU CUSTOM_FLASH_ATTN/FLASHMLA]: Setting kv cache block size to 64."
                 )
-            elif henvs.VLLM_HCU_USE_FLASH_ATTN:
+            elif henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED:
                 if henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None and henvs.VLLM_HCU_USE_CUSTOM_OPS:
                     block_size = henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE
                     if block_size <= 0 or block_size % 16 != 0:

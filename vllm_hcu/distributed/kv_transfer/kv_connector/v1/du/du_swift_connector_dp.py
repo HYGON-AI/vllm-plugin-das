@@ -277,7 +277,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
                             num_block,
                             request_id,
                         )
-                elif not henvs.VLLM_HCU_USE_FLASH_ATTN: #FlashAttention_NV
+                elif not (henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED): #FlashAttention_NV
                     self.check_tensors_except_dim(layer, kv_cache, 1)
                     if len(block_ids) == num_block:
                         layer[:, block_ids, ...] = kv_cache
@@ -420,7 +420,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
             if (not isinstance(kv_layer, tuple)):
                 if (isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3 or layer.shape[1] == 2):
                     return layer[block_ids, ...]
-                elif not henvs.VLLM_HCU_USE_FLASH_ATTN: # FlashAttention_NV
+                elif not (henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED): # FlashAttention_NV
                     return layer[:, block_ids, ...]
                 else:
                     logger.error("🚧kv_cache not mla && gqa")
