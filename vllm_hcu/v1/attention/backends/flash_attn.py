@@ -709,7 +709,7 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_KVCACHE_E5M2:
+        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN and self.kv_cache_dtype == "fp8_e5m2":
             self.supports_quant_query_input = False
         else:
             self.supports_quant_query_input = flash_attn_supports_quant_query_input()
