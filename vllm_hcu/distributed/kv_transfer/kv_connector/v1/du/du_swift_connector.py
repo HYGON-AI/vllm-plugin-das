@@ -239,6 +239,7 @@ class DuSwiftConnector(KVConnectorBase_V1):
                             request_id,
                         )
                 elif layer.shape[0] == 2: #FlashAttention_NV #FlashAttention_NV
+                    num_block = kv_cache.shape[1]
                     self.check_tensors_except_dim(layer, kv_cache, 1)
                     if len(block_ids) == num_block:
                         layer[:, block_ids, ...] = kv_cache

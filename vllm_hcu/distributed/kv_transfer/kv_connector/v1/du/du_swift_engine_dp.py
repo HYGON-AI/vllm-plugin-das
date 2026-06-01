@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.distributed.utils import get_pp_indices
 from vllm.config import ModelConfig
+import vllm.compilation.monitor as monitor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -692,6 +693,8 @@ class DuSwiftEngineDp:
                         rank = int(data["rank"])
                         world_size = int(data["world_size"])
                         with set_du_swift_context(self.nccl_num_channels):
+                            while monitor.cudagraph_capturing_enabled:
+                                time.sleep(1)
                             comm: ncclComm_t = self.nccl.ncclCommInitRank(
                                     world_size, unique_id, rank)
                         self.comms[data["pd_pair_id"]] = (comm, rank)

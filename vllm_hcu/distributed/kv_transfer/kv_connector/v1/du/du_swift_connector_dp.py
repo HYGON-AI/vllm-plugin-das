@@ -262,7 +262,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
-            if not isinstance(layer, tuple):
+            if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
                 if (isinstance(attn_metadata, MLACommonMetadata) or layer.ndim == 3 or layer.shape[1] == 2):
                     num_block = kv_cache.shape[0]
                     self.check_tensors_except_dim(layer, kv_cache, 0)
@@ -277,7 +277,8 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
                             num_block,
                             request_id,
                         )
-                elif not (henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED): #FlashAttention_NV
+                elif layer.shape[0] == 2: #FlashAttention_NV #FlashAttention_NV
+                    num_block = kv_cache.shape[1]
                     self.check_tensors_except_dim(layer, kv_cache, 1)
                     if len(block_ids) == num_block:
                         layer[:, block_ids, ...] = kv_cache
