@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_PD_SPLIT: bool = False
+    VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -185,6 +186,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_PD_SPLIT":
         lambda: (os.environ.get("VLLM_HCU_USE_PD_SPLIT", "False").lower() in
                  ("true", "1")),
+
+    # If use custom AITER_W4A16_MOE impl, please set True
+    "VLLM_HCU_USE_AITER_W4A16_MOE":
+        lambda: (os.environ.get("VLLM_HCU_USE_AITER_W4A16_MOE", "True").lower() in
+                    ("true", "1")),
 }
 
 # end-env-vars-definition
