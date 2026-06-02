@@ -89,6 +89,7 @@ import re
 import sys
 from pathlib import Path
 
+import vllm
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -172,6 +173,72 @@ def _get_patch_files():
         patch_files.append((module_name, patch_file))
     return patch_files
 
+
+def _module_to_source_path(module_name: str) -> Path | None:
+    """Resolve a vLLM module to a source path without importing it.
+
+    ``importlib.util.find_spec("pkg.sub.module")`` may import parent packages
+    while resolving the spec. Some vLLM parent packages import modules that
+    register torch custom ops at import time, so path resolution must stay
+    filesystem-only.
+    """
+    if module_name == "vllm":
+        module_parts: list[str] = []
+    elif module_name.startswith("vllm."):
+        module_parts = module_name.split(".")[1:]
+    else:
+        logger.debug(f"Only vllm modules are supported, skipping {module_name}")
+        return None
+
+    vllm_roots = getattr(vllm, "__path__", None)
+    if not vllm_roots:
+        return None
+
+    base = Path(next(iter(vllm_roots)))
+    module_path = base.joinpath(*module_parts)
+
+    file_path = module_path.with_suffix(".py")
+    if file_path.is_file():
+        return file_path
+
+    package_init = module_path / "__init__.py"
+    if package_init.is_file():
+        return package_init
+
+    return None
+
+
+def _is_safe_to_evict_module(source: str) -> bool:
+    """Return whether the module can be removed from sys.modules safely.
+
+    Re-importing modules with import-time torch custom-op registration can
+    attempt to define the same op twice in PyTorch's process-global registry.
+    """
+    unsafe_markers = (
+        "direct_register_custom_op(",
+        "torch.library.custom_op(",
+        "torch.library.Library(",
+        "Library(",
+        "register_fake(",
+    )
+    return not any(marker in source for marker in unsafe_markers)
+
+
+def _evict_module_if_safe(module_name: str, source: str) -> None:
+    if module_name not in sys.modules:
+        return
+
+    if _is_safe_to_evict_module(source):
+        del sys.modules[module_name]
+        logger.debug(f"Removed {module_name} from import cache after patching")
+        return
+
+    logger.warning(
+        f"{module_name} was already imported and has import-time torch "
+        "registration; restart the Python process to use the patched source"
+    )
+
+
 def _load_patch_config(patch_file: Path) -> list[_PatchEntry]:
     """Load and normalize literal + regex patches from a patch file."""
     spec = importlib.util.spec_from_file_location("patch_config", patch_file)
@@ -228,29 +295,17 @@ def apply_patches():
 
     for module_name, patch_file in patch_files:
         try:
-            # Find the module spec
-            try:
-                spec = importlib.util.find_spec(module_name)
-            except (ModuleNotFoundError, ImportError) as e:
-                # Module doesn't exist in this vLLM version (e.g., vllm.worker.worker
-                # exists in vLLM 0.10.x but not in 0.13.0 where V0 engine was removed)
-                # or has circular import issues during spec discovery
-                logger.debug(
-                    f"Module {module_name} not found or has import issues: {e}, "
-                    "skipping patch (this is expected for version-specific patches "
-                    "or when modules are not yet fully initialized)"
-                )
-                continue
-            if spec is None or spec.origin is None:
+            source_path = _module_to_source_path(module_name)
+            if source_path is None:
                 logger.debug(f"Module {module_name} not found, skipping patch")
                 continue
 
             # Read the source file
             try:
-                with open(spec.origin, "r") as f:
+                with open(source_path, "r") as f:
                     source = f.read()
             except (IOError, OSError) as e:
-                logger.debug(f"Cannot read {spec.origin}: {e}, skipping patch")
+                logger.debug(f"Cannot read {source_path}: {e}, skipping patch")
                 continue
 
             # Load patches from patch file
@@ -294,12 +349,11 @@ def apply_patches():
             
             if applied_count > 0:
                 # Write back the patched source
-                with open(spec.origin, "w") as f:
+                with open(source_path, "w") as f:
                     f.write(patched_source)
 
-                # Remove from cache to force reload
-                if module_name in sys.modules:
-                    del sys.modules[module_name]
+                # Remove from cache to force reload when doing so is safe.
+                _evict_module_if_safe(module_name, patched_source)
 
                 logger.info(f"Applied {applied_count} patch(es) to {module_name}")
 

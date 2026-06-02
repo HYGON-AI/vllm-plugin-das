@@ -18,6 +18,10 @@ def register_model():
         "GlmMoeDsaForCausalLM", "vllm_hcu.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )
 
+    ModelRegistry.register_model(
+        "Glm4MoeForCausalLM", "vllm_hcu.models.glm4_moe:Glm4MoeForCausalLM"
+    )
+
 
 def register_quant_method():
     """to do"""

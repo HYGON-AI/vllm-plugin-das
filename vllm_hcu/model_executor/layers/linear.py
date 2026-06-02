@@ -186,6 +186,9 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def supports_quanted_inputs(self):
+        return False
+
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
@@ -426,10 +429,16 @@ class ReplicatedLinear(LinearBase):
     def forward(
         self,
         x: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
-        output = self.quant_method.apply(self, x, bias)
+        if x_and_scale_quanted is not None \
+            and hasattr(self.quant_method, "supports_quanted_inputs") \
+                and self.quant_method.supports_quanted_inputs():
+            output = self.quant_method.apply(self, x, bias, x_and_scale_quanted=x_and_scale_quanted)
+        else:
+            output = self.quant_method.apply(self, x, bias)
 
         if not self.return_bias:
             return output
@@ -622,11 +631,17 @@ class ColumnParallelLinear(LinearBase):
     def forward(
         self,
         input_,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        if x_and_scale_quanted is not None \
+            and hasattr(self.quant_method, "supports_quanted_inputs") \
+                and self.quant_method.supports_quanted_inputs():
+            output_parallel = self.quant_method.apply(self, input_, bias, x_and_scale_quanted=x_and_scale_quanted)
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -1606,6 +1621,7 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
             input_parallel = input_
@@ -1619,7 +1635,13 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+
+        if x_and_scale_quanted is not None \
+            and hasattr(self.quant_method, "supports_quanted_inputs") \
+                and self.quant_method.supports_quanted_inputs():
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_, x_and_scale_quanted=x_and_scale_quanted)
+        else:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)

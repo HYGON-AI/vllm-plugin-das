@@ -30,6 +30,9 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
+    VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
+    VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
+    VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -141,6 +144,21 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "True").lower() in
                     ("true", "1")),
+
+    # If use fused rmsnorm and quant, please set True
+    "VLLM_HCU_USE_FUSED_RMS_QUANT":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "False").lower() in
+                 ("true", "1")),
+
+    # If use fused silu and mul and quant, please set True
+    "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", "True").lower() in
+                 ("true", "1")),
+
+    #If set to 1/True, enable fuse split qkv+rmsnorm+rope+kv_update just like glm4.7 moe attention.
+    "VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE", "True").lower() in
+                 ("true", "1")),
 }
 
 # end-env-vars-definition
