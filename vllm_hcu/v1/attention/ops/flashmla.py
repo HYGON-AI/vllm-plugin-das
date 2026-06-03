@@ -112,13 +112,14 @@ def flash_mla_with_kvcache_fp8(
         out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla_fp8(
             q,
             k_cache,
-            block_table,
-            cache_seqlens,
+            None,
             head_dim_v,
-            tile_scheduler_metadata,
-            num_splits,
+            cache_seqlens,
+            block_table,
             softmax_scale,
             causal,
+            tile_scheduler_metadata,
+            num_splits,
             descale_q,
             descale_k,
         )
