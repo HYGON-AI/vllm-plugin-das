@@ -21,6 +21,14 @@ def register_model():
     ModelRegistry.register_model(
         "Glm4MoeForCausalLM", "vllm_hcu.models.glm4_moe:Glm4MoeForCausalLM"
     )
+    
+    ModelRegistry.register_model(
+        "HYV3ForCausalLM", "vllm_hcu.models.hy_v3:HYV3ForCausalLM"
+    )
+    
+    ModelRegistry.register_model(
+        "HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP"
+    )
 
 
 def register_quant_method():
