@@ -27,5 +27,16 @@ from vllm_hcu.platforms import envs as henvs
                         if request_type == EngineCoreRequestType.ADD:
                             self.scheduler.connector.register_req(req.request_id)
 """,
-    )
+    ),
+
+    (
+"""
+        # Post-step hook.
+        self.post_step(model_executed)
+""",
+"""
+        # Post-step hook.
+        #self.post_step(model_executed)
+""",
+    ),
 ]

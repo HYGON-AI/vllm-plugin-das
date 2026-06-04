@@ -23,7 +23,7 @@ from vllm import envs
 """
 from vllm import envs
 import vllm_hcu.platforms.envs as henvs
-""",              
+""",
 ),
 
 (
@@ -32,7 +32,7 @@ import vllm_hcu.platforms.envs as henvs
 """,
 """
     def schedule_default(self) -> SchedulerOutput:
-""",              
+""",
 ),
 
 (
@@ -642,7 +642,128 @@ import vllm_hcu.platforms.envs as henvs
             return self.schedule_default()
     
     def _preempt_request(self, request: Request, timestamp: float) -> None:
-""",              
+""",
 ),
 ############################ pd split schedule ################################
+
+################### supports non-async scheduling pp + mtp ####################
+    (
+"""
+        self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+""",
+"""
+        self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.is_mtp_kv_consumer = (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.kv_transfer_config is not None
+            and self.vllm_config.kv_transfer_config.is_kv_consumer
+        )
+""",
+    ),
+
+    (
+"""
+            request = self.running[req_index]
+""",
+"""
+            request = self.running[req_index]
+            if (
+                self.use_pp
+                and request.num_output_placeholders > 0
+                and self.scheduler_config.async_scheduling
+            ):
+                req_index += 1
+                continue
+""",
+    ),
+
+    (
+"""
+            if num_new_tokens == 0:
+""",
+"""
+            if num_new_tokens <= 0:
+""",
+    ),
+
+    (
+"""
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+""",
+"""
+                    if (self.is_mtp_kv_consumer
+                            and not self.scheduler_config.async_scheduling):
+                        num_new_tokens = (
+                            request.num_tokens_with_spec - num_computed_tokens
+                        )
+                    else:
+                        num_new_tokens = request.num_tokens - num_computed_tokens
+""",
+    ),
+
+    (
+"""
+                self.running.append(request)
+""",
+"""
+                # Speculative decode related.
+                if (
+                    (self.is_mtp_kv_consumer
+                     or not self.vllm_config.kv_transfer_config)
+                    and request.spec_token_ids
+                    and not self.scheduler_config.async_scheduling
+                ):
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens + num_computed_tokens - request.num_tokens
+                    )
+                    if num_scheduled_spec_tokens > 0:
+                        # Trim spec_token_ids list to num_scheduled_spec_tokens.
+                        del request.spec_token_ids[num_scheduled_spec_tokens:]
+                        scheduled_spec_decode_tokens[request.request_id] = (
+                            request.spec_token_ids)
+                    else:
+                        # Prefill request: spec tokens not applicable yet.
+                        request.spec_token_ids = []
+
+                self.running.append(request)
+""",
+    ),
+
+    (
+"""
+        sampled_token_ids = model_runner_output.sampled_token_ids
+""",
+"""
+        sampled_token_ids = model_runner_output.sampled_token_ids
+        spec_token_ids = model_runner_output.spec_token_ids
+""",
+    ),
+
+    (
+"""
+                request.num_nans_in_logits = num_nans_in_logits[req_id]
+""",
+"""
+                request.num_nans_in_logits = num_nans_in_logits[req_id]
+
+            # Use output-local new_token_ids instead of request.is_prefill_chunk
+            # because PP batch_queue may process an older output after the
+            # request state has advanced to a later step.
+            if spec_token_ids:
+                if not new_token_ids:
+                    # Non-final prefill chunk: no tokens generated,
+                    # clear any stale spec_token_ids.
+                    if request.spec_token_ids:
+                        request.spec_token_ids = []
+                else:
+                    if self.structured_output_manager.should_advance(request):
+                        metadata = request.structured_output_request
+                        request.spec_token_ids = metadata.grammar.validate_tokens(
+                            spec_token_ids[req_index])
+                    else:
+                        request.spec_token_ids = spec_token_ids[req_index]
+""",
+    ),
+################### supports non-async scheduling pp + mtp ####################
+
 ]

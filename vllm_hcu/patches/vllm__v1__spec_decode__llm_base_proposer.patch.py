@@ -65,7 +65,6 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 """,
 ),
 
-
 (
 """
         per_group_attn_metadata, per_layer_attn_metadata = (
@@ -173,6 +172,52 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
         )
 """,
 ),
+
+(
+'''                    sh = getattr(layer, "shared_head", None)
+                    if sh is not None and hasattr(sh, "head"):
+                        del sh.head
+                        sh.head = target_language_model.lm_head
+                        logger.info(
+                            "Shared target model lm_head with MTP shared_head.head."
+                        )
+''',
+'''                    sh = getattr(layer, "shared_head", None)
+                    if sh is None or not hasattr(sh, "head"):
+                        continue
+
+                    has_own_trained_weights = False
+
+                    if self.enable_multi_layers_mtp:
+                        if hasattr(sh.head, "weight") and hasattr(
+                            target_language_model.lm_head, "weight"
+                        ):
+                            mtp_head_weight = sh.head.weight
+                            target_head_weight = target_language_model.lm_head.weight
+                            if isinstance(mtp_head_weight, torch.Tensor) and isinstance(
+                                target_head_weight, torch.Tensor
+                            ):
+                                if not torch.isnan(mtp_head_weight).any() and not (
+                                    torch.equal(
+                                        mtp_head_weight.cpu(), target_head_weight.cpu()
+                                    )
+                                ):
+                                    has_own_trained_weights = True
+
+                    if has_own_trained_weights:
+                        logger.info(
+                            "MTP model has its own trained shared_head weights. "
+                            "Keeping separate from target model lm_head."
+                        )
+                    else:
+                        del sh.head
+                        sh.head = target_language_model.lm_head
+                        logger.info(
+                            "Shared target model lm_head with MTP shared_head.head."
+                        )
+''',
+),
+
 ################ lightly cp###########################
 
 (

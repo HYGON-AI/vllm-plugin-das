@@ -41,6 +41,7 @@ from .deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 
 import vllm_hcu.platforms.envs as henvs
@@ -214,7 +215,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -224,6 +225,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
+        self.use_pp = vllm_config.parallel_config.pipeline_parallel_size > 1
 
     def set_moe_parameters(self):
         self.expert_weights = []
@@ -312,6 +314,16 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
+                # load embed_tokens weight from target model in pp mode
+                if "embed_tokens" in name and self.use_pp:
+                    for local_name in params_dict.keys():
+                        if "embed_tokens" in local_name:
+                            param = params_dict[local_name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                            break
                 continue
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
