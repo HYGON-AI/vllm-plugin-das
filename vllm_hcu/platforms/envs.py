@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
+    VLLM_USE_OPT_CAT: bool = False
+    VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
@@ -71,6 +73,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
+             ("true", "1")),
+    # vLLM will use use opt cat 
+    "VLLM_USE_OPT_CAT":
+    lambda: (os.environ.get("VLLM_USE_OPT_CAT", "True").lower() in
+             ("true", "1")),
+    # vLLM will use use fused cat and mla
+    "VLLM_HCU_USE_CAT_MLA":
+    lambda: (os.environ.get("VLLM_HCU_USE_CAT_MLA", "True").lower() in
              ("true", "1")),
     # If set, vllm will disable DSA
     "VLLM_HCU_DISABLE_DSA":

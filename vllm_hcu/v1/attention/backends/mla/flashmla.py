@@ -34,6 +34,7 @@ from vllm_hcu.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
     flash_mla_with_kvcache_fp8,
+    flash_mla_with_kvcache_fp8_with_cat,
     get_mla_metadata,
     get_mla_metadata_dense_fp8,
     is_flashmla_dense_supported,
@@ -263,9 +264,46 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        if type(q) is tuple:
-            q = torch.cat(q, dim=-1)
+        # if type(q) is tuple:
+        #     q = torch.cat(q, dim=-1)
+        
+        if isinstance(q, tuple):
+            q_nope, q_pe = q
+            if henvs.VLLM_HCU_USE_CAT_MLA and  on_gfx938() and (self.kv_cache_dtype == "fp8_e4m3" or self.kv_cache_dtype == "fp8_ds_mla"):
+                assert isinstance(q_nope, torch.Tensor)
+                assert isinstance(q_pe, torch.Tensor)
+                
+                num_decodes = attn_metadata.num_decodes
+                q_nope = reshape_query_for_spec_decode(q_nope, num_decodes)
+                q_pe = reshape_query_for_spec_decode(q_pe, num_decodes)
+                scheduler_metadata = attn_metadata.decode.scheduler_metadata
+                
+                assert q_nope.shape[0] == num_decodes  
+                o, lse = flash_mla_with_kvcache_fp8_with_cat(
+                    q_nope=q_nope,
+                    q_pe=q_pe,
+                    k_cache=kv_c_and_k_pe_cache.unsqueeze(-2).view(torch.float8_e4m3fn),  # Add head dim of 1
+                    block_table=attn_metadata.decode.block_table,
+                    cache_seqlens=attn_metadata.decode.seq_lens,
+                    head_dim_v=self.kv_lora_rank,
+                    tile_scheduler_metadata=scheduler_metadata.tile_scheduler_metadata,
+                    num_splits=scheduler_metadata.num_splits,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    descale_q=layer._q_scale.reshape(1),
+                    descale_k=layer._k_scale.reshape(1),          
+                )                
+                o = reshape_attn_output_for_spec_decode(o)
+                return o, lse 
+            if henvs.VLLM_USE_OPT_CAT and q_nope.shape[0] < 1024:
+                from vllm_hcu.ops.test_concat import (
+                    concat_helper_decode,
+                )
 
+                q = concat_helper_decode(q_nope, q_pe, dim=2)
+            else:
+                q = torch.cat((q_nope, q_pe), dim=-1)
+        
         # mypy assertion: q is now always a tensor
         assert isinstance(q, torch.Tensor)
 
@@ -303,37 +341,21 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             scheduler_metadata.tile_scheduler_metadata = tile_scheduler_metadata
             scheduler_metadata.num_splits = num_splits
 
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            if on_gfx938() and (self.kv_cache_dtype == "fp8_e4m3" or self.kv_cache_dtype == "fp8_ds_mla"):
-                o, lse = flash_mla_with_kvcache_fp8(
-                    q=q.to(torch.float8_e4m3fn),
-                    k_cache=kv_c_and_k_pe_cache.unsqueeze(-2).view(torch.float8_e4m3fn),  # Add head dim of 1
-                    block_table=attn_metadata.decode.block_table,
-                    cache_seqlens=attn_metadata.decode.seq_lens,
-                    head_dim_v=self.kv_lora_rank,
-                    tile_scheduler_metadata=scheduler_metadata.tile_scheduler_metadata,
-                    num_splits=scheduler_metadata.num_splits,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    descale_q=layer._q_scale.reshape(1),
-                    descale_k=layer._k_scale.reshape(1),
-                )
-            else:
-                o, lse = flash_mla_with_kvcache_fp8(
-                    q=q,
-                    k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
-                    block_table=attn_metadata.decode.block_table,
-                    cache_seqlens=attn_metadata.decode.seq_lens,
-                    head_dim_v=self.kv_lora_rank,
-                    tile_scheduler_metadata=scheduler_metadata.tile_scheduler_metadata,
-                    num_splits=scheduler_metadata.num_splits,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    descale_q=layer._q_scale.reshape(1),
-                    descale_k=layer._k_scale.reshape(1),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    
-                )
+        if self.kv_cache_dtype.startswith("fp8"):
+            o, lse = flash_mla_with_kvcache_fp8(
+                q=q,
+                k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
+                block_table=attn_metadata.decode.block_table,
+                cache_seqlens=attn_metadata.decode.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=scheduler_metadata.tile_scheduler_metadata,
+                num_splits=scheduler_metadata.num_splits,
+                softmax_scale=self.scale,
+                causal=True,
+                descale_q=layer._q_scale.reshape(1),
+                descale_k=layer._k_scale.reshape(1),
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
         else:
             o, lse = flash_mla_with_kvcache(
                 q=q,

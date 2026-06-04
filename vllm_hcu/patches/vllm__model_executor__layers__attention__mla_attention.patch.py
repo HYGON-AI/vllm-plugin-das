@@ -6,8 +6,36 @@ vllm.model_executor.layers.attention.mla_attention process_weights_after_loading
 
 PATCHES = [
 (
-    "import vllm.envs as envs",
-    "import vllm.envs as envs\nimport vllm_hcu.platforms.envs as henvs",
+"""
+import vllm.envs as envs
+""",
+"""        
+import vllm.envs as envs
+import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.platforms.hcu import on_gfx938
+""",
+),
+
+(
+"""
+            if fp8_attention and self.impl.supports_quant_query_input:
+                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                mqa_q = self._decode_concat_quant_fp8_op(
+                    mqa_ql_nope, mqa_q_pe, self._q_scale
+                )
+""",
+"""
+            if fp8_attention and self.impl.supports_quant_query_input and on_gfx938():
+                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                if henvs.VLLM_HCU_USE_CAT_MLA:
+                    mqa_q = (mqa_ql_nope, mqa_q_pe)
+                else:
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
+""",
 ),
 
 (
