@@ -25,4 +25,17 @@ PATCHES = [
                 logger.warning("Unknown vLLM environment variable detected: %s", env)
 ''',
 ),
+
+(
+'''
+    "VLLM_ROCM_USE_AITER_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
+    ),
+''',
+'''
+    "VLLM_ROCM_USE_AITER_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_MOE", "False").lower() in ("true", "1")
+    ),
+''',
+),
 ]
