@@ -573,6 +573,10 @@ class HCUPlatform(Platform):
         )
 
     @classmethod
+    def get_punica_wrapper(cls) -> str:
+        return "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
+
+    @classmethod
     def opaque_attention_op(cls) -> bool:
         return True
 
