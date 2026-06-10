@@ -168,11 +168,19 @@ def patch_module_class_function():
     from .patches.patch_w8a8_channelwise_blaslt_apply_scaled_mm import (
         patch_fp8_scaled_mm,
     )
+    from .patches.patch_hcu_lora_column_parallel_linear import (
+        patch_hcu_lora_column_parallel_linear,
+    )
+    from .patches.patch_qwen35_lora_disable_piecewise_cudagraph import (
+        patch_qwen35_lora_disable_piecewise_cudagraph,
+    )
     from .patches.patch_weight_utils_skip_debug import (
         patch_safetensors_weights_iterator,
     )
     patch_aiter_moe_asm()
     patch_fp8_scaled_mm()
+    patch_hcu_lora_column_parallel_linear()
+    patch_qwen35_lora_disable_piecewise_cudagraph()
     patch_safetensors_weights_iterator()
 
 #自定义函数或者类的补丁
