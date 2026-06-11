@@ -4,6 +4,10 @@
 #include <c10/hip/HIPGuard.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+
+typedef __hip_bfloat162 __nv_bfloat162;
+typedef __hip_bfloat16 __nv_bfloat16;
 
 // 1. 基础定义 (必须在最前面，供后续所有模板使用)
 enum class Fp8KVCacheDataType {
@@ -13,12 +17,49 @@ enum class Fp8KVCacheDataType {
   kInt8 = 3
 };
 
+// Define custom BF16 vector data types.
+struct bf16_4_t {
+  __nv_bfloat162 x;
+  __nv_bfloat162 y;
+};
+
+struct bf16_8_t {
+  __nv_bfloat162 x;
+  __nv_bfloat162 y;
+  __nv_bfloat162 z;
+  __nv_bfloat162 w;
+};
+
+// Define custom FP32 vector data types.
+struct Float4_ {
+  float2 x;
+  float2 y;
+};
+
+struct Float8_ {
+  float2 x;
+  float2 y;
+  float2 z;
+  float2 w;
+};
+
 #define VLLM_SHFL_XOR_SYNC(var, lane_mask) __shfl_xor(var, lane_mask)
 #define VLLM_SHFL_XOR_SYNC_WIDTH(var, lane_mask, width) \
   __shfl_xor(var, lane_mask, width)
 
 // 2. 补全量化转换函数 (Device 端)
 namespace fp8 {
+
+  // KV-CACHE int8
+static inline __device__ float fp8_to_float(uint8_t input) {
+  const uint32_t w = (uint32_t)input << 24;
+  const uint32_t sign = w & UINT32_C(0x80000000);
+  const uint32_t nonsign = w & UINT32_C(0x7FFFFFFF);
+  uint32_t renorm_shift = __clz(nonsign);
+  renorm_shift = renorm_shift > 4 ? renorm_shift - 4 : 0;
+  uint32_t result = sign | ((nonsign << renorm_shift >> 4) + ((0x78 - renorm_shift) << 23));
+  return c10::detail::fp32_from_bits(result);
+}
 
 // float -> fp8
 static inline __device__ uint8_t float_to_fp8_e4m3(float f) {
@@ -73,16 +114,212 @@ static inline __device__ uint8_t float_to_fp8_e5m2(float f) {
   return result;
 }
 
+static inline __device__ float fp8e5m2_to_fp32(const uint8_t& input) {
+  union uf16 {
+    uint16_t as_bits;
+    _Float16 as_value;
+  };
+  uf16 u16;
+  u16.as_bits = (uint16_t)input << 8;
+  return (float)u16.as_value;
+}
+
 inline __device__ float half_to_float(uint16_t h) {
   float f;
   asm volatile("v_cvt_f32_f16 %0, %1;" : "=v"(f) : "v"(h));
   return f;
 }
 
+inline __device__ uint16_t float_to_half(float f) {
+  union {
+    uint32_t u32;
+    uint16_t u16[2];
+  } tmp;
+  asm volatile("v_cvt_f16_f32 %0, %1;\n" : "=v"(tmp.u32) : "v"(f));
+  return tmp.u16[0];
+}
+
 template <typename Tout, typename Tin>
 __inline__ __device__ Tout scaled_vec_conversion(const Tin& x,
                                                  const float scale, Fp8KVCacheDataType kv_type) {
   return x;
+}
+
+using __nv_bfloat16 = __hip_bfloat16;
+
+// fp8 -> __nv_bfloat16
+template <>
+__inline__ __device__ __nv_bfloat16
+scaled_vec_conversion<__nv_bfloat16, uint8_t>(const uint8_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  if (kv_type == Fp8KVCacheDataType::kFp8E5M2) {
+    return __float2bfloat16(fp8e5m2_to_fp32(a) * scale);
+  }
+
+  return __float2bfloat16(fp8_to_float(a) * scale);
+  // fp8_type f8;
+  // f8.__x = a;
+  // return __float2bfloat16(static_cast<float>(f8) * scale);
+}
+
+// fp8x2 -> __nv_bfloat162
+template <>
+__inline__ __device__ __nv_bfloat162
+scaled_vec_conversion<__nv_bfloat162, uint16_t>(const uint16_t& a,
+                                                float scale, Fp8KVCacheDataType kv_type) {
+  __nv_bfloat162 res;
+  res.x = scaled_vec_conversion<__nv_bfloat16, uint8_t>((uint8_t)a, scale, kv_type);
+  res.y =
+      scaled_vec_conversion<__nv_bfloat16, uint8_t>((uint8_t)(a >> 8U), scale, kv_type);
+  return res;
+}
+
+// fp8x4 -> bf16_4_t
+template <>
+__inline__ __device__ bf16_4_t
+scaled_vec_conversion<bf16_4_t, uint32_t>(const uint32_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  bf16_4_t res;
+  res.x = scaled_vec_conversion<__nv_bfloat162, uint16_t>((uint16_t)a, scale, kv_type);
+  res.y = scaled_vec_conversion<__nv_bfloat162, uint16_t>((uint16_t)(a >> 16U),
+                                                          scale, kv_type);
+  return res;
+}
+
+// fp8x8 -> bf16_8_t
+template <>
+__inline__ __device__ bf16_8_t
+scaled_vec_conversion<bf16_8_t, uint2>(const uint2& a, float scale, Fp8KVCacheDataType kv_type) {
+  bf16_4_t tmp1, tmp2;
+  tmp1 = scaled_vec_conversion<bf16_4_t, uint32_t>(a.x, scale, kv_type);
+  tmp2 = scaled_vec_conversion<bf16_4_t, uint32_t>(a.y, scale, kv_type);
+  bf16_8_t res;
+  res.x = tmp1.x;
+  res.y = tmp1.y;
+  res.z = tmp2.x;
+  res.w = tmp2.y;
+  return res;
+}
+
+// fp8 -> float
+template <>
+__inline__ __device__ float scaled_vec_conversion<float, uint8_t>(
+    const uint8_t& a, float scale, Fp8KVCacheDataType kv_type) {
+    if (kv_type == Fp8KVCacheDataType::kFp8E5M2) {
+      return fp8e5m2_to_fp32(a) * scale;
+    }
+    return fp8_to_float(a) * scale;
+  // fp8_type f8;
+  // f8.__x = a;
+  // return static_cast<float>(f8) * scale;
+}
+
+// fp8x2 -> float2
+template <>
+__inline__ __device__ float2
+scaled_vec_conversion<float2, uint16_t>(const uint16_t& a, float scale, Fp8KVCacheDataType kv_type) {
+    float2 f2r;
+    f2r.x = scaled_vec_conversion<float, uint8_t>((uint8_t)a, scale, kv_type);
+    f2r.y = scaled_vec_conversion<float, uint8_t>((uint8_t)(a >> 8U), scale, kv_type);
+    return f2r;
+    // [[maybe_unused]] 
+  // fp8x2_type f8x2;
+  // f8x2.__x = a;
+  // return static_cast<float2>(f8x2) * scale;
+}
+
+// fp8x4 -> float4
+template <>
+__inline__ __device__ Float4_
+scaled_vec_conversion<Float4_, uint32_t>(const uint32_t& a, const float scale, Fp8KVCacheDataType kv_type) {
+  Float4_ res;
+  res.x = scaled_vec_conversion<float2, uint16_t>((uint16_t)a, scale, kv_type);
+  res.y = scaled_vec_conversion<float2, uint16_t>((uint16_t)(a >> 16U), scale, kv_type);
+  return res;
+}
+
+// fp8x4 -> float4
+template <>
+__inline__ __device__ float4
+scaled_vec_conversion<float4, uint32_t>(const uint32_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  Float4_ res = scaled_vec_conversion<Float4_, uint32_t>(a, scale, kv_type);
+  return {res.x.x, res.x.y, res.y.x, res.y.y};
+}
+
+// fp8x8 -> float8
+template <>
+__inline__ __device__ Float8_
+scaled_vec_conversion<Float8_, uint2>(const uint2& a, float scale, Fp8KVCacheDataType kv_type) {
+  Float4_ tmp1, tmp2;
+  tmp1 = scaled_vec_conversion<Float4_, uint32_t>(a.x, scale, kv_type);
+  tmp2 = scaled_vec_conversion<Float4_, uint32_t>(a.y, scale, kv_type);
+  Float8_ res;
+  res.x = tmp1.x;
+  res.y = tmp1.y;
+  res.z = tmp2.x;
+  res.w = tmp2.y;
+  return res;
+}
+
+// fp8 -> half
+template <>
+__inline__ __device__ uint16_t
+scaled_vec_conversion<uint16_t, uint8_t>(const uint8_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  if (kv_type == Fp8KVCacheDataType::kFp8E5M2) {
+    return float_to_half(fp8e5m2_to_fp32(a) * scale);
+  }
+  float res = fp8_to_float(a) * scale;
+  return float_to_half(res);
+  // __half_raw res;
+  // res.data = scaled_vec_conversion<float, uint8_t>(a, scale);
+  // return res.x;
+}
+
+// fp8x2 -> half2
+template <>
+__inline__ __device__ uint32_t
+scaled_vec_conversion<uint32_t, uint16_t>(const uint16_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint16_t u16[2];
+    uint32_t u32;
+  } res;
+  res.u16[0] = scaled_vec_conversion<uint16_t, uint8_t>((uint8_t)a, scale, kv_type);
+  res.u16[1] = scaled_vec_conversion<uint16_t, uint8_t>((uint8_t)(a >> 8U), scale, kv_type);
+  return res.u32;
+  // [[maybe_unused]] __half2_raw h2r =
+  //     __hip_cvt_fp8x2_to_halfraw2(a, fp8_type::__default_interpret);
+  // union {
+  //   __half2_raw h2r;
+  //   uint32_t ui32;
+  // } tmp;
+  // tmp.h2r = __hip_cvt_fp8x2_to_halfraw2(a, fp8_type::__default_interpret);
+  // tmp.h2r.x.data *= scale;
+  // tmp.h2r.y.data *= scale;
+  // return tmp.ui32;
+}
+
+// fp8x4 -> half2x2
+template <>
+__inline__ __device__ uint2
+scaled_vec_conversion<uint2, uint32_t>(const uint32_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint2 u32x2;
+    uint32_t u32[2];
+  } tmp;
+  tmp.u32[0] = scaled_vec_conversion<uint32_t, uint16_t>((uint16_t)a, scale, kv_type);
+  tmp.u32[1] = scaled_vec_conversion<uint32_t, uint16_t>((uint16_t)(a >> 16U), scale, kv_type);
+  return tmp.u32x2;
+}
+
+// fp8x8 -> half2x4
+template <>
+__inline__ __device__ uint4 scaled_vec_conversion<uint4, uint2>(const uint2& a,
+                                                                float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint4 u64x2;
+    uint2 u64[2];
+  } tmp;
+  tmp.u64[0] = scaled_vec_conversion<uint2, uint32_t>(a.x, scale, kv_type);
+  tmp.u64[1] = scaled_vec_conversion<uint2, uint32_t>(a.y, scale, kv_type);
+  return tmp.u64x2;
 }
 
 // half -> fp8
@@ -97,6 +334,62 @@ scaled_vec_conversion<uint8_t, uint16_t>(const uint16_t& a, float scale, Fp8KVCa
   }
 }
 
+// halfx2 -> fp8x2
+template <>
+__inline__ __device__ uint16_t
+scaled_vec_conversion<uint16_t, uint32_t>(const uint32_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint8_t ui8[2];
+    uint16_t ui16;
+  } tmp;
+  union {
+    uint32_t ui32;
+    half2 h2r;
+  } tmp_a;
+  tmp_a.ui32 = a;
+  tmp.ui8[0] = scaled_vec_conversion<uint8_t, uint16_t>(tmp_a.h2r.data[0], scale, kv_type);
+  tmp.ui8[1] = scaled_vec_conversion<uint8_t, uint16_t>(tmp_a.h2r.data[1], scale, kv_type);
+  return tmp.ui16;
+  // union {
+  //   uint32_t ui32;
+  //   __half2_raw h2r;
+  // } tmp;
+  // tmp.ui32 = a;
+  // tmp.h2r.x.data /= scale;
+  // tmp.h2r.y.data /= scale;
+  // return __hip_cvt_halfraw2_to_fp8x2(tmp.h2r, fp8_type::__default_saturation,
+  //                                    fp8_type::__default_interpret);
+}
+
+// half2x2 -> fp8x4
+template <>
+__inline__ __device__ uint32_t
+scaled_vec_conversion<uint32_t, uint2>(const uint2& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint16_t ui16[2];
+    uint32_t ui32;
+  } tmp;
+  tmp.ui16[0] = scaled_vec_conversion<uint16_t, uint32_t>(a.x, scale, kv_type);
+  tmp.ui16[1] = scaled_vec_conversion<uint16_t, uint32_t>(a.y, scale, kv_type);
+  return tmp.ui32;
+}
+
+// half2x4 -> fp8x8
+template <>
+__inline__ __device__ uint2 scaled_vec_conversion<uint2, uint4>(const uint4& a,
+                                                                float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint2 ui2[2];
+    uint4 ui4;
+  } tmp;
+  tmp.ui4 = a;
+  uint2 res;
+  res.x = scaled_vec_conversion<uint32_t, uint2>(tmp.ui2[0], scale, kv_type);
+  res.y = scaled_vec_conversion<uint32_t, uint2>(tmp.ui2[1], scale, kv_type);
+  return res;
+}
+
+// bf16 -> fp8
 template <>
 __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, __hip_bfloat16>(
     const __nv_bfloat16& a, float scale, Fp8KVCacheDataType kv_type) {
@@ -108,9 +401,90 @@ __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, __hip_bfloat16>(
       }
 }
 
+// bf16x2 -> fp8x2
+template <>
+__inline__ __device__ uint16_t scaled_vec_conversion<uint16_t, __nv_bfloat162>(
+    const __nv_bfloat162& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint8_t ui8[2];
+    uint16_t ui16;
+  } tmp;
+  tmp.ui8[0] = scaled_vec_conversion<uint8_t, __nv_bfloat16>(a.x, scale, kv_type);
+  tmp.ui8[1] = scaled_vec_conversion<uint8_t, __nv_bfloat16>(a.y, scale, kv_type);
+  return tmp.ui16;
+}
+
+// bf16x4 -> fp8x4
+template <>
+__inline__ __device__ uint32_t
+scaled_vec_conversion<uint32_t, bf16_4_t>(const bf16_4_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint16_t ui16[2];
+    uint32_t ui32;
+  } tmp;
+  tmp.ui16[0] = scaled_vec_conversion<uint16_t, __nv_bfloat162>(a.x, scale, kv_type);
+  tmp.ui16[1] = scaled_vec_conversion<uint16_t, __nv_bfloat162>(a.y, scale, kv_type);
+  return tmp.ui32;
+}
+
+// bf16x8 -> fp8x8
+template <>
+__inline__ __device__ uint2
+scaled_vec_conversion<uint2, bf16_8_t>(const bf16_8_t& a, float scale, Fp8KVCacheDataType kv_type) {
+  uint2 res;
+  res.x = scaled_vec_conversion<uint32_t, bf16_4_t>({a.x, a.y}, scale, kv_type);
+  res.y = scaled_vec_conversion<uint32_t, bf16_4_t>({a.z, a.w}, scale, kv_type);
+  return res;
+}
+
+// float -> fp8
+template <>
+__inline__ __device__ uint8_t
+scaled_vec_conversion<uint8_t, float>(const float& a, float scale, Fp8KVCacheDataType kv_type) {
+  if (kv_type == Fp8KVCacheDataType::kFp8E4M3) {
+    return float_to_fp8_e4m3(a / scale);
+  } else {
+    return float_to_fp8_e5m2(a / scale);
+  }
+  // return __hip_cvt_float_to_fp8(a / scale, fp8_type::__default_saturation,
+  //                               fp8_type::__default_interpret);
+}
+
+// floatx2 -> fp8x2
+template <>
+__inline__ __device__ uint16_t
+scaled_vec_conversion<uint16_t, float2>(const float2& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint8_t ui8[2];
+    uint16_t ui16;
+  } tmp;
+  tmp.ui8[0] = scaled_vec_conversion<uint8_t, float>(a.x, scale, kv_type);
+  tmp.ui8[1] = scaled_vec_conversion<uint8_t, float>(a.y, scale, kv_type);
+  return tmp.ui16;
+  // return __hip_cvt_float2_to_fp8x2(a / scale, fp8_type::__default_saturation,
+  //                                  fp8_type::__default_interpret);
+}
+
+// floatx4 -> fp8x4
+template <>
+__inline__ __device__ uint32_t
+scaled_vec_conversion<uint32_t, float4>(const float4& a, float scale, Fp8KVCacheDataType kv_type) {
+  union {
+    uint16_t ui16[2];
+    uint32_t ui32;
+  } tmp;
+  tmp.ui16[0] = scaled_vec_conversion<uint16_t, float2>({a.x, a.y}, scale, kv_type);
+  tmp.ui16[1] = scaled_vec_conversion<uint16_t, float2>({a.z, a.w}, scale, kv_type);
+  return tmp.ui32;
+}
+
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
 __device__ __forceinline__ Tout scaled_convert(const Tin& val, const float scale) {
-  return scaled_vec_conversion<Tout, Tin>(val, scale, kv_dt);
+  if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E4M3 || kv_dt == Fp8KVCacheDataType::kFp8E5M2) {
+    return scaled_vec_conversion<Tout, Tin>(val, scale, kv_dt);
+  }
+  assert(false);
+  return {};  // Squash missing return statement warning
 }
 
 }

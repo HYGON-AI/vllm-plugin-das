@@ -122,6 +122,8 @@ def flash_mla_with_kvcache_fp8(
             descale_k,
         )
     else:
+        if kv_cache_dtype == "fp8":
+                kv_cache_dtype = "fp8_e4m3"
         out, softmax_lse = flash_mla_cuda.fwd_kvcache_quantization_mla( 
             q,
             k_cache,
