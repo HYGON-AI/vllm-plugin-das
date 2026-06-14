@@ -146,13 +146,25 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
     except Exception:
         pass
 
-    return OLD_IMPORT_HOOK(
+    module = OLD_IMPORT_HOOK(
         module_name,
         globals=globals,
         locals=locals,
         fromlist=fromlist,
         level=level
     )
+
+    if module_name == "vllm.tokenizers.hf":
+        try:
+            from .patches.patch_deepseek_r1_distill_llama_70b_tokenizer import (
+                patch_deepseek_r1_distill_llama_70b_tokenizer,
+            )
+
+            patch_deepseek_r1_distill_llama_70b_tokenizer()
+        except Exception:
+            pass
+
+    return module
 
 def import_hook():
     """Apply import hook for VLLM hcu"""
@@ -177,11 +189,15 @@ def patch_module_class_function():
     from .patches.patch_weight_utils_skip_debug import (
         patch_safetensors_weights_iterator,
     )
+    from .patches.patch_deepseek_r1_distill_llama_70b_tokenizer import (
+        patch_deepseek_r1_distill_llama_70b_tokenizer,
+    )
     patch_aiter_moe_asm()
     patch_fp8_scaled_mm()
     patch_hcu_lora_column_parallel_linear()
     patch_qwen35_lora_disable_piecewise_cudagraph()
     patch_safetensors_weights_iterator()
+    patch_deepseek_r1_distill_llama_70b_tokenizer()
 
 #自定义函数或者类的补丁
 def patch_fuction_class(custom_function):
