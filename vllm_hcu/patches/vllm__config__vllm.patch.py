@@ -25,4 +25,15 @@ PATCHES = [
 
 '''
 ),
+(
+'''
+        model_config.hf_config = hf_config
+        model_config.model_arch_config = model_config.get_model_arch_config()
+''',
+'''
+        model_config.hf_config = hf_config
+        model_config.hf_text_config = model_config.hf_config.get_text_config()
+        model_config.model_arch_config = model_config.get_model_arch_config()
+''',
+),
 ]
