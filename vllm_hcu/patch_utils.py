@@ -137,12 +137,11 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
                 sys.modules[module_name] = module
                 sys.modules[target_module] = module
                 return module
-            
+
             module = importlib.import_module(target_module)
             sys.modules[module_name] = module
             sys.modules[target_module] = module
             return module
-            
     except Exception:
         pass
 
@@ -156,10 +155,14 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
 
     if module_name == "vllm.tokenizers.hf":
         try:
+            from .patches.patch_kimi_k25_tokenizer_regex import (
+                patch_kimi_k25_tokenizer_regex,
+            )
             from .patches.patch_deepseek_r1_distill_llama_70b_tokenizer import (
                 patch_deepseek_r1_distill_llama_70b_tokenizer,
             )
 
+            patch_kimi_k25_tokenizer_regex()
             patch_deepseek_r1_distill_llama_70b_tokenizer()
         except Exception:
             pass
@@ -189,11 +192,15 @@ def patch_module_class_function():
     from .patches.patch_weight_utils_skip_debug import (
         patch_safetensors_weights_iterator,
     )
+    from .patches.patch_kimi_k25_vision_chunk_prompt import (
+        patch_kimi_k25_vision_chunk_prompt_updates,
+    )
     patch_aiter_moe_asm()
     patch_fp8_scaled_mm()
     patch_hcu_lora_column_parallel_linear()
     patch_qwen35_lora_disable_piecewise_cudagraph()
     patch_safetensors_weights_iterator()
+    patch_kimi_k25_vision_chunk_prompt_updates()
 
 #自定义函数或者类的补丁
 def patch_fuction_class(custom_function):
