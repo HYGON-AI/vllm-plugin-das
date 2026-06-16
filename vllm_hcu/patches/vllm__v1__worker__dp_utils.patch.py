@@ -5,19 +5,12 @@
 
 PATCHES = [
     (
-        """from vllm.logger import init_logger
-from vllm.v1.worker.ubatch_utils import (""",
-        """from vllm.logger import init_logger
-import vllm_hcu.platforms.envs as henvs
-from vllm.v1.worker.ubatch_utils import (""",
-    ),
-    (
         """    if parallel_config.data_parallel_size == 1:
         # Early exit.
         return False, None, cudagraph_mode""",
         """    if (
         parallel_config.data_parallel_size == 1
-        or henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_low_latency"
+        or parallel_config.all2all_backend == "deepep_low_latency"
     ):
         # Early exit.
         return False, None, cudagraph_mode""",

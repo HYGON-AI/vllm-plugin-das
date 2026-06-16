@@ -59,7 +59,6 @@ from typing import Callable, Optional
 from compressed_tensors.quantization import (QuantizationStrategy)
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
-import vllm_hcu.platforms.envs as henvs 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from torch.nn.parameter import Parameter
@@ -79,7 +78,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEPrepareAndFinalizeModular,
     FusedMoeWeightScaleSupported,
 )
-
+from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
 
 logger = init_logger(__name__)
 
@@ -198,10 +197,11 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
         parallel_config = vllm_config.parallel_config
         self.dp_size = get_dp_group().world_size
         self.use_deepep = self.dp_size > 1 and parallel_config.enable_expert_parallel and \
-            (henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_high_throughput" or \
-             henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_low_latency" or \
-             henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_auto")
-        
+            parallel_config.all2all_backend in (
+                "deepep_high_throughput",
+                "deepep_low_latency",
+            )
+
         if self.use_deepep:
             all2all_manager = get_ep_group().device_communicator.all2all_manager
             assert all2all_manager is not None
@@ -217,7 +217,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             a2_scale=layer.w2_input_scale,
             per_act_token_quant=True,
             per_out_ch_quant=False,
-            block_shape=[256, 256] if self.use_deepep else None,
+            block_shape=None,
         )
 
 
@@ -276,12 +276,17 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_deepep:
+            # FP8 DeepEP (HT + LL): pack full [E, N, K] -> 6D layout.
+            w1_marlin = pack_int8_weight_enk_to_w6_low_latency(layer.w13_weight)
+            w2_marlin = pack_int8_weight_enk_to_w6_low_latency(layer.w2_weight)
+            layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
+            layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
+            return
+
         w1_marlin_list = []
         for ii in range(layer.w13_weight.shape[0]):
-            if not self.use_deepep:
-                w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
-            else:
-                w1_marlin_in = weight8bit_nt_kpack2_marlin2(layer.w13_weight[ii])
+            w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
             w1_marlin_list.append(w1_marlin_in.float() if w1_marlin_in.dtype == torch.float8_e4m3fn else w1_marlin_in)
         w1_marlin = torch.stack(w1_marlin_list, dim=0)
         w1_marlin = fp32_to_fp8_e4m3fn(w1_marlin)
@@ -289,10 +294,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
         del w1_marlin_list
         w2_marlin_list = []
         for ii in range(layer.w2_weight.shape[0]):
-            if not self.use_deepep:
-                w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
-            else:
-                w2_marlin_in = weight8bit_nt_kpack2_marlin2(layer.w2_weight[ii])
+            w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
             w2_marlin_list.append(w2_marlin_in.float() if w2_marlin_in.dtype == torch.float8_e4m3fn else w2_marlin_in)
         w2_marlin = torch.stack(w2_marlin_list, dim=0)
         w2_marlin = fp32_to_fp8_e4m3fn(w2_marlin)
@@ -379,10 +381,10 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
         layer: torch.nn.Module,
     ) -> FusedMoEExpertsModular:
-        from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
             BatchedDeepGemmExperts,
         )
-        from vllm.model_executor.layers.fused_moe.deep_gemm_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
             DeepGemmExperts,
         )
 
@@ -443,9 +445,10 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         parallel_config = vllm_config.parallel_config
         self.dp_size = get_dp_group().world_size
         self.use_deepep = self.dp_size > 1 and parallel_config.enable_expert_parallel and \
-            (henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_high_throughput" or \
-             henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_low_latency" or \
-             henvs.VLLM_HCU_ALL2ALL_BACKEND == "deepep_auto")
+            parallel_config.all2all_backend in (
+                "deepep_high_throughput",
+                "deepep_low_latency",
+            )
         if self.use_deepep:
             all2all_manager = get_ep_group().device_communicator.all2all_manager
             assert all2all_manager is not None
@@ -465,7 +468,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             per_act_token_quant=True,
-            block_shape=[256, 256] if self.use_deepep else None,
+            block_shape=None,
         )
         
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
@@ -751,10 +754,10 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
         layer: torch.nn.Module,
     ) -> FusedMoEExpertsModular:
-        from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
             BatchedDeepGemmExperts,
         )
-        from vllm.model_executor.layers.fused_moe.deep_gemm_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
             DeepGemmExperts,
         )
 

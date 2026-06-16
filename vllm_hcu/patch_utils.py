@@ -40,7 +40,7 @@ MODULE_EXCHANGE_LAZY_MIN_DEPTH: int = 2
 
 # 官方模块名 -> vllm_hcu 实现模块名
 MODULE_EXCHANGE_MAP: dict[str, str] = {
-    "vllm.model_executor.layers.fused_moe.modular_kernel": "vllm_hcu.model_executor.layers.fused_moe.modular_kernel",
+    #"vllm.model_executor.layers.fused_moe.modular_kernel": "vllm_hcu.model_executor.layers.fused_moe.modular_kernel",
     "vllm.model_executor.layers.fused_moe.deep_gemm_utils": "vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils",
     "vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe": "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
     "vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe": "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",

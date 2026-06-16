@@ -22,14 +22,13 @@ if TYPE_CHECKING:
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
-    # EP / MoE all2all backend (same env name as upstream vLLM when registered there).
-    VLLM_HCU_ALL2ALL_BACKEND: str | None = None
     VLLM_HCU_USE_KVCACHE_E5M2 : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
+    VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
@@ -53,9 +52,6 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
-
-    # Expert-parallel all2all backend. Unset -> None (use ParallelConfig / CLI in caller).
-    "VLLM_HCU_ALL2ALL_BACKEND": lambda: os.environ.get("VLLM_HCU_ALL2ALL_BACKEND"),
 
     # If set, vLLM will transpose weight to use nn layout
     "VLLM_USE_NN":
@@ -147,6 +143,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "True").lower() in
                     ("true", "1")),
+
+    # DeepEP HT permute: use lightop op.ep_scatter when True (also requires
+    # VLLM_HCU_USE_CUSTOM_OPS), triton kernels when False.
+    "VLLM_HCU_USE_LIGHTOP_EP_SCATTER":
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_EP_SCATTER", "True").lower() in
+                 ("true", "1")),
 
     # If use fused rmsnorm and quant, please set True
     "VLLM_HCU_USE_FUSED_RMS_QUANT":

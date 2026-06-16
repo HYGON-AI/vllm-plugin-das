@@ -39,17 +39,21 @@ from vllm.utils.deep_gemm import (
     get_mk_alignment_for_contiguous_layout,
     is_deep_gemm_supported,
     m_grouped_fp8_fp4_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nt_contiguous,
+    #m_grouped_fp8_gemm_nt_contiguous,
 )
 from vllm.utils.import_utils import has_deep_gemm
 
-from lightop import fuse_silu_mul_quant
+from lightop import fuse_silu_mul_quant, fuse_silu_mul_fp8_quant
 if has_deep_gemm():
-    from deepgemm import m_grouped_i8_gemm_nt_contiguous
+    from deepgemm import m_grouped_i8_gemm_nt_contiguous, m_grouped_fp8_gemm_nt_contiguous
 else:
     from lightop import m_grouped_w8a8_gemm_nt_contig_asm as m_grouped_i8_gemm_nt_contiguous
 
 logger = init_logger(__name__)
+
+# HT EP: per-expert token count padding (matches deep_gemm_utils BLOCK_E).
+# Not FusedMoEQuantConfig.block_shape (that flag is for block quantization only).
+_HCU_HT_EP_TOKEN_ALIGNMENT = 256
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
@@ -129,7 +133,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig, N: int = -1, K: int = -1):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        if quant_config.use_fp8_w8a8 or quant_config.use_fp8_w8a16:
+        if quant_config.use_fp8_w8a16:
             assert quant_config.block_shape == get_mk_alignment_for_contiguous_layout()
             assert quant_config.quant_dtype == torch.float8_e4m3fn
             assert not quant_config.per_act_token_quant
@@ -191,8 +195,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        assert self.block_shape is not None
-        block_m = self.block_shape[0]
+
+        block_m = _HCU_HT_EP_TOKEN_ALIGNMENT
         M_sum = compute_aligned_M(
             M, topk, local_num_experts, block_m, expert_tokens_meta
         )
@@ -274,30 +278,27 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     ):
         assert a1q_scale is not None
         assert a2_scale is None
-        assert self.block_shape is not None
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
         a1q = hidden_states
-        _, N, K = w1.size()
+        #_, N, K = w1.size()
 
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
         # assert w2.size(1) == K
-        
         if self.N > 0:
             N = self.N
             K = self.K
 
-        use_fp8 = self.quant_config.use_fp8_w8a16 or self.quant_config.use_fp8_w8a8
-        
+        use_fp8 = self.quant_config.use_fp8_w8a16 or self.quant_config.use_fp8_w8a8     
         M_sum = compute_aligned_M(
             M=topk_ids.size(0),
             num_topk=topk_ids.size(1),
             local_num_experts=local_num_experts,
-            alignment=get_mk_alignment_for_contiguous_layout()[0] if use_fp8 else self.block_shape[0],
+            alignment=_HCU_HT_EP_TOKEN_ALIGNMENT,
             expert_tokens_meta=expert_tokens_meta,
         )
 
@@ -320,14 +321,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             m_grouped_fp8_gemm_nt_contiguous(
                 (a1q, a1q_scale), (w1, self.w1_scale), mm1_out, expert_ids
             )
-
-            activation_out_dim = self.adjust_N_for_activation(N, activation)
-            quant_out = _resize_cache(
-                workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
-            )
-            a2q, a2q_scale = self._act_mul_quant(
-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
-            )
+            
+            a2q, a2q_scale = fuse_silu_mul_fp8_quant(mm1_out, fp8type=0)
 
             mm2_out = _resize_cache(workspace2, (M_sum, K))
             m_grouped_fp8_gemm_nt_contiguous(

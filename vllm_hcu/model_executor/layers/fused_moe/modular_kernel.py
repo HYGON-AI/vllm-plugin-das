@@ -802,9 +802,16 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         require a specialized implementation, like MarlinExperts, they are free
         to override this function.
         """
-        assert len(w1.shape) == 3 and len(w2.shape) == 3
-        E, N, _ = w1.shape
-        K = a1.size(-1)
+        if w1.dim() == 6:
+            assert w2.dim() == 6
+            E = w1.size(0)
+            # [E, K/64, N/16, 4, 16, 16] packed layout
+            N = w1.size(2) * w1.size(4)
+            K = w1.size(1) * w1.size(3) * w1.size(5)
+        else:
+            assert len(w1.shape) == 3 and len(w2.shape) == 3
+            E, N, _ = w1.shape
+            K = a1.size(-1)
 
         if a1.dim() == 2:
             # Make sure we are using the correct a1 (pre-permute).
@@ -1378,7 +1385,10 @@ class FusedMoEKernelModularImpl:
         else:
             self.alt_event.record()
             if self.shared_experts is not None:
-                shared_output = self.shared_experts(se_hidden_states)
+                self.shared_experts.apply(
+                    se_hidden_states,
+                    SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+                )
 
             current_stream = torch.cuda.current_stream()
             with torch.cuda.stream(self.alt_stream):

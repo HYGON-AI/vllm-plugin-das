@@ -13,8 +13,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
 
+import vllm_hcu.platforms.envs as henvs
 from lightop import op
-
 
 def expert_num_tokens_round_up_and_sum(
     expert_num_tokens: torch.Tensor, alignment: int
@@ -32,18 +32,20 @@ def compute_aligned_M(
     alignment: int,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
 ):
+    # Conservative upper bound on permuted rows (M_sum). Safe even when
+    # dispatch meta under-counts vs post-dispatch topk_ids after DeepEP remap.
+    M_sum_upper = (M * num_topk) + local_num_experts * (alignment - 1)
+    M_sum_upper = round_up(M_sum_upper, alignment)
+
     if (expert_tokens_meta is not None) and (
         expert_tokens_meta.expert_num_tokens_cpu is not None
     ):
-        return expert_num_tokens_round_up_and_sum(
+        M_sum_meta = expert_num_tokens_round_up_and_sum(
             expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
         )
+        return max(M_sum_meta, M_sum_upper)
 
-    # expert_num_tokens information is not available on the cpu.
-    # compute the max required size.
-    M_sum = (M * num_topk) + local_num_experts * (alignment - 1)
-    M_sum = round_up(M_sum, alignment)
-    return M_sum
+    return M_sum_upper
 
 
 @triton.jit
@@ -58,12 +60,10 @@ def round_up_128(x: int) -> int:
     y = 128
     return ((x + y - 1) // y) * y
 
-
 @triton.jit
 def round_up_256(x: int) -> int:
     y = 256
     return ((x + y - 1) // y) * y
-
 
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
@@ -82,7 +82,7 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    # tokens_per_expert = round_up_128(tokens_per_expert)
+    #tokens_per_expert = round_up_128(tokens_per_expert)
     tokens_per_expert = round_up_256(tokens_per_expert)
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
 
@@ -199,8 +199,9 @@ def ep_scatter(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
 ):
-    BLOCK_E = 256  # token num of per expert is aligned to 256
+    # BLOCK_E = 128  # token num of per expert is aligned to 128
     # BLOCK_D = 128  # block size of quantization
+    BLOCK_E = 256  # token num of per expert is aligned to 256
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
@@ -211,7 +212,12 @@ def ep_scatter(
     assert m_indices.shape[0] % BLOCK_E == 0
     assert expert_start_loc.shape[0] == num_experts
 
-    if hasattr(op, "ep_scatter"):
+    use_lightop_ep_scatter = (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
+        and hasattr(op, "ep_scatter")
+    )
+    if use_lightop_ep_scatter:
         op.ep_scatter(
             recv_x, recv_x_scale,
             recv_topk, expert_map,
@@ -270,6 +276,7 @@ def ep_scatter(
 @triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
+    input_num_rows,
     input_tensor,
     input_tensor_stride0,
     input_tensor_stride1,
@@ -293,6 +300,7 @@ def _fwd_kernel_ep_gather(
     cur_block_int32 = tl.program_id(0)
     cur_block = cur_block_int32.to(tl.int64)
     start_cur_token_int32 = tl.program_id(1)
+
     grid_num = tl.num_programs(1)
 
     for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):
@@ -312,17 +320,22 @@ def _fwd_kernel_ep_gather(
                 source_token_index_int32 = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
-                source_token_index = source_token_index_int32.to(tl.int64)
-                acc_weight = tl.load(
-                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
-                )
-                tmp = tl.load(
-                    input_tensor
-                    + source_token_index * input_tensor_stride0
-                    + cur_block * BLOCK_D
-                    + off_d
-                )
-                accumulator += tmp.to(tl.float32) * acc_weight
+                if (source_token_index_int32 >= 0) and (
+                    source_token_index_int32 < input_num_rows
+                ):
+                    source_token_index = source_token_index_int32.to(tl.int64)
+                    acc_weight = tl.load(
+                        recv_topk_weight
+                        + cur_token * recv_topk_weight_stride0
+                        + topk_index
+                    )
+                    tmp = tl.load(
+                        input_tensor
+                        + source_token_index * input_tensor_stride0
+                        + cur_block * BLOCK_D
+                        + off_d
+                    )
+                    accumulator += tmp.to(tl.float32) * acc_weight
 
         tl.store(
             output_tensor
@@ -344,6 +357,7 @@ def ep_gather(
 ):
     num_warps = 2
     num_tokens = output_tensor.shape[0]
+    input_num_rows = input_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     BLOCK_D = min(hidden_size, 1024)
     assert hidden_size % BLOCK_D == 0
@@ -351,6 +365,7 @@ def ep_gather(
 
     _fwd_kernel_ep_gather[grid](
         num_tokens,
+        input_num_rows,
         input_tensor,
         input_tensor.stride(0),
         input_tensor.stride(1),
@@ -426,15 +441,15 @@ def deepgemm_moe_permute(
         device=device,
         dtype=torch.int32,
     )
-    inv_perm = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
+    inv_perm = torch.full(
+        topk_ids.shape, fill_value=-1, device=device, dtype=torch.int32
+    )
 
-    expert_num_tokens = None
-    if expert_tokens_meta is not None:
-        expert_num_tokens = expert_tokens_meta.expert_num_tokens
-    else:
-        expert_num_tokens = count_expert_num_tokens(
-            topk_ids, local_num_experts, expert_map
-        )
+    # Derive per-expert counts from topk_ids so ep_scatter layout matches the
+    # indices written into inv_perm (dispatch meta can diverge after remap).
+    expert_num_tokens = count_expert_num_tokens(
+        topk_ids, local_num_experts, expert_map
+    )
 
     ep_scatter(
         recv_x=aq,
