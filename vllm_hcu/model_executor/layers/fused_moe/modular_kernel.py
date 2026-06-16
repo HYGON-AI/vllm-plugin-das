@@ -494,10 +494,10 @@ class FusedMoEExperts(ABC):
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
         self.expected_m = max_num_tokens
-    
+
     def set_expected_m(self, expected_m: int) -> None:
         self.expected_m = expected_m
-        
+
     def get_expected_m(self) -> int:
         return self.expected_m
 
@@ -1141,12 +1141,14 @@ class FusedMoEKernelModularImpl:
     def _maybe_apply_shared_experts(
         self,
         shared_experts_input: torch.Tensor | None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         if self.shared_experts is not None:
             assert shared_experts_input is not None
             self.shared_experts.apply(
                 shared_experts_input,
                 SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+                x_and_scale_quanted=x_and_scale_quanted,
             )
 
     def _prepare(
@@ -1157,6 +1159,8 @@ class FusedMoEKernelModularImpl:
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        prequanted_a1_scale: torch.Tensor | None = None,
+        prequanted_a1: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1168,6 +1172,16 @@ class FusedMoEKernelModularImpl:
         The _prepare method is a wrapper around self.prepare_finalize.prepare
         that handles DBO and async.
         """
+        use_all2all_kernels = (
+            self.moe_parallel_config is not None
+            and self.moe_parallel_config.use_all2all_kernels
+        )
+        if (
+            prequanted_a1
+            and not use_all2all_kernels
+        ):
+            return hidden_states, prequanted_a1_scale, None, topk_ids, topk_weights
+
         num_tokens = hidden_states.shape[0] if hidden_states is not None else None
         num_dispatchers = getattr(self.fused_experts, "num_dispatchers", None)
         topk = topk_ids.shape[1] if topk_ids is not None else None
@@ -1193,7 +1207,7 @@ class FusedMoEKernelModularImpl:
                 topk,
                 global_num_experts,
             )
-            
+
         if not self.prepare_finalize.supports_async():
             # We shouldn't be running an a2a kernel that doesn't
             # support async prepare/finalize
@@ -1356,6 +1370,7 @@ class FusedMoEKernelModularImpl:
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         shared_experts_input: torch.Tensor | None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         The _finalize method is a wrapper around self.prepare_finalize.finalize
@@ -1388,6 +1403,7 @@ class FusedMoEKernelModularImpl:
                 self.shared_experts.apply(
                     se_hidden_states,
                     SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+                    x_and_scale_quanted=x_and_scale_quanted,
                 )
 
             current_stream = torch.cuda.current_stream()
@@ -1423,7 +1439,7 @@ class FusedMoEKernelModularImpl:
                         hook()
 
                 receiver()
-                
+
                 self.alt_event.record()
             current_stream.wait_event(self.alt_event)
 
@@ -1441,6 +1457,8 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         shared_experts_input: torch.Tensor | None = None,
+        quanted_hidden_states: torch.Tensor | None = None,
+        scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1481,12 +1499,16 @@ class FusedMoEKernelModularImpl:
             global_num_experts = local_num_experts
 
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
-            hidden_states,
+            quanted_hidden_states
+            if quanted_hidden_states is not None
+            else hidden_states,
             topk_weights,
             topk_ids,
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
+            prequanted_a1_scale=scale,
+            prequanted_a1=quanted_hidden_states is not None,
         )
 
         fused_out = self._fused_experts(
@@ -1514,6 +1536,11 @@ class FusedMoEKernelModularImpl:
             topk_ids,
             apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
+            x_and_scale_quanted=(
+                (quanted_hidden_states, scale)
+                if quanted_hidden_states is not None and scale is not None
+                else None
+            ),
         )
 
 
@@ -1714,6 +1741,8 @@ class FusedMoEKernel:
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         shared_experts_input: torch.Tensor | None = None,
+        quanted_hidden_states: torch.Tensor | None = None,
+        scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1727,4 +1756,6 @@ class FusedMoEKernel:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
+            quanted_hidden_states=quanted_hidden_states,
+            scale=scale,
         )

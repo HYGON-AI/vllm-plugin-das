@@ -32,6 +32,9 @@ PATCHES = [
     enable_lightly_cplb: bool = False
     """Use lightly context parallel load balancing."""
 
+    enable_custom_sp: bool = False
+    """Use HCU custom runtime sequence parallelism."""
+
 '''
 ),
 ################ lightly cp###########################

@@ -21,7 +21,41 @@ PATCHES = [
 """,
 """
         use_nn_moe: bool | None = False,
+        i_q: torch.Tensor | None = None,
+        i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
+""",
+),
+(
+"""
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            expert_map=None if self.disable_expert_map else layer.expert_map,
+            shared_experts_input=shared_experts_input,
+        )
+""",
+"""
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            expert_map=None if self.disable_expert_map else layer.expert_map,
+            shared_experts_input=shared_experts_input,
+            quanted_hidden_states=i_q,
+            scale=i_s,
+        )
 """,
 ),
 ]

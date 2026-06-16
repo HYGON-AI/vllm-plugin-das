@@ -23,11 +23,11 @@ def apply_int8_linear(
     input_zero_point: torch.Tensor | None = None,
     azp_adj: torch.Tensor | None  = None,
     bias: torch.Tensor | None = None,
-    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None, 
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     from lmslim import quant_ops
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-    
+
     if (henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT or henvs.VLLM_HCU_USE_FUSED_RMS_QUANT) and \
         henvs.VLLM_HCU_USE_CUSTOM_OPS and \
         x_and_scale_quanted is not None:
@@ -61,7 +61,7 @@ def apply_int8_linear(
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer, x, bias)
 """,
-"""        
+"""
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM:
             layer.weight.data = layer.weight.data.T
@@ -72,7 +72,7 @@ def apply_int8_linear(
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None,
-        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None, 
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM:
             return apply_int8_linear(input=x,

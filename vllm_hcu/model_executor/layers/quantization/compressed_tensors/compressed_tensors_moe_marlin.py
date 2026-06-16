@@ -313,6 +313,8 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             activation: str = "silu",
             routed_scaling_factor: Optional[float] = None,
             shared_output: Optional[torch.Tensor] = None,
+            i_q: torch.Tensor | None = None,
+            i_s: torch.Tensor | None = None,
     ):
         from lmslim.layers.fused_moe.fuse_moe_fp8_marlin import fused_experts_impl_fp8_marlin
         return fused_experts_impl_fp8_marlin(
@@ -333,6 +335,8 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             use_nn_moe=False,
+            i_q=i_q,
+            i_s=i_s,
             shared_output=shared_output,
             routed_scaling_factor=routed_scaling_factor)
 
@@ -358,6 +362,8 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             logical_to_physical_map: Optional[torch.Tensor] = None,
             logical_replica_count: Optional[torch.Tensor] = None,
             shared_output: Optional[torch.Tensor] = None,
+            i_q: torch.Tensor | None = None,
+            i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if enable_eplb:
             raise NotImplementedError(
@@ -374,7 +380,9 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             apply_router_weight_on_input=apply_router_weight_on_input,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
-            shared_output=shared_output, )
+            shared_output=shared_output,
+            i_q=i_q,
+            i_s=i_s, )
 
     def select_gemm_impl(
         self,
@@ -440,7 +448,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             raise ValueError(
                 "For INT8 Fused MoE layers, we require channelwise, "
                 "dynamic per token quantization. Found static input scales.")
-        
+
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         self.dp_size = get_dp_group().world_size
@@ -470,11 +478,11 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             per_act_token_quant=True,
             block_shape=None,
         )
-        
+
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
-        
+
         if self.use_deepep:
             self.N = 2 * intermediate_size_per_partition
             self.K = hidden_size

@@ -74,6 +74,22 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.sp_utils import (
+    configure_hcu_runtime_sp,
+    finalize_attention_output_for_sp,
+    finalize_mlp_output_for_sp,
+    finalize_moe_output_for_sp,
+    gather_tokens_for_sp,
+    hcu_runtime_sp_enabled,
+    prepare_attention_inputs_for_sp,
+    prepare_mlp_inputs_for_sp,
+    prepare_moe_inputs_for_sp,
+    split_positions_for_sp,
+    split_tokens_for_sp,
+    sp_mlp_down_proj_reduce_results,
+    use_sp_mlp_token_gather,
+)
+from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 
 logger = init_logger(__name__)
 
@@ -90,6 +106,7 @@ class HYV3FeedForward(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.use_sp_token_gather = use_sp_mlp_token_gather(reduce_results)
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -102,7 +119,7 @@ class HYV3FeedForward(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
+            reduce_results=sp_mlp_down_proj_reduce_results(reduce_results),
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -110,13 +127,34 @@ class HYV3FeedForward(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
 
-        self.act_fn = SiluAndMul()
-    
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
-        return out
+        self.enable_fuse_silu_mul_quant = henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        weight = getattr(self.gate_up_proj, "weight", None)
+        self.quant_dtype = weight.dtype if weight is not None else None
+
+        if self.enable_fuse_silu_mul_quant:
+            self.act_fn = FusedSiluAndMulAndQuant()
+        else:
+            self.act_fn = SiluAndMul()
+
+    def forward(
+        self,
+        x,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        x, x_and_scale_quanted = prepare_mlp_inputs_for_sp(
+            x, x_and_scale_quanted, self.use_sp_token_gather
+        )
+
+        if self.enable_fuse_silu_mul_quant:
+            gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
+            xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
+            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(x)
+
+        return finalize_mlp_output_for_sp(x, self.use_sp_token_gather)
 
 
 class HYV3MoEFused(nn.Module):
@@ -178,6 +216,7 @@ class HYV3MoEFused(nn.Module):
         scoring_func = "sigmoid"
         e_score_correction_bias = self.expert_bias
 
+        self.runtime_sp = hcu_runtime_sp_enabled()
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -196,6 +235,7 @@ class HYV3MoEFused(nn.Module):
             e_score_correction_bias=e_score_correction_bias,
             n_shared_experts=config.num_shared_experts,
             shared_experts=self.shared_mlp,
+            is_sequence_parallel=self.runtime_sp
         )
 
     def forward(
@@ -205,13 +245,26 @@ class HYV3MoEFused(nn.Module):
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
-
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        (
+            hidden_states,
+            router_logits,
+            gathered_quanted_hidden_states,
+            hidden_states_scale,
+            topk_weights,
+            topk_ids,
+        ) = prepare_moe_inputs_for_sp(hidden_states, router_logits, self.experts)
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            quanted_hidden_states=gathered_quanted_hidden_states,
+            scale=hidden_states_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
         )
+        final_hidden_states = finalize_moe_output_for_sp(final_hidden_states)
         return final_hidden_states.view(orig_shape)
 
 
@@ -233,6 +286,7 @@ class HYV3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.runtime_sp = hcu_runtime_sp_enabled()
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -266,6 +320,7 @@ class HYV3Attention(nn.Module):
             quant_config=quant_config,
             bias=None,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=self.runtime_sp,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -273,6 +328,7 @@ class HYV3Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=self.runtime_sp,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -316,8 +372,12 @@ class HYV3Attention(nn.Module):
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states, x_and_scale_quanted=x_and_scale_quanted)
-        
+
         if self.enable_fused_qkv_split_rms_rope_kvstore and self.use_qk_norm:
+            if self.runtime_sp:
+                raise NotImplementedError(
+                    "Runtime SP is not supported with fused qkv/rms/rope/kvstore."
+                )
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if (cos_sin_cache.device != qkv.device
                     or cos_sin_cache.dtype != qkv.dtype):
@@ -335,23 +395,46 @@ class HYV3Attention(nn.Module):
                                     self.q_norm.variance_epsilon,
                                     is_neox=self.rotary_emb.is_neox_style)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.runtime_sp:
+                q_size = self.total_num_heads * self.head_dim
+                kv_size = self.total_num_kv_heads * self.head_dim
+            else:
+                q_size = self.q_size
+                kv_size = self.kv_size
+            q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
             output_shape = None
             if self.use_qk_norm:
+                q_heads = self.total_num_heads if self.runtime_sp else self.num_heads
+                kv_heads = (
+                    self.total_num_kv_heads if self.runtime_sp else self.num_kv_heads
+                )
                 q_by_head = q.view(
-                    *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+                    *q.shape[:-1], q_heads, self.head_dim
                 )
                 q_by_head = self.q_norm(q_by_head)
                 q = q_by_head.view(q.shape)
 
                 k_by_head = k.view(
-                    *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+                    *k.shape[:-1], kv_heads, self.head_dim
                 )
                 k_by_head = self.k_norm(k_by_head)
                 k = k_by_head.view(k.shape)
             q, k = self.rotary_emb(positions, q, k)
+            if self.runtime_sp:
+                q, k, v = prepare_attention_inputs_for_sp(
+                    q,
+                    k,
+                    v,
+                    self.total_num_heads,
+                    self.total_num_kv_heads,
+                    self.head_dim,
+                )
             attn_output = self.attn(q, k, v, output_shape)
             attn_output = attn_output.view(q.shape[0], -1)
+            if self.runtime_sp:
+                attn_output = finalize_attention_output_for_sp(
+                    attn_output, self.total_num_heads, self.head_dim
+                )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -435,6 +518,9 @@ class HYV3Model(nn.Module):
         quant_config = vllm_config.quant_config
 
         parallel_config = vllm_config.parallel_config
+        configure_hcu_runtime_sp(
+            getattr(parallel_config, "enable_custom_sp", False)
+        )
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
@@ -532,11 +618,15 @@ class HYV3Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+
+            hidden_states = split_tokens_for_sp(hidden_states)
+            positions = split_positions_for_sp(positions)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            positions = split_positions_for_sp(positions)
 
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
@@ -547,10 +637,8 @@ class HYV3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = gather_tokens_for_sp(hidden_states)
 
         return hidden_states
 

@@ -21,9 +21,10 @@ PATCHES = [
 ''',
 '''
     fail_on_environ_validation: bool = False
-    
+
     enable_lightly_cp: bool = ParallelConfig.enable_lightly_cp
     enable_lightly_cplb: bool = ParallelConfig.enable_lightly_cplb
+    enable_custom_sp: bool = ParallelConfig.enable_custom_sp
 '''
 ),
 
@@ -35,6 +36,7 @@ PATCHES = [
             _api_process_rank=self._api_process_rank,
             enable_lightly_cp=self.enable_lightly_cp,
             enable_lightly_cplb=self.enable_lightly_cplb,
+            enable_custom_sp=self.enable_custom_sp,
 '''
 ),
 
@@ -63,6 +65,10 @@ PATCHES = [
         )
         parallel_group.add_argument(
             "--enable-lightly-cplb",
+            action="store_true",
+        )
+        parallel_group.add_argument(
+            "--enable-custom-sp",
             action="store_true",
         )
 '''

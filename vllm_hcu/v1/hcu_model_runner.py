@@ -3347,7 +3347,10 @@ class GPUModelRunner(
         if self.enable_lightly_cp and num_scheduled_tokens > self.lightly_cp_threshold:
             return pad_for_mla_cp(num_scheduled_tokens)
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
+        if (
+            self.compilation_config.pass_config.enable_sp
+            or getattr(self.parallel_config, "enable_custom_sp", False)
+        ) and tp_size > 1:
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
@@ -3763,7 +3766,10 @@ class GPUModelRunner(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
         num_tokens_padded = batch_descriptor.num_tokens
-        if self.compilation_config.pass_config.enable_sp:
+        if (
+            self.compilation_config.pass_config.enable_sp
+            or getattr(self.parallel_config, "enable_custom_sp", False)
+        ):
             assert (
                 batch_descriptor.num_tokens
                 % self.vllm_config.parallel_config.tensor_parallel_size

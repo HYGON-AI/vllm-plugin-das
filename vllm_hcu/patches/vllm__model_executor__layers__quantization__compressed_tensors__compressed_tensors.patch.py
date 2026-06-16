@@ -31,7 +31,7 @@ PATCHES = [
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
-        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None, 
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """
         Use the output of create_weights and the CompressedTensorsScheme

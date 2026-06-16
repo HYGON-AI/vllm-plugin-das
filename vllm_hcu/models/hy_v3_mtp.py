@@ -49,8 +49,14 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm.model_executor.models.hy_v3 import HYV3DecoderLayer, get_spec_layer_idx_from_weight_name
+from vllm_hcu.models.hy_v3 import HYV3DecoderLayer, get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import is_pp_missing_parameter, maybe_prefix
+
+from vllm_hcu.model_executor.layers.sp_utils import (
+    gather_tokens_for_sp,
+    split_positions_for_sp,
+    split_tokens_for_sp,
+)
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -178,13 +184,20 @@ class HYV3MultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+        positions = split_positions_for_sp(positions)
+        previous_hidden_states = split_tokens_for_sp(previous_hidden_states)
+        inputs_embeds = split_tokens_for_sp(inputs_embeds)
+        hidden_states =  self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
         )
+
+        hidden_states = gather_tokens_for_sp(hidden_states)
+
+        return hidden_states
 
     def compute_logits(
         self,

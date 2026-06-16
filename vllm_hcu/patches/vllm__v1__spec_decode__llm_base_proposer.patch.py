@@ -175,4 +175,40 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 ),
 ################ lightly cp###########################
 
+(
+"""
+    def _determine_batch_execution_and_padding(
+""",
+"""
+    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+        # Pad tokens to multiple of tensor_parallel_size when
+        # enabled collective fusion for SP
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if (
+            self.compilation_config.pass_config.enable_sp
+            or getattr(self.vllm_config.parallel_config, "enable_custom_sp", False)
+        ) and tp_size > 1:
+            return round_up(num_scheduled_tokens, tp_size)
+        return num_scheduled_tokens
+
+    def _determine_batch_execution_and_padding(
+""",
+),
+
+(
+"""
+        cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+            num_tokens,
+            valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
+        )
+""",
+"""
+        num_tokens = self._pad_for_sequence_parallelism(num_tokens)
+        cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+            num_tokens,
+            valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
+        )
+""",
+),
+
 ]

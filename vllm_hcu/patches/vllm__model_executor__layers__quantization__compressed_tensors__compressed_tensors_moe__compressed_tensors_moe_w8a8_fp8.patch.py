@@ -47,7 +47,7 @@ logger = init_logger(__name__)
         activation = getattr(layer.activation, "value", layer.activation)
         activation = str(activation)
         cache_key = (x.shape[0], topk_ids.shape[1], x.dtype, activation)
-        
+
         moe_config = self._aiter_moe_config_cache.get(cache_key)
         if moe_config is not None:
             return moe_config
@@ -112,6 +112,27 @@ logger = init_logger(__name__)
 ),
 
 (
+"""    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:""",
+"""    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        i_q: torch.Tensor | None = None,
+        i_s: torch.Tensor | None = None,
+    ) -> torch.Tensor:""",
+),
+
+(
 """
         assert not self.is_monolithic
 """,
@@ -134,8 +155,9 @@ logger = init_logger(__name__)
             )
             routed_scaling_factor = None
             shared_output = None
+
             output = aiter_moe(
-                hidden_states=x,
+                hidden_states=x if i_q is None else i_q,
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights.to(torch.float32),
@@ -147,7 +169,7 @@ logger = init_logger(__name__)
                 w2_scale=layer.w2_weight_scale,
                 w1_zp=None,
                 w2_zp=None,
-                a1_scale=layer.w13_input_scale,
+                a1_scale=layer.w13_input_scale if i_s is None else i_s,
                 a2_scale=layer.w2_input_scale,
                 block_shape=None,
                 global_num_experts=layer.global_num_experts,
@@ -157,6 +179,7 @@ logger = init_logger(__name__)
                     if routed_scaling_factor is not None
                     else 1.0
                 ),
+                output_dtype=None if i_q is None else x.dtype
             )
             if shared_output is not None:
                 output = output + shared_output

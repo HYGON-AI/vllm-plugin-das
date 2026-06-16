@@ -33,6 +33,21 @@ from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.sp_utils import (
+    configure_hcu_runtime_sp,
+    finalize_attention_output_for_sp,
+    finalize_mlp_output_for_sp,
+    finalize_moe_output_for_sp,
+    gather_tokens_for_sp,
+    hcu_runtime_sp_enabled,
+    prepare_attention_inputs_for_sp,
+    prepare_mlp_inputs_for_sp,
+    prepare_moe_inputs_for_sp,
+    split_positions_for_sp,
+    split_tokens_for_sp,
+    sp_mlp_down_proj_reduce_results,
+    use_sp_mlp_token_gather,
+)
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -92,6 +107,9 @@ class Glm4MoeMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.use_sp_token_gather = use_sp_mlp_token_gather(
+            reduce_results and ".shared_experts" not in prefix
+        )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -104,7 +122,9 @@ class Glm4MoeMLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
+            reduce_results=sp_mlp_down_proj_reduce_results(
+                reduce_results and ".shared_experts" not in prefix
+            ),
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -121,8 +141,12 @@ class Glm4MoeMLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-    def forward(self, x, 
+    def forward(self, x,
                 x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None):
+        x, x_and_scale_quanted = prepare_mlp_inputs_for_sp(
+            x, x_and_scale_quanted, self.use_sp_token_gather
+        )
+
         if self.enable_fuse_silu_mul_quant:
             gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
@@ -131,7 +155,8 @@ class Glm4MoeMLP(nn.Module):
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
             x, _ = self.down_proj(x)
-        return x
+
+        return finalize_mlp_output_for_sp(x, self.use_sp_token_gather)
 
 
 class Glm4MoE(nn.Module):
@@ -198,6 +223,7 @@ class Glm4MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        self.runtime_sp = hcu_runtime_sp_enabled()
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=config.n_routed_experts,
@@ -212,23 +238,37 @@ class Glm4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func="sigmoid",
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scale_to_output=True,
+            #apply_routed_scale_to_output=True,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             router_logits_dtype=torch.float32,
+            is_sequence_parallel=self.runtime_sp
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states.to(dtype=torch.float32))
 
+        (
+            hidden_states,
+            router_logits,
+            gathered_quanted_hidden_states,
+            hidden_states_scale,
+            topk_weights,
+            topk_ids,
+        ) = prepare_moe_inputs_for_sp(hidden_states, router_logits, self.experts)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            quanted_hidden_states=gathered_quanted_hidden_states,
+            scale=hidden_states_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
         )
+        final_hidden_states = finalize_moe_output_for_sp(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -250,6 +290,7 @@ class Glm4MoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.runtime_sp = hcu_runtime_sp_enabled()
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -279,6 +320,7 @@ class Glm4MoeAttention(nn.Module):
             bias=qkv_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=self.runtime_sp,
         )
 
         self.o_proj = RowParallelLinear(
@@ -287,6 +329,7 @@ class Glm4MoeAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=self.runtime_sp,
         )
 
         config.rope_parameters.setdefault("partial_rotary_factor", 0.5)
@@ -335,6 +378,10 @@ class Glm4MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states, x_and_scale_quanted=x_and_scale_quanted)
 
         if self.enable_fused_qkv_split_rms_rope_kvstore and self.use_qk_norm:
+            if self.runtime_sp:
+                raise NotImplementedError(
+                    "Runtime SP is not supported with fused qkv/rms/rope/kvstore."
+                )
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if (cos_sin_cache.device != qkv.device
                     or cos_sin_cache.dtype != qkv.dtype):
@@ -352,17 +399,46 @@ class Glm4MoeAttention(nn.Module):
                                     self.q_norm.variance_epsilon,
                                     is_neox=self.rotary_emb.is_neox_style)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.runtime_sp:
+                q_size = self.total_num_heads * self.head_dim
+                kv_size = self.total_num_kv_heads * self.head_dim
+            else:
+                q_size = self.q_size
+                kv_size = self.kv_size
+            q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
             if self.use_qk_norm:
-                q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
-                    q.shape
+                q_heads = self.total_num_heads if self.runtime_sp else self.num_heads
+                kv_heads = (
+                    self.total_num_kv_heads if self.runtime_sp else self.num_kv_heads
                 )
-                k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(
-                    k.shape
+                q_by_head = q.view(
+                    *q.shape[:-1], q_heads, self.head_dim
                 )
+                q_by_head = self.q_norm(q_by_head)
+                q = q_by_head.view(q.shape)
+
+                k_by_head = k.view(
+                    *k.shape[:-1], kv_heads, self.head_dim
+                )
+                k_by_head = self.k_norm(k_by_head)
+                k = k_by_head.view(k.shape)
 
             q, k = self.rotary_emb(positions, q, k)
+            if self.runtime_sp:
+                q, k, v = prepare_attention_inputs_for_sp(
+                    q,
+                    k,
+                    v,
+                    self.total_num_heads,
+                    self.total_num_kv_heads,
+                    self.head_dim,
+                )
             attn_output = self.attn(q, k, v)
+            attn_output = attn_output.view(q.shape[0], -1)
+            if self.runtime_sp:
+                attn_output = finalize_attention_output_for_sp(
+                    attn_output, self.total_num_heads, self.head_dim
+                )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -418,7 +494,12 @@ class Glm4MoeDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.enable_fuse_rmsnorm_quant = henvs.VLLM_HCU_USE_FUSED_RMS_QUANT and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        self.runtime_sp = hcu_runtime_sp_enabled()
+        self.enable_fuse_rmsnorm_quant = (
+            henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and not self.runtime_sp
+        )
         self.quant_dtype = self.self_attn.quant_dtype
         if self.enable_fuse_rmsnorm_quant:
             self.input_layernorm = FusedRMSNormAndQuant(config.hidden_size, eps=config.rms_norm_eps)
@@ -464,7 +545,6 @@ class Glm4MoeDecoderLayer(nn.Module):
 
             hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states,
                                            x_and_scale_quanted=(hidden_states_q, hidden_states_scale))
-        
         if self.enable_fuse_rmsnorm_quant and isinstance(self.mlp, Glm4MoeMLP):
             hidden_states_q, hidden_states_scale, residual = self.post_attention_layernorm(x=hidden_states,
                                                                                            residual=residual,
@@ -492,6 +572,9 @@ class Glm4MoeModel(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        configure_hcu_runtime_sp(
+            getattr(vllm_config.parallel_config, "enable_custom_sp", False)
+        )
         enable_eplb = vllm_config.parallel_config.enable_eplb
         self.config = config
 
@@ -539,11 +622,14 @@ class Glm4MoeModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = split_tokens_for_sp(hidden_states)
+            positions = split_positions_for_sp(positions)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            positions = split_positions_for_sp(positions)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
@@ -554,6 +640,7 @@ class Glm4MoeModel(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = gather_tokens_for_sp(hidden_states)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
