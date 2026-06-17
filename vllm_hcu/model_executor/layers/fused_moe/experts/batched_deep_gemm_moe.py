@@ -729,10 +729,10 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
         assert hidden_states.ndim == 3
-        assert self.block_shape is not None
+        # assert self.block_shape is not None
 
         a1q = hidden_states
-        _, N, K = w1.size()
+        # _, N, K = w1.size()
 
         # assert w2.size(1) == K
 
@@ -751,7 +751,8 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         
         if self.quant_config.use_fp8_w8a16 or self.quant_config.use_fp8_w8a8:
-            m_grouped_fp8_gemm_nt_masked(
+            from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+            m_grouped_fp8_gemm_nt_masked_ll(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
                 workspace1,
@@ -765,7 +766,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 tokens_per_expert=expert_num_tokens,
             )
 
-            m_grouped_fp8_gemm_nt_masked(
+            m_grouped_fp8_gemm_nt_masked_ll(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),
                 output,

@@ -104,7 +104,13 @@ import deep_ep
 """
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
-        expert_x, expert_num_tokens, handle, _, hook = self.buffer.low_latency_dispatch(
+        (
+            expert_x,
+            expert_num_tokens,
+            handle,
+            _,
+            hook,
+        ) = self.buffer.low_latency_dispatch(
             a1,
             dispatch_topk_ids,
             self.max_tokens_per_rank,
@@ -116,7 +122,7 @@ import deep_ep
             **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
             **(
                 dict(x_global_scale=qc_a1_gscale_or_scale)
-                if qc_a1_gscale_or_scale is not None
+                if qc_a1_gscale_or_scale is not None and nvfp4_dispatch
                 else dict()
             ),
             async_finish=False,
