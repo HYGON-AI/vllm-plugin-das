@@ -160,6 +160,17 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
 
+    def set_skip_topk(self, skip: bool):
+        """Toggle skip_topk on all MTP layers with sparse attention."""
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is not None:
+                self_attn = getattr(mtp_block, "self_attn", None)
+                if self_attn is not None:
+                    mla_attn = getattr(self_attn, "mla_attn", None)
+                    if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
+                        mla_attn.skip_topk = skip
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 

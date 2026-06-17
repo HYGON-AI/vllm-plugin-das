@@ -1111,7 +1111,6 @@ class DeepseekV2MLAAttention(nn.Module):
                     _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
                 elif 0 <= layer_id < len(_index_topk_pattern):
                     _skip_topk = _index_topk_pattern[layer_id] == "S"
-
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1332,8 +1331,8 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config,
-                prefix,
+                vllm_config=vllm_config,
+                prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
