@@ -322,7 +322,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 (a1q, a1q_scale), (w1, self.w1_scale), mm1_out, expert_ids
             )
             
-            a2q, a2q_scale = fuse_silu_mul_fp8_quant(mm1_out, fp8type=0)
+            a2q, a2q_scale = fuse_silu_mul_fp8_quant(mm1_out, fp8type=0, expert_ids=expert_ids)
 
             mm2_out = _resize_cache(workspace2, (M_sum, K))
             m_grouped_fp8_gemm_nt_contiguous(
