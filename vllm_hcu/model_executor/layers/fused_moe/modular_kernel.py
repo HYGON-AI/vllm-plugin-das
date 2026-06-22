@@ -107,7 +107,7 @@ class ExpertTokensMetadata:
         expert_num_tokens_list: list[int], device: str
     ) -> "ExpertTokensMetadata":
         expert_num_tokens_cpu = torch.tensor(
-            expert_num_tokens_list, device="cpu", dtype=torch.int32
+            expert_num_tokens_list, device="cpu", dtype=torch.int32, pin_memory=True
         )
         return ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens_cpu.to(device, non_blocking=True),
@@ -1383,9 +1383,6 @@ class FusedMoEKernelModularImpl:
                 shared_experts_input is the original hidden_states (full
                 dimension) needed by the shared expert MLP.
         """
-        se_hidden_states = (
-            shared_experts_input if shared_experts_input is not None else hidden_states
-        )
         if not self.prepare_finalize.supports_async():
             assert not dbo_enabled()
 
@@ -1398,50 +1395,36 @@ class FusedMoEKernelModularImpl:
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
         else:
-            self.alt_event.record()
-            if self.shared_experts is not None:
-                self.shared_experts.apply(
-                    se_hidden_states,
-                    SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
-                    x_and_scale_quanted=x_and_scale_quanted,
-                )
+            finalize_ret = self.prepare_finalize.finalize_async(
+                output,
+                fused_out,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+                self.fused_experts.finalize_weight_and_reduce_impl(),
+            )
+            self._maybe_apply_shared_experts(shared_experts_input, x_and_scale_quanted)
 
-            current_stream = torch.cuda.current_stream()
-            with torch.cuda.stream(self.alt_stream):
-                self.alt_stream.wait_event(self.alt_event)
-                finalize_ret = self.prepare_finalize.finalize_async(
-                    output,
-                    fused_out,
-                    topk_weights,
-                    topk_ids,
-                    apply_router_weight_on_input,
-                    self.fused_experts.finalize_weight_and_reduce_impl(),
-                )
-                # self._maybe_apply_shared_experts(shared_experts_input)
+            # TODO(lucas): refactor this in the alternative schedules followup
+            # currently unpack if we have hook + receiver pair or just
+            # receiver (see finalize_async docstring)
+            hook, receiver = (
+                finalize_ret
+                if isinstance(finalize_ret, tuple)
+                else (None, finalize_ret)
+            )
 
-                # TODO(lucas): refactor this in the alternative schedules followup
-                # currently unpack if we have hook + receiver pair or just
-                # receiver (see finalize_async docstring)
-                hook, receiver = (
-                    finalize_ret
-                    if isinstance(finalize_ret, tuple)
-                    else (None, finalize_ret)
-                )
+            if hook is not None:
+                if dbo_enabled():
+                    # If DBO is being used, register the hook with the ubatch
+                    # context and call it in dbo_maybe_run_recv_hook instead of
+                    #  passing it to the receiver.
+                    dbo_register_recv_hook(hook)
+                    dbo_yield()
+                else:
+                    hook()
 
-                if hook is not None:
-                    if dbo_enabled():
-                        # If DBO is being used, register the hook with the ubatch
-                        # context and call it in dbo_maybe_run_recv_hook instead of
-                        #  passing it to the receiver.
-                        dbo_register_recv_hook(hook)
-                        dbo_yield()
-                    else:
-                        hook()
-
-                receiver()
-
-                self.alt_event.record()
-            current_stream.wait_event(self.alt_event)
+            receiver()
 
         return output
 

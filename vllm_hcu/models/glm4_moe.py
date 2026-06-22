@@ -104,6 +104,7 @@ class Glm4MoeMLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
+        disable_tp: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -115,6 +116,7 @@ class Glm4MoeMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -125,6 +127,7 @@ class Glm4MoeMLP(nn.Module):
             reduce_results=sp_mlp_down_proj_reduce_results(
                 reduce_results and ".shared_experts" not in prefix
             ),
+            disable_tp=disable_tp,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -210,6 +213,11 @@ class Glm4MoE(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
+        self.runtime_sp = hcu_runtime_sp_enabled()
+        disable_shared_mlp_tp = (
+            self.runtime_sp and vllm_config.parallel_config.enable_expert_parallel
+        )
+
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = Glm4MoeMLP(
@@ -218,12 +226,12 @@ class Glm4MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                disable_tp=disable_shared_mlp_tp,
                 prefix=f"{prefix}.shared_experts",
             )
         else:
             self.shared_experts = None
 
-        self.runtime_sp = hcu_runtime_sp_enabled()
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=config.n_routed_experts,
@@ -268,7 +276,9 @@ class Glm4MoE(nn.Module):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
         )
-        final_hidden_states = finalize_moe_output_for_sp(final_hidden_states)
+        final_hidden_states = finalize_moe_output_for_sp(
+            final_hidden_states, self.experts
+        )
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 

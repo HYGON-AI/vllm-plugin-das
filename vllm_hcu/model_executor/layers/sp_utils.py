@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -88,6 +88,24 @@ def quant_method_supports_sp_moe_quant_inputs(quant_method) -> bool:
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
         return True
     return "i_q" in parameters and "i_s" in parameters
+
+
+def moe_uses_all2all_kernels_for_sp(experts) -> bool:
+    if not hcu_runtime_sp_enabled():
+        return False
+    moe_parallel_config = getattr(experts, "moe_parallel_config", None)
+    if moe_parallel_config is None:
+        return False
+    if not getattr(moe_parallel_config, "use_all2all_kernels", False):
+        return False
+    # The allgather_reducescatter backend still needs the outer custom-SP
+    # gather/reduce-scatter path. Only real all-to-all MoE backends can keep
+    # the token-sharded input/output layout here.
+    if getattr(moe_parallel_config, "use_ag_rs_all2all_kernels", False):
+        return False
+    if getattr(moe_parallel_config, "all2all_backend", None) == "allgather_reducescatter":
+        return False
+    return True
 
 
 def quantize_hidden_states_for_sp_moe(
@@ -199,6 +217,9 @@ def prepare_moe_inputs_for_sp(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
+    if moe_uses_all2all_kernels_for_sp(experts):
+        return hidden_states, router_logits, None, None, None, None
+
     hidden_states_dtype = hidden_states.dtype
     quanted_hidden_states, hidden_states_scale = quantize_hidden_states_for_sp_moe(
         hidden_states, experts
@@ -244,7 +265,10 @@ def prepare_moe_inputs_for_sp(
 
 def finalize_moe_output_for_sp(
     hidden_states: torch.Tensor,
+    experts=None,
 ) -> torch.Tensor:
+    if experts is not None and moe_uses_all2all_kernels_for_sp(experts):
+        return hidden_states
     return reduce_scatter_tokens_for_sp(hidden_states)
 
 

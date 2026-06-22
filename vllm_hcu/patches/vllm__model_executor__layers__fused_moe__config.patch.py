@@ -88,4 +88,17 @@ def int8_w8a8_moe_quant_config(
     )
 """,
 ),
+
+(
+"""
+    @property
+    def use_all2all_kernels(self):
+        return self.dp_size > 1 and self.use_ep
+""",
+"""
+    @property
+    def use_all2all_kernels(self):
+        return (self.dp_size > 1 or self.is_sequence_parallel) and self.use_ep
+""",
+),
 ]

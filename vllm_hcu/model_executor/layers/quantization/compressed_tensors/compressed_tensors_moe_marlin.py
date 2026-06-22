@@ -196,7 +196,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         self.dp_size = get_dp_group().world_size
-        self.use_deepep = self.dp_size > 1 and parallel_config.enable_expert_parallel and \
+        self.use_deepep = moe.moe_parallel_config.use_ep and \
             parallel_config.all2all_backend in (
                 "deepep_high_throughput",
                 "deepep_low_latency",

@@ -103,6 +103,7 @@ class HYV3FeedForward(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         expert_gate: torch.nn.Linear | None = None,
+        disable_tp: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -112,6 +113,7 @@ class HYV3FeedForward(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -120,6 +122,7 @@ class HYV3FeedForward(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=sp_mlp_down_proj_reduce_results(reduce_results),
+            disable_tp=disable_tp,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -200,6 +203,11 @@ class HYV3MoEFused(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        self.runtime_sp = hcu_runtime_sp_enabled()
+        disable_shared_mlp_tp = (
+            self.runtime_sp and vllm_config.parallel_config.enable_expert_parallel
+        )
+
         if config.num_shared_experts > 0:
             self.shared_mlp = HYV3FeedForward(
                 hidden_size=config.hidden_size,
@@ -208,6 +216,7 @@ class HYV3MoEFused(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}",
                 reduce_results=False,
+                disable_tp=disable_shared_mlp_tp,
             )
         else:
             self.shared_mlp = None
@@ -216,7 +225,6 @@ class HYV3MoEFused(nn.Module):
         scoring_func = "sigmoid"
         e_score_correction_bias = self.expert_bias
 
-        self.runtime_sp = hcu_runtime_sp_enabled()
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -264,7 +272,9 @@ class HYV3MoEFused(nn.Module):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
         )
-        final_hidden_states = finalize_moe_output_for_sp(final_hidden_states)
+        final_hidden_states = finalize_moe_output_for_sp(
+            final_hidden_states, self.experts
+        )
         return final_hidden_states.view(orig_shape)
 
 

@@ -23,4 +23,13 @@ PATCHES = [
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
 """,
 ),
+
+(
+"""
+            use_ep = config.parallel_config.data_parallel_size > 1
+""",
+"""
+            use_ep = config.parallel_config.data_parallel_size > 1 or getattr(config.parallel_config, "enable_custom_sp", False)
+""",
+),
 ]
