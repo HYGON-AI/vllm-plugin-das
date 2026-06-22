@@ -928,35 +928,4 @@ class MooncakeXferResponseStatus(IntEnum):
 """,
 ),
 
-# Multi-node prefill (Ray): single Mooncake bootstrap on global rank 0 (not per-node local rank 0).
-(
-"""
-    is_local_first_rank,
-)
-""",
-"""
-    is_global_first_rank,
-    is_local_first_rank,
-)
-""",
-),
-
-(
-"""
-    return is_local_first_rank() and (
-        parallel_config.local_engines_only or parallel_config.data_parallel_index == 0
-    )
-""",
-"""
-    # Hybrid/external LB: each local engine keeps its own bootstrap.
-    # Multi-node prefill (Ray/internal LB): only global rank 0 on dp index 0.
-    return (
-        is_local_first_rank() if parallel_config.local_engines_only
-        else is_global_first_rank()
-    ) and (
-        parallel_config.local_engines_only or parallel_config.data_parallel_index == 0
-    )
-""",
-),
-
 ]
