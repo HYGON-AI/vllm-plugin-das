@@ -737,641 +737,17 @@ class MooncakeXferResponseStatus(IntEnum):
 """,
 ),
 
-# GLM5 asymmetric PP, model-layer pairing, and pull failure fixes
+# Add asymmetric PP task counting and overlap-based slicing
 (
 """
-)
-from vllm.forward_context import ForwardContext
-""",
-"""
-)
-from vllm.distributed.utils import get_pp_indices
-from vllm.forward_context import ForwardContext
-""",
-),
-(
-"""
-
-class MooncakeXferMetadata(
-""",
-"""
-
-def _parse_model_layer_index(layer_name: str) -> int:
-    # Parse global transformer layer index from a KV cache layer name.
-    parts = layer_name.split(".")
-    for i, part in enumerate(parts):
-        if part == "layers" and i + 1 < len(parts):
-            return int(parts[i + 1])
-    raise ValueError(
-        f"Cannot parse transformer layer index from KV cache layer name: "
-        f"{layer_name}"
-    )
-
-
-def _cache_type_sort_key(layer_name: str) -> int:
-    # Indexer before MLA/attention within the same model layer.
-    if layer_name.endswith(".indexer") or ".indexer." in layer_name:
-        return 0
-    return 1
-
-
-class MooncakeXferMetadata(
-""",
-),
-(
-"""
-    block_len: int
-    slot_size_bytes: int
-""",
-"""
-    block_len: int
-    block_lens: list[int]
-    slot_size_bytes: int
-""",
-),
-(
-"""
-    src_layer_offset: int = 0
-""",
-"""
-    src_layer_offset: int = 0
-    # Global model layer range [start, end); pair P/D caches by layer when >= 0.
-    model_layer_start: int = -1
-    model_layer_end: int = -1
-""",
-),
-(
-"""
-        self.kv_caches_base_addr: list[int] = []
-        self.device_kv_caches: dict[str, torch.Tensor] = {}
-""",
-"""
-        self.kv_caches_base_addr: list[int] = []
-        self.cache_entry_model_layer: list[int] = []
-        self.cache_entry_layer_names: list[str] = []
-        # Global model layer -> local cache indices (e.g. Indexer + MLA).
-        self.model_layer_to_cache_indices: dict[int, list[int]] = {}
-        self.device_kv_caches: dict[str, torch.Tensor] = {}
-""",
-),
-(
-"""
-        self.use_mla = self.model_config.use_mla
-""",
-"""
-        self.use_mla = self.model_config.use_mla
-        self.block_len_per_layer: list[int] = []
-""",
-),
-(
-"""
-        local_base_addr = self.kv_caches_base_addr
-        # For asymmetric PP (P_SIZE < D_SIZE): P's single rank owns more
-        # layers than the target D rank, so we need to skip past the layers
-        # that belong to earlier D PP ranks in the global layer order.
-        src_offset = agent_meta.src_layer_offset
-        if src_offset:
-            local_base_addr = local_base_addr[src_offset:]
-        remote_base_addr = agent_meta.kv_caches_base_addr
-""",
-"""
-        use_model_layer_range = agent_meta.model_layer_start >= 0
-        if use_model_layer_range:
-            local_base_addr = self.kv_caches_base_addr
-            local_block_lens = self.block_len_per_layer
-            remote_base_addr = agent_meta.kv_caches_base_addr
-            remote_block_lens = agent_meta.block_lens or [
-                agent_meta.block_len
-            ] * len(remote_base_addr)
-        else:
-            local_base_addr = self.kv_caches_base_addr
-            # For asymmetric PP (P_SIZE < D_SIZE): P's single rank owns more
-            # layers than the target D rank, so we need to skip past the layers
-            # that belong to earlier D PP ranks in the global layer order.
-            src_offset = agent_meta.src_layer_offset
-            if src_offset:
-                local_base_addr = local_base_addr[src_offset:]
-            local_block_lens = self.block_len_per_layer
-            if src_offset:
-                local_block_lens = local_block_lens[src_offset:]
-            remote_base_addr = agent_meta.kv_caches_base_addr
-            remote_block_lens = agent_meta.block_lens or [
-                agent_meta.block_len
-            ] * len(remote_base_addr)
-""",
-),
-(
-"""
-        remote_block_len = agent_meta.block_len
-        remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
-""",
-"""
-        remote_block_len = agent_meta.block_len
-        src_offset = agent_meta.src_layer_offset
-        remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
-""",
-),
-(
-"""
-            "remote_tp_rank=%d src_layer_offset=%d",
-""",
-"""
-            "remote_tp_rank=%d src_layer_offset=%d model_layers=[%d,%d)",
-""",
-),
-(
-"""
-            agent_meta.remote_tp_rank, src_offset,
-        )
-""",
-"""
-            agent_meta.remote_tp_rank, src_offset,
-            agent_meta.model_layer_start, agent_meta.model_layer_end,
-        )
-""",
-),
-(
-"""
-            remote_block_size = remote_block_len / self.slot_size_bytes
-            assert self.block_len == remote_block_len
-""",
-"""
-            remote_block_size = self.block_size
-            if not use_model_layer_range:
-                assert len(local_base_addr) == len(local_block_lens), (
-                    "MLA KV cache base addresses and block lengths mismatch"
-                )
-                assert len(remote_base_addr) == len(remote_block_lens), (
-                    "Remote MLA KV cache base addresses and block lengths mismatch"
-                )
-""",
-),
-(
-"""
-            for local_layer_addr, remote_layer_addr in zip(
-                local_base_addr, remote_base_addr
-            ):
-""",
-"""
-            if use_model_layer_range:
-
-                def _model_layer_pair_iter():
-                    remote_cursor = 0
-                    for layer_idx in range(
-                        agent_meta.model_layer_start, agent_meta.model_layer_end
-                    ):
-                        local_indices = sorted(
-                            self.model_layer_to_cache_indices.get(layer_idx, []),
-                            key=lambda idx: _cache_type_sort_key(
-                                self.cache_entry_layer_names[idx]
-                            ),
-                        )
-                        if not local_indices:
-                            logger.warning(
-                                "P worker missing KV cache for model layer %d",
-                                layer_idx,
-                            )
-                            continue
-                        for local_idx in local_indices:
-                            if remote_cursor >= len(remote_base_addr):
-                                raise RuntimeError(
-                                    "Remote KV cache entry count mismatch for "
-                                    f"model layer {layer_idx}: remote_cursor="
-                                    f"{remote_cursor} remote_entries="
-                                    f"{len(remote_base_addr)}"
-                                )
-                            yield (
-                                self.kv_caches_base_addr[local_idx],
-                                self.block_len_per_layer[local_idx],
-                                remote_base_addr[remote_cursor],
-                                remote_block_lens[remote_cursor],
-                            )
-                            remote_cursor += 1
-                    if remote_cursor != len(remote_base_addr):
-                        raise RuntimeError(
-                            "Remote KV cache entry count mismatch after pairing: "
-                            f"paired={remote_cursor} remote_entries="
-                            f"{len(remote_base_addr)} "
-                            f"model_layers=[{agent_meta.model_layer_start},"
-                            f"{agent_meta.model_layer_end})"
-                        )
-
-                layer_iter = _model_layer_pair_iter()
-            elif self.use_mla:
-                layer_iter = zip(
-                    local_base_addr,
-                    local_block_lens,
-                    remote_base_addr,
-                    remote_block_lens,
-                )
-            else:
-                layer_iter = (
-                    (local_layer_addr, block_len, remote_layer_addr, remote_block_len)
-                    for local_layer_addr, remote_layer_addr in zip(
-                        local_base_addr, remote_base_addr
-                    )
-                )
-
-            for (
-                local_layer_addr,
-                layer_block_len,
-                remote_layer_addr,
-                layer_remote_block_len,
-            ) in layer_iter:
-""",
-),
-(
-"""
-                            local_layer_addr + group_local_block_id[0] * block_len + rank_offset
-""",
-"""
-                            local_layer_addr
-                            + group_local_block_id[0] * layer_block_len
-                            + rank_offset
-""",
-),
-(
-"""
-                            remote_layer_addr + group_remote_block_id[0] * remote_block_len
-""",
-"""
-                            remote_layer_addr
-                            + group_remote_block_id[0] * layer_remote_block_len
-""",
-),
-(
-"""
-                        lengths.append(remote_block_len * num_blocks)
-""",
-"""
-                        lengths.append(layer_remote_block_len * num_blocks)
-""",
-),
-(
-"""
-        seen_base_addresses = []
-""",
-"""
-        seen_base_addresses = []
-        base_addr_to_idx: dict[int, int] = {}
-        self.block_len_per_layer = []
-        self.cache_entry_model_layer = []
-        self.cache_entry_layer_names = []
-        self.model_layer_to_cache_indices = {}
-""",
-),
-(
-"""
-                [tuple(cache.shape) for cache in cache_list],
-            )
-
-            for cache in cache_list:
-""",
-"""
-                [tuple(cache.shape) for cache in cache_list],
-            )
-            model_layer = _parse_model_layer_index(layer_name)
-
-            for cache in cache_list:
-""",
-),
-(
-"""
-                if base_addr in seen_base_addresses:
-""",
-"""
-                if base_addr in base_addr_to_idx:
-                    cache_idx = base_addr_to_idx[base_addr]
-                    layer_indices = self.model_layer_to_cache_indices.setdefault(
-                        model_layer, []
-                    )
-                    if cache_idx not in layer_indices:
-                        layer_indices.append(cache_idx)
-""",
-),
-(
-"""
-                seen_base_addresses.append(base_addr)
-                curr_tensor_size_bytes = cache.nbytes
-""",
-"""
-                seen_base_addresses.append(base_addr)
-                cache_idx = len(seen_base_addresses) - 1
-                base_addr_to_idx[base_addr] = cache_idx
-                self.cache_entry_model_layer.append(model_layer)
-                self.cache_entry_layer_names.append(layer_name)
-                self.model_layer_to_cache_indices.setdefault(model_layer, []).append(
-                    cache_idx
-                )
-                curr_tensor_size_bytes = cache.nbytes
-""",
-),
-(
-"""
-                assert tensor_size_bytes == curr_tensor_size_bytes, (
-                    "All kv cache tensors must have the same size"
-                )
-""",
-"""
-                assert cache.shape[0] == self.num_blocks, (
-                    "All kv cache tensors must have the same number of blocks"
-                )
-                if not self.use_mla:
-                    assert tensor_size_bytes == curr_tensor_size_bytes, (
-                        "All kv cache tensors must have the same size"
-                    )
-""",
-),
-(
-"""
-                assert self.block_size == kernel_block_size
-                kv_data_ptrs.append(base_addr)
-""",
-"""
-                assert self.block_size == kernel_block_size
-                block_len = (
-                    cache.stride(0) * cache.element_size()
-                    if self.use_mla
-                    else curr_tensor_size_bytes // self.num_blocks
-                )
-                self.block_len_per_layer.append(block_len)
-                kv_data_ptrs.append(base_addr)
-""",
-),
-(
-"""
-                kv_data_lens.append(tensor_size_bytes)
-""",
-"""
-                kv_data_lens.append(
-                    self.num_blocks * block_len if self.use_mla
-                    else curr_tensor_size_bytes
-                )
-""",
-),
-(
-"""
-        self.kv_caches_base_addr = seen_base_addresses
-""",
-"""
-        self.kv_caches_base_addr = seen_base_addresses
-        for layer_idx, cache_indices in self.model_layer_to_cache_indices.items():
-            cache_indices.sort(
-                key=lambda idx: _cache_type_sort_key(self.cache_entry_layer_names[idx])
-            )
-""",
-),
-(
-"""
-        assert tensor_size_bytes % self.num_blocks == 0
-        self.block_len = tensor_size_bytes // self.num_blocks
-""",
-"""
-        assert self.block_len_per_layer
-        self.block_len = self.block_len_per_layer[0]
-""",
-),
-(
-"""
-            "registered num_blocks=%d block_len=%d slot_size_bytes=%d",
-""",
-"""
-            "registered num_blocks=%d block_len=%d slot_size_bytes=%d "
-            "model_layers=%d cache_entries=%d pp_rank=%d pp_size=%d",
-""",
-),
-(
-"""
-            self.slot_size_bytes,
-        )
-""",
-"""
-            self.slot_size_bytes,
-            len(self.model_layer_to_cache_indices),
-            len(self.cache_entry_model_layer),
-            self.pp_rank,
-            self.pp_size,
-        )
-""",
-),
-(
-"""
-        chunk_idx: int | None = None,
-    ):
-""",
-"""
-        chunk_idx: int | None = None,
-        model_layer_start: int = -1,
-        model_layer_end: int = -1,
-    ):
-""",
-),
-(
-"""
-        # If addr_slice is set, only send the overlapping layer addresses
-        # for the target P PP rank. This is essential for asymmetric PP
-        # where D has more layers per rank than P, and the request must
-        # be split across multiple P ranks.
-""",
-'\n',
-),
-(
-"""
-        if addr_slice is not None:
-""",
-"""
-        block_lens = self.block_len_per_layer
-        if model_layer_start >= 0:
-            base_addrs = []
-            block_lens = []
-            for layer_idx in range(model_layer_start, model_layer_end):
-                cache_indices = sorted(
-                    self.model_layer_to_cache_indices.get(layer_idx, []),
-                    key=lambda idx: _cache_type_sort_key(
-                        self.cache_entry_layer_names[idx]
-                    ),
-                )
-                for cache_idx in cache_indices:
-                    base_addrs.append(self.kv_caches_base_addr[cache_idx])
-                    block_lens.append(self.block_len_per_layer[cache_idx])
-        elif addr_slice is not None:
-""",
-),
-(
-"""
-            base_addrs = base_addrs[addr_slice[0]:addr_slice[1]]
-""",
-"""
-            base_addrs = base_addrs[addr_slice[0]:addr_slice[1]]
-            block_lens = block_lens[addr_slice[0]:addr_slice[1]]
-""",
-),
-(
-"""
-            block_len=self.block_len,
-""",
-"""
-            block_len=block_lens[0] if block_lens else 0,
-            block_lens=block_lens,
-""",
-),
-(
-"""
-            src_layer_offset=src_layer_offset,
-""",
-"""
-            src_layer_offset=src_layer_offset if model_layer_start < 0 else 0,
-            model_layer_start=model_layer_start,
-            model_layer_end=model_layer_end,
-""",
-),
-(
-"""
-                        logger.error(
-                            "Error happens during transferring kvcache for %s: %s",
-                            req_ids,
-                            response.err_msg,
-""",
-"""
-                        self.process_pulling_result(
-                            MooncakeXferResponse(
-                                status=MooncakeXferResponseStatus.ERROR,
-                                err_reqs=list(pull_metas.keys()),
-                                err_msg=response.err_msg,
-                            ),
-                            pull_metas,
-""",
-),
-(
-"""
-            logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
-            return
-""",
-"""
-            logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
-            self.process_pulling_result(
-                MooncakeXferResponse(
-                    status=MooncakeXferResponseStatus.ERROR,
-                    err_reqs=list(pull_metas.keys()),
-                    err_msg=str(e),
-                ),
-                pull_metas,
-            )
-            return
-""",
-),
-(
-"""
-        ok_reqs: list[ReqId] = response.ok_reqs or []
-
-        for req_id in ok_reqs:
-""",
-"""
-        if response.ok_reqs:
-            logger.debug("pulling kv_caches for %s finished", response.ok_reqs)
-        if response.err_reqs:
-            logger.error(
-                "pulling kv_caches for %s failed: %s",
-                response.err_reqs,
-                response.err_msg,
-            )
-
-        for req_id in (response.ok_reqs or []) + (response.err_reqs or []):
-""",
-),
-(
-"""
-        if ok_reqs:
-            logger.debug("pulling kv_caches for %s finished", ok_reqs)
-
-        if response.err_reqs:
-            logger.error(
-                "pulling kv_caches for %s failed: %s",
-                response.err_reqs,
-                response.err_msg,
-            )
-""",
-"""
-    def _fail_pull_metas(
-        self, pull_metas: dict[ReqId, PullReqMeta], err_msg: str
-    ) -> None:
-        # Bootstrap / topology errors happen before receive_kv sets task counts.
-        for pull_meta in pull_metas.values():
-            if pull_meta.pull_tasks_count <= 0:
-                pull_meta.pull_tasks_count = 1
-        self.process_pulling_result(
-            MooncakeXferResponse(
-                status=MooncakeXferResponseStatus.ERROR,
-                err_reqs=list(pull_metas.keys()),
-                err_msg=err_msg,
-            ),
-            pull_metas,
-        )
-""",
-),
-(
-"""
-            block_len=0,
-            slot_size_bytes=0,
-""",
-"""
-            block_len=0,
-            block_lens=[],
-            slot_size_bytes=0,
-""",
-),
-(
-"""
-                        logger.error(
-                            "Notification-only transfer failed for %s: %s",
-                            req_ids,
-                            response.err_msg,
-""",
-"""
-                        self.process_pulling_result(
-                            MooncakeXferResponse(
-                                status=MooncakeXferResponseStatus.ERROR,
-                                err_reqs=list(pull_metas.keys()),
-                                err_msg=response.err_msg,
-                            ),
-                            pull_metas,
-""",
-),
-(
-"""
-                e,
-            )
-
-    async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
-""",
-"""
-                e,
-            )
-            self.process_pulling_result(
-                MooncakeXferResponse(
-                    status=MooncakeXferResponseStatus.ERROR,
-                    err_reqs=list(pull_metas.keys()),
-                    err_msg=str(e),
-                ),
-                pull_metas,
-            )
-
-    async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
-""",
-),
-(
-"""
+    def receive_kv(
+        self,
+        remote_engine_id: EngineId,
+        pull_metas: dict[ReqId, PullReqMeta],
     ):
         remote_tp_ranks = self.kv_topo.get_target_remote_ranks_from_engine_id(
-""",
-"""
-    ):
-        # Determine which remote TP ranks to pull from.
-        remote_tp_ranks = self.kv_topo.get_target_remote_ranks_from_engine_id(
-""",
-),
-(
-"""
+            remote_engine_id
+        )
         count = len(remote_tp_ranks)
         if count != 1:
             logger.error("Mooncake: Heterogeneous TP is not supported yet.")
@@ -1387,6 +763,15 @@ class MooncakeXferMetadata(
             )
 """,
 """
+    def receive_kv(
+        self,
+        remote_engine_id: EngineId,
+        pull_metas: dict[ReqId, PullReqMeta],
+    ):
+        # Determine which remote TP ranks to pull from.
+        remote_tp_ranks = self.kv_topo.get_target_remote_ranks_from_engine_id(
+            remote_engine_id
+        )
 
         # Infer P's PP size from the bootstrap topology:
         # each tp_rank entry maps pp_rank -> worker_addr.
@@ -1394,18 +779,19 @@ class MooncakeXferMetadata(
         p_pp_size = 1
         sample_tp = next(iter(self._remote_agents.get(remote_engine_id, {})), None)
         if sample_tp is None:
-            self._fail_pull_metas(
-                pull_metas,
-                f"no remote TP topology found for engine {remote_engine_id}",
+            logger.error(
+                "Failed to infer remote PP size for engine %s: no remote TP "
+                "topology found. Skip KV receive.",
+                remote_engine_id,
             )
             return
         else:
             p_pp_size = len(self._remote_agents[remote_engine_id][sample_tp])
         if p_pp_size <= 0:
-            self._fail_pull_metas(
-                pull_metas,
-                f"invalid remote PP size {p_pp_size} for engine {remote_engine_id}",
-            )
+            logger.error(
+                "Invalid remote PP size inferred for engine %s: p_pp_size=%d "
+                "(sample_tp=%s). Skip KV receive.",
+                remote_engine_id, p_pp_size, sample_tp)
             return
 
         if p_pp_size == self.pp_size:
@@ -1458,13 +844,28 @@ class MooncakeXferMetadata(
             # overlapping P PP rank, each transferring only the layers that
             # P rank owns.
             #
-            # Partition by transformer model layers (same scheme as vLLM PP).
-            # Pair MLA/Indexer (and other multi-cache layers) by model layer
-            # index instead of assuming contiguous cache registration order.
-            total_model_layers = self.model_config.get_total_num_hidden_layers()
-            d_model_start, d_model_end = get_pp_indices(
-                total_model_layers, self.pp_rank, self.pp_size
+            # addr_stride = 2 when split_k_and_v=True (K and V have separate
+            # entries per layer), otherwise = 1 (combined K+V per layer).
+            addr_stride = 2 if self.kv_topo.split_k_and_v else 1
+            assert len(self.kv_caches_base_addr) % addr_stride == 0, (
+                "Local kv_caches_base_addr size must align with addr_stride. "
+                f"got len={len(self.kv_caches_base_addr)} addr_stride={addr_stride}"
             )
+            num_actual_layers = len(self.kv_caches_base_addr) // addr_stride
+            total_layers = num_actual_layers * self.pp_size
+            # Support uneven layer partition on P side:
+            # first `remainder` ranks own `base+1` layers, others own `base`.
+            base_layers_per_rank, remainder = divmod(total_layers, p_pp_size)
+
+            def get_p_layer_range(pp_rank: int) -> tuple[int, int]:
+                extra = 1 if pp_rank < remainder else 0
+                start = pp_rank * base_layers_per_rank + min(pp_rank, remainder)
+                end = start + base_layers_per_rank + extra
+                return start, end
+
+            # D's global layer range for this PP rank.
+            d_layer_start = self.pp_rank * num_actual_layers
+            d_layer_end = d_layer_start + num_actual_layers
 
             # Count total tasks = TP targets x PP targets (with overlap).
             tasks = 0
@@ -1474,69 +875,56 @@ class MooncakeXferMetadata(
                     worker_addr = tp_entry.get(pp_rank)
                     if worker_addr is None:
                         continue
-                    p_model_start, p_model_end = get_pp_indices(
-                        total_model_layers, pp_rank, p_pp_size
-                    )
-                    if d_model_start >= p_model_end or p_model_start >= d_model_end:
+                    p_layer_start, p_layer_end = get_p_layer_range(pp_rank)
+                    if d_layer_start >= p_layer_end or p_layer_start >= d_layer_end:
                         continue
                     tasks += 1
 
             if tasks == 0:
-                self._fail_pull_metas(
-                    pull_metas,
-                    f"asymmetric PP has zero overlap tasks for engine "
-                    f"{remote_engine_id}",
+                logger.error(
+                    "receive_kv asymmetric pp has zero overlap tasks: "
+                    "remote_engine_id=%s req_ids=%s; mark requests finished.",
+                    remote_engine_id,
+                    list(pull_metas.keys()),
                 )
+                for pull_meta in pull_metas.values():
+                    pull_meta.pull_tasks_count = 0
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
                 return
 
             for pull_meta in pull_metas.values():
                 pull_meta.pull_tasks_count = tasks
 
             needs_chunk_idx = len(remote_tp_ranks) > 1
+            logger.debug(
+                "receive_kv asymmetric pp: remote_tp_ranks=%s p_pp_size=%d "
+                "d_pp_size=%d tasks=%d needs_chunk_idx=%s",
+                remote_tp_ranks, p_pp_size, self.pp_size, tasks, needs_chunk_idx)
             for i, remote_tp_rank in enumerate(remote_tp_ranks):
                 tp_entry = self._remote_agents[remote_engine_id].get(remote_tp_rank, {})
                 for pp_rank in range(p_pp_size):
                     worker_addr = tp_entry.get(pp_rank)
                     if worker_addr is None:
                         continue
-                    p_model_start, p_model_end = get_pp_indices(
-                        total_model_layers, pp_rank, p_pp_size
-                    )
-                    # Skip P PP ranks with no model-layer overlap.
-                    if d_model_start >= p_model_end or p_model_start >= d_model_end:
+                    p_layer_start, p_layer_end = get_p_layer_range(pp_rank)
+                    # Skip P PP ranks with no layer overlap.
+                    if d_layer_start >= p_layer_end or p_layer_start >= d_layer_end:
                         continue
-                    overlap_model_start = max(d_model_start, p_model_start)
-                    overlap_model_end = min(d_model_end, p_model_end)
-                    # MLA KV is replicated across TP; only pull from the first
-                    # remote TP rank when P_TP > D_TP.
-                    if self.use_mla and i > 0:
-                        asyncio.create_task(
-                            self._send_notification_only(
-                                worker_addr, pull_metas, i
-                            )
-                        )
-                        continue
+                    overlap_start = max(d_layer_start, p_layer_start)
+                    overlap_end = min(d_layer_end, p_layer_end)
+                    addr_start = (overlap_start - d_layer_start) * addr_stride
+                    addr_end = (overlap_end - d_layer_start) * addr_stride
+                    # When P_SIZE < D_SIZE, P's single rank owns more layers
+                    # than D rank's subset. P must skip the layers belonging
+                    # to earlier D ranks in global layer order.
+                    p_src_offset = (overlap_start - p_layer_start) * addr_stride
                     asyncio.create_task(
                         self.receive_kv_from_single_worker(
-                            worker_addr, pull_metas,
-                            model_layer_start=overlap_model_start,
-                            model_layer_end=overlap_model_end,
+                            worker_addr, pull_metas, (addr_start, addr_end),
+                            src_layer_offset=p_src_offset,
                             chunk_idx=i if needs_chunk_idx else None,
                         )
                     )
-""",
-),
-(
-"""
-            logger.error(
-                "Failed to find remote engine_id %s from bootstrap server %s",
-                remote_engine_id,
-                remote_bootstrap_addr,
-""",
-"""
-            self._fail_pull_metas(
-                pull_metas,
-                f"engine_id {remote_engine_id} not found at {remote_bootstrap_addr}",
 """,
 ),
 
