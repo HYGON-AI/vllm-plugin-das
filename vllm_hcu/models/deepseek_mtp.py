@@ -300,9 +300,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Determine whether to load the indexer weight
+        mtp_has_indexer = any("indexer" in param_name for param_name in params_dict.keys())
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            #  Skip loading mtp indexer weights
+            if "indexer" in name and not mtp_has_indexer:
+                logger.info(f"Skipping mtp indexer weight (DSA disabled): {name}")
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
