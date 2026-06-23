@@ -1029,7 +1029,7 @@ def rocm_aiter_sparse_attn_indexer_native(
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
     assert topk_indices_buffer is not None
     assert scale_fmt is not None
-    slot_mapping = layer_attn_metadata.slot_mapping[:attn_metadata.num_kv_actual_tokens]
+    slot_mapping = layer_attn_metadata.slot_mapping[:layer_attn_metadata.num_kv_actual_tokens]
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
