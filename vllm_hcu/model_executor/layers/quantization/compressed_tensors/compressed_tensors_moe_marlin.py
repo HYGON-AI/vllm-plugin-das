@@ -365,11 +365,6 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             i_q: torch.Tensor | None = None,
             i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if enable_eplb:
-            raise NotImplementedError(
-                "EPLB not supported for "
-                "`CompressedTensorsW8A8Int8MoEMethod` yet.")
-
         return self.fused_experts(
             layer=layer,
             x=x,
@@ -383,6 +378,10 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             shared_output=shared_output,
             i_q=i_q,
             i_s=i_s, )
+
+    @property
+    def supports_eplb(self) -> bool:
+        return True
 
     def select_gemm_impl(
         self,

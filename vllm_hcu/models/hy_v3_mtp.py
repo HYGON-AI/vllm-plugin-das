@@ -173,6 +173,64 @@ class HYV3MultiTokenPredictor(nn.Module):
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
+        self.expert_weights = []
+        self.num_expert_groups = 1
+        self.moe_layers = []
+        example_layer = None
+        for layer in self.layers.values():
+            mtp_block = layer.mtp_block
+            if mtp_block.block_type == "moe":
+                example_layer = mtp_block.mlp
+                self.moe_layers.append(mtp_block.mlp.experts)
+
+        if example_layer is None:
+            self.num_moe_layers = 0
+            raise RuntimeError("No MoE layer found in MTP layers.")
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_logical_experts = getattr(example_layer, "n_logical_experts", None)
+        self.num_physical_experts = getattr(example_layer, "n_physical_experts", None)
+        self.num_local_physical_experts = getattr(
+            example_layer, "n_local_physical_experts", None
+        )
+        self.num_routed_experts = getattr(example_layer, "n_routed_experts", None)
+        self.num_shared_experts = config.num_shared_experts
+        self.num_redundant_experts = getattr(example_layer, "n_redundant_experts", None)
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.expert_weights.clear()
+        for layer_idx, layer in enumerate(self.moe_layers):
+            self.expert_weights.append(layer.get_expert_weights())
+            layer.set_eplb_state(
+                moe_layer_idx=layer_idx,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+            )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for layer in self.layers.values():
+            mtp_block = layer.mtp_block
+            if mtp_block.block_type == "moe":
+                moe = mtp_block.mlp
+                moe.n_local_physical_experts = num_local_physical_experts
+                moe.n_physical_experts = num_physical_experts
+                moe.n_redundant_experts = self.num_redundant_experts
+                moe.experts.update_expert_map()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -221,7 +279,43 @@ class HYV3MTP(nn.Module):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
+        self.expert_weights = self.model.expert_weights
+        self.num_moe_layers = self.model.num_moe_layers
+        self.num_expert_groups = self.model.num_expert_groups
+        self.num_logical_experts = self.model.num_logical_experts
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_routed_experts = self.model.num_routed_experts
+        self.num_shared_experts = self.model.num_shared_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
+        self.moe_layers = self.model.moe_layers
+
         self.sampler = Sampler()
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.model.set_eplb_state(
+            expert_load_view=expert_load_view,
+            logical_to_physical_map=logical_to_physical_map,
+            logical_replica_count=logical_replica_count,
+        )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        self.model.update_physical_experts_metadata(
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
+        )
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
 
     def forward(
         self,

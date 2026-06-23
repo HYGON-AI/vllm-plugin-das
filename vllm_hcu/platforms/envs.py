@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_PD_SPLIT: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
+    VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -190,6 +191,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If use custom AITER_W4A16_MOE impl, please set True
     "VLLM_HCU_USE_AITER_W4A16_MOE":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_W4A16_MOE", "True").lower() in
+                    ("true", "1")),
+
+    # If set, use torch ops for EPLB logical-to-physical mapping and load
+    # recording instead of the fused Triton kernel.
+    "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD":
+        lambda: (os.environ.get("VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", "False").lower() in
                     ("true", "1")),
 }
 

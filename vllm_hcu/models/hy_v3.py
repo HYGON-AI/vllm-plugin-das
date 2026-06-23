@@ -460,6 +460,7 @@ class HYV3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         layer_idx = int(prefix.split(".")[-1])
+        parallel_config = get_current_vllm_config().parallel_config
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = HYV3Attention(
             config=config,
@@ -489,7 +490,10 @@ class HYV3DecoderLayer(nn.Module):
             self.block_type = "feedforward"
         else:
             self.mlp = HYV3MoEFused(
-                config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+                enable_eplb=parallel_config.enable_eplb,
             )
             self.block_type = "moe"
 
@@ -583,6 +587,7 @@ class HYV3Model(nn.Module):
             example_layer, "n_local_physical_experts", None
         )
         self.num_routed_experts = getattr(example_layer, "n_routed_experts", None)
+        self.num_shared_experts = config.num_shared_experts
         self.num_redundant_experts = getattr(example_layer, "n_redundant_experts", None)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -604,6 +609,22 @@ class HYV3Model(nn.Module):
                 moe.n_physical_experts = num_physical_experts
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.expert_weights.clear()
+        for layer_idx, layer in enumerate(self.moe_layers):
+            self.expert_weights.append(layer.get_expert_weights())
+            layer.set_eplb_state(
+                moe_layer_idx=layer_idx,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+            )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -801,9 +822,44 @@ class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.expert_weights = self.model.expert_weights
+        self.num_moe_layers = self.model.num_moe_layers
+        self.num_expert_groups = self.model.num_expert_groups
+        self.num_logical_experts = self.model.num_logical_experts
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_routed_experts = self.model.num_routed_experts
+        self.num_shared_experts = self.model.num_shared_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
+        self.moe_layers = self.model.moe_layers
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.model.set_eplb_state(
+            expert_load_view=expert_load_view,
+            logical_to_physical_map=logical_to_physical_map,
+            logical_replica_count=logical_replica_count,
+        )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        self.model.update_physical_experts_metadata(
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
+        )
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
 
     def forward(
         self,
