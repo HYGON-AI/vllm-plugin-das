@@ -35,6 +35,16 @@ PATCHES = [
 """,
 ),
 
+(
+"""
+        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+""",
+"""
+        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        self.enable_multi_layers_mtp = self.speculative_config.enable_multi_layers_mtp
+""",
+),
+
 ################ lightly cp###########################
 (
 """
