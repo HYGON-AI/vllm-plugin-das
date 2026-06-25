@@ -7,6 +7,16 @@ vllm.v1.models.spec_decode.llm_base_proposer  __init__
 PATCHES = [
 (
 """
+        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+""",
+"""
+        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        self.enable_multi_layers_mtp = self.speculative_config.enable_multi_layers_mtp
+""",
+),
+    
+(
+"""
         if current_platform.is_rocm():
 """,
 """
@@ -35,16 +45,6 @@ PATCHES = [
 """,
 ),
 
-(
-"""
-        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
-""",
-"""
-        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
-        self.enable_multi_layers_mtp = self.speculative_config.enable_multi_layers_mtp
-""",
-),
-
 ################ lightly cp###########################
 (
 """
@@ -68,10 +68,10 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 
 (
 """
-        max_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
 """,
-"""     
-        max_batch_size = vllm_config.scheduler_config.max_num_seqs if not vllm_config.parallel_config.enable_lightly_cplb else vllm_config.scheduler_config.max_num_seqs * 2
+"""
+        self.max_batch_size = vllm_config.scheduler_config.max_num_seqs if not vllm_config.parallel_config.enable_lightly_cplb else vllm_config.scheduler_config.max_num_seqs * 2
 """,
 ),
 
@@ -115,12 +115,12 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 (
 """
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                slot_mapping_size, common_attn_metadata.slot_mapping
             ),
 """,
 """        
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                slot_mapping_size, common_attn_metadata.slot_mapping
             ),
             scatter_indexes_tensor=self.scatter_indexes_tensor,
             gather_indexes_tensor=self.gather_indexes_tensor,
@@ -143,18 +143,17 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
 
 (
 """
-        total_num_tokens = query_start_loc_cpu[-1].item()
-
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             seq_lens=common_attn_metadata.seq_lens,
             query_start_loc_cpu=query_start_loc_cpu,
             _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
+            max_seq_len=common_attn_metadata.max_seq_len,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
@@ -162,19 +161,18 @@ from vllm.v1.attention.backend import CommonAttentionMetadata, CpCommonAttention
         )
 """,
 """        
-        total_num_tokens = query_start_loc_cpu[-1].item()
-
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             seq_lens=common_attn_metadata.seq_lens,
             query_start_loc_cpu=query_start_loc_cpu,
             _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             num_kv_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
+            max_seq_len=common_attn_metadata.max_seq_len,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
