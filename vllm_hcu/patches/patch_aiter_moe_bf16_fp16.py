@@ -49,7 +49,8 @@ def _get_aiter_moe_asm_blockers(
         blockers.append("w13_bias is unsupported")
     if getattr(layer, "w2_bias", None) is not None:
         blockers.append("w2_bias is unsupported")
-    if _activation_name(layer) != "silu":
+    if _activation_name(layer) not in("silu","gelu_tanh"): 
+    #if _activation_name(layer) != "silu":
         blockers.append("activation is not silu")
 
     w1 = getattr(layer, "w13_weight", None)

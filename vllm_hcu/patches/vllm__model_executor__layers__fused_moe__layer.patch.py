@@ -41,4 +41,29 @@ PATCHES = [
         )
 """,
 ),
+(
+"""
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
+""",
+"""
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
+from vllm_hcu.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    HcuUnquantizedFusedMoEMethod,
+)
+""",
+),
+(
+"""
+            if quant_method is None:
+                quant_method = UnquantizedFusedMoEMethod(self.moe_config)
+""",
+"""
+            if quant_method is None:
+                quant_method = HcuUnquantizedFusedMoEMethod(self.moe_config)
+""",
+),
 ]

@@ -177,9 +177,9 @@ def import_hook():
 #补丁替换类中函数
 def patch_module_class_function():
     # Lazy import so plugin loading does not eagerly import optional deps.
-    from .patches.patch_aiter_moe_bf16_fp16 import (
-        patch_aiter_moe_asm,
-    )
+    # from .patches.patch_aiter_moe_bf16_fp16 import (
+    #     patch_aiter_moe_asm,
+    # )
     from .patches.patch_w8a8_channelwise_blaslt_apply_scaled_mm import (
         patch_fp8_scaled_mm,
     )
@@ -195,7 +195,7 @@ def patch_module_class_function():
     from .patches.patch_kimi_k25_vision_chunk_prompt import (
         patch_kimi_k25_vision_chunk_prompt_updates,
     )
-    patch_aiter_moe_asm()
+    # patch_aiter_moe_asm()
     patch_fp8_scaled_mm()
     patch_hcu_lora_column_parallel_linear()
     patch_qwen35_lora_disable_piecewise_cudagraph()
