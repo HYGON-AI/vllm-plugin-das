@@ -7,6 +7,16 @@ Patch for vllm._aiter_ops is_aiter_found_and_supported.
 PATCHES = [
 (
 """
+import vllm.envs as envs
+"""
+,
+"""
+import vllm.envs as envs
+from vllm_hcu.platforms import envs as henvs
+"""
+),
+(
+"""
         return on_mi3xx()
 """,
 """
@@ -30,6 +40,7 @@ def _get_aiter_w16a16_moe_solution_id(
     top_k: int,
     dtype: torch.dtype,
     activation: str,
+    use_shuffle: int,
 ) -> str:
     try:
         from aiter.moe import MoeQuantType, MoeSolutionType, get_aiter_moe_config
@@ -50,7 +61,7 @@ def _get_aiter_w16a16_moe_solution_id(
         dtype=dtype,
         quant_type=MoeQuantType.W16A16,
         activation=activation,
-        use_shuffle=1,
+        use_shuffle=use_shuffle,
     )
     if not status or moe_config.solution_type != MoeSolutionType.ASM:
         raise RuntimeError(
@@ -140,32 +151,48 @@ def _rocm_aiter_fused_moe_impl(
     if use_w16a16_asm:
         from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
 
+        use_shuffle = 1 if henvs.VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE else 0
         global_num_experts = (
             expert_mask.numel() if expert_mask is not None else w1.shape[0]
         )
-        solution_id = _get_aiter_w16a16_moe_solution_id(
-            M=hidden_states.shape[0],
-            E=w1.shape[0],
-            N1=w1.shape[1],
-            N2=w2.shape[1],
-            K=w1.shape[2],
-            top_k=topk_ids.shape[1],
-            dtype=hidden_states.dtype,
-            activation=activation_name,
-        )
-        return fused_experts_asm_impl(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            output_dtype or hidden_states.dtype,
-            activation=activation_name,
-            global_num_experts=global_num_experts,
-            expert_map=expert_mask,
-            use_shuffle=1,
-            solution_id=solution_id,
-        )
+        if henvs.VLLM_HCU_USE_AITER_MOE_CONFIG:
+            solution_id = _get_aiter_w16a16_moe_solution_id(
+                M=hidden_states.shape[0],
+                E=w1.shape[0],
+                N1=w1.shape[1],
+                N2=w2.shape[1],
+                K=w1.shape[2],
+                top_k=topk_ids.shape[1],
+                dtype=hidden_states.dtype,
+                activation=activation_name,
+                use_shuffle=use_shuffle,
+            )
+            return fused_experts_asm_impl(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                output_dtype or hidden_states.dtype,
+                activation=activation_name,
+                global_num_experts=global_num_experts,
+                expert_map=expert_mask,
+                use_shuffle=use_shuffle,
+                solution_id=solution_id,
+            )
+        else:
+            return fused_experts_asm_impl(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                output_dtype or hidden_states.dtype,
+                activation=activation_name,
+                global_num_experts=global_num_experts,
+                expert_map=expert_mask,
+                use_shuffle=use_shuffle,
+            )
     else:
         return fused_moe(
             hidden_states,

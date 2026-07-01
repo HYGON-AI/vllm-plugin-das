@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm_hcu.platforms import envs as henvs
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
@@ -113,22 +114,26 @@ class HcuUnquantizedFusedMoEMethod(_Original):
         w2 = layer.w2_weight
 
         try:
-            from aiter.ops.shuffle import asm_shuffle_weight_b8
+            if henvs.VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE:
+                from aiter.ops.shuffle import asm_shuffle_weight_b8
 
-            with torch.no_grad():
-                replace_parameter(
-                    layer, "w13_weight", asm_shuffle_weight_b8(w1, stage=1)
-                )
-                replace_parameter(
-                    layer, "w2_weight", asm_shuffle_weight_b8(w2, stage=2)
-                )
+                with torch.no_grad():
+                    replace_parameter(
+                        layer, "w13_weight", asm_shuffle_weight_b8(w1, stage=1)
+                    )
+                    replace_parameter(
+                        layer, "w2_weight", asm_shuffle_weight_b8(w2, stage=2)
+                    )
 
-                new_w1 = layer.w13_weight
-                new_w2 = layer.w2_weight
-                _copy_parameter_attrs(w1, new_w1)
-                _copy_parameter_attrs(w2, new_w2)
-                setattr(new_w1, "aiter_moe_shuffled", True)
-                setattr(new_w2, "aiter_moe_shuffled", True)
+                    new_w1 = layer.w13_weight
+                    new_w2 = layer.w2_weight
+                    _copy_parameter_attrs(w1, new_w1)
+                    _copy_parameter_attrs(w2, new_w2)
+                    setattr(new_w1, "aiter_moe_shuffled", True)
+                    setattr(new_w2, "aiter_moe_shuffled", True)
+            else:
+                setattr(w1, "aiter_moe_shuffled", False)
+                setattr(w2, "aiter_moe_shuffled", False)
 
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
