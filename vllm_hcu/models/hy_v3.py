@@ -134,7 +134,7 @@ class HYV3FeedForward(nn.Module):
         weight = getattr(self.gate_up_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None
 
-        if self.enable_fuse_silu_mul_quant:
+        if self.enable_fuse_silu_mul_quant and self.quant_dtype is not None:
             self.act_fn = FusedSiluAndMulAndQuant()
         else:
             self.act_fn = SiluAndMul()
@@ -148,7 +148,7 @@ class HYV3FeedForward(nn.Module):
             x, x_and_scale_quanted, self.use_sp_token_gather
         )
 
-        if self.enable_fuse_silu_mul_quant:
+        if self.enable_fuse_silu_mul_quant and self.quant_dtype is not None:
             gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
             x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
