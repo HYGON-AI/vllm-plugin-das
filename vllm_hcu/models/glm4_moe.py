@@ -135,7 +135,11 @@ class Glm4MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
 
-        self.enable_fuse_silu_mul_quant = henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        self.enable_fuse_silu_mul_quant = (
+            henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and quant_config is not None 
+        )
         weight = getattr(self.gate_up_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None
 

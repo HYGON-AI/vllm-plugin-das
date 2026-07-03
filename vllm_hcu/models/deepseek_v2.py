@@ -117,6 +117,7 @@ from vllm.model_executor.models.utils import (
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
+from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 
 logger = init_logger(__name__)
 
@@ -241,16 +242,33 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+        self.enable_fuse_silu_mul_quant = (
+            henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and quant_config is not None 
+        )
+        weight = getattr(self.gate_up_proj, "weight", None)
+        self.quant_dtype = weight.dtype if weight is not None else None
+
+        if self.enable_fuse_silu_mul_quant:
+            self.act_fn = FusedSiluAndMulAndQuant()
+        else:
+            self.act_fn = SiluAndMul()
+
+    def forward(self, x, x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None):
         enable_lightly_cp = get_forward_context().enable_lightly_cp
         if enable_lightly_cp: 
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
         
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if self.enable_fuse_silu_mul_quant:
+            gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
+            xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
+            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(x)
 
         if enable_lightly_cp:
             x = tensor_model_parallel_reduce_scatter(x.contiguous(), dim=0)
@@ -297,12 +315,24 @@ class DeepseekV2SharedMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.enable_fuse_silu_mul_quant = henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        weight = getattr(self.gate_up_proj, "weight", None)
+        self.quant_dtype = weight.dtype if weight is not None else None
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if self.enable_fuse_silu_mul_quant:
+            self.act_fn = FusedSiluAndMulAndQuant()
+        else:
+            self.act_fn = SiluAndMul()
+
+    def forward(self, x, x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None):
+        if self.enable_fuse_silu_mul_quant:
+            gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
+            xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
+            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -793,15 +823,15 @@ class Indexer(nn.Module):
             # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
             k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
             
-            enable_lightly_cp = get_forward_context().enable_lightly_cp
-            if enable_lightly_cp:
-                k = tensor_model_parallel_all_gather(
-                    k.contiguous(), 0
-                )
-                gather_indexes_tensor = get_forward_context().gather_indexes_tensor
-                enable_lightly_cplb = get_forward_context().enable_lightly_cplb
-                if enable_lightly_cplb and gather_indexes_tensor is not None:
-                    k = torch.index_select(k, 0, gather_indexes_tensor)   
+        enable_lightly_cp = get_forward_context().enable_lightly_cp
+        if enable_lightly_cp:
+            k = tensor_model_parallel_all_gather(
+                k.contiguous(), 0
+            )
+            gather_indexes_tensor = get_forward_context().gather_indexes_tensor
+            enable_lightly_cplb = get_forward_context().enable_lightly_cplb
+            if enable_lightly_cplb and gather_indexes_tensor is not None:
+                k = torch.index_select(k, 0, gather_indexes_tensor)   
 
         # we only quant q here since k quant is fused with cache insertion
         if not current_platform.is_rocm() or on_gfx938():
@@ -1257,7 +1287,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
         attn_kwargs = {
             "positions": positions,
             "hidden_states": hidden_states,
