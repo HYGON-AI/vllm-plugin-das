@@ -1966,4 +1966,218 @@ def _validate_asymmetric_region_lengths(
 ''',
 ),
 
+# Mooncake TTFT trace (6-segment model, VLLM_HCU_MOONCAKE_TTFT_TRACE=1)
+(
+'''import asyncio
+import logging
+import threading
+''',
+'''import asyncio
+import logging
+import re
+import threading
+''',
+),
+
+(
+'''logger = init_logger(__name__)
+
+try:
+    from mooncake.engine import TransferEngine
+''',
+'''logger = init_logger(__name__)
+
+_CMPL_UUID_RE = re.compile(
+    r"cmpl-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
+
+def ttft_trace_enabled() -> bool:
+    return henvs.VLLM_HCU_MOONCAKE_TTFT_TRACE
+
+
+def transfer_id_from_req(
+    req_id: str | None,
+    kv_params: dict[str, Any] | None = None,
+) -> str | None:
+    if kv_params and kv_params.get("transfer_id"):
+        return str(kv_params["transfer_id"])
+    if not req_id:
+        return None
+    match = _CMPL_UUID_RE.match(req_id)
+    if match:
+        return f"xfer-{match.group(1)}"
+    return None
+
+
+def log_ttft_event(
+    event: str,
+    *,
+    transfer_id: str | None = None,
+    req_id: str | None = None,
+    kv_params: dict[str, Any] | None = None,
+) -> None:
+    if not ttft_trace_enabled():
+        return
+    tid = transfer_id if transfer_id and transfer_id != "-" else None
+    if tid is None:
+        tid = transfer_id_from_req(req_id, kv_params)
+    logger.debug(
+        "Mooncake TTFT_EVENT event=%s ts=%.6f transfer_id=%s req_id=%s",
+        event,
+        time.time(),
+        tid or "-",
+        req_id or "-",
+    )
+
+
+try:
+    from mooncake.engine import TransferEngine
+''',
+),
+
+(
+'''    sent: int = 0
+    sending: int = 0
+
+
+class MooncakeConnectorMetadata(KVConnectorMetadata):
+''',
+'''    sent: int = 0
+    sending: int = 0
+    ttft_send_start_logged: bool = False
+
+
+class MooncakeConnectorMetadata(KVConnectorMetadata):
+''',
+),
+
+(
+'''                # Get unhashed blocks to pull from remote.
+                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+            else:
+                logger.warning(
+                    "Got invalid KVTransferParams: %s. This "
+                    "request will not utilize KVTransfer",
+                    params,
+                )
+''',
+'''                # Get unhashed blocks to pull from remote.
+                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                log_ttft_event(
+                    "d_alloc",
+                    transfer_id=params.get("transfer_id"),
+                    req_id=request.request_id,
+                )
+            else:
+                logger.warning(
+                    "Got invalid KVTransferParams: %s. This "
+                    "request will not utilize KVTransfer",
+                    params,
+                )
+''',
+),
+
+(
+'''                # Add an empty list to worker to create event.
+                self._reqs_need_send[request.request_id] = (request, [])
+
+    def build_connector_meta(
+''',
+'''                # Add an empty list to worker to create event.
+                self._reqs_need_send[request.request_id] = (request, [])
+                log_ttft_event(
+                    "p_alloc",
+                    transfer_id=params.get("transfer_id"),
+                    req_id=request.request_id,
+                )
+
+    def build_connector_meta(
+''',
+),
+
+(
+'''            if src_ptrs:
+                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                ret_value = await self.sender_loop.run_in_executor(
+''',
+'''            if src_ptrs:
+                for _, send_meta in ok_ready_reqs:
+                    if not send_meta.ttft_send_start_logged:
+                        log_ttft_event(
+                            "p_send_kv_start",
+                            transfer_id=send_meta.transfer_id,
+                            req_id=send_meta.p_req_id or None,
+                        )
+                        send_meta.ttft_send_start_logged = True
+                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                ret_value = await self.sender_loop.run_in_executor(
+''',
+),
+
+(
+'''                send_meta.sent += 1
+                if (
+                    send_meta.sent == send_meta.need_send
+                    and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
+                ):
+                    self.finished_sending_reqs.add(send_meta.p_req_id)
+
+            response = MooncakeXferResponse(
+''',
+'''                send_meta.sent += 1
+                if send_meta.sent == send_meta.need_send:
+                    log_ttft_event(
+                        "p_send_kv_done",
+                        transfer_id=send_meta.transfer_id,
+                        req_id=send_meta.p_req_id or None,
+                    )
+                if (
+                    send_meta.sent == send_meta.need_send
+                    and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
+                ):
+                    self.finished_sending_reqs.add(send_meta.p_req_id)
+
+            response = MooncakeXferResponse(
+''',
+),
+
+(
+'''            if pull_meta.pull_tasks_count == 0:
+                self.finished_recving_reqs.add(pull_meta.d_req_id)
+
+    def _fail_pull_metas(
+''',
+'''            if pull_meta.pull_tasks_count == 0:
+                self.finished_recving_reqs.add(pull_meta.d_req_id)
+                log_ttft_event(
+                    "d_kv_ready",
+                    transfer_id=pull_meta.transfer_id,
+                    req_id=pull_meta.d_req_id,
+                )
+
+    def _fail_pull_metas(
+''',
+),
+
+(
+'''                send_meta.ready.set()
+            else:
+                # From update_state_after_alloc(),
+                # but not reach request_finished() yet
+                # This may be already created by send_kv_to_decode()
+''',
+'''                send_meta.ready.set()
+                log_ttft_event(
+                    "p_ready",
+                    transfer_id=transfer_id,
+                    req_id=p_req_id,
+                )
+            else:
+                # From update_state_after_alloc(),
+                # but not reach request_finished() yet
+                # This may be already created by send_kv_to_decode()
+''',
+),
+
 ]

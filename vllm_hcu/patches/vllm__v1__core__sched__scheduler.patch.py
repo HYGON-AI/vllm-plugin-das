@@ -766,4 +766,38 @@ import vllm_hcu.platforms.envs as henvs
     ),
 ################### supports non-async scheduling pp + mtp ####################
 
+    (
+'''
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.logger import init_logger
+''',
+'''
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+    log_ttft_event,
+)
+from vllm.logger import init_logger
+''',
+    ),
+
+    (
+'''
+        self.finished_recving_kv_req_ids.remove(request.request_id)
+
+    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
+''',
+'''
+        self.finished_recving_kv_req_ids.remove(request.request_id)
+        params = request.kv_transfer_params or {}
+        log_ttft_event(
+            "d_kv_sched_ready",
+            transfer_id=params.get("transfer_id"),
+            req_id=request.request_id,
+            kv_params=params,
+        )
+
+    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
+''',
+    ),
+
 ]

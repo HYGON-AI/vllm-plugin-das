@@ -7,6 +7,7 @@
   - [下载和安装](#下载和安装)
 - [使用方法](#使用方法)
   - [环境变量](#环境变量)
+  - [TTFT 分段追踪](#ttft-分段追踪)
   - [P、D 单实例单节点](#pd-单实例单节点)
   - [P：TP2PP4  D：TP4PP2 (1P1D)](#ptp2pp4-dtp4pp2-1p1d)
   - [P：TP8  D：DP8EP8 (1P1D)](#ptp8-ddp8ep8-1p1d)
@@ -36,6 +37,57 @@ mooncake whl 包（ubuntu2204）路径：http://pypi.sourcefind.cn:666/das_night
 export VLLM_HOST_IP=${HOST_IP}           # 本机 ip 地址
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1  # 优先选择和本地网卡同名的远端网卡进行通信
 ```
+
+### TTFT 分段追踪
+
+开启后，Prefill / Decode 进程会在关键路径上输出结构化 **TTFT_EVENT** 日志，用于 PD 分离场景下的 TTFT 六段分解分析。
+
+#### 启用方式
+
+Prefill 与 Decode **均需**设置（与 `--disable-log-stats` 无关）。该变量由 `vllm_hcu.platforms.envs` 维护：
+
+```bash
+export VLLM_HCU_MOONCAKE_TTFT_TRACE=1
+export VLLM_LOGGING_LEVEL=DEBUG   # TTFT_EVENT 以 DEBUG 级别输出，需同步开启
+```
+
+#### 日志格式
+
+每条事件一行，包含事件名、墙钟时间戳（秒，浮点）、`transfer_id` 与 `req_id`：
+
+```text
+Mooncake TTFT_EVENT event=p_alloc ts=1751510400.123456 transfer_id=xfer-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx req_id=cmpl-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+从 Prefill / Decode 日志中过滤事件：
+
+```bash
+grep 'Mooncake TTFT_EVENT' prefiller.log decoder.log
+```
+
+#### 八事件与六段模型
+
+| 侧 | 事件 | 含义 |
+|----|------|------|
+| P（kv_producer） | `p_alloc` | 请求分配 KV |
+| P | `p_ready` | Prefill 完成 |
+| P | `p_send_kv_start` | 开始发送 KV |
+| P | `p_send_kv_done` | KV 发送完成 |
+| D（kv_consumer） | `d_alloc` | Decode 侧分配 KV |
+| D | `d_kv_ready` | KV 拉取完成 |
+| D | `d_kv_sched_ready` | Scheduler 就绪，可开始 decode |
+| D | `d_first_token` | 首个 token 输出 |
+
+六段时延（相邻事件时间差，单位 ms）：
+
+| 段 | 起止事件 | 说明 |
+|----|----------|------|
+| P prefill | `p_alloc` → `p_ready` | Prefill 计算 |
+| P ready→send | `p_ready` → `p_send_kv_start` | Prefill 完成到开始发 KV |
+| P send | `p_send_kv_start` → `p_send_kv_done` | KV 发送 |
+| D wait KV | `d_alloc` → `d_kv_ready` | Decode 等待 KV 传输 |
+| D KV sched | `d_kv_ready` → `d_kv_sched_ready` | KV 就绪到可调度 decode |
+| D decode | `d_kv_sched_ready` → `d_first_token` | 首 token 前 decode |
 
 ### P、D 单实例单节点
 

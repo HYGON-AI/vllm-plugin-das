@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
     VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
+    VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -209,6 +210,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If use AITER MoE config (solution_id lookup), please set True (default True)
     "VLLM_HCU_USE_AITER_MOE_CONFIG":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MOE_CONFIG", "True").lower() in
+                    ("true", "1")),
+
+    # Emit Mooncake TTFT_EVENT DEBUG lines with wall-clock ts for PD TTFT analysis.
+    "VLLM_HCU_MOONCAKE_TTFT_TRACE":
+        lambda: (os.environ.get("VLLM_HCU_MOONCAKE_TTFT_TRACE", "False").lower() in
                     ("true", "1"))
 }
 
