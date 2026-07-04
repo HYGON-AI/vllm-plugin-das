@@ -2419,7 +2419,7 @@ class GPUModelRunner(
                 if enable_lightly_cp and cm.seq_indexes_list is not None:
                     cm.block_table_tensor = cm.block_table_tensor[cm.seq_indexes_list]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if self.speculative_config and spec_decode_common_attn_metadata is None and get_pp_group().is_last_rank:
                 if isinstance(
                     self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
                 ):
@@ -2434,7 +2434,7 @@ class GPUModelRunner(
                     else:
                         spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            if self.speculative_config and get_pp_group().is_last_rank and isinstance(self.drafter, Gemma4Proposer):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
@@ -5805,7 +5805,7 @@ class GPUModelRunner(
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
-            ):
+            ) and hasattr(self, "drafter"):
                 assert isinstance(
                     self.drafter,
                     EagleProposer

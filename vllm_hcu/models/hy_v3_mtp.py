@@ -57,7 +57,7 @@ from vllm_hcu.model_executor.layers.sp_utils import (
     split_positions_for_sp,
     split_tokens_for_sp,
 )
-
+from vllm.model_executor.models.interfaces import SupportsPP
 
 def _is_moe(config: PretrainedConfig) -> bool:
     return bool(
@@ -270,7 +270,7 @@ class HYV3MultiTokenPredictor(nn.Module):
         return logits
 
 
-class HYV3MTP(nn.Module):
+class HYV3MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -289,7 +289,7 @@ class HYV3MTP(nn.Module):
         self.num_shared_experts = self.model.num_shared_experts
         self.num_redundant_experts = self.model.num_redundant_experts
         self.moe_layers = self.model.moe_layers
-
+        self.use_pp = vllm_config.parallel_config.pipeline_parallel_size > 1
         self.sampler = Sampler()
 
     def set_eplb_state(
@@ -453,6 +453,16 @@ class HYV3MTP(nn.Module):
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
+                # load embed_tokens weight from target model in pp mode
+                if "embed_tokens" in name and self.use_pp:
+                    for local_name in params_dict.keys():
+                        if "embed_tokens" in local_name:
+                            param = params_dict[local_name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                            break
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
             # Skip weights that _rewrite_spec_layer_name marked for skipping
