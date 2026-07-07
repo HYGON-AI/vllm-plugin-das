@@ -40,3 +40,6 @@ void concat_and_cache_mla_hcu(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           const std::string& kv_cache_dtype,
                           torch::Tensor& scale);
 
+void deepseek_v4_inv_rope(torch::Tensor& rope,
+                          torch::Tensor const& position_ids,
+                          torch::Tensor const& cos_sin_cache);

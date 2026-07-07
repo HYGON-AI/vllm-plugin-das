@@ -15,6 +15,14 @@ def register_model():
     )
 
     ModelRegistry.register_model(
+        "DeepseekV4ForCausalLM", "vllm_hcu.models.deepseek_v4:DeepseekV4ForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "DeepSeekV4MTPModel", "vllm_hcu.models.deepseek_v4_mtp:DeepSeekV4MTP"
+    )
+
+    ModelRegistry.register_model(
         "GlmMoeDsaForCausalLM", "vllm_hcu.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )
 

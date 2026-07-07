@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Optional
 
 import deep_ep
+import vllm_hcu.platforms.envs as henvs
 """,
 ),
 (
@@ -134,38 +135,79 @@ import deep_ep
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
 
         quant_type = 0
-        if self.use_int8_dispatch:
+        fp8_round_scale = False
+        if self.use_ue8m0_dispatch:
+            quant_type = 3
+            fp8_round_scale = True
+        elif self.use_int8_dispatch:
             quant_type = 1
         elif self.use_fp8_dispatch:
             quant_type = 2
-        expert_x, expert_num_tokens, handle, _, hook = self.buffer.low_latency_dispatch(
-            a1,
-            dispatch_topk_ids,
-            self.max_tokens_per_rank,
-            num_experts,
-            quant_type = quant_type,
-            fp8_round_scale=False,
-            async_finish=False,
-            return_recv_hook=True,
-        )
-""",
-),
-    # FP8 (apply after INT8 patches above on clean vllm018)
-(
-"""
-logger = init_logger(__name__)
-""",
-"""
-from vllm.platforms import current_platform
-logger = init_logger(__name__)
+
+        fp8_dispatch_quant_group_size = 0
+        if self.use_fp8_dispatch:
+            block_k = (
+                quant_config.block_shape[1]
+                if quant_config.block_shape is not None
+                else None
+            )
+            fp8_dispatch_quant_group_size = (
+                0
+                if block_k is None and quant_config.per_act_token_quant
+                else DEEPEP_QUANT_BLOCK_SIZE
+            )
+
+        if (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API
+        ):
+            expert_x, expert_num_tokens, handle, _, hook = self.buffer.low_latency_dispatch(
+                a1,
+                dispatch_topk_ids,
+                topk_weights,
+                self.max_tokens_per_rank,
+                num_experts,
+                quant_type=quant_type,
+                quant_group_size=fp8_dispatch_quant_group_size,
+                fp8_round_scale=fp8_round_scale,
+                async_finish=False,
+                return_recv_hook=True,
+            )
+        else:
+            legacy_quant_type = 0
+            if self.use_int8_dispatch:
+                legacy_quant_type = 1
+            elif self.use_fp8_dispatch:
+                legacy_quant_type = 2
+            expert_x, expert_num_tokens, handle, _, hook = self.buffer.low_latency_dispatch(
+                a1,
+                dispatch_topk_ids,
+                self.max_tokens_per_rank,
+                num_experts,
+                quant_type=legacy_quant_type,
+                fp8_round_scale=False,
+                async_finish=False,
+                return_recv_hook=True,
+            )
 """,
 ),
 (
 """
             if block_k == DEEPEP_QUANT_BLOCK_SIZE:
+                # DeepEP kernels did the quantization for us.
+                x, x_scales = x
+                return x, x_scales
 """,
 """
-            if block_k == DEEPEP_QUANT_BLOCK_SIZE or (isinstance(x, tuple) and x[0].dtype == current_platform.fp8_dtype()):
+            if block_k == DEEPEP_QUANT_BLOCK_SIZE or (
+                block_k is None and quant_config.per_act_token_quant
+            ):
+                # DeepEP kernels did the quantization for us.
+                x, x_scales = x
+                if block_k is None:
+                    num_experts = x.size(0)
+                    x_scales = normalize_batched_scales_shape(x_scales, num_experts)
+                return x, x_scales
 """,
 ),
 ]

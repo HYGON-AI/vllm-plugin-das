@@ -121,7 +121,8 @@ ext_modules = [
         name='vllm_hcu.hcu_ops', 
         sources=['vllm_hcu/csrc/hcu_cache_kernel.cu',
                  'vllm_hcu/csrc/torch_bindings.cpp',
-                 'vllm_hcu/csrc/custom_all_reduce.cu'
+                 'vllm_hcu/csrc/custom_all_reduce.cu',
+                 'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu'
                  ], 
         define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')], 
         extra_compile_args={
@@ -151,6 +152,8 @@ class CustomBuildExt(BuildExtension.with_options(use_ninja=True)):
             # 确定目标包路径 vllm_hcu/
             target_dir = os.path.join(ROOT, "vllm_hcu")
             target_path = os.path.join(target_dir, file_name)
+            if os.path.abspath(ext_path) == os.path.abspath(target_path):
+                continue
 
             # 如果目标已存在则先删除
             if os.path.exists(target_path):

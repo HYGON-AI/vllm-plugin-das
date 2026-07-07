@@ -957,6 +957,108 @@ def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
     return padded
 
 
+def _decode_row_ends_from_seq_lens(
+    seq_lens: torch.Tensor,
+    next_n: int,
+    num_rows: int,
+) -> torch.Tensor:
+    """Match top_k_per_row_decode's effective row length calculation."""
+    if seq_lens.dim() == 2:
+        return torch.clamp(seq_lens.reshape(-1)[:num_rows], min=0)
+
+    flat_seq_lens = seq_lens.reshape(-1)
+    if flat_seq_lens.numel() * next_n == num_rows and next_n > 1:
+        offsets = torch.arange(
+            next_n, dtype=flat_seq_lens.dtype, device=flat_seq_lens.device
+        )
+        row_ends = flat_seq_lens.unsqueeze(1) - next_n + offsets + 1
+        return torch.clamp(row_ends.reshape(-1)[:num_rows], min=0)
+    return torch.clamp(flat_seq_lens[:num_rows], min=0)
+
+
+def _use_lightop_sparse_mla_topk() -> bool:
+    return (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK
+    )
+
+
+def _lightop_topk_indices_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    num_rows = topk_indices.shape[0]
+    if logits.dim() != 2:
+        raise RuntimeError(f"Prefill topk expects 2D logits, got {logits.shape}")
+    if logits.shape[0] != num_rows:
+        if logits.shape[1] == num_rows:
+            logits = logits.transpose(0, 1)
+        else:
+            raise RuntimeError(
+                "Prefill topk logits/query row mismatch: "
+                f"logits={tuple(logits.shape)}, "
+                f"topk_indices={tuple(topk_indices.shape)}"
+            )
+
+    max_seq_len = logits.shape[1]
+    logits = logits.contiguous()
+    row_starts_i32 = (
+        row_starts.to(device=logits.device, dtype=torch.int32)
+        .reshape(-1)[:num_rows]
+        .clamp(0, max_seq_len)
+    )
+    row_ends_i32 = (
+        row_ends.to(device=logits.device, dtype=torch.int32)
+        .reshape(-1)[:num_rows]
+        .clamp(0, max_seq_len)
+    )
+    row_ends_i32 = torch.maximum(row_ends_i32, row_starts_i32)
+    topk_out = (
+        topk_indices
+        if topk_indices.is_contiguous()
+        else torch.empty(
+            topk_indices.shape,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+    )
+    op.top_k_per_row_prefill(
+        logits,
+        row_starts_i32,
+        row_ends_i32,
+        topk_out,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+    if topk_out is not topk_indices:
+        topk_indices.copy_(topk_out)
+
+
+def _lightop_topk_indices_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
+    op.top_k_per_row_decode(
+        logits,
+        1,
+        row_ends.to(device=logits.device, dtype=torch.int32),
+        topk_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -1115,7 +1217,16 @@ def rocm_aiter_sparse_attn_indexer_native(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
+            if _use_lightop_sparse_mla_topk():
+                _lightop_topk_indices_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    topk_tokens,
+                )
+            else:
+                topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -1141,19 +1252,32 @@ def rocm_aiter_sparse_attn_indexer_native(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        use_lightop_sparse_mla_topk = _use_lightop_sparse_mla_topk()
+        seq_lens = (
+            decode_metadata.seq_lens[:batch_size]
+            if use_lightop_sparse_mla_topk
+            else decode_metadata.seq_lens
+        )
 
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
             weights[:num_padded_tokens],
-            decode_metadata.seq_lens,
+            seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
         )
 
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-        topk_indices.copy_(_topk_indices_torch(logits, topk_tokens)[:num_decode_tokens])
+        if use_lightop_sparse_mla_topk:
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+            _lightop_topk_indices_decode(
+                logits, seq_lens, next_n, topk_indices, topk_tokens
+            )
+        else:
+            topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+            topk_indices.copy_(_topk_indices_torch(logits, topk_tokens)[:num_decode_tokens]
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

@@ -5,13 +5,21 @@ from math import prod
 def patch_fp8_scaled_mm():
     from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
         ChannelWiseTorchFP8ScaledMMLinearKernel,
+        TorchFP8ScaledMMLinearKernel,
     )
     from vllm_hcu.platforms import envs as henvs
 
     if getattr(ChannelWiseTorchFP8ScaledMMLinearKernel, "_hcu_fp8_patch_applied", False):
         return
 
+    original_get_output_padding = TorchFP8ScaledMMLinearKernel.get_output_padding
     original_apply_scaled_mm = ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm
+
+    def new_get_output_padding(self):
+        return None
+
+    TorchFP8ScaledMMLinearKernel.get_output_padding = new_get_output_padding
+    TorchFP8ScaledMMLinearKernel._hcu_rocm_no_output_padding = True
 
     def new_apply_scaled_mm(
         self,
@@ -63,3 +71,6 @@ def patch_fp8_scaled_mm():
 
     ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm = new_apply_scaled_mm
     ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_patch_applied = True
+    ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_original_get_output_padding = (
+        original_get_output_padding
+    )

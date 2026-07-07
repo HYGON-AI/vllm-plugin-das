@@ -41,6 +41,12 @@ MODULE_EXCHANGE_LAZY_MIN_DEPTH: int = 2
 # 官方模块名 -> vllm_hcu 实现模块名
 MODULE_EXCHANGE_MAP: dict[str, str] = {
     #"vllm.model_executor.layers.fused_moe.modular_kernel": "vllm_hcu.model_executor.layers.fused_moe.modular_kernel",
+    "vllm.model_executor.layers.deepseek_compressor": "vllm_hcu.model_executor.layers.deepseek_compressor",
+    "vllm.model_executor.layers.deepseek_v4_attention": "vllm_hcu.model_executor.layers.deepseek_v4_attention",
+    "vllm.model_executor.layers.mhc": "vllm_hcu.model_executor.layers.mhc",
+    "vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache":
+        "vllm_hcu.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache",
+    "vllm.v1.attention.backends.mla.sparse_swa": "vllm_hcu.v1.attention.backends.mla.sparse_swa",
     "vllm.model_executor.layers.fused_moe.deep_gemm_utils": "vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils",
     "vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe": "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
     "vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe": "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
@@ -127,6 +133,7 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
         "vllm.model_executor.parameter": "vllm_hcu.model_executor.parameter",
         "vllm.model_executor.layers.linear": "vllm_hcu.model_executor.layers.linear",
         "vllm.model_executor.layers.sparse_attn_indexer": "vllm_hcu.model_executor.layers.sparse_attn_indexer",
+        "vllm.model_executor.layers.deepseek_compressor": "vllm_hcu.model_executor.layers.deepseek_compressor",
         }
         
         if module_name in module_mappings:

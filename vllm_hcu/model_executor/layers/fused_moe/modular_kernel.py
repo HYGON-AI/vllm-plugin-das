@@ -1182,31 +1182,36 @@ class FusedMoEKernelModularImpl:
         ):
             return hidden_states, prequanted_a1_scale, None, topk_ids, topk_weights
 
-        num_tokens = hidden_states.shape[0] if hidden_states is not None else None
-        num_dispatchers = getattr(self.fused_experts, "num_dispatchers", None)
-        topk = topk_ids.shape[1] if topk_ids is not None else None
-
         if (
-            num_tokens is not None
-            and num_dispatchers is not None
-            and topk is not None
-            and global_num_experts is not None
-            and global_num_experts > 0
+            self.fused_experts.activation_format()
+            == FusedMoEActivationFormat.BatchedExperts
         ):
-            expected_m = (
-                num_tokens * num_dispatchers * topk + global_num_experts
-            ) // global_num_experts
+            num_tokens = hidden_states.shape[0] if hidden_states is not None else None
+            num_dispatchers = getattr(self.fused_experts, "num_dispatchers", None)
+            topk = topk_ids.shape[1] if topk_ids is not None else None
 
-            self.fused_experts.set_expected_m(expected_m)
-        else:
-            logger.warning_once(
-                "Skip set_expected_m because required values are invalid: "
-                "num_tokens=%s, num_dispatchers=%s, topk=%s, global_num_experts=%s",
-                num_tokens,
-                num_dispatchers,
-                topk,
-                global_num_experts,
-            )
+            if (
+                num_tokens is not None
+                and num_dispatchers is not None
+                and topk is not None
+                and global_num_experts is not None
+                and global_num_experts > 0
+            ):
+                expected_m = (
+                    num_tokens * num_dispatchers * topk + global_num_experts
+                ) // global_num_experts
+
+                self.fused_experts.set_expected_m(expected_m)
+            else:
+                logger.warning_once(
+                    "Skip set_expected_m because required values are invalid: "
+                    "num_tokens=%s, num_dispatchers=%s, topk=%s, "
+                    "global_num_experts=%s",
+                    num_tokens,
+                    num_dispatchers,
+                    topk,
+                    global_num_experts,
+                )
 
         if not self.prepare_finalize.supports_async():
             # We shouldn't be running an a2a kernel that doesn't

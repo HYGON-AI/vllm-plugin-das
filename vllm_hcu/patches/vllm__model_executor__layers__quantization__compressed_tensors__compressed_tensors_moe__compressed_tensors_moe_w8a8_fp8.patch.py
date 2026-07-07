@@ -188,4 +188,33 @@ logger = init_logger(__name__)
         assert not self.is_monolithic
 """,
 ),
+
+(
+"""
+            )
+
+    def maybe_make_prepare_finalize(
+""",
+"""
+            )
+            if self.fp8_backend == Fp8MoeBackend.DPSK_DEEPGEMM:
+                fused_experts = self.moe_kernel.fused_experts
+                deepgemm_experts = getattr(fused_experts, "experts", fused_experts)
+                deepgemm_experts.process_weights_after_loading(layer)
+
+    def maybe_make_prepare_finalize(
+""",
+),
+
+(
+"""
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    convert_to_fp8_moe_kernel_format,
+""",
+"""
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
+    convert_to_fp8_moe_kernel_format,
+""",
+),
 ]

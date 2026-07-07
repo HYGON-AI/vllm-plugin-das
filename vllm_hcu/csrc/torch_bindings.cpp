@@ -42,6 +42,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def("reshape_and_cache", &reshape_and_cache_hcu);
   ops.def("concat_and_cache_mla", &concat_and_cache_mla_hcu);
+  ops.def(
+      "deepseek_v4_inv_rope(Tensor! rope, Tensor position_ids, "
+      "Tensor cos_sin_cache) -> ()");
+  ops.impl("deepseek_v4_inv_rope", torch::kCUDA, &deepseek_v4_inv_rope);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
