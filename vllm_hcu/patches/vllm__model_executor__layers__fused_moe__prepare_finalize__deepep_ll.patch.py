@@ -182,6 +182,7 @@ import vllm_hcu.platforms.envs as henvs
             expert_x, expert_num_tokens, handle, _, hook = self.buffer.low_latency_dispatch(
                 a1,
                 dispatch_topk_ids,
+                topk_weights,
                 self.max_tokens_per_rank,
                 num_experts,
                 quant_type=legacy_quant_type,
