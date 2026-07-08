@@ -1108,6 +1108,7 @@ def _validate_asymmetric_region_lengths(
         split_k_and_v = self.transfer_topo.split_k_and_v
 ''',
 '''        self.block_len_per_layer = []
+        self.slot_size_bytes_per_layer = []
         self.cache_entry_model_layer = []
         self.cache_entry_layer_names = []
         self.model_layer_to_cache_indices = {}
@@ -1200,6 +1201,10 @@ def _validate_asymmetric_region_lengths(
                 block_len = cache.stride(0) * cache.element_size()
 
                 self.block_len_per_layer.append(block_len)
+                kv_data_ptrs.append(base_addr)
+                kv_data_lens.append(self.num_blocks * block_len)
+
+        self.kv_caches_base_addr = seen_base_addresses
 ''',
 '''                    "All kv cache tensors must have the same number of blocks"
                 )
@@ -1219,10 +1224,14 @@ def _validate_asymmetric_region_lengths(
                             f"shape={tuple(cache.shape)}, "
                             f"candidates={candidate_sizes}."
                         )
-                assert self.block_size == kernel_block_size, (
-                    f"KV cache block_size mismatch for layer {layer_name}: "
-                    f"expected {self.block_size}, got {kernel_block_size} "
-                    f"from shape {tuple(cache.shape)}"
+                assert kernel_block_size > 0, (
+                    f"Invalid KV cache physical block_size for layer {layer_name}: "
+                    f"got {kernel_block_size} from shape {tuple(cache.shape)}"
+                )
+                assert self.block_size % kernel_block_size == 0, (
+                    f"KV cache logical block_size must be a multiple of physical "
+                    f"block_size for layer {layer_name}: logical={self.block_size}, "
+                    f"physical={kernel_block_size}, shape={tuple(cache.shape)}"
                 )
 
                 if split_k_and_v and not self.use_mla:
@@ -1233,7 +1242,10 @@ def _validate_asymmetric_region_lengths(
                     block_len = curr_tensor_size_bytes // self.num_blocks
                     register_len = curr_tensor_size_bytes
                 elif self.use_mla:
-                    # MLA: stride-based block length so RDMA reaches block padding.
+                    # MLA: stride(0) is the physical kernel-block byte stride.
+                    # Mooncake transfer addresses are indexed by the cache's
+                    # physical block IDs, so block_len and registered length
+                    # must use the same physical stride.
                     block_len = cache.stride(0) * cache.element_size()
                     register_len = self.num_blocks * block_len
                 else:
@@ -1245,18 +1257,10 @@ def _validate_asymmetric_region_lengths(
                     register_len = curr_tensor_size_bytes
 
                 self.block_len_per_layer.append(block_len)
-''',
-),
-
-# Use register_len for Mooncake memory registration length
-(
-'''                self.block_len_per_layer.append(block_len)
-                kv_data_ptrs.append(base_addr)
-                kv_data_lens.append(self.num_blocks * block_len)
-
-        self.kv_caches_base_addr = seen_base_addresses
-''',
-'''                self.block_len_per_layer.append(block_len)
+                if self.use_mla:
+                    self.slot_size_bytes_per_layer.append(
+                        block_len // kernel_block_size
+                    )
                 kv_data_ptrs.append(base_addr)
                 kv_data_lens.append(register_len)
 
@@ -1291,22 +1295,25 @@ def _validate_asymmetric_region_lengths(
 '''        assert tensor_size_bytes is not None
         assert self.num_blocks != 0
         assert self.block_len_per_layer
-        self.block_len = self.block_len_per_layer[0]
-        assert self.block_len % self.block_size == 0, (
-            f"Invalid KV block layout: block_len={self.block_len} is not "
-            f"divisible by block_size={self.block_size}."
-        )
-        per_token_bytes = self.block_len // self.block_size
         if self.use_mla:
-            self.slot_size_bytes = per_token_bytes
-        elif split_k_and_v:
-            self.slot_size_bytes = per_token_bytes
+            assert self.slot_size_bytes_per_layer
+            self.block_len = self.block_len_per_layer[0]
+            self.slot_size_bytes = self.slot_size_bytes_per_layer[0]
         else:
-            assert per_token_bytes % 2 == 0, (
-                "Combined K+V layout expects even per-token bytes. "
-                f"got per_token_bytes={per_token_bytes}."
+            self.block_len = self.block_len_per_layer[0]
+            assert self.block_len % self.block_size == 0, (
+                f"Invalid KV block layout: block_len={self.block_len} is not "
+                f"divisible by block_size={self.block_size}."
             )
-            self.slot_size_bytes = per_token_bytes // 2
+            per_token_bytes = self.block_len // self.block_size
+            if split_k_and_v:
+                self.slot_size_bytes = per_token_bytes
+            else:
+                assert per_token_bytes % 2 == 0, (
+                    "Combined K+V layout expects even per-token bytes. "
+                    f"got per_token_bytes={per_token_bytes}."
+                )
+                self.slot_size_bytes = per_token_bytes // 2
         self.device_kv_caches = kv_caches
 ''',
 ),

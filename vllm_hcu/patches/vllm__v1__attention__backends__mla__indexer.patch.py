@@ -25,6 +25,10 @@ from lightop import gemmopt
                 )
 """,
 """
+            # lightop requires context_lens to be contiguous. PD/Mooncake decode
+            # can pass a non-contiguous seq_lens view after metadata slicing.
+            seq_lens = seq_lens.contiguous()
+
             if current_platform.is_cuda() and has_deep_gemm():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
