@@ -1,0 +1,892 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import enum
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from vllm_hcu.patch.config import HcuFeatureConfig
+from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
+from vllm_hcu.patch.runtime_state import PatchRegistry
+from vllm_hcu.patch.worker.framework_opt import (
+    patch_all2all,
+    patch_base_device_communicator,
+    patch_cuda_communicator,
+    patch_dp_utils,
+    patch_eagle_utils,
+    patch_forward_context,
+    patch_gpu_ubatch_wrapper,
+    patch_llm_base_proposer,
+    patch_pynccl,
+    patch_pynccl_wrapper,
+    patch_ubatch_utils,
+)
+
+
+def _module(name: str, **attributes: object) -> ModuleType:
+    module = ModuleType(name)
+    for key, value in attributes.items():
+        setattr(module, key, value)
+    return module
+
+
+def _config(**updates: object) -> SimpleNamespace:
+    values = HcuFeatureConfig(**updates).to_dict()
+    return SimpleNamespace(additional_config={"hcu": values})
+
+
+def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
+    paths = (
+        "vllm_hcu/v1/hcu_model_runner.py",
+        "vllm_hcu/model_executor/layers/sp_utils.py",
+        "vllm_hcu/models/deepseek_v2.py",
+        "vllm_hcu/models/glm4_moe.py",
+        "vllm_hcu/models/hy_v3.py",
+    )
+    forbidden = (
+        ".parallel_config.enable_lightly_cp",
+        ".parallel_config.enable_lightly_cplb",
+        '"enable_custom_sp", False',
+        ".speculative_config.enable_multi_layers_mtp",
+    )
+    for path in paths:
+        source = Path(path).read_text(encoding="utf-8-sig")
+        assert "get_hcu_config" in source
+        assert not any(fragment in source for fragment in forbidden)
+
+
+def _fake_all2all_module() -> ModuleType:
+    class DeepEPAll2AllManagerBase:
+        def __init__(self, cpu_group, tcp_store_group=None):
+            self.cpu_group = cpu_group
+            self.tcp_store_group = tcp_store_group
+            self.internode = bool(tcp_store_group)
+            self.num_sms = 20
+
+    class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
+        def _make_all2all_kwargs(self):
+            return {"upstream": True}
+
+        def set_num_sms(self, num_sms: int):
+            self.applied_sms = min(num_sms, self.num_sms)
+
+    return _module(
+        patch_all2all.TARGET_MODULE,
+        DeepEPAll2AllManagerBase=DeepEPAll2AllManagerBase,
+        DeepEPHTAll2AllManager=DeepEPHTAll2AllManager,
+        envs=SimpleNamespace(VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE=False),
+    )
+
+
+def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    module = _fake_all2all_module()
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 17)
+    assert patch_all2all.apply_to_module(module) is True
+    assert patch_all2all.apply_to_module(module) is False
+
+    manager = module.DeepEPHTAll2AllManager("group", "tcp")
+    assert manager.num_sms == 30
+    kwargs = manager._make_all2all_kwargs()
+    assert kwargs["num_nvl_bytes"] == 1_000_000_000
+    assert kwargs["num_rdma_bytes"] == 500_000_000
+    assert kwargs["num_qps_per_rank"] == 30
+    manager.set_num_sms(29)
+    assert manager.applied_sms == 17
+    # The legacy contract replaces the call argument with the environment
+    # override first, then preserves vLLM's upper bound by ``self.num_sms``.
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 40)
+    manager.set_num_sms(29)
+    assert manager.applied_sms == 30
+    intranode = module.DeepEPHTAll2AllManager("group")
+    intranode_kwargs = intranode._make_all2all_kwargs()
+    assert intranode.num_sms == 60
+    assert intranode_kwargs["num_rdma_bytes"] == 0
+    assert intranode_kwargs["num_qps_per_rank"] == 1
+
+
+def _fake_base_communicator_module() -> ModuleType:
+    class DeviceCommunicatorBase:
+        def __init__(
+            self,
+            cpu_group,
+            device=None,
+            device_group=None,
+            unique_name="",
+            global_ranks=None,
+            global_world_size=None,
+        ):
+            self.device_group = device_group
+            self.is_ep_communicator = unique_name.split(":")[0] == "ep"
+            self.use_all2all = False
+
+        def reduce_scatter(self, input_, dim=-1):
+            return input_
+
+    return _module(
+        patch_base_device_communicator.TARGET_MODULE,
+        DeviceCommunicatorBase=DeviceCommunicatorBase,
+    )
+
+
+def test_base_communicator_reads_custom_sp_sidecar_and_uses_torch_collective(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.config
+
+    config = _config(enable_custom_sp=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=1)
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+    calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_to_all_single",
+        lambda output, input_, group=None: calls.append((output, input_, group)),
+    )
+    module = _fake_base_communicator_module()
+    assert patch_base_device_communicator.apply_to_module(module)
+    assert not patch_base_device_communicator.apply_to_module(module)
+    communicator = module.DeviceCommunicatorBase(
+        object(), device_group="device-group", unique_name="ep:0"
+    )
+    assert communicator.use_all2all is True
+    output, input_ = object(), object()
+    assert communicator.all_to_all_single(output, input_) is output
+    assert calls == [(output, input_, "device-group")]
+
+
+def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obsolete():
+    class CudaCommunicator:
+        def __init__(
+            self,
+            cpu_group,
+            device=None,
+            device_group=None,
+            unique_name="",
+            global_ranks=None,
+            global_world_size=None,
+            tcp_store_group=None,
+        ):
+            pass
+
+    module = _module(
+        patch_cuda_communicator.TARGET_MODULE, CudaCommunicator=CudaCommunicator
+    )
+    coordinator = ExactImportCoordinator(registry=PatchRegistry())
+    registration = patch_cuda_communicator.register(coordinator)
+    assert registration.module_name == patch_cuda_communicator.CUSTOM_ALLREDUCE_MODULE
+    assert patch_cuda_communicator.apply_to_module(module) is True
+    assert patch_cuda_communicator.apply_to_module(module) is False
+    assert "all_to_all_single" not in vars(CudaCommunicator)
+@dataclasses.dataclass
+class _Function:
+    name: str
+    restype: object
+    argtypes: list[object]
+
+
+def _fake_pynccl_wrapper_module(*, cached: bool = False) -> ModuleType:
+    class NCCLLibrary:
+        exported_functions: list[_Function] = []
+        path_to_library_cache = {"lib": object()} if cached else {}
+        path_to_dict_mapping = {}
+
+        def __init__(self, so_file=None):
+            self._funcs = {}
+
+        def ncclSend(self, sendbuff, count, datatype, dest, comm, stream):
+            return None
+
+    return _module(
+        patch_pynccl_wrapper.TARGET_MODULE,
+        NCCLLibrary=NCCLLibrary,
+        Function=_Function,
+        ncclResult_t=object(),
+        buffer_type=lambda value: value,
+        ncclDataType_t=object(),
+        ncclComm_t=object(),
+        cudaStream_t=lambda value: value,
+        find_nccl_library=lambda: "librccl.so",
+    )
+
+
+def test_pynccl_wrapper_capability_registration_precedes_library_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_pynccl_wrapper_module()
+    monkeypatch.setattr(
+        patch_pynccl_wrapper,
+        "_probe_rccl_symbol",
+        lambda target: (True, "librccl.so"),
+    )
+    assert patch_pynccl_wrapper.apply_to_module(module, required=True)
+    assert not patch_pynccl_wrapper.apply_to_module(module, required=True)
+    assert [item.name for item in module.NCCLLibrary.exported_functions] == [
+        "ncclAllToAll"
+    ]
+    calls: list[tuple[object, ...]] = []
+    library = object.__new__(module.NCCLLibrary)
+    library._funcs = {"ncclAllToAll": lambda *args: calls.append(args) or 0}
+    library.NCCL_CHECK = lambda result: None
+    library.ncclAllToAll(1, 2, 3, 4, 5, 6)
+    assert calls == [(1, 2, 3, 4, 5, 6)]
+
+    cached = _fake_pynccl_wrapper_module(cached=True)
+    assert not patch_pynccl_wrapper.apply_to_module(cached)
+    with pytest.raises(RuntimeError, match="explicitly requested"):
+        patch_pynccl_wrapper.apply_to_module(cached, required=True)
+
+
+def test_pynccl_communicator_method_is_capability_gated(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ReduceOp(enum.Enum):
+        SUM = "sum"
+
+    class PyNcclCommunicator:
+        def reduce_scatter(
+            self,
+            output_tensor,
+            input_tensor,
+            op=ReduceOp.SUM,
+            stream=None,
+        ):
+            return None
+
+    module = _module(
+        patch_pynccl.TARGET_MODULE,
+        PyNcclCommunicator=PyNcclCommunicator,
+        ReduceOp=ReduceOp,
+        current_stream=lambda: SimpleNamespace(cuda_stream=99),
+        buffer_type=lambda value: value,
+        cudaStream_t=lambda value: value,
+        ncclDataTypeEnum=SimpleNamespace(from_torch=lambda dtype: dtype),
+    )
+    wrapper = _fake_pynccl_wrapper_module()
+    wrapper._vllm_hcu_pynccl_all_to_all_applied = True
+
+    def nccl_all_to_all(*args):
+        return None
+
+    nccl_all_to_all._vllm_hcu_pynccl_all_to_all_wrapper = True
+    wrapper.NCCLLibrary.ncclAllToAll = nccl_all_to_all
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.device_communicators.pynccl_wrapper",
+        wrapper,
+    )
+    assert patch_pynccl.apply_to_module(module, required=True)
+    assert not patch_pynccl.apply_to_module(module, required=True)
+
+    class Tensor:
+        def __init__(self, device="cuda:0", size=4):
+            self.device = device
+            self.dtype = "int8"
+            self._size = size
+
+        def numel(self):
+            return self._size
+
+        def data_ptr(self):
+            return id(self)
+
+    calls: list[tuple[object, ...]] = []
+    communicator = object.__new__(PyNcclCommunicator)
+    communicator.disabled = False
+    communicator.device = "cuda:0"
+    communicator.world_size = 2
+    communicator.comm = "comm"
+    communicator.nccl = SimpleNamespace(
+        ncclAllToAll=lambda *args: calls.append(args)
+    )
+    input_tensor, output_tensor = Tensor(), Tensor()
+    assert (
+        communicator.all_to_all_single(output_tensor, input_tensor)
+        is output_tensor
+    )
+    assert calls[0][2] == 2
+    with pytest.raises(AssertionError, match="input tensor"):
+        communicator.all_to_all_single(output_tensor, Tensor(device="cuda:1"))
+
+
+class _Mode(enum.Enum):
+    NONE = 0
+
+
+def _fake_forward_context_module() -> ModuleType:
+    @dataclasses.dataclass
+    class ForwardContext:
+        value: object
+
+    def create_forward_context(
+        attn_metadata,
+        vllm_config,
+        dp_metadata=None,
+        cudagraph_runtime_mode=_Mode.NONE,
+        batch_descriptor=None,
+        ubatch_slices=None,
+        slot_mapping=None,
+        additional_kwargs=None,
+        skip_compiled=False,
+    ):
+        return ForwardContext(attn_metadata)
+
+    @contextlib.contextmanager
+    def set_forward_context(
+        attn_metadata,
+        vllm_config,
+        num_tokens=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=_Mode.NONE,
+        batch_descriptor=None,
+        ubatch_slices=None,
+        slot_mapping=None,
+        skip_compiled=False,
+    ):
+        yield "official"
+
+    return _module(
+        patch_forward_context.TARGET_MODULE,
+        ForwardContext=ForwardContext,
+        CUDAGraphMode=_Mode,
+        create_forward_context=create_forward_context,
+        set_forward_context=set_forward_context,
+    )
+
+
+def test_forward_context_keeps_dataclass_and_attaches_runtime_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_forward_context_module()
+    original_class = module.ForwardContext
+    assert patch_forward_context.apply_to_module(module)
+    assert not patch_forward_context.apply_to_module(module)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(all2all_backend="naive")
+    )
+    context = module.create_forward_context(
+        "metadata",
+        config,
+        scatter_indexes_tensor="scatter",
+        gather_indexes_tensor="gather",
+        enable_lightly_cp=True,
+        enable_lightly_cplb=True,
+    )
+    assert type(context) is original_class
+    assert dataclasses.is_dataclass(context)
+    assert context.scatter_indexes_tensor == "scatter"
+    assert context.gather_indexes_tensor == "gather"
+    assert context.enable_lightly_cp is True
+
+    sentinel = contextlib.nullcontext("hcu")
+    monkeypatch.setattr(
+        "vllm_hcu.forward_context_runtime.set_forward_context",
+        lambda *args, **kwargs: sentinel,
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    with module.set_forward_context(None, config) as value:
+        assert value == "hcu"
+
+
+def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
+    calls: list[tuple[object, ...]] = []
+
+    def coordinate_batch_across_dp(
+        num_tokens_unpadded,
+        allow_microbatching,
+        parallel_config,
+        num_tokens_padded=None,
+        uniform_decode=None,
+        cudagraph_mode=0,
+    ):
+        calls.append((num_tokens_unpadded, parallel_config))
+        return True, "tokens", 2
+
+    module = _module(
+        patch_dp_utils.TARGET_MODULE,
+        coordinate_batch_across_dp=coordinate_batch_across_dp,
+    )
+    patch_dp_utils.apply_to_module(module)
+    low_latency = SimpleNamespace(
+        data_parallel_size=4, all2all_backend="deepep_low_latency"
+    )
+    assert module.coordinate_batch_across_dp(4, False, low_latency) == (
+        False,
+        None,
+        0,
+    )
+    normal = SimpleNamespace(data_parallel_size=4, all2all_backend="naive")
+    assert module.coordinate_batch_across_dp(4, False, normal) == (
+        True,
+        "tokens",
+        2,
+    )
+    assert calls == [(4, normal)]
+
+
+class _Buffer:
+    def __init__(self, size, **kwargs):
+        self.size = size
+
+
+def _fake_proposer_module() -> ModuleType:
+    class SpecDecodeBaseProposer:
+        def __init__(
+            self,
+            vllm_config,
+            device,
+            pass_hidden_states_to_model,
+            runner=None,
+        ):
+            self.vllm_config = vllm_config
+            self.compilation_config = vllm_config.compilation_config
+            self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
+            self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.backup_next_token_ids = _Buffer(self.max_batch_size)
+            self.arange = torch.arange(max(self.max_batch_size + 1, self.max_num_tokens))
+            self.rocm_branch_initialized = True
+
+        def propose(
+            self,
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            next_token_ids,
+            token_indices_to_sample,
+            common_attn_metadata,
+            sampling_metadata,
+            mm_embed_inputs=None,
+            num_rejected_tokens_gpu=None,
+            slot_mappings=None,
+        ):
+            return "official"
+
+        def prepare_inputs_padded(
+            self,
+            common_attn_metadata,
+            spec_decode_metadata,
+            valid_sampled_tokens_count,
+        ):
+            return SimpleNamespace(num_actual_tokens=7), None, None
+
+        def _maybe_share_lm_head(self, target_language_model):
+            return "official-share"
+
+        def _determine_batch_execution_and_padding(
+            self, num_tokens, use_cudagraphs=True
+        ):
+            return num_tokens, use_cudagraphs
+
+    return _module(
+        patch_llm_base_proposer.TARGET_MODULE,
+        SpecDecodeBaseProposer=SpecDecodeBaseProposer,
+        CpuGpuBuffer=_Buffer,
+        is_pin_memory_available=lambda: False,
+        torch=torch,
+    )
+
+
+def _proposer_config(**hcu: object) -> SimpleNamespace:
+    config = _config(**hcu)
+    config.scheduler_config = SimpleNamespace(
+        max_num_seqs=4, max_num_batched_tokens=6
+    )
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=4)
+    config.compilation_config = SimpleNamespace(
+        pass_config=SimpleNamespace(enable_sp=False)
+    )
+    return config
+
+
+def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding():
+    module = _fake_proposer_module()
+    assert patch_llm_base_proposer.apply_to_module(module)
+    assert not patch_llm_base_proposer.apply_to_module(module)
+    runner = SimpleNamespace(lightly_cp_threshold=8)
+    config = _proposer_config(
+        enable_lightly_cp=True,
+        enable_lightly_cplb=True,
+        enable_custom_sp=True,
+        enable_multi_layers_mtp=True,
+    )
+    proposer = module.SpecDecodeBaseProposer(config, "cpu", True, runner)
+    assert proposer.rocm_branch_initialized is True
+    assert proposer.max_batch_size == 8
+    assert proposer.backup_next_token_ids.size == 8
+    assert proposer.query_start_loc.size == proposer.max_batch_size + 1
+    assert proposer.seq_lens.size == proposer.max_batch_size
+    assert proposer.enable_multi_layers_mtp is True
+    assert proposer._pad_for_sequence_parallelism(5) == 8
+    assert proposer._determine_batch_execution_and_padding(5) == (8, True)
+
+    off = module.SpecDecodeBaseProposer(_proposer_config(), "cpu", True)
+    assert off.propose(None, None, None, None, None, None, None) == "official"
+
+    prepared, _, _ = off.prepare_inputs_padded(None, None, None)
+    assert prepared.num_kv_actual_tokens == prepared.num_actual_tokens == 7
+
+
+def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.v1.spec_decode import proposer_runtime
+
+    canonical = SimpleNamespace(
+        num_actual_tokens=5,
+        max_query_len=2,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        _num_computed_tokens_cpu=torch.tensor([0], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([1], dtype=torch.int32),
+    )
+    cp_metadata = SimpleNamespace(
+        num_reqs=1,
+        slot_mapping=torch.tensor([0], dtype=torch.int64),
+        scatter_indexes_tensor=torch.tensor([0]),
+        gather_indexes_tensor=torch.tensor([0]),
+        cp_common_metadata=canonical,
+    )
+    common = SimpleNamespace(
+        num_reqs=1,
+        max_query_len=5,
+        seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0], dtype=torch.int64),
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([5], dtype=torch.int32),
+        _num_computed_tokens_cpu=torch.tensor([0], dtype=torch.int32),
+        batch_size=lambda: 1,
+    )
+    events: list[tuple[str, object]] = []
+    lightly_cp = _module(
+        "vllm_hcu.v1.attention.lightly_cp_utils",
+        pad_for_mla_cp=lambda value: 8,
+        prepare_cp_metadata=lambda **kwargs: (
+            events.append(("prepare", kwargs["num_tokens"])) or cp_metadata
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm_hcu.v1.attention.lightly_cp_utils", lightly_cp
+    )
+
+    @contextlib.contextmanager
+    def set_forward_context(*args, **kwargs):
+        events.append(("context", kwargs))
+        yield
+
+    module = SimpleNamespace(torch=torch, set_forward_context=set_forward_context)
+
+    class Model:
+        def __call__(self, **kwargs):
+            events.append(("model", kwargs))
+            return torch.ones(1, 2)
+
+    def build_metadata(metadata, draft_index=None):
+        events.append(("metadata", metadata))
+        return [metadata], {"layer": metadata}
+
+    proposer = SimpleNamespace(
+        method="mtp",
+        model=Model(),
+        hidden_size=2,
+        set_inputs_first_pass=lambda **kwargs: (
+            5,
+            torch.tensor([0]),
+            common,
+        ),
+        runner=SimpleNamespace(lightly_cp_threshold=1),
+        enable_lightly_cp=True,
+        enable_lightly_cplb=False,
+        query_start_loc=object(),
+        seq_lens=object(),
+        build_per_group_and_layer_attn_metadata=build_metadata,
+        _determine_batch_execution_and_padding=lambda value: (
+            "mode",
+            value,
+            None,
+        ),
+        build_model_inputs_first_pass=lambda num_tokens, num_input_tokens, mm: (
+            {},
+            1,
+        ),
+        vllm_config=object(),
+        _get_slot_mapping=lambda *args: {"slot": args},
+        model_returns_tuple=lambda: False,
+        _greedy_sample=lambda hidden: torch.tensor([42]),
+        num_speculative_tokens=1,
+        parallel_drafting=False,
+    )
+    result = proposer_runtime.propose(
+        module,
+        proposer,
+        torch.arange(5),
+        torch.arange(5),
+        torch.ones(5, 2),
+        torch.tensor([1]),
+        torch.tensor([0]),
+        common,
+        object(),
+    )
+    assert result.tolist() == [[42]]
+    assert events[0] == ("prepare", 5)
+    assert events[1] == ("metadata", cp_metadata)
+    context_kwargs = next(value for name, value in events if name == "context")
+    assert context_kwargs["scatter_indexes_tensor"] is cp_metadata.scatter_indexes_tensor
+    assert context_kwargs["gather_indexes_tensor"] is cp_metadata.gather_indexes_tensor
+    assert context_kwargs["enable_lightly_cp"] is True
+
+    # A second draft step must switch back from the rank-local CP view to the
+    # canonical metadata carried by cp_common_metadata.
+    events.clear()
+    proposer.num_speculative_tokens = 2
+    proposer.allowed_attn_types = None
+    proposer.uses_mrope = False
+    proposer.positions = torch.zeros(8, dtype=torch.int64)
+    proposer.constant_draft_positions = False
+    proposer.block_size = 1
+    proposer.input_ids = torch.zeros(8, dtype=torch.int32)
+    proposer.hidden_states = torch.zeros(8, 2)
+    proposer.supports_mm_inputs = False
+    proposer.pass_hidden_states_to_model = False
+    proposer.arange = torch.arange(9, dtype=torch.int32)
+    proposer.token_arange_np = np.arange(9)
+    proposer._get_positions = lambda size: proposer.positions[:size]
+    proposer._update_positions_dependent_metadata = (
+        lambda positions, metadata, *args: (
+            events.append(("canonical", metadata)) or positions
+        )
+    )
+    result = proposer_runtime.propose(
+        module,
+        proposer,
+        torch.arange(5),
+        torch.arange(5),
+        torch.ones(5, 2),
+        torch.tensor([1]),
+        torch.tensor([0]),
+        common,
+        object(),
+    )
+    assert result.tolist() == [[42, 42]]
+    assert ("canonical", canonical) in events
+    assert ("metadata", canonical) in events
+
+
+def test_multi_layer_mtp_preserves_distinct_trained_head():
+    from vllm_hcu.v1.spec_decode.proposer_runtime import (
+        preserve_multi_layer_mtp_heads,
+    )
+
+    trained = SimpleNamespace(weight=torch.tensor([[2.0]]))
+    shared = SimpleNamespace(head=trained)
+    layer = SimpleNamespace(shared_head=shared)
+    proposer = SimpleNamespace(
+        model=SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    )
+    target = SimpleNamespace(lm_head=SimpleNamespace(weight=torch.tensor([[1.0]])))
+
+    def official(self, target_language_model):
+        self.model.model.layers[0].shared_head.head = target_language_model.lm_head
+
+    preserve_multi_layer_mtp_heads(proposer, target, official)
+    assert shared.head is trained
+
+
+def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
+    target_buffer = object()
+
+    class DraftInner:
+        def __init__(self):
+            self.child = SimpleNamespace(topk_indices_buffer=None)
+
+        def named_modules(self):
+            return [("", self), ("child", self.child)]
+
+    models: list[object] = []
+
+    def load_eagle_model(target_model, vllm_config):
+        model = SimpleNamespace(model=DraftInner())
+        models.append(model)
+        return model
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE, load_eagle_model=load_eagle_model
+    )
+    patch_eagle_utils.apply_to_module(module)
+    target = SimpleNamespace(model=SimpleNamespace(topk_indices_buffer=target_buffer))
+    off_model = module.load_eagle_model(target, _config())
+    assert off_model.model.child.topk_indices_buffer is None
+    on_model = module.load_eagle_model(
+        target, _config(enable_multi_layers_mtp=True)
+    )
+    assert on_model.model.child.topk_indices_buffer is target_buffer
+
+
+def test_ubatch_sms_guard_disables_only_missing_compute_control(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class UBatchWrapper:
+        @staticmethod
+        def _create_sm_control_context(vllm_config):
+            return "official"
+
+    module = _module(
+        patch_gpu_ubatch_wrapper.TARGET_MODULE,
+        UBatchWrapper=UBatchWrapper,
+        deep_gemm_set_num_sms=lambda value: None,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.v1.worker_framework_runtime.deep_gemm_has_sms_api",
+        lambda target: False,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.v1.worker_framework_runtime.create_sm_control_context_without_compute",
+        lambda target, config: "hcu-no-compute-sms",
+    )
+    patch_gpu_ubatch_wrapper.apply_to_module(module)
+    assert UBatchWrapper._create_sm_control_context(object()) == "hcu-no-compute-sms"
+
+
+def _fake_ubatch_module() -> ModuleType:
+    @dataclasses.dataclass
+    class UBatchSlice:
+        request_slice: slice
+        token_slice: slice
+
+        @property
+        def num_tokens(self):
+            return self.token_slice.stop - self.token_slice.start
+
+    def _pad_out_ubatch_slices(ubatch_slices, num_total_tokens, num_reqs_padded):
+        last = ubatch_slices[-1]
+        return ubatch_slices[:-1] + [
+            UBatchSlice(
+                slice(last.request_slice.start, num_reqs_padded),
+                slice(last.token_slice.start, num_total_tokens),
+            )
+        ]
+
+    def maybe_create_ubatch_slices(
+        should_ubatch,
+        num_scheduled_tokens,
+        num_tokens_padded,
+        num_reqs_padded,
+        num_ubatches,
+        split_point=None,
+    ):
+        raise AssertionError("HCU implementation must own list split points")
+
+    def _make_metadata_with_slice(ubatch_slice, attn_metadata):
+        return SimpleNamespace()
+
+    return _module(
+        patch_ubatch_utils.TARGET_MODULE,
+        UBatchSlice=UBatchSlice,
+        np=np,
+        _pad_out_ubatch_slices=_pad_out_ubatch_slices,
+        maybe_create_ubatch_slices=maybe_create_ubatch_slices,
+        _make_metadata_with_slice=_make_metadata_with_slice,
+    )
+
+
+def test_ubatch_list_splits_use_python_ints_and_preserve_attention_metadata():
+    module = _fake_ubatch_module()
+    patch_ubatch_utils.apply_to_module(module)
+    slices, padded = module.maybe_create_ubatch_slices(
+        True,
+        np.array([3, 3], dtype=np.int32),
+        np.int32(8),
+        np.int32(2),
+        np.int32(2),
+        [np.int32(3)],
+    )
+    assert all(
+        type(boundary) is int
+        for item in (*slices, *padded)
+        for boundary in (
+            item.request_slice.start,
+            item.request_slice.stop,
+            item.token_slice.start,
+            item.token_slice.stop,
+        )
+    )
+    metadata = SimpleNamespace(
+        positions=torch.arange(6), is_prefilling=torch.tensor([True, False])
+    )
+    result = module._make_metadata_with_slice(slices[0], metadata)
+    torch.testing.assert_close(result.positions, torch.arange(3))
+    torch.testing.assert_close(result.is_prefilling, torch.tensor([True]))
+
+
+def test_clean_vllm_modules_import_apply_and_second_apply_is_idempotent():
+    script = r'''
+import vllm
+print('VLLM_SOURCE', vllm.__file__)
+from vllm_hcu.patch.worker.framework_opt import (
+    patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
+    patch_dp_utils, patch_eagle_utils, patch_forward_context,
+    patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
+    patch_pynccl_wrapper, patch_ubatch_utils,
+)
+adapters = (
+    patch_all2all, patch_base_device_communicator, patch_forward_context,
+    patch_llm_base_proposer, patch_dp_utils, patch_eagle_utils,
+    patch_gpu_ubatch_wrapper, patch_ubatch_utils,
+)
+for adapter in adapters:
+    assert adapter.apply() is True, adapter.__name__
+    assert adapter.apply() is False, adapter.__name__
+assert patch_cuda_communicator.apply_to_module(
+    __import__(patch_cuda_communicator.TARGET_MODULE, fromlist=['CudaCommunicator'])
+) is True
+assert patch_cuda_communicator.apply_to_module(
+    __import__(patch_cuda_communicator.TARGET_MODULE, fromlist=['CudaCommunicator'])
+) is False
+wrapper_applied = patch_pynccl_wrapper.apply(required=False)
+assert patch_pynccl_wrapper.apply(required=False) is False
+pynccl_applied = patch_pynccl.apply(required=False)
+assert patch_pynccl.apply(required=False) is False
+print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
+'''
+    env = dict(os.environ)
+    # Apply adapters explicitly so this subprocess is independent of ambient
+    # plugin discovery settings.
+    env["VLLM_PLUGINS"] = "__disabled__"
+    clean_vllm = Path(
+        env.get(
+            "VLLM_V021_SOURCE_ROOT",
+            str(Path.cwd().parent / "vllm_dcu_v0.21"),
+        )
+    )
+    python_paths = [str(Path.cwd())]
+    if (clean_vllm / "vllm").is_dir():
+        python_paths.insert(0, str(clean_vllm))
+    env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REAL_WORKER_FRAMEWORK_OK" in result.stdout
+    if (clean_vllm / "vllm").is_dir():
+        assert f"VLLM_SOURCE {clean_vllm / 'vllm' / '__init__.py'}" in result.stdout
