@@ -20,14 +20,11 @@ class _VisionChunkProcessorItems:
     pass
 
 
-def _load_patch_module():
-    patch_path = (
-        ROOT
-        / "vllm_hcu/patches/patch_kimi_k25_vision_chunk_prompt.py"
-    )
+def _load_runtime_compat_module():
+    compat_path = ROOT / "vllm_hcu/runtime_compat/kimi_k25_vision_prompt.py"
     spec = importlib.util.spec_from_file_location(
-        "patch_kimi_k25_vision_chunk_prompt_test",
-        patch_path,
+        "kimi_k25_vision_prompt_compat_test",
+        compat_path,
     )
     assert spec is not None
     assert spec.loader is not None
@@ -100,11 +97,11 @@ def _install_fake_modules():
     }
 
 
-def test_patch_adds_media_pad_text_fallback_and_dummy_prompt_shell() -> None:
+def test_runtime_compat_adds_media_pad_fallback_and_dummy_prompt_shell() -> None:
     state = _install_fake_modules()
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_kimi_k25_vision_chunk_prompt_updates()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_kimi_k25_vision_prompt_compat()
 
         processor = state["kimi_module"].KimiK25MultiModalProcessor()
         updates = processor._get_prompt_updates(None, {}, {})

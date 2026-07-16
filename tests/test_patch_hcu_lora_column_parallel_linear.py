@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -17,12 +21,12 @@ class _LoRAConfig:
         self.fully_sharded_loras = fully_sharded_loras
 
 
-def _load_patch_module():
-    patch_path = (
-        ROOT
-        / "vllm_hcu/patches/patch_hcu_lora_column_parallel_linear.py"
+def _load_runtime_compat_module():
+    compat_path = ROOT / "vllm_hcu/runtime_compat/lora_column_parallel.py"
+    spec = importlib.util.spec_from_file_location(
+        "hcu_lora_column_parallel_compat_test",
+        compat_path,
     )
-    spec = importlib.util.spec_from_file_location("patch_hcu_lora_test", patch_path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -213,11 +217,11 @@ def _install_fake_modules():
     }
 
 
-def test_patch_accepts_hcu_linear_types() -> None:
+def test_runtime_compat_accepts_hcu_linear_types() -> None:
     state = _install_fake_modules()
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_hcu_lora_column_parallel_linear()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_hcu_lora_column_parallel_compat()
 
         lora_module = state["lora_module"]
         hcu_column = state["hcu_column"]
@@ -263,29 +267,18 @@ def test_patch_accepts_hcu_linear_types() -> None:
                 sys.modules[name] = original_module
 
 
-def test_patch_utils_registers_hcu_lora_patch() -> None:
-    source = (ROOT / "vllm_hcu/patch_utils.py").read_text(encoding="utf-8")
-    module = ast.parse(source)
+def test_runtime_callback_registers_hcu_lora_compat() -> None:
+    from vllm_hcu.patch.runtime_callbacks import runtime_callback_names
 
-    function = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "patch_module_class_function"
-    )
-
-    names = {
-        node.id
-        for node in ast.walk(function)
-        if isinstance(node, ast.Name)
-    }
-
-    assert "patch_hcu_lora_column_parallel_linear" in names
+    assert (
+        "runtime_method.hcu_lora_column_parallel",
+        "vllm.lora.layers.column_parallel_linear",
+    ) in runtime_callback_names()
 
 
-def test_patch_file_does_not_import_hcu_linear_module() -> None:
+def test_runtime_compat_does_not_import_hcu_linear_module() -> None:
     source = (
-        ROOT / "vllm_hcu/patches/patch_hcu_lora_column_parallel_linear.py"
+        ROOT / "vllm_hcu/runtime_compat/lora_column_parallel.py"
     ).read_text(encoding="utf-8")
     module = ast.parse(source)
 
@@ -298,11 +291,11 @@ def test_patch_file_does_not_import_hcu_linear_module() -> None:
     assert "vllm_hcu.model_executor.layers" not in import_froms
 
 
-def test_patch_groups_qwen35_in_proj_qkvz_into_two_loras() -> None:
+def test_runtime_compat_groups_qwen35_in_proj_qkvz_into_two_loras() -> None:
     state = _install_fake_modules()
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_hcu_lora_column_parallel_linear()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_hcu_lora_column_parallel_compat()
 
         lora_module = state["lora_module"]
         layer = state["hcu_merged"](
@@ -336,3 +329,132 @@ def test_patch_groups_qwen35_in_proj_qkvz_into_two_loras() -> None:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = original_module
+
+
+def test_runtime_compat_explicit_module_is_import_free_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_modules()
+    try:
+        compat_module = _load_runtime_compat_module()
+
+        def fail_import(name: str):
+            raise AssertionError(f"explicit callback path imported {name}")
+
+        monkeypatch.setattr(compat_module.importlib, "import_module", fail_import)
+        lora_module = state["lora_module"]
+        compat_module.install_hcu_lora_column_parallel_compat(lora_module)
+        first_init = lora_module.ColumnParallelLinearWithLoRA.__init__
+        first_can_replace = lora_module.ColumnParallelLinearWithLoRA.__dict__[
+            "can_replace_layer"
+        ].__func__
+
+        compat_module.install_hcu_lora_column_parallel_compat(lora_module)
+
+        assert lora_module.ColumnParallelLinearWithLoRA.__init__ is first_init
+        assert (
+            lora_module.ColumnParallelLinearWithLoRA.__dict__["can_replace_layer"]
+            .__func__
+            is first_can_replace
+        )
+        assert lora_module._hcu_lora_column_parallel_linear_patch_applied is True
+    finally:
+        for name in state["injected"]:
+            original_module = state["restore"][name]
+            if original_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original_module
+
+
+def test_runtime_compat_zero_arg_api_uses_exact_child_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_modules()
+    try:
+        compat_module = _load_runtime_compat_module()
+        lora_module = state["lora_module"]
+        imported: list[str] = []
+
+        def import_module(name: str):
+            imported.append(name)
+            return lora_module
+
+        monkeypatch.setattr(compat_module.importlib, "import_module", import_module)
+        wrong_module = types.ModuleType("vllm.lora.layers.not_column_parallel")
+        with pytest.raises(TypeError, match="expected module"):
+            compat_module.install_hcu_lora_column_parallel_compat(wrong_module)
+
+        compat_module.install_hcu_lora_column_parallel_compat()
+        compat_module.install_hcu_lora_column_parallel_compat()
+        assert imported == [
+            "vllm.lora.layers.column_parallel_linear",
+            "vllm.lora.layers.column_parallel_linear",
+        ]
+
+        # A marker without its exact method bindings is corruption, not an
+        # idempotent success.
+        lora_module.ColumnParallelLinearWithLoRA.__init__ = lambda self, base: None
+        with pytest.raises(RuntimeError, match="postcondition failed"):
+            compat_module.install_hcu_lora_column_parallel_compat(lora_module)
+    finally:
+        for name in state["injected"]:
+            original_module = state["restore"][name]
+            if original_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original_module
+
+
+def test_clean_v021_lora_callback_uses_completed_exact_module_without_gpu() -> None:
+    clean_vllm = Path(
+        os.environ.get("VLLM_V021_SOURCE_ROOT", ROOT.parent / "vllm_dcu_v0.21")
+    )
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(clean_vllm)))
+    code = r'''
+import importlib
+import json
+
+from vllm_hcu.patch import apply_platform_patches, patch_report
+
+apply_platform_patches()
+target = importlib.import_module("vllm.lora.layers.column_parallel_linear")
+compat = importlib.import_module("vllm_hcu.runtime_compat.lora_column_parallel")
+
+# Exercise the retained direct API and its idempotent postcondition check.
+first_init = target.ColumnParallelLinearWithLoRA.__init__
+compat.install_hcu_lora_column_parallel_compat()
+record = patch_report()["patches"]["runtime_method.hcu_lora_column_parallel"]
+print(json.dumps({
+    "module": target.__name__,
+    "status": record["status"],
+    "marker": getattr(
+        target, "_hcu_lora_column_parallel_linear_patch_applied", False
+    ),
+    "same_init": target.ColumnParallelLinearWithLoRA.__init__ is first_init,
+    "binding": getattr(
+        target.ColumnParallelLinearWithLoRA.__init__,
+        "_hcu_lora_column_parallel_compat_binding",
+        None,
+    ),
+}))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "module": "vllm.lora.layers.column_parallel_linear",
+        "status": "applied",
+        "marker": True,
+        "same_init": True,
+        "binding": "column_init",
+    }

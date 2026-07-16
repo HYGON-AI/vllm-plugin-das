@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import importlib.util
 import os
 import sys
@@ -11,13 +10,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_patch_module():
-    patch_path = (
-        ROOT / "vllm_hcu/patches/patch_qwen35_lora_disable_piecewise_cudagraph.py"
-    )
+def _load_runtime_compat_module():
+    compat_path = ROOT / "vllm_hcu/runtime_compat/qwen35_lora_cudagraph.py"
     spec = importlib.util.spec_from_file_location(
-        "patch_qwen35_lora_piecewise_test",
-        patch_path,
+        "qwen35_lora_cudagraph_compat_test",
+        compat_path,
     )
     assert spec is not None
     assert spec.loader is not None
@@ -127,11 +124,11 @@ def _install_fake_modules():
     }
 
 
-def test_patch_filters_all_piecewise_capture_for_qwen35() -> None:
+def test_runtime_compat_filters_all_piecewise_capture_for_qwen35() -> None:
     state = _install_fake_modules()
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_qwen35_lora_disable_piecewise_cudagraph()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_qwen35_lora_cudagraph_compat()
 
         class _ModelConfig:
             architecture = "Qwen3_5ForConditionalGeneration"
@@ -156,11 +153,11 @@ def test_patch_filters_all_piecewise_capture_for_qwen35() -> None:
                 sys.modules[name] = original_module
 
 
-def test_patch_disables_piecewise_dispatch_for_qwen35() -> None:
+def test_runtime_compat_disables_piecewise_dispatch_for_qwen35() -> None:
     state = _install_fake_modules()
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_qwen35_lora_disable_piecewise_cudagraph()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_qwen35_lora_cudagraph_compat()
 
         class _ModelConfig:
             architecture = "Qwen3_5ForConditionalGeneration"
@@ -191,13 +188,13 @@ def test_patch_disables_piecewise_dispatch_for_qwen35() -> None:
                 sys.modules[name] = original_module
 
 
-def test_patch_allows_env_opt_out_for_qwen35() -> None:
+def test_runtime_compat_allows_env_opt_out_for_qwen35() -> None:
     state = _install_fake_modules()
     original_env = os.environ.get("VLLM_HCU_QWEN35_LORA_ALLOW_UNSAFE_COMPILE")
     os.environ["VLLM_HCU_QWEN35_LORA_ALLOW_UNSAFE_COMPILE"] = "1"
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_qwen35_lora_disable_piecewise_cudagraph()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_qwen35_lora_cudagraph_compat()
 
         class _ModelConfig:
             architecture = "Qwen3_5ForConditionalGeneration"
@@ -231,11 +228,11 @@ def test_patch_allows_env_opt_out_for_qwen35() -> None:
                 sys.modules[name] = original_module
 
 
-def test_patch_leaves_other_models_unchanged() -> None:
+def test_runtime_compat_leaves_other_models_unchanged() -> None:
     state = _install_fake_modules()
     try:
-        patch_module = _load_patch_module()
-        patch_module.patch_qwen35_lora_disable_piecewise_cudagraph()
+        compat_module = _load_runtime_compat_module()
+        compat_module.install_qwen35_lora_cudagraph_compat()
 
         class _ModelConfig:
             architecture = "LlamaForCausalLM"
@@ -265,21 +262,10 @@ def test_patch_leaves_other_models_unchanged() -> None:
                 sys.modules[name] = original_module
 
 
-def test_patch_utils_registers_qwen35_piecewise_patch() -> None:
-    source = (ROOT / "vllm_hcu/patch_utils.py").read_text(encoding="utf-8")
-    module = ast.parse(source)
+def test_runtime_callback_registers_qwen35_cudagraph_compat() -> None:
+    from vllm_hcu.patch.runtime_callbacks import runtime_callback_names
 
-    function = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "patch_module_class_function"
-    )
-
-    names = {
-        node.id
-        for node in ast.walk(function)
-        if isinstance(node, ast.Name)
-    }
-
-    assert "patch_qwen35_lora_disable_piecewise_cudagraph" in names
+    assert (
+        "runtime_method.qwen35_lora_cudagraph",
+        "vllm.v1.cudagraph_dispatcher",
+    ) in runtime_callback_names()
