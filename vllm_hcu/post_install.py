@@ -1,34 +1,21 @@
-"""Post-install helpers for applying vLLM source patches."""
+# SPDX-License-Identifier: Apache-2.0
+"""One-release read-only compatibility entry for the former patch command."""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+from vllm_hcu.doctor import main as doctor_main
 
 
-def apply_post_install_patches() -> int:
-    try:
-        from pathlib import Path
+def apply_post_install_patches(argv: Sequence[str] | None = None) -> int:
+    """Run diagnostics only; retained for callers of the legacy command name."""
 
-        import vllm_hcu
-        from vllm_hcu.patches import _module_to_source_path
-        from vllm_hcu.patch_utils import _register_patches
-        #fused_moe_modular_method等在import时会缓存 FusedMoEKernel，import_hook替换modular_kernel不可靠，改用软链。
-        dst = _module_to_source_path(
-            "vllm.model_executor.layers.fused_moe.modular_kernel"
-        )
-        src = (
-            Path(vllm_hcu.__file__).parent
-            / "model_executor/layers/fused_moe/modular_kernel.py"
-        ).resolve()
-        if dst is None:
-            raise FileNotFoundError("vllm modular_kernel not found")
-        link_path = dst
-        if not (link_path.is_symlink() and link_path.resolve() == src):
-            link_path.unlink(missing_ok=True)
-            link_path.symlink_to(src)
-
-        _register_patches()
-        print("Post-install patches applied successfully")
-        return 0
-    except Exception as e:
-        print(f"Warning: Failed to apply patches: {e}")
-        return 1
+    print(
+        "vllm-hcu-apply-patches is now read-only; vLLM-HCU no longer writes "
+        "vLLM source files or creates modular_kernel symlinks."
+    )
+    return doctor_main(argv)
 
 
 def main() -> int:

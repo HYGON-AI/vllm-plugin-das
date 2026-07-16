@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, Union
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-from setuptools import find_packages, setup, find_namespace_packages
+from setuptools import find_namespace_packages, setup
 
 if "MAX_JOBS" not in os.environ:
     os.environ["MAX_JOBS"] = str(multiprocessing.cpu_count())
@@ -17,7 +17,7 @@ if "MAX_JOBS" not in os.environ:
 # 基础路径
 # =========================================================
 ROOT = Path(__file__).parent.resolve()
-PWD = str(ROOT)
+BASE_VERSION = "0.21.0"
 
 ADD_GIT_VERSION = os.environ.get("ADD_GIT_VERSION", "1") == "1"
 
@@ -29,7 +29,13 @@ def get_git_sha(root: Union[str, Path]) -> str:
     try:
         return (
             subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={Path(root).resolve()}",
+                    "rev-parse",
+                    "HEAD",
+                ],
                 cwd=root,
                 stderr=subprocess.DEVNULL,
             )
@@ -67,50 +73,11 @@ def build_hcu_version(sha: Optional[str] = None) -> str:
 
 
 # =========================================================
-# 写入 version.py
-# =========================================================
-def write_version_file(version_suffix: str) -> None:
-    version_file = ROOT / "vllm_hcu" / "version.py"
-
-    content = f'''\
-try:
-    __version__ = "0.21.0"
-    __version_tuple__ = (0, 21, 0)
-    __hcu_version__ = "0.21.0+{version_suffix}"
-
-    from vllm_hcu.version import __version__, __version_tuple__, __hcu_version__
-except Exception as e:
-    import warnings
-
-    warnings.warn(f"Failed to read commit hash: {{e}}", RuntimeWarning)
-    __version__ = "dev"
-    __version_tuple__ = (0, 0, 0)
-'''
-
-    with open(version_file, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-# =========================================================
 # 获取最终版本
 # =========================================================
 def get_version() -> str:
-    # 确保 git safe directory（避免 CI 报错）
-    subprocess.run(
-        ["git", "config", "--global", "--add", "safe.directory", PWD],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
     version_suffix = build_hcu_version()
-    write_version_file(version_suffix)
-
-    version_file = ROOT / "vllm_hcu" / "version.py"
-    scope = {}
-    with open(version_file, encoding="utf-8") as f:
-        exec(compile(f.read(), str(version_file), "exec"), scope)
-
-    return scope["__hcu_version__"]
+    return f"{BASE_VERSION}+{version_suffix}"
 
 # =========================================================
 # --- 2. 定义 C++ 扩展模块 ---
@@ -171,7 +138,7 @@ setup(
     version=get_version(),
     description="vLLM HCU backend plugin",
     python_requires=">=3.10",
-    packages=find_namespace_packages(),
+    packages=find_namespace_packages(include=["vllm_hcu", "vllm_hcu.*"]),
     package_data={"vllm_hcu": ["*.so", "so/*.so", "include/*.h"]},
     ext_modules=ext_modules,
     cmdclass={
@@ -180,6 +147,7 @@ setup(
     entry_points={
         "console_scripts": [
             "vllm-hcu-apply-patches = vllm_hcu.post_install:main",
+            "vllm-hcu-doctor = vllm_hcu.doctor:main",
         ],
         "vllm.platform_plugins": [
             "hcu = vllm_hcu:hcu_platform_plugin",
