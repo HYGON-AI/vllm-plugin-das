@@ -22,7 +22,7 @@ import vllm_hcu.platforms.envs as henvs
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
-from vllm_hcu.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 # from vllm.model_executor.layers.utils import cublas_gemm_bf16_bf16_fp32
 from vllm_hcu.utils.bf16_fp32_gemm import linear_bf16_fp32
 from vllm.utils.deep_gemm import fp8_einsum
@@ -41,7 +41,7 @@ from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
 )
 
 if TYPE_CHECKING:
-    from vllm_hcu.v1.attention.backends.mla.sparse_swa import (
+    from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
 
@@ -55,7 +55,7 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm_hcu.model_executor.layers.deepseek_compressor import DeepseekCompressor
+from vllm.model_executor.layers.deepseek_compressor import DeepseekCompressor
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import (
@@ -79,7 +79,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
-from vllm_hcu.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm_hcu.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,

@@ -1,3 +1,12 @@
+"""Manual GPU correctness/performance harness for the concat kernels.
+
+This module predates the repository pytest suite.  Its ``test_*`` callables
+take benchmark inputs supplied by the manual driver below, not pytest
+fixtures, so exclude the module from automatic collection.
+"""
+
+__test__ = False
+
 import triton
 import triton.language as tl
 import torch
@@ -318,4 +327,4 @@ if __name__ == '__main__':
     test_concat_Acc_decode(((765, 16, 512), (765, 16, 64)),  2)
     test_concat_Acc_decode(((766, 16, 512), (766, 16, 64)),  2)
     test_concat_Acc_decode(((765, 32, 512), (765, 32, 64)),  2)
-    test_concat_Acc_decode(((767, 32, 512), (767, 32, 64)),  2) 
+    test_concat_Acc_decode(((767, 32, 512), (767, 32, 64)), 2)

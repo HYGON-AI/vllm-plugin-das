@@ -11,6 +11,7 @@ from torch.distributed.distributed_c10d import is_nccl_available
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm_hcu import _ensure_platform_plugin_ready
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 import vllm_hcu.platforms.envs as henvs 
 
 logger = init_logger(__name__)
+
+_ensure_platform_plugin_ready()
 
 try:
     from amdsmi import (
@@ -449,7 +452,25 @@ class HCUPlatform(Platform):
         return device_props.total_memory
 
     @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        """Register HCU config adapters through vLLM's public platform hook."""
+        from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+        from vllm_hcu.patch.platform.core_fix.patch_hcu_config import (
+            pre_register_and_update,
+        )
+
+        IMPORT_COORDINATOR.drain_ready_callbacks()
+        pre_register_and_update(parser)
+
+    @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
+        # ``vllm._aiter_ops`` performs import-time custom-op registration.
+        # Arm its exact HCU replacement before either implementation can load.
+        from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+        from vllm_hcu.patch.worker import prepare_worker_patches
+
+        IMPORT_COORDINATOR.drain_ready_callbacks()
+        prepare_worker_patches()
         from vllm._aiter_ops import rocm_aiter_ops
 
         compilation_config = vllm_config.compilation_config
@@ -483,6 +504,26 @@ class HCUPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
+        from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+        from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
+            validate_and_update_hcu_config,
+        )
+
+        IMPORT_COORDINATOR.drain_ready_callbacks()
+        validate_and_update_hcu_config(vllm_config)
+
+        # Use vLLM's public qualified-class configuration hooks.  Both
+        # selectors only assign strings and therefore keep the official and
+        # HCU Scheduler/Executor implementations lazy until engine startup.
+        from vllm_hcu.patch.platform.framework_opt.patch_multiproc_executor import (
+            select_hcu_multiproc_executor,
+        )
+        from vllm_hcu.patch.platform.framework_opt.patch_scheduler import (
+            select_hcu_scheduler,
+        )
+
+        select_hcu_scheduler(vllm_config)
+        select_hcu_multiproc_executor(vllm_config)
 
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config

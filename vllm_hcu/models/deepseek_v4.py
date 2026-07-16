@@ -20,7 +20,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
-from vllm_hcu.model_executor.layers.deepseek_v4_attention import (
+from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4Indexer,
     DeepseekV4MLAModules,
     DeepseekV4MultiHeadLatentAttentionWrapper,
@@ -1157,7 +1157,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         # Lazy import to avoid top-level tilelang dependency.
         # Registers both torch.ops.vllm.mhc_pre and mhc_post
-        import vllm_hcu.model_executor.layers.mhc  # noqa: F401
+        import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
