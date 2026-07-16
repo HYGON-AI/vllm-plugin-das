@@ -25,7 +25,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils import (
+from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M,
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
