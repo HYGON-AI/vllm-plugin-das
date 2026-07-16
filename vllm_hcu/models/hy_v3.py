@@ -63,6 +63,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.hy_v3 import HYV3Config
+from vllm.v1.attention.selector import get_attn_backend
 
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
@@ -74,6 +75,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.model_executor.layers.sp_utils import (
     configure_hcu_runtime_sp,
     finalize_attention_output_for_sp,
@@ -92,6 +94,10 @@ from vllm_hcu.model_executor.layers.sp_utils import (
 from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 
 logger = init_logger(__name__)
+
+
+def fused_qkv_cache_layout_supported(attn_backend: type) -> bool:
+    return attn_backend.get_name() != "TRITON_ATTN"
 
 
 class HYV3FeedForward(nn.Module):
@@ -155,7 +161,7 @@ class HYV3FeedForward(nn.Module):
         if self.enable_fuse_silu_mul_quant and self.quant_dtype is not None:
             gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
@@ -352,6 +358,15 @@ class HYV3Attention(nn.Module):
         )
         self.enable_fused_qkv_split_rms_rope_kvstore = henvs.VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE \
             and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        if self.enable_fused_qkv_split_rms_rope_kvstore:
+            kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+            attn_backend = get_attn_backend(
+                self.head_dim,
+                torch.get_default_dtype(),
+                kv_cache_dtype,
+            )
+            if not fused_qkv_cache_layout_supported(attn_backend):
+                self.enable_fused_qkv_split_rms_rope_kvstore = False
         weight = getattr(self.qkv_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None
 
@@ -536,9 +551,7 @@ class HYV3Model(nn.Module):
         quant_config = vllm_config.quant_config
 
         parallel_config = vllm_config.parallel_config
-        configure_hcu_runtime_sp(
-            getattr(parallel_config, "enable_custom_sp", False)
-        )
+        configure_hcu_runtime_sp(get_hcu_config(vllm_config).enable_custom_sp)
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 

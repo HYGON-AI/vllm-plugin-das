@@ -33,6 +33,7 @@ from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.model_executor.layers.sp_utils import (
     configure_hcu_runtime_sp,
     finalize_attention_output_for_sp,
@@ -80,6 +81,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.selector import get_attn_backend
 
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
@@ -94,6 +96,10 @@ from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 from vllm_hcu.ops.fuse_rms_norm_quant import FusedRMSNormAndQuant
 
 logger = init_logger(__name__)
+
+
+def fused_qkv_cache_layout_supported(attn_backend: type) -> bool:
+    return attn_backend.get_name() != "TRITON_ATTN"
 
 
 class Glm4MoeMLP(nn.Module):
@@ -157,7 +163,7 @@ class Glm4MoeMLP(nn.Module):
         if self.enable_fuse_silu_mul_quant:
             gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
@@ -355,6 +361,15 @@ class Glm4MoeAttention(nn.Module):
 
         self.enable_fused_qkv_split_rms_rope_kvstore = henvs.VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE \
             and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        if self.enable_fused_qkv_split_rms_rope_kvstore:
+            kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+            attn_backend = get_attn_backend(
+                self.head_dim,
+                torch.get_default_dtype(),
+                kv_cache_dtype,
+            )
+            if not fused_qkv_cache_layout_supported(attn_backend):
+                self.enable_fused_qkv_split_rms_rope_kvstore = False
         weight = getattr(self.qkv_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None
 
@@ -586,9 +601,7 @@ class Glm4MoeModel(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        configure_hcu_runtime_sp(
-            getattr(vllm_config.parallel_config, "enable_custom_sp", False)
-        )
+        configure_hcu_runtime_sp(get_hcu_config(vllm_config).enable_custom_sp)
         enable_eplb = vllm_config.parallel_config.enable_eplb
         self.config = config
 

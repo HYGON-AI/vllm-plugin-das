@@ -74,7 +74,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     scaled_dequantize,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+from vllm.model_executor.layers.sparse_attn_indexer import (
     SparseAttnIndexer,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -115,6 +115,7 @@ from vllm.model_executor.models.utils import (
 )
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
 from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
@@ -264,7 +265,7 @@ class DeepseekV2MLP(nn.Module):
         if self.enable_fuse_silu_mul_quant:
             gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
@@ -328,7 +329,7 @@ class DeepseekV2SharedMLP(nn.Module):
         if self.enable_fuse_silu_mul_quant:
             gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(gate_up, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
@@ -1019,10 +1020,11 @@ class DeepseekV2MLAAttention(nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.num_heads = num_heads
+        hcu_feature_config = get_hcu_config(vllm_config)
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size if not \
-            vllm_config.parallel_config.enable_lightly_cp else self.num_heads
+            hcu_feature_config.enable_lightly_cp else self.num_heads
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -1055,7 +1057,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
-                disable_tp=vllm_config.parallel_config.enable_lightly_cp,
+                disable_tp=hcu_feature_config.enable_lightly_cp,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1064,7 +1066,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
-                disable_tp=vllm_config.parallel_config.enable_lightly_cp,
+                disable_tp=hcu_feature_config.enable_lightly_cp,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -1073,7 +1075,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
-            disable_tp=vllm_config.parallel_config.enable_lightly_cp,
+            disable_tp=hcu_feature_config.enable_lightly_cp,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -1081,7 +1083,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            disable_tp=vllm_config.parallel_config.enable_lightly_cp,
+            disable_tp=hcu_feature_config.enable_lightly_cp,
         )
 
         if config.rope_parameters["rope_type"] != "default":
