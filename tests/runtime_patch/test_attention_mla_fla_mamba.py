@@ -1,0 +1,747 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU runtime-contract tests for attention, MLA, FLA, and Mamba adapters."""
+
+from __future__ import annotations
+
+import importlib
+import inspect
+import sys
+from dataclasses import dataclass
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+
+def _adapter(name: str):
+    return importlib.import_module(f"vllm_hcu.patch.worker.op_opt.{name}")
+
+
+def _module(name: str, **values) -> ModuleType:
+    module = ModuleType(name)
+    module.__dict__.update(values)
+    return module
+
+
+def _gdn_causal_conv1d_fn(
+    x,
+    weight,
+    bias=None,
+    conv_states=None,
+    query_start_loc=None,
+    cache_indices=None,
+    has_initial_state=None,
+    activation="silu",
+    pad_slot_id=-1,
+    null_block_id=0,
+    block_idx_first_scheduled_token=None,
+    block_idx_last_scheduled_token=None,
+    initial_state_idx=None,
+    num_computed_tokens=None,
+    block_size_to_align=0,
+    metadata=None,
+    validate_data=False,
+):
+    return weight
+
+
+def _gdn_causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+    conv_state_indices=None,
+    num_accepted_tokens=None,
+    query_start_loc=None,
+    max_query_len=-1,
+    null_block_id=0,
+    block_idx_last_scheduled_token=None,
+    initial_state_idx=None,
+    validate_data=False,
+):
+    return weight
+
+
+def _install_fake_module(monkeypatch, name: str, **values) -> ModuleType:
+    parts = name.split(".")
+    for index in range(1, len(parts)):
+        parent_name = ".".join(parts[:index])
+        if parent_name not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent_name, ModuleType(parent_name))
+    module = _module(name, **values)
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def test_attention_direct_forward_preserves_cpu_values_and_query_device():
+    from vllm_hcu.model_executor.layers.mla_runtime import torch as runtime_torch
+
+    # Importing attention_runtime requires a real vLLM custom-op registry, so
+    # exercise its pure forward body through the source module only when the
+    # runtime dependency is already available.
+    try:
+        runtime = importlib.import_module(
+            "vllm_hcu.model_executor.layers.attention_runtime"
+        )
+    except (ImportError, RuntimeError):
+        pytest.skip("vLLM custom-op registry is unavailable in the CPU unit environment")
+    assert runtime_torch is torch
+    calls = {}
+
+    class Impl:
+        def do_kv_cache_update(self, layer, key, value, cache, slots):
+            calls["dummy_device"] = key.device
+
+    def attention(query, key, value, output, layer_name, **kwargs):
+        output.copy_(query + key + value)
+
+    upstream = SimpleNamespace(
+        _encode_layer_name=lambda value: value,
+        _resolve_layer_name=lambda value: value,
+        get_attention_context=lambda value: (
+            None,
+            SimpleNamespace(impl=Impl()),
+            (torch.empty(0), torch.empty(0)),
+            torch.tensor([0]),
+        ),
+        unified_attention_with_output=attention,
+    )
+    self = SimpleNamespace(
+        calculate_kv_scales=False,
+        query_quant=None,
+        num_heads=1,
+        num_kv_heads=1,
+        head_size=2,
+        head_size_v=2,
+        layer_name="layer",
+        kv_cache_dtype="auto",
+        attn_backend=SimpleNamespace(forward_includes_kv_cache_update=False),
+        kv_sharing_target_layer_name=None,
+    )
+    query = torch.tensor([[1.0, 2.0]])
+    key = torch.tensor([[3.0, 4.0]])
+    value = torch.tensor([[5.0, 6.0]])
+    output = runtime.attention_forward(upstream, self, query, key, value)
+    torch.testing.assert_close(output, torch.tensor([[9.0, 12.0]]))
+    assert calls["dummy_device"] == query.device
+
+
+def test_fused_attention_accepts_only_supported_stacked_kv_cache_layout():
+    try:
+        runtime = importlib.import_module(
+            "vllm_hcu.model_executor.layers.attention_runtime"
+        )
+    except (ImportError, RuntimeError):
+        pytest.skip("vLLM custom-op registry is unavailable in the CPU unit environment")
+
+    axis_zero = torch.arange(24).reshape(2, 3, 4)
+    key, value = runtime.split_kv_cache(axis_zero)
+    torch.testing.assert_close(key, axis_zero[0])
+    torch.testing.assert_close(value, axis_zero[1])
+
+    with pytest.raises(ValueError, match="stacked KV cache dimension"):
+        runtime.split_kv_cache(torch.empty(3, 2, 4))
+
+
+def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+
+    def original(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+                 chunk_indices=None, chunk_size=64, core_attn_out=None):
+        return q + k + v + h
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_fwd_o=original,
+        torch=torch,
+    )
+    assert adapter.apply_to_module(module)
+    assert not adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", False)
+    x = torch.arange(4, dtype=torch.float32)
+    torch.testing.assert_close(module.chunk_fwd_o(x, x, x, x), original(x, x, x, x))
+
+
+def test_fla_chunk_delta_h_enabled_missing_aiter_fails_clearly(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_delta_h")
+
+    def original(k, w, u, g=None, gk=None, initial_state=None,
+                 output_final_state=False, chunk_size=64, save_new_value=True,
+                 cu_seqlens=None, chunk_indices=None, chunk_offsets=None):
+        return k, u, None
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_gated_delta_rule_fwd_h=original,
+        torch=torch,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.triton.fla.vllm.chunk_delta_h",
+        ModuleType("aiter.ops.triton.fla.vllm.chunk_delta_h"),
+    )
+    with pytest.raises(RuntimeError, match="enabled but unavailable"):
+        module.chunk_gated_delta_rule_fwd_h(
+            torch.empty(1, 1, 1, 1),
+            torch.empty(1),
+            torch.empty(1, 1, 1, 1),
+        )
+
+
+def test_mamba_nn_sharded_loader_cpu_numeric():
+    from vllm_hcu.model_executor.layers.mamba_runtime import (
+        mamba_v2_nn_sharded_weight_loader,
+    )
+
+    param = torch.zeros(2, 4)
+    loaded = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    loader = mamba_v2_nn_sharded_weight_loader([(4, 0, False)], 1, 0)
+    loader(param, loaded)
+    torch.testing.assert_close(param, loaded)
+
+
+def test_mamba_mixer_init_converts_conv_buffer_to_nn_layout(monkeypatch):
+    adapter = _adapter("patch_mamba_mixer2")
+
+    class MambaMixer2:
+        def __init__(self, hidden_size, ssm_state_size, conv_kernel_size,
+                     intermediate_size, use_conv_bias, use_bias, n_groups=1,
+                     num_heads=128, head_dim=64, rms_norm_eps=1e-5,
+                     activation="silu", use_rms_norm=True, model_config=None,
+                     cache_config=None, quant_config=None, prefix=""):
+            del hidden_size, ssm_state_size, intermediate_size, use_conv_bias, use_bias
+            del n_groups, num_heads, head_dim, rms_norm_eps, activation, use_rms_norm
+            del model_config, cache_config, quant_config, prefix
+            self.conv1d = SimpleNamespace(
+                weight=torch.arange(12, dtype=torch.float32).reshape(3, 1, conv_kernel_size)
+            )
+            self.conv_weights = self.conv1d.weight.view(3, conv_kernel_size)
+
+    def loader(shard_spec, tp_size, tp_rank):
+        return lambda param, weight: None
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        MambaMixer2=MambaMixer2,
+        mamba_v2_sharded_weight_loader=loader,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    instance = MambaMixer2(4, 1, 4, 4, False, False)
+    assert instance.conv_weights.shape == (4, 3)
+    torch.testing.assert_close(
+        instance.conv_weights, instance.conv1d.weight.squeeze(1).T.contiguous()
+    )
+
+
+def test_gdn_feature_off_delegates_official_state_dtype(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    calls: list[str] = []
+
+    def causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+        null_block_id,
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+        num_computed_tokens,
+        block_size_to_align,
+        metadata,
+        validate_data,
+    ):
+        return "official-causal"
+
+    def recurrent(*args, **kwargs):
+        return "official-recurrent"
+
+    def sigmoid(*args, **kwargs):
+        return "official-sigmoid"
+
+    def causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices,
+        num_accepted_tokens,
+        query_start_loc,
+        max_query_len,
+        null_block_id,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+        validate_data,
+    ):
+        return "official-update"
+
+    class GatedDeltaNetAttention:
+        def get_state_dtype(self):
+            calls.append("official-state-dtype")
+            return "official-dtype"
+
+    class Calculator:
+        @staticmethod
+        def gated_delta_net_state_dtype(*args):
+            raise AssertionError("feature-off path must not recompute upstream dtype")
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        causal_conv1d_fn=causal_conv1d_fn,
+        causal_conv1d_update=causal_conv1d_update,
+        fused_recurrent_gated_delta_rule_packed_decode=recurrent,
+        fused_sigmoid_gating_delta_rule_update=sigmoid,
+        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        MambaStateDtypeCalculator=Calculator,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    instance = GatedDeltaNetAttention()
+    assert instance.get_state_dtype() == "official-dtype"
+    assert calls == ["official-state-dtype"]
+
+
+def test_gdn_runtime_adapter_has_stable_patch_id():
+    adapter = _adapter("patch_gdn_linear_attention")
+    assert adapter.PATCH_ID == "worker.op_opt.mamba.gdn_linear_attention"
+
+
+def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    captured = {}
+
+    def causal_fn(*args, **kwargs):
+        captured["causal_fn"] = args[1]
+        return args[1]
+
+    causal_fn.__signature__ = inspect.signature(_gdn_causal_conv1d_fn)  # type: ignore[attr-defined]
+
+    def causal_update(*args, **kwargs):
+        captured["causal_update"] = args[2]
+        return args[2]
+
+    causal_update.__signature__ = inspect.signature(_gdn_causal_conv1d_update)  # type: ignore[attr-defined]
+
+    def aiter_update(*args, **kwargs):
+        captured["aiter_update"] = args[10]
+        return args[10]
+
+    class GatedDeltaNetAttention:
+        def get_state_dtype(self):
+            return "official-dtype"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        causal_conv1d_fn=causal_fn,
+        causal_conv1d_update=causal_update,
+        GDN_AITER_TRITON_AVAILABLE=True,
+        gdn_aiter_fused_reshape_causal_conv1d_update_single_token=aiter_update,
+        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
+        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        MambaStateDtypeCalculator=SimpleNamespace(
+            gated_delta_net_state_dtype=lambda *a: "calculator"
+        ),
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", False)
+
+    physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    expected = physical_weight.T.contiguous()
+    conv_state = torch.empty(1, 8, 3)
+    x_fn = torch.empty(8, 2)
+    x_update = torch.empty(2, 8)
+
+    module.causal_conv1d_fn(
+        x_fn,
+        physical_weight,
+        None,
+        conv_states=conv_state,
+        query_start_loc=torch.tensor([0, 2]),
+    )
+    module.causal_conv1d_update(x_update, conv_state, physical_weight)
+    module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
+        torch.empty(1),
+        1,
+        1,
+        1,
+        1,
+        1,
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1),
+        conv_state,
+        physical_weight,
+        None,
+        "silu",
+    )
+
+    for key in ("causal_fn", "causal_update", "aiter_update"):
+        torch.testing.assert_close(captured[key], expected)
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    logical_weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    assert module.causal_conv1d_update(x_update, conv_state, logical_weight) is logical_weight
+
+
+def test_gdn_custom_causal_conv_uses_normalized_weight(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    captured = {}
+
+    def dcu_fn(x, weight, bias, **kwargs):
+        captured["weight"] = weight
+        captured["seq_lens_cpu"] = kwargs["seq_lens_cpu"]
+        return "dcu-result"
+
+    _install_fake_module(monkeypatch, "causal_conv1d", causal_conv1d_fn_dcu=dcu_fn)
+
+    class GatedDeltaNetAttention:
+        def get_state_dtype(self):
+            return "official-dtype"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        causal_conv1d_fn=_gdn_causal_conv1d_fn,
+        causal_conv1d_update=_gdn_causal_conv1d_update,
+        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
+        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        MambaStateDtypeCalculator=SimpleNamespace(
+            gated_delta_net_state_dtype=lambda *a: "calculator"
+        ),
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+
+    physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    result = module.causal_conv1d_fn(
+        torch.empty(8, 2),
+        physical_weight,
+        None,
+        conv_states=torch.empty(1, 8, 3),
+        query_start_loc=torch.tensor([0, 2]),
+        metadata=SimpleNamespace(nums_dict={"seqlens": [2]}),
+    )
+
+    assert result == "dcu-result"
+    torch.testing.assert_close(captured["weight"], physical_weight.T.contiguous())
+    assert captured["seq_lens_cpu"] == [2]
+
+
+def test_gdn_aiter_recurrent_and_sigmoid_feature_on(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.fused_recurrent",
+        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "aiter-recurrent",
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.fused_sigmoid_gating",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "aiter-sigmoid",
+    )
+
+    class GatedDeltaNetAttention:
+        def get_state_dtype(self):
+            return "official-dtype"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        causal_conv1d_fn=_gdn_causal_conv1d_fn,
+        causal_conv1d_update=_gdn_causal_conv1d_update,
+        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
+        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        MambaStateDtypeCalculator=SimpleNamespace(
+            gated_delta_net_state_dtype=lambda *a: "calculator"
+        ),
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    assert module.fused_recurrent_gated_delta_rule_packed_decode() == "aiter-recurrent"
+    assert module.fused_sigmoid_gating_delta_rule_update() == "aiter-sigmoid"
+
+
+def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    calls = []
+
+    class GatedDeltaNetAttention:
+        model_config = SimpleNamespace(dtype=torch.float16)
+        cache_config = SimpleNamespace(
+            mamba_cache_dtype="float32",
+            mamba_ssm_cache_dtype="float32",
+        )
+
+        def get_state_dtype(self):
+            return "official-dtype"
+
+    class Calculator:
+        @staticmethod
+        def gated_delta_net_state_dtype(model_dtype, cache_dtype, ssm_dtype):
+            calls.append((model_dtype, cache_dtype, ssm_dtype))
+            return "hcu-dtype"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        causal_conv1d_fn=_gdn_causal_conv1d_fn,
+        causal_conv1d_update=_gdn_causal_conv1d_update,
+        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
+        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        MambaStateDtypeCalculator=Calculator,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    assert GatedDeltaNetAttention().get_state_dtype() == "hcu-dtype"
+    assert calls == [(torch.float16, "float32", "auto")]
+
+
+def test_causal_conv_metadata_exact_callback():
+    adapter = _adapter("patch_attention_backend_utils")
+
+    def compute(query_start_loc_p_cpu, *, device):
+        return {8: {"device": device}}, None, None
+
+    module = _module(adapter.TARGET_MODULE, compute_causal_conv1d_metadata=compute)
+    assert adapter.apply_to_module(module)
+    result = module.compute_causal_conv1d_metadata(
+        torch.tensor([0, 2, 5]), device=torch.device("cpu")
+    )
+    assert result[0]["seqlens"] == [2, 3]
+    assert not adapter.apply_to_module(module)
+
+
+def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
+    adapter = _adapter("patch_attention_backend")
+
+    class CommonAttentionMetadata:
+        def __init__(self, query_start_loc, query_start_loc_cpu, seq_lens,
+                     num_reqs, num_actual_tokens, max_query_len, max_seq_len,
+                     block_table_tensor, slot_mapping):
+            self.query_start_loc = query_start_loc
+            self.query_start_loc_cpu = query_start_loc_cpu
+            self.seq_lens = seq_lens
+            self.num_reqs = num_reqs
+            self.num_actual_tokens = num_actual_tokens
+            self.max_query_len = max_query_len
+            self.max_seq_len = max_seq_len
+            self.block_table_tensor = block_table_tensor
+            self.slot_mapping = slot_mapping
+
+        def unpadded(self, num_actual_tokens, num_actual_reqs):
+            return CommonAttentionMetadata(
+                self.query_start_loc, self.query_start_loc_cpu, self.seq_lens,
+                num_actual_reqs, num_actual_tokens, self.max_query_len,
+                self.max_seq_len, self.block_table_tensor,
+                self.slot_mapping[:num_actual_tokens],
+            )
+
+        def replace(self, **kwargs):
+            values = dict(
+                query_start_loc=self.query_start_loc,
+                query_start_loc_cpu=self.query_start_loc_cpu,
+                seq_lens=self.seq_lens,
+                num_reqs=self.num_reqs,
+                num_actual_tokens=self.num_actual_tokens,
+                max_query_len=self.max_query_len,
+                max_seq_len=self.max_seq_len,
+                block_table_tensor=self.block_table_tensor,
+                slot_mapping=self.slot_mapping,
+            )
+            values.update(kwargs)
+            return CommonAttentionMetadata(**values)
+
+    class SparseMLAAttentionImpl:
+        def do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping,
+                               kv_cache_dtype, k_scale):
+            return "official"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        CommonAttentionMetadata=CommonAttentionMetadata,
+        SparseMLAAttentionImpl=SparseMLAAttentionImpl,
+        torch=torch,
+    )
+    adapter.apply_to_module(module)
+    tensor = torch.arange(4)
+    metadata = CommonAttentionMetadata(
+        tensor, tensor, tensor, 1, 4, 4, 4, tensor, tensor,
+        num_kv_actual_tokens=7, gather_indexes_tensor=tensor,
+    )
+    assert metadata.num_kv_actual_tokens == 7
+    assert metadata.gather_indexes_tensor is tensor
+    assert metadata.replace(max_seq_len=9).num_kv_actual_tokens == 7
+    assert metadata.unpadded(2, 1).num_kv_actual_tokens == 2
+    assert module.CpCommonAttentionMetadata.__module__.startswith("vllm_hcu")
+
+
+def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
+    adapter = _adapter("patch_mla_indexer")
+
+    def split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
+                     max_logits_bytes, request_offset=0):
+        return [(slice(0, 1), slice(0, 0)), (slice(1, 2), slice(0, 2))]
+
+    def split_batch(common_attn_metadata, decode_threshold=1,
+                    require_uniform=False, treat_short_extends_as_decodes=True):
+        return treat_short_extends_as_decodes
+
+    class Builder:
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return SimpleNamespace(decode=None)
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        split_indexer_prefill_chunks=split_chunks,
+        split_decodes_and_prefills=split_batch,
+        DeepseekV32IndexerMetadataBuilder=Builder,
+        current_platform=SimpleNamespace(is_rocm=lambda: False),
+    )
+    adapter.apply_to_module(module)
+    chunks = module.split_indexer_prefill_chunks(None, None, 1, 1)
+    assert chunks == [(slice(1, 2), slice(0, 2))]
+    common = SimpleNamespace(
+        is_prefilling=torch.tensor([True]), num_actual_tokens=2,
+        num_kv_actual_tokens=5,
+    )
+    assert module.split_decodes_and_prefills(common) is False
+    assert Builder().build(0, common).num_kv_actual_tokens == 5
+
+
+def test_mla_forward_slices_kv_with_independent_token_count():
+    from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
+
+    captured = {}
+
+    class SparseBase:
+        pass
+
+    class Impl:
+        dcp_world_size = 1
+
+        def forward_mha(self, q, k, pe, kv_cache, metadata, scale, output):
+            captured["q"] = q.shape[0]
+            captured["k"] = k.shape[0]
+            output.zero_()
+
+    upstream = SimpleNamespace(
+        _detect_output_quant_key=lambda *args: None,
+        is_quantized_kv_cache=lambda value: False,
+        SparseMLAAttentionImpl=SparseBase,
+    )
+    self = SimpleNamespace(
+        impl=Impl(), kv_cache_dtype="auto", num_heads=1, v_head_dim=1,
+        qk_nope_head_dim=1, qk_rope_head_dim=1,
+        chunked_prefill_workspace_size=4, _k_scale=torch.tensor(1.0),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=2, num_kv_actual_tokens=4,
+        num_decodes=0, num_prefills=1, num_decode_tokens=0,
+    )
+    q = torch.ones(2, 1, 2)
+    k = torch.ones(4, 1)
+    pe = torch.ones(4, 1, 1)
+    output = torch.empty(2, 1)
+    result = mla_forward_impl(
+        upstream, self, q, k, pe, torch.empty(0), metadata, output
+    )
+    assert result is output
+    assert captured == {"q": 2, "k": 4}
+
+
+def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch):
+    adapter = _adapter("patch_mla_layer")
+
+    class MultiHeadLatentAttentionWrapper:
+        def __init__(
+            self,
+            hidden_size,
+            num_heads,
+            scale,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            q_lora_rank,
+            kv_lora_rank,
+            mla_modules,
+            cache_config=None,
+            quant_config=None,
+            prefix="",
+            skip_topk=False,
+        ):
+            self.skip_topk = skip_topk
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            return (
+                "official",
+                self.skip_topk,
+                positions,
+                hidden_states,
+                llama_4_scaling,
+            )
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        MultiHeadLatentAttentionWrapper=MultiHeadLatentAttentionWrapper,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.config",
+        get_current_vllm_config_or_none=lambda: None,
+    )
+    assert adapter.apply_to_module(module) is True
+    instance = MultiHeadLatentAttentionWrapper(
+        16, 2, 0.5, 4, 4, 8, 4, 4, object(), skip_topk=True
+    )
+    assert instance.skip_topk is True
+    assert instance.forward("positions", "hidden") == (
+        "official",
+        True,
+        "positions",
+        "hidden",
+        None,
+    )
+
+
+def test_wrong_exact_module_name_fails_before_mutation():
+    adapter = _adapter("patch_fla_chunk_o")
+    wrong = _module("vllm.wrong")
+    with pytest.raises(RuntimeError, match="expected module"):
+        adapter.apply_to_module(wrong)
