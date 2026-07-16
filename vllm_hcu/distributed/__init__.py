@@ -1,5 +1,6 @@
-try:
-    import vllm_hcu.distributed.kv_transfer.kv_connector.v1.du.du_swift_connector
-    import vllm_hcu.distributed.device_communicators.custom_all_reduce
-except ImportError:
-    pass
+# SPDX-License-Identifier: Apache-2.0
+"""HCU distributed implementations.
+
+Importing the package must stay side-effect free.  Connector registration and
+custom-allreduce module exchange are armed explicitly by their feature groups.
+"""

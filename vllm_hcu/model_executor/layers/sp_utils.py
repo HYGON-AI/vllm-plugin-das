@@ -12,6 +12,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
+from vllm_hcu.patch.config import get_hcu_config
 
 
 _HCU_RUNTIME_SP_ENABLED: bool | None = None
@@ -28,9 +29,7 @@ def hcu_runtime_sp_enabled() -> bool:
         return False
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is not None:
-        enabled = bool(
-            getattr(vllm_config.parallel_config, "enable_custom_sp", False)
-        )
+        enabled = get_hcu_config(vllm_config).enable_custom_sp
         configure_hcu_runtime_sp(enabled)
         return enabled
     return bool(_HCU_RUNTIME_SP_ENABLED)

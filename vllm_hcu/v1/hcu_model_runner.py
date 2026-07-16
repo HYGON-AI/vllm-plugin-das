@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 import vllm_hcu.platforms.envs as henvs 
+from vllm_hcu.patch.config import get_hcu_config
 
 logger = init_logger(__name__)
 
@@ -451,8 +452,12 @@ class GPUModelRunner(
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
-        self.enable_lightly_cp = self.parallel_config.enable_lightly_cp
-        self.enable_lightly_cplb = self.enable_lightly_cp and self.parallel_config.enable_lightly_cplb
+        self.hcu_feature_config = get_hcu_config(vllm_config)
+        self.enable_lightly_cp = self.hcu_feature_config.enable_lightly_cp
+        self.enable_lightly_cplb = (
+            self.enable_lightly_cp
+            and self.hcu_feature_config.enable_lightly_cplb
+        )
         self.max_num_reqs = (
             scheduler_config.max_num_seqs
             if not self.enable_lightly_cplb
@@ -3389,7 +3394,7 @@ class GPUModelRunner(
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if (
             self.compilation_config.pass_config.enable_sp
-            or getattr(self.parallel_config, "enable_custom_sp", False)
+            or self.hcu_feature_config.enable_custom_sp
         ) and tp_size > 1:
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
@@ -3808,7 +3813,7 @@ class GPUModelRunner(
         num_tokens_padded = batch_descriptor.num_tokens
         if (
             self.compilation_config.pass_config.enable_sp
-            or getattr(self.parallel_config, "enable_custom_sp", False)
+            or self.hcu_feature_config.enable_custom_sp
         ):
             assert (
                 batch_descriptor.num_tokens
@@ -4544,29 +4549,6 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_dict = None
-
-            # Get draft token ids if available
-            output_spec_token_ids = None
-            if not self.use_async_scheduling and self._draft_token_ids is not None:
-                # Use synchronous copy to avoid NPU async stream/event
-                # synchronization issues. _get_draft_token_ids_cpu relies on
-                # event.synchronize() which may not properly wait for the
-                # async copy on NPU, resulting in stale data.
-                if torch.is_tensor(self._draft_token_ids):
-                    num_reqs = self._draft_token_ids.shape[0]
-                    draft_ids_list = self._draft_token_ids[:num_reqs].cpu().tolist()
-                    draft_req_ids = self._draft_token_req_ids
-                else:
-                    draft_ids_list = self._draft_token_ids
-                    draft_req_ids = self.input_batch.req_ids
-
-                if draft_ids_list and draft_req_ids:
-                    draft_by_req_id = dict(zip(draft_req_ids, draft_ids_list))
-                    output_spec_token_ids = [
-                        draft_by_req_id.get(req_id, [])
-                        for req_id in req_ids_output_copy
-                    ]
-
             if self.routed_experts_initialized:
                 routed_experts_dict = extract_routed_experts_for_current_batch(
                     req_ids=req_ids_output_copy,
@@ -4580,7 +4562,6 @@ class GPUModelRunner(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
-                spec_token_ids=output_spec_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
