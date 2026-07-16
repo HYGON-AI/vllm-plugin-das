@@ -10,18 +10,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def test_aiter_ops_asm_branch_is_w16a16_only() -> None:
     source = (
-        REPO_ROOT / "vllm_hcu/patches/vllm___aiter_ops.patch.py"
+        REPO_ROOT
+        / "vllm_hcu/model_executor/layers/fused_moe/aiter_runtime.py"
     ).read_text()
 
     assert "use_w16a16_asm = (" in source
-    assert "quant_type == QuantType.No" in source
+    assert "QuantType(quant_method) == QuantType.No" in source
     assert "w1_scale is None" in source
     assert "w2_scale is None" in source
     assert "a1_scale is None" in source
     assert "a2_scale is None" in source
-    assert "if use_w16a16_asm:" in source
+    assert "if not use_w16a16_asm:" in source
     assert "if use_asm:" not in source
-    compile(source, "vllm___aiter_ops.patch.py", "exec")
+    compile(source, "aiter_runtime.py", "exec")
 
 
 def test_unquantized_moe_asm_shuffle_has_front_loaded_blockers() -> None:
