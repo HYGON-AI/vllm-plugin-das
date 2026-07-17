@@ -67,10 +67,14 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE, FusedMoEActivationFormat, FusedMoEMethodBase,
     FusedMoeWeightScaleSupported, FusedMoEConfig)
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
     weight8bit_nt_kpack2_marlin2,
 )
-from vllm.model_executor.layers.fused_moe.config import (FusedMoEQuantConfig, int8_w8a8_moe_quant_config, fp8_w8a8_moe_quant_config)
+from vllm.model_executor.layers.fused_moe import config as fused_moe_config
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig,
+    fp8_w8a8_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     FusedMoEMethodBase,
@@ -469,7 +473,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        return int8_w8a8_moe_quant_config(
+        return fused_moe_config.int8_w8a8_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,

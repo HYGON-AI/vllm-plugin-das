@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import enum
+import os
+import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -1248,6 +1251,10 @@ def test_quant_fp8_eligibility_and_feature_off(
 def test_weight8bit_marlin2_layout_2d_3d_and_validation():
     module = _module(patch_w8a8_utils.TARGET_MODULE)
     patch_w8a8_utils.apply_to_module(module)
+    assert (
+        module.weight8bit_nt_kpack2_marlin2
+        is int8_runtime.weight8bit_nt_kpack2_marlin2
+    )
     weight = torch.arange(16 * 64, dtype=torch.int32).to(torch.int8).view(16, 64)
     result = module.weight8bit_nt_kpack2_marlin2(weight)
     reference = (
@@ -1262,6 +1269,53 @@ def test_weight8bit_marlin2_layout_2d_3d_and_validation():
     assert result_3d.shape == (2, 1, 1024)
     with pytest.raises(ValueError, match="rank 2 or 3"):
         module.weight8bit_nt_kpack2_marlin2(torch.ones(16, dtype=torch.int8))
+
+
+def test_slimquant_marlin_module_imports_before_worker_patch():
+    repo = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    script = """
+from vllm.model_executor.layers.quantization.utils import w8a8_utils
+assert not hasattr(w8a8_utils, "weight8bit_nt_kpack2_marlin2")
+from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors_moe_marlin,
+)
+from vllm_hcu.model_executor.layers.quantization import int8_runtime
+from vllm.model_executor.layers.fused_moe import config as fused_moe_config
+assert (
+    compressed_tensors_moe_marlin.weight8bit_nt_kpack2_marlin2
+    is int8_runtime.weight8bit_nt_kpack2_marlin2
+)
+calls = []
+def hcu_int8_config(**kwargs):
+    calls.append(kwargs)
+    return "HCU_INT8_CONFIG"
+fused_moe_config.int8_w8a8_moe_quant_config = hcu_int8_config
+method = object.__new__(
+    compressed_tensors_moe_marlin.CompressedTensorsW8A8Int8MarlinMoEMethod
+)
+layer = type("Layer", (), {
+    "w13_weight_scale": object(),
+    "w2_weight_scale": object(),
+    "w13_input_scale": object(),
+    "w2_input_scale": object(),
+})()
+assert method.get_fused_moe_quant_config(layer) == "HCU_INT8_CONFIG"
+assert calls[0]["block_shape"] is None
+print("SLIMQUANT_PREPATCH_IMPORT_OK")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SLIMQUANT_PREPATCH_IMPORT_OK" in result.stdout
 
 
 @pytest.mark.parametrize("is_rocm", [False, True])
