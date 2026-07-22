@@ -1,9 +1,16 @@
-# vLLM-HCU v0.21 Runtime Patch Architecture
+# vLLM-HCU v0.25 Runtime Patch Architecture
 
 This document describes the production runtime integration between vLLM-HCU
-and the DCU vLLM 0.21 release series. It covers the code that is shipped and
+and the DCU vLLM 0.25 release series. It covers the code that is shipped and
 maintained after the source-patch migration; migration inventories, experiments,
 and historical audit evidence are intentionally outside this document.
+
+> Revision basis: final v0.25 r8 behavior. The r8 Wheel is
+> `vllm_hcu-0.25.0+das.9ae3515.dtk2604` with SHA-256
+> `779e44f0c402435b5d54f4f30143bd80224f9ba27d8be4335dca7349490f7020`.
+> This architecture document records the production contracts validated by r8;
+> it is not a claim that every optional model or topology has final-Wheel model
+> coverage.
 
 ## 1. Design goals
 
@@ -19,8 +26,12 @@ The runtime integration follows these rules:
    `vllm_config`.
 7. Keep substantial HCU behavior in HCU-owned implementation modules, not in
    callback bodies.
+8. Let vLLM 0.25 own shared interfaces and algorithms. Retain only the minimum
+   DCU delta or a capability that the target release does not provide.
+9. Treat `torch.compile`, Dynamo, vLLM piecewise graphs, and custom-op boundaries
+   as runtime ABI. Relational symbolic values must not escape those boundaries.
 
-The accepted dependency contract is installed vLLM `0.21.x`. Every plugin
+The accepted dependency contract is installed vLLM `0.25.x`. Every plugin
 entry point and both patch phases pass through the same compatibility gate in
 `vllm_hcu/compatibility.py` before registering runtime changes.
 
@@ -191,7 +202,85 @@ Patch registration and feature activation are separate. A callback may be
 armed for import-order safety while its feature state is disabled; disabled
 callbacks do not become required terminal patches.
 
-## 6. Failure and observability
+## 6. r8 safety and backend ownership contracts
+
+### 6.1 MLA prefix-cache policy
+
+HCU MLA plus prefix caching is not enabled for the v0.25 release contract. The
+public HCU platform configuration hook uses the target-owned
+`ModelConfig.use_mla` signal and sets the shared
+`VllmConfig.cache_config.enable_prefix_caching` to `False` before EngineCore,
+Scheduler, KV-cache, executor, or Worker construction and serialization. It
+emits one stable warning before EngineCore observes the final value.
+
+This decision is process-wide configuration policy. Launch wrappers, model-path
+matching, request sidecars, scheduler reordering, or Worker-local changes must
+not substitute for it. Every consumer must observe the same final
+`VllmConfig`.
+
+### 6.2 Channel quantization ownership
+
+The accepted v0.25 Channel-FP8 product route keeps the target release's Triton
+implementations as the compute owners:
+
+- compressed-tensors selects
+  `ChannelWiseTorchFP8ScaledMMLinearKernel` for Channel-FP8 linear layers;
+- the HCU scaled-mm boundary validates DCU layout and metadata, then delegates
+  the dense calculation to target vLLM `triton_scaled_mm`;
+- FP8 MoE uses the target `TRITON Fp8 MoE backend`;
+- an explicit AITER FP8-MoE selection is not the r8 product route.
+
+`patch_scaled_mm_linear_kernel.py` adds the narrow prequantized-input bridge to
+the reviewed target kernel. A supplied `(quantized_activation, scale)` pair
+bypasses duplicate activation quantization and is forwarded through the target
+scaled-mm owner. The adapter reports this capability only on the reviewed HCU
+Channel-FP8 target class; unsupported kernels keep upstream behavior or fail at
+the compatibility gate instead of consuming the tuple silently.
+
+Channel-INT8 remains a separate contract. Its accepted route is
+SlimQuant/compressed-tensors Marlin with `moe_w8a8_channel` PERCHANNEL UP and
+DOWN kernels; Block/PERBLOCK fallback is not equivalent.
+
+### 6.3 Dynamic-shape and custom-op boundaries
+
+r8 treats graph boundaries as ABI. Python validation must not construct,
+return, or thread `torch.SymBool`, SymPy `Equality`, or another relational
+Boolean across a vLLM piecewise or HCU custom-op boundary. In particular,
+membership tests and scale-shape checks involving dynamic token counts cannot
+be allowed to become scalar graph outputs.
+
+The approved pattern is:
+
+1. Preserve friendly type, rank, layout, dtype, device, and scale-shape errors
+   for concrete eager calls.
+2. During compilation, avoid constructing relational symbolic values in the
+   outer Python wrapper.
+3. Keep the custom-op fake implementation limited to output tensor
+   shape/dtype/device/stride metadata; it must not perform real computation or
+   emit a relational Boolean.
+4. In the real custom-op implementation, repeat the required contract checks
+   with concrete runtime dimensions before calling target vLLM Triton compute.
+5. Validate the returned tensor's exact shape, dtype, and device before it
+   crosses back through the boundary.
+
+This rule applies both to `vllm_hcu/runtime_compat/scaled_mm.py` and the
+prequantized-input adapter in
+`vllm_hcu/patch/worker/op_opt/patch_scaled_mm_linear_kernel.py`. A fix is not
+complete with eager unit tests alone: focused coverage must use multiple token
+counts in one strict-dynamic graph, reject symbolic Boolean graph values, run a
+real standalone Inductor compile, and then pass the exact model's compile and
+cudagraph gate. The r8 T4 run exercised this path through full model startup and
+GSM8K-100.
+
+### 6.4 Native resource ownership
+
+Conditionally allocated device, IPC, stream, event, or workspace resources are
+initialized to inert values. Ownership is recorded only after successful
+acquisition, and teardown releases only resources owned by that instance.
+Kernel or collective success without clean construction and teardown is not a
+passing lifecycle contract.
+
+## 7. Failure and observability
 
 `PATCH_REGISTRY` stores one record per patch ID, including:
 
@@ -209,7 +298,7 @@ process cannot retry a partially completed custom-op or registry mutation.
 performs read-only checks for version compatibility, installed source
 integrity, plugin entry points, and package metadata.
 
-## 7. Extension guidelines
+## 8. Extension guidelines
 
 When adding a runtime integration:
 
@@ -225,6 +314,12 @@ When adding a runtime integration:
    upstream config fields.
 8. Add focused tests for ordering, late import behavior, idempotence, target
    drift, feature-off behavior, and failure latching.
+9. For dynamic shapes, add strict-dynamic and standalone-compile tests that
+   prove no relational symbolic value crosses a piecewise/custom-op boundary.
+10. For quantized routes, test backend selection and positive route evidence;
+    an import-only or output-shape-only test is insufficient.
+11. For native ownership, test both successful operation and natural teardown
+    on every required topology.
 
 The production boundary check in `tools/check_production_boundary.py` should
 remain clean after every change.

@@ -6,7 +6,7 @@ vLLM HCU Plugin
 
 ## Install
 
-vLLM-HCU v0.21 is a runtime plugin for the DCU vLLM v0.21 base package. Install
+vLLM-HCU v0.25 is a runtime plugin for the DCU vLLM v0.25 base package. Install
 the matching vLLM package first, then install this repository:
 
 ```bash
@@ -63,8 +63,8 @@ modified. `patch_report()` reports the process role, target symbols, patch
 status, failure details, and feature activation state.
 
 All three plugin entry points and both patch-application phases share one
-fail-closed compatibility gate. This branch accepts installed vLLM `0.21.x`
-(including local builds such as `0.21.0+das...`) and rejects missing, malformed,
+fail-closed compatibility gate. This branch accepts installed vLLM `0.25.x`
+(including local builds such as `0.25.0+das...`) and rejects missing, malformed,
 or other release series before any patch is registered. The corresponding
 doctor check is named `vllm_compatible`.
 
@@ -73,7 +73,7 @@ doctor check is named `vllm_compatible`.
 ```text
 vllm_hcu/
 ├── __init__.py                  # three vLLM plugin entry points
-├── compatibility.py             # shared vLLM 0.21.x compatibility gate
+├── compatibility.py             # shared vLLM 0.25.x compatibility gate
 ├── doctor.py                    # read-only installation diagnostics
 ├── patch/
 │   ├── __init__.py              # public platform/Worker patch lifecycle API
@@ -128,7 +128,7 @@ Worker imports model runners and custom operators. Required incompatibilities
 are fail-closed and retained in the process-local patch registry; they do not
 fall back to source rewriting.
 
-See [Runtime patch architecture](docs/runtime_patch_architecture_v021.md) for
+See [Runtime patch architecture](docs/runtime_patch_architecture_v025.md) for
 the lifecycle, ownership rules, module-replacement contract, and extension
 guidelines.
 
