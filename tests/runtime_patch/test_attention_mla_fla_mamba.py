@@ -74,6 +74,92 @@ def _install_fake_module(monkeypatch, name: str, **values) -> ModuleType:
     return module
 
 
+def test_flashmla_sparse_bf16_preserves_v025_topk_length(monkeypatch):
+    adapter = _adapter("patch_flashmla_sparse")
+    calls: list[tuple[object, ...]] = []
+
+    class FlashMLASparseMetadataBuilder:
+        def build(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=False,
+        ):
+            del self, common_prefix_len, common_attn_metadata, fast_build
+            return SimpleNamespace(fp8_use_mixed_batch=False)
+
+    class FlashMLASparseImpl:
+        softmax_scale = 0.25
+        num_heads = 2
+
+        def _fp8_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            kernel_metadata,
+        ):
+            del self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
+            return "official-fp8"
+
+        def _bf16_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_length=None,
+        ):
+            calls.append(
+                ("official", q, kv_c_and_k_pe_cache, topk_indices, topk_length)
+            )
+            return "official-bf16"
+
+    def sparse_fwd(q, cache, indices, softmax_scale, *, topk_length=None):
+        calls.append(("hcu", q, cache, indices, softmax_scale, topk_length))
+        return torch.ones(q.shape[0], 4, q.shape[-1]), None
+
+    import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
+
+    monkeypatch.setattr(hcu_flashmla, "FlashMLASchedMeta", object)
+    monkeypatch.setattr(hcu_flashmla, "flash_mla_sparse_fwd", sparse_fwd)
+    monkeypatch.setattr(
+        hcu_flashmla,
+        "flash_mla_with_kvcache",
+        lambda **kwargs: (kwargs, None),
+    )
+    monkeypatch.setattr(hcu_flashmla, "get_mla_metadata", lambda *a, **k: None)
+
+    platform = SimpleNamespace(is_rocm=lambda: True)
+    module = _module(
+        adapter.TARGET_MODULE,
+        FlashMLASparseMetadataBuilder=FlashMLASparseMetadataBuilder,
+        FlashMLASparseImpl=FlashMLASparseImpl,
+        current_platform=platform,
+        torch=torch,
+    )
+    assert adapter.apply_to_module(module)
+    impl = FlashMLASparseImpl()
+    q = torch.ones(2, 2, 4)
+    cache = torch.ones(2, 4)
+    indices = torch.zeros(2, 3, dtype=torch.int64)
+    topk_length = torch.tensor([1, 2])
+    output = impl._bf16_flash_mla_kernel(
+        q,
+        cache,
+        indices,
+        topk_length,
+    )
+    assert output.shape == (2, 2, 4)
+    assert calls[-1][-1] is topk_length
+
+    platform.is_rocm = lambda: False
+    assert (
+        impl._bf16_flash_mla_kernel(q, cache, indices, topk_length)
+        == "official-bf16"
+    )
+    assert calls[-1][-1] is topk_length
+
+
 def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     from vllm_hcu.model_executor.layers.mla_runtime import torch as runtime_torch
 
@@ -122,8 +208,18 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     query = torch.tensor([[1.0, 2.0]])
     key = torch.tensor([[3.0, 4.0]])
     value = torch.tensor([[5.0, 6.0]])
-    output = runtime.attention_forward(upstream, self, query, key, value)
-    torch.testing.assert_close(output, torch.tensor([[9.0, 12.0]]))
+    output = runtime.attention_forward(
+        upstream,
+        self,
+        query,
+        key,
+        value,
+        output_dtype=torch.float64,
+    )
+    torch.testing.assert_close(
+        output, torch.tensor([[9.0, 12.0]], dtype=torch.float64)
+    )
+    assert output.dtype is torch.float64
     assert calls["dummy_device"] == query.device
 
 
@@ -171,7 +267,8 @@ def test_fla_chunk_delta_h_enabled_missing_aiter_fails_clearly(monkeypatch):
 
     def original(k, w, u, g=None, gk=None, initial_state=None,
                  output_final_state=False, chunk_size=64, save_new_value=True,
-                 cu_seqlens=None, chunk_indices=None, chunk_offsets=None):
+                 cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
+                 use_exp2=False):
         return k, u, None
 
     module = _module(
@@ -247,7 +344,7 @@ def test_mamba_mixer_init_converts_conv_buffer_to_nn_layout(monkeypatch):
 
 
 def test_gdn_feature_off_delegates_official_state_dtype(monkeypatch):
-    adapter = _adapter("patch_gdn_linear_attention")
+    adapter = _adapter("patch_gdn_base")
     calls: list[str] = []
 
     def causal_conv1d_fn(
@@ -299,6 +396,9 @@ def test_gdn_feature_off_delegates_official_state_dtype(monkeypatch):
             calls.append("official-state-dtype")
             return "official-dtype"
 
+    class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+        pass
+
     class Calculator:
         @staticmethod
         def gated_delta_net_state_dtype(*args):
@@ -310,7 +410,7 @@ def test_gdn_feature_off_delegates_official_state_dtype(monkeypatch):
         causal_conv1d_update=causal_conv1d_update,
         fused_recurrent_gated_delta_rule_packed_decode=recurrent,
         fused_sigmoid_gating_delta_rule_update=sigmoid,
-        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        QwenGatedDeltaNetAttention=QwenGatedDeltaNetAttention,
         MambaStateDtypeCalculator=Calculator,
     )
     adapter.apply_to_module(module)
@@ -318,18 +418,26 @@ def test_gdn_feature_off_delegates_official_state_dtype(monkeypatch):
 
     monkeypatch.setattr(henvs, "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE", False)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
-    instance = GatedDeltaNetAttention()
+    instance = QwenGatedDeltaNetAttention()
     assert instance.get_state_dtype() == "official-dtype"
     assert calls == ["official-state-dtype"]
 
 
 def test_gdn_runtime_adapter_has_stable_patch_id():
-    adapter = _adapter("patch_gdn_linear_attention")
-    assert adapter.PATCH_ID == "worker.op_opt.mamba.gdn_linear_attention"
+    assert _adapter("patch_gdn_causal_conv1d").PATCH_ID == (
+        "worker.op_opt.mamba.gdn.causal_conv1d"
+    )
+    assert _adapter("patch_gdn_base").PATCH_ID == (
+        "worker.op_opt.mamba.gdn.base_state_dtype"
+    )
+    assert _adapter("patch_gdn_linear_attention").PATCH_ID == (
+        "worker.op_opt.mamba.gdn.qwen_kernel_bindings"
+    )
 
 
 def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
-    adapter = _adapter("patch_gdn_linear_attention")
+    causal_adapter = _adapter("patch_gdn_causal_conv1d")
+    qwen_adapter = _adapter("patch_gdn_linear_attention")
     captured = {}
 
     def causal_fn(*args, **kwargs):
@@ -344,18 +452,67 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
 
     causal_update.__signature__ = inspect.signature(_gdn_causal_conv1d_update)  # type: ignore[attr-defined]
 
-    def aiter_update(*args, **kwargs):
-        captured["aiter_update"] = args[10]
-        return args[10]
+    def aiter_update(
+        x,
+        num_actual_tokens,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        ba,
+        z_out,
+        core_attn_out,
+        conv_state,
+        weight,
+        bias=None,
+        activation=None,
+        conv_state_indices=None,
+        num_accepted_tokens=None,
+        query_start_loc=None,
+        max_query_len=-1,
+        pad_slot_id=-1,
+        block_idx_last_scheduled_token=None,
+        initial_state_idx=None,
+        validate_data=False,
+        qkvz_layout="interleaved",
+    ):
+        del (
+            x,
+            num_actual_tokens,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            ba,
+            z_out,
+            core_attn_out,
+            conv_state,
+            bias,
+            activation,
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            max_query_len,
+            pad_slot_id,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            validate_data,
+            qkvz_layout,
+        )
+        captured["aiter_update"] = weight
+        return weight
 
     class GatedDeltaNetAttention:
         def get_state_dtype(self):
             return "official-dtype"
 
-    module = _module(
-        adapter.TARGET_MODULE,
+    causal_module = _module(
+        causal_adapter.TARGET_MODULE,
         causal_conv1d_fn=causal_fn,
         causal_conv1d_update=causal_update,
+    )
+    qwen_module = _module(
+        qwen_adapter.TARGET_MODULE,
         GDN_AITER_TRITON_AVAILABLE=True,
         gdn_aiter_fused_reshape_causal_conv1d_update_single_token=aiter_update,
         fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
@@ -365,7 +522,8 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
             gated_delta_net_state_dtype=lambda *a: "calculator"
         ),
     )
-    adapter.apply_to_module(module)
+    causal_adapter.apply_to_module(causal_module)
+    qwen_adapter.apply_to_module(qwen_module)
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
@@ -378,15 +536,15 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     x_fn = torch.empty(8, 2)
     x_update = torch.empty(2, 8)
 
-    module.causal_conv1d_fn(
+    causal_module.causal_conv1d_fn(
         x_fn,
         physical_weight,
         None,
         conv_states=conv_state,
         query_start_loc=torch.tensor([0, 2]),
     )
-    module.causal_conv1d_update(x_update, conv_state, physical_weight)
-    module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
+    causal_module.causal_conv1d_update(x_update, conv_state, physical_weight)
+    qwen_module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
         torch.empty(1),
         1,
         1,
@@ -407,34 +565,27 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
 
     monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
     logical_weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    assert module.causal_conv1d_update(x_update, conv_state, logical_weight) is logical_weight
+    assert (
+        causal_module.causal_conv1d_update(
+            x_update, conv_state, logical_weight
+        )
+        is logical_weight
+    )
 
 
-def test_gdn_custom_causal_conv_uses_normalized_weight(monkeypatch):
-    adapter = _adapter("patch_gdn_linear_attention")
-    captured = {}
+def test_gdn_custom_causal_conv_is_retired(monkeypatch):
+    adapter = _adapter("patch_gdn_causal_conv1d")
 
-    def dcu_fn(x, weight, bias, **kwargs):
-        captured["weight"] = weight
-        captured["seq_lens_cpu"] = kwargs["seq_lens_cpu"]
-        return "dcu-result"
+    def dcu_fn(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("retired custom causal-conv path must not be imported")
 
     _install_fake_module(monkeypatch, "causal_conv1d", causal_conv1d_fn_dcu=dcu_fn)
-
-    class GatedDeltaNetAttention:
-        def get_state_dtype(self):
-            return "official-dtype"
 
     module = _module(
         adapter.TARGET_MODULE,
         causal_conv1d_fn=_gdn_causal_conv1d_fn,
         causal_conv1d_update=_gdn_causal_conv1d_update,
-        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
-        GatedDeltaNetAttention=GatedDeltaNetAttention,
-        MambaStateDtypeCalculator=SimpleNamespace(
-            gated_delta_net_state_dtype=lambda *a: "calculator"
-        ),
     )
     adapter.apply_to_module(module)
     from vllm_hcu.platforms import envs as henvs
@@ -453,50 +604,53 @@ def test_gdn_custom_causal_conv_uses_normalized_weight(monkeypatch):
         metadata=SimpleNamespace(nums_dict={"seqlens": [2]}),
     )
 
-    assert result == "dcu-result"
-    torch.testing.assert_close(captured["weight"], physical_weight.T.contiguous())
-    assert captured["seq_lens_cpu"] == [2]
+    torch.testing.assert_close(result, physical_weight.T.contiguous())
 
 
-def test_gdn_aiter_recurrent_and_sigmoid_feature_on(monkeypatch):
+def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
 
     _install_fake_module(
         monkeypatch,
         "aiter.ops.triton.fla.fused_recurrent",
-        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "aiter-recurrent",
+        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: pytest.fail(
+            "retired HCU recurrent path must not be imported"
+        ),
     )
     _install_fake_module(
         monkeypatch,
         "aiter.ops.triton.fla.fused_sigmoid_gating",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "aiter-sigmoid",
+        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: pytest.fail(
+            "retired HCU sigmoid path must not be imported"
+        ),
     )
 
-    class GatedDeltaNetAttention:
-        def get_state_dtype(self):
-            return "official-dtype"
+    def recurrent(*args, **kwargs):
+        del args, kwargs
+        return "official-recurrent"
+
+    def sigmoid(*args, **kwargs):
+        del args, kwargs
+        return "official-sigmoid"
 
     module = _module(
         adapter.TARGET_MODULE,
-        causal_conv1d_fn=_gdn_causal_conv1d_fn,
-        causal_conv1d_update=_gdn_causal_conv1d_update,
-        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
-        GatedDeltaNetAttention=GatedDeltaNetAttention,
-        MambaStateDtypeCalculator=SimpleNamespace(
-            gated_delta_net_state_dtype=lambda *a: "calculator"
-        ),
+        GDN_AITER_TRITON_AVAILABLE=False,
+        fused_recurrent_gated_delta_rule_packed_decode=recurrent,
+        fused_sigmoid_gating_delta_rule_update=sigmoid,
     )
     adapter.apply_to_module(module)
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    assert module.fused_recurrent_gated_delta_rule_packed_decode() == "aiter-recurrent"
-    assert module.fused_sigmoid_gating_delta_rule_update() == "aiter-sigmoid"
+    assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
+    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
+    assert module.fused_recurrent_gated_delta_rule_packed_decode() == "official-recurrent"
+    assert module.fused_sigmoid_gating_delta_rule_update() == "official-sigmoid"
 
 
 def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):
-    adapter = _adapter("patch_gdn_linear_attention")
+    adapter = _adapter("patch_gdn_base")
     calls = []
 
     class GatedDeltaNetAttention:
@@ -509,6 +663,9 @@ def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):
         def get_state_dtype(self):
             return "official-dtype"
 
+    class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+        pass
+
     class Calculator:
         @staticmethod
         def gated_delta_net_state_dtype(model_dtype, cache_dtype, ssm_dtype):
@@ -517,11 +674,11 @@ def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):
 
     module = _module(
         adapter.TARGET_MODULE,
-        causal_conv1d_fn=_gdn_causal_conv1d_fn,
-        causal_conv1d_update=_gdn_causal_conv1d_update,
-        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
-        GatedDeltaNetAttention=GatedDeltaNetAttention,
+        QwenGatedDeltaNetAttention=QwenGatedDeltaNetAttention,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.model_executor.layers.mamba.mamba_utils",
         MambaStateDtypeCalculator=Calculator,
     )
     adapter.apply_to_module(module)
@@ -529,7 +686,8 @@ def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):
 
     monkeypatch.setattr(henvs, "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    assert GatedDeltaNetAttention().get_state_dtype() == "hcu-dtype"
+    assert QwenGatedDeltaNetAttention().get_state_dtype() == "hcu-dtype"
+    assert GatedDeltaNetAttention().get_state_dtype() == "official-dtype"
     assert calls == [(torch.float16, "float32", "auto")]
 
 

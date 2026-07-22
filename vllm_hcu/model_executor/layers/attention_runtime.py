@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU-owned attention implementations used by the v0.21 runtime adapters.
+"""HCU-owned attention implementations used by the v0.25 runtime adapters.
 
 The module is imported only after vLLM's attention layer has finished loading.
 Keeping the implementation here avoids embedding a large copied method in a
@@ -42,7 +42,7 @@ def init_kv_cache_quant_e5m2(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> None:
-    """v0.21 ``_init_kv_cache_quant`` with the HCU E5M2 restriction removed."""
+    """v0.25 target ``_init_kv_cache_quant`` plus the HCU E5M2 delta."""
 
     upstream.set_default_quant_scales(layer, register_buffer=True)
     layer._o_scale_float = None
@@ -66,8 +66,9 @@ def attention_forward(
     key: torch.Tensor,
     value: torch.Tensor,
     output_shape: torch.Size | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Attention forward preserving v0.21 semantics for HCU custom KV layout.
+    """Attention forward preserving v0.25 semantics for HCU custom KV layout.
 
     HCU's split key/value cache is not a single tensor.  Calling the Python
     implementation keeps the data dependency dummy on the query device while
@@ -81,7 +82,8 @@ def attention_forward(
             value,
             upstream._encode_layer_name(self.layer_name),
         )
-    output_dtype = query.dtype
+    if output_dtype is None:
+        output_dtype = query.dtype
     if self.query_quant is not None:
         if self.kv_cache_dtype not in {"fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"}:
             raise ValueError(

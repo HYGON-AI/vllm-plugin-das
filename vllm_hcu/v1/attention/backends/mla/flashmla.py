@@ -256,6 +256,11 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             kv_sharing_target_layer_name,
             **mla_args,
         )
+        # The gfx938 CAT kernel consumes split query components; the regular
+        # gfx938 FP8 path consumes vLLM's pre-quantized concatenated query.
+        self.supports_quant_query_input = (
+            on_gfx938() and not henvs.VLLM_HCU_USE_CAT_MLA
+        )
 
         is_supported, reason = is_flashmla_dense_supported()
         assert is_supported, reason

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict v0.21 MLAAttention runtime adapter."""
+"""Strict v0.25 MLAAttention runtime adapter."""
 
 from __future__ import annotations
 
@@ -43,9 +43,11 @@ def apply_to_module(module: ModuleType) -> bool:
         original_init, TARGETS[0],
         positional=("self", "num_heads", "scale", "qk_nope_head_dim", "qk_rope_head_dim",
                     "v_head_dim", "q_lora_rank", "kv_lora_rank", "kv_b_proj",
-                    "cache_config", "quant_config", "prefix", "use_sparse", "indexer"),
+                    "cache_config", "quant_config", "prefix", "attn_backend",
+                    "use_sparse", "indexer", "topk_indices_buffer"),
         defaults={"cache_config": None, "quant_config": None, "prefix": "",
-                  "use_sparse": False, "indexer": None},
+                  "attn_backend": None, "use_sparse": False, "indexer": None,
+                  "topk_indices_buffer": None},
         var_keyword="extra_impl_args",
     )
     original_forward = require_callable(cls, "forward_impl", TARGETS[1])
@@ -84,7 +86,7 @@ def apply_to_module(module: ModuleType) -> bool:
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
-        if not config.enable_lightly_cp and not mla.current_platform.is_rocm():
+        if not config.enable_lightly_cp:
             return original_forward(
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                 output_scale, output_block_scale, quant_group_size,

@@ -32,12 +32,14 @@ def apply_to_module(module: ModuleType) -> bool:
         positional=(
             "k", "w", "u", "g", "gk", "initial_state", "output_final_state",
             "chunk_size", "save_new_value", "cu_seqlens", "chunk_indices", "chunk_offsets",
+            "use_exp2",
         ),
         defaults={
             "g": None, "gk": None, "initial_state": None,
             "output_final_state": False, "chunk_size": chunk.FLA_CHUNK_SIZE,
             "save_new_value": True, "cu_seqlens": None, "chunk_indices": None,
             "chunk_offsets": None,
+            "use_exp2": False,
         },
     )
 
@@ -45,12 +47,12 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_chunk_delta_h(
         k, w, u, g=None, gk=None, initial_state=None, output_final_state=False,
         chunk_size=chunk.FLA_CHUNK_SIZE, save_new_value=True, cu_seqlens=None,
-        chunk_indices=None, chunk_offsets=None,
+        chunk_indices=None, chunk_offsets=None, use_exp2=False,
     ):
         if not _enabled():
             return original(k, w, u, g, gk, initial_state, output_final_state,
                             chunk_size, save_new_value, cu_seqlens, chunk_indices,
-                            chunk_offsets)
+                            chunk_offsets, use_exp2)
         try:
             from aiter.ops.triton.fla.vllm.chunk_delta_h import (
                 launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
@@ -81,7 +83,7 @@ def apply_to_module(module: ModuleType) -> bool:
             initial_state=initial_state, initial_state_indices=None,
             final_state=final_state, cu_seqlens=cu_seqlens,
             chunk_offsets=chunk_offsets, N=N, T=T, H=H, Hg=Hg, K=K, V=V,
-            BT=BT, use_exp2=False, transpose_state_layout=True, kernel_cfg=None,
+            BT=BT, use_exp2=use_exp2, transpose_state_layout=True, kernel_cfg=None,
         )
         return h, v_new, final_state
 

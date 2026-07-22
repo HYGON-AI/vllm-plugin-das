@@ -44,7 +44,14 @@ def apply_to_module(module: ModuleType) -> bool:
     bf16 = require_callable(impl_cls, "_bf16_flash_mla_kernel", TARGETS[2])
     require_exact_signature(
         bf16, TARGETS[2],
-        positional=("self", "q", "kv_c_and_k_pe_cache", "topk_indices"),
+        positional=(
+            "self",
+            "q",
+            "kv_c_and_k_pe_cache",
+            "topk_indices",
+            "topk_length",
+        ),
+        defaults={"topk_length": None},
     )
     # Swap only the function bindings consumed by this backend.  The official
     # backend class remains registered and no global module alias is installed.
@@ -94,14 +101,30 @@ def apply_to_module(module: ModuleType) -> bool:
         return out, lse
 
     @functools.wraps(bf16)
-    def hcu_bf16(self, q, kv_c_and_k_pe_cache, topk_indices):
+    def hcu_bf16(
+        self,
+        q,
+        kv_c_and_k_pe_cache,
+        topk_indices,
+        topk_length=None,
+    ):
         if not flash.current_platform.is_rocm():
-            return bf16(self, q, kv_c_and_k_pe_cache, topk_indices)
+            return bf16(
+                self,
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                topk_length,
+            )
         num_tokens = q.shape[0]
         cache = kv_c_and_k_pe_cache.view(-1, 1, kv_c_and_k_pe_cache.shape[-1])
         indices = topk_indices.view(num_tokens, 1, -1)
         return flash.flash_mla_sparse_fwd(
-            q, cache, indices, self.softmax_scale
+            q,
+            cache,
+            indices,
+            self.softmax_scale,
+            topk_length=topk_length,
         )[0][:, :self.num_heads, :]
 
     for function in (hcu_build, hcu_fp8, hcu_bf16):

@@ -860,7 +860,9 @@ void concat_and_cache_mla_hcu(
   int entry_stride = kv_cache.stride(1);
 
   const at::OptionalDeviceGuard device_guard(device_of(kv_c));
-  const hipStream_t stream = at::hip::getCurrentCUDAStream();
+  // HCU PyTorch exposes the HIP-backed stream through the CUDA-compatible
+  // namespace, matching the rest of vLLM's ROCm kernels.
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (kv_cache_dtype == "fp8_ds_mla") {
     dim3 grid(num_tokens);

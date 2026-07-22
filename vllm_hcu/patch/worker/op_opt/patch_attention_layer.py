@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime migration of the v0.21 dense attention HCU fragments."""
+"""Runtime migration of the v0.25 dense attention HCU fragments."""
 
 from __future__ import annotations
 
@@ -60,8 +60,15 @@ def apply_to_module(module: ModuleType) -> bool:
     require_exact_signature(
         original_forward,
         TARGETS[1],
-        positional=("self", "query", "key", "value", "output_shape"),
-        defaults={"output_shape": None},
+        positional=(
+            "self",
+            "query",
+            "key",
+            "value",
+            "output_shape",
+            "output_dtype",
+        ),
+        defaults={"output_shape": None, "output_dtype": None},
     )
     if "FusedQkvSplitRmsNormRopeAttention" in vars(attention):
         raise PatchCompatibilityError(
@@ -81,13 +88,23 @@ def apply_to_module(module: ModuleType) -> bool:
         return original_init_quant(layer, quant_config, prefix)
 
     @functools.wraps(original_forward)
-    def hcu_forward(self, query, key, value, output_shape=None):
+    def hcu_forward(
+        self, query, key, value, output_shape=None, output_dtype=None
+    ):
         custom_flash, _ = _feature_flags()
         if custom_flash or getattr(self, "kv_cache_dtype", None) == "fp8_e5m2":
             return attention_runtime.attention_forward(
-                attention, self, query, key, value, output_shape
+                attention,
+                self,
+                query,
+                key,
+                value,
+                output_shape,
+                output_dtype,
             )
-        return original_forward(self, query, key, value, output_shape)
+        return original_forward(
+            self, query, key, value, output_shape, output_dtype
+        )
 
     setattr(hcu_init_kv_cache_quant, _WRAPPER_MARKER, True)
     setattr(hcu_forward, _WRAPPER_MARKER, True)

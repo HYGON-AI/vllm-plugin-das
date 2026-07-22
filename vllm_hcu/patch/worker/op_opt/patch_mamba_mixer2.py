@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU NN-layout adapters for v0.21 MambaMixer2."""
+"""vLLM v0.25 target MambaMixer2 behavior plus HCU NN-layout deltas."""
 
 from __future__ import annotations
 
