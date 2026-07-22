@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit platform/core callback ordering for vLLM v0.21.
+"""Explicit platform/core callback ordering for the audited target vLLM API.
 
 Importing this package is side-effect free.  The dispatcher calls
 ``register_platform_core_callbacks`` after the exact import coordinator is
@@ -22,7 +22,6 @@ from . import (
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
-    patch_model_arch_config_convertor,
     patch_slimquant_registry,
     patch_vllm_config,
 )
@@ -40,7 +39,6 @@ _ORDERED_ADAPTERS = (
     patch_slimquant_registry,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
-    patch_model_arch_config_convertor,
 )
 
 

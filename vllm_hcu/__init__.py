@@ -81,7 +81,7 @@ def hcu_platform_plugin() -> str:
             ensure_vllm_compatible()
             _apply_platform_preserving_role()
         except Exception as exc:
-            # vLLM v0.21 invokes every platform plugin once inside a broad
+            # The audited target vLLM invokes every platform plugin once inside a broad
             # exception-swallowing activation probe and invokes the selected
             # plugin a second time outside that probe.  Return the class path
             # once so HCU remains selected, then make the second invocation

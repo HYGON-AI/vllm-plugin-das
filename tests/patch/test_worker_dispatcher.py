@@ -19,17 +19,35 @@ from vllm_hcu.patch.runtime_state import LatchedPatchError, PatchRegistry, Patch
 
 
 REPO = Path(__file__).resolve().parents[2]
-CLEAN_VLLM = Path(
-    os.environ.get("VLLM_V021_SOURCE_ROOT", REPO.parent / "vllm_dcu_v0.21")
+TARGET_VLLM_ROOT = Path(
+    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO.parent / "vllm_025")
+).resolve()
+if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"VLLM_V025_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+    )
+
+_TARGET_SOURCE_ASSERTION = r'''
+import os as _vllm_hcu_os
+from pathlib import Path as _VllmHcuPath
+import vllm as _vllm_hcu_target
+_vllm_hcu_root = _VllmHcuPath(
+    _vllm_hcu_os.environ["VLLM_V025_SOURCE_ROOT"]
+).resolve()
+_vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
+assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
+    f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
+'''
 
 
 def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(CLEAN_VLLM)))
+    env["VLLM_V025_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
         capture_output=True,
         text=True,
@@ -64,7 +82,7 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
             "vllm_hcu.distributed.device_communicators.custom_all_reduce",
         ),
     )
-    assert len(callbacks) == 55
+    assert len(callbacks) == 58
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
@@ -214,10 +232,10 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "first": 59,
-        "second": 59,
+        "first": 62,
+        "second": 62,
         "replacements": 4,
-        "callbacks": 55,
+        "callbacks": 58,
         "statuses": ["armed"],
         "targets_loaded": [],
         "business_loaded": [],
@@ -263,7 +281,7 @@ def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["pid"] == payload["actual_pid"]
     assert payload["role"] == "Worker"
-    assert payload["count"] == 59
+    assert payload["count"] == 62
     assert set(map(tuple, payload["selected"].values())) == {("armed", True)}
     assert payload["pynccl"] == ["armed", False]
 

@@ -108,7 +108,7 @@ _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._launch_in_aux_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._run_in_aux_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts.output",
-            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.apply",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.forward",
         ),
     ),
     _ReplacementSpec(
@@ -152,6 +152,13 @@ _OP_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             "vllm._aiter_ops._rocm_aiter_fused_moe_impl",
             "vllm._aiter_ops._rocm_aiter_topk_softmax_impl",
             "vllm._aiter_ops.rocm_aiter_ops.get_aiter_activation_type",
+            "vllm._aiter_ops.rocm_aiter_ops."
+            "is_shuffled_per_token_w8a8_gemm_tuned",
+            "vllm._aiter_ops.rocm_aiter_ops.is_per_token_w8a8_gemm_tuned",
+            "vllm._aiter_ops.rocm_aiter_ops.is_fp8bmm_enabled",
+            "vllm._aiter_ops._rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
+            "vllm._aiter_ops."
+            "_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
         ),
     ),
 )
@@ -218,6 +225,11 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer2")),
+    # All GDN deltas bind Qwen's module-local symbols/class only.  The
+    # canonical causal-conv module and the shared GDN base remain vLLM-owned
+    # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched.
+    _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
+    _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
@@ -275,6 +287,9 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_gpu_worker_shutdown"),
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_dp_utils"),
         feature="deepep_low_latency",
@@ -697,7 +712,7 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
     for feature-off tests.  Reading it through :func:`get_hcu_config` performs
     the same strict sidecar validation in spawned workers as in the main
     process.  Target modules remain lazy; an armed required callback will fail
-    its importing worker if the audited v0.21 symbol is incompatible.
+    its importing worker if the audited target vLLM symbol is incompatible.
     """
 
     ensure_vllm_compatible()

@@ -14,7 +14,6 @@ from vllm_hcu.patch.tokenizer_callbacks import register_tokenizer_callbacks
 
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
-    patch_allreduce_rms_fusion,
     patch_engine_core,
     patch_kv_cache_utils,
     patch_kv_connector_factory,
@@ -35,8 +34,7 @@ _DISPATCH_LOCK = threading.RLock()
 # coordinator applies those callbacks immediately in the order below.  Keep
 # the HCU-owned Mooncake contract ahead of its factory registration, then arm
 # the vLLM integration points from low-level KV/distributed contracts through
-# scheduling and engine output.  The all-reduce fusion callback is last
-# because resolving an already-loaded target imports the HCU communicator.
+# scheduling and engine output.
 _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_mooncake_connector,
     patch_kv_connector_factory,
@@ -47,7 +45,6 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_output_processor,
     patch_multiproc_executor,
     patch_outputs,
-    patch_allreduce_rms_fusion,
 )
 
 

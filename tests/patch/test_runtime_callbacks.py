@@ -123,7 +123,8 @@ def test_fp8_callback_invokes_implementation_only_after_exact_target(
     module.TorchFP8ScaledMMLinearKernel = TorchKernel
     calls: list[str] = []
 
-    def patch():
+    def patch(target):
+        assert target is module
         calls.append("fp8")
         ChannelWise._hcu_fp8_patch_applied = True
 
@@ -306,18 +307,33 @@ def test_weight_installer_is_direct_idempotent_and_keeps_bindings_coherent(
     assert imported == [default_loader.__name__, default_loader.__name__]
 
 
-def test_clean_v021_model_loader_import_order_has_no_weight_debug_cycle():
+def test_clean_v025_model_loader_import_order_has_no_weight_debug_cycle():
     repo = Path(__file__).resolve().parents[2]
-    clean_vllm = Path(
-        os.environ.get("VLLM_V021_SOURCE_ROOT", repo.parent / "vllm_dcu_v0.21")
-    )
+    target_vllm = Path(
+        os.environ.get("VLLM_V025_SOURCE_ROOT", repo.parent / "vllm_025")
+    ).resolve()
+    if not (target_vllm / "vllm" / "__init__.py").is_file():
+        raise RuntimeError(
+            f"VLLM_V025_SOURCE_ROOT does not contain vllm: {target_vllm}"
+        )
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["PYTHONPATH"] = os.pathsep.join((str(repo), str(clean_vllm)))
+    env["VLLM_V025_SOURCE_ROOT"] = str(target_vllm)
+    env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(repo)))
     code = r'''
 import importlib.abc
 import json
+import os
 import sys
+from pathlib import Path
+
+import vllm
+
+target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+target_file = Path(vllm.__file__).resolve()
+assert target_file.is_relative_to(target_root), (
+    f"vllm resolved outside target root: {target_file} not under {target_root}"
+)
 
 from vllm_hcu.patch import apply_platform_patches, patch_report
 
@@ -411,7 +427,8 @@ def test_loaded_target_callback_is_applied_and_reported(
     module.ChannelWiseTorchFP8ScaledMMLinearKernel = ChannelWise
     module.TorchFP8ScaledMMLinearKernel = type("TorchKernel", (), {})
 
-    def patch():
+    def patch(target):
+        assert target is module
         ChannelWise._hcu_fp8_patch_applied = True
 
     monkeypatch.setattr(

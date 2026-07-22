@@ -40,29 +40,9 @@ _BASE_LINEAR: tuple[_Entry, ...] = (
 
 _DEEPSEEK_V4: tuple[_Entry, ...] = (
     (
-        "module_exchange.deepseek_v4.fused_compress_quant_cache",
-        "vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache",
-        "vllm_hcu.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache",
-    ),
-    (
         "module_exchange.deepseek_v4.sparse_swa",
         "vllm.v1.attention.backends.mla.sparse_swa",
         "vllm_hcu.v1.attention.backends.mla.sparse_swa",
-    ),
-    (
-        "module_exchange.deepseek_v4.compressor",
-        "vllm.model_executor.layers.deepseek_compressor",
-        "vllm_hcu.model_executor.layers.deepseek_compressor",
-    ),
-    (
-        "module_exchange.deepseek_v4.attention",
-        "vllm.model_executor.layers.deepseek_v4_attention",
-        "vllm_hcu.model_executor.layers.deepseek_v4_attention",
-    ),
-    (
-        "module_exchange.deepseek_v4.mhc",
-        "vllm.model_executor.layers.mhc",
-        "vllm_hcu.model_executor.layers.mhc",
     ),
 )
 

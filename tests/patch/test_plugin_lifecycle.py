@@ -27,9 +27,26 @@ from vllm_hcu.patch.runtime_state import (
 
 
 REPO = Path(__file__).resolve().parents[2]
-CLEAN_VLLM = Path(
-    os.environ.get("VLLM_V021_SOURCE_ROOT", REPO.parent / "vllm_dcu_v0.21")
+TARGET_VLLM_ROOT = Path(
+    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO.parent / "vllm_025")
+).resolve()
+if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"VLLM_V025_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+    )
+
+_TARGET_SOURCE_ASSERTION = r'''
+import os as _vllm_hcu_os
+from pathlib import Path as _VllmHcuPath
+import vllm as _vllm_hcu_target
+_vllm_hcu_root = _VllmHcuPath(
+    _vllm_hcu_os.environ["VLLM_V025_SOURCE_ROOT"]
+).resolve()
+_vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
+assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
+    f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
+'''
 
 
 @pytest.fixture(autouse=True)
@@ -43,12 +60,19 @@ def _fresh_python(
     code: str,
     *,
     plugins: str = "__disabled__",
+    assert_target_first: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = plugins
-    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(CLEAN_VLLM)))
+    env["VLLM_V025_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    child_code = (
+        _TARGET_SOURCE_ASSERTION + code
+        if assert_target_first
+        else code + _TARGET_SOURCE_ASSERTION
+    )
     return subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", child_code],
         check=False,
         capture_output=True,
         text=True,
@@ -166,10 +190,17 @@ def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
         "'vllm_hcu.v1.executor.multiproc_executor']; "
         "print(json.dumps({'path':path,'builtins_same':builtins.__import__ is old,"
         "'patch_utils':'vllm_hcu.patch_utils' in sys.modules,"
-        "'heavy':[name for name in heavy if name in sys.modules]}))"
+        "'heavy':[name for name in heavy if name in sys.modules]}))",
+        assert_target_first=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    payload = json.loads(
+        next(
+            line
+            for line in reversed(result.stdout.strip().splitlines())
+            if line.startswith("{")
+        )
+    )
     assert payload == {
         "path": "vllm_hcu.platforms.hcu.HCUPlatform",
         "builtins_same": True,
@@ -415,6 +446,7 @@ def test_platform_check_uses_lazy_scheduler_and_executor_selectors(monkeypatch):
         lambda config: events.append("executor") or False,
     )
     config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
@@ -426,12 +458,266 @@ def test_platform_check_uses_lazy_scheduler_and_executor_selectors(monkeypatch):
     assert config.parallel_config.worker_cls == "vllm_hcu.v1.worker.HcuGPUWorker"
 
 
+@pytest.mark.parametrize(
+    ("use_mla", "initially_enabled", "expected_enabled", "expected_changed"),
+    [
+        (True, True, False, True),
+        (True, False, False, False),
+        (False, True, True, False),
+    ],
+)
+def test_hcu_config_disables_only_unqualified_mla_prefix_caching(
+    monkeypatch,
+    use_mla,
+    initially_enabled,
+    expected_enabled,
+    expected_changed,
+):
+    import pickle
+    import torch
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        hcu_module._mla_safety_logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=use_mla),
+        cache_config=SimpleNamespace(enable_prefix_caching=initially_enabled),
+    )
+
+    assert (
+        hcu_module._disable_unqualified_mla_prefix_caching(config)
+        is expected_changed
+    )
+    assert config.cache_config.enable_prefix_caching is expected_enabled
+    restored = pickle.loads(pickle.dumps(config))
+    assert restored.cache_config.enable_prefix_caching is expected_enabled
+    assert warnings == (
+        [
+            "Prefix caching is disabled for HCU MLA execution because this "
+            "combination is not correctness-qualified on the current HCU path."
+        ]
+        if expected_changed
+        else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_config", "cache_config"),
+    [
+        (None, SimpleNamespace(enable_prefix_caching=True)),
+        (SimpleNamespace(use_mla=True), None),
+    ],
+)
+def test_hcu_mla_prefix_safety_allows_incomplete_config(
+    monkeypatch, model_config, cache_config
+):
+    import torch
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        hcu_module._mla_safety_logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message),
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        cache_config=cache_config,
+    )
+
+    assert hcu_module._disable_unqualified_mla_prefix_caching(config) is False
+    assert warnings == []
+
+
+def test_hcu_mla_prefix_safety_warning_uses_vllm_process_logger(monkeypatch):
+    import logging
+    import torch
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    calls: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        hcu_module._mla_safety_logger,
+        "warning_once",
+        lambda message, *args, **kwargs: calls.append((message, kwargs)),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+    )
+
+    assert hcu_module._disable_unqualified_mla_prefix_caching(config) is True
+    assert calls == [
+        (
+            "Prefix caching is disabled for HCU MLA execution because this "
+            "combination is not correctness-qualified on the current HCU path.",
+            {"scope": "process"},
+        )
+    ]
+    assert hcu_module._mla_safety_logger.name == (
+        "vllm.hcu.mla_prefix_cache_safety"
+    )
+    configured_vllm_logger = logging.getLogger("vllm")
+    assert configured_vllm_logger.handlers
+
+
+def test_hcu_mla_prefix_safety_warning_is_visible_in_fresh_process():
+    message = (
+        "Prefix caching is disabled for HCU MLA execution because this "
+        "combination is not correctness-qualified on the current HCU path."
+    )
+    result = _fresh_python(
+        r'''
+import torch
+from types import SimpleNamespace
+
+torch.cuda.get_device_properties = lambda device: SimpleNamespace(
+    gcnArchName="gfx936"
+)
+import vllm_hcu.platforms.hcu as hcu_module
+
+config = SimpleNamespace(
+    model_config=SimpleNamespace(use_mla=True),
+    cache_config=SimpleNamespace(enable_prefix_caching=True),
+)
+assert hcu_module._disable_unqualified_mla_prefix_caching(config) is True
+assert config.cache_config.enable_prefix_caching is False
+second_config = SimpleNamespace(
+    model_config=SimpleNamespace(use_mla=True),
+    cache_config=SimpleNamespace(enable_prefix_caching=True),
+)
+assert hcu_module._disable_unqualified_mla_prefix_caching(second_config) is True
+assert second_config.cache_config.enable_prefix_caching is False
+'''
+    )
+    assert result.returncode == 0, result.stderr
+    managed_stream_lines = (
+        result.stdout.splitlines() + result.stderr.splitlines()
+    )
+    matching_lines = [line for line in managed_stream_lines if message in line]
+    assert len(matching_lines) == 1
+    assert "WARNING" in matching_lines[0]
+    assert "[hcu.py:" in matching_lines[0]
+
+
+def test_hcu_mla_prefix_safety_mutates_target_cache_config(monkeypatch):
+    import torch
+    from vllm.config.cache import CacheConfig
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    cache_config = CacheConfig(enable_prefix_caching=True)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+        cache_config=cache_config,
+    )
+
+    assert hcu_module._disable_unqualified_mla_prefix_caching(config) is True
+    assert cache_config.enable_prefix_caching is False
+
+
+def test_hcu_config_disables_mla_prefix_before_scheduler_selection(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    from vllm_hcu.patch.platform.core_fix import patch_vllm_config
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_multiproc_executor,
+        patch_scheduler,
+    )
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    events: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda config: events.append(
+            ("validate", config.cache_config.enable_prefix_caching)
+        ),
+    )
+    monkeypatch.setattr(
+        hcu_module._mla_safety_logger,
+        "warning_once",
+        lambda message, *args, **kwargs: events.append(
+            ("warning", config.cache_config.enable_prefix_caching)
+        ),
+    )
+    monkeypatch.setattr(
+        patch_scheduler,
+        "select_hcu_scheduler",
+        lambda config: events.append(
+            ("scheduler", config.cache_config.enable_prefix_caching)
+        )
+        or False,
+    )
+    monkeypatch.setattr(
+        patch_multiproc_executor,
+        "select_hcu_multiproc_executor",
+        lambda config: events.append(
+            ("executor", config.cache_config.enable_prefix_caching)
+        )
+        or False,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True,
+            user_specified_block_size=True,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
+        ),
+        parallel_config=SimpleNamespace(worker_cls="auto"),
+    )
+
+    hcu_module.HCUPlatform.check_and_update_config(config)
+
+    assert events == [
+        ("validate", True),
+        ("warning", False),
+        ("scheduler", False),
+        ("executor", False),
+    ]
+    assert config.cache_config.enable_prefix_caching is False
+
+
 def test_scheduler_selector_matrix_is_lazy_and_conflict_safe(monkeypatch):
     from vllm_hcu.patch.platform.framework_opt import patch_scheduler
 
     monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", False)
     config = SimpleNamespace(
         additional_config={"hcu": {}},
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         scheduler_config=SimpleNamespace(
             scheduler_cls="custom.Scheduler",
             async_scheduling=False,

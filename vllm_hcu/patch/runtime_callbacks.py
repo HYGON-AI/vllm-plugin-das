@@ -79,7 +79,7 @@ def apply_fp8_scaled_mm(module: ModuleType) -> None:
         "vllm_hcu.runtime_compat.scaled_mm",
         "install_fp8_scaled_mm_compat",
     )
-    function()
+    function(module)
     if not getattr(channel_class, "_hcu_fp8_patch_applied", False):
         raise Stage3CompatibilityError("FP8 scaled-mm runtime patch did not apply")
 
@@ -130,7 +130,7 @@ def apply_qwen35_lora_cudagraph(module: ModuleType) -> None:
 def apply_weight_debug_skip(module: ModuleType) -> None:
     # ``weight_utils`` is imported from reload.layerwise while base_loader is
     # still being initialised.  Importing default_loader from a weight_utils
-    # post-import callback therefore creates this real v0.21 cycle:
+    # post-import callback therefore creates this audited target vLLM cycle:
     #
     #   base_loader -> reload.layerwise -> weight_utils -> default_loader
     #                                                -> base_loader (partial)
@@ -223,7 +223,7 @@ _ORDERED_CALLBACKS: tuple[
         apply_fp8_scaled_mm,
         (
             "vllm.model_executor.kernels.linear.scaled_mm.pytorch."
-            "TorchFP8ScaledMMLinearKernel.get_output_padding",
+            "ChannelWiseTorchFP8ScaledMMLinearKernel.get_output_padding",
             "vllm.model_executor.kernels.linear.scaled_mm.pytorch."
             "ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm",
         ),
