@@ -16,7 +16,6 @@ import pytest
 os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
 
 from vllm_hcu.patch.platform.framework_opt import (
-    patch_allreduce_rms_fusion,
     patch_engine_core,
     patch_kv_cache_utils,
     patch_kv_connector_factory,
@@ -40,44 +39,6 @@ def test_clean_vllm_real_factory_and_runtime_contract_smoke():
     # Run before this process imports the heavy Mooncake/model stack so the
     # independent clean-vLLM smoke does not temporarily double memory use.
     _run_clean_vllm_real_factory_and_runtime_contract_smoke()
-
-
-def test_allreduce_fusion_uses_hcu_communicator_identity(monkeypatch):
-    Hcu = type(
-        "CustomAllreduce",
-        (),
-        {
-            "__module__": (
-                "vllm_hcu.distributed.device_communicators.custom_all_reduce"
-            )
-        },
-    )
-    canonical = _module(
-        patch_allreduce_rms_fusion.CUSTOM_ALLREDUCE_MODULE,
-        CustomAllreduce=Hcu,
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        patch_allreduce_rms_fusion.CUSTOM_ALLREDUCE_MODULE,
-        canonical,
-    )
-    module = _module(
-        patch_allreduce_rms_fusion.TARGET_MODULE,
-        CustomAllreduce=Hcu,
-    )
-    assert patch_allreduce_rms_fusion.apply_to_module(module) is True
-    assert module.CustomAllreduce is Hcu
-    assert patch_allreduce_rms_fusion.apply_to_module(module) is False
-
-    stale = _module(
-        patch_allreduce_rms_fusion.TARGET_MODULE,
-        CustomAllreduce=type("CustomAllreduce", (), {}),
-    )
-    with pytest.raises(
-        patch_allreduce_rms_fusion.PatchCompatibilityError,
-        match="canonical alias",
-    ):
-        patch_allreduce_rms_fusion.apply_to_module(stale)
 
 
 def test_group_coordinator_all_to_all_delegates_to_device_communicator():
@@ -293,7 +254,7 @@ def test_hcu_mooncake_bootstrap_contracts(hcu_mooncake, monkeypatch):
 
 def _fake_scheduler_module():
     class Scheduler:
-        def schedule(self):
+        def schedule(self, throttle_prefills=False):
             return "official"
 
         def update_draft_token_ids(self, draft_token_ids):
@@ -308,6 +269,8 @@ def _fake_scheduler_module():
         "_try_promote_blocked_waiting_request",
         "_try_schedule_encoder_inputs",
         "_mamba_block_aligned_split",
+        "_build_kv_connector_meta",
+        "_inflight_prefill_reserved_blocks",
         "_make_cached_request_data",
         "_update_after_schedule",
         "_preempt_request",
@@ -321,6 +284,7 @@ def test_scheduler_feature_off_keeps_official_class(monkeypatch):
     monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", False)
     config = SimpleNamespace(
         additional_config={"hcu": {}},
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         scheduler_config=SimpleNamespace(
             scheduler_cls=None,
             async_scheduling=False,
@@ -330,8 +294,17 @@ def test_scheduler_feature_off_keeps_official_class(monkeypatch):
     assert config.scheduler_config.scheduler_cls is None
     from vllm_hcu.v1.core.sched.scheduler import HcuScheduler
 
-    monkeypatch.setattr(HcuScheduler.__mro__[1], "schedule", lambda self: "official")
-    assert HcuScheduler.schedule(object.__new__(HcuScheduler)) == "official"
+    observed: list[bool] = []
+
+    def official_schedule(self, throttle_prefills: bool = False):
+        observed.append(throttle_prefills)
+        return "official"
+
+    monkeypatch.setattr(HcuScheduler.__mro__[1], "schedule", official_schedule)
+    scheduler = object.__new__(HcuScheduler)
+    assert HcuScheduler.schedule(scheduler) == "official"
+    assert HcuScheduler.schedule(scheduler, throttle_prefills=True) == "official"
+    assert observed == [False, True]
 
 
 def test_scheduler_selects_hcu_class_through_scheduler_cls(monkeypatch):
@@ -344,6 +317,7 @@ def test_scheduler_selects_hcu_class_through_scheduler_cls(monkeypatch):
     monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     config = SimpleNamespace(
         additional_config={"hcu": {}},
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         scheduler_config=SimpleNamespace(
             scheduler_cls=None,
             async_scheduling=False,
@@ -363,6 +337,7 @@ def test_scheduler_rejects_split_pd_with_async_scheduling(monkeypatch):
     monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     config = SimpleNamespace(
         additional_config={"hcu": {}},
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         scheduler_config=SimpleNamespace(
             scheduler_cls=None,
             async_scheduling=True,
@@ -655,7 +630,7 @@ def test_output_processor_logs_first_decoder_token_once(monkeypatch):
     assert trace_calls[0][0] == ("d_first_token",)
 
 
-def test_hcu_multiproc_executor_sizes_message_queue_chunks(monkeypatch):
+def test_hcu_multiproc_executor_sizes_message_queue_from_v025_config(monkeypatch):
     from vllm_hcu.v1.executor import multiproc_executor as hcu_executor
 
     records = []
@@ -691,7 +666,7 @@ def test_hcu_multiproc_executor_sizes_message_queue_chunks(monkeypatch):
         fake_parent_init,
     )
     executor = object.__new__(hcu_executor.HcuMultiprocExecutor)
-    executor.__dict__["max_concurrent_batches"] = 3
+    executor.vllm_config = SimpleNamespace(max_concurrent_batches=3)
     executor._init_executor()
     assert records == [12, 12, 20, 10, ("handle", "response", 0), 10]
     assert hcu_executor._upstream.MessageQueue is FakeMessageQueue
@@ -722,7 +697,7 @@ def test_hcu_multiproc_executor_restores_queue_after_parent_failure(monkeypatch)
         fake_parent_init,
     )
     executor = object.__new__(hcu_executor.HcuMultiprocExecutor)
-    executor.__dict__["max_concurrent_batches"] = 3
+    executor.vllm_config = SimpleNamespace(max_concurrent_batches=3)
 
     with pytest.raises(LookupError, match="parent init failed"):
         executor._init_executor()
@@ -750,7 +725,7 @@ def test_hcu_multiproc_executor_detects_concurrent_queue_replacement(monkeypatch
         fake_parent_init,
     )
     executor = object.__new__(hcu_executor.HcuMultiprocExecutor)
-    executor.__dict__["max_concurrent_batches"] = 3
+    executor.vllm_config = SimpleNamespace(max_concurrent_batches=3)
 
     with pytest.raises(RuntimeError, match="replaced concurrently"):
         executor._init_executor()
@@ -792,7 +767,7 @@ def test_hcu_multiproc_executor_restores_message_queue_in_fork_child(monkeypatch
         fake_parent_init,
     )
     executor = object.__new__(hcu_executor.HcuMultiprocExecutor)
-    executor.__dict__["max_concurrent_batches"] = 3
+    executor.vllm_config = SimpleNamespace(max_concurrent_batches=3)
     executor._init_executor()
 
     assert child_result == [b"restored"]
@@ -822,10 +797,10 @@ def test_outputs_keep_model_runner_ipc_stable_and_use_draft_channel():
     assert patch_outputs.apply_to_module(module) is False
 
 
-def test_clean_v021_model_runner_output_and_hcu_draft_method_contract():
+def test_clean_v025_model_runner_output_and_hcu_draft_method_contract():
     repo = Path(__file__).resolve().parents[2]
     clean_vllm = Path(
-        os.environ.get("VLLM_V021_SOURCE_ROOT", repo.parent / "vllm_dcu_v0.21")
+        os.environ.get("VLLM_V025_SOURCE_ROOT", repo.parent / "vllm_025")
     )
     script = r'''
 import ast
@@ -917,7 +892,7 @@ print("CLEAN_OUTPUT_DRAFT_CHANNEL_OK", vllm.__file__)
 def _run_clean_vllm_real_factory_and_runtime_contract_smoke():
     repo = Path(__file__).resolve().parents[2]
     clean_vllm = Path(
-        os.environ.get("VLLM_V021_SOURCE_ROOT", repo.parent / "vllm_dcu_v0.21")
+        os.environ.get("VLLM_V025_SOURCE_ROOT", repo.parent / "vllm_025")
     )
     script = """
 from vllm_hcu.patch.platform.framework_opt import (

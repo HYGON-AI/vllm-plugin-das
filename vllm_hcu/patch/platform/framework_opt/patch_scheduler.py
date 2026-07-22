@@ -22,6 +22,18 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler",
     "vllm_hcu.v1.core.sched.scheduler.HcuScheduler",
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids",
+    f"{TARGET_MODULE}.Scheduler.schedule",
+    f"{TARGET_MODULE}.Scheduler.update_draft_token_ids_in_output",
+    f"{TARGET_MODULE}.Scheduler._select_waiting_queue_for_scheduling",
+    f"{TARGET_MODULE}.Scheduler._is_blocked_waiting_status",
+    f"{TARGET_MODULE}.Scheduler._try_promote_blocked_waiting_request",
+    f"{TARGET_MODULE}.Scheduler._try_schedule_encoder_inputs",
+    f"{TARGET_MODULE}.Scheduler._mamba_block_aligned_split",
+    f"{TARGET_MODULE}.Scheduler._build_kv_connector_meta",
+    f"{TARGET_MODULE}.Scheduler._inflight_prefill_reserved_blocks",
+    f"{TARGET_MODULE}.Scheduler._make_cached_request_data",
+    f"{TARGET_MODULE}.Scheduler._update_after_schedule",
+    f"{TARGET_MODULE}.Scheduler._preempt_request",
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
 HCU_SCHEDULER_PATH = "vllm_hcu.v1.core.sched.scheduler.HcuScheduler"
@@ -33,13 +45,19 @@ def apply_to_module(module: ModuleType) -> bool:
     scheduler = require_class(target, "Scheduler", TARGETS[0])
     if getattr(target, _MARKER, False):
         return False
-    require_signature_prefix(require_callable(scheduler, "schedule", f"{TARGETS[0]}.schedule"), f"{TARGETS[0]}.schedule", ("self",))
+    require_signature_prefix(
+        require_callable(scheduler, "schedule", f"{TARGETS[0]}.schedule"),
+        f"{TARGETS[0]}.schedule",
+        ("self", "throttle_prefills"),
+    )
     for method_name in (
         "_select_waiting_queue_for_scheduling",
         "_is_blocked_waiting_status",
         "_try_promote_blocked_waiting_request",
         "_try_schedule_encoder_inputs",
         "_mamba_block_aligned_split",
+        "_build_kv_connector_meta",
+        "_inflight_prefill_reserved_blocks",
         "_make_cached_request_data",
         "_update_after_schedule",
         "_preempt_request",
@@ -105,19 +123,19 @@ def select_hcu_scheduler(vllm_config: object) -> bool:
         )
     async_scheduling = scheduler_config.async_scheduling
     if async_scheduling is True:
-        # vLLM v0.21 resolves its default async policy before invoking
+        # vLLM v0.25 resolves its default async policy before invoking
         # Platform.check_and_update_config().  HcuScheduler intentionally
         # inherits the synchronous Scheduler and therefore does not implement
         # AsyncScheduler's placeholder/cache-update protocol.  Reject the
         # inconsistent pair instead of allowing silent request-state damage.
         raise RuntimeError(
             "split-P/D HcuScheduler does not support async scheduling in "
-            "vLLM v0.21; explicitly disable it with --no-async-scheduling"
+            "vLLM v0.25; explicitly disable it with --no-async-scheduling"
         )
     if async_scheduling is None:
         # This is reachable for direct/programmatic selector use before
         # VllmConfig.__post_init__.  Pin the only supported policy so the
-        # subsequent v0.21 auto-selection cannot turn it back on.
+        # subsequent v0.25 auto-selection cannot turn it back on.
         scheduler_config.async_scheduling = False
     elif async_scheduling is not False:
         raise PatchCompatibilityError(

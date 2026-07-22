@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 import vllm_hcu.platforms.envs as henvs 
 
 logger = init_logger(__name__)
+_mla_safety_logger = init_logger("vllm.hcu.mla_prefix_cache_safety")
 
 _ensure_platform_plugin_ready()
 
@@ -120,6 +121,37 @@ def on_gfx93x() -> bool:
 
 def on_gfx938() -> bool:
     return _ON_GFX938
+
+
+def _disable_unqualified_mla_prefix_caching(vllm_config: "VllmConfig") -> bool:
+    """Fail safe before EngineCore/Scheduler creation for HCU MLA.
+
+    The current HCU MLA execution path is not correctness-qualified with
+    automatic prefix caching.  Mutating the shared VllmConfig here keeps the
+    EngineCore, Scheduler, KV cache manager, and serialized worker configs in
+    agreement.  ModelConfig.use_mla is the target-owned structural signal; do
+    not infer MLA from model paths or quantization names.
+    """
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    if model_config is None or cache_config is None:
+        return False
+    if not (model_config.use_mla and cache_config.enable_prefix_caching):
+        return False
+
+    cache_config.enable_prefix_caching = False
+    # Plugin module loggers live outside the configured ``vllm`` logger
+    # hierarchy.  Route this release-safety warning through a named vLLM
+    # child so it remains visible in the managed service log before
+    # EngineCore starts.  Process scope also avoids depending on distributed
+    # rank state during early configuration.
+    _mla_safety_logger.warning_once(
+        "Prefix caching is disabled for HCU MLA execution because this "
+        "combination is not correctness-qualified on the current HCU path.",
+        scope="process",
+    )
+    return True
 
 @cache
 def _get_backend_priorities(
@@ -511,6 +543,7 @@ class HCUPlatform(Platform):
 
         IMPORT_COORDINATOR.drain_ready_callbacks()
         validate_and_update_hcu_config(vllm_config)
+        _disable_unqualified_mla_prefix_caching(vllm_config)
 
         # Use vLLM's public qualified-class configuration hooks.  Both
         # selectors only assign strings and therefore keep the official and

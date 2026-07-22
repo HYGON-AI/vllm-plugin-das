@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU Scheduler for the v0.21 split-P/D scheduling policy.
+"""HCU Scheduler for the v0.25 split-P/D scheduling policy.
 
 The class is selected through vLLM's public ``scheduler_cls`` configuration.
 It never replaces the official ``Scheduler`` class. Feature-off execution
@@ -11,9 +11,9 @@ from __future__ import annotations
 from vllm.v1.core.sched import scheduler as _upstream
 from vllm_hcu.platforms import envs as henvs
 
-# The migrated method intentionally uses the same stable scheduler data types
-# as vLLM v0.21. Export its module globals after the adapter verifies the exact
-# v0.21 contract; this avoids duplicating model/request types.
+# The migrated method intentionally uses the same scheduler data types as the
+# matching vLLM release. Export its module globals to avoid duplicating
+# model/request types while keeping this adapter limited to scheduling policy.
 for _name, _value in vars(_upstream).items():
     if not _name.startswith("__"):
         globals().setdefault(_name, _value)
@@ -56,7 +56,10 @@ class HcuScheduler(_upstream.Scheduler):
             kv_params=params,
         )
 
-    def schedule_split_pd(self) -> SchedulerOutput:
+    def schedule_split_pd(
+        self, throttle_prefills: bool = False
+    ) -> SchedulerOutput:
+        self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -85,23 +88,34 @@ class HcuScheduler(_upstream.Scheduler):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # Whether the running batch contains any prefill requests.
+        prefill_scheduled = False
 
         # For logging.
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
 
+        # DP prefill balancing: on a throttled (non-cadence-aligned) step,
+        # defer all prefill compute unless saturated. This is computed from
+        # the pre-existing running batch before the HCU waiting-first pass.
+        defer_prefills = (
+            throttle_prefills and not self.prefill_capacity_bound
+        ) and any(not r.is_prefill_chunk for r in self.running)
+
         # Legacy used this set before defining it. Initialise it before the
         # waiting-first pass so LoRA limits are enforced deterministically.
         scheduled_loras = self._hcu_initial_scheduled_loras()
 
-        req_index = len(self.running)
         # First, schedule the WAITING requests.
 
         step_skipped_waiting = create_request_queue(self.policy)
 
         while self._hcu_can_schedule_waiting(token_budget):
-            if len(self.running) == self.max_num_running_reqs:
+            # Paused streaming sessions are not in ``running`` but still hold
+            # a model-runner request slot.
+            num_running = len(self.running) + self.num_waiting_for_streaming_input
+            if num_running >= self.max_num_running_reqs:
                 break
 
             request_queue = self._select_waiting_queue_for_scheduling()
@@ -129,7 +143,7 @@ class HcuScheduler(_upstream.Scheduler):
                 self.lora_config
                 and request.lora_request
                 and (
-                    len(scheduled_loras) == self.lora_config.max_loras
+                    len(scheduled_loras) >= self.lora_config.max_loras
                     and request.lora_request.lora_int_id not in scheduled_loras
                 )
             ):
@@ -141,13 +155,50 @@ class HcuScheduler(_upstream.Scheduler):
             num_external_computed_tokens = 0
             load_kv_async = False
             connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+            num_uncached_common_prefix_tokens = 0
 
             # Get already-cached tokens.
             if request.num_computed_tokens == 0:
                 # Get locally-cached tokens.
-                new_computed_blocks, num_new_local_computed_tokens = (
-                    self.kv_cache_manager.get_computed_blocks(request)
-                )
+                if (
+                    self.connector is not None
+                    and self.has_mamba_layers
+                    and isinstance(
+                        self.kv_cache_manager.coordinator,
+                        HybridKVCacheCoordinator,
+                    )
+                ):
+                    computed, per_group_hits = (
+                        self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
+                            request.block_hashes,
+                            request.num_tokens - 1,
+                        )
+                    )
+                    new_computed_blocks = (
+                        self.kv_cache_manager.create_kv_cache_blocks(computed)
+                    )
+                    # For Mamba hybrid models this must be the full-attention
+                    # hit length passed to the external connector.
+                    num_new_local_computed_tokens = max(per_group_hits)
+                    if self.kv_cache_manager.log_stats:
+                        assert self.kv_cache_manager.prefix_cache_stats is not None
+                        self.kv_cache_manager.prefix_cache_stats.record(
+                            num_tokens=request.num_tokens,
+                            num_hits=num_new_local_computed_tokens,
+                            preempted=request.num_preemptions > 0,
+                        )
+                else:
+                    new_computed_blocks, num_new_local_computed_tokens = (
+                        self.kv_cache_manager.get_computed_blocks(request)
+                    )
+
+                # Hint for Marconi-style hybrid prefix-cache admission.
+                if self.has_mamba_layers:
+                    num_uncached_common_prefix_tokens = getattr(
+                        self.kv_cache_manager.coordinator,
+                        "num_uncached_common_prefix_tokens",
+                        0,
+                    )
 
                 # Get externally-cached tokens if using a KVConnector.
                 if self.connector is not None:
@@ -165,7 +216,6 @@ class HcuScheduler(_upstream.Scheduler):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
-                    request.num_external_computed_tokens = ext_tokens
                     num_external_computed_tokens = ext_tokens
 
                     connector_prefix_cache_queries = (
@@ -178,6 +228,20 @@ class HcuScheduler(_upstream.Scheduler):
                     num_new_local_computed_tokens + num_external_computed_tokens
                 )
                 assert num_computed_tokens <= request.num_tokens
+
+                # Do not admit a request while its multimodal encoder cache is
+                # still being prefetched by the external connector.
+                if (
+                    self.ec_connector is not None
+                    and request.mm_features
+                    and not self.ec_connector.ensure_cache_available(
+                        request, num_computed_tokens
+                    )
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 if request.prefill_stats is not None:
                     assert num_computed_tokens <= request.num_prompt_tokens
                     request.prefill_stats.set(
@@ -195,17 +259,38 @@ class HcuScheduler(_upstream.Scheduler):
             encoder_inputs_to_schedule = None
             external_load_encoder_input = []
             new_encoder_compute_budget = encoder_compute_budget
+            pad_spec_decode = False
 
             if load_kv_async:
                 # KVTransfer: loading remote KV, do not allocate for new work.
                 assert num_external_computed_tokens > 0
                 num_new_tokens = 0
+            elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                # DP prefill balancing: defer local prefill compute on this
+                # non-cadence-aligned step.
+                break
             else:
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed
                 # requests, which have output tokens.
                 num_new_tokens = request.num_tokens - num_computed_tokens
+
+                # Pad new decode requests to the uniform speculative-decoding
+                # size so this step can retain the full graph.
+                if (
+                    (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                    and num_new_tokens == 1
+                    and (scheduled_running_reqs and not prefill_scheduled)
+                ):
+                    num_new_tokens = 1 + self.num_spec_tokens
+                    if (
+                        num_new_tokens > token_budget
+                        or num_computed_tokens + num_new_tokens > self.max_model_len
+                    ):
+                        break
+                    pad_spec_decode = True
+
                 threshold = self.scheduler_config.long_prefill_token_threshold
                 if 0 < threshold < num_new_tokens:
                     num_new_tokens = threshold
@@ -241,23 +326,24 @@ class HcuScheduler(_upstream.Scheduler):
                         # The request cannot be scheduled.
                         break
 
-            if self.need_mamba_block_aligned_split:
+            # Async receive performs no local work, so block alignment must
+            # wait until the request is actually scheduled.
+            if self.need_mamba_block_aligned_split and not load_kv_async:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request,
                     num_new_tokens,
                     num_new_local_computed_tokens,
                     num_external_computed_tokens,
+                    num_uncached_common_prefix_tokens,
                 )
                 if num_new_tokens == 0:
                     break
 
-            # Handles an edge case when P/D Disaggregation
-            # is used with Spec Decoding where an
-            # extra block gets allocated which
-            # creates a mismatch between the number
-            # of local and remote blocks.
+            # Async KV load has no forward pass. Allocate speculative
+            # lookahead later to keep local/remote block counts aligned.
+            limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
             effective_lookahead_tokens = (
-                0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                0 if limit_lookahead_tokens else self.num_lookahead_tokens
             )
 
             # Determine if we need to allocate cross-attention blocks.
@@ -272,6 +358,13 @@ class HcuScheduler(_upstream.Scheduler):
                     for i in encoder_inputs_to_schedule
                 )
 
+            reserved_blocks = 0
+            if load_kv_async:
+                # Async loads hold non-preemptible blocks until the transfer
+                # completes; reserve space already owned by other inflight
+                # prefills before admitting this one.
+                reserved_blocks = self._inflight_prefill_reserved_blocks()
+
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -282,6 +375,8 @@ class HcuScheduler(_upstream.Scheduler):
                 delay_cache_blocks=load_kv_async,
                 num_encoder_tokens=num_encoder_tokens,
                 full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                reserved_blocks=reserved_blocks,
+                has_scheduled_reqs=bool(self.running),
             )
 
             if new_blocks is None:
@@ -333,6 +428,7 @@ class HcuScheduler(_upstream.Scheduler):
                 # _update_waiting_for_remote_kv will then cache
                 # only the successfully loaded tokens.
                 request.num_computed_tokens = num_computed_tokens
+                self._inflight_prefills.add(request)
                 continue
 
             self.running.append(request)
@@ -356,9 +452,14 @@ class HcuScheduler(_upstream.Scheduler):
             token_budget -= num_new_tokens
             request.status = RequestStatus.RUNNING
             request.num_computed_tokens = num_computed_tokens
-            # Count the number of prefix cached tokens.
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = num_computed_tokens
+            if pad_spec_decode:
+                scheduled_spec_decode_tokens[request_id] = [
+                    -1
+                ] * self.num_spec_tokens
+            # Track only requests that remain in their prefill after this
+            # chunk. v0.25 uses this set to account for reserved blocks.
+            if num_computed_tokens + num_new_tokens < request.num_tokens:
+                self._inflight_prefills.add(request)
             # Encoder-related.
             if encoder_inputs_to_schedule:
                 scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -378,6 +479,11 @@ class HcuScheduler(_upstream.Scheduler):
         # re-queue requests skipped in this pass ahead of older skipped items.
         if step_skipped_waiting:
             self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+        # DP prefill balancing: after a release step, remember whether the
+        # waiting queue was capacity-bound.
+        if self._pause_state == PauseState.UNPAUSED and not defer_prefills:
+            self.prefill_capacity_bound = bool(self.waiting)
 
         # next, schedule the RUNNING requests.
         if not scheduled_new_reqs and not scheduled_resumed_reqs:
@@ -401,6 +507,18 @@ class HcuScheduler(_upstream.Scheduler):
                     req_index += 1
                     continue
 
+                if self.current_step < request.next_decode_eligible_step:
+                    # V2+PP+async: preserve the worker-side sampled-token
+                    # broadcast ring cadence.
+                    req_index += 1
+                    continue
+
+                if defer_prefills and request.is_prefill_chunk:
+                    # Decode work may proceed, but in-progress prefill chunks
+                    # wait for a cadence-aligned step.
+                    req_index += 1
+                    continue
+
                 num_new_tokens = (
                     request.num_tokens_with_spec
                     + request.num_output_placeholders
@@ -413,7 +531,10 @@ class HcuScheduler(_upstream.Scheduler):
                 # Make sure the input position does not exceed the max model len.
                 # This is necessary when using spec decoding.
                 num_new_tokens = min(
-                    num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                    num_new_tokens,
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step,
                 )
 
                 # Schedule encoder inputs.
@@ -511,6 +632,7 @@ class HcuScheduler(_upstream.Scheduler):
 
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
+                prefill_scheduled |= request.is_prefill_chunk
                 request_id = request.request_id
                 req_to_new_blocks[request_id] = new_blocks
                 num_scheduled_tokens[request_id] = num_new_tokens
@@ -550,17 +672,6 @@ class HcuScheduler(_upstream.Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-            # Record the LoRAs in scheduled_running_reqs
-            scheduled_loras: set[int] = set()
-            if self.lora_config:
-                scheduled_loras = set(
-                    req.lora_request.lora_int_id
-                    for req in scheduled_running_reqs
-                    if req.lora_request and req.lora_request.lora_int_id > 0
-                )
-                assert len(scheduled_loras) <= self.lora_config.max_loras
-
-
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -586,8 +697,8 @@ class HcuScheduler(_upstream.Scheduler):
 
         # Construct the scheduler output.
         if self.use_v2_model_runner:
-            scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
-            scheduled_resumed_reqs = []
+            scheduled_new_reqs.extend(scheduled_resumed_reqs)
+            scheduled_resumed_reqs.clear()
             new_reqs_data = [
                 NewRequestData.from_request(
                     req,
@@ -613,15 +724,23 @@ class HcuScheduler(_upstream.Scheduler):
                 req_to_new_blocks,
             )
 
-        # Record the request ids that were scheduled in this step.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        # Record the request ids scheduled in this step for MRV1 only.
+        if not self.use_v2_model_runner:
+            self.prev_step_scheduled_req_ids.clear()
+            self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         new_block_ids_to_zero = (
             (self.kv_cache_manager.take_new_block_ids() or None)
             if self.needs_kv_cache_zeroing
             else None
         )
+
+        # Dynamic speculative decoding: choose K for this batch width.
+        num_spec_tokens_to_schedule = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                len(num_scheduled_tokens)
+            ]
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -631,7 +750,7 @@ class HcuScheduler(_upstream.Scheduler):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
+            preempted_req_ids=self.reset_preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -639,6 +758,7 @@ class HcuScheduler(_upstream.Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -646,9 +766,7 @@ class HcuScheduler(_upstream.Scheduler):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
-            meta: KVConnectorMetadata = self.connector.build_connector_meta(
-                scheduler_output
-            )
+            meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
         # Build the connector meta for ECConnector
@@ -658,19 +776,24 @@ class HcuScheduler(_upstream.Scheduler):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        # Advance the deferred-free fence only for non-empty steps. Their
+        # output is processed later in ``update_from_output``.
+        if self.defer_block_free and total_num_scheduled_tokens > 0:
+            self.sched_step_seq += 1
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    def schedule(self):
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not henvs.VLLM_HCU_USE_PD_SPLIT:
-            return super().schedule()
+            return super().schedule(throttle_prefills=throttle_prefills)
         if not henvs.VLLM_HCU_USE_CUSTOM_OPS:
             raise RuntimeError(
                 "VLLM_HCU_USE_PD_SPLIT requires VLLM_HCU_USE_CUSTOM_OPS; "
                 "refusing to silently use the default scheduler"
             )
-        return self.schedule_split_pd()
+        return self.schedule_split_pd(throttle_prefills=throttle_prefills)
 
 
 __all__ = ["HcuScheduler"]

@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -16,7 +16,6 @@ from vllm_hcu.patch.platform.core_fix import (
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
-    patch_model_arch_config_convertor,
 )
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.runtime_state import (
@@ -332,77 +331,6 @@ def test_tool_parser_preserves_unsuffixed_behavior():
     parser = _FakeToolParser(_Tokenizer(vocabulary))
     assert parser.suffix == ""
     assert parser.tool_calls_start_token == "<tool_calls>"
-
-
-class _FakeConvertor:
-    def __init__(self, hf_config, hf_text_config):
-        self.hf_config = hf_config
-        self.hf_text_config = hf_text_config
-
-    def is_deepseek_mla(self):
-        return True
-
-    def get_head_size(self):
-        return self.hf_text_config.kv_lora_rank + self.hf_text_config.qk_rope_head_dim
-
-
-def test_model_arch_recovers_corrupt_rope_dim_from_raw_config(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    logger = logging.getLogger("test.hcu.model_arch")
-    module = _module(
-        patch_model_arch_config_convertor.TARGET_MODULE,
-        ModelArchConfigConvertorBase=_FakeConvertor,
-        logger=logger,
-    )
-    raw_requests: list[tuple[str, str]] = []
-    repo_utils = _module(
-        "vllm.transformers_utils.repo_utils",
-        get_hf_file_to_dict=lambda filename, model_path: (
-            raw_requests.append((filename, model_path)) or {"qk_rope_head_dim": 64}
-        ),
-    )
-    monkeypatch.setitem(sys.modules, repo_utils.__name__, repo_utils)
-
-    patch_model_arch_config_convertor.apply(module)
-    text_config = SimpleNamespace(
-        qk_rope_head_dim=128,
-        qk_nope_head_dim=128,
-        kv_lora_rank=512,
-    )
-    convertor = _FakeConvertor(
-        SimpleNamespace(name_or_path="/models/deepseek"), text_config
-    )
-    assert convertor.get_head_size() == 576
-    assert text_config.qk_rope_head_dim == 64
-    assert raw_requests == [("config.json", "/models/deepseek")]
-
-
-def test_model_arch_does_not_read_raw_config_when_values_are_not_corrupt(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    module = _module(
-        patch_model_arch_config_convertor.TARGET_MODULE,
-        ModelArchConfigConvertorBase=_FakeConvertor,
-        logger=logging.getLogger("test.hcu.model_arch.clean"),
-    )
-    repo_utils = _module(
-        "vllm.transformers_utils.repo_utils",
-        get_hf_file_to_dict=lambda filename, model_path: pytest.fail(
-            "raw config should not be read"
-        ),
-    )
-    monkeypatch.setitem(sys.modules, repo_utils.__name__, repo_utils)
-    patch_model_arch_config_convertor.apply(module)
-
-    text_config = SimpleNamespace(
-        qk_rope_head_dim=64,
-        qk_nope_head_dim=128,
-        kv_lora_rank=512,
-    )
-    convertor = _FakeConvertor(SimpleNamespace(name_or_path="unused"), text_config)
-    assert convertor.get_head_size() == 576
-    assert text_config.qk_rope_head_dim == 64
 
 
 def test_apply_rejects_wrong_callback_module():

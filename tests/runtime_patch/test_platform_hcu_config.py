@@ -18,6 +18,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -34,17 +35,35 @@ from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 
 
 REPO = Path(__file__).resolve().parents[2]
-CLEAN_VLLM = Path(
-    os.environ.get("VLLM_V021_SOURCE_ROOT", REPO.parent / "vllm_dcu_v0.21")
+TARGET_VLLM_ROOT = Path(
+    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO.parent / "vllm_025")
+).resolve()
+if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"VLLM_V025_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+    )
+
+_TARGET_SOURCE_ASSERTION = r'''
+import os as _vllm_hcu_os
+from pathlib import Path as _VllmHcuPath
+import vllm as _vllm_hcu_target
+_vllm_hcu_root = _VllmHcuPath(
+    _vllm_hcu_os.environ["VLLM_V025_SOURCE_ROOT"]
+).resolve()
+_vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
+assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
+    f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
+'''
 
 
-def _run_fresh_v021(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_v025(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(CLEAN_VLLM)))
+    env["VLLM_V025_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
         capture_output=True,
         text=True,
@@ -479,8 +498,8 @@ def test_request_cudagraph_buckets_and_feature_off_equivalence(
     assert explicit.compilation_config.post_init_calls == 1
 
 
-def test_real_v021_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
-    result = _run_fresh_v021(
+def test_real_v025_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
+    result = _run_fresh_v025(
         "import json; from types import SimpleNamespace; "
         "import vllm.config.compilation as compilation_module; "
         "import vllm.config.vllm as vllm_module; "
@@ -507,7 +526,9 @@ def test_real_v021_set_cudagraph_binds_custom_sp_before_first_adjustment() -> No
         "enable_custom_sp=True).to_dict()}; enabled._set_cudagraph_sizes(); "
         "initial_enabled=list(enabled.compilation_config.cudagraph_capture_sizes); "
         "enabled_mode=enabled.compilation_config."
-        "resolve_cudagraph_mode_and_sizes(AttentionCGSupport.ALWAYS,None,2,4); "
+        "resolve_cudagraph_mode_and_sizes(AttentionCGSupport.ALWAYS,None,"
+        "uniform_decode_query_len=2,use_v2_model_runner=False,"
+        "tensor_parallel_size=4); "
         "disabled=make(False); "
         "disabled.model_config=SimpleNamespace(enforce_eager=False); "
         "disabled.compilation_config=CompilationConfig(cudagraph_mode="
@@ -522,7 +543,9 @@ def test_real_v021_set_cudagraph_binds_custom_sp_before_first_adjustment() -> No
         "disabled._set_cudagraph_sizes(); "
         "initial_disabled=list(disabled.compilation_config.cudagraph_capture_sizes); "
         "disabled_mode=disabled.compilation_config."
-        "resolve_cudagraph_mode_and_sizes(AttentionCGSupport.ALWAYS,None,2,4); "
+        "resolve_cudagraph_mode_and_sizes(AttentionCGSupport.ALWAYS,None,"
+        "uniform_decode_query_len=2,use_v2_model_runner=False,"
+        "tensor_parallel_size=4); "
         "print(json.dumps({'initial_enabled':initial_enabled,"
         "'initial_disabled':initial_disabled,'enabled':enabled."
         "compilation_config.cudagraph_capture_sizes,'disabled':disabled."
@@ -645,6 +668,63 @@ def test_slimquant_registry_rejects_provider_conflict() -> None:
     module._CUSTOMIZED_METHOD_TO_QUANT_CONFIG["slimquant_w4a8"] = object
     with pytest.raises(PatchCompatibilityError, match="already registered"):
         patch_slimquant_registry.apply_to_module(module)
+
+
+def test_slimquant_marlin_inherits_v025_compressed_tensors_constructor() -> None:
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors.compressed_tensors_marlin import (
+        SlimQuantCompressedTensorsMarlinConfig,
+    )
+
+    assert inspect.signature(
+        SlimQuantCompressedTensorsMarlinConfig.__init__
+    ) == inspect.signature(CompressedTensorsConfig.__init__)
+    config = SlimQuantCompressedTensorsMarlinConfig.from_config(
+        {
+            "config_groups": {},
+            "format": "int-quantized",
+            "ignore": [],
+            "kv_cache_scheme": None,
+            "quant_method": "compressed-tensors",
+        }
+    )
+    assert config.target_scheme_map == {}
+    assert config.ignore == []
+    assert config.quant_format == "int-quantized"
+
+    # v0.25's FusedMoE public symbol is a factory and may be wrapped by HCU;
+    # quantization dispatch must use the target-owned RoutedExperts type.
+    source = Path(
+        "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
+        "compressed_tensors_marlin.py"
+    ).read_text(encoding="utf-8-sig")
+    assert "isinstance(layer, RoutedExperts)" in source
+    assert "isinstance(layer, FusedMoE)" not in source
+    assert config.get_quant_method(torch.nn.Embedding(4, 4), "embed") is None
+
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+        CompressedTensorsW8A8FP8MarlinMoEMethod,
+        CompressedTensorsW8A8Int8MarlinMoEMethod,
+    )
+
+    target_prefix = (
+        "self",
+        "layer",
+        "x",
+        "topk_weights",
+        "topk_ids",
+        "shared_experts",
+        "shared_experts_input",
+    )
+    for method in (
+        CompressedTensorsW8A8FP8MarlinMoEMethod.apply,
+        CompressedTensorsW8A8Int8MarlinMoEMethod.apply,
+    ):
+        parameters = tuple(inspect.signature(method).parameters)
+        assert parameters[: len(target_prefix)] == target_prefix
+        assert parameters[len(target_prefix) :] == ("i_q", "i_s")
 
 
 class _HashableConfig:

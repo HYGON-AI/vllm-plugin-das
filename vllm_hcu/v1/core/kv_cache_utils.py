@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU hybrid-KV page-size unification for vLLM v0.21."""
+"""vLLM v0.25 target hybrid-KV page sizing plus HCU unification policy."""
 
 from __future__ import annotations
 

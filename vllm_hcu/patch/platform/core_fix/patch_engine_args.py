@@ -255,7 +255,7 @@ def _wrap_constructor(owner: type) -> None:
 
 
 def apply_to_module(module: ModuleType) -> bool:
-    """Install constructor/config wrappers on the exact v0.21 module."""
+    """Install constructor/config wrappers on the exact audited target module."""
 
     arg_utils = load_exact_module(TARGET_MODULE, module)
     if getattr(arg_utils, _MARKER, False):
@@ -362,7 +362,7 @@ def arm_partial_import_bridge(
     platform discovery recursively installs HCU from that import, the normal
     exact post-import callback correctly remains armed, but there may be no
     later plugin boundary before a caller constructs ``EngineArgs``.  For this
-    one exact v0.21 module, temporarily wrap its already-imported ``dataclass``
+    one exact audited target module, temporarily wrap its already-imported ``dataclass``
     global.  The wrapper applies the public patch transaction after
     ``AsyncEngineArgs`` has been decorated (so both generated constructors
     exist) and before the import statement publishes the completed module.
