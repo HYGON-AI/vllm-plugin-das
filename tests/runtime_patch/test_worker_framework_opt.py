@@ -65,6 +65,57 @@ def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
         assert not any(fragment in source for fragment in forbidden)
 
 
+def test_hcu_runner_uses_v025_routed_experts_contract():
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
+        encoding="utf-8-sig"
+    )
+    removed_v021_api = (
+        "extract_routed_experts_for_current_batch",
+        "free_routing_buffers",
+        "get_global_experts_capturer",
+        "init_routed_experts_capturer_with_shared_cache",
+        "issue_routing_d2h_copy",
+        "routed_experts_dict=",
+    )
+    assert not any(name in source for name in removed_v021_api)
+    required_v025_api = (
+        "RoutedExpertsCapturer",
+        "RoutedExpertsLists",
+        "RoutedExpertsTensors",
+        "self.routed_experts_capturer.clear_buffer()",
+        "self.routed_experts_slot_mapping_device",
+        "routed_experts=routed_experts_snapshot",
+    )
+    assert all(name in source for name in required_v025_api)
+
+
+def test_hcu_runner_uses_v025_input_batch_constructor_contract():
+    import ast
+
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "InputBatch"
+    ]
+    assert len(calls) == 2
+    for call in calls:
+        assert "pin_memory" not in {keyword.arg for keyword in call.keywords}
+
+
+def test_hcu_runner_uses_v025_uniform_kv_cache_contract():
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "self.use_uniform_kv_cache(self.attn_groups)" in source
+    assert "self.use_uniform_kv_cache(self.attn_groups, cache_dtype)" not in source
+
+
 def _fake_all2all_module() -> ModuleType:
     class DeepEPAll2AllManagerBase:
         def __init__(self, cpu_group, tcp_store_group=None):
@@ -341,6 +392,7 @@ def _fake_forward_context_module() -> ModuleType:
         slot_mapping=None,
         additional_kwargs=None,
         skip_compiled=False,
+        is_padding=None,
     ):
         return ForwardContext(attn_metadata)
 
@@ -355,6 +407,7 @@ def _fake_forward_context_module() -> ModuleType:
         ubatch_slices=None,
         slot_mapping=None,
         skip_compiled=False,
+        is_padding=None,
     ):
         yield "official"
 
@@ -461,6 +514,7 @@ def _fake_proposer_module() -> ModuleType:
 
         def propose(
             self,
+            num_speculative_tokens,
             target_token_ids,
             target_positions,
             target_hidden_states,
@@ -533,7 +587,7 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert proposer._determine_batch_execution_and_padding(5) == (8, True)
 
     off = module.SpecDecodeBaseProposer(_proposer_config(), "cpu", True)
-    assert off.propose(None, None, None, None, None, None, None) == "official"
+    assert off.propose(1, None, None, None, None, None, None, None) == "official"
 
     prepared, _, _ = off.prepare_inputs_padded(None, None, None)
     assert prepared.num_kv_actual_tokens == prepared.num_actual_tokens == 7
@@ -635,6 +689,7 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     result = proposer_runtime.propose(
         module,
         proposer,
+        1,
         torch.arange(5),
         torch.arange(5),
         torch.ones(5, 2),
@@ -675,6 +730,7 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     result = proposer_runtime.propose(
         module,
         proposer,
+        2,
         torch.arange(5),
         torch.arange(5),
         torch.ones(5, 2),
@@ -836,7 +892,14 @@ def test_ubatch_list_splits_use_python_ints_and_preserve_attention_metadata():
 
 def test_clean_vllm_modules_import_apply_and_second_apply_is_idempotent():
     script = r'''
+import os
+from pathlib import Path
 import vllm
+target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+target_file = Path(vllm.__file__).resolve()
+assert target_file.is_relative_to(target_root), (
+    f"vllm resolved outside target root: {target_file} not under {target_root}"
+)
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
@@ -868,16 +931,16 @@ print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
     # Apply adapters explicitly so this subprocess is independent of ambient
     # plugin discovery settings.
     env["VLLM_PLUGINS"] = "__disabled__"
-    clean_vllm = Path(
-        env.get(
-            "VLLM_V021_SOURCE_ROOT",
-            str(Path.cwd().parent / "vllm_dcu_v0.21"),
+    repository = Path(__file__).resolve().parents[2]
+    target_vllm = Path(
+        env.get("VLLM_V025_SOURCE_ROOT", repository.parent / "vllm_025")
+    ).resolve()
+    if not (target_vllm / "vllm" / "__init__.py").is_file():
+        raise RuntimeError(
+            f"VLLM_V025_SOURCE_ROOT does not contain vllm: {target_vllm}"
         )
-    )
-    python_paths = [str(Path.cwd())]
-    if (clean_vllm / "vllm").is_dir():
-        python_paths.insert(0, str(clean_vllm))
-    env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    env["VLLM_V025_SOURCE_ROOT"] = str(target_vllm)
+    env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(repository)))
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env,
@@ -888,5 +951,4 @@ print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "REAL_WORKER_FRAMEWORK_OK" in result.stdout
-    if (clean_vllm / "vllm").is_dir():
-        assert f"VLLM_SOURCE {clean_vllm / 'vllm' / '__init__.py'}" in result.stdout
+    assert f"VLLM_SOURCE {target_vllm / 'vllm' / '__init__.py'}" in result.stdout

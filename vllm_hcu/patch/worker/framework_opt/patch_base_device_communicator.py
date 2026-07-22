@@ -45,7 +45,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     if "all_to_all_single" in vars(communicator):
         raise PatchCompatibilityError(
-            f"audited v0.21 target {TARGETS[0]} unexpectedly already exists"
+            f"audited target vLLM API {TARGETS[0]} unexpectedly already exists"
         )
     original_init = require_callable(communicator, "__init__", TARGETS[1])
     require_exact_signature(

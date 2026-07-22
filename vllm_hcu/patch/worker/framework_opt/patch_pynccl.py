@@ -46,7 +46,9 @@ def apply_to_module(module: ModuleType, *, required: bool = False) -> bool:
     if previous_probe is not None:
         return _unavailable(pynccl, str(previous_probe), required)
     if "all_to_all_single" in vars(communicator):
-        raise PatchCompatibilityError(f"audited v0.21 target {TARGETS[0]} unexpectedly exists")
+        raise PatchCompatibilityError(
+            f"audited target vLLM API {TARGETS[0]} unexpectedly exists"
+        )
     reduce_scatter = require_callable(
         communicator, "reduce_scatter", f"{TARGET_MODULE}.PyNcclCommunicator.reduce_scatter"
     )

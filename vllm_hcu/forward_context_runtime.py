@@ -37,13 +37,14 @@ def set_forward_context(
     ubatch_slices: object | None = None,
     slot_mapping: object | None = None,
     skip_compiled: bool = False,
+    is_padding: object | None = None,
     *,
     scatter_indexes_tensor: object | None = None,
     gather_indexes_tensor: object | None = None,
     enable_lightly_cp: bool = False,
     enable_lightly_cplb: bool = False,
 ):
-    """Mirror v0.21's context manager while skipping invalid DeepEP-LL DP sync."""
+    """Mirror v0.25's context manager while skipping invalid DeepEP-LL DP sync."""
 
     if cudagraph_runtime_mode is None:
         cudagraph_runtime_mode = module.CUDAGraphMode.NONE
@@ -56,11 +57,17 @@ def set_forward_context(
     low_latency = parallel_config.all2all_backend == "deepep_low_latency"
     if (
         not low_latency
-        and parallel_config.data_parallel_size > 1
+        and (
+            parallel_config.data_parallel_size > 1
+            or parallel_config.use_sequence_parallel_moe
+        )
         and parallel_config.is_moe_model is not False
         and (attn_metadata is not None or num_tokens is not None)
     ):
-        if num_tokens_across_dp is None:
+        if (
+            num_tokens_across_dp is None
+            and parallel_config.data_parallel_size > 1
+        ):
             assert ubatch_slices is None
             assert num_tokens is not None
             _, num_tokens_across_dp, _ = module.coordinate_batch_across_dp(
@@ -69,6 +76,11 @@ def set_forward_context(
                 allow_microbatching=False,
             )
             assert num_tokens_across_dp is not None
+        elif num_tokens_across_dp is None:
+            assert num_tokens is not None
+            num_tokens_across_dp = module.torch.tensor(
+                [num_tokens], dtype=module.torch.int32
+            )
         dp_metadata = module.DPMetadata.make(
             parallel_config, num_tokens or 0, num_tokens_across_dp
         )
@@ -102,6 +114,7 @@ def set_forward_context(
         slot_mapping,
         additional_kwargs,
         skip_compiled,
+        is_padding,
         scatter_indexes_tensor=scatter_indexes_tensor,
         gather_indexes_tensor=gather_indexes_tensor,
         enable_lightly_cp=enable_lightly_cp,
@@ -109,13 +122,7 @@ def set_forward_context(
     )
 
     try:
-        with (
-            module.override_forward_context(forward_context),
-            vllm_config.kernel_config.ir_op_priority.set_priority(),
-            module.vllm.ir.enable_torch_wrap(
-                vllm_config.compilation_config.ir_enable_torch_wrap
-            ),
-        ):
+        with module.override_forward_context(forward_context):
             yield
     finally:
         if need_to_track_batchsize:

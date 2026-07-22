@@ -82,12 +82,16 @@ def apply_to_module(module: ModuleType, *, required: bool = False) -> bool:
         positional=("self", "sendbuff", "count", "datatype", "dest", "comm", "stream"),
     )
     if "ncclAllToAll" in vars(library_class):
-        raise PatchCompatibilityError(f"audited v0.21 target {TARGETS[0]} unexpectedly exists")
+        raise PatchCompatibilityError(
+            f"audited target vLLM API {TARGETS[0]} unexpectedly exists"
+        )
     exported = getattr(library_class, "exported_functions", None)
     if not isinstance(exported, list):
         raise PatchCompatibilityError(f"required HCU patch target {TARGETS[1]} is missing")
     if any(getattr(function, "name", None) == "ncclAllToAll" for function in exported):
-        raise PatchCompatibilityError(f"audited v0.21 target {TARGETS[1]} unexpectedly exists")
+        raise PatchCompatibilityError(
+            f"audited target vLLM API {TARGETS[1]} unexpectedly exists"
+        )
 
     # Extending exported_functions after a path has been cached would leave an
     # NCCLLibrary instance whose _funcs dictionary cannot contain the symbol.

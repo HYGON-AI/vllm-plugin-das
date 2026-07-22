@@ -74,7 +74,7 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     if "all_to_all_single" in vars(communicator):
         raise PatchCompatibilityError(
-            "clean vLLM v0.21 unexpectedly contains the stale CUDA all-to-all "
+            "clean audited target vLLM unexpectedly contains the stale CUDA all-to-all "
             "method that the retired legacy source patch attempted to remove"
         )
     setattr(cuda, _MARKER, True)

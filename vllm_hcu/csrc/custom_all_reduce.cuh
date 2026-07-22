@@ -475,7 +475,7 @@ class CustomAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
-  uint32_t** dev_curr_hdp_reg;
+  uint32_t** dev_curr_hdp_reg = nullptr;
   hipEvent_t stopEvent;
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
@@ -815,7 +815,9 @@ class CustomAllreduce {
     for (auto [_, ptr] : ipc_handles_) {
       CUDACHECK(cudaIpcCloseMemHandle(ptr));
     }
-    CUDACHECK(cudaFree(dev_curr_hdp_reg));
+    if (dev_curr_hdp_reg != nullptr) {
+      CUDACHECK(cudaFree(dev_curr_hdp_reg));
+    }
     CUDACHECK(cudaEventDestroy(stopEvent));
   }
 };

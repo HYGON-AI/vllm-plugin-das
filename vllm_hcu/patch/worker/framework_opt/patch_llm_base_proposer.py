@@ -59,7 +59,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     if "_pad_for_sequence_parallelism" in vars(proposer_class):
         raise PatchCompatibilityError(
-            f"audited v0.21 target {TARGETS[4]} unexpectedly already exists"
+            f"audited target vLLM API {TARGETS[4]} unexpectedly already exists"
         )
 
     original_init = require_callable(proposer_class, "__init__", TARGETS[0])
@@ -81,6 +81,7 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[1],
         positional=(
             "self",
+            "num_speculative_tokens",
             "target_token_ids",
             "target_positions",
             "target_hidden_states",
@@ -156,6 +157,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_propose)
     def hcu_propose(
         self,
+        num_speculative_tokens,
         target_token_ids,
         target_positions,
         target_hidden_states,
@@ -171,6 +173,7 @@ def apply_to_module(module: ModuleType) -> bool:
         if config is None or not config.enable_lightly_cp:
             return original_propose(
                 self,
+                num_speculative_tokens,
                 target_token_ids,
                 target_positions,
                 target_hidden_states,
@@ -185,6 +188,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return proposer_runtime.propose(
             proposer_module,
             self,
+            num_speculative_tokens,
             target_token_ids,
             target_positions,
             target_hidden_states,

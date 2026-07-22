@@ -42,7 +42,7 @@ def apply_to_module(module: ModuleType) -> bool:
         context_class
     ):
         raise PatchCompatibilityError(
-            f"required target {TARGETS[1]} is not the extensible v0.21 dataclass"
+            f"required target {TARGETS[1]} is not the extensible v0.25 dataclass"
         )
     original_create = require_callable(forward, "create_forward_context", TARGETS[2])
     create_positional = (
@@ -55,6 +55,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "slot_mapping",
         "additional_kwargs",
         "skip_compiled",
+        "is_padding",
     )
     create_defaults = {
         "dp_metadata": None,
@@ -64,6 +65,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "slot_mapping": None,
         "additional_kwargs": None,
         "skip_compiled": False,
+        "is_padding": None,
     }
     require_exact_signature(
         original_create,
@@ -82,6 +84,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "ubatch_slices",
         "slot_mapping",
         "skip_compiled",
+        "is_padding",
     )
     set_defaults = {
         "num_tokens": None,
@@ -91,6 +94,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "ubatch_slices": None,
         "slot_mapping": None,
         "skip_compiled": False,
+        "is_padding": None,
     }
     require_exact_signature(
         original_set,
@@ -112,6 +116,7 @@ def apply_to_module(module: ModuleType) -> bool:
         slot_mapping=None,
         additional_kwargs=None,
         skip_compiled=False,
+        is_padding=None,
         *,
         scatter_indexes_tensor=None,
         gather_indexes_tensor=None,
@@ -128,6 +133,7 @@ def apply_to_module(module: ModuleType) -> bool:
             slot_mapping,
             additional_kwargs,
             skip_compiled,
+            is_padding,
         )
         return forward_context_runtime.attach_hcu_context_fields(
             context,
@@ -148,6 +154,7 @@ def apply_to_module(module: ModuleType) -> bool:
         ubatch_slices=None,
         slot_mapping=None,
         skip_compiled=False,
+        is_padding=None,
         *,
         scatter_indexes_tensor=None,
         gather_indexes_tensor=None,
@@ -174,6 +181,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 ubatch_slices,
                 slot_mapping,
                 skip_compiled,
+                is_padding,
             )
         return forward_context_runtime.set_forward_context(
             forward,
@@ -186,6 +194,7 @@ def apply_to_module(module: ModuleType) -> bool:
             ubatch_slices,
             slot_mapping,
             skip_compiled,
+            is_padding,
             scatter_indexes_tensor=scatter_indexes_tensor,
             gather_indexes_tensor=gather_indexes_tensor,
             enable_lightly_cp=enable_lightly_cp,

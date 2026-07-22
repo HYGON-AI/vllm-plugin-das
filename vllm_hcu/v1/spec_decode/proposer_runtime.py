@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lightly-CP and multi-layer-MTP behavior for the v0.21 base proposer."""
+"""Lightly-CP and multi-layer-MTP behavior for the v0.25 base proposer."""
 
 from __future__ import annotations
 
@@ -79,6 +79,7 @@ def _lightly_cp_active(proposer: object, num_tokens: int) -> bool:
 def propose(
     module: object,
     proposer: object,
+    num_speculative_tokens: int,
     target_token_ids: object,
     target_positions: object,
     target_hidden_states: object,
@@ -90,9 +91,11 @@ def propose(
     num_rejected_tokens_gpu: object | None = None,
     slot_mappings: object | None = None,
 ):
-    """v0.21 proposer algorithm with the Lightly-CP chain kept atomic."""
+    """v0.25 proposer algorithm with the Lightly-CP chain kept atomic."""
 
     torch = module.torch
+    proposer.num_speculative_tokens = num_speculative_tokens
+    proposer._last_draft_probs = None
     batch_size = common_attn_metadata.batch_size()
 
     if proposer.method in ("eagle3", "dflash"):

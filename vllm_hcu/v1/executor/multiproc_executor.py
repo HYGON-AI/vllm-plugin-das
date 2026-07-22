@@ -65,10 +65,11 @@ if hasattr(os, "register_at_fork"):
 class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
     """Size the scheduler-output MQ for all concurrently in-flight PP batches.
 
-    vLLM v0.21 creates the queue inside a monolithic ``_init_executor``.  The
-    subclass supplies a constructor proxy only while that parent initializer
-    runs and restores the module binding in ``finally``.  This keeps the
-    official lifecycle, worker startup, and failure cleanup intact.
+    vLLM v0.25 owns batch concurrency on ``VllmConfig`` and creates the queue
+    inside a monolithic ``_init_executor``.  The subclass supplies a constructor
+    proxy only while that parent initializer runs and restores the module binding
+    in ``finally``.  This keeps the official lifecycle, worker startup, and
+    failure cleanup intact.
     """
 
     _mq_constructor_lock = threading.RLock()
@@ -76,7 +77,7 @@ class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
     def _init_executor(self) -> None:
         global _FORK_ORIGINAL_MESSAGE_QUEUE, _FORK_PROXY_MESSAGE_QUEUE
         original_message_queue = _upstream.MessageQueue
-        max_chunks = max(10, 4 * self.max_concurrent_batches)
+        max_chunks = max(10, 4 * self.vllm_config.max_concurrent_batches)
         hcu_message_queue = _MessageQueueConstructorProxy(
             original_message_queue, max_chunks
         )

@@ -70,6 +70,13 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        # Native/IPC ownership must be inert before any early return or
+        # fallible allocation.  ``__del__`` can run for a partially-created
+        # object when communicator construction fails.
+        self._ptr = 0
+        self.meta_ptrs: list[int] = []
+        self.buffer_ptrs: list[int] = []
+        self.rank = -1
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -186,7 +193,6 @@ class CustomAllreduce:
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.max_size = max_size
-        self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
         self._ptr = torch.ops.hcu_ops.init_custom_ar(
@@ -281,12 +287,35 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def close(self):
-        if not self.disabled and self._ptr:
-            if torch.ops.hcu_ops is not None:
-                torch.ops.hcu_ops.dispose(self._ptr)
+        native_ptr = getattr(self, "_ptr", 0)
+        meta_ptrs = getattr(self, "meta_ptrs", [])
+        buffer_ptrs = getattr(self, "buffer_ptrs", [])
+        rank = getattr(self, "rank", -1)
+        if not native_ptr and not meta_ptrs and not buffer_ptrs:
+            self.disabled = True
+            return
+
+        # Module globals may already be cleared when ``__del__`` runs during
+        # interpreter finalization.  Normal worker teardown drops the
+        # communicator while torch is alive and therefore still performs all
+        # native releases; at finalization there is no safe Python operator
+        # surface left to call.
+        torch_module = globals().get("torch")
+        torch_ops = getattr(torch_module, "ops", None)
+        hcu_ops = getattr(torch_ops, "hcu_ops", None)
+        if hcu_ops is None:
+            return
+
+        if native_ptr:
+            hcu_ops.dispose(native_ptr)
             self._ptr = 0
-            self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
-            self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+        if rank >= 0 and meta_ptrs:
+            hcu_ops.free_shared_buffer(meta_ptrs[rank])
+            self.meta_ptrs = []
+        if rank >= 0 and buffer_ptrs:
+            hcu_ops.free_shared_buffer(buffer_ptrs[rank])
+            self.buffer_ptrs = []
+        self.disabled = True
 
     def __del__(self):
         self.close()
