@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import functools
+from math import prod
 from types import ModuleType
+
+import torch
 
 from ._common import (
     PatchCompatibilityError,
@@ -61,18 +64,68 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         if x_and_scale_quanted is None:
             return original(self, layer, x, bias)
+        if not supports_quanted_inputs(self):
+            raise RuntimeError(
+                "prequantized FP8 inputs require the reviewed Channel-FP8 "
+                "target Triton route"
+            )
         if not isinstance(x_and_scale_quanted, tuple) or len(x_and_scale_quanted) != 2:
             raise ValueError("x_and_scale_quanted must be a (tensor, scale) tuple")
 
         x_2d_q, x_scale = x_and_scale_quanted
-        if getattr(x_2d_q, "ndim", None) != 2:
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("prequantized scaled-mm reference input must be a tensor")
+        if not isinstance(x_2d_q, torch.Tensor) or not isinstance(
+            x_scale, torch.Tensor
+        ):
+            raise TypeError("prequantized scaled-mm data and scale must be tensors")
+        if x.ndim < 2 or x_2d_q.ndim != 2:
             raise ValueError("prequantized scaled-mm activation must be a 2D tensor")
-        if x_2d_q.shape[0] != x.numel() // x.shape[-1]:
-            raise ValueError(
-                "prequantized scaled-mm activation token count does not match input"
-            )
 
         weight, weight_scale, _, _ = self._get_layer_params(layer)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            raise ValueError("prequantized scaled-mm weight must be a 2D tensor")
+        num_tokens = prod(x.shape[:-1])
+        if tuple(x_2d_q.shape) != (num_tokens, weight.shape[0]):
+            raise ValueError(
+                "prequantized scaled-mm activation shape does not match input "
+                "tokens and weight K"
+            )
+        if (
+            x_2d_q.dtype != weight.dtype
+            or x_2d_q.device != weight.device
+            or x.device != weight.device
+        ):
+            raise ValueError(
+                "prequantized scaled-mm input and weight must share dtype/device"
+            )
+        # Comparing the scale shape with ``num_tokens`` while tracing creates a
+        # SymBool.  vLLM's piecewise splitter can then thread the relation into
+        # a standalone subgraph as a ``sympy.Equality`` input, which this Torch
+        # Inductor does not support.  Preserve the friendly eager error here;
+        # the target-Triton custom-op implementation repeats this contract with
+        # concrete runtime dimensions before launching the backend.
+        if not torch.compiler.is_compiling():
+            if tuple(x_scale.shape) not in (
+                (),
+                (1,),
+                (num_tokens,),
+                (1, 1),
+                (num_tokens, 1),
+            ):
+                raise ValueError(
+                    "prequantized scaled-mm scale must be scalar or per-token"
+                )
+        if (
+            x_scale.device != weight.device
+            or not x_scale.is_floating_point()
+            or not isinstance(weight_scale, torch.Tensor)
+            or weight_scale.device != weight.device
+        ):
+            raise ValueError(
+                "prequantized scaled-mm scales must be floating tensors on "
+                "the weight device"
+            )
         output_shape = [*x.shape[:-1], weight.shape[1]]
         out_dtype = x.dtype if self.config.out_dtype is None else self.config.out_dtype
         return self.apply_scaled_mm(
@@ -86,7 +139,12 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
     def supports_quanted_inputs(self) -> bool:
-        return True
+        kernel_class = type(self)
+        return bool(
+            getattr(kernel_class, "_hcu_fp8_patch_applied", False)
+            and getattr(kernel_class, "_hcu_fp8_backend", None)
+            == "target-triton"
+        )
 
     setattr(hcu_apply_weights, _WRAPPER_MARKER, True)
     setattr(kernel_class, "_vllm_hcu_original_apply_weights", original)

@@ -40,9 +40,9 @@ def apply_to_module(module: ModuleType) -> bool:
     require_exact_signature(
         original,
         TARGETS[0],
-        positional=("self", "swiglu_limit"),
+        positional=("self", "swiglu_limit", "alpha", "beta"),
         keyword_only=("compile_native",),
-        defaults={"compile_native": True},
+        defaults={"alpha": 1.0, "beta": 0.0, "compile_native": True},
     )
     if len(op_class.__mro__) < 2:
         raise PatchCompatibilityError(
@@ -66,9 +66,18 @@ def apply_to_module(module: ModuleType) -> bool:
     )
 
     @functools.wraps(original)
-    def hcu_init(self, swiglu_limit: float, *, compile_native: bool = True):
+    def hcu_init(
+        self,
+        swiglu_limit: float,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        *,
+        compile_native: bool = True,
+    ):
         base_init(self, enforce_enable=True, compile_native=compile_native)
         self.swiglu_limit = float(swiglu_limit)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
         platform = activation.current_platform
         if platform.is_rocm() or platform.is_cuda_alike() or platform.is_xpu():
             try:

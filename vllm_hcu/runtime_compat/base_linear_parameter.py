@@ -6,7 +6,7 @@ arm a cold module exchange.  Replacing that module late would split the
 parameter class family: the parent package would retain official class
 objects while later imports observed HCU copies.  This adapter therefore
 keeps the official module and class identities and changes only the six
-audited v0.21 loader methods.
+audited target vLLM loader methods.
 """
 
 from __future__ import annotations

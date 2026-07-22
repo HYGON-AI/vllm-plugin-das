@@ -26,6 +26,9 @@ class _GateUp:
     def __call__(self, value, x_and_scale_quanted=None):
         return self.gate_up, None
 
+    def _forward_with_hcu_quanted(self, value, x_and_scale_quanted):
+        return self(value, x_and_scale_quanted=x_and_scale_quanted)
+
 
 class _FusedAct:
     def __init__(self, xq: torch.Tensor, xs: torch.Tensor) -> None:
@@ -52,6 +55,9 @@ class _Down:
     def __call__(self, value, x_and_scale_quanted=None):
         self.calls.append((value, x_and_scale_quanted))
         return self.output, None
+
+    def _forward_with_hcu_quanted(self, value, x_and_scale_quanted):
+        return self(value, x_and_scale_quanted=x_and_scale_quanted)
 
 
 def _load_forward(relative_path: str, class_name: str, mode: str):

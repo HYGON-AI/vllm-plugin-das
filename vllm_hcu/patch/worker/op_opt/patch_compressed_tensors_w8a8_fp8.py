@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU channelwise FP8 layout and prequantized-input adapter."""
+"""Preserve target Channel-FP8 layout and bridge prequantized inputs."""
 
 from __future__ import annotations
 
@@ -27,18 +27,6 @@ TARGETS = (
 )
 _CLASS_MARKER = "_vllm_hcu_w8a8_fp8_applied"
 _WRAPPER_MARKER = "_vllm_hcu_w8a8_fp8_wrapper"
-
-
-def _custom_quantization_enabled() -> bool:
-    try:
-        from vllm_hcu.platforms import envs as henvs
-
-        return bool(henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM)
-    except (AttributeError, ImportError) as exc:
-        raise PatchCompatibilityError(
-            "required HCU flag VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM is unavailable"
-        ) from exc
-
 
 def apply_to_module(module: ModuleType) -> bool:
     fp8_module = load_exact_module(TARGET_MODULE, module)
@@ -76,24 +64,32 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer) -> None:
-        custom_channel = (
-            _custom_quantization_enabled()
-            and self.strategy == fp8_module.QuantizationStrategy.CHANNEL
-        )
-        if custom_channel:
+        channel_strategy = self.strategy == fp8_module.QuantizationStrategy.CHANNEL
+        if channel_strategy:
             kernel_class = type(getattr(self, "fp8_linear", None))
-            if not getattr(kernel_class, "_hcu_fp8_patch_applied", False):
+            if (
+                not getattr(kernel_class, "_hcu_fp8_patch_applied", False)
+                or getattr(kernel_class, "_hcu_fp8_backend", None)
+                != "target-triton"
+            ):
                 raise RuntimeError(
-                    "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM is enabled for "
-                    "channelwise FP8, but the HCU channelwise scaled-mm kernel "
-                    "adapter is not active"
+                    "channelwise FP8 requires the reviewed target Triton "
+                    "scaled-mm adapter before weight processing"
                 )
 
         original_process(self, layer)
-        if custom_channel:
-            # Upstream stores B as [K, N] for torch._scaled_mm.  The HCU
-            # hipBLASLt adapter consumes a contiguous [N, K] weight.
-            layer.weight.data = layer.weight.data.t().contiguous()
+        if channel_strategy:
+            weight = getattr(layer, "weight", None)
+            if (
+                getattr(weight, "ndim", None) != 2
+                or weight.stride() != (1, weight.shape[0])
+                or getattr(weight, "input_dim", None) != 0
+                or getattr(weight, "output_dim", None) != 1
+            ):
+                raise RuntimeError(
+                    "vLLM v0.25 Channel-FP8 post-load weight did not retain "
+                    "the reviewed [K,N] column-major layout"
+                )
 
     @functools.wraps(original_apply)
     def hcu_apply_weights(
@@ -107,18 +103,26 @@ def apply_to_module(module: ModuleType) -> bool:
             return original_apply(self, layer, x, bias)
         if not isinstance(x_and_scale_quanted, tuple) or len(x_and_scale_quanted) != 2:
             raise ValueError("x_and_scale_quanted must be a (tensor, scale) tuple")
-        supports = getattr(self.fp8_linear, "supports_quanted_inputs", None)
-        if callable(supports) and bool(supports()):
-            return self.fp8_linear.apply_weights(
-                layer,
-                x,
-                bias,
-                x_and_scale_quanted=x_and_scale_quanted,
+        if not supports_quanted_inputs(self):
+            raise RuntimeError(
+                "prequantized FP8 inputs are only supported by the reviewed "
+                "Channel-FP8 target Triton route"
             )
-        return original_apply(self, layer, x, bias)
+        return self.fp8_linear.apply_weights(
+            layer,
+            x,
+            bias,
+            x_and_scale_quanted=x_and_scale_quanted,
+        )
 
     def supports_quanted_inputs(self) -> bool:
-        return True
+        kernel_class = type(getattr(self, "fp8_linear", None))
+        return bool(
+            self.strategy == fp8_module.QuantizationStrategy.CHANNEL
+            and getattr(kernel_class, "_hcu_fp8_patch_applied", False)
+            and getattr(kernel_class, "_hcu_fp8_backend", None)
+            == "target-triton"
+        )
 
     for function in (hcu_process_weights_after_loading, hcu_apply_weights):
         setattr(function, _WRAPPER_MARKER, True)

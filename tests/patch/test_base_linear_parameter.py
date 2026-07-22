@@ -28,9 +28,13 @@ from vllm_hcu.runtime_compat.base_linear_parameter import (
 TARGET = "vllm.model_executor.parameter"
 REMOVED_HCU_TARGET = "vllm_hcu.model_executor.parameter"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CLEAN_VLLM = Path(
-    os.environ.get("VLLM_V021_SOURCE_ROOT", REPO_ROOT.parent / "vllm_dcu_v0.21")
-)
+TARGET_VLLM_ROOT = Path(
+    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO_ROOT.parent / "vllm_025")
+).resolve()
+if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"VLLM_V025_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+    )
 
 
 def _fake_parameter_module() -> ModuleType:
@@ -351,9 +355,12 @@ def test_invalid_loaded_target_is_failed_once_and_never_retried(
         )
 
 
-def _clean_v021_environment(cache_root: Path) -> dict[str, str]:
+def _clean_v025_environment(cache_root: Path) -> dict[str, str]:
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join((str(REPO_ROOT), str(CLEAN_VLLM)))
+    env["VLLM_V025_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(TARGET_VLLM_ROOT), str(REPO_ROOT))
+    )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["VLLM_CACHE_ROOT"] = str(cache_root)
     env["VLLM_PLUGINS"] = "hcu,hcu_model,hcu_ops"
@@ -365,10 +372,19 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
 ):
     def inspection_probe() -> dict[str, object]:
         import importlib
+        import os
         import sys
+        from pathlib import Path
 
+        import vllm
         import vllm.model_executor as model_executor
         from vllm_hcu.patch import patch_report
+
+        target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+        target_file = Path(vllm.__file__).resolve()
+        assert target_file.is_relative_to(target_root), (
+            f"vllm resolved outside target root: {target_file} not under {target_root}"
+        )
 
         parameter = importlib.import_module("vllm.model_executor.parameter")
         linear = importlib.import_module("vllm.model_executor.layers.linear")
@@ -411,7 +427,7 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
 
     output_path = tmp_path / "registry-output.pkl"
     payload = cloudpickle.dumps((inspection_probe, str(output_path)))
-    env = _clean_v021_environment(tmp_path / "cache")
+    env = _clean_v025_environment(tmp_path / "cache")
     result = subprocess.run(
         [sys.executable, "-m", "vllm.model_executor.models.registry"],
         input=payload,
@@ -449,16 +465,25 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
 def test_qwen35_real_inspect_cache_miss_uses_official_registry_command(
     tmp_path: Path,
 ):
-    env = _clean_v021_environment(tmp_path / "cache")
+    env = _clean_v025_environment(tmp_path / "cache")
     code = r'''
 import importlib
 import json
+import os
 import sys
+from pathlib import Path
 
+import vllm
 registry = importlib.import_module("vllm.model_executor.models.registry")
 from vllm.plugins import load_general_plugins
 load_general_plugins()
 load_general_plugins()
+
+target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+target_file = Path(vllm.__file__).resolve()
+assert target_file.is_relative_to(target_root), (
+    f"vllm resolved outside target root: {target_file} not under {target_root}"
+)
 
 registered = registry.ModelRegistry.models["Qwen3_5ForConditionalGeneration"]
 model_info = registered.inspect_model_cls()

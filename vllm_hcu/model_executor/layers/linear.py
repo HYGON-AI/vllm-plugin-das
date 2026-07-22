@@ -4,12 +4,14 @@
 import os
 import itertools
 from abc import abstractmethod
+from collections.abc import Iterable
 
 from typing import Any
 import vllm_hcu.platforms.envs as henvs 
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
+from typing_extensions import TypeIs
 
 import vllm.envs as envs
 from vllm.distributed import (
@@ -426,10 +428,10 @@ class ReplicatedLinear(LinearBase):
         )
         param.data.copy_(loaded_weight)
 
-    def forward(
+    def _forward_with_hcu_quanted(
         self,
         x: torch.Tensor,
-        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
@@ -444,6 +446,11 @@ class ReplicatedLinear(LinearBase):
             return output
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        return self._forward_with_hcu_quanted(x, None)
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -628,10 +635,10 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
         param.load_column_parallel_weight(loaded_weight=loaded_weight, is_quantization=self.is_quantization)
 
-    def forward(
+    def _forward_with_hcu_quanted(
         self,
         input_,
-        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
@@ -653,6 +660,9 @@ class ColumnParallelLinear(LinearBase):
             return output
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def forward(self, input_) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        return self._forward_with_hcu_quanted(input_, None)
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -722,31 +732,31 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         )
         self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
 
-    def validate_shard_id(self, loaded_shard_id: int | tuple[int, ...] | None):
-        if loaded_shard_id is None:
-            return
-        if isinstance(loaded_shard_id, tuple):
-            for idx in loaded_shard_id:
+    def validate_shard_id(self, shard_id: Any) -> TypeIs[int | tuple[int, ...] | None]:
+        if isinstance(shard_id, int):
+            if shard_id < 0 or shard_id >= len(self.output_sizes):
+                raise ValueError(
+                    f"Shard id should be between 0 and {len(self.output_sizes) - 1}. "
+                    f"Got shard id {shard_id}."
+                )
+            return True
+        if shard_id is None:
+            return True
+        if isinstance(shard_id, tuple):
+            for idx in shard_id:
                 if not (0 <= idx < len(self.output_sizes)):
                     raise ValueError(
                         f"Shard id index {idx} should be between 0 and "
-                        f"{len(self.output_sizes) - 1}. Got shard id {loaded_shard_id}."
+                        f"{len(self.output_sizes) - 1}. Got shard id {shard_id}."
                     )
-            if len(loaded_shard_id) > 1 and any(
-                b - a != 1 for a, b in zip(loaded_shard_id[:-1], loaded_shard_id[1:])
+            if len(shard_id) > 1 and any(
+                b - a != 1 for a, b in zip(shard_id[:-1], shard_id[1:])
             ):
                 raise ValueError(
                     "Shard id with multiple indices should be consecutive. "
-                    f"Got shard id {loaded_shard_id}."
+                    f"Got shard id {shard_id}."
                 )
-            return
-        elif isinstance(loaded_shard_id, int):
-            if loaded_shard_id < 0 or loaded_shard_id >= len(self.output_sizes):
-                raise ValueError(
-                    f"Shard id should be between 0 and {len(self.output_sizes) - 1}. "
-                    f"Got shard id {loaded_shard_id}."
-                )
-            return
+            return True
         raise ValueError("This line should not be reached")
 
     def weight_loader(
@@ -1038,6 +1048,31 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             is_quantization=self.is_quantization,
         )
 
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """Preserve v0.25 stacked-weight shard metadata during autoload."""
+
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, self)
+            else:
+                param = getattr(self, name, self)
+            if param is None and name == "bias":
+                continue
+            param.weight_loader(param, loaded_weight, shard_id)
+            logger.debug(
+                "Loaded shard %s with shape %s into %s.%s",
+                shard_id,
+                loaded_weight.shape,
+                self.prefix,
+                name,
+            )
+            yield name
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
@@ -1125,17 +1160,13 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
         self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
 
-    def validate_shard_id(self, loaded_shard_id: str | None):
-        if loaded_shard_id is None:
-            return
-        if isinstance(loaded_shard_id, str):
-            if loaded_shard_id not in ["q", "k", "v"]:
-                raise ValueError(
-                    "Shard id for QKVParallelLinear should be 'q', 'k', or 'v', "
-                    f"got shard id {loaded_shard_id}."
-                )
-            return
-        raise ValueError("This line should not be reached")
+    def validate_shard_id(self, shard_id: Any) -> TypeIs[str | None]:
+        if shard_id in {"q", "k", "v"} or shard_id is None:
+            return True
+        raise ValueError(
+            "Shard id for QKVParallelLinear should be 'q', 'k', or 'v', "
+            f"got shard id {shard_id}."
+        )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
@@ -1461,6 +1492,189 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """Preserve v0.25 stacked-weight shard metadata during autoload."""
+
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, self)
+            else:
+                param = getattr(self, name, self)
+            if param is None and name == "bias":
+                continue
+            param.weight_loader(param, loaded_weight, shard_id)
+            logger.debug(
+                "Loaded shard %s with shape %s into %s.%s",
+                shard_id,
+                loaded_weight.shape,
+                self.prefix,
+                name,
+            )
+            yield name
+
+
+class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+    """v0.25 five-way QKV/indexer projection with HCU linear primitives.
+
+    The class is owned by vLLM's MiniMax-M3 model contract.  Keep its v0.25
+    sharding and loading semantics intact while inheriting this replacement
+    module's DCU-aware column-parallel implementation.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        assert total_num_index_heads == total_num_kv_heads, (
+            "MinimaxM3QKVParallelLinearWithIndexer requires "
+            "total_num_index_heads == total_num_kv_heads"
+        )
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.v_head_size = head_size
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        self.total_num_index_heads = total_num_index_heads
+        self.index_head_size = index_head_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        self.num_index_heads = self.num_kv_heads
+
+        q = self.num_heads * self.head_size
+        kv = self.num_kv_heads * self.head_size
+        iq = self.num_index_heads * self.index_head_size
+        ik = self.index_head_size
+        self.output_sizes = [
+            q * tp_size,
+            kv * tp_size,
+            kv * tp_size,
+            iq * tp_size,
+            ik * tp_size,
+        ]
+
+        ColumnParallelLinear.__init__(
+            self,
+            input_size=self.hidden_size,
+            output_size=sum(self.output_sizes),
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def validate_shard_id(self, shard_id: Any) -> TypeIs[str | None]:
+        if shard_id in {"q", "k", "v", "index_q", "index_k"} or shard_id is None:
+            return True
+        raise ValueError(
+            "Shard id for MinimaxM3QKVParallelLinearWithIndexer must be one of "
+            "'q', 'k', 'v', 'index_q', 'index_k'; got "
+            f"{shard_id}."
+        )
+
+    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
+        h = self.head_size
+        nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
+        return {
+            "q": 0,
+            "k": nq * h,
+            "v": (nq + nkv) * h,
+            "index_q": (nq + 2 * nkv) * h,
+            "index_k": (nq + 2 * nkv + nidx) * h,
+        }.get(loaded_shard_id)
+
+    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
+        h = self.head_size
+        return {
+            "q": self.num_heads * h,
+            "k": self.num_kv_heads * h,
+            "v": self.num_kv_heads * h,
+            "index_q": self.num_index_heads * h,
+            "index_k": self.index_head_size,
+        }.get(loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("q", "k", "v", "index_q", "index_k")
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        num_heads = (
+            self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
+        )
+        param.load_qkv_weight(
+            loaded_weight=loaded_weight,
+            num_heads=num_heads,
+            shard_id=loaded_shard_id,
+            shard_offset=shard_offset,
+            shard_size=shard_size,
+            tp_rank=self.tp_rank,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("q", "k", "v", "index_q", "index_k")
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim is not None
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+        if loaded_shard_id == "q":
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "index_k":
+            shard_rank = 0
+        else:
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
+        loaded_weight = loaded_weight.narrow(
+            output_dim, shard_rank * shard_size, shard_size
+        )
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
 
 # --8<-- [start:row_parallel_linear]
 @PluggableLayer.register("row_parallel_linear")
@@ -1618,10 +1832,10 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight, is_quantization=self.is_quantization)
 
-    def forward(
+    def _forward_with_hcu_quanted(
         self,
         input_,
-        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
             input_parallel = input_
@@ -1652,6 +1866,9 @@ class RowParallelLinear(LinearBase):
             return output
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def forward(self, input_) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        return self._forward_with_hcu_quanted(input_, None)
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size_per_partition}"
