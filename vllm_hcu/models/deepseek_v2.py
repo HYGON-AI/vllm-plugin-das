@@ -263,9 +263,11 @@ class DeepseekV2MLP(nn.Module):
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
         
         if self.enable_fuse_silu_mul_quant:
-            gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
+            gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
+                x, x_and_scale_quanted
+            )
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj._forward_with_hcu_quanted(xq, (xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
@@ -327,9 +329,11 @@ class DeepseekV2SharedMLP(nn.Module):
 
     def forward(self, x, x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None):
         if self.enable_fuse_silu_mul_quant:
-            gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
+            gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
+                x, x_and_scale_quanted
+            )
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj._forward_with_hcu_quanted(xq, (xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)

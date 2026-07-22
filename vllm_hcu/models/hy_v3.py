@@ -159,9 +159,11 @@ class HYV3FeedForward(nn.Module):
         )
 
         if self.enable_fuse_silu_mul_quant and self.quant_dtype is not None:
-            gate_up, _ = self.gate_up_proj(x, x_and_scale_quanted=x_and_scale_quanted)
+            gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
+                x, x_and_scale_quanted
+            )
             xq, xs = self.act_fn(gate_up, quant_dtype=self.quant_dtype)
-            x, _ = self.down_proj(xq, x_and_scale_quanted=(xq, xs))
+            x, _ = self.down_proj._forward_with_hcu_quanted(xq, (xq, xs))
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
@@ -400,7 +402,9 @@ class HYV3Attention(nn.Module):
         hidden_states: torch.Tensor,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states, x_and_scale_quanted=x_and_scale_quanted)
+        qkv, _ = self.qkv_proj._forward_with_hcu_quanted(
+            hidden_states, x_and_scale_quanted
+        )
 
         if self.enable_fused_qkv_split_rms_rope_kvstore and self.use_qk_norm:
             if self.runtime_sp:

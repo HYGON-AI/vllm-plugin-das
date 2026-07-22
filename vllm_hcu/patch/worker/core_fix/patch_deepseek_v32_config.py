@@ -10,7 +10,7 @@ DSA selection belongs to the HCU model implementation.  The behavior guarded
 by :func:`is_hcu_dsa_enabled` is already used by
 ``vllm_hcu.models.deepseek_v2.DeepseekV2MLAAttention`` and
 ``vllm_hcu.models.deepseek_mtp.DeepSeekMultiTokenPredictorLayer``.  This module
-only checks that the official verifier API is still the audited v0.21 shape;
+only checks that the official verifier API is still the audited target shape;
 it never replaces that method.
 """
 
