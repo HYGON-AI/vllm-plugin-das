@@ -23,7 +23,7 @@ TARGETS = (
     f"{TARGET_MODULE}.SharedExperts._launch_in_aux_stream",
     f"{TARGET_MODULE}.SharedExperts._run_in_aux_stream",
     f"{TARGET_MODULE}.SharedExperts.output",
-    f"{TARGET_MODULE}.SharedExperts.apply",
+    f"{TARGET_MODULE}.SharedExperts.forward",
 )
 _MARKER = "_vllm_hcu_shared_experts_replacement_validated"
 
@@ -36,7 +36,12 @@ def apply_to_module(module: ModuleType) -> bool:
     expected = {
         "maybe_sync_shared_experts_stream": ("self", "shared_experts_input", "x_and_scale_quanted"),
         "_run_in_aux_stream": ("self", "shared_experts_input", "x_and_scale_quanted"),
-        "apply": ("self", "shared_experts_input", "order", "x_and_scale_quanted"),
+        "forward": (
+            "self",
+            "shared_experts_input",
+            "order",
+            "x_and_scale_quanted",
+        ),
     }
     for name, names in expected.items():
         function = getattr(cls, name, None)

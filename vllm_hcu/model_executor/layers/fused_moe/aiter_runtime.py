@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable
+from importlib import import_module
 from typing import Any
 
 import torch
@@ -18,6 +19,258 @@ import torch
 
 class HcuAiterRuntimeError(RuntimeError):
     """An explicitly requested HCU AITER path cannot be provided."""
+
+
+def _import_optional_aiter_module(module_name: str) -> object | None:
+    """Import one optional AITER capability without hiding ABI failures.
+
+    A missing requested module (or one of its package parents) means that the
+    optional capability is unavailable.  Missing transitive dependencies and
+    other errors raised while executing an existing module are not capability
+    misses and must remain visible.
+    """
+
+    try:
+        return import_module(module_name)
+    except ModuleNotFoundError as exc:
+        missing_name = exc.name
+        if isinstance(missing_name, str) and (
+            missing_name == module_name
+            or module_name.startswith(f"{missing_name}.")
+        ):
+            return None
+        raise
+
+
+def get_w8a8_tuned_config_path(
+    runtime_symbol: str,
+    config_attribute: str,
+) -> str | None:
+    """Return a usable target-style AITER W8A8 tuning-config path.
+
+    AITER linear kernels are optional candidates.  Some locked HCU AITER
+    builds import successfully but expose neither the target runtime callable
+    nor the target ``AITER_CONFIGS`` contract.  Treat those expected capability
+    gaps as an unavailable candidate so vLLM's native selector can continue;
+    propagate other import/runtime failures instead of hiding an ABI fault.
+    """
+
+    aiter = _import_optional_aiter_module("aiter")
+    if aiter is None or not callable(getattr(aiter, runtime_symbol, None)):
+        return None
+    gemm_ops = _import_optional_aiter_module("aiter.ops.gemm_op_a8w8")
+    if gemm_ops is None:
+        return None
+    configs = getattr(gemm_ops, "AITER_CONFIGS", None)
+    path = getattr(configs, config_attribute, None)
+    return path if isinstance(path, str) and path else None
+
+
+_AITER_TRITON_FP8_BMM_MODULE = (
+    "aiter.ops.triton."
+    "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant"
+)
+_AITER_TRITON_FP8_BMM_SYMBOL = (
+    "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant"
+)
+
+
+def has_triton_fp8_bmm() -> bool:
+    """Whether the locked AITER build exposes vLLM's optional MLA FP8 BMM."""
+
+    module = _import_optional_aiter_module(_AITER_TRITON_FP8_BMM_MODULE)
+    return module is not None and callable(
+        getattr(module, _AITER_TRITON_FP8_BMM_SYMBOL, None)
+    )
+
+
+def is_triton_fp8_bmm_enabled(
+    aiter_enabled: bool,
+    feature_enabled: bool,
+) -> bool:
+    """Apply environment gates before probing the optional AITER module."""
+
+    return bool(
+        aiter_enabled
+        and feature_enabled
+        and has_triton_fp8_bmm()
+    )
+
+
+_AITER_RMSNORM_DYNAMIC_QUANT_ARGUMENTS = {
+    "rmsnorm2d_fwd_with_dynamicquant": (
+        "out",
+        "input",
+        "yscale",
+        "weight",
+        "epsilon",
+    ),
+    "rmsnorm2d_fwd_with_add_dynamicquant": (
+        "out",
+        "input",
+        "residual_in",
+        "residual_out",
+        "yscale",
+        "weight",
+        "epsilon",
+    ),
+}
+_AITER_MODEL_SENSITIVE_RMSNORM_ARGUMENT = "use_model_sensitive_rmsnorm"
+_VLLM_NATIVE_RMSNORM_DYNAMIC_QUANT_ARGUMENTS = (
+    "result",
+    "input",
+    "weight",
+    "scale",
+    "epsilon",
+    "scale_ub",
+    "residual",
+)
+
+
+def _schema_argument_names(schema: object, owner: str) -> tuple[str, ...]:
+    arguments = getattr(schema, "arguments", None)
+    if not isinstance(arguments, (list, tuple)) or not arguments:
+        raise HcuAiterRuntimeError(f"{owner} has no readable operator schema")
+    names = tuple(getattr(argument, "name", None) for argument in arguments)
+    if any(not isinstance(name, str) or not name for name in names):
+        raise HcuAiterRuntimeError(
+            f"{owner} exposes an operator schema with unnamed arguments"
+        )
+    return names  # type: ignore[return-value]
+
+
+def _aiter_rmsnorm_dynamic_quant_abi(op_name: str) -> str:
+    """Return the exact supported ABI profile for one AITER RMSNorm op."""
+
+    expected = _AITER_RMSNORM_DYNAMIC_QUANT_ARGUMENTS.get(op_name)
+    if expected is None:
+        raise HcuAiterRuntimeError(
+            f"unsupported HCU AITER RMSNorm operator {op_name!r}"
+        )
+    packet = getattr(getattr(torch.ops, "aiter", None), op_name, None)
+    overload = getattr(packet, "default", None)
+    schema = getattr(overload, "_schema", None)
+    names = _schema_argument_names(schema, f"aiter::{op_name}")
+    if names == expected:
+        return "legacy-default"
+    if names == expected + (_AITER_MODEL_SENSITIVE_RMSNORM_ARGUMENT,):
+        return "model-sensitive"
+    raise HcuAiterRuntimeError(
+        f"aiter::{op_name} exposes unsupported arguments {names!r}; "
+        f"expected {expected!r} with or without the trailing "
+        f"{_AITER_MODEL_SENSITIVE_RMSNORM_ARGUMENT!r}"
+    )
+
+
+def _vllm_native_rmsnorm_dynamic_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+    residual: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Use vLLM v0.25's native fused op when legacy AITER lacks FP8."""
+
+    import_module("vllm._C_stable_libtorch")
+    packet = getattr(
+        getattr(torch.ops, "_C", None),
+        "rms_norm_dynamic_per_token_quant",
+        None,
+    )
+    operation = getattr(packet, "default", None)
+    schema = getattr(operation, "_schema", None)
+    names = _schema_argument_names(
+        schema, "_C::rms_norm_dynamic_per_token_quant"
+    )
+    if names != _VLLM_NATIVE_RMSNORM_DYNAMIC_QUANT_ARGUMENTS:
+        raise HcuAiterRuntimeError(
+            "vLLM native RMSNorm dynamic-quant fallback exposes unsupported "
+            f"arguments {names!r}"
+        )
+    if not callable(operation):
+        raise HcuAiterRuntimeError(
+            "vLLM native RMSNorm dynamic-quant fallback is not callable"
+        )
+
+    scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    output = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    residual_out = residual.clone() if residual is not None else None
+    operation(output, x, weight, scale, epsilon, None, residual_out)
+    return output, scale, residual_out
+
+
+def rmsnorm_dynamic_quant_impl(
+    aiter_operation: Callable[..., None],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Call the target AITER ABI, with a native FP8 legacy fallback."""
+
+    op_name = "rmsnorm2d_fwd_with_dynamicquant"
+    abi = _aiter_rmsnorm_dynamic_quant_abi(op_name)
+    if abi == "legacy-default" and quant_dtype != torch.int8:
+        output, scale, _ = _vllm_native_rmsnorm_dynamic_quant(
+            x, weight, epsilon, quant_dtype
+        )
+        return output, scale
+
+    scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    output = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    arguments = (output, x, scale, weight, epsilon)
+    if abi == "model-sensitive":
+        aiter_operation(
+            *arguments,
+            use_model_sensitive_rmsnorm=0,
+        )
+    else:
+        aiter_operation(*arguments)
+    return output, scale
+
+
+def rmsnorm_add_dynamic_quant_impl(
+    aiter_operation: Callable[..., None],
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Call the fused-add target ABI without mutating either caller input."""
+
+    op_name = "rmsnorm2d_fwd_with_add_dynamicquant"
+    abi = _aiter_rmsnorm_dynamic_quant_abi(op_name)
+    if abi == "legacy-default" and quant_dtype != torch.int8:
+        output, scale, residual_out = _vllm_native_rmsnorm_dynamic_quant(
+            x, weight, epsilon, quant_dtype, residual
+        )
+        if residual_out is None:  # pragma: no cover - internal invariant
+            raise HcuAiterRuntimeError(
+                "vLLM native fused-add RMSNorm fallback lost residual output"
+            )
+        return output, residual_out, scale
+
+    scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    output = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    residual_out = torch.empty_like(x)
+    arguments = (
+        output,
+        x,
+        residual,
+        residual_out,
+        scale,
+        weight,
+        epsilon,
+    )
+    if abi == "model-sensitive":
+        aiter_operation(
+            *arguments,
+            use_model_sensitive_rmsnorm=0,
+        )
+    else:
+        aiter_operation(*arguments)
+    return output, residual_out, scale
 
 
 def is_aiter_found_and_supported(
@@ -122,8 +375,11 @@ def fused_moe_impl(
     output_dtype: torch.dtype | None = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
+    gate_mode: str = "",
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """Select HCU's W16A16 ASM path, otherwise preserve upstream exactly."""
 
@@ -159,8 +415,11 @@ def fused_moe_impl(
                 output_dtype,
                 hidden_pad,
                 intermediate_pad,
+                gate_mode,
                 bias1,
                 bias2,
+                moe_sorting_dispatch_policy,
+                swiglu_limit,
             )
         # ActivationType in older HCU AITER builds has no numeric GELU-tanh
         # member, while fused_moe accepts its stable string spelling.
@@ -171,6 +430,27 @@ def fused_moe_impl(
                 "HCU AITER GELU-tanh MoE was selected, but "
                 "aiter.fused_moe.fused_moe is unavailable"
             ) from exc
+        parameters = inspect.signature(fused_moe).parameters
+        optional_arguments = {
+            "num_local_tokens": (num_local_tokens, None),
+            "dtype": (output_dtype, None),
+            "hidden_pad": (hidden_pad, 0),
+            "intermediate_pad": (intermediate_pad, 0),
+            "gate_mode": (gate_mode, ""),
+            "bias1": (bias1, None),
+            "bias2": (bias2, None),
+            "moe_sorting_dispatch_policy": (moe_sorting_dispatch_policy, 0),
+            "swiglu_limit": (swiglu_limit, 0.0),
+        }
+        supported_arguments: dict[str, object] = {}
+        for name, (value, default) in optional_arguments.items():
+            if name in parameters:
+                supported_arguments[name] = value
+            elif value != default:
+                raise HcuAiterRuntimeError(
+                    "the installed proprietary AITER fused_moe ABI does not "
+                    f"support non-default {name}={value!r}"
+                )
         return fused_moe(
             hidden_states,
             w1,
@@ -185,12 +465,7 @@ def fused_moe_impl(
             w2_scale,
             a1_scale,
             a2_scale,
-            num_local_tokens=num_local_tokens,
-            dtype=output_dtype,
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
-            bias1=bias1,
-            bias2=bias2,
+            **supported_arguments,
         )
 
     try:
@@ -214,6 +489,20 @@ def fused_moe_impl(
         "expert_map": expert_mask,
         "use_shuffle": use_shuffle,
     }
+    if gate_mode:
+        raise HcuAiterRuntimeError(
+            "HCU W16A16 ASM MoE cannot represent vLLM v0.25 "
+            f"gate_mode={gate_mode!r}"
+        )
+    if moe_sorting_dispatch_policy:
+        raise HcuAiterRuntimeError(
+            "HCU W16A16 ASM MoE cannot represent vLLM v0.25 "
+            "moe_sorting_dispatch_policy="
+            f"{moe_sorting_dispatch_policy}"
+        )
+    if swiglu_limit:
+        # The proprietary HCU ASM ABI names vLLM's SwiGLU limit gemm1_limit.
+        kwargs["gemm1_limit"] = swiglu_limit
     if bool(henvs.VLLM_HCU_USE_AITER_MOE_CONFIG):
         kwargs["solution_id"] = get_w16a16_moe_solution_id(
             M=int(hidden_states.shape[0]),
@@ -311,5 +600,7 @@ __all__ = [
     "get_gelu_tanh_activation_type",
     "get_w16a16_moe_solution_id",
     "is_aiter_found_and_supported",
+    "rmsnorm_add_dynamic_quant_impl",
+    "rmsnorm_dynamic_quant_impl",
     "topk_softmax_impl",
 ]

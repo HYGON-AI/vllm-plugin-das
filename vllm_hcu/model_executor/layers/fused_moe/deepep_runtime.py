@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU DeepEP prepare/finalize implementations for vLLM v0.21.
+"""vLLM v0.25 target DeepEP prepare/finalize behavior plus HCU deltas.
 
 The adapters install these functions only after the corresponding DeepEP
 module has loaded.  Keeping all vLLM/DeepEP references behind the ``module``

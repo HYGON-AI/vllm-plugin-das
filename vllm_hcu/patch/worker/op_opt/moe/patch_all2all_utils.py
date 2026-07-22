@@ -28,7 +28,14 @@ def apply_to_module(module: ModuleType) -> bool:
     require_parameter_names(
         original,
         TARGETS[0],
-        ("moe", "quant_config", "routing_tables", "allow_new_interface", "use_monolithic"),
+        (
+            "moe",
+            "quant_config",
+            "routing_tables",
+            "allow_new_interface",
+            "use_monolithic",
+            "eep_stage",
+        ),
     )
 
     @functools.wraps(original)
@@ -38,6 +45,7 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
+        eep_stage=False,
     ):
         prepare_finalize = original(
             moe,
@@ -45,6 +53,7 @@ def apply_to_module(module: ModuleType) -> bool:
             routing_tables,
             allow_new_interface,
             use_monolithic,
+            eep_stage,
         )
         ll_class = getattr(target, "DeepEPLLPrepareAndFinalize", None)
         if ll_class is None or not isinstance(prepare_finalize, ll_class):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU AITER/DPSK adapter for compressed-tensors FP8-W8A8 MoE."""
+"""Guard target-owned compressed-tensors Channel-FP8 MoE routing."""
 
 from __future__ import annotations
 
@@ -22,29 +22,62 @@ TARGET_MODULE = (
 PATCH_ID = "worker.op_opt.compressed_tensors.moe_w8a8_fp8"
 TARGETS = (
     f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod.__init__",
-    f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod."
-    "process_weights_after_loading",
-    f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod.apply",
-    f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod."
-    "_get_aiter_moe_runtime_config",
-    f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod."
-    "_get_aiter_weights_for_solution",
 )
 _CLASS_MARKER = "_vllm_hcu_moe_w8a8_fp8_applied"
 _WRAPPER_MARKER = "_vllm_hcu_moe_w8a8_fp8_wrapper"
+_REQUIRED_BACKEND = "triton"
+_REQUIRED_SELECTED_BACKEND = "TRITON"
 
 
-def _aiter_requested() -> bool:
+def _aiter_moe_state() -> tuple[bool, bool]:
     try:
+        import vllm.envs as target_envs
         from vllm_hcu.platforms import envs as henvs
 
-        return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
-            henvs.VLLM_HCU_USE_AITER_W8A8_FP8_MOE
+        return (
+            bool(target_envs.VLLM_ROCM_USE_AITER_MOE),
+            bool(henvs.VLLM_HCU_USE_AITER_W8A8_FP8_MOE),
         )
     except (AttributeError, ImportError) as exc:
         raise PatchCompatibilityError(
-            "required HCU AITER FP8-W8A8 MoE flags are unavailable"
+            "required target/HCU FP8-MoE routing flags are unavailable"
         ) from exc
+
+
+def _selected_backend_name(method) -> str | None:
+    backend = getattr(method, "fp8_backend", None)
+    value = getattr(backend, "value", backend)
+    return value if isinstance(value, str) else None
+
+
+def _is_channel_token_route(fp8_moe_module, weight_quant, input_quant) -> bool:
+    strategy = getattr(fp8_moe_module, "QuantizationStrategy", None)
+    try:
+        return bool(
+            weight_quant.strategy == strategy.CHANNEL
+            and input_quant.strategy == strategy.TOKEN
+        )
+    except AttributeError as exc:
+        raise PatchCompatibilityError(
+            "vLLM compressed-tensors FP8 MoE quantization strategy contract "
+            "is unavailable"
+        ) from exc
+
+
+def _require_target_triton_policy(moe) -> None:
+    target_aiter, hcu_aiter = _aiter_moe_state()
+    if target_aiter or hcu_aiter:
+        raise RuntimeError(
+            "Channel-FP8 MoE requires VLLM_ROCM_USE_AITER_MOE=0 and "
+            "VLLM_HCU_USE_AITER_W8A8_FP8_MOE=0 before model construction"
+        )
+
+    requested_backend = getattr(moe, "moe_backend", None)
+    if requested_backend != _REQUIRED_BACKEND:
+        raise RuntimeError(
+            "Channel-FP8 MoE requires the explicit vLLM v0.25 target route "
+            "--moe-backend triton"
+        )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -54,28 +87,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "CompressedTensorsW8A8Fp8MoEMethod",
         f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod",
     )
-    wrapped = (
-        (method_class, "__init__", TARGETS[0], _WRAPPER_MARKER),
-        (
-            method_class,
-            "process_weights_after_loading",
-            TARGETS[1],
-            _WRAPPER_MARKER,
-        ),
-        (method_class, "apply", TARGETS[2], _WRAPPER_MARKER),
-        (
-            method_class,
-            "_get_aiter_moe_runtime_config",
-            TARGETS[3],
-            _WRAPPER_MARKER,
-        ),
-        (
-            method_class,
-            "_get_aiter_weights_for_solution",
-            TARGETS[4],
-            _WRAPPER_MARKER,
-        ),
-    )
+    wrapped = ((method_class, "__init__", TARGETS[0], _WRAPPER_MARKER),)
     if already_applied(method_class, _CLASS_MARKER, wrapped):
         return False
 
@@ -86,121 +98,28 @@ def apply_to_module(module: ModuleType) -> bool:
         positional=("self", "weight_quant", "input_quant", "moe", "layer_name"),
         defaults={"layer_name": None},
     )
-    original_process = require_callable(
-        method_class, "process_weights_after_loading", TARGETS[1]
-    )
-    require_exact_signature(
-        original_process,
-        TARGETS[1],
-        positional=("self", "layer"),
-    )
-    original_apply = require_callable(method_class, "apply", TARGETS[2])
-    require_exact_signature(
-        original_apply,
-        TARGETS[2],
-        positional=(
-            "self",
-            "layer",
-            "x",
-            "topk_weights",
-            "topk_ids",
-            "shared_experts_input",
-        ),
-    )
-    for name, target in (
-        ("_get_aiter_moe_runtime_config", TARGETS[3]),
-        ("_get_aiter_weights_for_solution", TARGETS[4]),
-    ):
-        if name in vars(method_class):
-            raise PatchCompatibilityError(
-                f"required HCU patch target {target} unexpectedly already exists"
-            )
-
-    from vllm_hcu.model_executor.layers.quantization import (
-        compressed_tensors_moe_runtime as hcu_runtime,
-    )
 
     @functools.wraps(original_init)
     def hcu_init(self, weight_quant, input_quant, moe, layer_name=None):
-        original_init(self, weight_quant, input_quant, moe, layer_name)
-        self._hcu_aiter_moe_config_cache = {}
-
-    @functools.wraps(original_process)
-    def hcu_process_weights_after_loading(self, layer) -> None:
-        original_process(self, layer)
-        hcu_runtime.process_dpsk_deepgemm_weights(self, layer)
-
-    @functools.wraps(original_apply)
-    def hcu_apply(
-        self,
-        layer,
-        x,
-        topk_weights,
-        topk_ids,
-        shared_experts_input,
-        i_q=None,
-        i_s=None,
-    ):
-        if not _aiter_requested():
-            if i_q is not None or i_s is not None:
-                raise RuntimeError(
-                    "prequantized i_q/i_s inputs require the HCU AITER "
-                    "FP8-W8A8 MoE backend"
-                )
-            return original_apply(
-                self,
-                layer,
-                x,
-                topk_weights,
-                topk_ids,
-                shared_experts_input,
-            )
-        return hcu_runtime.apply_aiter_w8a8_fp8_moe(
-            self,
-            layer,
-            x,
-            topk_weights,
-            topk_ids,
-            shared_experts_input,
-            i_q,
-            i_s,
+        channel_token = _is_channel_token_route(
+            fp8_moe_module, weight_quant, input_quant
         )
+        if channel_token:
+            _require_target_triton_policy(moe)
+        original_init(self, weight_quant, input_quant, moe, layer_name)
+        if channel_token:
+            selected_backend = _selected_backend_name(self)
+            if selected_backend != _REQUIRED_SELECTED_BACKEND:
+                raise RuntimeError(
+                    "vLLM v0.25 did not select the required target TRITON "
+                    f"Channel-FP8 MoE backend (selected={selected_backend!r})"
+                )
 
-    def hcu_get_aiter_moe_runtime_config(self, layer, x, topk_ids):
-        return hcu_runtime.get_aiter_w8a8_runtime_config(self, layer, x, topk_ids)
-
-    def hcu_get_aiter_weights_for_solution(self, layer, solution_type):
-        return hcu_runtime.get_aiter_weights_for_solution(layer, solution_type)
-
-    for function in (
-        hcu_init,
-        hcu_process_weights_after_loading,
-        hcu_apply,
-        hcu_get_aiter_moe_runtime_config,
-        hcu_get_aiter_weights_for_solution,
-    ):
-        setattr(function, _WRAPPER_MARKER, True)
+    setattr(hcu_init, _WRAPPER_MARKER, True)
     setattr(method_class, "_vllm_hcu_original_init", original_init)
-    setattr(method_class, "_vllm_hcu_original_process_weights", original_process)
-    setattr(method_class, "_vllm_hcu_original_apply", original_apply)
     setattr(method_class, "__init__", hcu_init)
-    setattr(
-        method_class,
-        "process_weights_after_loading",
-        hcu_process_weights_after_loading,
-    )
-    setattr(method_class, "apply", hcu_apply)
-    setattr(
-        method_class,
-        "_get_aiter_moe_runtime_config",
-        hcu_get_aiter_moe_runtime_config,
-    )
-    setattr(
-        method_class,
-        "_get_aiter_weights_for_solution",
-        hcu_get_aiter_weights_for_solution,
-    )
     setattr(method_class, _CLASS_MARKER, True)
+    setattr(method_class, "_vllm_hcu_fp8_moe_owner", "target-triton")
     return True
 
 

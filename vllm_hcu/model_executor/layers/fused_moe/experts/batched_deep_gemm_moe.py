@@ -21,7 +21,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     get_fp8_min_max,
     kFp8Dynamic128Sym,
+    kFp8DynamicTokenSym,
     kFp8Static128BlockSym,
+    kFp8StaticChannelSym,
+    kInt8DynamicTokenSym,
+    kInt8StaticChannelSym,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -34,324 +38,7 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.math_utils import cdiv, round_up
 
-from vllm.utils.import_utils import has_deep_gemm
-from vllm.model_executor.layers.activation import SiluAndMul
-from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_fp8_quant_ep
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-if has_deep_gemm():
-    from deepgemm import m_grouped_w8a8_gemm_nt_masked, m_grouped_fp8_gemm_nt_masked
-else:
-    from lightop import m_grouped_w8a8_gemm_nt_masked
-    
 logger = init_logger(__name__)
-
-
-# ==============================================
-# MOE Grouped GEMM Triton内核 (int8量化 + 专家并行)
-# 输入布局：All2All后 -> [E, M, K] / [E, N, K]
-# 输出：[E, M, N] 直接写入传入的output张量
-# ==============================================
-@triton.jit
-def moe_grouped_gemm_kernel(
-    # 指针
-    A_ptr, B_ptr,
-    A_scale_ptr, B_scale_ptr,
-    token_counts_ptr,
-    output_ptr,
-
-    # 维度步长 (Batch/E维度步长, M/Token步长, N/Out通道步长, K/特征步长)
-    stride_A_E, stride_A_M, stride_A_K,
-    stride_B_E, stride_B_N, stride_B_K,
-    stride_A_scale_E, stride_A_scale_M,
-    stride_B_scale_E, stride_B_scale_N,
-    stride_out_E, stride_out_M, stride_out_N,
-
-    # 固定维度
-    E: tl.constexpr,  # 专家总数
-    M: tl.constexpr,  # 每个专家最大Token数
-    N: tl.constexpr,  # 每个专家输出维度
-    K: tl.constexpr,  # 输入特征维度
-
-    # 分块参数 (T自动调优)
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    # ===================== 1. 专家ID + 计算坐标 =====================
-    # 程序ID对应：专家ID(E) + Token分块(M) + 输出分块(N)
-    pid_e = tl.program_id(0)    # 专家维度 (0~E-1)
-    pid_m = tl.program_id(1)    # Token分块维度
-    pid_n = tl.program_id(2)    # 输出分块维度
-
-    # 当前专家实际需要计算的Token数量
-    token_cnt = tl.load(token_counts_ptr + pid_e)
-    # 超出实际Token数直接退出 (动态Token数)
-    if pid_m * BLOCK_M >= token_cnt:
-        return
-
-    # ===================== 2. 计算当前分块的内存偏移 =====================
-    # 输入A [E, M, K]
-    A_base = A_ptr + pid_e * stride_A_E
-    # 权重B [E, N, K]
-    B_base = B_ptr + pid_e * stride_B_E
-    # Scale
-    A_scale_base = A_scale_ptr + pid_e * stride_A_scale_E
-    B_scale_base = B_scale_ptr + pid_e * stride_B_scale_E
-    # 输出 [E, M, N]
-    out_base = output_ptr + pid_e * stride_out_E
-
-    # 分块坐标
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    # 内存索引
-    a_ptrs = A_base + (offs_m[:, None] * stride_A_M + offs_k[None, :] * stride_A_K)
-    b_ptrs = B_base + (offs_n[:, None] * stride_B_N + offs_k[None, :] * stride_B_K)
-
-    # ===================== 3. 初始化累加器 =====================
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # ===================== 4. K维度循环计算GEMM (int8矩阵乘) =====================
-    for k in range(0, K, BLOCK_K):
-        # 加载int8数据 (保持int8精度)
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-        # 矩阵乘累加
-        acc += tl.dot(a, tl.trans(b))  # B: [N,K] -> 转置为[K,N]
-        # 指针步进
-        a_ptrs += BLOCK_K * stride_A_K
-        b_ptrs += BLOCK_K * stride_B_K
-
-    # ===================== 5. int8反量化 (Per-Token + Per-Output Channel) =====================
-    # 加载当前专家的scale
-    a_scale = tl.load(A_scale_base + offs_m * stride_A_scale_M)  # [BLOCK_M]
-    b_scale = tl.load(B_scale_base + offs_n * stride_B_scale_N)  # [BLOCK_N]
-    # 反量化：out = (int8_mm) * A_scale * B_scale
-    result = acc * a_scale[:, None] * b_scale[None, :]
-
-    # ===================== 6. 写入输出 [E, M, N] =====================
-    out_ptrs = out_base + (offs_m[:, None] * stride_out_M + offs_n[None, :] * stride_out_N)
-    # 掩码：只写有效Token + 有效输出通道
-    mask_m = offs_m < token_cnt
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(out_ptrs, result, mask=mask)
-
-
-# ==============================================
-# 包装函数 (对外调用接口，自动处理步长/启动网格)
-# ==============================================
-def moe_grouped_gemm(
-    A: torch.Tensor,        # [E, M, K]
-    B: torch.Tensor,        # [E, N, K] int8
-    A_scale: torch.Tensor,  # [E, M, 1]
-    B_scale: torch.Tensor,  # [E, N, 1]
-    token_counts: torch.Tensor,  # [E]
-    output: torch.Tensor,   # [E, M, N] (传入，直接写入)
-):
-    # 维度校验
-    E, M, K = A.shape
-    _, N, _ = B.shape
-    assert B.shape == (E, N, K)
-    assert A_scale.shape == (E, M, 1)
-    assert B_scale.shape == (E, N, 1)
-    assert token_counts.shape == (E,)
-    assert output.shape == (E, M, N)
-
-    # 设备统一
-    assert A.device == B.device == A_scale.device == B_scale.device == token_counts.device == output.device
-    assert A.is_cuda
-
-    # 自动分块大小 (适配主流GPU)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64
-
-    # 计算网格：[E, ceil(M/BLOCK_M), ceil(N/BLOCK_N)]
-    grid = (
-        E,
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
-    )
-
-    # 启动内核
-    moe_grouped_gemm_kernel[grid](
-        # 数据指针
-        A, B,
-        A_scale, B_scale,
-        token_counts,
-        output,
-
-        # 步长 (按最后一维连续的张量自动计算)
-        stride_A_E=A.stride(0), stride_A_M=A.stride(1), stride_A_K=A.stride(2),
-        stride_B_E=B.stride(0), stride_B_N=B.stride(1), stride_B_K=B.stride(2),
-        stride_A_scale_E=A_scale.stride(0), stride_A_scale_M=A_scale.stride(1),
-        stride_B_scale_E=B_scale.stride(0), stride_B_scale_N=B_scale.stride(1),
-        stride_out_E=output.stride(0), stride_out_M=output.stride(1), stride_out_N=output.stride(2),
-
-        # 固定维度
-        E=E, M=M, N=N, K=K,
-
-        # 分块参数
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-    return output
-# ==============================================
-# MOE Grouped GEMM Triton内核 (int8量化 + 专家并行)
-# 输入布局：All2All后 -> [E, M, K] / [E, N, K]
-# 输出：[E, M, N] 直接写入传入的output张量
-# ==============================================
-@triton.jit
-def moe_grouped_gemm_kernel(
-    # 指针
-    A_ptr, B_ptr,
-    A_scale_ptr, B_scale_ptr,
-    token_counts_ptr,
-    output_ptr,
-
-    # 维度步长 (Batch/E维度步长, M/Token步长, N/Out通道步长, K/特征步长)
-    stride_A_E, stride_A_M, stride_A_K,
-    stride_B_E, stride_B_N, stride_B_K,
-    stride_A_scale_E, stride_A_scale_M,
-    stride_B_scale_E, stride_B_scale_N,
-    stride_out_E, stride_out_M, stride_out_N,
-
-    # 固定维度
-    E: tl.constexpr,  # 专家总数
-    M: tl.constexpr,  # 每个专家最大Token数
-    N: tl.constexpr,  # 每个专家输出维度
-    K: tl.constexpr,  # 输入特征维度
-
-    # 分块参数 (T自动调优)
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    # ===================== 1. 专家ID + 计算坐标 =====================
-    # 程序ID对应：专家ID(E) + Token分块(M) + 输出分块(N)
-    pid_e = tl.program_id(0)    # 专家维度 (0~E-1)
-    pid_m = tl.program_id(1)    # Token分块维度
-    pid_n = tl.program_id(2)    # 输出分块维度
-
-    # 当前专家实际需要计算的Token数量
-    token_cnt = tl.load(token_counts_ptr + pid_e)
-    # 超出实际Token数直接退出 (动态Token数)
-    if pid_m * BLOCK_M >= token_cnt:
-        return
-
-    # ===================== 2. 计算当前分块的内存偏移 =====================
-    # 输入A [E, M, K]
-    A_base = A_ptr + pid_e * stride_A_E
-    # 权重B [E, N, K]
-    B_base = B_ptr + pid_e * stride_B_E
-    # Scale
-    A_scale_base = A_scale_ptr + pid_e * stride_A_scale_E
-    B_scale_base = B_scale_ptr + pid_e * stride_B_scale_E
-    # 输出 [E, M, N]
-    out_base = output_ptr + pid_e * stride_out_E
-
-    # 分块坐标
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    # 内存索引
-    a_ptrs = A_base + (offs_m[:, None] * stride_A_M + offs_k[None, :] * stride_A_K)
-    b_ptrs = B_base + (offs_n[:, None] * stride_B_N + offs_k[None, :] * stride_B_K)
-
-    # ===================== 3. 初始化累加器 =====================
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # ===================== 4. K维度循环计算GEMM (int8矩阵乘) =====================
-    for k in range(0, K, BLOCK_K):
-        # 加载int8数据 (保持int8精度)
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-        # 矩阵乘累加
-        acc += tl.dot(a, tl.trans(b))  # B: [N,K] -> 转置为[K,N]
-        # 指针步进
-        a_ptrs += BLOCK_K * stride_A_K
-        b_ptrs += BLOCK_K * stride_B_K
-
-    # ===================== 5. int8反量化 (Per-Token + Per-Output Channel) =====================
-    # 加载当前专家的scale
-    a_scale = tl.load(A_scale_base + offs_m * stride_A_scale_M)  # [BLOCK_M]
-    b_scale = tl.load(B_scale_base + offs_n * stride_B_scale_N)  # [BLOCK_N]
-    # 反量化：out = (int8_mm) * A_scale * B_scale
-    result = acc * a_scale[:, None] * b_scale[None, :]
-
-    # ===================== 6. 写入输出 [E, M, N] =====================
-    out_ptrs = out_base + (offs_m[:, None] * stride_out_M + offs_n[None, :] * stride_out_N)
-    # 掩码：只写有效Token + 有效输出通道
-    mask_m = offs_m < token_cnt
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(out_ptrs, result, mask=mask)
-
-
-# ==============================================
-# 包装函数 (对外调用接口，自动处理步长/启动网格)
-# ==============================================
-def moe_grouped_gemm(
-    A: torch.Tensor,        # [E, M, K]
-    B: torch.Tensor,        # [E, N, K] int8
-    A_scale: torch.Tensor,  # [E, M, 1]
-    B_scale: torch.Tensor,  # [E, N, 1]
-    token_counts: torch.Tensor,  # [E]
-    output: torch.Tensor,   # [E, M, N] (传入，直接写入)
-):
-    # 维度校验
-    E, M, K = A.shape
-    _, N, _ = B.shape
-    assert B.shape == (E, N, K)
-    assert A_scale.shape == (E, M, 1)
-    assert B_scale.shape == (E, N, 1)
-    assert token_counts.shape == (E,)
-    assert output.shape == (E, M, N)
-
-    # 设备统一
-    assert A.device == B.device == A_scale.device == B_scale.device == token_counts.device == output.device
-    assert A.is_cuda
-
-    # 自动分块大小 (适配主流GPU)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64
-
-    # 计算网格：[E, ceil(M/BLOCK_M), ceil(N/BLOCK_N)]
-    grid = (
-        E,
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
-    )
-
-    # 启动内核
-    moe_grouped_gemm_kernel[grid](
-        # 数据指针
-        A, B,
-        A_scale, B_scale,
-        token_counts,
-        output,
-
-        # 步长 (按最后一维连续的张量自动计算)
-        stride_A_E=A.stride(0), stride_A_M=A.stride(1), stride_A_K=A.stride(2),
-        stride_B_E=B.stride(0), stride_B_N=B.stride(1), stride_B_K=B.stride(2),
-        stride_A_scale_E=A_scale.stride(0), stride_A_scale_M=A_scale.stride(1),
-        stride_B_scale_E=B_scale.stride(0), stride_B_scale_N=B_scale.stride(1),
-        stride_out_E=output.stride(0), stride_out_M=output.stride(1), stride_out_N=output.stride(2),
-
-        # 固定维度
-        E=E, M=M, N=N, K=K,
-
-        # 分块参数
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-    return output
 
 
 def scales_shape_stride_dtype(
@@ -527,7 +214,7 @@ def persistent_masked_m_silu_mul_quant(
         DeepGemmQuantScaleFMT.UE8M0,
     ]
 
-    device_capability = current_platform.get_device_capability(device_id=y.device.index)
+    device_capability = current_platform.get_device_capability()
     assert device_capability is not None
     cuda_arch = device_capability.to_int()
 
@@ -590,8 +277,6 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
         max_num_tokens: int,
         num_dispatchers: int,
-        N: int = -1,
-        K: int = -1,
     ):
         """
         max_num_tokens: Maximum number of tokens from a DP Rank
@@ -604,12 +289,23 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
-        # assert self.block_shape == get_mk_alignment_for_contiguous_layout()
-        # assert self.quant_config.use_fp8_w8a8
-        
-        self.N = N
-        self.K = K
-        self.act_fn = SiluAndMul()
+        if current_platform.is_rocm() and (
+            self.quant_config.use_int8_w8a8
+            or self.quant_config.use_fp8_w8a8
+        ):
+            # HCU LightOP consumes per-token Channel scales (block_shape=None).
+            pass
+        else:
+            assert self.block_shape == get_mk_alignment_for_contiguous_layout()
+            assert self.quant_config.use_fp8_w8a8
+
+        # v0.25 exposes the unpadded model dimensions on FusedMoEConfig. HCU
+        # keeps them private because repacked Channel weights may have a
+        # different physical N/K layout.
+        self._hcu_logical_n = 2 * int(
+            moe_config.intermediate_size_per_partition_unpadded
+        )
+        self._hcu_logical_k = int(moe_config.hidden_dim_unpadded)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -629,6 +325,13 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
     ) -> bool:
         SUPPORTED_W_A = [(kFp8Static128BlockSym, kFp8Dynamic128Sym)]
+        if current_platform.is_rocm():
+            SUPPORTED_W_A.extend(
+                [
+                    (kInt8StaticChannelSym, kInt8DynamicTokenSym),
+                    (kFp8StaticChannelSym, kFp8DynamicTokenSym),
+                ]
+            )
         return (weight_key, activation_key) in SUPPORTED_W_A
 
     @staticmethod
@@ -639,16 +342,14 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
         return True
 
-    def supports_expert_map(self) -> bool:
-        return False
-
     def supports_packed_ue8m0_act_scales(self) -> bool:
         """
-        DeepGemm supports packed ue8m0 activation scales format in devices == sm100
+        DeepGemm supports packed ue8m0 activation scales on Blackwell-family
+        GPUs (SM100 datacenter and SM120 consumer).
         """
-        return (
-            is_deep_gemm_e8m0_used()
-            and current_platform.is_device_capability_family(100)
+        return is_deep_gemm_e8m0_used() and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
         )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
@@ -673,6 +374,9 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         assert self.max_num_tokens is not None
         num_dispatchers = self.num_dispatchers
         num_experts = local_num_experts
+        if current_platform.is_rocm():
+            N = self._hcu_logical_n
+            K = self._hcu_logical_k
         max_num_tokens = M if self.max_num_tokens is None else self.max_num_tokens
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace13 = (num_experts, max_num_tokens * num_dispatchers, max(K, N))
@@ -723,24 +427,30 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
-        use_nn_moe: bool | None = False,
     ):
         assert expert_tokens_meta is not None
         expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
         assert hidden_states.ndim == 3
-        # assert self.block_shape is not None
+        assert self.block_shape is not None or (
+            current_platform.is_rocm()
+            and (
+                self.quant_config.use_int8_w8a8
+                or self.quant_config.use_fp8_w8a8
+            )
+        )
 
         a1q = hidden_states
-        # _, N, K = w1.size()
+        _, N, K = w1.size()
 
-        # assert w2.size(1) == K
+        assert w2.size(1) == K
 
         E, max_num_tokens, N, K, _ = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
-        if self.N > 0:
-            N = self.N
+        if current_platform.is_rocm():
+            N = self._hcu_logical_n
+            K = self._hcu_logical_k
 
         workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
 
@@ -749,9 +459,41 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             max_tokens_per_expert=max_num_tokens,
             topk=topk_ids.size(-1),
         )
-        
-        if self.quant_config.use_fp8_w8a16 or self.quant_config.use_fp8_w8a8:
+
+        if self.quant_config.use_int8_w8a8:
+            if activation != MoEActivation.SILU:
+                raise ValueError(
+                    "HCU Channel INT8 batched DeepGEMM supports only SiLU activation"
+                )
+            from lightop import (
+                fuse_silu_mul_quant_ep,
+                m_grouped_w8a8_gemm_nt_masked,
+            )
+
+            m_grouped_w8a8_gemm_nt_masked(
+                (a1q, a1q_scale),
+                (w1, self.w1_scale),
+                workspace1,
+                expert_num_tokens,
+                expected_m,
+            )
+            a2q, a2q_scale = fuse_silu_mul_quant_ep(
+                workspace1,
+                expert_num_tokens,
+            )
+            m_grouped_w8a8_gemm_nt_masked(
+                (a2q, a2q_scale),
+                (w2, self.w2_scale),
+                output,
+                expert_num_tokens,
+                expected_m,
+            )
+        elif current_platform.is_rocm():
+            # HCU's low-latency masked kernel and fused activation are supplied
+            # by the proprietary DeepGEMM/LightOP wheels and imported lazily.
             from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+            from lightop import fuse_silu_mul_fp8_quant_ep
+
             m_grouped_fp8_gemm_nt_masked_ll(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
@@ -759,13 +501,11 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expert_num_tokens,
                 expected_m,
             )
-
             a2q, a2q_scale = fuse_silu_mul_fp8_quant_ep(
                 input=workspace1,
                 fp8type=0,
                 tokens_per_expert=expert_num_tokens,
             )
-
             m_grouped_fp8_gemm_nt_masked_ll(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),
@@ -773,27 +513,26 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expert_num_tokens,
                 expected_m,
             )
-        elif self.quant_config.use_int8_w8a8:
-            m_grouped_w8a8_gemm_nt_masked((a1q, a1q_scale), 
-                                  (w1, self.w1_scale),
-                                    workspace1,
-                                    expert_num_tokens, 
-                                    expected_m,
-                                    )
-
-            assert expert_num_tokens is not None
-
-            a2q, a2q_scale = fuse_silu_mul_quant_ep(workspace1, expert_num_tokens)
-            m_grouped_w8a8_gemm_nt_masked((a2q, a2q_scale),
-                                          (w2, self.w2_scale),
-                                          output,
-                                          expert_num_tokens,
-                                          expected_m)
-                        
-            # moe_grouped_gemm(a1q, w1, a1q_scale, self.w1_scale, expert_num_tokens, workspace1)
-            # act_out = self.act_fn(workspace1)
-            # a2q, a2q_scale = per_token_quant_int8(act_out)
-            # moe_grouped_gemm(a2q, w2, a2q_scale, self.w2_scale, expert_num_tokens, output)
-            
         else:
-            raise ValueError(f"Unsupported dtype {self.quant_config.quant_dtype}")
+            fp8_m_grouped_gemm_nt_masked(
+                (a1q, a1q_scale),
+                (w1, self.w1_scale),
+                workspace1,
+                expert_num_tokens,
+                expected_m,
+            )
+
+            quant_scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
+            a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
+                workspace1,
+                expert_num_tokens,
+                quant_scale_fmt=quant_scale_fmt,
+            )
+
+            fp8_m_grouped_gemm_nt_masked(
+                (a2q, a2q_scale),
+                (w2, self.w2_scale),
+                output,
+                expert_num_tokens,
+                expected_m,
+            )

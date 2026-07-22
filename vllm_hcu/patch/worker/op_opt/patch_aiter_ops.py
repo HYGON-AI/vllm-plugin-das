@@ -25,6 +25,11 @@ TARGETS = (
     f"{TARGET_MODULE}._rocm_aiter_fused_moe_impl",
     f"{TARGET_MODULE}._rocm_aiter_topk_softmax_impl",
     f"{TARGET_MODULE}.rocm_aiter_ops.get_aiter_activation_type",
+    f"{TARGET_MODULE}.rocm_aiter_ops.is_shuffled_per_token_w8a8_gemm_tuned",
+    f"{TARGET_MODULE}.rocm_aiter_ops.is_per_token_w8a8_gemm_tuned",
+    f"{TARGET_MODULE}.rocm_aiter_ops.is_fp8bmm_enabled",
+    f"{TARGET_MODULE}._rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
+    f"{TARGET_MODULE}._rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
 )
 
 _REPLACEMENT_MARKER = "_vllm_hcu_aiter_ops_replacement"
@@ -49,8 +54,11 @@ _FUSED_POSITIONAL = (
     "output_dtype",
     "hidden_pad",
     "intermediate_pad",
+    "gate_mode",
     "bias1",
     "bias2",
+    "moe_sorting_dispatch_policy",
+    "swiglu_limit",
 )
 _FUSED_DEFAULTS = {
     "expert_mask": None,
@@ -65,8 +73,11 @@ _FUSED_DEFAULTS = {
     "output_dtype": None,
     "hidden_pad": 0,
     "intermediate_pad": 0,
+    "gate_mode": "",
     "bias1": None,
     "bias2": None,
+    "moe_sorting_dispatch_policy": 0,
+    "swiglu_limit": 0.0,
 }
 _TOPK_POSITIONAL = (
     "topk_weights",
@@ -91,6 +102,19 @@ _SOLUTION_POSITIONAL = (
     "dtype",
     "activation",
     "use_shuffle",
+)
+_RMSNORM_POSITIONAL = (
+    "x",
+    "weight",
+    "epsilon",
+    "quant_dtype",
+)
+_RMSNORM_ADD_POSITIONAL = (
+    "x",
+    "residual",
+    "weight",
+    "epsilon",
+    "quant_dtype",
 )
 
 
@@ -160,6 +184,50 @@ def _validate(module: ModuleType) -> None:
     require_exact_signature(
         solution, TARGETS[2], positional=_SOLUTION_POSITIONAL
     )
+    rmsnorm = _require_hcu_wrapper(
+        module,
+        "_rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
+        TARGETS[9],
+    )
+    rmsnorm_add = _require_hcu_wrapper(
+        module,
+        "_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
+        TARGETS[10],
+    )
+    require_exact_signature(
+        rmsnorm,
+        TARGETS[9],
+        positional=_RMSNORM_POSITIONAL,
+    )
+    require_exact_signature(
+        rmsnorm_add,
+        TARGETS[10],
+        positional=_RMSNORM_ADD_POSITIONAL,
+    )
+    for index, name in (
+        (6, "is_shuffled_per_token_w8a8_gemm_tuned"),
+        (7, "is_per_token_w8a8_gemm_tuned"),
+    ):
+        tuning_probe = require_callable(aiter_class, name, TARGETS[index])
+        require_exact_signature(
+            tuning_probe,
+            TARGETS[index],
+            positional=("N", "K", "q_dtype_w"),
+        )
+        if not isinstance(vars(aiter_class).get(name), staticmethod):
+            raise PatchCompatibilityError(
+                f"required HCU target {TARGETS[index]} must remain a staticmethod"
+            )
+    fp8_bmm_probe = require_callable(
+        aiter_class, "is_fp8bmm_enabled", TARGETS[8]
+    )
+    require_exact_signature(fp8_bmm_probe, TARGETS[8], positional=())
+    if not isinstance(
+        vars(aiter_class).get("is_fp8bmm_enabled"), classmethod
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU target {TARGETS[8]} must remain a classmethod"
+        )
     if not isinstance(
         vars(aiter_class).get("get_aiter_activation_type"), staticmethod
     ):

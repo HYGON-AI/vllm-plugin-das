@@ -9,12 +9,18 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
 
 import vllm_hcu.platforms.envs as henvs
-from lightop import op
+
+
+# HCU DeepEP/LightOP kernels use 256-row expert slices. Keep this separate
+# from the target's quantization block shape: it is a DCU workspace contract.
+_HCU_TOKEN_ALIGNMENT = 256
+
 
 def expert_num_tokens_round_up_and_sum(
     expert_num_tokens: torch.Tensor, alignment: int
@@ -25,27 +31,100 @@ def expert_num_tokens_round_up_and_sum(
     return torch.sum(ent).item()
 
 
+def compute_aligned_M_and_alignment(
+    M: int,
+    num_topk: int,
+    local_num_experts: int,
+    alignment: int,
+    expert_tokens_meta: mk.ExpertTokensMetadata | None,
+) -> tuple[int, int]:
+    """Return (M_sum, alignment_used).
+
+    `alignment_used` may be smaller than the caller-supplied `alignment` on
+    SM100/SM120 when DeepGEMM can JIT a smaller BLOCK_M for the per-call
+    expected_m. Callers that index by block size (e.g. ``M_sum // block_m``)
+    or assert workspace alignment must use the returned `alignment_used`,
+    not their original `alignment` argument.
+
+    Prefer this over the int-returning :func:`compute_aligned_M` when the
+    GEMM call site needs to wrap itself in ``mk_alignment_scope`` or
+    otherwise reason about the actual per-expert padding.
+    """
+    if current_platform.is_rocm():
+        # DCU schedulers require a conservative fixed alignment. Metadata can
+        # lag a post-dispatch expert remap, so it may raise the bound but must
+        # never shrink the worst-case workspace derived from the routed batch.
+        alignment = max(alignment, _HCU_TOKEN_ALIGNMENT)
+        M_sum_upper = round_up(
+            (M * num_topk) + local_num_experts * (alignment - 1), alignment
+        )
+        if (expert_tokens_meta is not None) and (
+            expert_tokens_meta.expert_num_tokens_cpu is not None
+        ):
+            M_sum_meta = expert_num_tokens_round_up_and_sum(
+                expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
+            )
+            return max(M_sum_upper, M_sum_meta), alignment
+        return M_sum_upper, alignment
+
+    if (expert_tokens_meta is not None) and (
+        expert_tokens_meta.expert_num_tokens_cpu is not None
+    ):
+        return (
+            expert_num_tokens_round_up_and_sum(
+                expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
+            ),
+            alignment,
+        )
+
+    # expert_num_tokens not on cpu. Cap padding by min(M*num_topk,
+    # local_num_experts) — at batch=1 decode only `num_topk` experts can be
+    # active, so the worst-case `local_num_experts*(align-1)` is too loose.
+    # Also shrink `alignment` to DeepGEMM's per-call theoretical BLOCK_M on
+    # SM100/SM120 when smaller.
+    expected_m = M * num_topk
+    try:
+        from vllm.utils.deep_gemm import (
+            get_theoretical_mk_alignment_for_contiguous_layout,
+        )
+
+        # num_groups=local_num_experts so the helper recovers per-expert em;
+        # omitting it over-picks BLOCK_M on SM120 (heuristic assumes em is
+        # already per-expert).
+        per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
+            expected_m=expected_m,
+            num_groups=local_num_experts,
+        )
+        if per_call_align and per_call_align <= alignment:
+            alignment = per_call_align
+    except Exception:
+        pass
+
+    max_active_experts = min(M * num_topk, local_num_experts)
+    M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
+    M_sum = round_up(M_sum, alignment)
+    return M_sum, alignment
+
+
 def compute_aligned_M(
     M: int,
     num_topk: int,
     local_num_experts: int,
     alignment: int,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
-):
-    # Conservative upper bound on permuted rows (M_sum). Safe even when
-    # dispatch meta under-counts vs post-dispatch topk_ids after DeepEP remap.
-    M_sum_upper = (M * num_topk) + local_num_experts * (alignment - 1)
-    M_sum_upper = round_up(M_sum_upper, alignment)
+) -> int:
+    """Return ``M_sum`` only (backward-compat wrapper).
 
-    if (expert_tokens_meta is not None) and (
-        expert_tokens_meta.expert_num_tokens_cpu is not None
-    ):
-        M_sum_meta = expert_num_tokens_round_up_and_sum(
-            expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
-        )
-        return max(M_sum_meta, M_sum_upper)
-
-    return M_sum_upper
+    Equivalent to :func:`compute_aligned_M_and_alignment`'s first return
+    value. Existing downstream callers and the warmup path that only size
+    a workspace use this. Call sites that need the actual per-expert
+    alignment (to wrap GEMMs in ``mk_alignment_scope``) should use
+    :func:`compute_aligned_M_and_alignment` instead.
+    """
+    M_sum, _ = compute_aligned_M_and_alignment(
+        M, num_topk, local_num_experts, alignment, expert_tokens_meta
+    )
+    return M_sum
 
 
 @triton.jit
@@ -56,16 +135,6 @@ def apply_expert_map(expert_id, expert_map):
 
 
 @triton.jit
-def round_up_128(x: int) -> int:
-    y = 128
-    return ((x + y - 1) // y) * y
-
-@triton.jit
-def round_up_256(x: int) -> int:
-    y = 256
-    return ((x + y - 1) // y) * y
-
-@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     expert_start_loc,
@@ -73,6 +142,7 @@ def _fwd_kernel_ep_scatter_1(
     num_experts: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_EXPERT_NUM: tl.constexpr,
+    ALIGN_M: tl.constexpr,
 ):
     cur_expert = tl.program_id(0)
 
@@ -82,17 +152,16 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    #tokens_per_expert = round_up_128(tokens_per_expert)
-    tokens_per_expert = round_up_256(tokens_per_expert)
+    # Round up to ALIGN_M so cumsum matches the workspace's per-expert slices.
+    tokens_per_expert = ((tokens_per_expert + ALIGN_M - 1) // ALIGN_M) * ALIGN_M
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
 
-    tl.store(
-        expert_start_loc + offset_cumsum,
-        cumsum,
-        mask=offset_cumsum < num_experts,
+    # Extract this block's offset from the register vector (warp shuffle,
+    # no global memory round-trip) then write it once to expert_start_loc.
+    cur_expert_start = tl.sum(
+        tl.where(offset_cumsum == cur_expert, cumsum, tl.zeros_like(cumsum))
     )
-    tl.debug_barrier()
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    tl.store(expert_start_loc + cur_expert, cur_expert_start)
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
@@ -101,11 +170,13 @@ def _fwd_kernel_ep_scatter_1(
     # any rows in the per-expert aligned region that do not correspond to
     # real tokens are left untouched here and should remain initialized to
     # -1 so DeepGEMM can skip them
-    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E):
+        offs = start_m + off_expert
+        mask = offs < cur_expert_token_num
         tl.store(
-            m_indices_start_ptr + start_m + off_expert,
+            m_indices_start_ptr + offs,
             cur_expert,
-            mask=start_m + off_expert < cur_expert_token_num
+            mask=mask,
         )
 
 
@@ -138,6 +209,9 @@ def _fwd_kernel_ep_scatter_2(
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+    PACK_UE8M0: tl.constexpr,
+    SCALE_PACKED_SIZE: tl.constexpr,
+    SCALE_PACKED_SIZE_PAD: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -145,45 +219,84 @@ def _fwd_kernel_ep_scatter_2(
     offset_in = tl.arange(0, HIDDEN_SIZE_PAD)
     mask = offset_in < HIDDEN_SIZE
 
-    index_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
-    mask_s = index_in_s < SCALE_HIDDEN_SIZE
+    output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
 
-    for token_id_int32 in range(start_token_id, total_token_num, grid_num):
-        token_id = token_id_int32.to(tl.int64)
+    if PACK_UE8M0:
+        # One int32 per 4 consecutive 32-wide UE8M0 groups, stored MN-major.
+        offs_pk = tl.arange(0, SCALE_PACKED_SIZE_PAD)
+        mask_pk = offs_pk < SCALE_PACKED_SIZE
+    else:
+        offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+        mask_s = offset_in_s < SCALE_HIDDEN_SIZE
+
+    for token_id in range(start_token_id, total_token_num, grid_num):
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
-        to_copy_s = tl.load(
-            recv_x_scale
-            + token_id * recv_x_scale_stride0
-            + index_in_s * recv_x_scale_stride1,
-            mask=mask_s,
-        )
 
-        for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
-            topk_index = topk_idx_int32.to(tl.int64)
+        if PACK_UE8M0:
+            # Pack 4 UE8M0 bytes into one int32 (byte j = group 4*pk+j).
+            base_s = recv_x_scale + token_id * recv_x_scale_stride0
+            g0, g1 = offs_pk * 4, offs_pk * 4 + 1
+            g2, g3 = offs_pk * 4 + 2, offs_pk * 4 + 3
+            b0 = tl.load(
+                base_s + g0 * recv_x_scale_stride1, mask=g0 < SCALE_HIDDEN_SIZE
+            )
+            b1 = tl.load(
+                base_s + g1 * recv_x_scale_stride1, mask=g1 < SCALE_HIDDEN_SIZE
+            )
+            b2 = tl.load(
+                base_s + g2 * recv_x_scale_stride1, mask=g2 < SCALE_HIDDEN_SIZE
+            )
+            b3 = tl.load(
+                base_s + g3 * recv_x_scale_stride1, mask=g3 < SCALE_HIDDEN_SIZE
+            )
+            packed_s = (
+                b0.to(tl.int32)
+                | (b1.to(tl.int32) << 8)
+                | (b2.to(tl.int32) << 16)
+                | (b3.to(tl.int32) << 24)
+            )
+        else:
+            to_copy_s = tl.load(
+                recv_x_scale
+                + token_id * recv_x_scale_stride0
+                + offset_in_s * recv_x_scale_stride1,
+                mask=mask_s,
+            )
+
+        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
 
             if HAS_EXPERT_MAP:
                 expert_id = apply_expert_map(expert_id, expert_map)
 
             if expert_id >= 0:
-                dest_token_index_int32 = tl.atomic_add(expert_start_loc + expert_id, 1)
-                dest_token_index = dest_token_index_int32.to(tl.int64)
+                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_i64 = dest_token_index.to(tl.int64)
                 tl.store(
                     output_index + token_id * output_index_stride0 + topk_index,
-                    dest_token_index_int32,
+                    dest_token_index,
                 )
                 output_tensor_ptr = (
-                    output_tensor + dest_token_index * output_tensor_stride0
+                    output_tensor + dest_token_index_i64 * output_tensor_stride0
                 )
+                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+
                 output_tensor_scale_ptr = (
                     output_tensor_scale + dest_token_index * output_tensor_scale_stride0
                 )
-                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
-                tl.store(
-                    output_tensor_scale_ptr + index_in_s * output_tensor_scale_stride1,
-                    to_copy_s,
-                    mask=mask_s,
-                )
+                if PACK_UE8M0:
+                    tl.store(
+                        output_tensor_scale_ptr + offs_pk * output_tensor_scale_stride1,
+                        packed_s,
+                        mask=mask_pk,
+                    )
+                else:
+                    tl.store(
+                        output_tensor_scale_ptr
+                        + offset_in_s * output_tensor_scale_stride1,
+                        to_copy_s,
+                        mask=mask_s,
+                    )
 
 
 @torch.no_grad()
@@ -198,85 +311,107 @@ def ep_scatter(
     output_tensor_scale: torch.Tensor,
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
+    align_m: int = 128,
+    block_size: int = 128,
+    pack_ue8m0: bool = False,
 ):
-    # BLOCK_E = 128  # token num of per expert is aligned to 128
-    # BLOCK_D = 128  # block size of quantization
-    BLOCK_E = 256  # token num of per expert is aligned to 256
+    # BLOCK_E is the m_indices fill-loop tile (masked), independent of align_m.
+    BLOCK_E = 128
+    BLOCK_D = block_size  # block size of activation-scale quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    scale_hidden_size = recv_x_scale.shape[-1]
     # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
 
-    assert m_indices.shape[0] % BLOCK_E == 0
+    assert m_indices.shape[0] % align_m == 0
     assert expert_start_loc.shape[0] == num_experts
 
-    use_lightop_ep_scatter = (
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
-        and hasattr(op, "ep_scatter")
+    # pack_ue8m0: scatter packs 4 UE8M0 bytes per int32; else copies scales as-is.
+    # HCU LightOP uses the incoming per-token scale width for both INT8 and
+    # FP8. MXFP8 remains on the target-native packed UE8M0 path below.
+    hcu_native_scales = current_platform.is_rocm() and not pack_ue8m0
+    scale_hidden_size = (
+        recv_x_scale.shape[-1] if hcu_native_scales else hidden_size // BLOCK_D
     )
-    if use_lightop_ep_scatter:
-        op.ep_scatter(
-            recv_x, recv_x_scale,
-            recv_topk, expert_map,
-            num_recv_tokens_per_expert,
-            output_tensor, output_tensor_scale, m_indices, output_index,
-            num_experts, BLOCK_E
-        )
-    else:
-        _fwd_kernel_ep_scatter_1[(grid,)](
-            num_recv_tokens_per_expert,
-            expert_start_loc,
-            m_indices,
-            num_experts=num_experts,
-            num_warps=num_warps,
-            BLOCK_E=BLOCK_E,
-            BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
-        )
+    scale_packed_size = (scale_hidden_size + 3) // 4 if pack_ue8m0 else 1
 
-        grid = min(recv_topk.shape[0], 1024 * 8)
+    if (
+        current_platform.is_rocm()
+        and not pack_ue8m0
+        and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
+    ):
+        from lightop import op
 
-        _fwd_kernel_ep_scatter_2[(grid,)](
-            recv_topk.shape[0],
-            expert_start_loc,
-            recv_x,
-            recv_x.stride(0),
-            recv_x.stride(1),
-            recv_x_scale,
-            recv_x_scale.stride(0),
-            recv_x_scale.stride(1),
-            recv_topk,
-            recv_topk.stride(0),
-            recv_topk.stride(1),
-            output_tensor,
-            output_tensor.stride(0),
-            output_tensor.stride(1),
-            output_tensor_scale,
-            output_tensor_scale.stride(0),
-            output_tensor_scale.stride(1),
-            output_index,
-            output_index.stride(0),
-            output_index.stride(1),
-            topk_num=recv_topk.shape[1],
-            expert_map=expert_map,
-            HAS_EXPERT_MAP=expert_map is not None,
-            num_warps=num_warps,
-            HIDDEN_SIZE=hidden_size,
-            HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
-            # SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
-            # SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
-            SCALE_HIDDEN_SIZE=scale_hidden_size,
-            SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
-        )
+        if hasattr(op, "ep_scatter"):
+            op.ep_scatter(
+                recv_x,
+                recv_x_scale,
+                recv_topk,
+                expert_map,
+                num_recv_tokens_per_expert,
+                output_tensor,
+                output_tensor_scale,
+                m_indices,
+                output_index,
+                num_experts,
+                align_m,
+            )
+            return
+
+    _fwd_kernel_ep_scatter_1[(grid,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        ALIGN_M=align_m,
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+
+    _fwd_kernel_ep_scatter_2[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        expert_map=expert_map,
+        HAS_EXPERT_MAP=expert_map is not None,
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        PACK_UE8M0=pack_ue8m0,
+        SCALE_PACKED_SIZE=scale_packed_size,
+        SCALE_PACKED_SIZE_PAD=triton.next_power_of_2(scale_packed_size),
+    )
     return
 
 
 @triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
-    input_num_rows,
     input_tensor,
     input_tensor_stride0,
     input_tensor_stride1,
@@ -297,18 +432,14 @@ def _fwd_kernel_ep_gather(
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    cur_block_int32 = tl.program_id(0)
-    cur_block = cur_block_int32.to(tl.int64)
-    start_cur_token_int32 = tl.program_id(1)
-
+    cur_block = tl.program_id(0)
+    start_cur_token = tl.program_id(1)
     grid_num = tl.num_programs(1)
 
-    for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):
-        cur_token = cur_token_int32.to(tl.int64)
+    for cur_token in range(start_cur_token, total_token_num, grid_num):
         off_d = tl.arange(0, BLOCK_D)
         accumulator = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for topk_index_int32 in range(0, topk_num):
-            topk_index = topk_index_int32.to(tl.int64)
+        for topk_index in range(0, topk_num):
             expert_id = tl.load(
                 recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index
             )
@@ -317,25 +448,19 @@ def _fwd_kernel_ep_gather(
                 expert_id = apply_expert_map(expert_id, expert_map)
 
             if expert_id >= 0:
-                source_token_index_int32 = tl.load(
+                source_token_index = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
-                if (source_token_index_int32 >= 0) and (
-                    source_token_index_int32 < input_num_rows
-                ):
-                    source_token_index = source_token_index_int32.to(tl.int64)
-                    acc_weight = tl.load(
-                        recv_topk_weight
-                        + cur_token * recv_topk_weight_stride0
-                        + topk_index
-                    )
-                    tmp = tl.load(
-                        input_tensor
-                        + source_token_index * input_tensor_stride0
-                        + cur_block * BLOCK_D
-                        + off_d
-                    )
-                    accumulator += tmp.to(tl.float32) * acc_weight
+                acc_weight = tl.load(
+                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
+                )
+                tmp = tl.load(
+                    input_tensor
+                    + source_token_index * input_tensor_stride0
+                    + cur_block * BLOCK_D
+                    + off_d
+                )
+                accumulator += tmp.to(tl.float32) * acc_weight
 
         tl.store(
             output_tensor
@@ -355,9 +480,26 @@ def ep_gather(
     expert_map: torch.Tensor | None,
     output_tensor: torch.Tensor,
 ):
+    if (
+        current_platform.is_rocm()
+        and henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
+    ):
+        from lightop import op
+
+        if hasattr(op, "ep_gather"):
+            op.ep_gather(
+                input_tensor,
+                recv_topk_ids,
+                recv_topk_weight,
+                input_index,
+                expert_map,
+                output_tensor,
+            )
+            return
+
     num_warps = 2
     num_tokens = output_tensor.shape[0]
-    input_num_rows = input_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     BLOCK_D = min(hidden_size, 1024)
     assert hidden_size % BLOCK_D == 0
@@ -365,7 +507,6 @@ def ep_gather(
 
     _fwd_kernel_ep_gather[grid](
         num_tokens,
-        input_num_rows,
         input_tensor,
         input_tensor.stride(0),
         input_tensor.stride(1),
@@ -398,16 +539,22 @@ def deepgemm_moe_permute(
     expert_map: torch.Tensor | None,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
     aq_out: torch.Tensor | None = None,
+    block_size: int | None = None,
 ):
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
     H = aq.size(1)
     device = aq.device
 
-    # block_m, block_k = get_mk_alignment_for_contiguous_layout()
-    block_m = 256
+    block_m, block_k = get_mk_alignment_for_contiguous_layout()
+    if current_platform.is_rocm():
+        block_m = max(block_m, _HCU_TOKEN_ALIGNMENT)
+    # The activation-scale group size may differ from the M/K tile alignment
+    # (e.g. MXFP8 uses a 32-element scale group while block_k stays 128).
+    if block_size is not None:
+        block_k = block_size
 
-    M_sum = compute_aligned_M(
+    M_sum, align_used = compute_aligned_M_and_alignment(
         M=topk_ids.size(0),
         num_topk=topk_ids.size(1),
         local_num_experts=local_num_experts,
@@ -423,12 +570,21 @@ def deepgemm_moe_permute(
     if aq_out is None:
         aq_out = torch.empty((M_sum, H), device=device, dtype=aq.dtype)
 
-    # aq_scale_out = torch.empty(
-    #     (M_sum, H // block_k), device=device, dtype=torch.float32
-    # )
-    aq_scale_out = torch.empty(
-        (M_sum, aq_scale.shape[-1]), device=device, dtype=torch.float32
-    )
+    # uint8 UE8M0 (MXFP8) -> scatter packs into DeepGEMM's int32 MN-major
+    # TMA-aligned layout; float32 (FP8/FP4) scattered row-major as-is.
+    pack_ue8m0 = aq_scale.dtype == torch.uint8
+    sf_k = aq_scale.shape[-1] if current_platform.is_rocm() else H // block_k
+    if pack_ue8m0:
+        packed_sf_k = (sf_k + 3) // 4
+        tma_aligned_mn = round_up(M_sum, 4)
+        aq_scale_out = torch.empty_strided(
+            (M_sum, packed_sf_k),
+            (1, tma_aligned_mn),
+            device=device,
+            dtype=torch.int32,
+        )
+    else:
+        aq_scale_out = torch.empty((M_sum, sf_k), device=device, dtype=torch.float32)
 
     # DeepGEMM uses negative values in m_indices (here expert_ids) to mark
     # completely invalid / padded blocks that should be skipped. We always
@@ -441,15 +597,24 @@ def deepgemm_moe_permute(
         device=device,
         dtype=torch.int32,
     )
-    inv_perm = torch.full(
-        topk_ids.shape, fill_value=-1, device=device, dtype=torch.int32
-    )
+    if current_platform.is_rocm():
+        inv_perm = torch.full(
+            topk_ids.shape, fill_value=-1, device=device, dtype=torch.int32
+        )
+    else:
+        inv_perm = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
 
-    # Derive per-expert counts from topk_ids so ep_scatter layout matches the
-    # indices written into inv_perm (dispatch meta can diverge after remap).
-    expert_num_tokens = count_expert_num_tokens(
-        topk_ids, local_num_experts, expert_map
-    )
+    if current_platform.is_rocm():
+        # Recompute after routing/remap so LightOP's layout and inv_perm agree.
+        expert_num_tokens = count_expert_num_tokens(
+            topk_ids, local_num_experts, expert_map
+        )
+    elif expert_tokens_meta is not None:
+        expert_num_tokens = expert_tokens_meta.expert_num_tokens
+    else:
+        expert_num_tokens = count_expert_num_tokens(
+            topk_ids, local_num_experts, expert_map
+        )
 
     ep_scatter(
         recv_x=aq,
@@ -462,9 +627,12 @@ def deepgemm_moe_permute(
         output_tensor_scale=aq_scale_out,
         m_indices=expert_ids,
         output_index=inv_perm,
+        align_m=align_used,
+        block_size=block_k,
+        pack_ue8m0=pack_ue8m0,
     )
 
-    return aq_out, aq_scale_out, expert_ids, inv_perm
+    return aq_out, aq_scale_out, expert_ids, inv_perm, align_used
 
 
 def deepgemm_unpermute_and_reduce(

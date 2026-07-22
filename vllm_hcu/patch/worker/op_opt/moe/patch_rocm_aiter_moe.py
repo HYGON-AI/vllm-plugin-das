@@ -40,7 +40,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "hidden_states", "w1", "w2", "topk_weights", "topk_ids",
             "moe_config", "activation", "apply_router_weight_on_input",
             "expert_map", "quant_config", "a1q_scale", "num_local_tokens",
-            "output_dtype",
+            "output_dtype", "moe_sorting_dispatch_policy",
         ),
     )
     require_parameter_names(supports, TARGETS[2], ("activation",))
@@ -67,6 +67,7 @@ def apply_to_module(module: ModuleType) -> bool:
         SILU=moe_activation.SILU,
         GELU=gelu_tanh,
         SWIGLUOAI=moe_activation.SWIGLUOAI,
+        SWIGLUOAI_UNINTERLEAVE=moe_activation.SWIGLUOAI_UNINTERLEAVE,
     )
     special_globals["ActivationMethod"] = SimpleNamespace(
         SILU=hcu_activation_method.SILU,

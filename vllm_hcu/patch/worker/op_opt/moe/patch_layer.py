@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wire HCU-owned MoE method/runner capabilities into ``FusedMoE``."""
+"""Wire HCU-owned MoE capabilities into the v0.25 factory pipeline."""
 
 from __future__ import annotations
 
@@ -11,9 +11,8 @@ from ._common import load_exact_module, require_callable, require_class, require
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.layer"
 PATCH_ID = "worker.op_opt.moe.layer"
 TARGETS = (
-    f"{TARGET_MODULE}.FusedMoE.__init__",
-    f"{TARGET_MODULE}.FusedMoE.forward",
-    f"{TARGET_MODULE}.FusedMoE.get_expert_weights",
+    f"{TARGET_MODULE}.FusedMoE",
+    f"{TARGET_MODULE}.RoutedExperts.get_expert_weights",
 )
 _MARKER = "_vllm_hcu_moe_layer_applied"
 
@@ -22,73 +21,55 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if getattr(target, _MARKER, False):
         return False
-    cls = require_class(target, "FusedMoE", TARGETS[0].rsplit(".", 1)[0])
-    init = require_callable(cls, "__init__", TARGETS[0])
-    forward = require_callable(cls, "forward", TARGETS[1])
-    get_weights = require_callable(cls, "get_expert_weights", TARGETS[2])
+    factory = require_callable(target, "FusedMoE", TARGETS[0])
+    routed_experts_cls = require_class(
+        target, "RoutedExperts", f"{TARGET_MODULE}.RoutedExperts"
+    )
+    get_weights = require_callable(
+        routed_experts_cls, "get_expert_weights", TARGETS[1]
+    )
     require_parameter_names(
-        init,
+        factory,
         TARGETS[0],
         (
-            "self", "num_experts", "top_k", "hidden_size", "intermediate_size",
-            "params_dtype", "renormalize", "use_grouped_topk", "num_expert_group",
-            "topk_group", "quant_config", "tp_size", "ep_size", "dp_size",
-            "pcp_size", "prefix", "custom_routing_function", "scoring_func",
-            "routed_scaling_factor", "swiglu_limit", "e_score_correction_bias",
-            "apply_router_weight_on_input", "activation", "is_act_and_mul",
-            "enable_eplb", "num_redundant_experts", "has_bias",
-            "is_sequence_parallel", "expert_mapping", "n_shared_experts",
-            "router_logits_dtype", "gate", "shared_experts", "shared_expert_gate",
-            "routed_input_transform", "routed_output_transform",
-            "apply_routed_scale_to_output", "zero_expert_type", "hash_indices_table",
+            "num_experts", "top_k", "hidden_size", "intermediate_size",
+            "intermediate_pad", "params_dtype", "renormalize", "use_grouped_topk",
+            "num_expert_group", "topk_group", "quant_config", "tp_size", "dp_size",
+            "pcp_size", "prefix", "custom_routing_function", "router",
+            "scoring_func", "routed_scaling_factor", "swiglu_limit",
+            "swiglu_alpha", "swiglu_beta", "e_score_correction_bias",
+            "apply_router_weight_on_input", "activation", "enable_eplb",
+            "num_redundant_experts", "has_bias", "is_sequence_parallel",
+            "reduce_results", "ckpt_names", "n_shared_experts", "router_logits_dtype",
+            "gate", "shared_experts", "shared_expert_gate", "routed_input_transform",
+            "routed_output_transform", "apply_routed_scale_to_output",
+            "zero_expert_type", "hash_indices_table", "runner_cls", "runner_args",
+            "routed_experts_cls", "routed_experts_args",
         ),
     )
-    require_parameter_names(
-        forward,
-        TARGETS[1],
-        ("self", "hidden_states", "router_logits", "input_ids"),
-    )
-    require_parameter_names(get_weights, TARGETS[2], ("self",))
+    require_parameter_names(get_weights, TARGETS[1], ("self",))
 
-    @functools.wraps(init)
-    def hcu_init(self, *args, **kwargs):
-        init(self, *args, **kwargs)
-        official_cls = target.UnquantizedFusedMoEMethod
-        if type(self.quant_method) is not official_cls:
-            return
+    @functools.wraps(factory)
+    def hcu_factory(*args, **kwargs):
+        runner = factory(*args, **kwargs)
+        experts = runner.routed_experts
+        official_cls = getattr(target, "UnquantizedFusedMoEMethod", None)
+        if official_cls is None:
+            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                UnquantizedFusedMoEMethod as official_cls,
+            )
+        if type(experts.quant_method) is not official_cls:
+            return runner
         from vllm_hcu.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
             HcuUnquantizedFusedMoEMethod,
         )
 
-        old_method = self.quant_method
-        hcu_method = HcuUnquantizedFusedMoEMethod(self.moe_config)
+        old_method = experts.quant_method
+        hcu_method = HcuUnquantizedFusedMoEMethod(experts.moe_config)
         hcu_method.moe_quant_config = getattr(old_method, "moe_quant_config", None)
-        self.quant_method = hcu_method
-        self.base_quant_method = hcu_method
-        self.runner._replace_quant_method(hcu_method)
-
-    @functools.wraps(forward)
-    def hcu_forward(
-        self,
-        hidden_states,
-        router_logits,
-        input_ids=None,
-        quanted_hidden_states=None,
-        scale=None,
-        topk_weights=None,
-        topk_ids=None,
-    ):
-        return self.runner.forward(
-            hidden_states,
-            router_logits,
-            input_ids,
-            quanted_hidden_states=quanted_hidden_states,
-            scale=scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-        )
-
-    del hcu_forward.__wrapped__
+        experts._replace_quant_method(hcu_method)
+        runner._replace_quant_method(hcu_method)
+        return runner
 
     @functools.wraps(get_weights)
     def hcu_get_expert_weights(self):
@@ -104,12 +85,10 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         return get_weights(self)
 
-    cls._vllm_hcu_original_init = init
-    cls.__init__ = hcu_init
-    cls._vllm_hcu_original_forward = forward
-    cls.forward = hcu_forward
-    cls._vllm_hcu_original_get_expert_weights = get_weights
-    cls.get_expert_weights = hcu_get_expert_weights
+    target._vllm_hcu_original_fused_moe_factory = factory
+    target.FusedMoE = hcu_factory
+    routed_experts_cls._vllm_hcu_original_get_expert_weights = get_weights
+    routed_experts_cls.get_expert_weights = hcu_get_expert_weights
     setattr(target, _MARKER, True)
     return True
 

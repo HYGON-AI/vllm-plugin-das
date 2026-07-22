@@ -76,6 +76,7 @@ def test_all2all_dispatch_selection_contract():
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
+        eep_stage=False,
     ):
         del (
             moe,
@@ -83,6 +84,7 @@ def test_all2all_dispatch_selection_contract():
             routing_tables,
             allow_new_interface,
             use_monolithic,
+            eep_stage,
         )
         return prepare_finalize
 
@@ -243,6 +245,7 @@ def test_aiter_and_triton_expert_capability_contract():
         GELU = "gelu"
         GELU_TANH = "gelu_tanh"
         SWIGLUOAI = "swigluoai"
+        SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
 
     class ActivationMethod(IntEnum):
         SILU = 0
@@ -259,10 +262,12 @@ def test_aiter_and_triton_expert_capability_contract():
                 hidden_states, w1, w2, topk_weights, topk_ids, moe_config,
                 activation, apply_router_weight_on_input, expert_map,
                 quant_config, a1q_scale, num_local_tokens, output_dtype,
+                moe_sorting_dispatch_policy=0,
             ):
                 del hidden_states, w1, w2, topk_weights, topk_ids, moe_config
                 del apply_router_weight_on_input, expert_map, quant_config
                 del a1q_scale, num_local_tokens, output_dtype
+                del moe_sorting_dispatch_policy
                 if activation == MoEActivation.SILU:
                     return ActivationMethod.SILU
                 if activation == MoEActivation.GELU:
@@ -333,7 +338,7 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
     parameter_names = (
-        "hidden_states", "w1", "w2", "topk_weights", "topk_ids", "inplace",
+        "hidden_states", "w1", "w2", "topk_weights", "topk_ids",
         "activation", "apply_router_weight_on_input", "use_fp8_w8a8",
         "use_int8_w8a8", "use_int8_w8a16", "use_int4_w4a16",
         "ocp_mx_scheme", "per_channel_quant", "global_num_experts",
@@ -350,7 +355,6 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
     module = _module(
         patch_fused_moe.TARGET_MODULE,
         torch=torch,
-        disable_inplace=lambda: False,
         fused_experts_impl=namespace["fused_experts_impl"],
     )
     assert patch_fused_moe.apply_to_module(module) is True
@@ -362,7 +366,7 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
     weights = torch.ones((1, 1))
     ids = torch.zeros((1, 1), dtype=torch.int32)
     arguments = (
-        hidden, w1, w2, weights, ids, False, "silu", False, False, False,
+        hidden, w1, w2, weights, ids, "silu", False, False, False,
         False, True, None, False, 1, None, None, None, None, None, None,
         None, [128, 128], None, None,
     )
@@ -412,13 +416,11 @@ def test_modular_method_dimensions_and_prequant_contract():
 
         @staticmethod
         def make(
-            moe_layer,
+            routed_experts,
             old_quant_method,
             prepare_finalize,
-            shared_experts,
-            inplace,
         ):
-            del moe_layer, old_quant_method, prepare_finalize, shared_experts, inplace
+            del routed_experts, old_quant_method, prepare_finalize
             return None
 
         def apply(
@@ -427,9 +429,10 @@ def test_modular_method_dimensions_and_prequant_contract():
             x,
             topk_weights,
             topk_ids,
+            shared_experts,
             shared_experts_input,
         ):
-            del layer, topk_weights, topk_ids, shared_experts_input
+            del layer, topk_weights, topk_ids, shared_experts, shared_experts_input
             return x
 
     module = _module(
@@ -443,11 +446,9 @@ def test_modular_method_dimensions_and_prequant_contract():
         K=64,
         select_gemm_impl=lambda prepare, layer: (prepare, layer),
     )
-    method = FusedMoEModularMethod.make(
-        "layer", old_method, "prepare", "shared", True
-    )
+    method = FusedMoEModularMethod.make("layer", old_method, "prepare")
     assert FusedMoEKernel.last.arguments == (
-        "prepare", ("prepare", "layer"), "shared", True, 32, 64,
+        "prepare", ("prepare", "layer"), None, False, 32, 64,
     )
     layer = SimpleNamespace(
         w13_weight="w1",
@@ -460,13 +461,17 @@ def test_modular_method_dimensions_and_prequant_contract():
     x = torch.ones((2, 3))
     i_q = torch.ones((2, 3), dtype=torch.int8)
     i_s = torch.ones((2, 1))
-    assert method.apply(layer, x, "weights", "ids", "shared", False, i_q, i_s) is x
+    assert method.apply(
+        layer, x, "weights", "ids", "shared", "shared-input", False, i_q, i_s
+    ) is x
     assert FusedMoEKernel.last.applied["quanted_hidden_states"] is i_q
     assert FusedMoEKernel.last.applied["scale"] is i_s
     with pytest.raises(ValueError, match="i_q and i_s together"):
-        method.apply(layer, x, "weights", "ids", "shared", False, i_q, None)
+        method.apply(
+            layer, x, "weights", "ids", "shared", "shared-input", False, i_q, None
+        )
     with pytest.raises(RuntimeError, match="use_nn_moe"):
-        method.apply(layer, x, "weights", "ids", "shared", True)
+        method.apply(layer, x, "weights", "ids", "shared", "shared-input", True)
 
 
 def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPatch):
@@ -478,7 +483,9 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
         logical_to_physical_map,
         logical_replica_count,
         record_enabled,
+        num_unpadded_tokens=None,
     ):
+        del num_unpadded_tokens
         calls.append(True)
         return topk_ids + 100
 
@@ -519,6 +526,18 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
     )
     assert torch.equal(result, torch.tensor([[0, 2], [1, 2]], dtype=torch.int32))
     assert torch.equal(loads, torch.tensor([1, 1, 2]))
+
+    loads.zero_()
+    result = module.eplb_map_to_physical_and_record(
+        ids,
+        loads,
+        mapping,
+        replicas,
+        enabled,
+        num_unpadded_tokens=torch.tensor(1),
+    )
+    assert torch.equal(result, torch.tensor([[0, 2], [1, 2]], dtype=torch.int32))
+    assert torch.equal(loads, torch.tensor([1, 0, 1]))
 
 
 def test_hash_router_normalizes_index_dtypes():
@@ -561,63 +580,56 @@ def test_hash_router_normalizes_index_dtypes():
 def test_moe_layer_forward_and_repacked_weight_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    init_names = (
+    factory_names = (
         "num_experts", "top_k", "hidden_size", "intermediate_size",
-        "params_dtype", "renormalize", "use_grouped_topk", "num_expert_group",
-        "topk_group", "quant_config", "tp_size", "ep_size", "dp_size",
-        "pcp_size", "prefix", "custom_routing_function", "scoring_func",
-        "routed_scaling_factor", "swiglu_limit", "e_score_correction_bias",
-        "apply_router_weight_on_input", "activation", "is_act_and_mul",
+        "intermediate_pad", "params_dtype", "renormalize", "use_grouped_topk",
+        "num_expert_group", "topk_group", "quant_config", "tp_size", "dp_size",
+        "pcp_size", "prefix", "custom_routing_function", "router", "scoring_func",
+        "routed_scaling_factor", "swiglu_limit", "swiglu_alpha", "swiglu_beta",
+        "e_score_correction_bias", "apply_router_weight_on_input", "activation",
         "enable_eplb", "num_redundant_experts", "has_bias",
-        "is_sequence_parallel", "expert_mapping", "n_shared_experts",
+        "is_sequence_parallel", "reduce_results", "ckpt_names", "n_shared_experts",
         "router_logits_dtype", "gate", "shared_experts", "shared_expert_gate",
         "routed_input_transform", "routed_output_transform",
         "apply_routed_scale_to_output", "zero_expert_type", "hash_indices_table",
+        "runner_cls", "runner_args", "routed_experts_cls", "routed_experts_args",
     )
 
     class UnquantizedFusedMoEMethod:
         def __init__(self):
             self.moe_quant_config = "official-config"
 
+    class RoutedExperts:
+        def __init__(self):
+            self.moe_config = "moe-config"
+            self.quant_method = UnquantizedFusedMoEMethod()
+            self.local_num_experts = 2
+            self._dsv4_channel_fp8_deepgemm_repacked = False
+
+        def _replace_quant_method(self, method):
+            self.quant_method = method
+
+        def get_expert_weights(self):
+            return "official-weights"
+
     class Runner:
         def __init__(self):
+            self.routed_experts = RoutedExperts()
             self.replaced = None
-            self.forwarded = None
 
         def _replace_quant_method(self, method):
             self.replaced = method
 
-        def forward(self, *args, **kwargs):
-            self.forwarded = (args, kwargs)
-            return "forwarded"
-
     module = _module(
         patch_layer.TARGET_MODULE,
         UnquantizedFusedMoEMethod=UnquantizedFusedMoEMethod,
+        RoutedExperts=RoutedExperts,
         Runner=Runner,
     )
-    source = "class FusedMoE:\n"
-    source += "    def __init__(self, " + ", ".join(
-        f"{name}=None" for name in init_names
-    ) + "):\n"
-    source += textwrap.indent(
-        textwrap.dedent(
-            """
-            self.moe_config = "moe-config"
-            self.quant_method = UnquantizedFusedMoEMethod()
-            self.base_quant_method = self.quant_method
-            self.runner = Runner()
-            self.local_num_experts = 2
-            self._dsv4_channel_fp8_deepgemm_repacked = False
-            """
-        ),
-        "        ",
-    )
-    source += (
-        "    def forward(self, hidden_states, router_logits, input_ids):\n"
-        "        return 'official-forward'\n\n"
-        "    def get_expert_weights(self):\n"
-        "        return 'official-weights'\n"
+    source = (
+        "def FusedMoE("
+        + ", ".join(f"{name}=None" for name in factory_names)
+        + "):\n    return Runner()\n"
     )
     exec(source, module.__dict__)
 
@@ -637,42 +649,18 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     monkeypatch.setitem(sys.modules, hcu_module_name, hcu_module)
 
     assert patch_layer.apply_to_module(module) is True
-    layer = module.FusedMoE()
-    assert isinstance(layer.quant_method, HcuUnquantizedFusedMoEMethod)
-    assert layer.quant_method.moe_quant_config == "official-config"
-    assert layer.base_quant_method is layer.quant_method
-    assert layer.runner.replaced is layer.quant_method
+    runner = module.FusedMoE()
+    experts = runner.routed_experts
+    assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
+    assert experts.quant_method.moe_quant_config == "official-config"
+    assert runner.replaced is experts.quant_method
 
-    hidden = torch.ones((1, 2))
-    quanted = torch.ones((1, 2), dtype=torch.int8)
-    scale = torch.ones((1, 1))
-    topk_weights = torch.ones((1, 1))
-    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
-    assert (
-        layer.forward(
-            hidden,
-            None,
-            None,
-            quanted,
-            scale,
-            topk_weights,
-            topk_ids,
-        )
-        == "forwarded"
-    )
-    assert layer.runner.forwarded[1] == {
-        "quanted_hidden_states": quanted,
-        "scale": scale,
-        "topk_weights": topk_weights,
-        "topk_ids": topk_ids,
-    }
-
-    layer._dsv4_channel_fp8_deepgemm_repacked = True
-    layer.w13_weight = torch.arange(24).reshape(2, 3, 4)
-    layer.w2_weight = torch.arange(16).reshape(2, 2, 4)
-    layer.w13_weight_scale = torch.arange(6).reshape(2, 3)
-    layer.w2_weight_scale = torch.arange(4).reshape(2, 2)
-    weights = layer.get_expert_weights()
+    experts._dsv4_channel_fp8_deepgemm_repacked = True
+    experts.w13_weight = torch.arange(24).reshape(2, 3, 4)
+    experts.w2_weight = torch.arange(16).reshape(2, 2, 4)
+    experts.w13_weight_scale = torch.arange(6).reshape(2, 3)
+    experts.w2_weight_scale = torch.arange(4).reshape(2, 2)
+    weights = experts.get_expert_weights()
     assert [tuple(weight.shape) for weight in weights] == [
         (2, 12),
         (2, 8),
@@ -1042,10 +1030,11 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
         GroupedTopKRouter=GroupedTopKRouter,
     )
     factory_names = (
-        "top_k", "global_num_experts", "renormalize", "indices_type_getter",
+        "top_k", "global_num_experts", "renormalize",
         "use_grouped_topk", "num_expert_group", "topk_group", "scoring_func",
-        "num_fused_shared_experts", "routed_scaling_factor",
-        "e_score_correction_bias", "custom_routing_function", "enable_eplb",
+        "num_fused_shared_experts", "shared_expert_weight",
+        "routed_scaling_factor", "e_score_correction_bias",
+        "custom_routing_function",
         "eplb_state", "zero_expert_type", "num_logical_experts",
         "hash_indices_table",
     )
@@ -1257,10 +1246,14 @@ def test_custom_op_runner_rejects_post_import_callback():
 
 def test_moe_runner_and_shared_experts_cold_replacement_contract():
     repository = Path(__file__).resolve().parents[2]
-    clean_vllm = repository.parent / "vllm_dcu_v0.21"
-    python_path = [str(repository)]
-    if clean_vllm.is_dir():
-        python_path.append(str(clean_vllm))
+    target_vllm = Path(
+        os.environ.get("VLLM_V025_SOURCE_ROOT", repository.parent / "vllm_025")
+    ).resolve()
+    if not (target_vllm / "vllm" / "__init__.py").is_file():
+        raise RuntimeError(
+            f"VLLM_V025_SOURCE_ROOT does not contain vllm: {target_vllm}"
+        )
+    python_path = [str(target_vllm), str(repository)]
     existing = os.environ.get("PYTHONPATH")
     if existing:
         python_path.append(existing)
@@ -1269,9 +1262,18 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         """
         import importlib
         import inspect
+        import os
+        from pathlib import Path
         from types import SimpleNamespace
 
         import torch
+        import vllm
+
+        target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+        target_file = Path(vllm.__file__).resolve()
+        assert target_file.is_relative_to(target_root), (
+            f"vllm resolved outside target root: {target_file} not under {target_root}"
+        )
 
         from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
         from vllm_hcu.patch.runtime_state import PatchRegistry
@@ -1326,11 +1328,18 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 x,
                 topk_weights,
                 topk_ids,
+                shared_experts,
                 shared_experts_input,
                 i_q=None,
                 i_s=None,
             ):
-                del layer, topk_weights, topk_ids, shared_experts_input
+                del (
+                    layer,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts,
+                    shared_experts_input,
+                )
                 assert i_q is quanted and i_s is scale
                 return x + 1
 
@@ -1340,7 +1349,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 raise AssertionError("preselected routing must bypass router")
 
         runner = object.__new__(runner_module.MoERunner)
-        runner._quant_method = QuantMethod()
+        runner.routed_experts = SimpleNamespace(quant_method=QuantMethod())
         runner._shared_experts = None
         runner.router = Router()
         hidden = torch.ones((2, 3))
@@ -1349,7 +1358,6 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         topk_weights = torch.ones((2, 1))
         topk_ids = torch.zeros((2, 1), dtype=torch.int32)
         shared, output = runner._apply_quant_method(
-            SimpleNamespace(_routing_replay_out=None),
             hidden,
             None,
             None,
@@ -1368,11 +1376,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 del layer, topk_weights, topk_ids, shared_experts_input
                 return x
 
-        runner._quant_method = UnsupportedQuantMethod()
+        runner.routed_experts.quant_method = UnsupportedQuantMethod()
         runner.__dict__.pop("_supports_quanted_inputs", None)
         try:
             runner._apply_quant_method(
-                SimpleNamespace(_routing_replay_out=None),
                 hidden,
                 None,
                 None,
@@ -1406,6 +1413,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
     )
     environment = os.environ.copy()
     environment["VLLM_PLUGINS"] = "__disabled__"
+    environment["VLLM_V025_SOURCE_ROOT"] = str(target_vllm)
     environment["PYTHONPATH"] = os.pathsep.join(python_path)
     result = subprocess.run(
         [sys.executable, "-c", script],

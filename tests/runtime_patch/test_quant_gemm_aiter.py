@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import enum
 import os
 import subprocess
@@ -112,6 +113,600 @@ def _install_fake_aiter(
     module.__path__ = []  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "aiter", module)
     return module
+
+
+def test_aiter_w8a8_tuning_capability_requires_runtime_and_target_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    aiter = _install_fake_aiter(
+        monkeypatch,
+        gemm_a8w8_bpreshuffle=lambda: None,
+        gemm_a8w8_CK=lambda: None,
+    )
+    configs = SimpleNamespace(
+        AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE="/configs/preshuffle.csv",
+        AITER_CONFIG_GEMM_A8W8_FILE="/configs/per-token.csv",
+    )
+    monkeypatch.setitem(sys.modules, "aiter.ops", _package("aiter.ops"))
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.gemm_op_a8w8",
+        _module("aiter.ops.gemm_op_a8w8", AITER_CONFIGS=configs),
+    )
+
+    assert aiter_runtime.get_w8a8_tuned_config_path(
+        "gemm_a8w8_bpreshuffle",
+        "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE",
+    ) == "/configs/preshuffle.csv"
+    assert aiter_runtime.get_w8a8_tuned_config_path(
+        "gemm_a8w8_CK",
+        "AITER_CONFIG_GEMM_A8W8_FILE",
+    ) == "/configs/per-token.csv"
+
+    delattr(aiter, "gemm_a8w8_bpreshuffle")
+    assert (
+        aiter_runtime.get_w8a8_tuned_config_path(
+            "gemm_a8w8_bpreshuffle",
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE",
+        )
+        is None
+    )
+
+
+def test_aiter_w8a8_tuning_capability_fails_closed_on_expected_api_drift(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch, gemm_a8w8_CK=lambda: None)
+    monkeypatch.setitem(sys.modules, "aiter.ops", _package("aiter.ops"))
+
+    for name, gemm_module in (
+        ("missing-config-owner", _module("aiter.ops.gemm_op_a8w8")),
+        (
+            "missing-config-attribute",
+            _module(
+                "aiter.ops.gemm_op_a8w8",
+                AITER_CONFIGS=SimpleNamespace(),
+            ),
+        ),
+        (
+            "invalid-empty-path",
+            _module(
+                "aiter.ops.gemm_op_a8w8",
+                AITER_CONFIGS=SimpleNamespace(AITER_CONFIG_GEMM_A8W8_FILE=""),
+            ),
+        ),
+    ):
+        monkeypatch.setitem(sys.modules, "aiter.ops.gemm_op_a8w8", gemm_module)
+        assert (
+            aiter_runtime.get_w8a8_tuned_config_path(
+                "gemm_a8w8_CK",
+                "AITER_CONFIG_GEMM_A8W8_FILE",
+            )
+            is None
+        ), name
+
+
+def test_aiter_w8a8_tuning_capability_does_not_hide_unexpected_abi_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    aiter = _module("aiter", gemm_a8w8_CK=lambda: None)
+
+    for error in (
+        OSError("unexpected AITER loader ABI error"),
+        ImportError("undefined symbol: proprietary_aiter_abi"),
+        AttributeError("unexpected module initialization failure"),
+    ):
+        def fake_import(name: str, *, failure=error):
+            if name == "aiter":
+                return aiter
+            raise failure
+
+        monkeypatch.setattr(aiter_runtime, "import_module", fake_import)
+        with pytest.raises(type(error), match=str(error)):
+            aiter_runtime.get_w8a8_tuned_config_path(
+                "gemm_a8w8_CK",
+                "AITER_CONFIG_GEMM_A8W8_FILE",
+            )
+
+
+def test_aiter_w8a8_tuning_capability_short_circuits_broken_submodule(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+
+    def fake_import(name: str):
+        calls.append(name)
+        if name == "aiter":
+            return _module("aiter")
+        raise AssertionError("the unavailable runtime must short-circuit")
+
+    monkeypatch.setattr(aiter_runtime, "import_module", fake_import)
+    assert (
+        aiter_runtime.get_w8a8_tuned_config_path(
+            "gemm_a8w8_CK",
+            "AITER_CONFIG_GEMM_A8W8_FILE",
+        )
+        is None
+    )
+    assert calls == ["aiter"]
+
+
+def test_optional_aiter_module_distinguishes_absence_from_transitive_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    requested = "aiter.ops.gemm_op_a8w8"
+
+    def missing_requested(name: str):
+        raise ModuleNotFoundError(
+            f"No module named {name!r}",
+            name=name,
+        )
+
+    monkeypatch.setattr(aiter_runtime, "import_module", missing_requested)
+    assert aiter_runtime._import_optional_aiter_module(requested) is None
+
+    def missing_transitive(name: str):
+        raise ModuleNotFoundError(
+            "No module named 'proprietary_abi_dependency'",
+            name="proprietary_abi_dependency",
+        )
+
+    monkeypatch.setattr(aiter_runtime, "import_module", missing_transitive)
+    with pytest.raises(ModuleNotFoundError, match="proprietary_abi_dependency"):
+        aiter_runtime._import_optional_aiter_module(requested)
+
+
+def test_aiter_triton_fp8_bmm_capability_is_symbol_aware(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    symbol = aiter_runtime._AITER_TRITON_FP8_BMM_SYMBOL
+    module = _module(
+        aiter_runtime._AITER_TRITON_FP8_BMM_MODULE,
+        **{symbol: lambda: None},
+    )
+    monkeypatch.setattr(aiter_runtime, "import_module", lambda name: module)
+    assert aiter_runtime.has_triton_fp8_bmm()
+
+    delattr(module, symbol)
+    assert not aiter_runtime.has_triton_fp8_bmm()
+
+    def missing_requested(name: str):
+        raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+    monkeypatch.setattr(aiter_runtime, "import_module", missing_requested)
+    assert not aiter_runtime.has_triton_fp8_bmm()
+
+    def missing_transitive(name: str):
+        raise ModuleNotFoundError(
+            "No module named 'triton_runtime_abi'",
+            name="triton_runtime_abi",
+        )
+
+    monkeypatch.setattr(aiter_runtime, "import_module", missing_transitive)
+    with pytest.raises(ModuleNotFoundError, match="triton_runtime_abi"):
+        aiter_runtime.has_triton_fp8_bmm()
+
+
+def test_aiter_triton_fp8_bmm_env_gates_short_circuit_capability_probe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def unexpected_probe():
+        raise AssertionError("disabled environment gates must short-circuit")
+
+    monkeypatch.setattr(aiter_runtime, "has_triton_fp8_bmm", unexpected_probe)
+    assert not aiter_runtime.is_triton_fp8_bmm_enabled(False, False)
+    assert not aiter_runtime.is_triton_fp8_bmm_enabled(False, True)
+    assert not aiter_runtime.is_triton_fp8_bmm_enabled(True, False)
+
+    monkeypatch.setattr(aiter_runtime, "has_triton_fp8_bmm", lambda: False)
+    assert not aiter_runtime.is_triton_fp8_bmm_enabled(True, True)
+    monkeypatch.setattr(aiter_runtime, "has_triton_fp8_bmm", lambda: True)
+    assert aiter_runtime.is_triton_fp8_bmm_enabled(True, True)
+
+
+def _operator_schema(*names: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        arguments=[SimpleNamespace(name=name) for name in names]
+    )
+
+
+@pytest.mark.parametrize(
+    ("op_name", "legacy_arguments"),
+    tuple(aiter_runtime._AITER_RMSNORM_DYNAMIC_QUANT_ARGUMENTS.items()),
+)
+@pytest.mark.parametrize(
+    ("profile", "suffix"),
+    (
+        ("legacy-default", ()),
+        (
+            "model-sensitive",
+            (aiter_runtime._AITER_MODEL_SENSITIVE_RMSNORM_ARGUMENT,),
+        ),
+    ),
+)
+def test_aiter_rmsnorm_dynamic_quant_abi_requires_exact_known_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    op_name: str,
+    legacy_arguments: tuple[str, ...],
+    profile: str,
+    suffix: tuple[str, ...],
+):
+    overload = SimpleNamespace(
+        _schema=_operator_schema(*(legacy_arguments + suffix))
+    )
+    namespace = SimpleNamespace(
+        **{op_name: SimpleNamespace(default=overload)}
+    )
+    monkeypatch.setattr(
+        aiter_runtime,
+        "torch",
+        SimpleNamespace(ops=SimpleNamespace(aiter=namespace)),
+    )
+
+    assert aiter_runtime._aiter_rmsnorm_dynamic_quant_abi(op_name) == profile
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (),
+        ("a0", "a1", "a2", "a3", "a4"),
+        ("input", "out", "yscale", "weight", "epsilon"),
+        ("out", "input", "yscale", "weight", "epsilon", "unexpected"),
+    ),
+)
+def test_aiter_rmsnorm_dynamic_quant_abi_fails_closed_on_unknown_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
+):
+    op_name = "rmsnorm2d_fwd_with_dynamicquant"
+    overload = SimpleNamespace(_schema=_operator_schema(*arguments))
+    namespace = SimpleNamespace(
+        **{op_name: SimpleNamespace(default=overload)}
+    )
+    monkeypatch.setattr(
+        aiter_runtime,
+        "torch",
+        SimpleNamespace(ops=SimpleNamespace(aiter=namespace)),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="no readable operator schema|unsupported arguments",
+    ):
+        aiter_runtime._aiter_rmsnorm_dynamic_quant_abi(op_name)
+
+
+def test_aiter_rmsnorm_dynamic_quant_abi_fails_closed_when_op_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        aiter_runtime,
+        "torch",
+        SimpleNamespace(ops=SimpleNamespace(aiter=SimpleNamespace())),
+    )
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="no readable operator schema",
+    ):
+        aiter_runtime._aiter_rmsnorm_dynamic_quant_abi(
+            "rmsnorm2d_fwd_with_dynamicquant"
+        )
+
+
+@pytest.mark.parametrize("fused_add", [False, True])
+@pytest.mark.parametrize(
+    ("profile", "expected_kwargs"),
+    (
+        ("legacy-default", {}),
+        ("model-sensitive", {"use_model_sensitive_rmsnorm": 0}),
+    ),
+)
+def test_aiter_rmsnorm_int8_calls_each_supported_abi_once(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_add: bool,
+    profile: str,
+    expected_kwargs: dict[str, int],
+):
+    monkeypatch.setattr(
+        aiter_runtime,
+        "_aiter_rmsnorm_dynamic_quant_abi",
+        lambda op_name: profile,
+    )
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def operation(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    x = torch.ones(2, 4)
+    weight = torch.ones(4)
+    if fused_add:
+        result = aiter_runtime.rmsnorm_add_dynamic_quant_impl(
+            operation,
+            x,
+            torch.full_like(x, 2),
+            weight,
+            1e-6,
+            torch.int8,
+        )
+        assert len(result) == 3
+        assert len(calls[0][0]) == 7
+    else:
+        result = aiter_runtime.rmsnorm_dynamic_quant_impl(
+            operation, x, weight, 1e-6, torch.int8
+        )
+        assert len(result) == 2
+        assert len(calls[0][0]) == 5
+    assert len(calls) == 1
+    assert calls[0][1] == expected_kwargs
+
+
+@pytest.mark.parametrize("fused_add", [False, True])
+def test_legacy_aiter_rmsnorm_fp8_uses_vllm_native_fallback_only(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_add: bool,
+):
+    monkeypatch.setattr(
+        aiter_runtime,
+        "_aiter_rmsnorm_dynamic_quant_abi",
+        lambda op_name: "legacy-default",
+    )
+    native_calls: list[tuple[object, ...]] = []
+
+    def native(x, weight, epsilon, quant_dtype, residual=None):
+        native_calls.append((x, weight, epsilon, quant_dtype, residual))
+        output = torch.empty_like(x, dtype=quant_dtype)
+        scale = torch.empty(x.shape[0], 1)
+        residual_out = residual.clone() if residual is not None else None
+        return output, scale, residual_out
+
+    monkeypatch.setattr(
+        aiter_runtime,
+        "_vllm_native_rmsnorm_dynamic_quant",
+        native,
+    )
+
+    def unexpected_aiter(*args, **kwargs):
+        raise AssertionError("legacy AITER FP8 kernel must not run")
+
+    x = torch.ones(2, 4)
+    weight = torch.ones(4)
+    if fused_add:
+        residual = torch.full_like(x, 2)
+        output, residual_out, scale = (
+            aiter_runtime.rmsnorm_add_dynamic_quant_impl(
+                unexpected_aiter,
+                x,
+                residual,
+                weight,
+                1e-6,
+                torch.float8_e4m3fn,
+            )
+        )
+        assert native_calls[0][4] is residual
+        assert residual_out is not residual
+        torch.testing.assert_close(residual_out, residual)
+    else:
+        output, scale = aiter_runtime.rmsnorm_dynamic_quant_impl(
+            unexpected_aiter,
+            x,
+            weight,
+            1e-6,
+            torch.float8_e4m3fn,
+        )
+        assert native_calls[0][4] is None
+    assert output.dtype is torch.float8_e4m3fn
+    assert scale.shape == (2, 1)
+    assert len(native_calls) == 1
+
+
+def test_vllm_native_rmsnorm_fallback_validates_schema_and_clones_residual(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[object, ...]] = []
+
+    class NativeOperation:
+        _schema = _operator_schema(
+            *aiter_runtime._VLLM_NATIVE_RMSNORM_DYNAMIC_QUANT_ARGUMENTS
+        )
+
+        def __call__(self, *args):
+            calls.append(args)
+            output, x, _weight, scale, _epsilon, scale_ub, residual = args
+            output.fill_(1)
+            scale.fill_(2)
+            assert scale_ub is None
+            if residual is not None:
+                residual.add_(x)
+
+    torch_proxy = SimpleNamespace(
+        empty=torch.empty,
+        float32=torch.float32,
+        ops=SimpleNamespace(
+            _C=SimpleNamespace(
+                rms_norm_dynamic_per_token_quant=SimpleNamespace(
+                    default=NativeOperation()
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(aiter_runtime, "torch", torch_proxy)
+    monkeypatch.setattr(aiter_runtime, "import_module", lambda name: object())
+
+    x = torch.ones(2, 4)
+    residual = torch.full_like(x, 2)
+    original_x = x.clone()
+    original_residual = residual.clone()
+    output, scale, residual_out = (
+        aiter_runtime._vllm_native_rmsnorm_dynamic_quant(
+            x,
+            torch.ones(4),
+            1e-6,
+            torch.float8_e4m3fn,
+            residual,
+        )
+    )
+
+    assert len(calls) == 1
+    assert output.dtype is torch.float8_e4m3fn
+    assert torch.all(scale == 2)
+    assert residual_out is not None and residual_out is not residual
+    torch.testing.assert_close(residual_out, original_x + original_residual)
+    torch.testing.assert_close(x, original_x)
+    torch.testing.assert_close(residual, original_residual)
+
+
+@pytest.mark.parametrize("fused_add", [False, True])
+def test_aiter_rmsnorm_kernel_errors_propagate_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_add: bool,
+):
+    monkeypatch.setattr(
+        aiter_runtime,
+        "_aiter_rmsnorm_dynamic_quant_abi",
+        lambda op_name: "model-sensitive",
+    )
+    calls = 0
+
+    def broken_operation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("AITER kernel execution failed")
+
+    x = torch.ones(2, 4)
+    if fused_add:
+        call = lambda: aiter_runtime.rmsnorm_add_dynamic_quant_impl(
+            broken_operation,
+            x,
+            torch.ones_like(x),
+            torch.ones(4),
+            1e-6,
+            torch.int8,
+        )
+    else:
+        call = lambda: aiter_runtime.rmsnorm_dynamic_quant_impl(
+            broken_operation,
+            x,
+            torch.ones(4),
+            1e-6,
+            torch.int8,
+        )
+    with pytest.raises(RuntimeError, match="AITER kernel execution failed"):
+        call()
+    assert calls == 1
+
+
+def test_aiter_replacement_rmsnorm_wrappers_delegate_without_retry_logic():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/aiter_ops.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    expected = {
+        "_rocm_aiter_rmsnorm_fused_dynamic_quant_impl": (
+            "rmsnorm_dynamic_quant_impl"
+        ),
+        "_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl": (
+            "rmsnorm_add_dynamic_quant_impl"
+        ),
+    }
+    for function_name, runtime_name in expected.items():
+        function = functions[function_name]
+        calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == runtime_name
+        ]
+        assert len(calls) == 1, function_name
+        assert not any(isinstance(node, ast.Try) for node in ast.walk(function))
+
+
+def test_aiter_replacement_maps_each_optional_capability_exactly():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/aiter_ops.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    owner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "rocm_aiter_ops"
+    )
+    methods = {
+        node.name: node
+        for node in owner.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    expected = {
+        "is_shuffled_per_token_w8a8_gemm_tuned": (
+            "gemm_a8w8_bpreshuffle",
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE",
+        ),
+        "is_per_token_w8a8_gemm_tuned": (
+            "gemm_a8w8_CK",
+            "AITER_CONFIG_GEMM_A8W8_FILE",
+        ),
+    }
+    for method_name, expected_arguments in expected.items():
+        calls = [
+            node
+            for node in ast.walk(methods[method_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_w8a8_tuned_config_path"
+        ]
+        assert len(calls) == 1, method_name
+        assert tuple(ast.literal_eval(arg) for arg in calls[0].args) == expected_arguments
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_check_kernel_tuned"
+            for node in ast.walk(methods[method_name])
+        ), method_name
+
+    fp8_bmm_source = ast.unparse(methods["is_fp8bmm_enabled"])
+    assert "_hcu_runtime.is_triton_fp8_bmm_enabled" in fp8_bmm_source
+
+
+def test_hcu_aiter_moe_uses_v025_out_of_place_contract():
+    repo = Path(__file__).resolve().parents[2]
+    sources = (
+        repo
+        / "vllm_hcu/model_executor/layers/quantization/"
+        "compressed_tensors_moe_runtime.py",
+        repo
+        / "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
+        "compressed_tensors_moe_marlin.py",
+    )
+
+    for source_path in sources:
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, ast.Attribute) and node.attr == "disable_inplace"
+            for node in ast.walk(tree)
+        ), source_path
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "aiter_moe"
+        ]
+        assert calls, source_path
+        for call in calls:
+            inplace = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "inplace"),
+                None,
+            )
+            assert isinstance(inplace, ast.Constant), source_path
+            assert inplace.value is False, source_path
 
 
 def test_aiter_gelu_tanh_and_feature_off_delegation(
@@ -230,6 +825,85 @@ def test_aiter_w16a16_asm_selection(monkeypatch: pytest.MonkeyPatch):
         "use_shuffle": 0,
     }
 
+    assert (
+        aiter_runtime.fused_moe_impl(
+            upstream,
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation_method=3,
+            swiglu_limit=7.5,
+        )
+        == "asm"
+    )
+    assert asm_calls[1][1]["gemm1_limit"] == 7.5
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="cannot represent.*gate_mode",
+    ):
+        aiter_runtime.fused_moe_impl(
+            upstream,
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            gate_mode="interleave",
+        )
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="cannot represent.*moe_sorting_dispatch_policy",
+    ):
+        aiter_runtime.fused_moe_impl(
+            upstream,
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            moe_sorting_dispatch_policy=2,
+        )
+
+
+def test_aiter_feature_off_delegates_v025_fused_moe_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    _install_fake_vllm_envs(
+        monkeypatch,
+        VLLM_ROCM_USE_AITER=False,
+        VLLM_ROCM_USE_AITER_MOE=False,
+    )
+    calls: list[tuple[object, ...]] = []
+
+    def original(*args):
+        calls.append(args)
+        return "target"
+
+    tensors = (
+        torch.ones(2, 4),
+        torch.ones(3, 8, 4),
+        torch.ones(3, 4, 4),
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+    )
+    assert (
+        aiter_runtime.fused_moe_impl(
+            original,
+            *tensors,
+            gate_mode="separated",
+            moe_sorting_dispatch_policy=3,
+            swiglu_limit=4.5,
+        )
+        == "target"
+    )
+    assert calls[0][17] == "separated"
+    assert calls[0][20] == 3
+    assert calls[0][21] == 4.5
+
 
 def test_aiter_solution_lookup_success_and_failures(monkeypatch: pytest.MonkeyPatch):
     class MoeQuantType:
@@ -290,6 +964,9 @@ def test_scaled_mm_prequantized_input_bypasses_quantizer():
     calls: list[tuple[object, ...]] = []
 
     class FP8ScaledMMLinearKernel:
+        _hcu_fp8_patch_applied = True
+        _hcu_fp8_backend = "target-triton"
+
         def apply_weights(self, layer, x, bias=None):
             calls.append(("original", layer, x, bias))
             return "original"
@@ -301,7 +978,7 @@ def test_scaled_mm_prequantized_input_bypasses_quantizer():
     patch_scaled_mm_linear_kernel.apply_to_module(module)
     kernel = FP8ScaledMMLinearKernel()
     kernel.config = SimpleNamespace(out_dtype=None)
-    weight = torch.ones(3, 5)
+    weight = torch.ones(3, 5, dtype=torch.int8)
     weight_scale = torch.ones(5)
     kernel._get_layer_params = lambda layer: (weight, weight_scale, None, None)
     kernel.apply_scaled_mm = lambda **kwargs: calls.append(("scaled", kwargs)) or kwargs
@@ -315,6 +992,122 @@ def test_scaled_mm_prequantized_input_bypasses_quantizer():
     assert kernel.apply_weights(object(), x) == "original"
 
 
+def test_scaled_mm_prequantized_scale_shape_preserves_eager_value_error():
+    class FP8ScaledMMLinearKernel:
+        _hcu_fp8_patch_applied = True
+        _hcu_fp8_backend = "target-triton"
+
+        def apply_weights(self, layer, x, bias=None):
+            return x
+
+    module = _module(
+        patch_scaled_mm_linear_kernel.TARGET_MODULE,
+        FP8ScaledMMLinearKernel=FP8ScaledMMLinearKernel,
+    )
+    patch_scaled_mm_linear_kernel.apply_to_module(module)
+    kernel = FP8ScaledMMLinearKernel()
+    kernel.config = SimpleNamespace(out_dtype=None)
+    weight = torch.ones(3, 5, dtype=torch.int8)
+    weight_scale = torch.ones(5)
+    kernel._get_layer_params = lambda layer: (weight, weight_scale, None, None)
+    kernel.apply_scaled_mm = lambda **kwargs: kwargs
+
+    with pytest.raises(ValueError, match="scale must be scalar or per-token"):
+        kernel.apply_weights(
+            object(),
+            torch.ones(2, 3),
+            x_and_scale_quanted=(
+                torch.ones(2, 3, dtype=torch.int8),
+                torch.ones(2, 2),
+            ),
+        )
+
+
+def test_scaled_mm_prequantized_scale_shape_is_one_strict_dynamic_graph():
+    from sympy.logic.boolalg import Boolean
+
+    class FP8ScaledMMLinearKernel:
+        _hcu_fp8_patch_applied = True
+        _hcu_fp8_backend = "target-triton"
+
+        def apply_weights(self, layer, x, bias=None):
+            return x
+
+        def apply_scaled_mm(
+            self,
+            *,
+            A,
+            B,
+            out_dtype,
+            As,
+            Bs,
+            bias,
+            output_shape,
+        ):
+            # Keep this CPU-only graph shape dependent while avoiding any
+            # device kernel.  The regression target is the wrapper's symbolic
+            # scale-shape validation before this target-owned call.
+            return A.to(out_dtype) * As
+
+    module = _module(
+        patch_scaled_mm_linear_kernel.TARGET_MODULE,
+        FP8ScaledMMLinearKernel=FP8ScaledMMLinearKernel,
+    )
+    patch_scaled_mm_linear_kernel.apply_to_module(module)
+    kernel = FP8ScaledMMLinearKernel()
+    kernel.config = SimpleNamespace(out_dtype=torch.float32)
+    weight = torch.ones(3, 5, dtype=torch.int8)
+    weight_scale = torch.ones(5)
+    kernel._get_layer_params = lambda layer: (weight, weight_scale, None, None)
+    layer = object()
+    compile_count = 0
+    captured_graphs = []
+
+    def counting_backend(graph_module, example_inputs):
+        nonlocal compile_count
+        compile_count += 1
+        captured_graphs.append(graph_module)
+        return graph_module.forward
+
+    def apply_prequantized(x, x_2d_q, x_scale):
+        return kernel.apply_weights(
+            layer,
+            x,
+            x_and_scale_quanted=(x_2d_q, x_scale),
+        )
+
+    compiled = torch.compile(
+        apply_prequantized,
+        backend=counting_backend,
+        dynamic=True,
+        fullgraph=True,
+    )
+    for num_tokens in (2, 33, 65, 129):
+        x = torch.ones(num_tokens, 3)
+        x_2d_q = torch.ones(num_tokens, 3, dtype=torch.int8)
+        x_scale = torch.ones(num_tokens, 1)
+        for tensor in (x, x_2d_q, x_scale):
+            torch._dynamo.mark_dynamic(
+                tensor,
+                0,
+                min=1,
+                max=10240,
+            )
+
+        result = compiled(x, x_2d_q, x_scale)
+        assert result.shape == (num_tokens, 3)
+        torch.testing.assert_close(result, torch.ones(num_tokens, 3))
+
+    assert compile_count == 1
+    symbolic_boolean_nodes = []
+    for graph_module in captured_graphs:
+        for node in graph_module.graph.nodes:
+            value = node.meta.get("example_value")
+            if isinstance(value, (torch.SymBool, Boolean)):
+                symbolic_boolean_nodes.append((node.name, repr(value)))
+    assert symbolic_boolean_nodes == [], symbolic_boolean_nodes
+
+
 def test_clamp_swiglu_enforces_rocm_custom_op():
     sentinel = object()
 
@@ -324,9 +1117,18 @@ def test_clamp_swiglu_enforces_rocm_custom_op():
             self._forward_method = "dispatched"
 
     class SiluAndMulWithClamp(CustomOp):
-        def __init__(self, swiglu_limit: float, *, compile_native: bool = True):
+        def __init__(
+            self,
+            swiglu_limit: float,
+            alpha: float = 1.0,
+            beta: float = 0.0,
+            *,
+            compile_native: bool = True,
+        ):
             super().__init__(compile_native=compile_native)
             self.swiglu_limit = float(swiglu_limit)
+            self.alpha = float(alpha)
+            self.beta = float(beta)
 
         def forward_native(self, x):
             return x
@@ -348,9 +1150,11 @@ def test_clamp_swiglu_enforces_rocm_custom_op():
         ),
     )
     patch_activation.apply_to_module(module)
-    instance = SiluAndMulWithClamp(7.0, compile_native=False)
+    instance = SiluAndMulWithClamp(7.0, 1.5, 0.25, compile_native=False)
     assert instance.base_args == (True, False)
     assert instance.op is sentinel
+    assert instance.alpha == 1.5
+    assert instance.beta == 0.25
 
 
 def test_compressed_linear_only_forwards_supported_prequantized_input():
@@ -545,12 +1349,21 @@ def test_slimquant_w4a8_apply_fails_closed_for_unsupported_inputs(
 
 
 def _fake_moe_fp8_module():
+    channel = object()
+    token = object()
+    tensor = object()
+
     class CompressedTensorsW8A8Fp8MoEMethod:
+        init_calls: list[object] = []
+        selected_backend = "TRITON"
+
         def __init__(self, weight_quant, input_quant, moe, layer_name=None):
+            type(self).init_calls.append(moe)
             self.weight_quant = weight_quant
             self.input_quant = input_quant
             self.moe = moe
             self.layer_name = layer_name
+            self.fp8_backend = SimpleNamespace(value=type(self).selected_backend)
 
         def process_weights_after_loading(self, layer):
             layer.upstream_processed = True
@@ -561,6 +1374,7 @@ def _fake_moe_fp8_module():
             x,
             topk_weights,
             topk_ids,
+            shared_experts,
             shared_experts_input,
         ):
             return (
@@ -569,12 +1383,34 @@ def _fake_moe_fp8_module():
                 x,
                 topk_weights,
                 topk_ids,
+                shared_experts,
                 shared_experts_input,
             )
 
     return _module(
         patch_compressed_tensors_moe_w8a8_fp8.TARGET_MODULE,
         CompressedTensorsW8A8Fp8MoEMethod=CompressedTensorsW8A8Fp8MoEMethod,
+        QuantizationStrategy=SimpleNamespace(
+            CHANNEL=channel,
+            TOKEN=token,
+            TENSOR=tensor,
+        ),
+    )
+
+
+def _channel_fp8_moe_args(module: ModuleType) -> tuple[object, object]:
+    strategy = module.QuantizationStrategy
+    return (
+        SimpleNamespace(strategy=strategy.CHANNEL),
+        SimpleNamespace(strategy=strategy.TOKEN),
+    )
+
+
+def _tensor_fp8_moe_args(module: ModuleType) -> tuple[object, object]:
+    strategy = module.QuantizationStrategy
+    return (
+        SimpleNamespace(strategy=strategy.TENSOR),
+        SimpleNamespace(strategy=strategy.TENSOR),
     )
 
 
@@ -594,26 +1430,113 @@ def _fp8_moe_layer() -> SimpleNamespace:
     )
 
 
-def test_moe_fp8_feature_off_delegates_exactly(monkeypatch: pytest.MonkeyPatch):
+def test_moe_fp8_target_triton_owns_process_and_apply(
+    monkeypatch: pytest.MonkeyPatch,
+):
     module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    target_process = method_class.process_weights_after_loading
+    target_apply = method_class.apply
     monkeypatch.setattr(
         patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_requested",
-        lambda: False,
+        "_aiter_moe_state",
+        lambda: (False, False),
     )
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is True
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is False
-    method = module.CompressedTensorsW8A8Fp8MoEMethod(
-        object(), object(), SimpleNamespace(disable_inplace=False)
+    assert method_class.process_weights_after_loading is target_process
+    assert method_class.apply is target_apply
+    assert not hasattr(method_class, "_get_aiter_moe_runtime_config")
+    assert not hasattr(method_class, "_get_aiter_weights_for_solution")
+
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="triton"),
     )
     layer = _fp8_moe_layer()
+    method.process_weights_after_loading(layer)
+    assert layer.upstream_processed is True
     x = torch.ones(2, 4)
     weights = torch.ones(2, 2)
     ids = torch.zeros(2, 2, dtype=torch.int64)
-    result = method.apply(layer, x, weights, ids, None)
-    assert result == ("upstream", layer, x, weights, ids, None)
-    with pytest.raises(RuntimeError, match="require the HCU AITER"):
-        method.apply(layer, x, weights, ids, None, torch.ones_like(x), None)
+    shared = object()
+    result = method.apply(layer, x, weights, ids, shared, None)
+    assert result == ("upstream", layer, x, weights, ids, shared, None)
+    assert method_class.init_calls == [method.moe]
+
+
+@pytest.mark.parametrize(
+    ("target_aiter", "hcu_aiter"),
+    [(False, True), (True, False), (True, True)],
+)
+def test_moe_fp8_rejects_every_aiter_half_state_before_target_init(
+    monkeypatch: pytest.MonkeyPatch,
+    target_aiter: bool,
+    hcu_aiter: bool,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_w8a8_fp8,
+        "_aiter_moe_state",
+        lambda: (target_aiter, hcu_aiter),
+    )
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    with pytest.raises(RuntimeError, match="requires VLLM_ROCM_USE_AITER_MOE=0"):
+        method_class(
+            *_channel_fp8_moe_args(module),
+            SimpleNamespace(moe_backend="triton"),
+        )
+    assert method_class.init_calls == []
+
+
+def test_moe_fp8_requires_explicit_triton_and_checks_target_selection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_w8a8_fp8,
+        "_aiter_moe_state",
+        lambda: (False, False),
+    )
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    with pytest.raises(RuntimeError, match="--moe-backend triton"):
+        method_class(
+            *_channel_fp8_moe_args(module),
+            SimpleNamespace(moe_backend="auto"),
+        )
+    assert method_class.init_calls == []
+
+    method_class.selected_backend = "AITER"
+    with pytest.raises(RuntimeError, match="selected='AITER'"):
+        method_class(
+            *_channel_fp8_moe_args(module),
+            SimpleNamespace(moe_backend="triton"),
+        )
+    assert len(method_class.init_calls) == 1
+
+
+def test_moe_fp8_non_channel_routes_delegate_target_without_triton_policy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_w8a8_fp8,
+        "_aiter_moe_state",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("non-Channel route must not read Channel policy flags")
+        ),
+    )
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_tensor_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="auto"),
+    )
+    assert method.fp8_backend.value == "AITER"
+    assert len(method_class.init_calls) == 1
 
 
 def test_moe_fp8_aiter_config_is_layer_aware_and_cached(
@@ -695,34 +1618,16 @@ def test_moe_fp8_moe_c_shuffle_invalidates_on_weight_change(
     assert calls == ["w1", "w2", "w1", "w2"]
 
 
-def test_moe_fp8_prequantized_inputs_are_paired(monkeypatch: pytest.MonkeyPatch):
-    module = _fake_moe_fp8_module()
-    monkeypatch.setattr(
-        patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_requested",
-        lambda: True,
-    )
-    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    method = module.CompressedTensorsW8A8Fp8MoEMethod(
-        object(), object(), SimpleNamespace(disable_inplace=False)
-    )
-    x = torch.ones(2, 4)
-    with pytest.raises(
-        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
-        match="i_q and i_s together",
-    ):
-        method.apply(
-            _fp8_moe_layer(),
-            x,
-            torch.ones(2, 2),
-            torch.zeros(2, 2, dtype=torch.int64),
-            None,
-            torch.ones_like(x),
-            None,
-        )
+def test_moe_fp8_hcu_aiter_flag_defaults_off(monkeypatch: pytest.MonkeyPatch):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.delenv("VLLM_HCU_USE_AITER_W8A8_FP8_MOE", raising=False)
+    assert henvs.VLLM_HCU_USE_AITER_W8A8_FP8_MOE is False
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_W8A8_FP8_MOE", "1")
+    assert henvs.VLLM_HCU_USE_AITER_W8A8_FP8_MOE is True
 
 
-def test_moe_fp8_aiter_path_and_shared_expert_guard(
+def test_moe_fp8_aiter_path_accepts_v025_shared_expert_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
     kernel_calls: list[dict[str, object]] = []
@@ -747,8 +1652,12 @@ def test_moe_fp8_aiter_path_and_shared_expert_guard(
             aiter_moe=aiter_moe,
         ),
     )
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+
+    assert "disable_inplace" not in FusedMoEConfig.__dataclass_fields__
+    target_moe_config = object.__new__(FusedMoEConfig)
     method = SimpleNamespace(
-        moe=SimpleNamespace(disable_inplace=True),
+        moe=target_moe_config,
         _hcu_aiter_moe_config_cache={},
     )
     layer = _fp8_moe_layer()
@@ -756,26 +1665,44 @@ def test_moe_fp8_aiter_path_and_shared_expert_guard(
     weights = torch.ones(2, 2)
     ids = torch.zeros(2, 2, dtype=torch.int64)
     output = compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
-        method, layer, x, weights, ids, None
+        method, layer, x, weights, ids, None, None
     )
     torch.testing.assert_close(output, torch.full((2, 4), 7.0))
     assert kernel_calls[0]["hidden_states"] is x
     assert kernel_calls[0]["inplace"] is False
     assert kernel_calls[0]["topk_ids"].dtype is torch.int32
+    shared = object()
+    output_with_shared_contract = (
+        compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            method, layer, x, weights, ids, shared, x
+        )
+    )
+    torch.testing.assert_close(
+        output_with_shared_contract, torch.full((2, 4), 7.0)
+    )
+    method.moe = None
     with pytest.raises(
         compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
-        match="shared_experts_input",
+        match="vLLM v0.25 MoE configuration",
     ):
         compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
-            method, layer, x, weights, ids, x
+            method, layer, x, weights, ids, None, None
         )
 
 
-def test_moe_fp8_dpsk_backend_postprocesses_hcu_experts():
+def test_moe_fp8_target_process_has_no_hcu_dpsk_postprocess(
+    monkeypatch: pytest.MonkeyPatch,
+):
     module = _fake_moe_fp8_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_w8a8_fp8,
+        "_aiter_moe_state",
+        lambda: (False, False),
+    )
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
     method = module.CompressedTensorsW8A8Fp8MoEMethod(
-        object(), object(), SimpleNamespace(disable_inplace=False)
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="triton"),
     )
     processed: list[object] = []
     experts = SimpleNamespace(
@@ -788,7 +1715,7 @@ def test_moe_fp8_dpsk_backend_postprocesses_hcu_experts():
     layer = _fp8_moe_layer()
     method.process_weights_after_loading(layer)
     assert layer.upstream_processed is True
-    assert processed == [layer]
+    assert processed == []
 
 
 def _fake_moe_wna16_module():
@@ -949,7 +1876,11 @@ def _fake_fp8_scheme_module():
 
     class CompressedTensorsW8A8Fp8:
         def process_weights_after_loading(self, layer):
-            layer.weight = torch.nn.Parameter(layer.weight.t().contiguous())
+            layer.weight = torch.nn.Parameter(
+                layer.weight.t(), requires_grad=False
+            )
+            layer.weight.input_dim = 0
+            layer.weight.output_dim = 1
 
         def apply_weights(self, layer, x, bias=None):
             return self.fp8_linear.apply_weights(layer, x, bias)
@@ -963,40 +1894,44 @@ def _fake_fp8_scheme_module():
 
 def test_fp8_channel_weight_layout_requires_hcu_kernel(monkeypatch: pytest.MonkeyPatch):
     module, channel = _fake_fp8_scheme_module()
-    monkeypatch.setattr(
-        patch_compressed_tensors_w8a8_fp8,
-        "_custom_quantization_enabled",
-        lambda: True,
-    )
     patch_compressed_tensors_w8a8_fp8.apply_to_module(module)
     scheme = module.CompressedTensorsW8A8Fp8()
     scheme.strategy = channel
     scheme.fp8_linear = object()
-    with pytest.raises(RuntimeError, match="adapter is not active"):
+    with pytest.raises(RuntimeError, match="target Triton scaled-mm adapter"):
         scheme.process_weights_after_loading(SimpleNamespace(weight=torch.ones(2, 3)))
 
 
-def test_fp8_adapter_resolves_hcu_flag_lazily(monkeypatch: pytest.MonkeyPatch):
+def test_fp8_target_triton_route_is_independent_of_general_custom_gemm_flag(
+    monkeypatch: pytest.MonkeyPatch,
+):
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", False)
-    assert patch_compressed_tensors_w8a8_fp8._custom_quantization_enabled() is False
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", True)
-    assert patch_compressed_tensors_w8a8_fp8._custom_quantization_enabled() is True
+    module, channel = _fake_fp8_scheme_module()
+    patch_compressed_tensors_w8a8_fp8.apply_to_module(module)
+
+    class Kernel:
+        _hcu_fp8_patch_applied = True
+        _hcu_fp8_backend = "target-triton"
+
+    scheme = module.CompressedTensorsW8A8Fp8()
+    scheme.strategy = channel
+    scheme.fp8_linear = Kernel()
+    layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
+    scheme.process_weights_after_loading(layer)
+    assert layer.weight.shape == (3, 2)
+    assert layer.weight.stride() == (1, 3)
 
 
 def test_fp8_scheme_forwards_prequantized_input(monkeypatch: pytest.MonkeyPatch):
     module, channel = _fake_fp8_scheme_module()
-    monkeypatch.setattr(
-        patch_compressed_tensors_w8a8_fp8,
-        "_custom_quantization_enabled",
-        lambda: True,
-    )
     patch_compressed_tensors_w8a8_fp8.apply_to_module(module)
     calls: list[tuple[object, ...]] = []
 
     class Kernel:
         _hcu_fp8_patch_applied = True
+        _hcu_fp8_backend = "target-triton"
 
         def supports_quanted_inputs(self):
             return True
@@ -1011,7 +1946,10 @@ def test_fp8_scheme_forwards_prequantized_input(monkeypatch: pytest.MonkeyPatch)
     layer = SimpleNamespace(weight=torch.nn.Parameter(torch.arange(6.0).view(2, 3)))
     original = layer.weight.detach().clone()
     scheme.process_weights_after_loading(layer)
-    torch.testing.assert_close(layer.weight, original)
+    torch.testing.assert_close(layer.weight, original.t())
+    assert layer.weight.stride() == (1, 3)
+    assert layer.weight.input_dim == 0 and layer.weight.output_dim == 1
+    assert scheme.supports_quanted_inputs() is True
     pair = (torch.ones(1, 3, dtype=torch.int8), torch.ones(1, 1))
     assert (
         scheme.apply_weights(layer, torch.ones(1, 3), x_and_scale_quanted=pair)

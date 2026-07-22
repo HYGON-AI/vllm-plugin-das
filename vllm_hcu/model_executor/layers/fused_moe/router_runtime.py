@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU router implementations used by the v0.21 runtime adapters."""
+"""HCU router implementations used by the v0.25 runtime adapters."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ def eplb_map_to_physical_and_record(
     logical_to_physical_map,
     logical_replica_count,
     record_enabled,
+    num_unpadded_tokens=None,
 ):
     from vllm_hcu.platforms import envs as henvs
 
@@ -22,6 +23,7 @@ def eplb_map_to_physical_and_record(
             logical_to_physical_map,
             logical_replica_count,
             record_enabled,
+            num_unpadded_tokens,
         )
     topk_shape = topk_ids.shape
     flat = topk_ids.reshape(-1)
@@ -49,6 +51,10 @@ def eplb_map_to_physical_and_record(
     increments = valid_physical.to(expert_load_view.dtype) * record_enabled.to(
         expert_load_view.dtype
     )
+    if num_unpadded_tokens is not None:
+        increments = increments * (
+            token_idx < num_unpadded_tokens.to(token_idx.device)
+        ).to(expert_load_view.dtype)
     expert_load_view.scatter_add_(0, safe_physical, increments)
     return physical.reshape(topk_shape)
 

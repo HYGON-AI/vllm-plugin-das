@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """HCU-owned compressed-tensors MoE runtime helpers.
 
-The vLLM-facing adapters only validate and wrap the audited v0.21 methods.
+The vLLM-facing adapters only validate and wrap the audited target methods.
 All AITER configuration, weight-layout, and zero-point behavior lives here so
 that no vLLM source file needs to be rewritten.
 """
@@ -198,6 +198,7 @@ def apply_aiter_w8a8_fp8_moe(
     x: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    shared_experts: object | None,
     shared_experts_input: torch.Tensor | None,
     i_q: torch.Tensor | None = None,
     i_s: torch.Tensor | None = None,
@@ -208,11 +209,14 @@ def apply_aiter_w8a8_fp8_moe(
         raise HcuCompressedTensorsMoeError(
             "AITER FP8-W8A8 MoE requires i_q and i_s together"
         )
-    if shared_experts_input is not None:
+    if getattr(method, "moe", None) is None:
         raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE cannot consume shared_experts_input; "
-            "select a backend with shared-expert support"
+            "AITER FP8-W8A8 MoE requires the vLLM v0.25 MoE configuration"
         )
+    # vLLM v0.25 passes both objects through the quant-method contract.  The
+    # HCU MoERunner owns shared-expert launch/stream ordering around this
+    # routed-expert kernel, so this backend must accept (but not execute) them.
+    del shared_experts, shared_experts_input
     if bool(getattr(layer, "apply_router_weight_on_input", False)):
         raise HcuCompressedTensorsMoeError(
             "AITER FP8-W8A8 MoE does not support "
@@ -248,12 +252,6 @@ def apply_aiter_w8a8_fp8_moe(
     activation = getattr(getattr(layer, "activation", None), "value", None)
     if activation is None:
         activation = getattr(layer, "activation", None)
-    moe = getattr(method, "moe", None)
-    if moe is None or not hasattr(moe, "disable_inplace"):
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE requires the vLLM MoE configuration"
-        )
-
     return aiter_moe(
         hidden_states=x if i_q is None else i_q,
         w1=w1,
@@ -261,7 +259,10 @@ def apply_aiter_w8a8_fp8_moe(
         topk_weights=topk_weights.to(torch.float32),
         topk_ids=topk_ids.to(torch.int32),
         moe_config=moe_config,
-        inplace=not bool(moe.disable_inplace),
+        # vLLM v0.25 removed FusedMoEConfig.disable_inplace together with
+        # the in-place fused-experts mechanism.  Preserve the target contract
+        # and keep x available to the runner/shared-expert lifecycle.
+        inplace=False,
         activation=activation,
         w1_scale=_required_tensor(layer, "w13_weight_scale"),
         w2_scale=_required_tensor(layer, "w2_weight_scale"),

@@ -23,7 +23,7 @@ def apply_to_module(module: ModuleType) -> bool:
         original,
         TARGETS[0],
         (
-            "hidden_states", "w1", "w2", "topk_weights", "topk_ids", "inplace",
+            "hidden_states", "w1", "w2", "topk_weights", "topk_ids",
             "activation", "apply_router_weight_on_input", "use_fp8_w8a8",
             "use_int8_w8a8", "use_int8_w8a16", "use_int4_w4a16",
             "ocp_mx_scheme", "per_channel_quant", "global_num_experts",
@@ -39,7 +39,6 @@ def apply_to_module(module: ModuleType) -> bool:
         w2,
         topk_weights,
         topk_ids,
-        inplace,
         activation="silu",
         apply_router_weight_on_input=False,
         use_fp8_w8a8=False,
@@ -99,7 +98,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     topk_weights,
                     topk_ids,
                     moe_config,
-                    inplace and not target.disable_inplace(),
+                    False,
                     activation,
                     w1_scale,
                     w2_scale,
@@ -112,7 +111,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     expert_map,
                 )
         return original(
-            hidden_states, w1, w2, topk_weights, topk_ids, inplace, activation,
+            hidden_states, w1, w2, topk_weights, topk_ids, activation,
             apply_router_weight_on_input, use_fp8_w8a8, use_int8_w8a8,
             use_int8_w8a16, use_int4_w4a16, ocp_mx_scheme, per_channel_quant,
             global_num_experts, expert_map, w1_scale, w2_scale, w1_zp, w2_zp,

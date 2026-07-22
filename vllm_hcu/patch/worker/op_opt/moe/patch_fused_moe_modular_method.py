@@ -28,26 +28,25 @@ def apply_to_module(module: ModuleType) -> bool:
         make,
         TARGETS[0],
         (
-            "moe_layer",
+            "routed_experts",
             "old_quant_method",
             "prepare_finalize",
-            "shared_experts",
-            "inplace",
         ),
     )
     require_parameter_names(
         method_apply,
         TARGETS[1],
-        ("self", "layer", "x", "topk_weights", "topk_ids", "shared_experts_input"),
+        (
+            "self", "layer", "x", "topk_weights", "topk_ids",
+            "shared_experts", "shared_experts_input",
+        ),
     )
 
     @functools.wraps(make)
-    def hcu_make(moe_layer, old_quant_method, prepare_finalize, shared_experts, inplace=False):
+    def hcu_make(routed_experts, old_quant_method, prepare_finalize):
         kernel = target.FusedMoEKernel(
             prepare_finalize,
-            old_quant_method.select_gemm_impl(prepare_finalize, moe_layer),
-            shared_experts=shared_experts,
-            inplace=inplace,
+            old_quant_method.select_gemm_impl(prepare_finalize, routed_experts),
             N=getattr(old_quant_method, "N", -1),
             K=getattr(old_quant_method, "K", -1),
         )
@@ -60,13 +59,14 @@ def apply_to_module(module: ModuleType) -> bool:
         x,
         topk_weights,
         topk_ids,
+        shared_experts,
         shared_experts_input,
         use_nn_moe=False,
         i_q=None,
         i_s=None,
     ):
         if use_nn_moe:
-            raise RuntimeError("HCU v0.21 modular MoE does not support use_nn_moe=True")
+            raise RuntimeError("HCU v0.25 modular MoE does not support use_nn_moe=True")
         if (i_q is None) != (i_s is None):
             raise ValueError("HCU modular MoE requires i_q and i_s together")
         if self.moe_kernel is None:
@@ -80,7 +80,8 @@ def apply_to_module(module: ModuleType) -> bool:
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=None if self.disable_expert_map else layer.expert_map,
+            expert_map=layer.expert_map,
+            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
             quanted_hidden_states=i_q,
             scale=i_s,

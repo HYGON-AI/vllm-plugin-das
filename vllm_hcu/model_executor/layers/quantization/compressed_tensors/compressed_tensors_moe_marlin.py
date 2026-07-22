@@ -55,7 +55,7 @@ CompressedTensorsW8A8FP8MarlinMoEMethod 类：
 import enum
 import torch
 from enum import Enum
-from typing import Callable, Optional
+from typing import Optional
 from compressed_tensors.quantization import (QuantizationStrategy)
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -64,8 +64,9 @@ from vllm.logger import init_logger
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_ep_group, get_dp_group
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE, FusedMoEActivationFormat, FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported, FusedMoEConfig)
+    FusedMoEActivationFormat, FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported, FusedMoEConfig, RoutedExperts,
+    SharedExperts)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
     weight8bit_nt_kpack2_marlin2,
@@ -76,14 +77,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEMethodBase,
     FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
     FusedMoeWeightScaleSupported,
 )
-from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
-
 logger = init_logger(__name__)
 
 __all__ = [
@@ -282,6 +280,15 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.use_deepep:
             # FP8 DeepEP (HT + LL): pack full [E, N, K] -> 6D layout.
+            try:
+                from deepgemm.m_group_gemm import (
+                    pack_int8_weight_enk_to_w6_low_latency,
+                )
+            except ModuleNotFoundError as error:
+                raise RuntimeError(
+                    "HCU FP8 DeepEP weight packing requires the DCU-specific "
+                    "deepgemm package; install the matching proprietary wheel"
+                ) from error
             w1_marlin = pack_int8_weight_enk_to_w6_low_latency(layer.w13_weight)
             w2_marlin = pack_int8_weight_enk_to_w6_low_latency(layer.w2_weight)
             layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
@@ -338,7 +345,6 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            use_nn_moe=False,
             i_q=i_q,
             i_s=i_s,
             shared_output=shared_output,
@@ -346,40 +352,29 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
 
     def apply(
             self,
-            layer: torch.nn.Module,
+            layer: RoutedExperts,
             x: torch.Tensor,
             topk_weights: torch.Tensor,
             topk_ids: torch.Tensor,
-            global_num_experts: int = -1,
-            expert_map: Optional[torch.Tensor] = None,
-            custom_routing_function: Optional[Callable] = None,
-            scoring_func: str = "softmax",
-            e_score_correction_bias: Optional[torch.Tensor] = None,
-            apply_router_weight_on_input: bool = False,
-            activation: str = "silu",
-            enable_eplb: bool = False,
-            shared_experts_input: torch.Tensor | None = None,
-            use_nn_moe: Optional[bool] = False,
-            routed_scaling_factor: Optional[float] = None,
-            use_fused_gate: Optional[bool] = False,
-            expert_load_view: Optional[torch.Tensor] = None,
-            logical_to_physical_map: Optional[torch.Tensor] = None,
-            logical_replica_count: Optional[torch.Tensor] = None,
-            shared_output: Optional[torch.Tensor] = None,
+            shared_experts: SharedExperts | None,
+            shared_experts_input: torch.Tensor | None,
             i_q: torch.Tensor | None = None,
             i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # HCU's MoERunner executes shared experts on its managed stream and
+        # combines them after the routed kernel returns.
+        del shared_experts, shared_experts_input
         return self.fused_experts(
             layer=layer,
             x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            activation=activation,
-            routed_scaling_factor=routed_scaling_factor,
-            shared_output=shared_output,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            activation=layer.activation.value,
+            routed_scaling_factor=1.0,
+            shared_output=None,
             i_q=i_q,
             i_s=i_s, )
 
@@ -412,16 +407,14 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
                 max_num_tokens=max_num_tokens_per_rank,
                 num_dispatchers=prepare_finalize.num_dispatchers(),
                 quant_config=self.moe_quant_config,
-                N=self.N,
-                K=self.K
             )
 
         else:
             logger.debug("DeepGemmExperts(%s)", self.__class__.__name__)
-            return DeepGemmExperts(moe_config=self.moe,
-                                   quant_config=self.moe_quant_config,
-                                   N=self.N,
-                                   K=self.K)
+            return DeepGemmExperts(
+                moe_config=self.moe,
+                quant_config=self.moe_quant_config,
+            )
 
 
 class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
@@ -599,7 +592,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     # ── AITER W8A8 MoE runtime helpers ───────────────────────────────
     def _get_aiter_moe_runtime_config(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
@@ -638,7 +631,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
     def _get_aiter_weights_for_solution(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         solution_type: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return weights, optionally shuffled for MoE_C solution type."""
@@ -671,17 +664,18 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     # ── apply ───────────────────────────────────────────────────────
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None = None,
-        use_nn_moe: bool | None = False,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
         i_q: torch.Tensor | None = None,
         i_s: torch.Tensor | None = None,
-        shared_output: Optional[torch.Tensor] = None,
-        routed_scaling_factor: Optional[float] = 1.0,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        # HCU's MoERunner executes shared experts on its managed stream and
+        # combines them after the routed kernel returns.
+        del shared_experts, shared_experts_input
         # AITER W8A8 MoE fast-path
         if _is_hcu_aiter_w8a8_moe_requested():
             from aiter.moe import aiter_moe
@@ -711,7 +705,10 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 topk_weights=topk_weights.to(torch.float32),
                 topk_ids=topk_ids.to(torch.int32),
                 moe_config=moe_config,
-                inplace=not self.moe.disable_inplace,
+                # vLLM v0.25 removed FusedMoEConfig.disable_inplace and its
+                # fused-experts in-place contract.  This retained HCU AITER
+                # backend must therefore return a distinct output tensor.
+                inplace=False,
                 activation=layer.activation.value,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
@@ -722,14 +719,8 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 block_shape=None,
                 global_num_experts=layer.global_num_experts,
                 expert_map=layer.expert_map,
-                routed_scaling_factor=(
-                    routed_scaling_factor
-                    if routed_scaling_factor is not None
-                    else 1.0
-                ),
+                routed_scaling_factor=1.0,
             )
-            if shared_output is not None:
-                output = output + shared_output
             return output
 
         # Default Marlin INT8 path
@@ -753,11 +744,10 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            use_nn_moe=False,
             i_q=i_q,
             i_s=i_s,
-            shared_output=shared_output,
-            routed_scaling_factor=routed_scaling_factor,
+            shared_output=None,
+            routed_scaling_factor=1.0,
         )
 
     def select_gemm_impl(
@@ -785,13 +775,11 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 max_num_tokens=max_num_tokens_per_rank,
                 num_dispatchers=prepare_finalize.num_dispatchers(),
                 quant_config=self.moe_quant_config,
-                N=self.N,
-                K=self.K
             )
 
         else:
             logger.debug("DeepGemmExperts(%s)", self.__class__.__name__)
-            return DeepGemmExperts(moe_config=self.moe,
-                                   quant_config=self.moe_quant_config,
-                                   N=self.N,
-                                   K=self.K)
+            return DeepGemmExperts(
+                moe_config=self.moe,
+                quant_config=self.moe_quant_config,
+            )

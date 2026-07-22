@@ -30,6 +30,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "logical_to_physical_map",
             "logical_replica_count",
             "record_enabled",
+            "num_unpadded_tokens",
         ),
     )
 
@@ -40,10 +41,11 @@ def apply_to_module(module: ModuleType) -> bool:
         logical_to_physical_map,
         logical_replica_count,
         record_enabled,
+        num_unpadded_tokens=None,
     ):
         return router_runtime.eplb_map_to_physical_and_record(
             target, original, topk_ids, expert_load_view, logical_to_physical_map,
-            logical_replica_count, record_enabled,
+            logical_replica_count, record_enabled, num_unpadded_tokens,
         )
 
     target._vllm_hcu_original_eplb_map_to_physical_and_record = original

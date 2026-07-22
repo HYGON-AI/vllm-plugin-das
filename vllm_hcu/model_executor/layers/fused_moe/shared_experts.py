@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HCU-owned shared-expert execution for the v0.21 MoE runner."""
+"""HCU-owned v0.25 shared-expert execution."""
 
 import inspect
+from collections.abc import Callable
 from enum import IntEnum
 
 import torch
@@ -12,9 +13,6 @@ import vllm_hcu.platforms.envs as henvs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
-)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizeMethodBase,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -42,21 +40,15 @@ class SharedExpertsOrder(IntEnum):
     MULTI_STREAM_OVERLAPPED = (3,)
 
 
-class SharedExperts:
+class SharedExperts(torch.nn.Module):
     def __init__(
         self,
         layer: torch.nn.Module,
         moe_config: FusedMoEConfig,
-        quant_method: QuantizeMethodBase,
         enable_dbo: bool,
+        mk_can_overlap_shared_experts: Callable[[], bool],
     ):
-        from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-            FusedMoEMethodBase,
-        )
-
-        # quant_method must be a FusedMoEMethodBase but we can't use the type
-        # due to circular imports.
-        assert isinstance(quant_method, FusedMoEMethodBase)
+        super().__init__()
 
         # The SharedExperts need to handle DBO since they can be called from
         # an MK's finalize method.  We keep a list of outputs indexed by current
@@ -67,7 +59,8 @@ class SharedExperts:
         self._output_pending_on_stream: list[bool] = [False, False]
         self._layer = layer
         self._moe_config = moe_config
-        self._quant_method = quant_method
+
+        self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -83,10 +76,18 @@ class SharedExperts:
             if self._stream is not None:
                 logger.debug_once("Enabled separate cuda stream for MoE shared_experts")
 
+    # TODO(bnell): Hack for elastic_ep. Get rid of this
+    def _set_moe_config(self, new_moe_config: FusedMoEConfig):
+        self._moe_config = new_moe_config
+
     def _layer_supports_x_and_scale_quanted(self) -> bool:
         cached = getattr(self, "_supports_x_and_scale_quanted", None)
         if cached is not None:
             return cached
+        hcu_forward = getattr(self._layer, "_forward_with_hcu_quanted", None)
+        if callable(hcu_forward):
+            self._supports_x_and_scale_quanted = True
+            return True
         forward = getattr(self._layer, "forward", None)
         if forward is None:
             self._supports_x_and_scale_quanted = False
@@ -111,7 +112,15 @@ class SharedExperts:
                     f"{type(self._layer).__name__}.forward does not accept "
                     "x_and_scale_quanted"
                 )
-            return self._layer(shared_experts_input, x_and_scale_quanted=x_and_scale_quanted)
+            hcu_forward = getattr(
+                self._layer, "_forward_with_hcu_quanted", None
+            )
+            if callable(hcu_forward):
+                return hcu_forward(shared_experts_input, x_and_scale_quanted)
+            return self._layer(
+                shared_experts_input,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         return self._layer(shared_experts_input)
 
     @property
@@ -121,7 +130,6 @@ class SharedExperts:
             and henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE
         ):
             return False
-
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
         #   - we are using flashinfer with DP, since there nothing to gain
@@ -153,20 +161,15 @@ class SharedExperts:
         should_run_shared_in_aux_stream = self._should_run_shared_in_aux_stream(
             hidden_states
         )
-
-        if (
-            force_stream
-            and should_run_shared_in_aux_stream
-        ):
+        if force_stream and should_run_shared_in_aux_stream:
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
-        if self._quant_method.mk_owns_shared_expert:
+        if self._mk_can_overlap_shared_experts():
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
         if should_run_shared_in_aux_stream:
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
-        else:
-            return SharedExpertsOrder.NO_OVERLAP
+        return SharedExpertsOrder.NO_OVERLAP
 
     def _should_run_shared_in_aux_stream(
         self,
@@ -188,12 +191,10 @@ class SharedExperts:
 
         if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             assert self._stream is not None
-            assert self._moe_config.disable_inplace
-            assert self._output[self._output_idx] is None
 
             # Record that the clone will be used by shared_experts_stream
             # to avoid gc issue from deallocation of hidden_states_clone
-            # See torch.Tensor.record_stream for lifetime semantics.
+            # For more details: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501
             # NOTE: We don't need shared_output.record_stream(current_stream())
             # because we synch the streams before using shared_output.
             shared_experts_input.record_stream(self._stream)
@@ -225,17 +226,11 @@ class SharedExperts:
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         assert self._stream is not None
-
-        # Launch shared experts in parallel on a separate stream. The current
-        # stream waits only when the shared output is consumed.
         with torch.cuda.stream(self._stream):
-            if x_and_scale_quanted is not None:
-                self._output[self._output_idx] = self._run_layer(
-                    shared_experts_input,
-                    x_and_scale_quanted=x_and_scale_quanted,
-                )
-            else:
-                self._output[self._output_idx] = self._run_layer(shared_experts_input)
+            self._output[self._output_idx] = self._run_layer(
+                shared_experts_input,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         self._output_pending_on_stream[self._output_idx] = True
 
     def _run_in_aux_stream(
@@ -247,13 +242,10 @@ class SharedExperts:
 
         # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
-            if x_and_scale_quanted is not None:
-                output = self._run_layer(
-                    shared_experts_input,
-                    x_and_scale_quanted=x_and_scale_quanted,
-                )
-            else:
-                output = self._run_layer(shared_experts_input)
+            output = self._run_layer(
+                shared_experts_input,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         current_stream().wait_stream(self._stream)
 
         return output
@@ -273,7 +265,7 @@ class SharedExperts:
         self._output[self._output_idx] = None
         return output
 
-    def apply(
+    def forward(
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
@@ -300,12 +292,9 @@ class SharedExperts:
                 x_and_scale_quanted=x_and_scale_quanted,
             )
         else:
-            if x_and_scale_quanted is not None:
-                self._output[self._output_idx] = self._run_layer(
-                    shared_experts_input,
-                    x_and_scale_quanted=x_and_scale_quanted,
-                )
-            else:
-                self._output[self._output_idx] = self._run_layer(shared_experts_input)
+            self._output[self._output_idx] = self._run_layer(
+                shared_experts_input,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
 
         assert self._output[self._output_idx] is not None
