@@ -13,7 +13,7 @@ from vllm_hcu.patch.runtime_state import PATCH_REGISTRY, PatchStatus, run_patch
 
 
 class PatchCompatibilityError(RuntimeError):
-    """The installed vLLM target does not match the supported v0.21 API."""
+    """The installed vLLM target does not match the audited target API."""
 
 
 def load_exact_module(target: str, module: ModuleType | None) -> ModuleType:

@@ -9,7 +9,7 @@ from typing import Any
 
 
 class Stage3CompatibilityError(RuntimeError):
-    """A required vLLM v0.21 runtime target is missing or incompatible."""
+    """A required audited target vLLM runtime API is missing or incompatible."""
 
 
 def require_exact_module(module: ModuleType, expected_name: str) -> ModuleType:

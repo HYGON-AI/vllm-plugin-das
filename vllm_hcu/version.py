@@ -9,8 +9,8 @@ import importlib.metadata as importlib_metadata
 # This source constant defines the vLLM release series audited by this branch.
 # ``setup.py`` computes build provenance for wheel metadata without rewriting
 # this tracked file.
-__version__ = "0.21.0"
-__version_tuple__ = (0, 21, 0)
+__version__ = "0.25.0"
+__version_tuple__ = (0, 25, 0)
 
 
 def get_hcu_version() -> str:

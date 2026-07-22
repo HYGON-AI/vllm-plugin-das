@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict vLLM v0.21 contract checks for platform framework adapters."""
+"""Strict audited target vLLM contract checks for platform framework adapters."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 
 
 class PatchCompatibilityError(RuntimeError):
-    """The imported object is not the audited vLLM v0.21 target."""
+    """The imported object is not the audited target vLLM API."""
 
 
 def load_exact_module(target: str, module: ModuleType | None) -> ModuleType:

@@ -11,7 +11,7 @@ from typing import Any
 
 
 class PatchCompatibilityError(RuntimeError):
-    """The imported vLLM module does not expose the supported v0.21 API."""
+    """The imported vLLM module does not expose the audited target API."""
 
 
 def load_exact_module(target: str, module: ModuleType | None) -> ModuleType:

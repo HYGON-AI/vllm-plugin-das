@@ -68,7 +68,15 @@ def test_setup_version_query_keeps_provenance_without_rewriting_source(
     rocm_info.mkdir(parents=True)
     (rocm_info / "rocm_version").write_text("26.0.4\n", encoding="utf-8")
     sha = subprocess.check_output(
-        ["git", "rev-parse", "--short=7", "HEAD"],
+        [
+            "git",
+            "-c",
+            f"safe.directory={REPO_ROOT}",
+            "rev-parse",
+            "--short=7",
+            "HEAD",
+        ],
+        # The shared DCU workspace can be owned by a mounted host uid.
         cwd=REPO_ROOT,
         text=True,
     ).strip()
@@ -87,7 +95,7 @@ def test_setup_version_query_keeps_provenance_without_rewriting_source(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"0.21.0+das.{sha}.dtk2604" in result.stdout
+    assert f"0.25.0+das.{sha}.dtk2604" in result.stdout
     assert hashlib.sha256(version_file.read_bytes()).hexdigest() == before
 
 
