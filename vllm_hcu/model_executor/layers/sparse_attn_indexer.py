@@ -683,6 +683,90 @@ direct_register_custom_op(
 )
 
 
+if current_platform.is_rocm():
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_aiter_sparse_attn_indexer_fake,
+        rocm_aiter_sparse_attn_indexer_native,
+    )
+
+    def hcu_sparse_attn_indexer(
+        hidden_states: torch.Tensor,
+        k_cache_prefix: LayerNameType,
+        kv_cache: torch.Tensor,
+        q_fp8: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        quant_block_size: int,
+        scale_fmt: str | None,
+        topk_tokens: int,
+        head_dim: int,
+        max_model_len: int,
+        total_seq_lens: int,
+        topk_indices_buffer: torch.Tensor,
+        skip_k_cache_insert: bool,
+    ) -> torch.Tensor:
+        return rocm_aiter_sparse_attn_indexer_native(
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            q_fp8,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+            skip_k_cache_insert=skip_k_cache_insert,
+        )
+
+    def hcu_sparse_attn_indexer_fake(
+        hidden_states: torch.Tensor,
+        k_cache_prefix: LayerNameType,
+        kv_cache: torch.Tensor,
+        q_fp8: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        quant_block_size: int,
+        scale_fmt: str | None,
+        topk_tokens: int,
+        head_dim: int,
+        max_model_len: int,
+        total_seq_lens: int,
+        topk_indices_buffer: torch.Tensor,
+        skip_k_cache_insert: bool,
+    ) -> torch.Tensor:
+        del skip_k_cache_insert
+        return rocm_aiter_sparse_attn_indexer_fake(
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            q_fp8,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+        )
+
+    # The fallback reads ForwardContext metadata.  Keep it opaque to Dynamo
+    # and unsafe for capture while accurately declaring its buffer mutations.
+    direct_register_custom_op(
+        op_name="hcu_sparse_attn_indexer",
+        op_func=hcu_sparse_attn_indexer,
+        mutates_args=["kv_cache", "topk_indices_buffer"],
+        fake_impl=hcu_sparse_attn_indexer_fake,
+        dispatch_key=current_platform.dispatch_key,
+        tags=(torch._C.Tag.cudagraph_unsafe,),
+    )
+
+
 @CustomOp.register("sparse_attn_indexer")
 class SparseAttnIndexer(CustomOp):
     """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
@@ -846,4 +930,36 @@ class SparseAttnIndexer(CustomOp):
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "
             "Please enable aiter with VLLM_ROCM_USE_AITER=1"
+        )
+
+
+class V32SparseAttnIndexer(SparseAttnIndexer):
+    """Compile-isolated HCU fallback for V3.2/V4/GLM-5 indexers."""
+
+    def forward_hip(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ):
+        assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
+        assert isinstance(q_quant, torch.Tensor), (
+            "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
+        )
+        return torch.ops.vllm.hcu_sparse_attn_indexer(
+            hidden_states,
+            _encode_layer_name(self.k_cache.prefix),
+            self.k_cache.kv_cache,
+            q_quant,
+            k,
+            weights,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+            self.skip_k_cache_insert,
         )

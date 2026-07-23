@@ -572,7 +572,14 @@ def test_sparse_replacements_preserve_v025_definition_surface_and_signatures(
 
     target_definitions = definitions(target_tree)
     replacement_definitions = definitions(replacement_tree)
-    assert replacement_definitions.keys() == target_definitions.keys()
+    assert target_definitions.keys() <= replacement_definitions.keys()
+    hcu_owned_definitions = set(replacement_definitions).difference(
+        target_definitions
+    )
+    if replacement_relative.endswith("sparse_attn_indexer.py"):
+        assert hcu_owned_definitions == {"V32SparseAttnIndexer"}
+    else:
+        assert hcu_owned_definitions == set()
 
     for name, target_node in target_definitions.items():
         replacement_node = replacement_definitions[name]
