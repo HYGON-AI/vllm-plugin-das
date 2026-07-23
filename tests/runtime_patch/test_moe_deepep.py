@@ -239,7 +239,9 @@ def test_config_signature_drift_fails_before_mutation():
     assert not hasattr(module, "_vllm_hcu_moe_config_applied")
 
 
-def test_aiter_and_triton_expert_capability_contract():
+def test_aiter_and_triton_expert_capability_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
     class MoEActivation(Enum):
         SILU = "silu"
         GELU = "gelu"
@@ -285,6 +287,17 @@ def test_aiter_and_triton_expert_capability_contract():
         def _supports_activation(activation):
             return activation in (MoEActivation.SILU, MoEActivation.GELU)
 
+        @staticmethod
+        def _supports_current_device():
+            return False
+
+        @staticmethod
+        def is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        ):
+            del cls, moe_config, weight_key, activation_key, activation_format
+            return AiterExperts._supports_current_device(), None
+
     aiter_module = _module(
         patch_rocm_aiter_moe.TARGET_MODULE,
         IntEnum=IntEnum,
@@ -312,6 +325,28 @@ def test_aiter_and_triton_expert_capability_contract():
     )
     assert activation == aiter_module.ActivationMethod.GELU_TANH
     assert AiterExperts._supports_activation(MoEActivation.GELU_TANH) is True
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm._aiter_ops",
+        _module(
+            "vllm._aiter_ops",
+            is_aiter_found_and_supported=lambda: True,
+        ),
+    )
+    assert AiterExperts.is_supported_config(
+        AiterExperts,
+        SimpleNamespace(moe_backend="auto"),
+        None,
+        None,
+        None,
+    )[0] is False
+    assert AiterExperts.is_supported_config(
+        AiterExperts,
+        SimpleNamespace(moe_backend="aiter"),
+        None,
+        None,
+        None,
+    )[0] is True
 
     weight_key = object()
     activation_key = object()

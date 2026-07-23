@@ -28,12 +28,16 @@ _CLASS_MARKER = "_vllm_hcu_moe_wna16_applied"
 _WRAPPER_MARKER = "_vllm_hcu_moe_wna16_wrapper"
 
 
-def _aiter_requested() -> bool:
+def _aiter_requested(layer: object | None = None) -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+            is_aiter_moe_requested,
+        )
 
         return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
             henvs.VLLM_HCU_USE_AITER_W4A16_MOE
+            or is_aiter_moe_requested(getattr(layer, "moe_config", None))
         )
     except (AttributeError, ImportError) as exc:
         raise PatchCompatibilityError(
@@ -116,7 +120,7 @@ def apply_to_module(module: ModuleType) -> bool:
             params_dtype,
             **extra_weight_attrs,
         )
-        if _aiter_requested():
+        if _aiter_requested(layer):
             hcu_runtime.create_aiter_w4a16_qzeros(
                 self,
                 layer,
@@ -130,7 +134,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_get_config)
     def hcu_get_fused_moe_quant_config(self, layer):
-        if not _aiter_requested():
+        if not _aiter_requested(layer):
             return original_get_config(self, layer)
         return hcu_runtime.build_aiter_w4a16_quant_config(
             self,

@@ -11,6 +11,8 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from importlib import import_module
 from typing import Any
 
@@ -19,6 +21,49 @@ import torch
 
 class HcuAiterRuntimeError(RuntimeError):
     """An explicitly requested HCU AITER path cannot be provided."""
+
+
+_EXPLICIT_AITER_MOE: ContextVar[bool] = ContextVar(
+    "vllm_hcu_explicit_aiter_moe", default=False
+)
+
+
+def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
+    """Keep explicit ``moe_backend=aiter`` independent of auto env gates."""
+
+    if getattr(moe_config, "moe_backend", None) == "aiter":
+        return True
+    if _EXPLICIT_AITER_MOE.get():
+        return True
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if (
+            config is not None
+            and getattr(getattr(config, "kernel_config", None), "moe_backend", None)
+            == "aiter"
+        ):
+            return True
+    except (AttributeError, ImportError):
+        pass
+
+    import vllm.envs as envs
+
+    return bool(envs.VLLM_ROCM_USE_AITER) and bool(
+        envs.VLLM_ROCM_USE_AITER_MOE
+    )
+
+
+@contextmanager
+def aiter_moe_request_context(moe_config: object):
+    token = _EXPLICIT_AITER_MOE.set(
+        getattr(moe_config, "moe_backend", None) == "aiter"
+    )
+    try:
+        yield
+    finally:
+        _EXPLICIT_AITER_MOE.reset(token)
 
 
 def _import_optional_aiter_module(module_name: str) -> object | None:
@@ -383,12 +428,10 @@ def fused_moe_impl(
 ) -> torch.Tensor:
     """Select HCU's W16A16 ASM path, otherwise preserve upstream exactly."""
 
-    import vllm.envs as envs
     from aiter import QuantType
 
     use_w16a16_asm = (
-        bool(envs.VLLM_ROCM_USE_AITER)
-        and bool(envs.VLLM_ROCM_USE_AITER_MOE)
+        is_aiter_moe_requested()
         and QuantType(quant_method) == QuantType.No
         and w1_scale is None
         and w2_scale is None

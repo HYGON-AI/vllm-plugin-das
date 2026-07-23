@@ -11,8 +11,6 @@ from __future__ import annotations
 import torch
 
 from vllm_hcu.platforms import envs as henvs
-import vllm.envs as envs
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
     make_unquantized_moe_kernel,
@@ -30,8 +28,12 @@ def _copy_parameter_attrs(src: torch.nn.Parameter, dst: torch.nn.Parameter) -> N
             setattr(dst, key, value)
 
 
-def _is_hcu_aiter_moe_asm_requested() -> bool:
-    return envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MOE
+def _is_hcu_aiter_moe_asm_requested(method: object | None = None) -> bool:
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+        is_aiter_moe_requested,
+    )
+
+    return is_aiter_moe_requested(getattr(method, "moe", None))
 
 
 def _activation_name(layer: torch.nn.Module) -> str | None:
@@ -47,8 +49,8 @@ def _raise_if_aiter_moe_asm_blocked(method: object, layer: torch.nn.Module) -> N
     blockers: list[str] = []
     if not current_platform.is_rocm():
         blockers.append("current platform is not ROCm")
-    if not rocm_aiter_ops.is_fused_moe_enabled():
-        blockers.append("rocm_aiter_ops.is_fused_moe_enabled() is False")
+    if not _is_hcu_aiter_moe_asm_requested(method):
+        blockers.append("AITER MoE was not explicitly selected or enabled")
     if getattr(method, "unquantized_backend", None) != UnquantizedMoeBackend.AITER:
         blockers.append("unquantized backend is not UnquantizedMoeBackend.AITER")
     if getattr(layer, "apply_router_weight_on_input", False):
@@ -99,7 +101,7 @@ class HcuUnquantizedFusedMoEMethod(_Original):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not _is_hcu_aiter_moe_asm_requested():
+        if not _is_hcu_aiter_moe_asm_requested(self):
             return super().process_weights_after_loading(layer)
 
         if getattr(layer, "_hcu_aiter_moe_asm_packed", False):

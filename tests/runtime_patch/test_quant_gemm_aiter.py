@@ -868,6 +868,53 @@ def test_aiter_w16a16_asm_selection(monkeypatch: pytest.MonkeyPatch):
         )
 
 
+def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    _install_fake_vllm_envs(
+        monkeypatch,
+        VLLM_ROCM_USE_AITER=False,
+        VLLM_ROCM_USE_AITER_MOE=False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            fused_experts_asm_impl=lambda *args, **kwargs: (args, kwargs),
+        ),
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", False)
+    x = torch.ones(2, 4)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    topk_weight = torch.ones(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int64)
+
+    with aiter_runtime.aiter_moe_request_context(
+        SimpleNamespace(moe_backend="aiter")
+    ):
+        args, kwargs = aiter_runtime.fused_moe_impl(
+            lambda *unused: pytest.fail("explicit AITER must not delegate"),
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+        )
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            args[:5], (x, w1, w2, topk_weight, topk_ids)
+        )
+    )
+    assert kwargs["activation"] == "silu"
+
+
 def test_aiter_feature_off_delegates_v025_fused_moe_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1793,7 +1840,7 @@ def test_moe_wna16_feature_off_delegates_exactly(
     monkeypatch.setattr(
         patch_compressed_tensors_moe_wna16,
         "_aiter_requested",
-        lambda: False,
+        lambda _layer=None: False,
     )
     assert patch_compressed_tensors_moe_wna16.apply_to_module(module) is True
     assert patch_compressed_tensors_moe_wna16.apply_to_module(module) is False
@@ -1817,7 +1864,7 @@ def test_moe_wna16_allocates_correct_initialized_qzeros(
     monkeypatch.setattr(
         patch_compressed_tensors_moe_wna16,
         "_aiter_requested",
-        lambda: True,
+        lambda _layer=None: True,
     )
     patch_compressed_tensors_moe_wna16.apply_to_module(module)
     method = _wna16_method(module, gated=gated)
@@ -1844,7 +1891,7 @@ def test_moe_wna16_quant_config_requires_registered_qzeros(
     monkeypatch.setattr(
         patch_compressed_tensors_moe_wna16,
         "_aiter_requested",
-        lambda: True,
+        lambda _layer=None: True,
     )
     patch_compressed_tensors_moe_wna16.apply_to_module(module)
     method = _wna16_method(module, gated=True)

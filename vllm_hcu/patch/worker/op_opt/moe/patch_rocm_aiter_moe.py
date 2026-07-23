@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import types
+from contextvars import ContextVar
 from types import ModuleType, SimpleNamespace
 
 from ._common import (
@@ -21,8 +22,13 @@ TARGETS = (
     f"{TARGET_MODULE}.ActivationMethod",
     f"{TARGET_MODULE}.rocm_aiter_fused_experts",
     f"{TARGET_MODULE}.AiterExperts._supports_activation",
+    f"{TARGET_MODULE}.AiterExperts._supports_current_device",
+    f"{TARGET_MODULE}.AiterExperts.is_supported_config",
 )
 _MARKER = "_vllm_hcu_aiter_gelu_tanh_applied"
+_EXPLICIT_CAPABILITY_CHECK: ContextVar[bool] = ContextVar(
+    "vllm_hcu_aiter_explicit_capability_check", default=False
+)
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -33,6 +39,12 @@ def apply_to_module(module: ModuleType) -> bool:
     fused_experts = require_callable(target, "rocm_aiter_fused_experts", TARGETS[1])
     experts_class = require_class(target, "AiterExperts", TARGETS[2].rsplit(".", 1)[0])
     supports = require_callable(experts_class, "_supports_activation", TARGETS[2])
+    supports_device = require_callable(
+        experts_class, "_supports_current_device", TARGETS[3]
+    )
+    is_supported_config = require_callable(
+        experts_class, "is_supported_config", TARGETS[4]
+    )
     require_parameter_names(
         fused_experts,
         TARGETS[1],
@@ -44,6 +56,12 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
     )
     require_parameter_names(supports, TARGETS[2], ("activation",))
+    require_parameter_names(supports_device, TARGETS[3], ())
+    require_parameter_names(
+        is_supported_config,
+        TARGETS[4],
+        ("cls", "moe_config", "weight_key", "activation_key", "activation_format"),
+    )
     values = {member.name: member.value for member in activation_method}
     if values != {"SILU": 0, "GELU": 1}:
         raise PatchCompatibilityError(
@@ -87,13 +105,43 @@ def apply_to_module(module: ModuleType) -> bool:
         activation = kwargs.get("activation")
         if activation is None and len(args) > 6:
             activation = args[6]
-        if activation == gelu_tanh:
-            return special_impl(*args, **kwargs)
-        return fused_experts(*args, **kwargs)
+        moe_config = kwargs.get("moe_config")
+        if moe_config is None and len(args) > 5:
+            moe_config = args[5]
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+            aiter_moe_request_context,
+        )
+
+        with aiter_moe_request_context(moe_config):
+            if activation == gelu_tanh:
+                return special_impl(*args, **kwargs)
+            return fused_experts(*args, **kwargs)
 
     @functools.wraps(supports)
     def hcu_supports_activation(activation):
         return activation == gelu_tanh or supports(activation)
+
+    @functools.wraps(supports_device)
+    def hcu_supports_current_device():
+        if not _EXPLICIT_CAPABILITY_CHECK.get():
+            return supports_device()
+        from vllm._aiter_ops import is_aiter_found_and_supported
+
+        return is_aiter_found_and_supported()
+
+    @functools.wraps(is_supported_config)
+    def hcu_is_supported_config(
+        cls, moe_config, weight_key, activation_key, activation_format
+    ):
+        token = _EXPLICIT_CAPABILITY_CHECK.set(
+            getattr(moe_config, "moe_backend", None) == "aiter"
+        )
+        try:
+            return is_supported_config(
+                cls, moe_config, weight_key, activation_key, activation_format
+            )
+        finally:
+            _EXPLICIT_CAPABILITY_CHECK.reset(token)
 
     target._vllm_hcu_original_activation_method = activation_method
     target.ActivationMethod = hcu_activation_method
@@ -101,6 +149,10 @@ def apply_to_module(module: ModuleType) -> bool:
     target.rocm_aiter_fused_experts = hcu_fused_experts
     experts_class._vllm_hcu_original_supports_activation = supports
     experts_class._supports_activation = staticmethod(hcu_supports_activation)
+    experts_class._vllm_hcu_original_supports_current_device = supports_device
+    experts_class._supports_current_device = staticmethod(hcu_supports_current_device)
+    experts_class._vllm_hcu_original_is_supported_config = is_supported_config
+    experts_class.is_supported_config = staticmethod(hcu_is_supported_config)
     setattr(target, _MARKER, True)
     return True
 
