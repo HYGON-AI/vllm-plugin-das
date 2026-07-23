@@ -16,6 +16,7 @@ from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
     patch_engine_core,
     patch_distributed_utils,
+    patch_kv_cache_coordinator,
     patch_kv_cache_utils,
     patch_kv_connector_factory,
     patch_mooncake_connector,
@@ -41,6 +42,7 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_mooncake_connector,
     patch_kv_connector_factory,
     patch_parallel_state,
+    patch_kv_cache_coordinator,
     patch_kv_cache_utils,
     patch_scheduler,
     patch_engine_core,

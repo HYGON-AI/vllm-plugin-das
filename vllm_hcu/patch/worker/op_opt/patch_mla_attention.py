@@ -19,6 +19,7 @@ TARGETS = (
     f"{TARGET_MODULE}.MLAAttention.process_weights_after_loading",
     f"{TARGET_MODULE}.MLACommonMetadata.__init__",
     f"{TARGET_MODULE}.MLACommonMetadataBuilder.build",
+    f"{TARGET_MODULE}.split_decodes_and_prefills",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -35,6 +36,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (cls, "process_weights_after_loading", TARGETS[2], _WRAPPER),
         (metadata_cls, "__init__", TARGETS[3], _WRAPPER),
         (builder_cls, "build", TARGETS[4], _WRAPPER),
+        (mla, "split_decodes_and_prefills", TARGETS[5], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -70,6 +72,22 @@ def apply_to_module(module: ModuleType) -> bool:
         builder, TARGETS[4],
         positional=("self", "common_prefix_len", "common_attn_metadata", "fast_build"),
         defaults={"fast_build": False},
+    )
+    split_batch = require_callable(mla, "split_decodes_and_prefills", TARGETS[5])
+    require_exact_signature(
+        split_batch,
+        TARGETS[5],
+        positional=(
+            "common_attn_metadata",
+            "decode_threshold",
+            "require_uniform",
+            "treat_short_extends_as_decodes",
+        ),
+        defaults={
+            "decode_threshold": 1,
+            "require_uniform": False,
+            "treat_short_extends_as_decodes": True,
+        },
     )
 
     @functools.wraps(original_init)
@@ -128,18 +146,42 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return result
 
-    for function in (hcu_init, hcu_forward, hcu_process, hcu_metadata_init, hcu_build):
+    @functools.wraps(split_batch)
+    def hcu_split_batch(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        del treat_short_extends_as_decodes
+        return split_batch(
+            common_attn_metadata,
+            decode_threshold,
+            require_uniform,
+            False,
+        )
+
+    for function in (
+        hcu_init,
+        hcu_forward,
+        hcu_process,
+        hcu_metadata_init,
+        hcu_build,
+        hcu_split_batch,
+    ):
         setattr(function, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
     setattr(cls, "_vllm_hcu_original_forward_impl", original_forward)
     setattr(cls, "_vllm_hcu_original_process_weights", process)
     setattr(metadata_cls, "_vllm_hcu_original_init", metadata_init)
     setattr(builder_cls, "_vllm_hcu_original_build", builder)
+    setattr(mla, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
     setattr(cls, "__init__", hcu_init)
     setattr(cls, "forward_impl", hcu_forward)
     setattr(cls, "process_weights_after_loading", hcu_process)
     setattr(metadata_cls, "__init__", hcu_metadata_init)
     setattr(builder_cls, "build", hcu_build)
+    setattr(mla, "split_decodes_and_prefills", hcu_split_batch)
     setattr(mla, _MARKER, True)
     return True
 

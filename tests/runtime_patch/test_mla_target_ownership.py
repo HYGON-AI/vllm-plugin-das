@@ -187,6 +187,24 @@ def _adapter():
 
 
 def _fake_mla_module(adapter, target_calls):
+    split_calls = []
+
+    def split_decodes_and_prefills(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        split_calls.append(
+            (
+                common_attn_metadata,
+                decode_threshold,
+                require_uniform,
+                treat_short_extends_as_decodes,
+            )
+        )
+        return treat_short_extends_as_decodes
+
     class MLAAttention:
         def __init__(
             self,
@@ -281,6 +299,8 @@ def _fake_mla_module(adapter, target_calls):
     module.MLAAttention = MLAAttention
     module.MLACommonMetadata = MLACommonMetadata
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
+    module.split_decodes_and_prefills = split_decodes_and_prefills
+    module.split_calls = split_calls
     module.current_platform = SimpleNamespace(
         is_rocm=lambda: pytest.fail(
             "feature ownership must not depend on the target platform"
@@ -374,6 +394,9 @@ def test_mla_feature_off_delegates_exact_v025_forward_on_rocm():
 
     assert instance.forward_impl(*args) == "target-v0.25"
     assert target_calls == [(instance, args)]
+    common = object()
+    assert module.split_decodes_and_prefills(common, 3, True, True) is False
+    assert module.split_calls == [(common, 3, True, False)]
 
 
 def test_mla_feature_on_uses_hcu_lightly_cp_delta(monkeypatch):

@@ -697,13 +697,77 @@ def test_causal_conv_metadata_exact_callback():
     def compute(query_start_loc_p_cpu, *, device):
         return {8: {"device": device}}, None, None
 
-    module = _module(adapter.TARGET_MODULE, compute_causal_conv1d_metadata=compute)
+    def split_batch(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        del (
+            common_attn_metadata,
+            decode_threshold,
+            require_uniform,
+            treat_short_extends_as_decodes,
+        )
+        return "official"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        compute_causal_conv1d_metadata=compute,
+        split_decodes_and_prefills=split_batch,
+    )
     assert adapter.apply_to_module(module)
     result = module.compute_causal_conv1d_metadata(
         torch.tensor([0, 2, 5]), device=torch.device("cpu")
     )
     assert result[0]["seqlens"] == [2, 3]
     assert not adapter.apply_to_module(module)
+
+
+def test_uniform_short_extends_use_prefill_classification():
+    adapter = _adapter("patch_attention_backend_utils")
+
+    def compute(query_start_loc_p_cpu, *, device):
+        return {}, None, None
+
+    def split_batch(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        del (
+            common_attn_metadata,
+            decode_threshold,
+            require_uniform,
+            treat_short_extends_as_decodes,
+        )
+        return "official"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        compute_causal_conv1d_metadata=compute,
+        split_decodes_and_prefills=split_batch,
+    )
+    adapter.apply_to_module(module)
+    common = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 2, 4]),
+        is_prefilling=torch.tensor([False, True]),
+        num_reqs=2,
+        num_actual_tokens=4,
+    )
+    assert module.split_decodes_and_prefills(
+        common,
+        decode_threshold=2,
+        require_uniform=True,
+        treat_short_extends_as_decodes=False,
+    ) == (1, 1, 2, 2)
+    assert module.split_decodes_and_prefills(
+        common,
+        decode_threshold=2,
+        require_uniform=True,
+        treat_short_extends_as_decodes=True,
+    ) == "official"
 
 
 def test_common_attention_metadata_accepts_hcu_fields_and_unpads():

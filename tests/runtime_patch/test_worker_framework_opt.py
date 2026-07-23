@@ -664,8 +664,10 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     off = module.SpecDecodeBaseProposer(_proposer_config(), "cpu", True)
     assert off.propose(1, None, None, None, None, None, None, None) == "official"
 
-    prepared, _, _ = off.prepare_inputs_padded(None, None, None)
-    assert prepared.num_kv_actual_tokens == prepared.num_actual_tokens == 7
+    common = SimpleNamespace(num_kv_actual_tokens=5)
+    prepared, _, _ = off.prepare_inputs_padded(common, None, None)
+    assert prepared.num_actual_tokens == 7
+    assert prepared.num_kv_actual_tokens == 5
 
 
 def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(

@@ -208,13 +208,14 @@ def apply_to_module(module: ModuleType) -> bool:
         spec_decode_metadata,
         valid_sampled_tokens_count,
     ):
+        num_kv_actual_tokens = common_attn_metadata.num_kv_actual_tokens
         result = original_prepare(
             self,
             common_attn_metadata,
             spec_decode_metadata,
             valid_sampled_tokens_count,
         )
-        result[0].num_kv_actual_tokens = result[0].num_actual_tokens
+        result[0].num_kv_actual_tokens = num_kv_actual_tokens
         return result
 
     @functools.wraps(original_share)

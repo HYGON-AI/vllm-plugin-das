@@ -221,6 +221,7 @@ def propose(
             raise RuntimeError("Lightly-CP metadata lost its canonical CP view")
 
     common_attn_metadata.num_actual_tokens = batch_size
+    common_attn_metadata.num_kv_actual_tokens = batch_size
     common_attn_metadata.max_query_len = 1
     common_attn_metadata.query_start_loc = proposer.arange[: batch_size + 1]
     common_attn_metadata.query_start_loc_cpu = torch.from_numpy(

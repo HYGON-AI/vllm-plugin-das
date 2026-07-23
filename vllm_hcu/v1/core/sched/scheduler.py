@@ -339,9 +339,18 @@ class HcuScheduler(_upstream.Scheduler):
                 if num_new_tokens == 0:
                     break
 
-            # Async KV load has no forward pass. Allocate speculative
-            # lookahead later to keep local/remote block counts aligned.
-            limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
+            # Prefix-cache hits can leave a request in prompt prefill with a
+            # non-zero computed-token count.  Do not allocate MTP lookahead
+            # slots until that prompt prefill is complete.  Async KV load also
+            # has no forward pass, so it keeps the same restriction.
+            in_prompt_prefill = (
+                num_computed_tokens + num_new_tokens
+                <= request.num_prompt_tokens
+            )
+            limit_lookahead_tokens = (
+                (load_kv_async or in_prompt_prefill)
+                and self.num_lookahead_tokens > 0
+            )
             effective_lookahead_tokens = (
                 0 if limit_lookahead_tokens else self.num_lookahead_tokens
             )
