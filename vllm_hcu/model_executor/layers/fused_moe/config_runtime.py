@@ -139,10 +139,40 @@ def use_all2all_kernels(parallel_config: object) -> bool:
     )
 
 
+def use_deepep_auto_kernels(parallel_config: object) -> bool:
+    return bool(
+        use_all2all_kernels(parallel_config)
+        and parallel_config.all2all_backend == "deepep_auto"
+    )
+
+
+def use_batched_activation_format(
+    parallel_config: object, original_property: property
+) -> bool:
+    assert original_property.fget is not None
+    return bool(
+        use_deepep_auto_kernels(parallel_config)
+        or original_property.fget(parallel_config)
+    )
+
+
+def needs_round_robin_routing_tables(
+    parallel_config: object, original_property: property
+) -> bool:
+    assert original_property.fget is not None
+    return bool(
+        use_deepep_auto_kernels(parallel_config)
+        or original_property.fget(parallel_config)
+    )
+
+
 __all__ = [
     "int8_w8a8_moe_quant_config",
     "is_hcu_block_quant",
     "make_quant_config",
     "quant_flags_to_group_shape",
     "use_all2all_kernels",
+    "use_batched_activation_format",
+    "use_deepep_auto_kernels",
+    "needs_round_robin_routing_tables",
 ]

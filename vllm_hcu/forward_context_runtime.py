@@ -15,6 +15,7 @@ def attach_hcu_context_fields(
     gather_indexes_tensor: object | None,
     enable_lightly_cp: bool,
     enable_lightly_cplb: bool,
+    deepep_auto_use_low_latency: bool = False,
 ) -> object:
     """Keep the official dataclass identity and add process-local HCU state."""
 
@@ -22,7 +23,46 @@ def attach_hcu_context_fields(
     context.gather_indexes_tensor = gather_indexes_tensor
     context.enable_lightly_cp = bool(enable_lightly_cp)
     context.enable_lightly_cplb = bool(enable_lightly_cplb)
+    context.deepep_auto_use_low_latency = bool(
+        deepep_auto_use_low_latency
+    )
     return context
+
+
+def choose_deepep_auto_low_latency(
+    vllm_config: object,
+    num_tokens: int | None,
+    num_tokens_across_dp: object | None,
+    batch_descriptor: object | None,
+) -> bool:
+    """Choose LL for uniform decode and HT for prefill/mixed batches."""
+
+    from vllm_hcu.patch.config import get_hcu_config
+
+    if not get_hcu_config(vllm_config).deepep_auto:
+        return False
+    if batch_descriptor is not None:
+        return bool(getattr(batch_descriptor, "uniform", False))
+
+    # Draft/profiling forwards do not always carry BatchDescriptor.  Preserve
+    # the v0.21 bounded-token fallback at this boundary, using the v0.25
+    # scheduler/speculative configuration rather than runner globals.
+    if num_tokens_across_dp is None:
+        max_num_tokens = int(num_tokens or 0)
+    else:
+        maximum = getattr(num_tokens_across_dp, "max", None)
+        if not callable(maximum):
+            raise TypeError("num_tokens_across_dp must expose max()")
+        value = maximum()
+        item = getattr(value, "item", None)
+        max_num_tokens = int(item() if callable(item) else value)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0))
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    )
+    return max_num_tokens <= max_num_seqs * (1 + num_speculative_tokens)
 
 
 @contextmanager
@@ -43,6 +83,7 @@ def set_forward_context(
     gather_indexes_tensor: object | None = None,
     enable_lightly_cp: bool = False,
     enable_lightly_cplb: bool = False,
+    deepep_auto_use_low_latency: bool = False,
 ):
     """Mirror v0.25's context manager while skipping invalid DeepEP-LL DP sync."""
 
@@ -54,7 +95,10 @@ def set_forward_context(
 
     dp_metadata = None
     parallel_config = vllm_config.parallel_config
-    low_latency = parallel_config.all2all_backend == "deepep_low_latency"
+    low_latency = (
+        parallel_config.all2all_backend == "deepep_low_latency"
+        and not getattr(parallel_config, "_vllm_hcu_deepep_auto", False)
+    )
     if (
         not low_latency
         and (
@@ -119,6 +163,7 @@ def set_forward_context(
         gather_indexes_tensor=gather_indexes_tensor,
         enable_lightly_cp=enable_lightly_cp,
         enable_lightly_cplb=enable_lightly_cplb,
+        deepep_auto_use_low_latency=deepep_auto_use_low_latency,
     )
 
     try:
@@ -153,4 +198,8 @@ def set_forward_context(
                     )
 
 
-__all__ = ["attach_hcu_context_fields", "set_forward_context"]
+__all__ = [
+    "attach_hcu_context_fields",
+    "choose_deepep_auto_low_latency",
+    "set_forward_context",
+]

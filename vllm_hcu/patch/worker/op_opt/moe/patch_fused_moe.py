@@ -60,10 +60,16 @@ def apply_to_module(module: ModuleType) -> bool:
         w2_bias=None,
     ):
         from vllm_hcu.platforms import envs as henvs
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+            is_aiter_moe_requested,
+        )
 
         enabled = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_USE_AITER_W4A16_MOE
+            and (
+                henvs.VLLM_HCU_USE_AITER_W4A16_MOE
+                or is_aiter_moe_requested()
+            )
             and use_int4_w4a16
             and hidden_states.dtype == target.torch.bfloat16
         )

@@ -206,11 +206,21 @@ def _fake_all2all_module() -> ModuleType:
         def set_num_sms(self, num_sms: int):
             self.applied_sms = min(num_sms, self.num_sms)
 
+    class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
+        def __init__(self, cpu_group, tcp_store_group=None):
+            super().__init__(cpu_group, tcp_store_group)
+            self.support_fault_tolerance = False
+
     return _module(
         patch_all2all.TARGET_MODULE,
         DeepEPAll2AllManagerBase=DeepEPAll2AllManagerBase,
         DeepEPHTAll2AllManager=DeepEPHTAll2AllManager,
-        envs=SimpleNamespace(VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE=False),
+        DeepEPLLAll2AllManager=DeepEPLLAll2AllManager,
+        envs=SimpleNamespace(
+            VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE=False,
+            VLLM_DEEPEP_BUFFER_SIZE_MB=256,
+            VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL=False,
+        ),
     )
 
 
@@ -242,6 +252,48 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     assert intranode.num_sms == 60
     assert intranode_kwargs["num_rdma_bytes"] == 0
     assert intranode_kwargs["num_qps_per_rank"] == 1
+
+
+def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            assert kwargs == {
+                "num_max_dispatch_tokens_per_rank": 32,
+                "hidden": 7168,
+                "num_ranks": 8,
+                "num_experts": 256,
+            }
+            return 750_000_000
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+
+    manager = module.DeepEPAutoAll2AllManager("group", "tcp")
+    manager.support_fault_tolerance = True
+    kwargs = manager._make_all2all_kwargs(
+        max_num_tokens_per_dp_rank=32,
+        token_hidden_size=7168,
+        num_ep_ranks=8,
+        num_global_experts=256,
+        num_local_experts=32,
+    )
+    assert manager.is_deepep_auto_manager is True
+    assert manager.max_sms_used() == 48
+    assert kwargs == {
+        "group": "group",
+        "num_nvl_bytes": 1_000_000_000,
+        "num_rdma_bytes": 750_000_000,
+        "low_latency_mode": True,
+        "num_qps_per_rank": 32,
+        "allow_nvlink_for_low_latency_mode": True,
+        "allow_mnnvl": False,
+        "explicitly_destroy": True,
+        "enable_shrink": True,
+    }
 
 
 def _fake_base_communicator_module() -> ModuleType:
@@ -317,6 +369,57 @@ def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obso
     assert patch_cuda_communicator.apply_to_module(module) is True
     assert patch_cuda_communicator.apply_to_module(module) is False
     assert "all_to_all_single" not in vars(CudaCommunicator)
+
+
+def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.config
+    import vllm.distributed.device_communicators.all2all as all2all
+
+    created: list[tuple[object, object]] = []
+
+    class DeepEPAutoAll2AllManager:
+        def __init__(self, cpu_group, tcp_store_group=None):
+            created.append((cpu_group, tcp_store_group))
+
+    monkeypatch.setattr(
+        all2all,
+        "DeepEPAutoAll2AllManager",
+        DeepEPAutoAll2AllManager,
+        raising=False,
+    )
+    config = _config(deepep_auto=True)
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config_or_none", lambda: config
+    )
+
+    class CudaCommunicator:
+        def __init__(
+            self,
+            cpu_group,
+            device=None,
+            device_group=None,
+            unique_name="",
+            global_ranks=None,
+            global_world_size=None,
+            tcp_store_group=None,
+        ):
+            del device, device_group, unique_name, global_ranks, global_world_size
+            self.cpu_group = cpu_group
+            self.use_all2all = True
+            self.all2all_manager = "normalized-low-latency"
+
+    module = _module(
+        patch_cuda_communicator.TARGET_MODULE,
+        CudaCommunicator=CudaCommunicator,
+    )
+    assert patch_cuda_communicator.apply_to_module(module)
+    communicator = module.CudaCommunicator("cpu-group", tcp_store_group="tcp")
+    assert isinstance(communicator.all2all_manager, DeepEPAutoAll2AllManager)
+    assert created == [("cpu-group", "tcp")]
+
+
 @dataclasses.dataclass
 class _Function:
     name: str
@@ -503,6 +606,7 @@ def test_forward_context_keeps_dataclass_and_attaches_runtime_fields(
     assert patch_forward_context.apply_to_module(module)
     assert not patch_forward_context.apply_to_module(module)
     config = SimpleNamespace(
+        additional_config={},
         parallel_config=SimpleNamespace(all2all_backend="naive")
     )
     context = module.create_forward_context(
@@ -527,6 +631,31 @@ def test_forward_context_keeps_dataclass_and_attaches_runtime_fields(
     config.parallel_config.all2all_backend = "deepep_low_latency"
     with module.set_forward_context(None, config) as value:
         assert value == "hcu"
+
+
+def test_deepep_auto_forward_mode_uses_uniform_descriptor_then_token_fallback():
+    from vllm_hcu.forward_context_runtime import (
+        choose_deepep_auto_low_latency,
+    )
+
+    config = _config(deepep_auto=True)
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8)
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+
+    assert choose_deepep_auto_low_latency(
+        config, 512, None, SimpleNamespace(uniform=True)
+    )
+    assert not choose_deepep_auto_low_latency(
+        config, 1, None, SimpleNamespace(uniform=False)
+    )
+    assert choose_deepep_auto_low_latency(config, 32, None, None)
+    assert not choose_deepep_auto_low_latency(config, 33, None, None)
+    assert choose_deepep_auto_low_latency(
+        config, None, torch.tensor([4, 32, 16]), None
+    )
+    assert not choose_deepep_auto_low_latency(
+        config, None, torch.tensor([4, 33, 16]), None
+    )
 
 
 def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():

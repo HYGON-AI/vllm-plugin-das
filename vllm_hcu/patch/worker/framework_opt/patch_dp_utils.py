@@ -50,7 +50,12 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         if (
             parallel_config.data_parallel_size == 1
-            or parallel_config.all2all_backend == "deepep_low_latency"
+            or (
+                parallel_config.all2all_backend == "deepep_low_latency"
+                and not getattr(
+                    parallel_config, "_vllm_hcu_deepep_auto", False
+                )
+            )
         ):
             return False, None, cudagraph_mode
         return original(

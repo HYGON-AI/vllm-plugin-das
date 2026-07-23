@@ -88,6 +88,12 @@ def test_all2all_dispatch_selection_contract():
         )
         return prepare_finalize
 
+    def maybe_roundup_layer_hidden_size(
+        hidden_size, act_dtype, moe_parallel_config
+    ):
+        del act_dtype, moe_parallel_config
+        return hidden_size
+
     fp8_dtype = torch.float8_e4m3fn
     module = _module(
         patch_all2all_utils.TARGET_MODULE,
@@ -95,20 +101,199 @@ def test_all2all_dispatch_selection_contract():
         current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
         DeepEPLLPrepareAndFinalize=DeepEPLLPrepareAndFinalize,
         maybe_make_prepare_finalize=maybe_make_prepare_finalize,
+        maybe_roundup_layer_hidden_size=maybe_roundup_layer_hidden_size,
     )
     assert patch_all2all_utils.apply_to_module(module) is True
     assert patch_all2all_utils.apply_to_module(module) is False
 
     fp8_config = SimpleNamespace(quant_dtype=fp8_dtype)
-    result = module.maybe_make_prepare_finalize(None, fp8_config)
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_deepep_auto_kernels=False)
+    )
+    result = module.maybe_make_prepare_finalize(moe, fp8_config)
     assert result is prepare_finalize
     assert result.use_fp8_dispatch is True
     assert result.use_int8_dispatch is False
 
     int8_config = SimpleNamespace(quant_dtype=torch.int8)
-    result = module.maybe_make_prepare_finalize(None, int8_config)
+    result = module.maybe_make_prepare_finalize(moe, int8_config)
     assert result.use_fp8_dispatch is False
     assert result.use_int8_dispatch is True
+
+
+def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
+    calls: dict[str, object] = {}
+
+    class Manager:
+        is_deepep_auto_manager = True
+        dp_world_size = 2
+        world_size = 2
+        rank = 1
+
+        def get_handle(self, kwargs):
+            calls["handle_kwargs"] = kwargs
+            return "shared-handle"
+
+    class DeepEPHTPrepareAndFinalize:
+        def __init__(self, handle, **kwargs):
+            self.handle = handle
+            self.kwargs = kwargs
+
+        @staticmethod
+        def maybe_roundup_layer_hidden_size(hidden_size, act_dtype):
+            del act_dtype
+            return hidden_size + 1
+
+    class DeepEPLLPrepareAndFinalize:
+        def __init__(self, handle, **kwargs):
+            self.handle = handle
+            self.kwargs = kwargs
+
+        @staticmethod
+        def maybe_roundup_layer_hidden_size(hidden_size):
+            return hidden_size + 2
+
+    def maybe_make_prepare_finalize(
+        moe,
+        quant_config,
+        routing_tables=None,
+        allow_new_interface=False,
+        use_monolithic=False,
+        eep_stage=False,
+    ):
+        del (
+            moe,
+            quant_config,
+            routing_tables,
+            allow_new_interface,
+            use_monolithic,
+            eep_stage,
+        )
+        return "official"
+
+    def maybe_roundup_layer_hidden_size(
+        hidden_size, act_dtype, moe_parallel_config
+    ):
+        del act_dtype, moe_parallel_config
+        return hidden_size
+
+    manager = Manager()
+    module = _module(
+        patch_all2all_utils.TARGET_MODULE,
+        torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda: torch.float8_e4m3fn),
+        get_ep_all2all_manager=lambda eep_stage=False: manager,
+        get_current_vllm_config=lambda: SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        ),
+        DeepEPHTPrepareAndFinalize=DeepEPHTPrepareAndFinalize,
+        DeepEPLLPrepareAndFinalize=DeepEPLLPrepareAndFinalize,
+        maybe_make_prepare_finalize=maybe_make_prepare_finalize,
+        maybe_roundup_layer_hidden_size=maybe_roundup_layer_hidden_size,
+    )
+    assert patch_all2all_utils.apply_to_module(module)
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_deepep_auto_kernels=True),
+        dp_size=2,
+        hidden_dim=7168,
+        num_experts=8,
+        num_local_experts=4,
+    )
+    routing_tables = ("global-to-physical", "physical-to-global", "local-ids")
+    result = module.maybe_make_prepare_finalize(
+        moe,
+        SimpleNamespace(quant_dtype=torch.float8_e4m3fn),
+        routing_tables,
+    )
+    assert calls["handle_kwargs"] == {
+        "max_num_tokens_per_dp_rank": 12,
+        "token_hidden_size": 7168,
+        "num_ep_ranks": 2,
+        "num_global_experts": 8,
+        "num_local_experts": 4,
+    }
+    assert result.ht_prepare_finalize.handle == "shared-handle"
+    assert result.ht_prepare_finalize.kwargs == {
+        "num_dispatchers": 2,
+        "dp_size": 2,
+        "rank_expert_offset": 4,
+    }
+    assert result.ll_prepare_finalize.handle == "shared-handle"
+    assert result.ll_prepare_finalize.kwargs == {
+        "max_tokens_per_rank": 12,
+        "num_dispatchers": 2,
+        "use_fp8_dispatch": True,
+        "global_to_physical": "global-to-physical",
+        "physical_to_global": "physical-to-global",
+        "local_expert_global_ids": "local-ids",
+    }
+    assert module.maybe_roundup_layer_hidden_size(
+        10, torch.float16, moe.moe_parallel_config
+    ) == 13
+
+
+def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto as auto_module
+
+    class Delegate:
+        def __init__(self, name):
+            self.name = name
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def post_init_setup(self, experts):
+            self.calls.append(("post_init_setup", (experts,)))
+
+        def prepare(self, *args):
+            self.calls.append(("prepare", args))
+            return self.name
+
+        def finalize(self, *args):
+            self.calls.append(("finalize", args))
+            return None
+
+    ht = Delegate("ht")
+    ll = Delegate("ll")
+    prepare_finalize = auto_module.DeepEPAutoPrepareAndFinalize(ht, ll)
+    mode = {"low_latency": True}
+    monkeypatch.setattr(
+        auto_module,
+        "_forward_uses_low_latency",
+        lambda: mode["low_latency"],
+    )
+
+    class Experts:
+        ht_experts = "ht-experts"
+        ll_experts = "ll-experts"
+
+        def set_deepep_auto_use_low_latency(self, value):
+            self.low_latency = value
+
+    experts = Experts()
+    prepare_finalize.post_init_setup(experts)
+    assert ht.calls == [("post_init_setup", ("ht-experts",))]
+    assert ll.calls == [("post_init_setup", ("ll-experts",))]
+
+    assert prepare_finalize.prepare(
+        "a1", "weights", "ids", 8, None, False, "quant"
+    ) == "ll"
+    assert experts.low_latency is True
+    mode["low_latency"] = False
+    prepare_finalize.finalize(
+        "output", "experts", "weights", "ids", False, "reduce"
+    )
+    assert [name for name, _ in ll.calls[-2:]] == ["prepare", "finalize"]
+
+    assert prepare_finalize.prepare(
+        "a1", "weights", "ids", 8, None, False, "quant"
+    ) == "ht"
+    assert experts.low_latency is False
+    prepare_finalize.finalize(
+        "output", "experts", "weights", "ids", False, "reduce"
+    )
+    assert [name for name, _ in ht.calls[-2:]] == ["prepare", "finalize"]
 
 
 class _GroupShape:
@@ -177,6 +362,30 @@ def _fake_config_module() -> ModuleType:
         def use_all2all_kernels(self):
             return self.dp_size > 1 and self.use_ep
 
+        @property
+        def use_batched_activation_format(self):
+            return False
+
+        @property
+        def needs_round_robin_routing_tables(self):
+            return False
+
+        @staticmethod
+        def make(
+            tp_size_, pcp_size_, dp_size_, sp_size_, vllm_parallel_config
+        ):
+            result = FusedMoEParallelConfig()
+            result.tp_size = tp_size_
+            result.pcp_size = pcp_size_
+            result.dp_size = dp_size_
+            result.sp_size = sp_size_
+            result.use_ep = vllm_parallel_config.enable_expert_parallel
+            result.all2all_backend = vllm_parallel_config.all2all_backend
+            return result
+
+    class FusedMoEConfig:
+        pass
+
     return _module(
         patch_config.TARGET_MODULE,
         torch=torch,
@@ -186,6 +395,7 @@ def _fake_config_module() -> ModuleType:
         FusedMoEQuantConfig=FusedMoEQuantConfig,
         int8_w8a8_moe_quant_config=int8_config,
         FusedMoEParallelConfig=FusedMoEParallelConfig,
+        FusedMoEConfig=FusedMoEConfig,
     )
 
 
@@ -229,6 +439,19 @@ def test_hcu_block_quant_group_shapes_and_sequence_parallel_contract():
     parallel.use_ep = True
     parallel.is_sequence_parallel = True
     assert parallel.use_all2all_kernels is True
+    upstream = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        enable_expert_parallel=True,
+        _vllm_hcu_deepep_auto=True,
+    )
+    auto = module.FusedMoEParallelConfig.make(1, 1, 2, 1, upstream)
+    assert auto.all2all_backend == "deepep_auto"
+    assert auto.use_deepep_auto_kernels is True
+    assert auto.use_batched_activation_format is True
+    assert auto.needs_round_robin_routing_tables is True
+    moe = module.FusedMoEConfig()
+    moe.moe_parallel_config = auto
+    assert moe.use_deepep_auto_kernels is True
 
 
 def test_config_signature_drift_fails_before_mutation():
@@ -773,6 +996,8 @@ def test_moe_align_feature_off_and_lightop_contract(
 def test_fp8_oracle_sidecar_selection_and_format_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    auto_kernel_calls: list[tuple[object, object, object]] = []
+
     class Fp8MoeBackend(Enum):
         DEEPGEMM = "DEEPGEMM"
         BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
@@ -806,6 +1031,24 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         del fp8_backend, layer, w13_input_scale, w2_input_scale
         return "converted", w2, w13_scale, w2_scale
 
+    def make_fp8_moe_kernel(
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        fp8_backend,
+        routing_tables=None,
+        layer=None,
+    ):
+        del (
+            moe_quant_config,
+            moe_config,
+            experts_cls,
+            fp8_backend,
+            routing_tables,
+            layer,
+        )
+        return "official-kernel"
+
     module = _module(
         patch_fp8_oracle.TARGET_MODULE,
         Enum=Enum,
@@ -814,6 +1057,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         map_fp8_backend=map_fp8_backend,
         select_fp8_moe_backend=select_fp8_moe_backend,
         convert_to_fp8_moe_kernel_format=convert_to_fp8_moe_kernel_format,
+        make_fp8_moe_kernel=make_fp8_moe_kernel,
         mk=SimpleNamespace(
             FusedMoEActivationFormat=SimpleNamespace(
                 Standard="standard",
@@ -848,6 +1092,14 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
             del cls, config, weight_key, activation_key, activation_format
             return False, "unsupported"
 
+    def make_deepep_auto_deepgemm_fp8_moe_kernel(
+        *, moe_quant_config, moe_config, routing_tables
+    ):
+        auto_kernel_calls.append(
+            (moe_quant_config, moe_config, routing_tables)
+        )
+        return "deepep-auto-kernel"
+
     experts_name = (
         "vllm_hcu.model_executor.layers.fused_moe.experts."
         "dpsk_v4_deep_gemm_moe"
@@ -856,12 +1108,17 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         experts_name,
         DeepEPDeepGemmContiguousExperts=UnsupportedExperts,
         DeepEPDeepGemmMaskedExperts=SupportedExperts,
+        make_deepep_auto_deepgemm_fp8_moe_kernel=(
+            make_deepep_auto_deepgemm_fp8_moe_kernel
+        ),
     )
     monkeypatch.setitem(sys.modules, experts_name, experts_module)
     monkeypatch.setattr(
         patch_fp8_oracle,
-        "_sidecar_backend",
-        lambda config: "dpsk_deep_gemm",
+        "_sidecar_config",
+        lambda config: SimpleNamespace(
+            deepep_auto=False, moe_backend="dpsk_deep_gemm"
+        ),
     )
     config = SimpleNamespace(
         moe_backend="auto",
@@ -888,7 +1145,54 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         None,
     ) == tensors
 
-    monkeypatch.setattr(patch_fp8_oracle, "_sidecar_backend", lambda config: "auto")
+    assert module.make_fp8_moe_kernel(
+        "quant",
+        config,
+        SupportedExperts,
+        backend,
+        "routing",
+        "layer",
+    ) == "official-kernel"
+
+    monkeypatch.setattr(
+        patch_fp8_oracle,
+        "_sidecar_config",
+        lambda config: SimpleNamespace(deepep_auto=True, moe_backend="auto"),
+    )
+    auto_backend, auto_experts = module.select_fp8_moe_backend(
+        config, "w", "a"
+    )
+    assert auto_backend is backend
+    assert auto_experts is UnsupportedExperts
+    auto_config = SimpleNamespace(
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            use_batched_activation_format=False,
+            use_deepep_auto_kernels=True,
+        ),
+    )
+    assert module.make_fp8_moe_kernel(
+        "quant",
+        auto_config,
+        auto_experts,
+        auto_backend,
+        "routing",
+        "layer",
+    ) == "deepep-auto-kernel"
+    assert auto_kernel_calls == [("quant", auto_config, "routing")]
+    with pytest.raises(ValueError, match="only the HCU DPSK_DEEPGEMM"):
+        module.make_fp8_moe_kernel(
+            "quant",
+            auto_config,
+            auto_experts,
+            module.Fp8MoeBackend.TRITON,
+        )
+
+    monkeypatch.setattr(
+        patch_fp8_oracle,
+        "_sidecar_config",
+        lambda config: SimpleNamespace(deepep_auto=False, moe_backend="auto"),
+    )
     assert module.select_fp8_moe_backend(config, "w", "a") == "official-select"
 
 

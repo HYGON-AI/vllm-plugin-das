@@ -553,3 +553,190 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         if scale.dtype != torch.float32:
             scale = scale.to(torch.float32)
         return scale.contiguous()
+
+
+class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
+    """Switch DeepGEMM expert layout with the per-forward DeepEP mode."""
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int,
+        num_dispatchers: int,
+    ):
+        # The expert base validates one fixed activation format, while this
+        # adapter intentionally owns both.  Initialize its public state using
+        # the same v0.25 fields and let each concrete child validate itself.
+        self.moe_config = moe_config
+        self.quant_config = quant_config
+        self.max_num_tokens = max_num_tokens
+        self.num_dispatchers = num_dispatchers
+        self._use_low_latency_snapshot = False
+        self.ht_experts = DeepEPDeepGemmContiguousExperts(
+            moe_config=moe_config,
+            quant_config=quant_config,
+        )
+        self.ll_experts = DeepEPDeepGemmMaskedExperts(
+            moe_config=moe_config,
+            quant_config=quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=num_dispatchers,
+        )
+
+    def set_deepep_auto_use_low_latency(self, use_low_latency: bool) -> None:
+        self._use_low_latency_snapshot = bool(use_low_latency)
+
+    def _current(self) -> mk.FusedMoEExperts:
+        return self.ll_experts if self._use_low_latency_snapshot else self.ht_experts
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.ht_experts.process_weights_after_loading(layer)
+        self.ll_experts._deepgemm_w13 = self.ht_experts._deepgemm_w13
+        self.ll_experts._deepgemm_w2 = self.ht_experts._deepgemm_w2
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return DeepEPDeepGemmContiguousExperts._supports_current_device()
+
+    @staticmethod
+    def _supports_no_act_and_mul() -> bool:
+        return False
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return DeepEPDeepGemmContiguousExperts._supports_quant_scheme(
+            weight_key, activation_key
+        )
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation == MoEActivation.SILU
+
+    @staticmethod
+    def _supports_parallel_config(
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> bool:
+        return bool(
+            getattr(moe_parallel_config, "use_deepep_auto_kernels", False)
+        )
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return self._current().expects_unquantized_inputs
+
+    def supports_expert_map(self) -> bool:
+        return self._current().supports_expert_map()
+
+    def supports_packed_ue8m0_act_scales(self) -> bool:
+        return self._current().supports_packed_ue8m0_act_scales()
+
+    def activation_format(self) -> mk.FusedMoEActivationFormat:
+        return self._current().activation_format()
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        return self._current().moe_problem_size(a1, w1, w2, topk_ids)
+
+    def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
+        return self._current().workspace_dtype(act_dtype)
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        return self._current().workspace_shapes(
+            M,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return self._current().finalize_weight_and_reduce_impl()
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        return self._current().apply(
+            output=output,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale,
+            a2_scale=a2_scale,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=expert_tokens_meta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+
+def make_deepep_auto_deepgemm_fp8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+
+    prepare_finalize = maybe_make_prepare_finalize(
+        moe=moe_config,
+        quant_config=moe_quant_config,
+        routing_tables=routing_tables,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    if prepare_finalize is None:
+        raise RuntimeError("DeepEP auto prepare/finalize was not constructed")
+    max_num_tokens = prepare_finalize.ll_prepare_finalize.max_num_tokens_per_rank()
+    if max_num_tokens is None:
+        raise RuntimeError("DeepEP auto LL token capacity is unavailable")
+    experts = DeepEPAutoDeepGemmExperts(
+        moe_config=moe_config,
+        quant_config=moe_quant_config,
+        max_num_tokens=max_num_tokens,
+        num_dispatchers=prepare_finalize.num_dispatchers(),
+    )
+    logger.info_once("Using DeepEP auto MoE kernel with HT/LL experts.")
+    return mk.FusedMoEKernel(prepare_finalize, experts)

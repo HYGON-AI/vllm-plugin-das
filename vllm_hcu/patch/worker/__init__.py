@@ -46,6 +46,7 @@ FeatureKey = Literal[
     "deepep",
     "deepep_high_throughput",
     "deepep_low_latency",
+    "deepep_auto",
     "dpsk_deep_gemm",
     "forward_context",
     "lightly_cp",
@@ -658,6 +659,7 @@ def _feature_states(
     config: HcuFeatureConfig,
 ) -> dict[FeatureKey, bool]:
     backend = _parallel_backend(vllm_config)
+    deepep_auto = config.deepep_auto
     deepep = backend in {"deepep_high_throughput", "deepep_low_latency"}
     # ``pynccl`` is not silently inferred from custom-SP.  Custom-SP has a
     # portable torch.distributed path; only an explicit backend selection may
@@ -666,12 +668,21 @@ def _feature_states(
     return {
         "always": True,
         "custom_sp": config.enable_custom_sp,
-        "deepep": deepep,
-        "deepep_high_throughput": backend == "deepep_high_throughput",
-        "deepep_low_latency": backend == "deepep_low_latency",
-        "dpsk_deep_gemm": config.moe_backend == "dpsk_deep_gemm",
+        "deepep": deepep or deepep_auto,
+        "deepep_high_throughput": (
+            backend == "deepep_high_throughput" or deepep_auto
+        ),
+        "deepep_low_latency": (
+            backend == "deepep_low_latency" or deepep_auto
+        ),
+        "deepep_auto": deepep_auto,
+        "dpsk_deep_gemm": (
+            config.moe_backend == "dpsk_deep_gemm" or deepep_auto
+        ),
         "forward_context": bool(
-            config.enable_lightly_cp or backend == "deepep_low_latency"
+            config.enable_lightly_cp
+            or backend == "deepep_low_latency"
+            or deepep_auto
         ),
         "lightly_cp": config.enable_lightly_cp,
         "multi_layers_mtp": config.enable_multi_layers_mtp,

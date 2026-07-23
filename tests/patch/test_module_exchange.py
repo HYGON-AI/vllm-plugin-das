@@ -355,6 +355,28 @@ def test_replacement_consumers_use_canonical_aliases():
         } & imported
 
 
+def test_deepep_auto_does_not_restore_removed_expected_m_interface():
+    path = REPO_ROOT / (
+        "vllm_hcu/model_executor/layers/fused_moe/experts/"
+        "dpsk_v4_deep_gemm_moe.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "DeepEPAutoDeepGemmExperts"
+    )
+    methods = {
+        node.name for node in cls.body if isinstance(node, ast.FunctionDef)
+    }
+    attributes = {
+        node.attr for node in ast.walk(cls) if isinstance(node, ast.Attribute)
+    }
+    assert {"set_expected_m", "get_expected_m"}.isdisjoint(methods)
+    assert "expected_m" not in attributes
+
+
 def test_v025_native_mhc_contract_is_not_replaced():
     exchanges = dict(module_exchange_names())
     assert "vllm.model_executor.layers.mhc" not in exchanges

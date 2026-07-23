@@ -24,17 +24,22 @@ TARGETS = (
     f"{TARGET_MODULE}.map_fp8_backend",
     f"{TARGET_MODULE}.select_fp8_moe_backend",
     f"{TARGET_MODULE}.convert_to_fp8_moe_kernel_format",
+    f"{TARGET_MODULE}.make_fp8_moe_kernel",
 )
 _MARKER = "_vllm_hcu_fp8_dpsk_oracle_applied"
 
 
-def _sidecar_backend(config) -> str:
+def _sidecar_config(config):
     from vllm.config import get_current_vllm_config_or_none
 
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         vllm_config = getattr(config, "_hcu_vllm_config", None)
-    return get_hcu_config(vllm_config).moe_backend
+    return get_hcu_config(vllm_config)
+
+
+def _sidecar_backend(config) -> str:
+    return _sidecar_config(config).moe_backend
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -46,6 +51,7 @@ def apply_to_module(module: ModuleType) -> bool:
     map_backend = require_callable(target, "map_fp8_backend", TARGETS[2])
     select_backend = require_callable(target, "select_fp8_moe_backend", TARGETS[3])
     convert = require_callable(target, "convert_to_fp8_moe_kernel_format", TARGETS[4])
+    make_kernel = require_callable(target, "make_fp8_moe_kernel", TARGETS[5])
     require_parameter_names(backend_to_cls, TARGETS[1], ("backend",))
     require_parameter_names(map_backend, TARGETS[2], ("runner_backend",))
     require_parameter_names(
@@ -65,6 +71,18 @@ def apply_to_module(module: ModuleType) -> bool:
             "w2_scale",
             "w13_input_scale",
             "w2_input_scale",
+        ),
+    )
+    require_parameter_names(
+        make_kernel,
+        TARGETS[5],
+        (
+            "moe_quant_config",
+            "moe_config",
+            "experts_cls",
+            "fp8_backend",
+            "routing_tables",
+            "layer",
         ),
     )
     values = {member.name: member.value for member in old_enum}
@@ -104,7 +122,24 @@ def apply_to_module(module: ModuleType) -> bool:
         activation_key,
         allow_vllm_cutlass=False,
     ):
-        if _sidecar_backend(config) != "dpsk_deep_gemm":
+        sidecar = _sidecar_config(config)
+        if sidecar.deepep_auto:
+            if sidecar.moe_backend not in ("auto", "dpsk_deep_gemm"):
+                raise ValueError(
+                    "deepep_auto requires moe_backend='auto' or "
+                    "'dpsk_deep_gemm'"
+                )
+            if getattr(config, "moe_backend", "auto") != "auto":
+                raise ValueError(
+                    "deepep_auto requires the official FusedMoEConfig "
+                    "moe_backend to remain 'auto'"
+                )
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                DeepEPDeepGemmContiguousExperts,
+            )
+
+            return hcu_enum.DPSK_DEEPGEMM, DeepEPDeepGemmContiguousExperts
+        if sidecar.moe_backend != "dpsk_deep_gemm":
             return select_backend(config, weight_key, activation_key, allow_vllm_cutlass)
         if getattr(config, "moe_backend", "auto") != "auto":
             raise ValueError(
@@ -161,6 +196,43 @@ def apply_to_module(module: ModuleType) -> bool:
             w2_input_scale,
         )
 
+    @functools.wraps(make_kernel)
+    def hcu_make_fp8_moe_kernel(
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        fp8_backend,
+        routing_tables=None,
+        layer=None,
+    ):
+        if getattr(
+            moe_config.moe_parallel_config,
+            "use_deepep_auto_kernels",
+            False,
+        ):
+            if fp8_backend != hcu_enum.DPSK_DEEPGEMM:
+                raise ValueError(
+                    "deepep_auto currently supports only the HCU "
+                    f"DPSK_DEEPGEMM FP8 backend, got {fp8_backend.value}"
+                )
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                make_deepep_auto_deepgemm_fp8_moe_kernel,
+            )
+
+            return make_deepep_auto_deepgemm_fp8_moe_kernel(
+                moe_quant_config=moe_quant_config,
+                moe_config=moe_config,
+                routing_tables=routing_tables,
+            )
+        return make_kernel(
+            moe_quant_config,
+            moe_config,
+            experts_cls,
+            fp8_backend,
+            routing_tables,
+            layer,
+        )
+
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls
     target._vllm_hcu_original_map_fp8_backend = map_backend
@@ -169,6 +241,8 @@ def apply_to_module(module: ModuleType) -> bool:
     target.select_fp8_moe_backend = hcu_select_fp8_moe_backend
     target._vllm_hcu_original_convert_to_fp8_moe_kernel_format = convert
     target.convert_to_fp8_moe_kernel_format = hcu_convert_to_fp8_moe_kernel_format
+    target._vllm_hcu_original_make_fp8_moe_kernel = make_kernel
+    target.make_fp8_moe_kernel = hcu_make_fp8_moe_kernel
     setattr(target, _MARKER, True)
     return True
 

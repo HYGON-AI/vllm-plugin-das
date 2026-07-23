@@ -38,6 +38,28 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)
 
+    if parallel_config is not None:
+        setattr(
+            parallel_config,
+            "_vllm_hcu_deepep_auto",
+            feature_config.deepep_auto,
+        )
+    if feature_config.deepep_auto:
+        if parallel_config is None:
+            raise PatchCompatibilityError(
+                "deepep_auto requires VllmConfig.parallel_config"
+            )
+        if getattr(parallel_config, "all2all_backend", None) != "deepep_low_latency":
+            raise ValueError(
+                "HCU deepep_auto must be normalized to the vLLM 0.25 "
+                "deepep_low_latency configuration contract"
+            )
+        if feature_config.moe_backend not in ("auto", "dpsk_deep_gemm"):
+            raise ValueError(
+                "deepep_auto requires HCU moe_backend='auto' or "
+                "'dpsk_deep_gemm'"
+            )
+
     if feature_config.enable_lightly_cp:
         if model_config is None:
             raise PatchCompatibilityError(

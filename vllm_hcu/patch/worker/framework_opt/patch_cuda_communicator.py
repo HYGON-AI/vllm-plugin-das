@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import functools
 from types import ModuleType
+
+from vllm_hcu.patch.config import get_hcu_config
 
 from vllm_hcu.patch.import_coordinator import (
     IMPORT_COORDINATOR,
@@ -28,6 +31,7 @@ TARGETS = (
     f"{TARGET_MODULE}.CudaCommunicator.__init__",
 )
 _MARKER = "_vllm_hcu_cuda_communicator_validated"
+_WRAPPER = "_vllm_hcu_cuda_communicator_wrapper"
 
 
 def register(
@@ -45,6 +49,11 @@ def register(
 def apply_to_module(module: ModuleType) -> bool:
     cuda = load_exact_module(TARGET_MODULE, module)
     if getattr(cuda, _MARKER, False):
+        init = getattr(getattr(cuda, "CudaCommunicator", None), "__init__", None)
+        if not callable(init) or not getattr(init, _WRAPPER, False):
+            raise PatchCompatibilityError(
+                "HCU CUDA communicator marker is stale; restart the process"
+            )
         return False
     communicator = require_class(
         cuda, "CudaCommunicator", f"{TARGET_MODULE}.CudaCommunicator"
@@ -77,6 +86,46 @@ def apply_to_module(module: ModuleType) -> bool:
             "clean audited target vLLM unexpectedly contains the stale CUDA all-to-all "
             "method that the retired legacy source patch attempted to remove"
         )
+
+    @functools.wraps(init)
+    def hcu_init(
+        self,
+        cpu_group,
+        device=None,
+        device_group=None,
+        unique_name="",
+        global_ranks=None,
+        global_world_size=None,
+        tcp_store_group=None,
+    ):
+        init(
+            self,
+            cpu_group,
+            device,
+            device_group,
+            unique_name,
+            global_ranks,
+            global_world_size,
+            tcp_store_group,
+        )
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None or not get_hcu_config(vllm_config).deepep_auto:
+            return
+        if not getattr(self, "use_all2all", False):
+            raise RuntimeError("deepep_auto requires an active all-to-all group")
+        from vllm.distributed.device_communicators.all2all import (
+            DeepEPAutoAll2AllManager,
+        )
+
+        self.all2all_manager = DeepEPAutoAll2AllManager(
+            self.cpu_group, tcp_store_group
+        )
+
+    setattr(hcu_init, _WRAPPER, True)
+    setattr(communicator, "_vllm_hcu_original_init", init)
+    setattr(communicator, "__init__", hcu_init)
     setattr(cuda, _MARKER, True)
     return True
 

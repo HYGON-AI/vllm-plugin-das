@@ -22,6 +22,11 @@ TARGETS = (
     f"{TARGET_MODULE}.FusedMoEQuantConfig.make",
     f"{TARGET_MODULE}.int8_w8a8_moe_quant_config",
     f"{TARGET_MODULE}.FusedMoEParallelConfig.use_all2all_kernels",
+    f"{TARGET_MODULE}.FusedMoEParallelConfig.use_deepep_auto_kernels",
+    f"{TARGET_MODULE}.FusedMoEParallelConfig.use_batched_activation_format",
+    f"{TARGET_MODULE}.FusedMoEParallelConfig.needs_round_robin_routing_tables",
+    f"{TARGET_MODULE}.FusedMoEConfig.use_deepep_auto_kernels",
+    f"{TARGET_MODULE}.FusedMoEParallelConfig.make",
 )
 _MARKER = "_vllm_hcu_moe_config_applied"
 
@@ -34,6 +39,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     quant_class = require_class(target, "FusedMoEQuantConfig", TARGETS[1].rsplit(".", 1)[0])
     parallel_class = require_class(target, "FusedMoEParallelConfig", TARGETS[4].rsplit(".", 1)[0])
+    moe_class = require_class(target, "FusedMoEConfig", TARGETS[8].rsplit(".", 1)[0])
     flags = require_callable(target, "_quant_flags_to_group_shape", TARGETS[0])
     post_init = require_callable(quant_class, "__post_init__", TARGETS[1])
     make = require_callable(quant_class, "make", TARGETS[2])
@@ -72,6 +78,20 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
     )
     require_parameter_names(all2all_prop.fget, TARGETS[4], ("self",))
+    batched_prop = vars(parallel_class).get("use_batched_activation_format")
+    routing_prop = vars(parallel_class).get("needs_round_robin_routing_tables")
+    if not isinstance(batched_prop, property) or batched_prop.fget is None:
+        raise PatchCompatibilityError(f"required HCU patch target {TARGETS[6]} is missing")
+    if not isinstance(routing_prop, property) or routing_prop.fget is None:
+        raise PatchCompatibilityError(f"required HCU patch target {TARGETS[7]} is missing")
+    require_parameter_names(batched_prop.fget, TARGETS[6], ("self",))
+    require_parameter_names(routing_prop.fget, TARGETS[7], ("self",))
+    parallel_make = require_callable(parallel_class, "make", TARGETS[9])
+    require_parameter_names(
+        parallel_make,
+        TARGETS[9],
+        ("tp_size_", "pcp_size_", "dp_size_", "sp_size_", "vllm_parallel_config"),
+    )
 
     @functools.wraps(flags)
     def hcu_flags(quant_dtype, per_act_token_quant, per_out_ch_quant, block_shape):
@@ -138,6 +158,21 @@ def apply_to_module(module: ModuleType) -> bool:
 
     del hcu_int8_config.__wrapped__
 
+    @functools.wraps(parallel_make)
+    def hcu_parallel_make(
+        tp_size_, pcp_size_, dp_size_, sp_size_, vllm_parallel_config
+    ):
+        result = parallel_make(
+            tp_size_,
+            pcp_size_,
+            dp_size_,
+            sp_size_,
+            vllm_parallel_config,
+        )
+        if getattr(vllm_parallel_config, "_vllm_hcu_deepep_auto", False):
+            result.all2all_backend = "deepep_auto"
+        return result
+
     target._vllm_hcu_original_quant_flags_to_group_shape = flags
     target._quant_flags_to_group_shape = hcu_flags
     quant_class._vllm_hcu_original_post_init = post_init
@@ -148,6 +183,26 @@ def apply_to_module(module: ModuleType) -> bool:
     target.int8_w8a8_moe_quant_config = hcu_int8_config
     parallel_class._vllm_hcu_original_use_all2all_kernels = all2all_prop
     parallel_class.use_all2all_kernels = property(config_runtime.use_all2all_kernels)
+    parallel_class.use_deepep_auto_kernels = property(
+        config_runtime.use_deepep_auto_kernels
+    )
+    parallel_class._vllm_hcu_original_use_batched_activation_format = batched_prop
+    parallel_class.use_batched_activation_format = property(
+        lambda self: config_runtime.use_batched_activation_format(
+            self, batched_prop
+        )
+    )
+    parallel_class._vllm_hcu_original_needs_round_robin_routing_tables = routing_prop
+    parallel_class.needs_round_robin_routing_tables = property(
+        lambda self: config_runtime.needs_round_robin_routing_tables(
+            self, routing_prop
+        )
+    )
+    moe_class.use_deepep_auto_kernels = property(
+        lambda self: self.moe_parallel_config.use_deepep_auto_kernels
+    )
+    parallel_class._vllm_hcu_original_make = staticmethod(parallel_make)
+    parallel_class.make = staticmethod(hcu_parallel_make)
     setattr(target, _MARKER, True)
     return True
 

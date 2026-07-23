@@ -6,6 +6,8 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+from vllm_hcu.patch.config import get_hcu_config
+
 from ._common import (
     PatchCompatibilityError,
     already_applied,
@@ -122,6 +124,7 @@ def apply_to_module(module: ModuleType) -> bool:
         gather_indexes_tensor=None,
         enable_lightly_cp=False,
         enable_lightly_cplb=False,
+        deepep_auto_use_low_latency=False,
     ):
         context = original_create(
             attn_metadata,
@@ -141,6 +144,7 @@ def apply_to_module(module: ModuleType) -> bool:
             gather_indexes_tensor=gather_indexes_tensor,
             enable_lightly_cp=enable_lightly_cp,
             enable_lightly_cplb=enable_lightly_cplb,
+            deepep_auto_use_low_latency=deepep_auto_use_low_latency,
         )
 
     @functools.wraps(original_set)
@@ -161,14 +165,17 @@ def apply_to_module(module: ModuleType) -> bool:
         enable_lightly_cp=False,
         enable_lightly_cplb=False,
     ):
+        deepep_auto = get_hcu_config(vllm_config).deepep_auto
         low_latency = (
             vllm_config.parallel_config.all2all_backend == "deepep_low_latency"
+            and not deepep_auto
         )
         has_hcu_context = bool(
             enable_lightly_cp
             or enable_lightly_cplb
             or scatter_indexes_tensor is not None
             or gather_indexes_tensor is not None
+            or deepep_auto
         )
         if not low_latency and not has_hcu_context:
             return original_set(
@@ -199,6 +206,14 @@ def apply_to_module(module: ModuleType) -> bool:
             gather_indexes_tensor=gather_indexes_tensor,
             enable_lightly_cp=enable_lightly_cp,
             enable_lightly_cplb=enable_lightly_cplb,
+            deepep_auto_use_low_latency=(
+                forward_context_runtime.choose_deepep_auto_low_latency(
+                    vllm_config,
+                    num_tokens,
+                    num_tokens_across_dp,
+                    batch_descriptor,
+                )
+            ),
         )
 
     setattr(hcu_create, _WRAPPER, True)

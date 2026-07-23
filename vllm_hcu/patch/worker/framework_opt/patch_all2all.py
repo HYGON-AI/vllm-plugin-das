@@ -20,6 +20,7 @@ TARGETS = (
     f"{TARGET_MODULE}.DeepEPAll2AllManagerBase.__init__",
     f"{TARGET_MODULE}.DeepEPHTAll2AllManager._make_all2all_kwargs",
     f"{TARGET_MODULE}.DeepEPHTAll2AllManager.set_num_sms",
+    f"{TARGET_MODULE}.DeepEPAutoAll2AllManager",
 )
 _MARKER = "_vllm_hcu_deep_ep_runtime_applied"
 _WRAPPER = "_vllm_hcu_deep_ep_runtime_wrapper"
@@ -39,6 +40,11 @@ def apply_to_module(module: ModuleType) -> bool:
         (ht, "set_num_sms", TARGETS[2], _WRAPPER),
     )
     if already_applied(all2all, _MARKER, wrapped):
+        auto = getattr(all2all, "DeepEPAutoAll2AllManager", None)
+        if not isinstance(auto, type) or not getattr(
+            auto, "is_deepep_auto_manager", False
+        ):
+            raise RuntimeError("HCU DeepEP auto manager marker is stale")
         return False
 
     original_init = require_callable(base, "__init__", TARGETS[0])
@@ -80,6 +86,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(base, "__init__", hcu_init)
     setattr(ht, "_make_all2all_kwargs", hcu_make_kwargs)
     setattr(ht, "set_num_sms", hcu_set_num_sms)
+    framework_runtime.install_deep_ep_auto_manager(all2all)
     setattr(all2all, _MARKER, True)
     return True
 
