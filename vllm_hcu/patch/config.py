@@ -17,10 +17,13 @@ _FEATURE_FIELDS = (
     "enable_lightly_cplb",
     "enable_custom_sp",
     "enable_multi_layers_mtp",
+    "deepep_auto",
     "moe_backend",
+    "hcu_flash_attn_mode",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:4]
+_BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "dpsk_deep_gemm"})
+_SUPPORTED_FLASH_ATTN_MODES = frozenset({"classic", "cutlass", "custom"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +39,9 @@ class HcuFeatureConfig:
     enable_lightly_cplb: bool = False
     enable_custom_sp: bool = False
     enable_multi_layers_mtp: bool = False
+    deepep_auto: bool = False
     moe_backend: str = "auto"
+    hcu_flash_attn_mode: str | None = None
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -56,6 +61,18 @@ class HcuFeatureConfig:
             raise ValueError(
                 f"unsupported HCU moe_backend {self.moe_backend!r}; expected one of {supported}"
             )
+        if self.hcu_flash_attn_mode is not None:
+            if not isinstance(self.hcu_flash_attn_mode, str):
+                raise TypeError(
+                    "HCU config field 'hcu_flash_attn_mode' must be str or None, "
+                    f"got {type(self.hcu_flash_attn_mode).__name__}"
+                )
+            if self.hcu_flash_attn_mode not in _SUPPORTED_FLASH_ATTN_MODES:
+                supported = ", ".join(sorted(_SUPPORTED_FLASH_ATTN_MODES))
+                raise ValueError(
+                    "unsupported HCU hcu_flash_attn_mode "
+                    f"{self.hcu_flash_attn_mode!r}; expected one of {supported}"
+                )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
 
@@ -81,7 +98,7 @@ class HcuFeatureConfig:
             raise ValueError(f"unknown HCU config field(s): {names}")
         return replace(self, **updates)
 
-    def to_dict(self) -> dict[str, bool | str]:
+    def to_dict(self) -> dict[str, bool | str | None]:
         return asdict(self)
 
 

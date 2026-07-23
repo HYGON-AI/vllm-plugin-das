@@ -24,6 +24,27 @@ _mla_safety_logger = init_logger("vllm.hcu.mla_prefix_cache_safety")
 
 _ensure_platform_plugin_ready()
 
+
+def get_hcu_flash_attn_mode() -> str:
+    """Resolve the HCU flash-attention sub-mode from serialized config."""
+
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+    except ImportError:
+        # This module can be imported before vLLM finishes initializing its
+        # config module.  Do not cache that temporary flagless default.
+        return henvs.resolve_hcu_flash_attn_mode(None)
+
+    from vllm_hcu.patch.config import get_hcu_config
+
+    config = get_current_vllm_config_or_none()
+    explicit_mode = (
+        None if config is None else get_hcu_config(config).hcu_flash_attn_mode
+    )
+    # Do not cache the flagless default: VllmConfig may become available
+    # after this early platform module is imported.
+    return henvs.resolve_hcu_flash_attn_mode(explicit_mode)
+
 try:
     from amdsmi import (
         AmdSmiException,
@@ -158,9 +179,7 @@ def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
 ) -> list[AttentionBackendEnum]:
-    """Get backend priorities with lazy import to avoid circular dependency."""
-    # HCU platform prioritizes Triton-based backends since FlashAttention
-    # and other CUDA-specific backends may not be available.
+    """Get HCU backend priorities; validation filters unavailable kernels."""
     if use_sparse:
         return [
             AttentionBackendEnum.FLASHMLA_SPARSE,
@@ -168,27 +187,14 @@ def _get_backend_priorities(
         ]
 
     if use_mla:
-        if henvs.VLLM_HCU_USE_FLASHMLA:
-            return [
-                AttentionBackendEnum.FLASHMLA,
-            ]
-        else:
-            return [
-                AttentionBackendEnum.TRITON_MLA,
-            ]
-    else:
-        if (
-            henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN
-            or henvs.VLLM_HCU_USE_FLASH_ATTN
-            or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED
-        ):
-            return [
-                AttentionBackendEnum.FLASH_ATTN,
-            ]
-        else:
-            return [
-                AttentionBackendEnum.TRITON_ATTN,
-            ]
+        return [
+            AttentionBackendEnum.FLASHMLA,
+            AttentionBackendEnum.TRITON_MLA,
+        ]
+    return [
+        AttentionBackendEnum.FLASH_ATTN,
+        AttentionBackendEnum.TRITON_ATTN,
+    ]
 
 
 def register_attention_backends() -> None:
@@ -542,7 +548,7 @@ class HCUPlatform(Platform):
         )
 
         IMPORT_COORDINATOR.drain_ready_callbacks()
-        validate_and_update_hcu_config(vllm_config)
+        feature_config = validate_and_update_hcu_config(vllm_config)
         _disable_unqualified_mla_prefix_caching(vllm_config)
 
         # Use vLLM's public qualified-class configuration hooks.  Both
@@ -582,6 +588,7 @@ class HCUPlatform(Platform):
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         if cache_config and not cache_config.user_specified_block_size:
+            backend = vllm_config.attention_config.backend
             if (
                 envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION and envs.VLLM_ROCM_USE_AITER
                 # NOTE: This block has been deprecated
@@ -595,28 +602,53 @@ class HCUPlatform(Platform):
                 logger.warning(
                     "[ROCM_AITER_UNIFIED_ATTN]: Setting kv cache block size to 64."
                 )
-            elif henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASHMLA:
+            elif (
+                henvs.VLLM_HCU_USE_FLASHMLA
+                or backend == AttentionBackendEnum.FLASHMLA
+            ):
                 cache_config.block_size = 64
                 logger.warning(
-                    "[HCU CUSTOM_FLASH_ATTN/FLASHMLA]: Setting kv cache block size to 64."
+                    "[HCU FLASHMLA]: Setting kv cache block size to 64."
                 )
-            elif henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED:
-                if henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+            elif backend == AttentionBackendEnum.TRITON_ATTN:
+                cache_config.block_size = 16
+            elif backend == AttentionBackendEnum.FLASH_ATTN or (
+                backend is None and flash_attn_triton_available()
+            ):
+                mode = henvs.resolve_hcu_flash_attn_mode(
+                    feature_config.hcu_flash_attn_mode
+                )
+                if mode == "custom":
+                    cache_config.block_size = 64
+                    logger.warning(
+                        "[HCU FLASH_ATTN:custom]: Setting kv cache block size to 64."
+                    )
+                elif (
+                    henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None
+                    and henvs.VLLM_HCU_USE_CUSTOM_OPS
+                ):
                     block_size = henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE
                     if block_size <= 0 or block_size % 16 != 0:
                         raise ValueError(
-                            f"VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE must be "
+                            "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE must be "
                             f"a positive multiple of 16, got {block_size}."
                         )
                     cache_config.block_size = block_size
                     logger.warning(
-                        "[HCU FLASH_ATTN]: Setting kv cache block size to %d (VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE).",
+                        "[HCU FLASH_ATTN:%s]: Setting kv cache block size to %d "
+                        "(VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE).",
+                        mode,
                         cache_config.block_size,
+                    )
+                elif mode == "cutlass":
+                    cache_config.block_size = 64
+                    logger.warning(
+                        "[HCU FLASH_ATTN:cutlass]: Setting kv cache block size to 64."
                     )
                 else:
                     cache_config.block_size = 128
                     logger.warning(
-                        "[HCU FLASH_ATTN]: Setting kv cache block size to 128."
+                        "[HCU FLASH_ATTN:classic]: Setting kv cache block size to 128."
                     )
             else:
                 cache_config.block_size = 16
@@ -724,3 +756,8 @@ class HCUPlatform(Platform):
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
         return True
+
+
+# The registry stores lazy class paths, so this does not import HCU kernels.
+# It does make explicit backend selection resolve to HCU before validation.
+register_attention_backends()

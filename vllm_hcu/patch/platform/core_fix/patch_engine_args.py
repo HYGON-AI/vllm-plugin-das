@@ -28,6 +28,7 @@ TARGETS = (
     f"{TARGET_MODULE}.AsyncEngineArgs.__init__",
     f"{TARGET_MODULE}.EngineArgs.from_cli_args",
     f"{TARGET_MODULE}.EngineArgs.create_engine_config",
+    f"{TARGET_MODULE}.EngineArgs.add_cli_args",
 )
 _MARKER = "_vllm_hcu_feature_sidecar_patch_applied"
 _DATACLASS_BRIDGE_MARKER = "_vllm_hcu_engine_args_dataclass_bridge"
@@ -40,6 +41,14 @@ _HCU_BOOLEAN_KWARGS = (
 )
 _DPSK_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
+_DEEPEP_AUTO_BACKEND = "deepep_auto"
+_DEEPEP_AUTO_UPSTREAM_BACKEND = "deepep_low_latency"
+_FLASH_ATTN_BACKEND = "FLASH_ATTN"
+_HCU_FLASH_ATTN_ALIASES = {
+    "FLASH_ATTN_CLASSIC": "classic",
+    "FLASH_ATTN_CUTLASS": "cutlass",
+    "FLASH_ATTN_CUSTOM": "custom",
+}
 
 
 def _require_engine_args_class(module: ModuleType, name: str) -> type:
@@ -61,6 +70,9 @@ def _require_engine_args_class(module: ModuleType, name: str) -> type:
         ) from exc
     required = {
         "additional_config",
+        "all2all_backend",
+        "attention_backend",
+        "attention_config",
         "moe_backend",
         "kernel_config",
         "speculative_config",
@@ -112,6 +124,71 @@ def _normalise_constructor_kwargs(
                 f"conflicting {name} values in HCU sidecar and top-level "
                 "EngineArgs keyword"
             )
+
+    requested_flash_mode: str | None = None
+    top_level_attention_backend = bound.arguments.get("attention_backend")
+    if isinstance(top_level_attention_backend, str):
+        requested_flash_mode = _HCU_FLASH_ATTN_ALIASES.get(
+            top_level_attention_backend.upper()
+        )
+        if requested_flash_mode is not None:
+            if "attention_backend" not in kwargs:
+                raise TypeError(
+                    "positional HCU flash-attention aliases are not supported; "
+                    "pass attention_backend by keyword"
+                )
+            kwargs["attention_backend"] = _FLASH_ATTN_BACKEND
+
+    attention_config = bound.arguments.get("attention_config")
+    if isinstance(attention_config, Mapping):
+        nested_backend = attention_config.get("backend")
+        if isinstance(nested_backend, str):
+            nested_mode = _HCU_FLASH_ATTN_ALIASES.get(nested_backend.upper())
+            if nested_mode is not None:
+                if "attention_config" not in kwargs:
+                    raise TypeError(
+                        "positional attention_config containing an HCU "
+                        "flash-attention alias is not supported; pass it by keyword"
+                    )
+                if requested_flash_mode is not None and requested_flash_mode != nested_mode:
+                    raise ValueError(
+                        "conflicting HCU flash-attention aliases in attention_backend "
+                        "and attention_config.backend"
+                    )
+                requested_flash_mode = nested_mode
+                normalized_attention = dict(attention_config)
+                normalized_attention["backend"] = _FLASH_ATTN_BACKEND
+                kwargs["attention_config"] = normalized_attention
+
+    if requested_flash_mode is not None:
+        existing_mode = feature_config.hcu_flash_attn_mode
+        if existing_mode is not None and existing_mode != requested_flash_mode:
+            raise ValueError(
+                "conflicting hcu_flash_attn_mode in HCU sidecar and attention backend alias"
+            )
+        feature_config = feature_config.with_updates(
+            hcu_flash_attn_mode=requested_flash_mode
+        )
+
+    requested_deepep_auto = feature_config.deepep_auto
+    top_level_all2all = bound.arguments.get("all2all_backend")
+    if top_level_all2all == _DEEPEP_AUTO_BACKEND:
+        if "all2all_backend" not in kwargs:
+            raise TypeError(
+                "positional deepep_auto is not supported; pass "
+                "all2all_backend='deepep_auto' so HCU can normalize it before "
+                "upstream validation"
+            )
+        requested_deepep_auto = True
+        kwargs["all2all_backend"] = _DEEPEP_AUTO_UPSTREAM_BACKEND
+    elif requested_deepep_auto and top_level_all2all not in (
+        None,
+        _DEEPEP_AUTO_UPSTREAM_BACKEND,
+    ):
+        raise ValueError(
+            "HCU sidecar selects deepep_auto but EngineArgs.all2all_backend "
+            f"selects {top_level_all2all!r}"
+        )
 
     requested_dpsk = feature_config.moe_backend == _DPSK_BACKEND
     top_level_backend = bound.arguments.get("moe_backend")
@@ -182,12 +259,62 @@ def _normalise_constructor_kwargs(
 
     if requested_dpsk:
         updates["moe_backend"] = _DPSK_BACKEND
+    if requested_deepep_auto:
+        updates["deepep_auto"] = True
     return feature_config.with_updates(**updates) if updates else feature_config
 
 
 def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
     feature_config = get_hcu_config(engine_args)
+
+    attention_backend = getattr(engine_args, "attention_backend", None)
+    if isinstance(attention_backend, str):
+        requested_flash_mode = _HCU_FLASH_ATTN_ALIASES.get(
+            attention_backend.upper()
+        )
+        if requested_flash_mode is not None:
+            if (
+                feature_config.hcu_flash_attn_mode is not None
+                and feature_config.hcu_flash_attn_mode != requested_flash_mode
+            ):
+                raise ValueError(
+                    "conflicting hcu_flash_attn_mode in HCU sidecar and "
+                    "attention backend alias"
+                )
+            setattr(engine_args, "attention_backend", _FLASH_ATTN_BACKEND)
+            feature_config = feature_config.with_updates(
+                hcu_flash_attn_mode=requested_flash_mode
+            )
+
+    attention_config = getattr(engine_args, "attention_config", None)
+    direct_mode = getattr(attention_config, "hcu_flash_attn_mode", None)
+    if direct_mode is not None:
+        if (
+            feature_config.hcu_flash_attn_mode is not None
+            and feature_config.hcu_flash_attn_mode != direct_mode
+        ):
+            raise ValueError(
+                "conflicting hcu_flash_attn_mode in HCU sidecar and AttentionConfig"
+            )
+        feature_config = feature_config.with_updates(
+            hcu_flash_attn_mode=direct_mode
+        )
     requested_dpsk = feature_config.moe_backend == _DPSK_BACKEND
+
+    requested_deepep_auto = feature_config.deepep_auto
+    all2all_backend = getattr(engine_args, "all2all_backend", None)
+    if all2all_backend == _DEEPEP_AUTO_BACKEND:
+        requested_deepep_auto = True
+        setattr(
+            engine_args,
+            "all2all_backend",
+            _DEEPEP_AUTO_UPSTREAM_BACKEND,
+        )
+    elif requested_deepep_auto and all2all_backend != _DEEPEP_AUTO_UPSTREAM_BACKEND:
+        raise ValueError(
+            "HCU sidecar selects deepep_auto but EngineArgs.all2all_backend "
+            f"selects {all2all_backend!r}"
+        )
 
     backend = getattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)
     if backend == _DPSK_BACKEND:
@@ -212,6 +339,8 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
 
     if requested_dpsk and feature_config.moe_backend != _DPSK_BACKEND:
         feature_config = feature_config.with_updates(moe_backend=_DPSK_BACKEND)
+    if requested_deepep_auto and not feature_config.deepep_auto:
+        feature_config = feature_config.with_updates(deepep_auto=True)
 
     speculative_config = getattr(engine_args, "speculative_config", None)
     if isinstance(speculative_config, Mapping) and (
@@ -265,6 +394,7 @@ def apply_to_module(module: ModuleType) -> bool:
     async_engine_args = _require_engine_args_class(arg_utils, "AsyncEngineArgs")
     create_engine_config = vars(engine_args).get("create_engine_config")
     from_cli_descriptor = vars(engine_args).get("from_cli_args")
+    add_cli_descriptor = vars(engine_args).get("add_cli_args")
     if not callable(create_engine_config):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGET_MODULE}."
@@ -274,6 +404,11 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGET_MODULE}."
             "EngineArgs.from_cli_args must be a classmethod"
+        )
+    if not isinstance(add_cli_descriptor, staticmethod):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}."
+            "EngineArgs.add_cli_args must be a staticmethod"
         )
     from_cli_args = from_cli_descriptor.__func__
     from_cli_signature = inspect.signature(from_cli_args)
@@ -287,6 +422,13 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGET_MODULE}."
             f"EngineArgs.create_engine_config has incompatible signature {signature}"
+        )
+    add_cli_args = add_cli_descriptor.__func__
+    add_cli_signature = inspect.signature(add_cli_args)
+    if tuple(add_cli_signature.parameters) != ("parser",):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[4]} has incompatible "
+            f"signature {add_cli_signature}"
         )
 
     _wrap_constructor(engine_args)
@@ -309,6 +451,29 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(engine_args, "_vllm_hcu_original_from_cli_args", from_cli_descriptor)
     setattr(engine_args, "from_cli_args", hcu_from_cli_args)
+
+    @functools.wraps(add_cli_args)
+    def hcu_add_cli_args(parser):
+        result = add_cli_args(parser)
+        for action in getattr(result, "_actions", ()):
+            if getattr(action, "dest", None) != "all2all_backend":
+                continue
+            choices = getattr(action, "choices", None)
+            if choices is None:
+                raise PatchCompatibilityError(
+                    "--all2all-backend CLI action has no audited choices"
+                )
+            if _DEEPEP_AUTO_BACKEND not in choices:
+                action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
+            break
+        else:
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install --all2all-backend"
+            )
+        return result
+
+    setattr(engine_args, "_vllm_hcu_original_add_cli_args", add_cli_descriptor)
+    setattr(engine_args, "add_cli_args", staticmethod(hcu_add_cli_args))
 
     @functools.wraps(create_engine_config)
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):

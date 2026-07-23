@@ -83,6 +83,9 @@ def _make_arg_utils_module() -> ModuleType:
     @dataclass
     class EngineArgs:
         additional_config: dict[str, Any] = field(default_factory=dict)
+        attention_backend: str | None = None
+        attention_config: dict[str, Any] = field(default_factory=dict)
+        all2all_backend: str = "allgather_reducescatter"
         moe_backend: str = "auto"
         kernel_config: _KernelConfig | dict[str, Any] = field(
             default_factory=_KernelConfig
@@ -102,7 +105,19 @@ def _make_arg_utils_module() -> ModuleType:
             return SimpleNamespace(
                 additional_config=copy.deepcopy(self.additional_config),
                 kernel_config=copy.deepcopy(self.kernel_config),
+                parallel_config=SimpleNamespace(
+                    all2all_backend=self.all2all_backend
+                ),
             )
+
+        @staticmethod
+        def add_cli_args(parser: argparse.ArgumentParser):
+            parser.add_argument(
+                "--all2all-backend",
+                choices=("allgather_reducescatter", "deepep_low_latency"),
+                default="allgather_reducescatter",
+            )
+            return parser
 
         @classmethod
         def from_cli_args(cls, args: argparse.Namespace):
@@ -152,6 +167,9 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
     assert inspect.signature(module.EngineArgs.__init__) == original_signature
     assert {item.name for item in fields(module.EngineArgs)} == {
         "additional_config",
+        "attention_backend",
+        "attention_config",
+        "all2all_backend",
         "moe_backend",
         "kernel_config",
         "speculative_config",
@@ -159,6 +177,46 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
 
     config = args.create_engine_config()
     assert get_hcu_config(config) == get_hcu_config(args)
+
+
+def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(all2all_backend="deepep_auto")
+    assert args.all2all_backend == "deepep_low_latency"
+    assert get_hcu_config(args).deepep_auto is True
+    config = args.create_engine_config()
+    assert config.parallel_config.all2all_backend == "deepep_low_latency"
+    assert get_hcu_config(config).deepep_auto is True
+
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+    parsed = parser.parse_args(["--all2all-backend", "deepep_auto"])
+    assert parsed.all2all_backend == "deepep_auto"
+
+
+@pytest.mark.parametrize(
+    ("alias", "mode"),
+    [
+        ("FLASH_ATTN_CLASSIC", "classic"),
+        ("flash_attn_cutlass", "cutlass"),
+        ("FLASH_ATTN_CUSTOM", "custom"),
+    ],
+)
+def test_engine_args_normalizes_hcu_flash_attention_aliases(
+    alias: str, mode: str
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    top_level = module.EngineArgs(attention_backend=alias)
+    assert top_level.attention_backend == "FLASH_ATTN"
+    assert get_hcu_config(top_level).hcu_flash_attn_mode == mode
+    assert get_hcu_config(top_level.create_engine_config()).hcu_flash_attn_mode == mode
+
+    nested = module.EngineArgs(attention_config={"backend": alias})
+    assert nested.attention_config["backend"] == "FLASH_ATTN"
+    assert get_hcu_config(nested).hcu_flash_attn_mode == mode
 
 
 def test_async_engine_args_and_nested_dpsk_config_use_same_sidecar() -> None:

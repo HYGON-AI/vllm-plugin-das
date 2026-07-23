@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 import vllm_hcu.platforms.envs as henvs 
+from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm_hcu.patch.config import get_hcu_config
 
 logger = init_logger(__name__)
@@ -1058,13 +1059,10 @@ class GPUModelRunner(
             )
 
     def _init_kv_zero_meta(self) -> None:
-        """One-time precomputation for _zero_block_ids.
-
-        Delegates to KVBlockZeroer.init_meta with the runner's state.
-        Called from gpu_worker.py outside the CuMem pool context.
-        """
-        self._kv_block_zeroer = KVBlockZeroer(self.device, self.pin_memory)
-        self._kv_block_zeroer.init_meta(
+        """Initialize the target-owned KV cache block zeroer."""
+        self._kv_block_zeroer = KVBlockZeroer(
+            self.device,
+            pin_memory=self.pin_memory,
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self._kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
@@ -6894,9 +6892,12 @@ class GPUModelRunner(
                     else:
                         shape_block_size = kernel_block_size
 
-                    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN and \
-                        self.vllm_config.attention_config.backend != AttentionBackendEnum.TRITON_ATTN \
-                            and not self.vllm_config.model_config.use_mla:
+                    if (
+                        get_hcu_flash_attn_mode() == "custom"
+                        and self.vllm_config.attention_config.backend
+                        != AttentionBackendEnum.TRITON_ATTN
+                        and not self.vllm_config.model_config.use_mla
+                    ):
                         key_cache_shape, value_cache_shape = attn_backend.get_kv_cache_shape(
                             kernel_num_blocks,
                             shape_block_size,

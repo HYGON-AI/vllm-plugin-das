@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
 import zmq
@@ -262,7 +262,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
-            if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            if get_hcu_flash_attn_mode() != "custom":
                 if (isinstance(attn_metadata, MLACommonMetadata) or layer.ndim == 3 or layer.shape[1] == 2):
                     num_block = kv_cache.shape[0]
                     self.check_tensors_except_dim(layer, kv_cache, 0)
@@ -421,7 +421,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
             if (not isinstance(kv_layer, tuple)):
                 if (isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3 or layer.shape[1] == 2):
                     return layer[block_ids, ...]
-                elif not (henvs.VLLM_HCU_USE_FLASH_ATTN or henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED): # FlashAttention_NV
+                elif get_hcu_flash_attn_mode() not in ("classic", "cutlass"): # FlashAttention_NV
                     return layer[:, block_ids, ...]
                 else:
                     logger.error("🚧kv_cache not mla && gqa")

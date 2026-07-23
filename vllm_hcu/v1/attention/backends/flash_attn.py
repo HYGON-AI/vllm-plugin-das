@@ -70,6 +70,21 @@ import vllm.envs as envs
 logger = init_logger(__name__)
 
 
+def _get_flash_attn_mode() -> str:
+    # Lazy import avoids a platform/backend import cycle at module load time.
+    from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
+
+    return get_hcu_flash_attn_mode()
+
+
+def _find_kv_cache_block_dim(shape, sentinel: int) -> int:
+    """Find the block dimension for interleaved or separate K/V layouts."""
+
+    if shape and isinstance(shape[0], tuple):
+        return shape[0].index(sentinel)
+    return shape.index(sentinel)
+
+
 class HcuFlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -80,6 +95,8 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if _get_flash_attn_mode() == "custom":
+            return [64]
         vllm_config = get_current_vllm_config()
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -141,77 +158,68 @@ class HcuFlashAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
 
-    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
-        @staticmethod
-        def get_kv_cache_shape(
-            num_blocks: int,
-            block_size: int,
-            num_kv_heads: int,
-            head_size: int,
-            cache_dtype_str: str = "auto",
-        ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-            if block_size % 16 != 0:
-                raise ValueError("Block size must be a multiple of 16.")
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ):
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        if _get_flash_attn_mode() == "custom":
             return (
                 (num_blocks, num_kv_heads, block_size, head_size),
                 (num_blocks, num_kv_heads, head_size, block_size),
             )
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
 
-        @staticmethod
-        def get_kv_cache_stride_order(
-            include_num_layers_dimension: bool = False,
-        ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-            # `stride_order` indicates the permutation that gets
-            # us from `get_kv_cache_shape` to the actual memory layout we want.
-            cache_layout = get_kv_cache_layout()
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Handle the custom backend's separate K/V cache shape contract."""
+
+        sentinel = 1234567
+        shape = cls.get_kv_cache_shape(
+            sentinel,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return _find_kv_cache_block_dim(shape, sentinel)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ):
+        cache_layout = get_kv_cache_layout()
+        if _get_flash_attn_mode() == "custom":
             if cache_layout == "NHD" and include_num_layers_dimension:
-                # (num_blocks, num_layers, block_size, num_kv_heads, head_size)
                 return (1, 0, 3, 2, 5), (1, 0, 4, 2, 3)
-            elif cache_layout == "NHD":
-                key_stride_order = (0, 1, 2, 3)
-                value_stride_order = (0, 1, 2, 3)
-            elif cache_layout == "HND" and include_num_layers_dimension:
-                # (num_blocks, num_kv_heads, num_layers, block_size, head_size)
+            if cache_layout == "NHD":
+                return (0, 1, 2, 3), (0, 1, 2, 3)
+            if cache_layout == "HND" and include_num_layers_dimension:
                 return (1, 2, 0, 3, 4), (1, 2, 0, 4, 3)
-            elif cache_layout == "HND":
-                key_stride_order = (0, 1, 2, 3)
-                value_stride_order = (0, 1, 3, 2)
-            else:
-                raise ValueError(f"Unknown cache layout format {cache_layout}.")
-            return key_stride_order, value_stride_order
-    else:
-        @staticmethod
-        def get_kv_cache_shape(
-            num_blocks: int,
-            block_size: int,
-            num_kv_heads: int,
-            head_size: int,
-            cache_dtype_str: str = "auto",
-        ) -> tuple[int, ...]:
-            if block_size % 16 != 0:
-                raise ValueError("Block size must be a multiple of 16.")
-            return (2, num_blocks, block_size, num_kv_heads, head_size)
+            if cache_layout == "HND":
+                return (0, 1, 2, 3), (0, 1, 3, 2)
+            raise ValueError(f"Unknown cache layout format {cache_layout}.")
 
-        @staticmethod
-        def get_kv_cache_stride_order(
-            include_num_layers_dimension: bool = False,
-        ) -> tuple[int, ...]:
-            # `stride_order` indicates the permutation that gets
-            # us from `get_kv_cache_shape` to the actual memory layout we want.
-            cache_layout = get_kv_cache_layout()
-            if cache_layout == "NHD" and include_num_layers_dimension:
-                # (num_blocks, num_layers, 2, block_size, num_kv_heads, head_size)
-                return (2, 0, 1, 3, 4, 5)
-            elif cache_layout == "NHD":
-                stride_order = (0, 1, 2, 3, 4)
-            elif cache_layout == "HND" and include_num_layers_dimension:
-                # (num_blocks, num_kv_heads, num_layers, 2, block_size, head_size)
-                return (2, 4, 0, 1, 3, 5)
-            elif cache_layout == "HND":
-                stride_order = (0, 1, 3, 2, 4)
-            else:
-                raise ValueError(f"Unknown cache layout format {cache_layout}.")
-            return stride_order
+        if cache_layout == "NHD" and include_num_layers_dimension:
+            return (2, 0, 1, 3, 4, 5)
+        if cache_layout == "NHD":
+            return (0, 1, 2, 3, 4)
+        if cache_layout == "HND" and include_num_layers_dimension:
+            return (2, 4, 0, 1, 3, 5)
+        if cache_layout == "HND":
+            return (0, 1, 3, 2, 4)
+        raise ValueError(f"Unknown cache layout format {cache_layout}.")
 
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
@@ -263,6 +271,7 @@ class HcuFlashAttentionBackend(AttentionBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
@@ -709,7 +718,11 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN and self.kv_cache_dtype == "fp8_e5m2":
+        if (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and _get_flash_attn_mode() == "custom"
+            and self.kv_cache_dtype == "fp8_e5m2"
+        ):
             self.supports_quant_query_input = False
         else:
             self.supports_quant_query_input = flash_attn_supports_quant_query_input()
@@ -793,7 +806,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if isinstance(kv_cache, tuple):
             key_cache, value_cache = kv_cache
         else:
             key_cache, value_cache = kv_cache.unbind(0)
@@ -831,7 +844,7 @@ class FlashAttentionImpl(AttentionImpl):
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
 
-            if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+            if _get_flash_attn_mode() == "custom":
                 q_descale = None
                 k_descale = layer._k_scale
                 v_descale = layer._v_scale
@@ -866,7 +879,7 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+                if _get_flash_attn_mode() == "custom":
                     logger.info_once(
                         "[HCU FLASH_ATTN PATH] custom_flash_attn",
                         scope="local",
@@ -895,7 +908,7 @@ class FlashAttentionImpl(AttentionImpl):
                         s_aux=self.sinks,
                         is_prefix_cache=True,
                     )
-                elif henvs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED:
+                elif _get_flash_attn_mode() == "cutlass":
                     logger.info_once(
                         "[HCU FLASH_ATTN PATH] unified_flash_attn",
                         scope="local",
@@ -992,7 +1005,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if isinstance(kv_cache, tuple):
             key_cache, value_cache = kv_cache
         else:
             key_cache, value_cache = kv_cache.unbind(0)
@@ -1004,7 +1017,7 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if _get_flash_attn_mode() == "custom":
             torch.ops.hcu_ops.reshape_and_cache(
                 key,
                 value,
@@ -1060,7 +1073,7 @@ class FlashAttentionImpl(AttentionImpl):
                 self._dcp_dtype,
             ),
         )
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if _get_flash_attn_mode() == "custom":
             context_attn_out, context_lse = vllm_flash_attn_varlen_func(
                 q=query_across_dcp,
                 k=key_cache,
@@ -1121,7 +1134,7 @@ class FlashAttentionImpl(AttentionImpl):
         (dcp_query_out,) = current_workspace_manager().get_simultaneous(
             ((query.shape[0], self.num_heads, self.head_size), self._dcp_dtype),
         )
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if _get_flash_attn_mode() == "custom":
             query_attn_out, query_lse = vllm_flash_attn_varlen_func(
                 q=query,
                 k=key,
@@ -1220,7 +1233,7 @@ class FlashAttentionImpl(AttentionImpl):
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if _get_flash_attn_mode() == "custom":
             vllm_flash_attn_varlen_func(
                 q=query,
                 k=key,
@@ -1382,11 +1395,11 @@ def cascade_attention(
     assert common_prefix_len % block_size == 0
     num_common_kv_blocks = common_prefix_len // block_size
     assert num_common_kv_blocks > 0
-    if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+    if _get_flash_attn_mode() != "custom":
         descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
 
     # Process shared prefix.
-    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+    if _get_flash_attn_mode() == "custom":
         prefix_output, prefix_lse, _ = vllm_flash_attn_varlen_func(
             q=query,
             k=key_cache,
@@ -1438,11 +1451,11 @@ def cascade_attention(
             # num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
         )
 
-    if not henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+    if _get_flash_attn_mode() != "custom":
         descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
 
     # Process suffix per query.
-    if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+    if _get_flash_attn_mode() == "custom":
         suffix_output, suffix_lse, _ = vllm_flash_attn_varlen_func(
             q=query,
             k=key_cache,

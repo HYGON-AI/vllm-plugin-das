@@ -81,6 +81,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
 def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
     assert platform_framework_callback_names() == (
         (
+            "platform.framework_opt.pp_single_rank_partition",
+            "vllm.distributed.utils",
+        ),
+        (
             "platform.framework_opt.hcu_mooncake_connector",
             "vllm_hcu.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector",
@@ -237,9 +241,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 36,
+        "count": 37,
         "replacements": 11,
-        "callbacks": 25,
+        "callbacks": 26,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

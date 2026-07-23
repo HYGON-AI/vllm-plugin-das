@@ -82,7 +82,7 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
             "vllm_hcu.distributed.device_communicators.custom_all_reduce",
         ),
     )
-    assert len(callbacks) == 58
+    assert len(callbacks) == 59
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
@@ -232,10 +232,10 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "first": 62,
-        "second": 62,
+        "first": 63,
+        "second": 63,
         "replacements": 4,
-        "callbacks": 58,
+        "callbacks": 59,
         "statuses": ["armed"],
         "targets_loaded": [],
         "business_loaded": [],
@@ -281,7 +281,7 @@ def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["pid"] == payload["actual_pid"]
     assert payload["role"] == "Worker"
-    assert payload["count"] == 62
+    assert payload["count"] == 63
     assert set(map(tuple, payload["selected"].values())) == {("armed", True)}
     assert payload["pynccl"] == ["armed", False]
 

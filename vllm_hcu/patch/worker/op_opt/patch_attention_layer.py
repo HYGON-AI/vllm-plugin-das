@@ -29,9 +29,10 @@ _WRAPPER_MARKER = "_vllm_hcu_attention_runtime_wrapper"
 def _feature_flags() -> tuple[bool, bool]:
     try:
         from vllm_hcu.platforms import envs as henvs
+        from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 
         return (
-            bool(henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN),
+            get_hcu_flash_attn_mode() == "custom",
             bool(henvs.VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE),
         )
     except (AttributeError, ImportError) as exc:

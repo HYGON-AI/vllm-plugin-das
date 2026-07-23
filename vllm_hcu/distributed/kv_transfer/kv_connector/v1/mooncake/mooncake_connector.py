@@ -20,6 +20,7 @@ import zmq
 import zmq.asyncio
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -728,7 +729,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         # HCU CUSTOM FA writes V into a contiguous NHD-style split buffer.
         # Forcing HND yields a permuted non-contiguous V view and corrupts
         # reshape_and_cache / varlen prefill on the producer.
-        if henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN:
+        if get_hcu_flash_attn_mode() == "custom":
             backend = get_current_attn_backend(vllm_config)
             if backend.__name__ == "HcuFlashAttentionBackend":
                 logger.info_once(
@@ -1237,7 +1238,7 @@ class MooncakeConnectorWorker:
             self.split_kv_cache_layout = "HND"
         elif (
             backend.__name__ == "HcuFlashAttentionBackend"
-            and henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN
+            and get_hcu_flash_attn_mode() == "custom"
         ):
             self.split_kv_cache_layout = "HND"
         else:
@@ -1247,7 +1248,7 @@ class MooncakeConnectorWorker:
             "VLLM_HCU_USE_CUSTOM_FLASH_ATTN=%s",
             self.split_kv_cache_layout,
             backend.__name__,
-            henvs.VLLM_HCU_USE_CUSTOM_FLASH_ATTN,
+            get_hcu_flash_attn_mode() == "custom",
         )
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}

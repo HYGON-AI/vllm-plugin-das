@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import dataclasses
 import enum
@@ -87,6 +88,80 @@ def test_hcu_runner_uses_v025_routed_experts_contract():
         "routed_experts=routed_experts_snapshot",
     )
     assert all(name in source for name in required_v025_api)
+
+
+def test_hcu_runner_uses_v025_kv_block_zeroer_constructor_contract():
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+    init_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_init_kv_zero_meta"
+    )
+    constructor = next(
+        node
+        for node in ast.walk(init_method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "KVBlockZeroer"
+    )
+    assert {keyword.arg for keyword in constructor.keywords} == {
+        "pin_memory",
+        "attn_groups_iter",
+        "kernel_block_sizes",
+        "cache_dtype",
+        "runner_only_attn_layers",
+        "static_forward_context",
+    }
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "init_meta"
+        for node in ast.walk(init_method)
+    )
+
+
+@pytest.mark.parametrize(
+    "path,class_name",
+    (
+        (
+            "vllm_hcu/v1/attention/backends/flash_attn.py",
+            "HcuFlashAttentionBackend",
+        ),
+        (
+            "vllm_hcu/v1/attention/backends/mla/flashmla.py",
+            "HcuFlashMLABackend",
+        ),
+    ),
+)
+def test_hcu_attention_backend_uses_v025_combination_signature(path, class_name):
+    tree = ast.parse(Path(path).read_text(encoding="utf-8-sig"))
+    backend = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in backend.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "supports_combination"
+    )
+    assert [argument.arg for argument in method.args.args] == [
+        "cls",
+        "head_size",
+        "dtype",
+        "kv_cache_dtype",
+        "block_size",
+        "use_mla",
+        "has_sink",
+        "use_sparse",
+        "use_mm_prefix",
+        "device_capability",
+    ]
 
 
 def test_hcu_runner_uses_v025_input_batch_constructor_contract():

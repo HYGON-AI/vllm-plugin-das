@@ -15,6 +15,7 @@ from vllm_hcu.patch.tokenizer_callbacks import register_tokenizer_callbacks
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
     patch_engine_core,
+    patch_distributed_utils,
     patch_kv_cache_utils,
     patch_kv_connector_factory,
     patch_mooncake_connector,
@@ -36,6 +37,7 @@ _DISPATCH_LOCK = threading.RLock()
 # the vLLM integration points from low-level KV/distributed contracts through
 # scheduling and engine output.
 _ORDERED_FRAMEWORK_ADAPTERS = (
+    patch_distributed_utils,
     patch_mooncake_connector,
     patch_kv_connector_factory,
     patch_parallel_state,

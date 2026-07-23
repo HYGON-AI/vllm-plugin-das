@@ -49,7 +49,9 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "enable_lightly_cplb": False,
                 "enable_custom_sp": False,
                 "enable_multi_layers_mtp": False,
+                "deepep_auto": False,
                 "moe_backend": "auto",
+                "hcu_flash_attn_mode": None,
             }
         }
     }
@@ -86,6 +88,7 @@ def test_pop_legacy_keywords_leaves_upstream_kwargs_untouched() -> None:
     [
         ({"enable_lightly_cp": 1}, TypeError),
         ({"moe_backend": "triton"}, ValueError),
+        ({"hcu_flash_attn_mode": "future"}, ValueError),
         ({"future_typo": True}, ValueError),
         ({"enable_lightly_cplb": True}, ValueError),
     ],

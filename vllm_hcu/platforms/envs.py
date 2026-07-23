@@ -72,6 +72,44 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
         return None
     return int(value)
 
+
+def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
+    """Resolve an HCU flash-attention sub-mode without touching vLLM schema.
+
+    An explicit sidecar value wins.  The legacy environment switches retain
+    their historical priority, and the flagless HCU default remains the
+    separate-cache custom implementation.
+    """
+
+    if explicit_mode is not None:
+        normalized = explicit_mode.lower()
+        aliases = {
+            "unified": "cutlass",
+            "classic": "classic",
+            "cutlass": "cutlass",
+            "custom": "custom",
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                f"Unsupported HCU flash attention mode: {explicit_mode!r}."
+            )
+        return aliases[normalized]
+
+    if os.environ.get(
+        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False"
+    ).lower() in ("true", "1"):
+        return "custom"
+    if os.environ.get(
+        "VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "False"
+    ).lower() in ("true", "1"):
+        return "cutlass"
+    if os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in (
+        "true",
+        "1",
+    ):
+        return "classic"
+    return "custom"
+
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
 
