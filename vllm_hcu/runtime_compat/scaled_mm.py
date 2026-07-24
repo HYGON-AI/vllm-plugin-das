@@ -265,7 +265,7 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
     ):
         raise RuntimeError(
             "vLLM target triton_scaled_mm signature drifted from the reviewed "
-            "v0.25 contract"
+            "v0.25.1 contract"
         )
 
     channel_fp8_custom_op = _ensure_channel_fp8_custom_op(triton_scaled_mm)
@@ -312,7 +312,7 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
             raise ValueError("channelwise FP8 scaled-mm A must be contiguous")
         if B.stride() != (1, k):
             raise ValueError(
-                "channelwise FP8 scaled-mm B must retain the target v0.25 "
+                "channelwise FP8 scaled-mm B must retain the target v0.25.1 "
                 "column-major [K,N] post-load view"
             )
         if A.device != B.device or A.dtype != B.dtype:
@@ -329,7 +329,7 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
         # across subgraphs.  The target Torch Inductor does not accept a
         # ``sympy.Equality`` graph input.  Keep the friendly validation for
         # concrete eager calls; the custom-op implementation delegates to the
-        # target v0.25 Triton backend and repeats the HCU/target scale contract
+        # target v0.25.1 Triton backend and repeats the HCU/target scale contract
         # with concrete runtime dimensions.
         if not torch.compiler.is_compiling():
             _validate_scale_shapes(As, Bs, m, n)

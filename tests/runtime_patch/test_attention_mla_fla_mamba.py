@@ -74,7 +74,7 @@ def _install_fake_module(monkeypatch, name: str, **values) -> ModuleType:
     return module
 
 
-def test_flashmla_sparse_bf16_preserves_v025_topk_length(monkeypatch):
+def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     adapter = _adapter("patch_flashmla_sparse")
     calls: list[tuple[object, ...]] = []
 

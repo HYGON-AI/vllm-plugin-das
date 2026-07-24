@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Keep the v0.25 GPU-worker shutdown contract usable on DCU.
+"""Keep the v0.25.1 GPU-worker shutdown contract usable on DCU.
 
-vLLM v0.25 imports ``vllm.device_allocator.cumem`` at the end of every
+vLLM v0.25.1 imports ``vllm.device_allocator.cumem`` at the end of every
 CUDA-like worker shutdown in order to release an existing allocator singleton.
 On DCU, an ordinary (non-sleep-mode) worker never imports that module, and the
 shutdown-only probe can fail while constructing ``CudaRTLibrary`` because the
@@ -12,7 +12,7 @@ exist, so only that exact failed tail probe is an HCU no-op.
 The target method remains responsible for every other lifecycle step.  This
 adapter deliberately does not catch missing-runtime failures when cumem was
 already loaded, failures from model-runner teardown, or any traceback shape
-other than the audited v0.25 import probe.
+other than the audited v0.25.1 import probe.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ def _is_unused_cumem_probe_failure(
     current_platform: object,
     cumem_loaded_before_shutdown: bool,
 ) -> bool:
-    """Recognize only the audited v0.25 shutdown-tail import failure."""
+    """Recognize only the audited v0.25.1 shutdown-tail import failure."""
 
     if cumem_loaded_before_shutdown or error.args != (_MISSING_CUDART_MESSAGE,):
         return False
@@ -131,7 +131,7 @@ def apply_to_module(module: ModuleType) -> bool:
     if original_code is None or not required_names.issubset(original_code.co_names):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} no longer contains the "
-            "audited v0.25 cumem shutdown probe"
+            "audited v0.25.1 cumem shutdown probe"
         )
     current_platform = getattr(gpu_worker, "current_platform", None)
     if current_platform is None:

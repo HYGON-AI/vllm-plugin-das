@@ -87,7 +87,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 or getattr(weight, "output_dim", None) != 1
             ):
                 raise RuntimeError(
-                    "vLLM v0.25 Channel-FP8 post-load weight did not retain "
+                    "vLLM v0.25.1 Channel-FP8 post-load weight did not retain "
                     "the reviewed [K,N] column-major layout"
                 )
 

@@ -211,9 +211,9 @@ def apply_aiter_w8a8_fp8_moe(
         )
     if getattr(method, "moe", None) is None:
         raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE requires the vLLM v0.25 MoE configuration"
+            "AITER FP8-W8A8 MoE requires the vLLM v0.25.1 MoE configuration"
         )
-    # vLLM v0.25 passes both objects through the quant-method contract.  The
+    # vLLM v0.25.1 passes both objects through the quant-method contract.  The
     # HCU MoERunner owns shared-expert launch/stream ordering around this
     # routed-expert kernel, so this backend must accept (but not execute) them.
     del shared_experts, shared_experts_input
@@ -259,7 +259,7 @@ def apply_aiter_w8a8_fp8_moe(
         topk_weights=topk_weights.to(torch.float32),
         topk_ids=topk_ids.to(torch.int32),
         moe_config=moe_config,
-        # vLLM v0.25 removed FusedMoEConfig.disable_inplace together with
+        # vLLM v0.25.1 removed FusedMoEConfig.disable_inplace together with
         # the in-place fused-experts mechanism.  Preserve the target contract
         # and keep x available to the runner/shared-expert lifecycle.
         inplace=False,

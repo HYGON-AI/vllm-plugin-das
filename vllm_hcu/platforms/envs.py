@@ -331,7 +331,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     lambda: maybe_convert_int(os.getenv("VLLM_HCU_DEEPEP_NUM_SMS", None)),
 
     # If set, use the HCU DeepEP LL dispatch API with topk weights and
-    # quant_group_size. Default keeps the v0.21.0 DeepEP API path.
+    # quant_group_size. Default keeps the legacy DeepEP API path.
     "VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API":
         lambda: (os.environ.get("VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API", "False").lower() in
                     ("true", "1")),

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU router implementations used by the v0.25 runtime adapters."""
+"""HCU router implementations used by the v0.25.1 runtime adapters."""
 
 from __future__ import annotations
 

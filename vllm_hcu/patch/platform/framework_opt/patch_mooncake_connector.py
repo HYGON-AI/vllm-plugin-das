@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Contract validation for the HCU-owned v0.21 Mooncake connector."""
+"""Contract validation for the HCU-owned Mooncake connector."""
 
 from __future__ import annotations
 

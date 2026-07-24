@@ -66,7 +66,7 @@ def apply_to_module(module: ModuleType) -> bool:
         i_s=None,
     ):
         if use_nn_moe:
-            raise RuntimeError("HCU v0.25 modular MoE does not support use_nn_moe=True")
+            raise RuntimeError("HCU v0.25.1 modular MoE does not support use_nn_moe=True")
         if (i_q is None) != (i_s is None):
             raise ValueError("HCU modular MoE requires i_q and i_s together")
         if self.moe_kernel is None:

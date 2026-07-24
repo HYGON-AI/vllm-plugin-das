@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wire HCU-owned MoE capabilities into the v0.25 factory pipeline."""
+"""Wire HCU-owned MoE capabilities into the v0.25.1 factory pipeline."""
 
 from __future__ import annotations
 

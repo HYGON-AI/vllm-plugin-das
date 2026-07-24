@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM v0.25 target MambaMixer2 behavior plus HCU NN-layout deltas."""
+"""vLLM v0.25.1 target MambaMixer2 behavior plus HCU NN-layout deltas."""
 
 from __future__ import annotations
 

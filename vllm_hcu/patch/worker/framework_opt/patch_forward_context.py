@@ -44,7 +44,7 @@ def apply_to_module(module: ModuleType) -> bool:
         context_class
     ):
         raise PatchCompatibilityError(
-            f"required target {TARGETS[1]} is not the extensible v0.25 dataclass"
+            f"required target {TARGETS[1]} is not the extensible v0.25.1 dataclass"
         )
     original_create = require_callable(forward, "create_forward_context", TARGETS[2])
     create_positional = (

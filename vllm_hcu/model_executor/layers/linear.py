@@ -1051,7 +1051,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
-        """Preserve v0.25 stacked-weight shard metadata during autoload."""
+        """Preserve v0.25.1 stacked-weight shard metadata during autoload."""
 
         for name, loaded_weight in weights:
             shard_id = getattr(loaded_weight, "shard_id", None)
@@ -1495,7 +1495,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
-        """Preserve v0.25 stacked-weight shard metadata during autoload."""
+        """Preserve v0.25.1 stacked-weight shard metadata during autoload."""
 
         for name, loaded_weight in weights:
             shard_id = getattr(loaded_weight, "shard_id", None)
@@ -1519,9 +1519,9 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
-    """v0.25 five-way QKV/indexer projection with HCU linear primitives.
+    """v0.25.1 five-way QKV/indexer projection with HCU linear primitives.
 
-    The class is owned by vLLM's MiniMax-M3 model contract.  Keep its v0.25
+    The class is owned by vLLM's MiniMax-M3 model contract.  Keep its v0.25.1
     sharding and loading semantics intact while inheriting this replacement
     module's DCU-aware column-parallel implementation.
     """

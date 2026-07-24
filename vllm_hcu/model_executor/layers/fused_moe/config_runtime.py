@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM v0.25 target MoE configuration behavior plus HCU quantization deltas.
+"""vLLM v0.25.1 target MoE configuration behavior plus HCU quantization deltas.
 
 The functions in this module intentionally receive the imported vLLM module
 as an argument.  This keeps import-time dependencies light and, more

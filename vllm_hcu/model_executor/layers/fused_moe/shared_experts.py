@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HCU-owned v0.25 shared-expert execution."""
+"""HCU-owned v0.25.1 shared-expert execution."""
 
 import inspect
 from collections.abc import Callable

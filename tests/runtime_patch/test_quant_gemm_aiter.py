@@ -675,7 +675,7 @@ def test_aiter_replacement_maps_each_optional_capability_exactly():
     assert "_hcu_runtime.is_triton_fp8_bmm_enabled" in fp8_bmm_source
 
 
-def test_hcu_aiter_moe_uses_v025_out_of_place_contract():
+def test_hcu_aiter_moe_uses_v0251_out_of_place_contract():
     repo = Path(__file__).resolve().parents[2]
     sources = (
         repo
@@ -915,7 +915,7 @@ def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
     assert kwargs["activation"] == "silu"
 
 
-def test_aiter_feature_off_delegates_v025_fused_moe_contract(
+def test_aiter_feature_off_delegates_v0251_fused_moe_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _install_fake_aiter(monkeypatch)
@@ -1674,7 +1674,7 @@ def test_moe_fp8_hcu_aiter_flag_defaults_off(monkeypatch: pytest.MonkeyPatch):
     assert henvs.VLLM_HCU_USE_AITER_W8A8_FP8_MOE is True
 
 
-def test_moe_fp8_aiter_path_accepts_v025_shared_expert_contract(
+def test_moe_fp8_aiter_path_accepts_v0251_shared_expert_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
     kernel_calls: list[dict[str, object]] = []
@@ -1730,7 +1730,7 @@ def test_moe_fp8_aiter_path_accepts_v025_shared_expert_contract(
     method.moe = None
     with pytest.raises(
         compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
-        match="vLLM v0.25 MoE configuration",
+        match="vLLM v0.25.1 MoE configuration",
     ):
         compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
             method, layer, x, weights, ids, None, None

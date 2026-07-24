@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict v0.25 MLAAttention runtime adapter."""
+"""Strict v0.25.1 MLAAttention runtime adapter."""
 
 from __future__ import annotations
 

@@ -61,7 +61,7 @@ def _fake_gpu_worker_module(
         "CUMEM_CODE": cumem_code,
         "CUMEM_GLOBALS": cumem_globals,
     }
-    # ``use_real_import`` keeps the audited v0.25 names in the code object.
+    # ``use_real_import`` keeps the audited v0.25.1 names in the code object.
     # The synthetic exec branch produces the same three relevant traceback
     # frames without importing vLLM or touching a device.
     exec(
@@ -159,7 +159,7 @@ def test_gpu_worker_shutdown_rethrows_every_unapproved_probe_failure(
         worker.shutdown()
 
 
-def test_gpu_worker_shutdown_rejects_target_without_v025_probe():
+def test_gpu_worker_shutdown_rejects_target_without_v0251_probe():
     class Worker:
         def shutdown(self):
             return None
@@ -171,7 +171,7 @@ def test_gpu_worker_shutdown_rejects_target_without_v025_probe():
     )
     with pytest.raises(
         RuntimeError,
-        match="no longer contains the audited v0.25 cumem shutdown probe",
+        match="no longer contains the audited v0.25.1 cumem shutdown probe",
     ):
         patch_gpu_worker_shutdown.apply_to_module(module)
 

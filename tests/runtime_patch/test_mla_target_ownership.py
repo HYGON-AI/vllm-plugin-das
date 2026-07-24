@@ -274,7 +274,7 @@ def _fake_mla_module(adapter, target_calls):
                 quant_tma_aligned,
             )
             target_calls.append((self, args))
-            return "target-v0.25"
+            return "target-v0.25.1"
 
         def process_weights_after_loading(self, act_dtype):
             return act_dtype
@@ -382,7 +382,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     assert scale_calls == [(mla, False)]
 
 
-def test_mla_feature_off_delegates_exact_v025_forward_on_rocm():
+def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     adapter = _adapter()
     target_calls = []
     module = _fake_mla_module(adapter, target_calls)
@@ -392,7 +392,7 @@ def test_mla_feature_off_delegates_exact_v025_forward_on_rocm():
     instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
     args = _forward_args()
 
-    assert instance.forward_impl(*args) == "target-v0.25"
+    assert instance.forward_impl(*args) == "target-v0.25.1"
     assert target_calls == [(instance, args)]
     common = object()
     assert module.split_decodes_and_prefills(common, 3, True, True) is False

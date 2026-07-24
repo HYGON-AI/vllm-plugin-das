@@ -42,11 +42,11 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     if "skip_topk" not in original_init.__code__.co_names:
         raise PatchCompatibilityError(
-            "clean v0.25 target MLA constructor no longer stores skip_topk"
+            "clean v0.25.1 target MLA constructor no longer stores skip_topk"
         )
     if "skip_topk" not in original_forward.__code__.co_names:
         raise PatchCompatibilityError(
-            "clean v0.25 target MLA forward no longer guards skip_topk"
+            "clean v0.25.1 target MLA forward no longer guards skip_topk"
         )
 
     @functools.wraps(original_init)

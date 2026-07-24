@@ -51,9 +51,9 @@ def _install_version(
 @pytest.mark.parametrize(
     "value",
     (
-        "0.25.0",
+        "0.25.1",
         "0.25.9",
-        "0.25.0+das.5bf5c5f.dtk2604",
+        "0.25.1+das.5bf5c5f.dtk2604",
         "0.25.1.post2",
     ),
 )
@@ -78,7 +78,7 @@ def test_supported_vllm_series_accepts_pep440_variants(
         "0.20.2",
         "0.22.0",
         "0.24.1+das.local",
-        "1!0.25.0",
+        "1!0.25.1",
         "not a version",
     ),
 )
@@ -121,9 +121,9 @@ def test_runtime_hcu_version_prefers_metadata_with_source_fallback(
     monkeypatch.setattr(
         hcu_version.importlib_metadata,
         "version",
-        lambda name: "0.25.0+das.abcdef0.dtk2604",
+        lambda name: "0.25.1+das.abcdef0.dtk2604",
     )
-    assert hcu_version.get_hcu_version() == "0.25.0+das.abcdef0.dtk2604"
+    assert hcu_version.get_hcu_version() == "0.25.1+das.abcdef0.dtk2604"
 
     def missing(name: str):
         raise hcu_version.importlib_metadata.PackageNotFoundError(name)
@@ -159,7 +159,7 @@ def test_all_plugin_entries_gate_and_platform_probe_latches_compatibility(
 ) -> None:
     _install_version(monkeypatch, tmp_path, "0.24.0")
 
-    # vLLM v0.25 probes the platform plugin under a broad exception handler.
+    # vLLM v0.25.1 probes the platform plugin under a broad exception handler.
     # Preserve selection once, then surface the exact compatibility class.
     assert plugin.hcu_platform_plugin() == plugin._PLATFORM_CLASS_PATH
     with pytest.raises(

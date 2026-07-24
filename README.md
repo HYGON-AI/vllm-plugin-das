@@ -6,7 +6,7 @@ vLLM HCU Plugin
 
 ## Install
 
-vLLM-HCU v0.25 is a runtime plugin for the DCU vLLM v0.25 base package. Install
+vLLM-HCU v0.25.1 is a runtime plugin for the DCU vLLM v0.25.1 base package. Install
 the matching vLLM package first, then install this repository:
 
 ```bash
@@ -64,7 +64,7 @@ status, failure details, and feature activation state.
 
 All three plugin entry points and both patch-application phases share one
 fail-closed compatibility gate. This branch accepts installed vLLM `0.25.x`
-(including local builds such as `0.25.0+das...`) and rejects missing, malformed,
+(including local builds such as `0.25.1+das...`) and rejects missing, malformed,
 or other release series before any patch is registered. The corresponding
 doctor check is named `vllm_compatible`.
 
@@ -128,7 +128,7 @@ Worker imports model runners and custom operators. Required incompatibilities
 are fail-closed and retained in the process-local patch registry; they do not
 fall back to source rewriting.
 
-See [Runtime patch architecture](docs/runtime_patch_architecture_v025.md) for
+See [Runtime patch architecture](docs/runtime_patch_architecture_v0251.md) for
 the lifecycle, ownership rules, module-replacement contract, and extension
 guidelines.
 

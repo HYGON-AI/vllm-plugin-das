@@ -15,7 +15,7 @@ def lightly_cp_mla_wrapper_forward(
     llama_4_scaling: torch.Tensor | None,
     feature_config: HcuFeatureConfig,
 ) -> torch.Tensor:
-    """v0.25 target MLA wrapper forward plus the HCU Lightly-CP KV gather."""
+    """v0.25.1 target MLA wrapper forward plus the HCU Lightly-CP KV gather."""
 
     from vllm.distributed import tensor_model_parallel_all_gather
     from vllm.forward_context import get_forward_context
@@ -94,7 +94,7 @@ def mla_forward_impl(
     quant_col_major=None,
     quant_tma_aligned=None,
 ):
-    """v0.25 target MLA forward plus HCU Lightly-CP KV length and CAT support."""
+    """v0.25.1 target MLA forward plus HCU Lightly-CP KV length and CAT support."""
 
     quant_key = upstream._detect_output_quant_key(
         output, output_scale, output_block_scale, self.num_heads * self.v_head_dim

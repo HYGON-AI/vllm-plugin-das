@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HCU Scheduler for the v0.25 split-P/D scheduling policy.
+"""HCU Scheduler for the v0.25.1 split-P/D scheduling policy.
 
 The class is selected through vLLM's public ``scheduler_cls`` configuration.
 It never replaces the official ``Scheduler`` class. Feature-off execution
@@ -466,7 +466,7 @@ class HcuScheduler(_upstream.Scheduler):
                     -1
                 ] * self.num_spec_tokens
             # Track only requests that remain in their prefill after this
-            # chunk. v0.25 uses this set to account for reserved blocks.
+            # chunk. v0.25.1 uses this set to account for reserved blocks.
             if num_computed_tokens + num_new_tokens < request.num_tokens:
                 self._inflight_prefills.add(request)
             # Encoder-related.

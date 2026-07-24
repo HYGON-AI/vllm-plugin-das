@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# HCU-owned v0.21 Mooncake connector; migrated from 56 audited legacy segments.
+# HCU-owned Mooncake connector; migrated from 56 audited legacy segments.
 import asyncio
 import logging
 import re

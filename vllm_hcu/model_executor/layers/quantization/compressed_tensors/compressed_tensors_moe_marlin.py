@@ -705,7 +705,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 topk_weights=topk_weights.to(torch.float32),
                 topk_ids=topk_ids.to(torch.int32),
                 moe_config=moe_config,
-                # vLLM v0.25 removed FusedMoEConfig.disable_inplace and its
+                # vLLM v0.25.1 removed FusedMoEConfig.disable_inplace and its
                 # fused-experts in-place contract.  This retained HCU AITER
                 # backend must therefore return a distinct output tensor.
                 inplace=False,

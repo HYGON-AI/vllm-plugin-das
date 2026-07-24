@@ -44,9 +44,9 @@ def choose_deepep_auto_low_latency(
     if batch_descriptor is not None:
         return bool(getattr(batch_descriptor, "uniform", False))
 
-    # Draft/profiling forwards do not always carry BatchDescriptor.  Preserve
-    # the v0.21 bounded-token fallback at this boundary, using the v0.25
-    # scheduler/speculative configuration rather than runner globals.
+    # Draft/profiling forwards do not always carry BatchDescriptor. Preserve
+    # the bounded-token fallback at this boundary, using the target scheduler
+    # and speculative configuration rather than runner globals.
     if num_tokens_across_dp is None:
         max_num_tokens = int(num_tokens or 0)
     else:
@@ -85,7 +85,7 @@ def set_forward_context(
     enable_lightly_cplb: bool = False,
     deepep_auto_use_low_latency: bool = False,
 ):
-    """Mirror v0.25's context manager while skipping invalid DeepEP-LL DP sync."""
+    """Mirror v0.25.1's context manager while skipping invalid DeepEP-LL DP sync."""
 
     if cudagraph_runtime_mode is None:
         cudagraph_runtime_mode = module.CUDAGraphMode.NONE

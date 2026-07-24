@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HCU-owned v0.25 MoE runner with pre-quantized input support."""
+"""HCU-owned v0.25.1 MoE runner with pre-quantized input support."""
 
 import inspect
 from collections.abc import Callable, Iterable

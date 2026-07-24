@@ -299,7 +299,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             assert self.block_shape == get_mk_alignment_for_contiguous_layout()
             assert self.quant_config.use_fp8_w8a8
 
-        # v0.25 exposes the unpadded model dimensions on FusedMoEConfig. HCU
+        # v0.25.1 exposes the unpadded model dimensions on FusedMoEConfig. HCU
         # keeps them private because repacked Channel weights may have a
         # different physical N/K layout.
         self._hcu_logical_n = 2 * int(

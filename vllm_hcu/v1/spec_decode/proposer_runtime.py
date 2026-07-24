@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lightly-CP and multi-layer-MTP behavior for the v0.25 base proposer."""
+"""Lightly-CP and multi-layer-MTP behavior for the v0.25.1 base proposer."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def propose(
     num_rejected_tokens_gpu: object | None = None,
     slot_mappings: object | None = None,
 ):
-    """v0.25 proposer algorithm with the Lightly-CP chain kept atomic."""
+    """v0.25.1 proposer algorithm with the Lightly-CP chain kept atomic."""
 
     torch = module.torch
     proposer.num_speculative_tokens = num_speculative_tokens

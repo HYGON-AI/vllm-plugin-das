@@ -166,7 +166,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         # HCU's repacked Channel weights can expose physical N/K that differ
         # from the model dimensions. Keep the override private and derive it
-        # from v0.25's unpadded config instead of extending this constructor.
+        # from v0.25.1's unpadded config instead of extending this constructor.
         self._hcu_logical_n = 2 * int(
             moe_config.intermediate_size_per_partition_unpadded
         )

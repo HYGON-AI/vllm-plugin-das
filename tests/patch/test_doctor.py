@@ -66,7 +66,9 @@ def test_doctor_reuses_runtime_compatibility_check_name_and_detail(
         for item in doctor.collect_diagnostics(arm_platform=False)
     }
 
-    assert "vllm_v021" not in checks
+    assert {
+        name for name in checks if name.startswith("vllm_")
+    } == {"vllm_installed", "vllm_compatible"}
     assert not checks["vllm_compatible"].ok
     assert "expected=0.25.x" in checks["vllm_compatible"].detail
     assert "actual='0.22.0'" in checks["vllm_compatible"].detail

@@ -13,7 +13,7 @@ def mamba_v2_nn_sharded_weight_loader(
     tp_size: int,
     tp_rank: int,
 ) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Adapt the v0.25 target sharded loader to HCU's output-last NN layout."""
+    """Adapt the v0.25.1 target sharded loader to HCU's output-last NN layout."""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         boundary = loaded_boundary = 0

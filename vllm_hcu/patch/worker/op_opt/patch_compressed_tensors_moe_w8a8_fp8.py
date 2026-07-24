@@ -75,7 +75,7 @@ def _require_target_triton_policy(moe) -> None:
     requested_backend = getattr(moe, "moe_backend", None)
     if requested_backend != _REQUIRED_BACKEND:
         raise RuntimeError(
-            "Channel-FP8 MoE requires the explicit vLLM v0.25 target route "
+            "Channel-FP8 MoE requires the explicit vLLM v0.25.1 target route "
             "--moe-backend triton"
         )
 
@@ -111,7 +111,7 @@ def apply_to_module(module: ModuleType) -> bool:
             selected_backend = _selected_backend_name(self)
             if selected_backend != _REQUIRED_SELECTED_BACKEND:
                 raise RuntimeError(
-                    "vLLM v0.25 did not select the required target TRITON "
+                    "vLLM v0.25.1 did not select the required target TRITON "
                     f"Channel-FP8 MoE backend (selected={selected_backend!r})"
                 )
 

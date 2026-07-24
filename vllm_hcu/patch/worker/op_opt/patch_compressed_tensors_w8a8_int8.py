@@ -88,7 +88,7 @@ def apply_to_module(module: ModuleType) -> bool:
         original_weight = weight
         original_data = weight.data
         try:
-            # Cancel the v0.25 target kernel's own transpose so the final
+            # Cancel the v0.25.1 target kernel's own transpose so the final
             # custom hipBLASLt operand remains [N, K].
             layer.weight.data = original_data.t()
             original_process(self, layer)

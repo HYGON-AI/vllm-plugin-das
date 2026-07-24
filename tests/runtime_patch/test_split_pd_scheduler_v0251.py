@@ -243,7 +243,7 @@ def test_async_external_load_owns_blocks_and_inflight_state(
     assert allocate_kwargs["has_scheduled_reqs"] is False
 
 
-def test_dynamic_spec_and_deferred_free_fence_are_v025_owned(split_pd_enabled):
+def test_dynamic_spec_and_deferred_free_fence_are_v0251_owned(split_pd_enabled):
     scheduler = _make_scheduler()
     scheduler.dynamic_sd_lookup = [0, 3, 2, 1, 1]
     scheduler.defer_block_free = True

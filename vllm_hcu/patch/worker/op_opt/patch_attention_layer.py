@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime migration of the v0.25 dense attention HCU fragments."""
+"""Runtime migration of the v0.25.1 dense attention HCU fragments."""
 
 from __future__ import annotations
 

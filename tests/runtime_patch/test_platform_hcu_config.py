@@ -36,11 +36,11 @@ from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 
 REPO = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO.parent / "vllm_025")
+    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
 ).resolve()
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V025_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
 _TARGET_SOURCE_ASSERTION = r'''
@@ -48,7 +48,7 @@ import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V025_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
@@ -57,10 +57,10 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 '''
 
 
-def _run_fresh_v025(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V025_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
@@ -556,8 +556,8 @@ def test_request_cudagraph_buckets_and_feature_off_equivalence(
     assert explicit.compilation_config.post_init_calls == 1
 
 
-def test_real_v025_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
-    result = _run_fresh_v025(
+def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
+    result = _run_fresh_v0251(
         "import json; from types import SimpleNamespace; "
         "import vllm.config.compilation as compilation_module; "
         "import vllm.config.vllm as vllm_module; "
@@ -728,7 +728,7 @@ def test_slimquant_registry_rejects_provider_conflict() -> None:
         patch_slimquant_registry.apply_to_module(module)
 
 
-def test_slimquant_marlin_inherits_v025_compressed_tensors_constructor() -> None:
+def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> None:
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
@@ -752,7 +752,7 @@ def test_slimquant_marlin_inherits_v025_compressed_tensors_constructor() -> None
     assert config.ignore == []
     assert config.quant_format == "int-quantized"
 
-    # v0.25's FusedMoE public symbol is a factory and may be wrapped by HCU;
+    # v0.25.1's FusedMoE public symbol is a factory and may be wrapped by HCU;
     # quantization dispatch must use the target-owned RoutedExperts type.
     source = Path(
         "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"

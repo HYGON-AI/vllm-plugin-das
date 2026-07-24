@@ -53,11 +53,11 @@ logger = init_logger(__name__)
 class DeepEPDeepGemmContiguousExperts(TritonExperts):
     """DeepEP HT backend backed by contiguous DeepGEMM grouped GEMM.
 
-    `_apply_deepgemm_ht()` follows the HCU v0.21 DeepGemmExperts contiguous
+    `_apply_deepgemm_ht()` follows the HCU DeepGemmExperts contiguous
     grouped GEMM flow.
     """
 
-    # Match the HCU v0.21 DeepEP groupgemm path. DeepEP HT
+    # Match the HCU DeepEP groupgemm path. DeepEP HT
     # dispatch aligns FP8 groupgemm traffic to 256 tokens per expert.
     ALIGNMENT = 256
 
@@ -567,7 +567,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
     ):
         # The expert base validates one fixed activation format, while this
         # adapter intentionally owns both.  Initialize its public state using
-        # the same v0.25 fields and let each concrete child validate itself.
+        # the same v0.25.1 fields and let each concrete child validate itself.
         self.moe_config = moe_config
         self.quant_config = quant_config
         self.max_num_tokens = max_num_tokens

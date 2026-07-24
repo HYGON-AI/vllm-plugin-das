@@ -214,7 +214,7 @@ def _vllm_native_rmsnorm_dynamic_quant(
     quant_dtype: torch.dtype,
     residual: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Use vLLM v0.25's native fused op when legacy AITER lacks FP8."""
+    """Use vLLM v0.25.1's native fused op when legacy AITER lacks FP8."""
 
     import_module("vllm._C_stable_libtorch")
     packet = getattr(
@@ -534,12 +534,12 @@ def fused_moe_impl(
     }
     if gate_mode:
         raise HcuAiterRuntimeError(
-            "HCU W16A16 ASM MoE cannot represent vLLM v0.25 "
+            "HCU W16A16 ASM MoE cannot represent vLLM v0.25.1 "
             f"gate_mode={gate_mode!r}"
         )
     if moe_sorting_dispatch_policy:
         raise HcuAiterRuntimeError(
-            "HCU W16A16 ASM MoE cannot represent vLLM v0.25 "
+            "HCU W16A16 ASM MoE cannot represent vLLM v0.25.1 "
             "moe_sorting_dispatch_policy="
             f"{moe_sorting_dispatch_policy}"
         )

@@ -29,7 +29,7 @@ from vllm_hcu.patch.runtime_state import PatchRegistry, PatchStatus
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO_ROOT.parent / "vllm_025")
+    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
 ).resolve()
 
 
@@ -93,7 +93,7 @@ def test_exchange_inventory_arms_dependencies_before_canonical_consumers():
     assert "vllm.model_executor.parameter" not in order
 
 
-def test_deep_gemm_replacement_preserves_v025_warmup_helper():
+def test_deep_gemm_replacement_preserves_v0251_warmup_helper():
     repo = Path(__file__).resolve().parents[2]
     replacement = repo / (
         "vllm_hcu/model_executor/layers/fused_moe/deep_gemm_utils.py"
@@ -125,11 +125,11 @@ def test_deep_gemm_replacement_preserves_v025_warmup_helper():
         ),
     ),
 )
-def test_deep_gemm_replacements_preserve_v025_surface_and_signatures(
+def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
     target_relative: str,
     replacement_relative: str,
 ):
-    """Always-on whole-module replacements must keep the exact v0.25 API."""
+    """Always-on whole-module replacements must keep the exact v0.25.1 API."""
 
     target_tree = ast.parse(
         (TARGET_VLLM_ROOT / target_relative).read_text(encoding="utf-8")
@@ -253,7 +253,7 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
     )
 
 
-def test_linear_replacement_preserves_v025_stacked_weight_loaders():
+def test_linear_replacement_preserves_v0251_stacked_weight_loaders():
     repo = Path(__file__).resolve().parents[2]
     replacement = repo / "vllm_hcu/model_executor/layers/linear.py"
     tree = ast.parse(replacement.read_text(encoding="utf-8"))
@@ -292,7 +292,7 @@ def test_linear_replacement_preserves_v025_stacked_weight_loaders():
         )
 
 
-def test_linear_replacement_preserves_v025_minimax_indexer_contract():
+def test_linear_replacement_preserves_v0251_minimax_indexer_contract():
     repo = Path(__file__).resolve().parents[2]
     replacement = repo / "vllm_hcu/model_executor/layers/linear.py"
     tree = ast.parse(replacement.read_text(encoding="utf-8"))
@@ -377,7 +377,7 @@ def test_deepep_auto_does_not_restore_removed_expected_m_interface():
     assert "expected_m" not in attributes
 
 
-def test_v025_native_mhc_contract_is_not_replaced():
+def test_v0251_native_mhc_contract_is_not_replaced():
     exchanges = dict(module_exchange_names())
     assert "vllm.model_executor.layers.mhc" not in exchanges
 
@@ -408,7 +408,7 @@ def test_v025_native_mhc_contract_is_not_replaced():
     } <= exports
 
 
-def test_v025_native_amd_deepseek_v4_owns_model_and_mtp_contracts():
+def test_v0251_native_amd_deepseek_v4_owns_model_and_mtp_contracts():
     exchanges = dict(module_exchange_names())
     assert "vllm.v1.attention.backends.mla.sparse_swa" in exchanges
     assert {
@@ -466,7 +466,7 @@ def test_v025_native_amd_deepseek_v4_owns_model_and_mtp_contracts():
     assert "from .amd.mtp import DeepSeekV4MTP" in native_entry
 
 
-def test_aiter_replacement_preserves_v025_public_method_surface_and_ar_lifecycle():
+def test_aiter_replacement_preserves_v0251_public_method_surface_and_ar_lifecycle():
     target_path = TARGET_VLLM_ROOT / "vllm/_aiter_ops.py"
     replacement_path = REPO_ROOT / (
         "vllm_hcu/model_executor/layers/fused_moe/aiter_ops.py"
@@ -504,7 +504,7 @@ def test_aiter_replacement_preserves_v025_public_method_surface_and_ar_lifecycle
             ast.unparse(item) for item in target_method.decorator_list
         ], name
 
-    restored_v025_methods = {
+    restored_v0251_methods = {
         "fused_moe_supports_gate_mode",
         "get_fused_allreduce_rmsnorm_quant_per_group_op",
         "get_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_op",
@@ -519,10 +519,10 @@ def test_aiter_replacement_preserves_v025_public_method_surface_and_ar_lifecycle
         "mhc_pre",
         "shuffle_mxfp8_moe_weights",
     }
-    assert restored_v025_methods <= replacement_methods.keys()
+    assert restored_v0251_methods <= replacement_methods.keys()
 
-    # v0.25 owns the communicator instance on the TP device communicator.
-    # The v0.21 class-owned initialize/destroy lifecycle must not survive.
+    # v0.25.1 owns the communicator instance on the TP device communicator.
+    # The legacy class-owned initialize/destroy lifecycle must not survive.
     assert {
         "initialize_aiter_allreduce",
         "destroy_aiter_allreduce",
@@ -538,7 +538,7 @@ def test_aiter_replacement_preserves_v025_public_method_surface_and_ar_lifecycle
         ) == ast.dump(target_methods[method_name], include_attributes=False)
 
 
-def test_sparse_indexer_replacement_keeps_v025_q_rope_quant_contract():
+def test_sparse_indexer_replacement_keeps_v0251_q_rope_quant_contract():
     repo = Path(__file__).resolve().parents[2]
     path = repo / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -572,7 +572,7 @@ def test_sparse_indexer_replacement_keeps_v025_q_rope_quant_contract():
         ),
     ),
 )
-def test_sparse_replacements_preserve_v025_definition_surface_and_signatures(
+def test_sparse_replacements_preserve_v0251_definition_surface_and_signatures(
     target_relative: str,
     replacement_relative: str,
 ):

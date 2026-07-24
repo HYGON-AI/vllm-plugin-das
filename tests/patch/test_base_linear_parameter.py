@@ -29,11 +29,11 @@ TARGET = "vllm.model_executor.parameter"
 REMOVED_HCU_TARGET = "vllm_hcu.model_executor.parameter"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO_ROOT.parent / "vllm_025")
+    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
 ).resolve()
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V025_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
 
@@ -355,9 +355,9 @@ def test_invalid_loaded_target_is_failed_once_and_never_retried(
         )
 
 
-def _clean_v025_environment(cache_root: Path) -> dict[str, str]:
+def _clean_v0251_environment(cache_root: Path) -> dict[str, str]:
     env = dict(os.environ)
-    env["VLLM_V025_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join(
         (str(TARGET_VLLM_ROOT), str(REPO_ROOT))
     )
@@ -380,7 +380,7 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
         import vllm.model_executor as model_executor
         from vllm_hcu.patch import patch_report
 
-        target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+        target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
         target_file = Path(vllm.__file__).resolve()
         assert target_file.is_relative_to(target_root), (
             f"vllm resolved outside target root: {target_file} not under {target_root}"
@@ -427,7 +427,7 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
 
     output_path = tmp_path / "registry-output.pkl"
     payload = cloudpickle.dumps((inspection_probe, str(output_path)))
-    env = _clean_v025_environment(tmp_path / "cache")
+    env = _clean_v0251_environment(tmp_path / "cache")
     result = subprocess.run(
         [sys.executable, "-m", "vllm.model_executor.models.registry"],
         input=payload,
@@ -465,7 +465,7 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
 def test_qwen35_real_inspect_cache_miss_uses_official_registry_command(
     tmp_path: Path,
 ):
-    env = _clean_v025_environment(tmp_path / "cache")
+    env = _clean_v0251_environment(tmp_path / "cache")
     code = r'''
 import importlib
 import json
@@ -479,7 +479,7 @@ from vllm.plugins import load_general_plugins
 load_general_plugins()
 load_general_plugins()
 
-target_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
 target_file = Path(vllm.__file__).resolve()
 assert target_file.is_relative_to(target_root), (
     f"vllm resolved outside target root: {target_file} not under {target_root}"

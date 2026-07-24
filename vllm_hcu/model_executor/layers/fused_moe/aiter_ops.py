@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HCU-owned cold replacement for :mod:`vllm._aiter_ops`.
 
-The shared implementation below is the vLLM v0.25 target module.  vLLM owns
+The shared implementation below is the vLLM v0.25.1 target module.  vLLM owns
 its public interface, custom-op schemas, and communicator lifecycle; the
 small integration block immediately before registration applies only the
 remaining HCU/DCU capability deltas.
@@ -3033,7 +3033,7 @@ class rocm_aiter_ops:
 
 
 # ---------------------------------------------------------------------------
-# HCU v0.25 integration.  Keep this immediately before the sole registration
+# HCU v0.25.1 integration.  Keep this immediately before the sole registration
 # call so every custom-op schema captures the HCU-aware callable on first use.
 # ---------------------------------------------------------------------------
 from vllm_hcu.model_executor.layers.fused_moe import aiter_runtime as _hcu_runtime

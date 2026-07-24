@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen-local HCU state-dtype delta for vLLM v0.25 GDN attention."""
+"""Qwen-local HCU state-dtype delta for vLLM v0.25.1 GDN attention."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM v0.25 ownership and HCU-delta contracts for Qwen GDN."""
+"""vLLM v0.25.1 ownership and HCU-delta contracts for Qwen GDN."""
 
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V025_SOURCE_ROOT", REPO_ROOT.parent / "vllm_025")
+    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
 ).resolve()
 # Do not resolve this symlink: resolving it would lose the venv package view.
 TARGET_PYTHON = Path(
     os.environ.get(
-        "VLLM_V025_PYTHON",
+        "VLLM_V0251_PYTHON",
         TARGET_VLLM_ROOT / ".venv/bin/python",
     )
 )
@@ -36,7 +36,7 @@ def _adapter(name: str):
     return importlib.import_module(f"vllm_hcu.patch.worker.op_opt.{name}")
 
 
-def _run_fresh_v025(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     assert (TARGET_VLLM_ROOT / "vllm/__init__.py").is_file()
     assert TARGET_PYTHON.is_file()
     env = dict(os.environ)
@@ -45,7 +45,7 @@ def _run_fresh_v025(code: str) -> subprocess.CompletedProcess[str]:
             "VLLM_PLUGINS": "__disabled__",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "VLLM_V025_SOURCE_ROOT": str(TARGET_VLLM_ROOT),
+            "VLLM_V0251_SOURCE_ROOT": str(TARGET_VLLM_ROOT),
             "VLLM_HCU_SOURCE_ROOT": str(REPO_ROOT),
             "VLLM_USE_NN": "1",
             "VLLM_HCU_USE_CUSTOM_OPS": "0",
@@ -444,7 +444,7 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
 
     monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
     assert adapter.apply_to_module(module) is True
-    with pytest.raises(PatchCompatibilityError, match="audited vLLM v0.25"):
+    with pytest.raises(PatchCompatibilityError, match="audited vLLM v0.25.1"):
         module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
             x=torch.empty(1),
             unexpected=torch.empty(1),
@@ -462,8 +462,8 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
         adapter.apply_to_module(bad_module)
 
 
-def test_real_v025_cold_import_scopes_gdn_deltas_to_qwen():
-    result = _run_fresh_v025(
+def test_real_v0251_cold_import_scopes_gdn_deltas_to_qwen():
+    result = _run_fresh_v0251(
         r'''\
 import importlib
 import json
@@ -476,7 +476,7 @@ import vllm_hcu
 import vllm.platforms as platforms
 from vllm.platforms.interface import UnspecifiedPlatform
 
-source_root = Path(os.environ["VLLM_V025_SOURCE_ROOT"]).resolve()
+source_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
 hcu_root = Path(os.environ["VLLM_HCU_SOURCE_ROOT"]).resolve()
 assert Path(vllm.__file__).resolve() == source_root / "vllm/__init__.py"
 assert Path(vllm_hcu.__file__).resolve() == hcu_root / "vllm_hcu/__init__.py"
@@ -563,12 +563,12 @@ report = patch_report()["patches"]
 statuses = {patch_id: report[patch_id]["status"] for patch_id in ids}
 assert set(statuses.values()) == {"applied"}
 print(json.dumps({
-    "sentinel": "GDN_V025_OWNERSHIP_OK",
+    "sentinel": "GDN_V0251_OWNERSHIP_OK",
     "statuses": statuses,
 }, sort_keys=True))
 '''
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["sentinel"] == "GDN_V025_OWNERSHIP_OK"
+    assert payload["sentinel"] == "GDN_V0251_OWNERSHIP_OK"
     assert set(payload["statuses"].values()) == {"applied"}

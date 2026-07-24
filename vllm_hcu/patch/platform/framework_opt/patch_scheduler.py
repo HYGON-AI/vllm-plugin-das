@@ -123,19 +123,19 @@ def select_hcu_scheduler(vllm_config: object) -> bool:
         )
     async_scheduling = scheduler_config.async_scheduling
     if async_scheduling is True:
-        # vLLM v0.25 resolves its default async policy before invoking
+        # vLLM v0.25.1 resolves its default async policy before invoking
         # Platform.check_and_update_config().  HcuScheduler intentionally
         # inherits the synchronous Scheduler and therefore does not implement
         # AsyncScheduler's placeholder/cache-update protocol.  Reject the
         # inconsistent pair instead of allowing silent request-state damage.
         raise RuntimeError(
             "split-P/D HcuScheduler does not support async scheduling in "
-            "vLLM v0.25; explicitly disable it with --no-async-scheduling"
+            "vLLM v0.25.1; explicitly disable it with --no-async-scheduling"
         )
     if async_scheduling is None:
         # This is reachable for direct/programmatic selector use before
         # VllmConfig.__post_init__.  Pin the only supported policy so the
-        # subsequent v0.25 auto-selection cannot turn it back on.
+        # subsequent v0.25.1 auto-selection cannot turn it back on.
         scheduler_config.async_scheduling = False
     elif async_scheduling is not False:
         raise PatchCompatibilityError(

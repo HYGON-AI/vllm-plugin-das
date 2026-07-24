@@ -65,7 +65,7 @@ if hasattr(os, "register_at_fork"):
 class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
     """Size the scheduler-output MQ for all concurrently in-flight PP batches.
 
-    vLLM v0.25 owns batch concurrency on ``VllmConfig`` and creates the queue
+    vLLM v0.25.1 owns batch concurrency on ``VllmConfig`` and creates the queue
     inside a monolithic ``_init_executor``.  The subclass supplies a constructor
     proxy only while that parent initializer runs and restores the module binding
     in ``finally``.  This keeps the official lifecycle, worker startup, and

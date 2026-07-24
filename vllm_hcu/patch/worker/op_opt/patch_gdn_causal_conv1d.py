@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen-local NN-layout deltas for vLLM v0.25 GDN causal-conv1d."""
+"""Qwen-local NN-layout deltas for vLLM v0.25.1 GDN causal-conv1d."""
 
 from __future__ import annotations
 
