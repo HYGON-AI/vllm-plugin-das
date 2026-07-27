@@ -47,7 +47,7 @@ echo ""
 PIDS=()
 
 # Switch to the directory of the current script
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
 check_required_files() {
     local files=("disagg_proxy_du_swift_xpyd.py")
@@ -105,7 +105,8 @@ cleanup() {
 wait_for_server() {
   local port=$1
   local timeout_seconds=$TIMEOUT_SECONDS
-  local start_time=$(date +%s)
+  local start_time
+  start_time=$(date +%s)
 
   echo "Waiting for server on port $port..."
 
@@ -115,7 +116,8 @@ wait_for_server() {
       return 0
     fi
 
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     if (( now - start_time >= timeout_seconds )); then
       echo "Timeout waiting for server on port $port"
       return 1
@@ -150,7 +152,7 @@ main() {
     echo ""
     echo "Starting proxy server on port $PROXY_PORT..."
     python3 disagg_proxy_du_swift_xpyd.py &
-    PIDS+=($!)
+    PIDS+=("$!")
 
     # Parse GPU and port arrays
     IFS=',' read -ra PREFILL_GPU_ARRAY <<< "$PREFILL_GPUS"
@@ -169,10 +171,10 @@ main() {
         local kv_port=$((21001 + i))
 
         echo "  Prefill server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
-        CUDA_VISIBLE_DEVICES=$gpu_id vllm serve $MODEL \
+        CUDA_VISIBLE_DEVICES="$gpu_id" vllm serve "$MODEL" \
         --enforce-eager \
         --host 0.0.0.0 \
-        --port $port \
+        --port "$port" \
         --tensor-parallel-size 1 \
         --seed 1024 \
         --dtype float16 \
@@ -183,7 +185,7 @@ main() {
         --gpu-memory-utilization 0.9 \
         --kv-transfer-config \
         "{\"kv_connector\":\"DuSwiftConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"$kv_port\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"$PROXY_PORT\",\"http_port\":\"$port\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}" > prefill$((i+1)).log 2>&1 &
-        PIDS+=($!)
+        PIDS+=("$!")
     done
 
     # =============================================================================
@@ -197,10 +199,10 @@ main() {
         local kv_port=$((22001 + i))
 
         echo "  Decode server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
-        CUDA_VISIBLE_DEVICES=$gpu_id vllm serve $MODEL \
+        CUDA_VISIBLE_DEVICES="$gpu_id" vllm serve "$MODEL" \
         --enforce-eager \
         --host 0.0.0.0 \
-        --port $port \
+        --port "$port" \
         --tensor-parallel-size 1 \
         --seed 1024 \
         --dtype float16 \
@@ -211,7 +213,7 @@ main() {
         --gpu-memory-utilization 0.7 \
         --kv-transfer-config \
         "{\"kv_connector\":\"DuSwiftConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"8e9\",\"kv_port\":\"$kv_port\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"$PROXY_PORT\",\"http_port\":\"$port\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}" > decode$((i+1)).log 2>&1 &
-        PIDS+=($!)
+        PIDS+=("$!")
     done
 
     # =============================================================================
@@ -220,7 +222,7 @@ main() {
     echo ""
     echo "Waiting for all servers to start..."
     for port in "${PREFILL_PORT_ARRAY[@]}" "${DECODE_PORT_ARRAY[@]}"; do
-        if ! wait_for_server $port; then
+        if ! wait_for_server "$port"; then
             echo "Failed to start server on port $port"
             cleanup
             exit 1
@@ -233,9 +235,9 @@ main() {
     # =============================================================================
     # Run Benchmark
     # =============================================================================
-    cd ../../../benchmarks/
-    vllm bench serve --port 10001 --seed $(date +%s) \
-        --model $MODEL \
+    cd ../../../benchmarks/ || exit 1
+    vllm bench serve --port 10001 --seed "$(date +%s)" \
+        --model "$MODEL" \
         --dataset-name random --random-input-len 7500 --random-output-len 200 \
         --num-prompts 200 --burstiness 100 --request-rate 2 | tee benchmark.log
 

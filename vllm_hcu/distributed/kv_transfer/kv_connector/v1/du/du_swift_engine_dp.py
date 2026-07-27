@@ -326,7 +326,7 @@ class DuSwiftEngineDp:
                     comm: ncclComm_t = self.nccl.ncclCommInitRank(2, unique_id, rank)
                 self.comms[remote_address] = (comm, rank)
                 logger.info(
-                    "🤝ncclCommInitRank Success, %sğ%s, MyRank:%s",
+                    "ncclCommInitRank success, %s -> %s, MyRank:%s",
                     self.zmq_address,
                     remote_address,
                     rank,
@@ -624,7 +624,7 @@ class DuSwiftEngineDp:
                     self.router_socket.send_multipart([remote_address, b"1"])
                     tensor = None
                     logger.warning(
-                        "🔴[PUT]Recv Tensor, Out Of Memory, %sğ%s, data:%s",
+                        "[PUT] Recv Tensor Out Of Memory, %s <- %s, data:%s",
                         self.zmq_address,
                         remote_address.decode(),
                         data,
@@ -735,7 +735,7 @@ class DuSwiftEngineDp:
                     self.send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
             else:
                 logger.warning(
-                    "ğ§Unexpected, Received message from %s, data:%s",
+                    "Unexpected, Received message from %s, data:%s",
                     remote_address,
                     data,
                 )
@@ -773,7 +773,7 @@ class DuSwiftEngineDp:
                     self.send_queue_cv.wait()
             duration = time.time() - start_time
             logger.debug(
-                "ğ§[PUT_ASYNC]It took %.3fms to wait for the send_queue"
+                "[PUT_ASYNC] It took %.3fms to wait for the send_queue"
                 " to be empty, rank:%d",
                 duration * 1000,
                 self.rank,
@@ -837,7 +837,7 @@ class DuSwiftEngineDp:
         response = sock.recv()
         if response != b"0":
             logger.error(
-                "ğ´Send Tensor, Peer Out Of Memory/Threshold, %s ğ %s, "
+                "Send Tensor, Peer Out Of Memory/Threshold, %s -> %s, "
                 "MyRank:%s, data:%s, tensor:%s, size:%fGB, response:%s",
                 self.zmq_address,
                 item.remote_address,

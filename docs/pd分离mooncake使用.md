@@ -24,7 +24,7 @@ Mooncake 旨在提升大语言模型（LLM）的推理效率，尤其是在对�
 
 mooncake 代码仓库：http://42.228.13.241:10068/dcutoolkit/deeplearing/mooncake
 
-mooncake whl 包（ubuntu2204）路径：http://pypi.sourcefind.cn:666/das_nightly/dtk2604-rc4-mooncake/+f/79c/add379d74452d/mooncake_transfer_engine-0.3.10.post1+das.opt1.dtk2604.2605131137.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl 
+mooncake whl 包（ubuntu2204）路径：http://pypi.sourcefind.cn:666/das_nightly/dtk2604-rc4-mooncake/+f/79c/add379d74452d/mooncake_transfer_engine-0.3.10.post1+das.opt1.dtk2604.2605131137.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl
 
 通过 pip 安装 mooncake：`pip install mooncake_transfer_engine*.whl`。
 
@@ -96,7 +96,7 @@ grep 'Mooncake TTFT_EVENT' prefiller.log decoder.log
 ```bash
 vllm serve Qwen3/Qwen3-8B \
   --port 8010 \
-  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}' 
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
 ```
 
 #### Decode 节点（10.63.60.113）
@@ -126,7 +126,7 @@ vllm serve /mnt/deepseek-v2/DeepSeek-V2-Lite-Chat \
   --port 8010 \
   -tp 2 \
   -pp 4 \
-  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}' 
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
 ```
 
 #### Decode 节点（10.63.60.114）
@@ -137,7 +137,7 @@ vllm serve /mnt/deepseek-v2/DeepSeek-V2-Lite-Chat \
   --port 8020 \
   -tp 4 \
   -pp 2 \
-  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}' 
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}'
 ```
 
 #### 代理服务器

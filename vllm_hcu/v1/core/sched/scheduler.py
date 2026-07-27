@@ -21,6 +21,21 @@ for _name, _value in vars(_upstream).items():
     if not _name.startswith("__"):
         globals().setdefault(_name, _value)
 
+time = _upstream.time
+logger = _upstream.logger
+PauseState = _upstream.PauseState
+SchedulerOutput = _upstream.SchedulerOutput
+Request = _upstream.Request
+KVCacheBlocks = _upstream.KVCacheBlocks
+create_request_queue = _upstream.create_request_queue
+RequestStatus = _upstream.RequestStatus
+HybridKVCacheCoordinator = _upstream.HybridKVCacheCoordinator
+EngineCoreEventType = _upstream.EngineCoreEventType
+record_function_or_nullcontext = _upstream.record_function_or_nullcontext
+SchedulingPolicy = _upstream.SchedulingPolicy
+NewRequestData = _upstream.NewRequestData
+ECConnectorMetadata = _upstream.ECConnectorMetadata
+
 
 class HcuScheduler(_upstream.Scheduler):
     """Waiting-first scheduler used only for explicit HCU split-P/D."""

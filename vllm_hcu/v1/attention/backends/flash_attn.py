@@ -41,6 +41,7 @@ from vllm.platforms import current_platform
 if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
+        get_scheduler_metadata,
         vllm_flash_attn_varlen_func,
         hg_flash_attn_varlen_func,
         varlen_fwd_unified,

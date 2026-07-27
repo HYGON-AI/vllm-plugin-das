@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 import os
 import gc
 import torch
 import math
-from typing import Dict, List, Optional, Set, Tuple, Type, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.utils.torch_utils import set_random_seed
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
@@ -16,6 +18,9 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm.v1.worker.utils import request_memory
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 class HcuGPUWorker(Worker):
