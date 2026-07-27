@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU-owned compressed-tensors MoE runtime helpers.
 
 The vLLM-facing adapters only validate and wrap the audited target methods.

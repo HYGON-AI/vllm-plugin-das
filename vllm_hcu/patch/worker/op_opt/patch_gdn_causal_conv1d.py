@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Qwen-local NN-layout deltas for vLLM v0.25.1 GDN causal-conv1d."""
 
 from __future__ import annotations

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Bind the feature-gated HCU grouped-top-k router in the official factory."""
 
 from __future__ import annotations

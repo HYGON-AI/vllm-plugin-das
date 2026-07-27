@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Runtime contracts for PP partitioning and HCU attention mode routing."""
 
 from __future__ import annotations
 
+import sys
 from types import ModuleType
 
 import pytest
@@ -110,6 +112,20 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
     expected_shape: object,
     expected_block_dim: int,
 ):
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.hcu_ops",
+        ModuleType("vllm_hcu.hcu_ops"),
+    )
+    flash_attn_extension = ModuleType("flash_attn")
+    for symbol in (
+        "flash_attn_varlen_func",
+        "vllm_flash_attn_varlen_func",
+        "hg_flash_attn_varlen_func",
+        "varlen_fwd_unified",
+    ):
+        setattr(flash_attn_extension, symbol, lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "flash_attn", flash_attn_extension)
     from vllm_hcu.v1.attention.backends import flash_attn
 
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)

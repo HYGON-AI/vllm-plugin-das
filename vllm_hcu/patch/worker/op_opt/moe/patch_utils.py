@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Expert-aware INT8 quantization adapter for batched DeepEP activations."""
 
 from __future__ import annotations

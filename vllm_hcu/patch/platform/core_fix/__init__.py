@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Explicit platform/core callback ordering for the audited target vLLM API.
 
 Importing this package is side-effect free.  The dispatcher calls

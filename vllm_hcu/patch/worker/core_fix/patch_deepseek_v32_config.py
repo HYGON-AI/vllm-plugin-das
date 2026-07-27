@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Audit and retire the broken DeepSeek-V3.2 verifier source patch.
 
 The legacy patch changed the official ``is_v32`` verifier to include

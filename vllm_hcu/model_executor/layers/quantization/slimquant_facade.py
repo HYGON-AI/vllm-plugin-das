@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Lightweight registry facades for HCU SlimQuant implementations.
 
 Registry discovery imports this module, but the concrete SlimQuant modules are

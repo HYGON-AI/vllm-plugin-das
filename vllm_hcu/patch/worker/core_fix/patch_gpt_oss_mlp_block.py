@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Adapt GPT-OSS router GEMM to HCU's optional NN weight layout."""
 
 from __future__ import annotations

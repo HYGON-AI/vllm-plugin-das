@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU-owned INT8 linear implementation backed by LMSlim hipBLASLt."""
 
 from __future__ import annotations

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 """HCU-owned cold replacement for :mod:`vllm._aiter_ops`.
 
 The shared implementation below is the vLLM v0.25.1 target module.  vLLM owns

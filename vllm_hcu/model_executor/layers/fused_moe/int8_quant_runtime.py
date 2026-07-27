@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Expert-aware per-token INT8 Triton quantization for HCU."""
 
 from __future__ import annotations

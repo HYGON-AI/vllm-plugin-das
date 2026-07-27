@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """DeepEP low-latency HCU INT8/FP8 dispatch adapter."""
 
 from __future__ import annotations

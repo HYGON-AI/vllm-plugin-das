@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """NN-layout adapter for vLLM v0.25.1's native Qwen GDN AITER path."""
 
 from __future__ import annotations

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from __future__ import annotations
 
@@ -209,6 +210,7 @@ def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
     }
 
 
+@pytest.mark.hcu
 def test_engine_core_first_import_does_not_patch_partial_modules_or_fallback():
     result = _fresh_python(
         "import json; "
@@ -241,6 +243,7 @@ def test_engine_core_first_import_does_not_patch_partial_modules_or_fallback():
     }
 
 
+@pytest.mark.hcu
 def test_arg_utils_first_import_applies_sidecar_before_first_construction():
     result = _fresh_python(
         "import dataclasses,json; "

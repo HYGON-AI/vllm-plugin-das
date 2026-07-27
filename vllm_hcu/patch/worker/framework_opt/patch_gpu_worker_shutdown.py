@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Keep the v0.25.1 GPU-worker shutdown contract usable on DCU.
 
 vLLM v0.25.1 imports ``vllm.device_allocator.cumem`` at the end of every

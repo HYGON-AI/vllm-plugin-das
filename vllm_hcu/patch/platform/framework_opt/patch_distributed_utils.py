@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Preserve the PP=1 fast path before parsing manual layer partitions."""
 
 from __future__ import annotations

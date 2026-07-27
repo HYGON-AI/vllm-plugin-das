@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Lightly-CP and multi-layer-MTP behavior for the v0.25.1 base proposer."""
 
 from __future__ import annotations

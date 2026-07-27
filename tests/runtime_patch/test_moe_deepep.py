@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from __future__ import annotations
 
@@ -1847,6 +1848,12 @@ def test_int8_expert_quant_adapter_contract(
         int8_quant_runtime,
         "_per_token_quant_int8_one_kernel",
         CpuLauncher(),
+    )
+    monkeypatch.setattr(
+        int8_quant_runtime.triton,
+        "next_power_of_2",
+        lambda value: 1 << (value - 1).bit_length(),
+        raising=False,
     )
     values = torch.tensor([[[1.0, -2.0], [5.0, 9.0]]])
     quanted, scales = int8_quant_runtime.per_token_quant_int8(values, counts)

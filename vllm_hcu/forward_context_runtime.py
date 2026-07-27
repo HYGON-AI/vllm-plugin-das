@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU-owned special forward-context path for Lightly-CP and DeepEP LL."""
 
 from __future__ import annotations

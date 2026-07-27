@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Add HCU's communicator-backed all-to-all method to GroupCoordinator."""
 
 from __future__ import annotations

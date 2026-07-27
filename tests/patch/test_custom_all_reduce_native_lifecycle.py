@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 """Source-level ownership guards for the HCU custom all-reduce extension."""
 
 from __future__ import annotations

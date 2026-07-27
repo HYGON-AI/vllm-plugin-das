@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU INT8/FP8 MoE quant descriptors and SP all-to-all capability."""
 
 from __future__ import annotations

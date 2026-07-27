@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Normalize Qwen3-VL dense ``tie_word_embeddings`` before construction."""
 
 from __future__ import annotations

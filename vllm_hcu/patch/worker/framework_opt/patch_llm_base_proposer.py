@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Atomic Lightly-CP/custom-SP/multi-layer-MTP proposer migration."""
 
 from __future__ import annotations

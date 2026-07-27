@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Register SlimQuant through vLLM's public out-of-tree quant registry."""
 
 from __future__ import annotations

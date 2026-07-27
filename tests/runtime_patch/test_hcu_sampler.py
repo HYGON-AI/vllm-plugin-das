@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
@@ -12,8 +15,28 @@ import pytest
 import torch
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
-from vllm_hcu.ops import topk_topp_sample
-from vllm_hcu.ops.topk_topp_sample import HcuSampler, HcuTopKTopPSampler
+
+def _load_topk_topp_sample() -> ModuleType:
+    """Load the sampler without importing unrelated lightop-backed ops."""
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu"
+        / "ops"
+        / "topk_topp_sample.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_vllm_hcu_test_topk_topp_sample",
+        module_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+topk_topp_sample = _load_topk_topp_sample()
+HcuSampler = topk_topp_sample.HcuSampler
+HcuTopKTopPSampler = topk_topp_sample.HcuTopKTopPSampler
 
 
 def test_hcu_sampler_keeps_official_topk_topp_when_custom_sampler_disabled(

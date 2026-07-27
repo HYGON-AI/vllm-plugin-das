@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Register HCU KV connectors and add the optional DP-rank constructor path."""
 
 from __future__ import annotations

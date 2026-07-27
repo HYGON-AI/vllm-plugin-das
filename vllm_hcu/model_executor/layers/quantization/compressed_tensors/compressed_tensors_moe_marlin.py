@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 """
 AITER W8A8 MoE修改说明:
 Patch for vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin

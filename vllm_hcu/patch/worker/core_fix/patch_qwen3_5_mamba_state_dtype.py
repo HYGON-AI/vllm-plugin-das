@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Select the Qwen3.5 Mamba SSM cache dtype for HCU custom kernels."""
 
 from __future__ import annotations

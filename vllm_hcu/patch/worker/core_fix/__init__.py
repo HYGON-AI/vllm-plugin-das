@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Model compatibility fixes required in worker processes.
 
 This package deliberately performs no import-time patching.  Each module

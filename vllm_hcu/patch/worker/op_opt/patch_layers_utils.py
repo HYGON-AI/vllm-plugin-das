@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Use the HCU-owned linear layer's default GEMM dispatch on ROCm."""
 
 from __future__ import annotations

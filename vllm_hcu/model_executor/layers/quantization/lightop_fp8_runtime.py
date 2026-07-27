@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Lazy, single-owner registration for LightOp per-token FP8 quantization."""
 
 from __future__ import annotations

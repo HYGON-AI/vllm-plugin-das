@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Strict, registry-free helpers for worker core-fix import callbacks."""
 
 from __future__ import annotations

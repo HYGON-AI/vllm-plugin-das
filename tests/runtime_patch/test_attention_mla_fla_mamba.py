@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU runtime-contract tests for attention, MLA, FLA, and Mamba adapters."""
 
 from __future__ import annotations
@@ -72,6 +73,117 @@ def _install_fake_module(monkeypatch, name: str, **values) -> ModuleType:
     module = _module(name, **values)
     monkeypatch.setitem(sys.modules, name, module)
     return module
+
+
+def test_dense_attention_layer_installs_hcu_runtime_and_preserves_fallback(
+    monkeypatch,
+):
+    adapter = _adapter("patch_attention_layer")
+    calls: list[tuple[object, ...]] = []
+
+    def original_init(layer, quant_config, prefix):
+        calls.append(("official-init", layer, quant_config, prefix))
+        return "official-init"
+
+    class Attention:
+        def forward(
+            self,
+            query,
+            key,
+            value,
+            output_shape=None,
+            output_dtype=None,
+        ):
+            calls.append(
+                (
+                    "official-forward",
+                    query,
+                    key,
+                    value,
+                    output_shape,
+                    output_dtype,
+                )
+            )
+            return "official-forward"
+
+    class FusedQkvSplitRmsNormRopeAttention:
+        pass
+
+    runtime = _module(
+        "vllm_hcu.model_executor.layers.attention_runtime",
+        FusedQkvSplitRmsNormRopeAttention=FusedQkvSplitRmsNormRopeAttention,
+        init_kv_cache_quant_e5m2=lambda *args: (
+            calls.append(("hcu-init", *args)) or "hcu-init"
+        ),
+        attention_forward=lambda *args: (
+            calls.append(("hcu-forward", *args)) or "hcu-forward"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    import vllm_hcu.model_executor.layers as hcu_layers
+
+    monkeypatch.setattr(hcu_layers, "attention_runtime", runtime)
+    monkeypatch.setattr(adapter, "_feature_flags", lambda: (False, False))
+    module = _module(
+        adapter.TARGET_MODULE,
+        Attention=Attention,
+        _init_kv_cache_quant=original_init,
+    )
+
+    assert adapter.apply_to_module(module) is True
+    assert adapter.apply_to_module(module) is False
+    assert (
+        module.FusedQkvSplitRmsNormRopeAttention
+        is FusedQkvSplitRmsNormRopeAttention
+    )
+
+    layer = SimpleNamespace(kv_cache_dtype="auto")
+    assert module._init_kv_cache_quant(layer, "quant", "prefix") == "official-init"
+    instance = Attention()
+    assert instance.forward("q", "k", "v") == "official-forward"
+
+    layer.kv_cache_dtype = "fp8_e5m2"
+    assert module._init_kv_cache_quant(layer, "quant", "prefix") == "hcu-init"
+    instance.kv_cache_dtype = "fp8_e5m2"
+    assert instance.forward("q", "k", "v") == "hcu-forward"
+    assert [call[0] for call in calls] == [
+        "official-init",
+        "official-forward",
+        "hcu-init",
+        "hcu-forward",
+    ]
+
+
+def test_dense_attention_public_export_is_idempotent_and_exact():
+    adapter = _adapter("patch_attention_exports")
+
+    class Attention:
+        pass
+
+    class FusedQkvSplitRmsNormRopeAttention:
+        pass
+
+    package = _module(
+        adapter.TARGET_MODULE,
+        Attention=Attention,
+        attention=SimpleNamespace(
+            FusedQkvSplitRmsNormRopeAttention=(
+                FusedQkvSplitRmsNormRopeAttention
+            )
+        ),
+        __all__=["Attention"],
+    )
+
+    assert adapter.apply_to_module(package) is True
+    assert adapter.apply_to_module(package) is False
+    assert (
+        package.FusedQkvSplitRmsNormRopeAttention
+        is FusedQkvSplitRmsNormRopeAttention
+    )
+    assert package.__all__ == [
+        "Attention",
+        "FusedQkvSplitRmsNormRopeAttention",
+    ]
 
 
 def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):

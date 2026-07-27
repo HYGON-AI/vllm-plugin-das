@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU-owned feature configuration stored in ``additional_config['hcu']``.
 
 The sidecar keeps HCU-only fields out of vLLM's Pydantic/dataclass schemas.

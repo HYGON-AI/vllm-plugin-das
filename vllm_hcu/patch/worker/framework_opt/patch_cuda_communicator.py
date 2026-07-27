@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Early module exchange for HCU CustomAllreduce used by CudaCommunicator."""
 
 from __future__ import annotations

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Select the HCU AITER gated-delta state kernel without source mutation."""
 
 from __future__ import annotations

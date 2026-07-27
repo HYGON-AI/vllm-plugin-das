@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from __future__ import annotations
 
@@ -367,6 +368,7 @@ def _clean_v0251_environment(cache_root: Path) -> dict[str, str]:
     return env
 
 
+@pytest.mark.hcu
 def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
     tmp_path: Path,
 ):
@@ -462,6 +464,7 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
     }
 
 
+@pytest.mark.hcu
 def test_qwen35_real_inspect_cache_miss_uses_official_registry_command(
     tmp_path: Path,
 ):

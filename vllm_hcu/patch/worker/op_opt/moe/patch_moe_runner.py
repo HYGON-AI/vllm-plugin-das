@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Metadata/validation for the custom-op-bearing HCU MoE runner replacement."""
 
 from __future__ import annotations

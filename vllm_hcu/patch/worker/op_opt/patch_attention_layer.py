@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Runtime migration of the v0.25.1 dense attention HCU fragments."""
 
 from __future__ import annotations

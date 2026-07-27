@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Mooncake decoder-first-token trace at the OutputProcessor boundary."""
 
 from __future__ import annotations

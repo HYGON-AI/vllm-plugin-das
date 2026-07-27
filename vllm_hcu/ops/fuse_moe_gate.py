@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 import os
 import torch

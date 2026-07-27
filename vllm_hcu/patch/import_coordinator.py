@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Exact-name import coordination for runtime HCU patches.
 
 Unlike the legacy hook, this module never replaces ``builtins.__import__`` and

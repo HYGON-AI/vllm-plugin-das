@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 """Setup script for vLLM HCU plugin."""
 
 import os
@@ -137,6 +140,7 @@ setup(
     name="vllm_hcu",
     version=get_version(),
     description="vLLM HCU backend plugin",
+    license="Apache-2.0",
     python_requires=">=3.10",
     packages=find_namespace_packages(include=["vllm_hcu", "vllm_hcu.*"]),
     package_data={"vllm_hcu": ["*.so", "so/*.so", "include/*.h"]},

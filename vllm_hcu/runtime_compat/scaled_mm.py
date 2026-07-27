@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Target-native Triton compatibility for channel-wise FP8 scaled MM."""
 
 from __future__ import annotations

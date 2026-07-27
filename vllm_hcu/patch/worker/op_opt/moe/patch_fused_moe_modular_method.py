@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Pass HCU kernel dimensions and pre-quantized inputs through modular MoE."""
 
 from __future__ import annotations

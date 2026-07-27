@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU/fake product tests for the Channel-FP8 target Triton route."""
 
 from __future__ import annotations

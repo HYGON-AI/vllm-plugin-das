@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 """MTP draft model for DeepSeek V4 (internal codename: DeepseekV4).
 
 Split from ``deepseek_mtp.py`` because the V4 architecture introduces several

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Advertise the audited Triton INT8 MoE path on ROCm/HCU."""
 
 from __future__ import annotations

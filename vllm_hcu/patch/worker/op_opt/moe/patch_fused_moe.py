@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Optional HCU AITER W4A16 fused-expert dispatch."""
 
 from __future__ import annotations

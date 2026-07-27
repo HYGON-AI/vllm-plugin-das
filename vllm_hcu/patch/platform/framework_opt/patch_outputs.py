@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Retire ModelRunnerOutput IPC mutation in favour of DraftTokenIds."""
 
 from __future__ import annotations

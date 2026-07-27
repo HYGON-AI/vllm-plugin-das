@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """vLLM v0.25.1 target MambaMixer2 behavior plus HCU NN-layout deltas."""
 
 from __future__ import annotations

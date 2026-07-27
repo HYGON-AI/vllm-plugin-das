@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU worker-side operator optimization runtime adapters.
 
 Importing this package has no effect on vLLM.  Dispatchers explicitly arm the

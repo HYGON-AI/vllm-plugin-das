@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Ordered exact callbacks for HCU-owned runtime compatibility helpers."""
 
 from __future__ import annotations

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """In-place NN-layout compatibility for vLLM's parameter classes.
 
 ``vllm.model_executor`` imports ``parameter`` before platform discovery can

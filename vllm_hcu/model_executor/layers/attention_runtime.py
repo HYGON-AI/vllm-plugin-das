@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU-owned attention implementations used by the v0.25.1 runtime adapters.
 
 The module is imported only after vLLM's attention layer has finished loading.

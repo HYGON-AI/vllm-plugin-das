@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Runtime patch foundations for the vLLM-HCU plugin.
 
 Feature dispatchers live in the ``platform`` and ``worker`` subpackages.  The

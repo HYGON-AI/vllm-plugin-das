@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Force the HCU Triton unified-attention launch to a single pipeline stage."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 import torch
 from vllm.model_executor.layers.layernorm import RMSNorm
 from lightop import fused_add_rms_norm

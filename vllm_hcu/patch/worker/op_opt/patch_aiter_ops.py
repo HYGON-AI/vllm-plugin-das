@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Metadata and validation for the cold HCU ``vllm._aiter_ops`` exchange."""
 
 from __future__ import annotations

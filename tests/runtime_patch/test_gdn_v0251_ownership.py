@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """vLLM v0.25.1 ownership and HCU-delta contracts for Qwen GDN."""
 
 from __future__ import annotations

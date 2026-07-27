@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from __future__ import annotations
 
@@ -1247,6 +1248,7 @@ def test_compressed_scheme_inactive_anchor_is_corrected_at_runtime():
     assert patch_compressed_tensors_scheme.apply_to_module(module) is False
 
 
+@pytest.mark.hcu
 def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1288,6 +1290,7 @@ def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     assert call["weight_dtype"] == "int4"
 
 
+@pytest.mark.hcu
 def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -1300,6 +1303,7 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
     assert isinstance(method, slimquant_w4a8.FusedMoEMethodBase)
 
 
+@pytest.mark.hcu
 def test_slimquant_w4a8_apply_uses_triton_channelwise_raw_packed_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1368,6 +1372,7 @@ def test_slimquant_w4a8_apply_uses_triton_channelwise_raw_packed_weights(
     assert kwargs["is_gated"] is True
 
 
+@pytest.mark.hcu
 def test_slimquant_w4a8_apply_fails_closed_for_unsupported_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ):

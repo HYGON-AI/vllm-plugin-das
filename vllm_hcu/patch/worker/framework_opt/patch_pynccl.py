@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Optional PyNccl communicator all-to-all method for capable RCCL builds."""
 
 from __future__ import annotations

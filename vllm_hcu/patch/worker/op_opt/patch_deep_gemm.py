@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Provide the audited TF32 MHC pre-norm fallback without source mutation."""
 
 from __future__ import annotations

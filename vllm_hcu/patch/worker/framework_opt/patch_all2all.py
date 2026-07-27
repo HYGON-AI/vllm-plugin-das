@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU DeepEP runtime tuning without rewriting vLLM's all2all module."""
 
 from __future__ import annotations
