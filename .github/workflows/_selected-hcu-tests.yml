@@ -10,6 +10,16 @@ on:
         description: Validated JSON list produced by the HCU CI selector
         required: true
         type: string
+      tested_ref:
+        description: Branch, tag, or SHA to check out and test
+        required: false
+        default: ""
+        type: string
+      image:
+        description: Immutable HCU CI image (repository@sha256:digest)
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -27,15 +37,24 @@ jobs:
       - ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     concurrency:
-      group: hcu-runner-${{ matrix.runner }}
+      group: hcu-runner-${{ matrix.runner }}-${{ matrix.partition_id }}
       cancel-in-progress: false
     env:
       HCU_CI_JOB_ID: ${{ matrix.id }}
+      HCU_CI_REGISTRY_JOB: ${{ matrix.registry_job }}
       HCU_CI_ARCH: ${{ matrix.arch }}
       HCU_CI_CARDS: ${{ matrix.cards }}
       HCU_CI_SUITE: ${{ matrix.suite }}
+      HCU_CI_PARTITION_ID: ${{ matrix.partition_id }}
+      HCU_CI_PARTITION_SIZE: ${{ matrix.partition_size }}
       HCU_CI_PYTEST_ARGS_JSON: ${{ toJSON(matrix.pytest_args) }}
       HCU_CI_REQUIREMENTS_JSON: ${{ toJSON(matrix.requirements) }}
+      HCU_CI_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE }}
+      HCU_CI_CONTAINER_NAME: vllm_hcu_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.id }}
+      HCU_CI_JOB_ROOT: /hcu-ci-artifacts
+      HCU_CI_HOST_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}
+      HCU_CI_MODEL_ROOT: ${{ vars.HCU_CI_MODEL_ROOT }}
+      HCU_CI_DATASET_ROOT: ${{ vars.HCU_CI_DATASET_ROOT }}
       VLLM_HCU_USE_FLASH_ATTN_UNIFIED: "1"
       VLLM_WORKER_MULTIPROC_METHOD: spawn
       VLLM_HCU_TEST_STRICT_RESOURCES: "1"
@@ -46,19 +65,39 @@ jobs:
       - name: Checkout tested revision
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tested_ref || github.sha }}
           clean: true
           fetch-depth: 1
 
-      - name: Run preflight and selected tests
-        env:
-          HCU_CI_JOB_ROOT: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
-        run: python .github/scripts/hcu_ci/run_hcu_ci_job.py
+      - name: Start immutable HCU CI container
+        run: >-
+          bash scripts/ci/hcu/hcu_ci_start_container.sh
+          --image "$HCU_CI_IMAGE"
+          --container-name "$HCU_CI_CONTAINER_NAME"
+          --workspace "$GITHUB_WORKSPACE"
+          --artifact-root "$HCU_CI_HOST_JOB_ROOT"
 
-      - name: Upload HCU logs and reports
+      - name: Install checked-out plugin without network access
+        run: bash scripts/ci/hcu/hcu_ci_install_dependency.sh
+
+      - name: Run preflight and registered test partition
+        run: >-
+          bash scripts/ci/hcu/hcu_ci_exec.sh
+          --container-name "$HCU_CI_CONTAINER_NAME"
+          -w /vllm-plugin-das
+          -- python .github/scripts/hcu_ci/run_hcu_ci_job.py
+
+      - name: Cleanup HCU CI container
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.run_id }}-${{ matrix.arch }}-${{ matrix.cards }}-${{ matrix.id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
-          if-no-files-found: error
-          retention-days: 14
+        run: bash scripts/ci/hcu/hcu_ci_cleanup_container.sh
+
+      - name: Report local HCU logs and reports
+        if: always()
+        run: |
+          echo "HCU logs retained on runner $RUNNER_NAME at $HCU_CI_HOST_JOB_ROOT"
+          {
+            echo "### Local HCU logs"
+            echo
+            echo "- Runner: \`$RUNNER_NAME\`"
+            echo "- Path: \`$HCU_CI_HOST_JOB_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"

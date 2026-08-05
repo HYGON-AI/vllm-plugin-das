@@ -19,6 +19,13 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from hcu_ci_register import (
+    matrix_github_outputs,
+    parse_registry,
+    partition_registrations,
+    registrations_for_job,
+)
+
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = REPOSITORY / ".github/workflows/configs/hcu-test-map.yaml"
@@ -84,6 +91,7 @@ def _validated_job(job_id: str, raw: Any) -> dict[str, Any]:
     timeout = raw["timeout_minutes"]
     pytest_args = raw["pytest_args"]
     requirements = raw["requirements"]
+    partitions = raw.get("partitions", 1)
     if not isinstance(runner, str) or not RUNNER_RE.fullmatch(runner):
         raise SelectionError(f"job {job_id!r} has invalid runner {runner!r}")
     if arch not in {"gfx936", "gfx938"}:
@@ -106,6 +114,12 @@ def _validated_job(job_id: str, raw: Any) -> dict[str, Any]:
         isinstance(item, dict) for item in requirements
     ):
         raise SelectionError(f"job {job_id!r} requirements must be mappings")
+    if (
+        not isinstance(partitions, int)
+        or isinstance(partitions, bool)
+        or not 1 <= partitions <= 32
+    ):
+        raise SelectionError(f"job {job_id!r} has invalid partitions {partitions!r}")
     return {
         "id": job_id,
         "runner": runner,
@@ -115,7 +129,54 @@ def _validated_job(job_id: str, raw: Any) -> dict[str, Any]:
         "pytest_args": pytest_args,
         "timeout_minutes": timeout,
         "requirements": requirements,
+        "partitions": partitions,
     }
+
+
+def expand_job_partitions(
+    selected_jobs: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expand jobs into deterministic LPT partitions from static registration."""
+
+    registrations = parse_registry()
+    all_job_ids = {job.get("registry_job", job["id"]) for job in selected_jobs}
+    # Full one-to-one validation is done by the static gate. Selection may be
+    # operating on a subset, so validate only that selected jobs are registered.
+    registered_ids = {item.job for item in registrations}
+    missing = sorted(all_job_ids.difference(registered_ids))
+    if missing:
+        raise SelectionError(f"selected HCU jobs have no registration: {missing}")
+
+    expanded: list[dict[str, Any]] = []
+    for job in selected_jobs:
+        display_id = job["id"]
+        registry_job = job.get("registry_job", job["id"])
+        enabled = registrations_for_job(registrations, registry_job)
+        partition_size = job.get("partitions", 1)
+        if partition_size > len(enabled):
+            raise SelectionError(
+                f"job {registry_job!r} requests {partition_size} partitions for "
+                f"only {len(enabled)} enabled registration(s)"
+            )
+        for partition_id in range(partition_size):
+            assigned = partition_registrations(
+                enabled,
+                partition_id,
+                partition_size,
+            )
+            item = dict(job)
+            item["registry_job"] = registry_job
+            item["partition_id"] = partition_id
+            item["partition_size"] = partition_size
+            item["estimated_seconds"] = int(
+                sum(registration.est_time for registration in assigned)
+            )
+            if partition_size > 1:
+                item["id"] = (
+                    f"{display_id}-p{partition_id + 1}of{partition_size}"
+                )
+            expanded.append(item)
+    return expanded
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -171,7 +232,7 @@ def select_jobs(
         }
     )
     if full:
-        return list(jobs.values()), ["full-hcu"], False
+        return expand_job_partitions(list(jobs.values())), ["full-hcu"], False
     if not normalized:
         return [], [], False
 
@@ -181,22 +242,28 @@ def select_jobs(
         return [], ["docs-only"], False
 
     selected_ids: set[str] = set()
+    classified_paths: set[str] = set()
     selected_groups: list[str] = ["docs-only"] if docs_only else []
     for group_name, group in config["groups"].items():
-        if any(_matches(path, group["patterns"]) for path in normalized):
+        matched_paths = {
+            path for path in normalized if _matches(path, group["patterns"])
+        }
+        if matched_paths:
             selected_groups.append(group_name)
             selected_ids.update(group["jobs"])
+            classified_paths.update(matched_paths)
 
     production_patterns = config.get("production_patterns", [])
-    production_changed = any(
-        _matches(path, production_patterns) for path in normalized
-    )
     test_patterns = config.get("test_patterns", [])
-    unclassified_test_changed = (
-        any(_matches(path, test_patterns) for path in normalized)
-        and not selected_ids
+    fallback = any(
+        path not in classified_paths
+        and not _matches(path, non_hcu)
+        and (
+            _matches(path, production_patterns)
+            or _matches(path, test_patterns)
+        )
+        for path in normalized
     )
-    fallback = (production_changed or unclassified_test_changed) and not selected_ids
     if fallback:
         selected_groups.append("conservative-fallback")
         selected_ids.update(config["fallback_jobs"])
@@ -204,7 +271,9 @@ def select_jobs(
         selected_groups.append("accuracy-hcu")
         selected_ids.update(config["accuracy_jobs"])
 
-    ordered = [job for job_id, job in jobs.items() if job_id in selected_ids]
+    ordered = expand_job_partitions(
+        [job for job_id, job in jobs.items() if job_id in selected_ids]
+    )
     return ordered, selected_groups, fallback
 
 
@@ -225,13 +294,14 @@ def _git_changed_paths(base: str, head: str) -> list[str]:
 
 
 def _write_github_outputs(path: Path, payload: dict[str, Any]) -> None:
-    values = {
-        "matrix": json.dumps(payload["jobs"], separators=(",", ":")),
-        "has_hcu": str(bool(payload["jobs"])).lower(),
-        "groups": ",".join(payload["groups"]),
-        "docs_only": str(payload["docs_only"]).lower(),
-        "fallback": str(payload["fallback"]).lower(),
-    }
+    values = matrix_github_outputs(payload["jobs"])
+    values.update(
+        {
+            "groups": ",".join(payload["groups"]),
+            "docs_only": str(payload["docs_only"]).lower(),
+            "fallback": str(payload["fallback"]).lower(),
+        }
+    )
     with path.open("a", encoding="utf-8") as stream:
         for name, value in values.items():
             stream.write(f"{name}={value}\n")

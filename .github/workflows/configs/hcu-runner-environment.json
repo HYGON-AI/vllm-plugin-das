@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "python": "3.10.12",
+  "torch_hip": "6.3.26113",
+  "rocm": {
+    "environment": "ROCM_PATH",
+    "version_file": ".info/rocm_version",
+    "version": "26.04"
+  },
+  "distributions": {
+    "torch": {
+      "match": "exact",
+      "version": "2.11.0+das.opt1.dtk2604.2606241127.g63672d"
+    },
+    "vllm": {
+      "match": "exact",
+      "version": "0.25.1+das.7b108ad.dtk2604"
+    },
+    "vllm-hcu": {
+      "match": "prefix",
+      "version": "0.25.1+"
+    },
+    "aiter": {
+      "match": "exact",
+      "version": "0.1.3+das.opt1.dtk2604.torch2110.2607161814.gec741a"
+    },
+    "evalscope": {
+      "match": "exact",
+      "version": "1.9.1"
+    },
+    "pytest": {
+      "match": "exact",
+      "version": "9.1.1"
+    }
+  }
+}
