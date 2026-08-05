@@ -1,0 +1,288 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: HCU release wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build and validate
+        required: true
+        default: v0.25.1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-release-wheel
+  cancel-in-progress: false
+
+jobs:
+  build-wheel:
+    runs-on:
+      - self-hosted
+      - hcu-linux-gfx938-1
+    timeout-minutes: 120
+    concurrency:
+      group: hcu-runner-hcu-linux-gfx938-1
+      cancel-in-progress: false
+    outputs:
+      tested_sha: ${{ steps.revision.outputs.tested_sha }}
+    env:
+      HCU_CI_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/release-build
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Resolve tested revision
+        id: revision
+        run: echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate build environment
+        run: |
+          mkdir -p "$HCU_CI_JOB_ROOT"
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
+            --arch gfx938 \
+            --cards 1 \
+            --output "$HCU_CI_JOB_ROOT/environment.json"
+
+      - name: Build wheel from checkout
+        run: |
+          mkdir -p "$HCU_CI_JOB_ROOT/wheel"
+          python3 -m pip wheel . \
+            --disable-pip-version-check \
+            --no-build-isolation \
+            --no-deps \
+            --wheel-dir "$HCU_CI_JOB_ROOT/wheel"
+          cd "$HCU_CI_JOB_ROOT/wheel"
+          sha256sum vllm_hcu-*.whl > SHA256SUMS
+
+      # The wheel remains a transport artifact because downstream validation
+      # jobs may be scheduled on a different self-hosted runner. Logs and
+      # environment reports stay under /tmp on the runner.
+      - name: Upload built wheel for downstream validation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcu-release-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.HCU_CI_JOB_ROOT }}/wheel
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report local build logs
+        if: always()
+        run: |
+          echo "Release build logs retained on runner $RUNNER_NAME at $HCU_CI_JOB_ROOT"
+          {
+            echo "### Local release build logs"
+            echo
+            echo "- Runner: \`$RUNNER_NAME\`"
+            echo "- Path: \`$HCU_CI_JOB_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  wheel-kernel-smoke:
+    needs: build-wheel
+    runs-on:
+      - self-hosted
+      - hcu-linux-gfx938-1
+    timeout-minutes: 60
+    concurrency:
+      group: hcu-runner-hcu-linux-gfx938-1
+      cancel-in-progress: false
+    env:
+      HCU_CI_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/release-kernel
+      HCU_RELEASE_VENV: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/venv-kernel
+      PYTHONPATH: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-wheel.outputs.tested_sha }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Download release wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: hcu-release-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.HCU_CI_JOB_ROOT }}/build
+
+      - name: Validate runner and install wheel
+        run: |
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
+            --arch gfx938 \
+            --cards 1 \
+            --output "$HCU_CI_JOB_ROOT/environment.json"
+          python3 .github/scripts/hcu_ci/prepare_release_wheel_env.py \
+            --wheel-dir "$HCU_CI_JOB_ROOT/build" \
+            --venv "$HCU_RELEASE_VENV"
+
+      - name: Verify wheel origin, versions, and compiled kernel extension
+        run: |
+          cd "$HCU_CI_JOB_ROOT"
+          "$HCU_RELEASE_VENV/bin/python" \
+            "$GITHUB_WORKSPACE/.github/scripts/hcu_ci/verify_release_wheel.py" \
+            --repository "$GITHUB_WORKSPACE" \
+            --output "$HCU_CI_JOB_ROOT/wheel-verification.json" \
+            --expected-sha "${{ needs.build-wheel.outputs.tested_sha }}" \
+            --kernel
+
+      - name: Report local kernel validation logs
+        if: always()
+        run: |
+          echo "Kernel validation logs retained on runner $RUNNER_NAME at $HCU_CI_JOB_ROOT"
+          {
+            echo "### Local kernel validation logs"
+            echo
+            echo "- Runner: \`$RUNNER_NAME\`"
+            echo "- Path: \`$HCU_CI_JOB_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  wheel-server-smoke:
+    needs: build-wheel
+    runs-on:
+      - self-hosted
+      - hcu-linux-gfx938-1
+    timeout-minutes: 120
+    concurrency:
+      group: hcu-runner-hcu-linux-gfx938-1
+      cancel-in-progress: false
+    env:
+      HCU_CI_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/release-server
+      HCU_RELEASE_VENV: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/venv-server
+      PYTHONPATH: ""
+      VLLM_HCU_TEST_STRICT_RESOURCES: "1"
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-wheel.outputs.tested_sha }}
+          clean: true
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hcu-release-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.HCU_CI_JOB_ROOT }}/build
+
+      - name: Validate runner, model, and wheel installation
+        run: |
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
+            --arch gfx938 \
+            --cards 1 \
+            --requirements-json '[{"kind":"model","env":"VLLM_HCU_QWEN25_15B_MODEL","relative":"qwen2.5/Qwen2.5-1.5B-Instruct"}]' \
+            --output "$HCU_CI_JOB_ROOT/environment.json"
+          python3 .github/scripts/hcu_ci/prepare_release_wheel_env.py \
+            --wheel-dir "$HCU_CI_JOB_ROOT/build" \
+            --venv "$HCU_RELEASE_VENV"
+
+      - name: Run OpenAI server smoke from installed wheel
+        run: |
+          cd "$HCU_CI_JOB_ROOT"
+          "$HCU_RELEASE_VENV/bin/python" \
+            "$GITHUB_WORKSPACE/.github/scripts/hcu_ci/run_release_wheel_tests.py" \
+            --repository "$GITHUB_WORKSPACE" \
+            --artifact-root "$HCU_CI_JOB_ROOT/test" \
+            --mode server
+
+      - name: Report local server validation logs
+        if: always()
+        run: |
+          echo "Server validation logs retained on runner $RUNNER_NAME at $HCU_CI_JOB_ROOT"
+          {
+            echo "### Local server validation logs"
+            echo
+            echo "- Runner: \`$RUNNER_NAME\`"
+            echo "- Path: \`$HCU_CI_JOB_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  wheel-multi-card-smoke:
+    needs: build-wheel
+    runs-on:
+      - self-hosted
+      - hcu-linux-gfx938-4
+    timeout-minutes: 180
+    concurrency:
+      group: hcu-runner-hcu-linux-gfx938-4
+      cancel-in-progress: false
+    env:
+      HCU_CI_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/release-multi-card
+      HCU_RELEASE_VENV: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/venv-multi-card
+      PYTHONPATH: ""
+      VLLM_HCU_TEST_STRICT_RESOURCES: "1"
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-wheel.outputs.tested_sha }}
+          clean: true
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hcu-release-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.HCU_CI_JOB_ROOT }}/build
+
+      - name: Validate runner, model, and wheel installation
+        run: |
+          python3 .github/scripts/hcu_ci/hcu_ci_preflight.py \
+            --arch gfx938 \
+            --cards 4 \
+            --requirements-json '[{"kind":"model","env":"VLLM_HCU_QWEN35_35B_A3B_MODEL","relative":"qwen3.5/Qwen3.5-35B-A3B"}]' \
+            --output "$HCU_CI_JOB_ROOT/environment.json"
+          python3 .github/scripts/hcu_ci/prepare_release_wheel_env.py \
+            --wheel-dir "$HCU_CI_JOB_ROOT/build" \
+            --venv "$HCU_RELEASE_VENV"
+
+      - name: Run TP4 and EP4 smoke from installed wheel
+        run: |
+          cd "$HCU_CI_JOB_ROOT"
+          "$HCU_RELEASE_VENV/bin/python" \
+            "$GITHUB_WORKSPACE/.github/scripts/hcu_ci/run_release_wheel_tests.py" \
+            --repository "$GITHUB_WORKSPACE" \
+            --artifact-root "$HCU_CI_JOB_ROOT/test" \
+            --mode multi-card
+
+      - name: Report local multi-card validation logs
+        if: always()
+        run: |
+          echo "Multi-card validation logs retained on runner $RUNNER_NAME at $HCU_CI_JOB_ROOT"
+          {
+            echo "### Local multi-card validation logs"
+            echo
+            echo "- Runner: \`$RUNNER_NAME\`"
+            echo "- Path: \`$HCU_CI_JOB_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release-wheel-gate:
+    if: always()
+    needs:
+      - build-wheel
+      - wheel-kernel-smoke
+      - wheel-server-smoke
+      - wheel-multi-card-smoke
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    env:
+      BUILD_RESULT: ${{ needs.build-wheel.result }}
+      KERNEL_RESULT: ${{ needs.wheel-kernel-smoke.result }}
+      SERVER_RESULT: ${{ needs.wheel-server-smoke.result }}
+      MULTI_CARD_RESULT: ${{ needs.wheel-multi-card-smoke.result }}
+    steps:
+      - name: Enforce release wheel result
+        run: |
+          echo "build=$BUILD_RESULT kernel=$KERNEL_RESULT server=$SERVER_RESULT multi_card=$MULTI_CARD_RESULT"
+          if [[ "$BUILD_RESULT" != "success" || \
+                "$KERNEL_RESULT" != "success" || \
+                "$SERVER_RESULT" != "success" || \
+                "$MULTI_CARD_RESULT" != "success" ]]; then
+            exit 1
+          fi
