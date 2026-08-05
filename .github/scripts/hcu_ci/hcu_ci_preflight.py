@@ -14,6 +14,16 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+REPOSITORY = Path(__file__).resolve().parents[3]
+DEFAULT_ENVIRONMENT_LOCK = (
+    REPOSITORY
+    / ".github"
+    / "workflows"
+    / "configs"
+    / "hcu-runner-environment.json"
+)
+
+
 class PreflightError(RuntimeError):
     """Raised when the selected runner cannot execute its assigned job."""
 
@@ -73,11 +83,109 @@ def _check_requirements(
     return resolved
 
 
+def _load_environment_lock(path: Path) -> dict[str, Any]:
+    try:
+        lock = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreflightError(f"cannot load environment lock {path}: {exc}") from exc
+    if not isinstance(lock, dict) or lock.get("schema_version") != 1:
+        raise PreflightError("environment lock must be a schema_version=1 mapping")
+    if not isinstance(lock.get("python"), str):
+        raise PreflightError("environment lock must declare an exact Python version")
+    if not isinstance(lock.get("torch_hip"), str):
+        raise PreflightError("environment lock must declare an exact torch HIP version")
+    distributions = lock.get("distributions")
+    if not isinstance(distributions, dict) or not distributions:
+        raise PreflightError(
+            "environment lock distributions must be a non-empty mapping"
+        )
+    for name, specification in distributions.items():
+        if not isinstance(name, str) or not name:
+            raise PreflightError("environment lock distribution names must be strings")
+        if not isinstance(specification, dict):
+            raise PreflightError(f"environment lock entry {name!r} must be a mapping")
+        if specification.get("match") not in {"exact", "prefix"}:
+            raise PreflightError(
+                f"environment lock entry {name!r} has an invalid match mode"
+            )
+        if not isinstance(specification.get("version"), str):
+            raise PreflightError(
+                f"environment lock entry {name!r} must declare a version"
+            )
+    rocm = lock.get("rocm")
+    if not isinstance(rocm, dict) or not all(
+        isinstance(rocm.get(name), str) and rocm[name]
+        for name in ("environment", "version_file", "version")
+    ):
+        raise PreflightError("environment lock must declare the DTK/ROCm version file")
+    return lock
+
+
+def _check_environment_lock(
+    path: Path,
+    *,
+    versions: dict[str, str | None],
+    torch_hip: str | None,
+) -> dict[str, Any]:
+    lock = _load_environment_lock(path)
+    actual_python = platform.python_version()
+    expected_python = lock["python"]
+    if actual_python != expected_python:
+        raise PreflightError(
+            f"runner Python drift: expected {expected_python}, got {actual_python}"
+        )
+    expected_hip = lock["torch_hip"]
+    if torch_hip != expected_hip:
+        raise PreflightError(
+            f"runner torch HIP drift: expected {expected_hip}, got {torch_hip}"
+        )
+
+    for name, specification in lock["distributions"].items():
+        actual = versions.get(name)
+        expected = specification["version"]
+        if actual is None:
+            raise PreflightError(f"locked distribution is missing: {name}")
+        matches = actual == expected
+        if specification["match"] == "prefix":
+            matches = actual.startswith(expected)
+        if not matches:
+            raise PreflightError(
+                f"runner distribution drift for {name}: expected "
+                f"{specification['match']} {expected}, got {actual}"
+            )
+
+    rocm = lock["rocm"]
+    root_text = os.environ.get(rocm["environment"])
+    if not root_text:
+        raise PreflightError(
+            f"runner environment is missing {rocm['environment']}"
+        )
+    version_path = Path(root_text).expanduser().resolve() / rocm["version_file"]
+    try:
+        actual_rocm = version_path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError) as exc:
+        raise PreflightError(
+            f"cannot read DTK/ROCm version from {version_path}: {exc}"
+        ) from exc
+    if actual_rocm != rocm["version"]:
+        raise PreflightError(
+            f"runner DTK/ROCm drift: expected {rocm['version']}, got {actual_rocm}"
+        )
+    return {
+        "path": str(path.resolve()),
+        "python": expected_python,
+        "torch_hip": expected_hip,
+        "rocm": actual_rocm,
+        "distributions": lock["distributions"],
+    }
+
+
 def run_preflight(
     *,
     expected_arch: str,
     required_cards: int,
     requirements: list[dict[str, Any]],
+    environment_lock: Path | None = None,
 ) -> dict[str, Any]:
     try:
         import torch
@@ -129,11 +237,28 @@ def run_preflight(
     resolved_requirements = _check_requirements(requirements, model_root)
     versions = {
         name: _distribution_version(name)
-        for name in ("torch", "vllm", "vllm-hcu", "aiter", "evalscope")
+        for name in (
+            "torch",
+            "vllm",
+            "vllm-hcu",
+            "aiter",
+            "evalscope",
+            "pytest",
+        )
     }
     for mandatory in ("torch", "vllm"):
         if versions[mandatory] is None:
             raise PreflightError(f"required distribution is missing: {mandatory}")
+    torch_hip = getattr(getattr(torch, "version", None), "hip", None)
+    lock_report = (
+        _check_environment_lock(
+            environment_lock,
+            versions=versions,
+            torch_hip=torch_hip,
+        )
+        if environment_lock is not None
+        else None
+    )
     return {
         "python": sys.version,
         "executable": sys.executable,
@@ -146,14 +271,21 @@ def run_preflight(
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "versions": versions,
         "resources": resolved_requirements,
+        "environment_lock": lock_report,
     }
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arch", required=True, choices=("gfx936", "gfx938"))
-    parser.add_argument("--cards", required=True, type=int)
+    parser.add_argument("--arch", choices=("gfx936", "gfx938"))
+    parser.add_argument("--cards", type=int)
     parser.add_argument("--requirements-json", default="[]")
+    parser.add_argument(
+        "--environment-lock",
+        type=Path,
+        default=DEFAULT_ENVIRONMENT_LOCK,
+    )
+    parser.add_argument("--check-lock-only", action="store_true")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -161,6 +293,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.check_lock_only:
+            print(json.dumps(_load_environment_lock(args.environment_lock), indent=2))
+            return 0
+        if args.arch is None or args.cards is None:
+            raise PreflightError(
+                "--arch and --cards are required for hardware preflight"
+            )
         raw_requirements = json.loads(args.requirements_json)
         if not isinstance(raw_requirements, list) or not all(
             isinstance(item, dict) for item in raw_requirements
@@ -170,6 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_arch=args.arch,
             required_cards=args.cards,
             requirements=raw_requirements,
+            environment_lock=args.environment_lock,
         )
         rendered = json.dumps(report, indent=2, sort_keys=True)
         print(rendered)
