@@ -140,7 +140,30 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="collect selected pytest nodes without executing them",
     )
+    parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help=(
+            "registered repository-relative pytest file or nodeid; repeat to "
+            "replace the suite's default filesystem targets"
+        ),
+    )
     return parser
+
+
+def _validated_targets(values: Sequence[str]) -> tuple[str, ...]:
+    targets: list[str] = []
+    for value in values:
+        path_text = value.split("::", 1)[0]
+        path = Path(path_text)
+        if path.is_absolute() or ".." in path.parts or not path_text.startswith("tests/"):
+            raise SystemExit(f"invalid registered pytest target: {value}")
+        resolved = REPOSITORY / path
+        if not resolved.is_file() or not resolved.name.startswith("test_"):
+            raise SystemExit(f"registered pytest target does not exist: {value}")
+        targets.append(value)
+    return tuple(targets)
 
 
 def _contains_test_files(entries: Sequence[str]) -> bool:
@@ -205,7 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.collect_only:
         command.append("--collect-only")
     command.extend(SUITE_PYTEST_ARGS[args.suite])
-    command.extend(SUITES[args.suite])
+    command.extend(_validated_targets(args.target) or SUITES[args.suite])
     command.extend(pytest_args)
     print(
         f"patch test suite={args.suite} vllm_source={vllm_root}",

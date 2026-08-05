@@ -54,7 +54,8 @@
       "suite": "contract-hcu",
       "pytest_args": [],
       "timeout_minutes": 45,
-      "requirements": []
+      "requirements": [],
+      "partitions": 2
     },
     "integration-smoke-gfx938": {
       "runner": "hcu-linux-gfx938-1",
@@ -63,7 +64,8 @@
       "suite": "integration-smoke",
       "pytest_args": [],
       "timeout_minutes": 45,
-      "requirements": []
+      "requirements": [],
+      "partitions": 2
     },
     "qwen35-smoke": {
       "runner": "hcu-linux-gfx938-1",
@@ -157,6 +159,7 @@
         "llama2_7b_eagle_spec_decode_token_parity or qwen35_4b_mtp_spec_decode_token_parity"
       ],
       "timeout_minutes": 120,
+      "partitions": 2,
       "requirements": [
         {
           "kind": "model",
@@ -257,6 +260,7 @@
         "qwen25_15b_openai_server_smoke or qwen25_vl_3b_image_mrope_smoke"
       ],
       "timeout_minutes": 120,
+      "partitions": 2,
       "requirements": [
         {
           "kind": "model",
@@ -280,6 +284,7 @@
         "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke or qwen3_embedding_06b_openai_embeddings_server_smoke or qwen3_reranker_score_and_rerank_server_smoke"
       ],
       "timeout_minutes": 90,
+      "partitions": 2,
       "requirements": [
         {
           "kind": "model",
@@ -387,21 +392,64 @@
           "relative": "DeepSeek-R1-Channel-FP8-w8a8"
         }
       ]
+    },
+    "single-node-topology": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "distributed-single-node",
+      "pytest_args": [],
+      "timeout_minutes": 30,
+      "requirements": []
     }
   },
+  "nightly_jobs": [
+    {"job": "accuracy-gfx936", "timeout_minutes": 45},
+    {"job": "accuracy-gfx938", "timeout_minutes": 45},
+    {"job": "contract-hcu-gfx936", "timeout_minutes": 60},
+    {"job": "integration-smoke-gfx938", "timeout_minutes": 60},
+    {"job": "qwen35-smoke", "timeout_minutes": 90},
+    {"job": "qwen35-graph", "timeout_minutes": 90},
+    {"job": "engine-features", "timeout_minutes": 120},
+    {"job": "lora", "timeout_minutes": 90},
+    {"job": "spec-decode", "timeout_minutes": 180},
+    {"job": "mamba-smoke", "timeout_minutes": 60},
+    {"job": "kv-transfer", "timeout_minutes": 90},
+    {"job": "qwen35-tp-ep", "timeout_minutes": 300},
+    {"job": "deepseek-tp-ep", "timeout_minutes": 360},
+    {"job": "qwen25-models", "timeout_minutes": 150},
+    {"job": "qwen3-pooling", "timeout_minutes": 120},
+    {"job": "qwen3-protocol", "timeout_minutes": 120},
+    {"job": "qwen35-gsm8k", "timeout_minutes": 120},
+    {"job": "qwen3-vl-mmmu", "timeout_minutes": 150},
+    {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
+    {"job": "deepseek-gsm8k", "timeout_minutes": 360},
+    {"job": "single-node-topology", "timeout_minutes": 30}
+  ],
   "groups": {
     "ci": {
       "patterns": [
         ".github/workflows/**",
         ".github/workflows/configs/**",
         ".github/scripts/hcu_ci/**",
+        "scripts/ci/hcu/**",
         "tools/run_patch_tests.py",
+        "tests/hcu_ci_registry.py",
         "tests/patch/test_hcu_ci_*.py"
       ],
       "jobs": [
         "accuracy-gfx936",
         "contract-hcu-gfx936",
         "integration-smoke-gfx938"
+      ]
+    },
+    "kernel-accuracy-tests": {
+      "patterns": [
+        "tests/accuracy/test_hcu_kernel_accuracy.py"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "accuracy-gfx938"
       ]
     },
     "platform-runtime": {
@@ -417,6 +465,32 @@
         "contract-hcu-gfx936",
         "integration-smoke-gfx938",
         "qwen35-smoke"
+      ]
+    },
+    "kernel-runtime": {
+      "patterns": [
+        "vllm_hcu/csrc/**",
+        "vllm_hcu/ops/**",
+        "vllm_hcu/model_executor/layers/attention_forward_runtime.py",
+        "vllm_hcu/model_executor/layers/attention_runtime.py",
+        "vllm_hcu/model_executor/layers/linear.py",
+        "vllm_hcu/model_executor/layers/mla_runtime.py",
+        "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "accuracy-gfx938",
+        "integration-smoke-gfx938"
+      ]
+    },
+    "distributed-runtime": {
+      "patterns": [
+        "vllm_hcu/distributed/**",
+        "vllm_hcu/csrc/custom_all_reduce*"
+      ],
+      "jobs": [
+        "contract-hcu-gfx936",
+        "qwen35-tp-ep"
       ]
     },
     "attention-graph": {
@@ -502,20 +576,26 @@
         "deepseek-tp-ep"
       ]
     },
-    "deepseek": {
+    "deepseek-runtime": {
       "patterns": [
         "vllm_hcu/models/deepseek*",
-        "vllm_hcu/**deepseek*",
-        "tests/integration/server/test_evalscope_deepseek*"
+        "vllm_hcu/**deepseek*"
       ],
       "jobs": [
         "deepseek-tp-ep",
         "deepseek-gsm8k"
       ]
     },
-    "model-tests": {
+    "deepseek-evalscope": {
       "patterns": [
-        "tests/integration/models/test_qwen35_9b_smoke.py",
+        "tests/integration/server/test_evalscope_deepseek*"
+      ],
+      "jobs": [
+        "deepseek-gsm8k"
+      ]
+    },
+    "model-runtime-helper": {
+      "patterns": [
         "tests/integration/model_runtime.py"
       ],
       "jobs": [
@@ -524,6 +604,14 @@
         "qwen3-pooling",
         "mamba-smoke",
         "spec-decode"
+      ]
+    },
+    "qwen35-smoke-tests": {
+      "patterns": [
+        "tests/integration/models/test_qwen35_9b_smoke.py"
+      ],
+      "jobs": [
+        "qwen35-smoke"
       ]
     },
     "qwen25-tests": {
@@ -591,14 +679,30 @@
     },
     "evalscope-runner": {
       "patterns": [
-        "tests/integration/server/evalscope_server.py",
-        "tests/integration/server/test_evalscope_report_threshold.py"
+        "tests/integration/server/evalscope_server.py"
       ],
       "jobs": [
         "qwen35-gsm8k",
         "qwen3-8b-gsm8k",
         "qwen3-vl-mmmu",
         "deepseek-gsm8k"
+      ]
+    },
+    "evalscope-report-tests": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_report_threshold.py"
+      ],
+      "jobs": [
+        "integration-smoke-gfx938"
+      ]
+    },
+    "single-node-topology-tests": {
+      "patterns": [
+        "tests/distributed/single_node/**",
+        "tests/fixtures/distributed.py"
+      ],
+      "jobs": [
+        "single-node-topology"
       ]
     }
   }
