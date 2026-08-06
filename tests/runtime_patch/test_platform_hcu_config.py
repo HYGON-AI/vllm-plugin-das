@@ -729,9 +729,10 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
     return SimpleNamespace(
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
-        model_config=SimpleNamespace(enforce_eager=True),
+        model_config=SimpleNamespace(enforce_eager=True, use_mla=False),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         kernel_config=SimpleNamespace(moe_backend="auto"),
+        kv_transfer_config=None,
     )
 
 
@@ -742,6 +743,7 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
         moe_backend="dpsk_deep_gemm",
+        hcu_flash_attn_mode="custom",
     )
     config = _validation_config(feature_config)
     assert patch_vllm_config.validate_and_update_hcu_config(config) == feature_config
@@ -761,7 +763,10 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
 
 
 def test_compilation_binding_is_recreated_after_pickle() -> None:
-    feature_config = HcuFeatureConfig(enable_custom_sp=True)
+    feature_config = HcuFeatureConfig(
+        enable_custom_sp=True,
+        hcu_flash_attn_mode="custom",
+    )
     config = _validation_config(feature_config)
     patch_vllm_config.validate_and_update_hcu_config(config)
     restored = pickle.loads(pickle.dumps(config))
@@ -908,6 +913,36 @@ def _vllm_hash(additional_config: dict[str, Any]) -> str:
         additional_config=additional_config,
     )
     return VllmConfig.compute_hash(config)
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, "cutlass"),
+        ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
+        ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
+        ({"VLLM_HCU_USE_CUSTOM_FLASH_ATTN": "1"}, "custom"),
+    ],
+)
+def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    expected: str,
+) -> None:
+    for name in (
+        "VLLM_HCU_USE_FLASH_ATTN",
+        "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert feature_config.hcu_flash_attn_mode == expected
+    assert get_hcu_config(config) == feature_config
 
 
 def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() -> None:

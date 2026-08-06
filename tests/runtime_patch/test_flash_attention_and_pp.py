@@ -4,14 +4,39 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
-from types import ModuleType
+from importlib.machinery import ModuleSpec
+from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_hcu.patch.platform.framework_opt import patch_distributed_utils
 from vllm_hcu.patch.worker.op_opt import patch_triton_unified_attention
 from vllm_hcu.platforms import envs as hcu_envs
+
+
+def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
+    hcu_ops = ModuleType("vllm_hcu.hcu_ops")
+    hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
+    monkeypatch.setitem(sys.modules, hcu_ops.__name__, hcu_ops)
+
+    flash_attn_extension = ModuleType("flash_attn")
+    flash_attn_extension.__spec__ = ModuleSpec(
+        flash_attn_extension.__name__,
+        loader=None,
+    )
+    for symbol in (
+        "flash_attn_varlen_func",
+        "vllm_flash_attn_varlen_func",
+        "hg_flash_attn_varlen_func",
+        "varlen_fwd_unified",
+    ):
+        setattr(flash_attn_extension, symbol, lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
+
+    return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
 
 
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
@@ -36,7 +61,7 @@ def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        (None, "custom"),
+        (None, "cutlass"),
         ("VLLM_HCU_USE_FLASH_ATTN", "classic"),
         ("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "cutlass"),
         ("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "custom"),
@@ -103,7 +128,8 @@ def test_platform_flash_attention_mode_rejects_invalid_sidecar(
             ((3, 4, 64, 128), (3, 4, 128, 64)),
             0,
         ),
-        ("cutlass", (2, 3, 64, 4, 128), 1),
+        ("cutlass", (3, 2, 64, 4, 128), 0),
+        ("classic", (3, 2, 64, 4, 128), 0),
     ],
 )
 def test_flash_attention_kv_cache_contract_follows_resolved_mode(
@@ -112,21 +138,7 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
     expected_shape: object,
     expected_block_dim: int,
 ):
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_hcu.hcu_ops",
-        ModuleType("vllm_hcu.hcu_ops"),
-    )
-    flash_attn_extension = ModuleType("flash_attn")
-    for symbol in (
-        "flash_attn_varlen_func",
-        "vllm_flash_attn_varlen_func",
-        "hg_flash_attn_varlen_func",
-        "varlen_fwd_unified",
-    ):
-        setattr(flash_attn_extension, symbol, lambda *args, **kwargs: None)
-    monkeypatch.setitem(sys.modules, "flash_attn", flash_attn_extension)
-    from vllm_hcu.v1.attention.backends import flash_attn
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
 
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
     monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: "NHD")
@@ -135,12 +147,328 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
     assert backend.get_kv_cache_shape(3, 64, 4, 128) == expected_shape
     assert backend.get_kv_cache_block_dim(64, 4, 128) == expected_block_dim
     if mode == "custom":
+        assert backend.indexes_kv_by_block_stride() is False
         assert backend.get_kv_cache_stride_order() == (
             (0, 1, 2, 3),
             (0, 1, 2, 3),
         )
     else:
+        assert backend.indexes_kv_by_block_stride() is True
         assert backend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
+        assert backend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4, 5)
+
+
+@pytest.mark.parametrize("mode", ["classic", "cutlass"])
+def test_block_first_hnd_stride_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+):
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
+    monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: "HND")
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    assert backend.get_kv_cache_shape(3, 64, 4, 128) == (3, 2, 64, 4, 128)
+    assert backend.get_kv_cache_block_dim(64, 4, 128) == 0
+    assert backend.get_kv_cache_stride_order() == (0, 1, 3, 2, 4)
+    assert backend.get_kv_cache_stride_order(True) == (1, 4, 0, 2, 3, 5)
+    assert backend.indexes_kv_by_block_stride() is True
+
+
+def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    assert backend.supports_mm_prefix() is False
+    reason = backend.supports_combination(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=64,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=True,
+        device_capability=flash_attn.DeviceCapability(9, 0),
+    )
+    assert reason is not None and "mm_prefix" in reason
+
+
+def test_hcu_flash_attention_rswa_is_explicitly_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    config = SimpleNamespace(model_config=SimpleNamespace(rswa_window=128))
+
+    with pytest.raises(NotImplementedError, match="R-SWA"):
+        flash_attn.FlashAttentionMetadataBuilder(
+            None,
+            [],
+            config,
+            torch.device("cpu"),
+        )
+
+
+def _bare_flash_attention_builder(flash_attn, *, sliding_window: int = 32):
+    builder = object.__new__(flash_attn.FlashAttentionMetadataBuilder)
+    builder.aot_schedule = True
+    builder.aot_sliding_window = (sliding_window - 1, 0)
+    builder.cache_config = SimpleNamespace(cache_dtype="auto")
+    builder.kv_cache_dtype = torch.float16
+    builder.num_heads_q = 4
+    builder.num_heads_kv = 2
+    builder.headdim = 64
+    builder.block_size = 64
+    builder.dcp_world_size = 1
+    builder.use_full_cuda_graph = False
+    builder.max_cudagraph_size = None
+    builder.max_num_splits = 0
+    builder.device = torch.device("cpu")
+    builder.kv_cache_spec = SimpleNamespace(sliding_window=sliding_window)
+    return builder
+
+
+def _common_attention_metadata(*, causal: bool | torch.Tensor):
+    return SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=2,
+        max_query_len=2,
+        max_seq_len=4,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, 1], dtype=torch.int64),
+        causal=causal,
+    )
+
+
+@pytest.mark.parametrize(
+    ("causal", "expected_window"),
+    [(True, (31, 0)), (False, (31, 31))],
+)
+def test_hcu_flash_attention_aligns_aot_and_forward_window_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    causal: bool,
+    expected_window: tuple[int, int],
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    scheduler_calls: list[dict[str, object]] = []
+
+    def get_scheduler_metadata(**kwargs):
+        scheduler_calls.append(kwargs)
+        return torch.zeros(1, dtype=torch.int32)
+
+    monkeypatch.setattr(flash_attn, "get_scheduler_metadata", get_scheduler_metadata)
+
+    metadata = builder.build(
+        0,
+        _common_attention_metadata(causal=causal),
+    )
+
+    assert scheduler_calls[0]["window_size"] == expected_window
+    assert metadata.sliding_window == expected_window
+
+
+def test_hcu_flash_attention_rejects_per_request_causal_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+
+    with pytest.raises(NotImplementedError, match="Per-request causal masks"):
+        builder.build(
+            0,
+            _common_attention_metadata(
+                causal=torch.tensor([True], dtype=torch.bool),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("metadata_window", "fallback_window", "causal", "expected"),
+    [
+        (None, (7, 0), True, [7, 0]),
+        (None, (7, 0), False, [7, 7]),
+        ((31, 31), (7, 0), True, [31, 31]),
+        (None, (-1, -1), False, [-1, -1]),
+        (None, None, False, None),
+    ],
+)
+def test_hcu_flash_attention_resolves_native_window_for_each_causal_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_window: tuple[int, int] | None,
+    fallback_window: tuple[int, int] | None,
+    causal: bool,
+    expected: list[int] | None,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+
+    assert (
+        flash_attn._get_native_sliding_window(
+            metadata_window,
+            fallback_window,
+            causal,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("attn_type_name", ["ENCODER", "ENCODER_ONLY"])
+def test_hcu_flash_attention_encoder_window_is_symmetric(
+    monkeypatch: pytest.MonkeyPatch,
+    attn_type_name: str,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        flash_attn,
+        "flash_attn_supports_quant_query_input",
+        lambda: False,
+    )
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "classic")
+
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=1,
+        head_size=64,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=8,
+        kv_cache_dtype="auto",
+        attn_type=getattr(flash_attn.AttentionType, attn_type_name),
+    )
+
+    assert impl.sliding_window == (7, 7)
+
+
+@pytest.mark.parametrize(
+    ("metadata_window", "expected_window"),
+    [(None, [7, 0]), ((31, 31), [31, 31])],
+)
+def test_hcu_flash_attention_forward_uses_metadata_window_with_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_window: tuple[int, int] | None,
+    expected_window: list[int],
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    impl.num_kv_heads = 1
+    impl.supports_quant_query_input = False
+    impl.dcp_world_size = 1
+    impl.scale = 1.0
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = 0.0
+    impl.sinks = None
+    impl.sliding_window = (7, 0)
+
+    calls: list[dict[str, object]] = []
+
+    def native_forward(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "classic")
+    monkeypatch.setattr(
+        flash_attn,
+        "canonicalize_singleton_dim_strides",
+        lambda tensor: tensor,
+    )
+    monkeypatch.setattr(flash_attn, "hg_flash_attn_varlen_func", native_forward)
+
+    metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        use_cascade=False,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        scheduler_metadata=None,
+        causal=True,
+        sliding_window=metadata_window,
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(1.0),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+    query = torch.zeros(1, 1, 2)
+
+    impl.forward(
+        layer,
+        query,
+        query,
+        query,
+        torch.zeros(1, 2, 1, 1, 2),
+        metadata,
+        torch.empty_like(query),
+    )
+
+    assert calls[0]["window_size"] == expected_window
+
+
+def test_block_first_kv_update_passes_axis_one_views_to_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "cutlass")
+    monkeypatch.setattr(
+        flash_attn,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(args),
+    )
+
+    key = torch.zeros(2, 1, 8)
+    value = torch.ones_like(key)
+    cache = torch.empty(3, 2, 4, 1, 8)
+    slots = torch.tensor([0, 5])
+    layer = SimpleNamespace(
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+
+    assert len(calls) == 1
+    writer_key, writer_value, key_cache, value_cache, writer_slots, *_ = calls[0]
+    assert writer_key is key
+    assert writer_value is value
+    assert writer_slots is slots
+    expected_key_cache, expected_value_cache = cache.unbind(1)
+    assert key_cache.stride() == expected_key_cache.stride()
+    assert value_cache.stride() == expected_value_cache.stride()
+    assert key_cache.storage_offset() == expected_key_cache.storage_offset()
+    assert value_cache.storage_offset() == expected_value_cache.storage_offset()
+
+
+def test_platform_block_copy_and_swap_use_axis_zero():
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    src = torch.arange(4 * 2 * 3).reshape(4, 2, 3)
+    inserted = torch.full_like(src, -1)
+    host = torch.full_like(src, -1)
+    src_blocks = torch.tensor([3, 1])
+    dst_blocks = torch.tensor([0, 2])
+
+    HCUPlatform.insert_blocks_to_device(src, inserted, src_blocks, dst_blocks)
+    HCUPlatform.swap_out_blocks_to_host(src, host, src_blocks, dst_blocks)
+
+    torch.testing.assert_close(inserted[dst_blocks], src[src_blocks])
+    torch.testing.assert_close(host[dst_blocks], src[src_blocks])
+    assert torch.count_nonzero(inserted[[1, 3]] + 1) == 0
+    assert torch.count_nonzero(host[[1, 3]] + 1) == 0
 
 
 class _FakeKernel:

@@ -18,7 +18,6 @@ os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
 
 from vllm_hcu.patch.platform.framework_opt import (
     patch_engine_core,
-    patch_kv_cache_utils,
     patch_kv_connector_factory,
     patch_mooncake_connector,
     patch_multiproc_executor,
@@ -61,38 +60,6 @@ def test_group_coordinator_all_to_all_delegates_to_device_communicator():
     assert group.all_to_all_single("out", "in") == "done"
     assert calls == [("out", "in")]
     assert patch_parallel_state.apply_to_module(module) is False
-
-
-@dataclass(frozen=True)
-class _Spec:
-    block_size: int
-    bytes_per_token: int
-    page_size_padded: int | None = None
-
-    @property
-    def page_size_bytes(self):
-        return self.page_size_padded or self.block_size * self.bytes_per_token
-
-
-def test_kv_page_size_uses_lcm_and_safe_padding():
-    from vllm_hcu.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
-
-    specs = {"a": _Spec(1, 6), "b": _Spec(1, 10)}
-    result = unify_kv_cache_spec_page_size(specs)
-    assert {spec.page_size_bytes for spec in result.values()} == {30}
-    assert result["a"].block_size == 5
-    assert result["b"].block_size == 3
-
-    def official(kv_cache_spec):
-        return kv_cache_spec
-
-    module = _module(
-        patch_kv_cache_utils.TARGET_MODULE,
-        unify_kv_cache_spec_page_size=official,
-    )
-    assert patch_kv_cache_utils.apply_to_module(module) is True
-    assert module.unify_kv_cache_spec_page_size is unify_kv_cache_spec_page_size
-    assert patch_kv_cache_utils.apply_to_module(module) is False
 
 
 def _fake_factory_module():

@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import functools
 import inspect
+from collections.abc import Mapping
 from types import ModuleType
 from typing import Any
 
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
@@ -31,13 +32,69 @@ _REQUEST_CAPTURE_SIZES = (
 )
 
 
+def _contains_mooncake_connector(
+    connector: object,
+    extra_config: object,
+) -> bool:
+    if connector == "MooncakeConnector":
+        return True
+    if connector != "MultiConnector":
+        return False
+
+    if not isinstance(extra_config, Mapping):
+        raise ValueError("MultiConnector extra config must be a mapping")
+    connectors = extra_config.get("connectors")
+    if not isinstance(connectors, (list, tuple)):
+        raise ValueError("MultiConnector requires a connectors list")
+    for child in connectors:
+        if not isinstance(child, Mapping):
+            raise ValueError("MultiConnector child config must be a mapping")
+        if _contains_mooncake_connector(
+            child.get("kv_connector"),
+            child.get("kv_connector_extra_config", {}),
+        ):
+            return True
+    return False
+
+
+def _uses_mooncake_connector(vllm_config: object) -> bool:
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    return _contains_mooncake_connector(
+        getattr(kv_transfer_config, "kv_connector", None),
+        getattr(kv_transfer_config, "kv_connector_extra_config", None),
+    )
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
+
+    feature_config = get_hcu_config(vllm_config)
+    updates: dict[str, str] = {}
+    if feature_config.hcu_flash_attn_mode is None:
+        # Persist the resolved sub-mode before vLLM computes compilation cache
+        # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
+        from vllm_hcu.platforms import envs as hcu_envs
+
+        updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
+    if updates:
+        feature_config = feature_config.with_updates(**updates)
+    # Persist the resolved mode so it enters vLLM's compilation hash.
+    set_hcu_config(vllm_config, feature_config)
 
     feature_config = bind_hcu_config(vllm_config)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)
+
+    if (
+        feature_config.hcu_flash_attn_mode != "custom"
+        and not getattr(model_config, "use_mla", False)
+        and _uses_mooncake_connector(vllm_config)
+    ):
+        raise NotImplementedError(
+            "MooncakeConnector is not yet validated with the non-custom HCU "
+            "block-first KV-cache ABI"
+        )
 
     if parallel_config is not None:
         setattr(

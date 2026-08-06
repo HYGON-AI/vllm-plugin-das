@@ -108,7 +108,6 @@ The following plugin files map to vLLM upstream paths and were reviewed under th
 | `vllm_hcu/v1/attention/backends/triton_attn.py` | `vllm/v1/attention/backends/triton_attn.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/v1/attention/ops/__init__.py` | `vllm/v1/attention/ops/__init__.py` | vLLM copyright retained; HYGON modification notice retained. No HYGON copyright added because only non-substantive/header content remains. |
 | `vllm_hcu/v1/core/__init__.py` | `vllm/v1/core/__init__.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
-| `vllm_hcu/v1/core/kv_cache_utils.py` | `vllm/v1/core/kv_cache_utils.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/v1/core/sched/__init__.py` | `vllm/v1/core/sched/__init__.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/v1/core/sched/scheduler.py` | `vllm/v1/core/sched/scheduler.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/v1/executor/__init__.py` | `vllm/v1/executor/__init__.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |

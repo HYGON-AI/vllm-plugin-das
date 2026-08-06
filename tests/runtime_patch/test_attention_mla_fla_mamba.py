@@ -327,16 +327,108 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     assert calls["dummy_device"] == query.device
 
 
-def test_fused_attention_accepts_only_supported_stacked_kv_cache_layout():
+@pytest.mark.parametrize(
+    ("kv_axis", "cache_shape"),
+    [(0, (3, 2, 4)), (1, (2, 3, 4))],
+)
+def test_fused_attention_rejects_incompatible_stacked_kv_axis(
+    kv_axis: int,
+    cache_shape: tuple[int, ...],
+):
     from vllm_hcu.model_executor.layers import kv_cache_utils as runtime
 
-    axis_zero = torch.arange(24).reshape(2, 3, 4)
-    key, value = runtime.split_kv_cache(axis_zero)
-    torch.testing.assert_close(key, axis_zero[0])
-    torch.testing.assert_close(value, axis_zero[1])
-
     with pytest.raises(ValueError, match="stacked KV cache dimension"):
-        runtime.split_kv_cache(torch.empty(3, 2, 4))
+        runtime.split_kv_cache(torch.empty(cache_shape), kv_axis=kv_axis)
+
+
+def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    try:
+        runtime = importlib.import_module(
+            "vllm_hcu.model_executor.layers.attention_runtime"
+        )
+        forward_context_module = importlib.import_module("vllm.forward_context")
+        hcu_platform = importlib.import_module("vllm_hcu.platforms.hcu")
+    except (ImportError, RuntimeError):
+        pytest.skip("vLLM custom-op registry is unavailable in this environment")
+
+    num_tokens, num_blocks, block_size = 2, 3, 4
+    q_size, kv_size, head_size = 4, 2, 2
+    kv_cache = torch.empty(num_blocks, 2, block_size, 1, head_size)
+    slot_mapping = torch.tensor([0, 5])
+    layer = SimpleNamespace(
+        kv_cache=kv_cache,
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+    context = SimpleNamespace(
+        slot_mapping={"layer": slot_mapping},
+        no_compile_layers={"layer": layer},
+    )
+    monkeypatch.setattr(forward_context_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(hcu_platform, "get_hcu_flash_attn_mode", lambda: "cutlass")
+
+    lightop_calls: list[dict[str, object]] = []
+    lightop_module = ModuleType("lightop")
+
+    def fake_lightop(*args, **kwargs):
+        del args
+        lightop_calls.append(kwargs)
+        assert kwargs["kv_cache_loc"] is None
+        assert kwargs["k_buffer"].numel() == 0
+        assert kwargs["v_buffer"].numel() == 0
+        return (
+            torch.arange(num_tokens * q_size, dtype=torch.float32).reshape(
+                num_tokens, q_size
+            ),
+            torch.arange(num_tokens * kv_size, dtype=torch.float32).reshape(
+                num_tokens, kv_size
+            ),
+            torch.arange(num_tokens * kv_size, dtype=torch.float32)
+            .reshape(num_tokens, kv_size)
+            .add(100),
+        )
+
+    lightop_module.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant = (
+        fake_lightop
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop_module)
+
+    writer_calls: list[tuple[object, ...]] = []
+    aiter_cache_module = ModuleType("aiter.ops.cache")
+    aiter_cache_module.reshape_and_cache_flash = (
+        lambda *args: writer_calls.append(args)
+    )
+    monkeypatch.setitem(sys.modules, "aiter.ops.cache", aiter_cache_module)
+
+    q, key, value = runtime.fused_qkv_split_rmsnorm_rope_kv_store_impl(
+        torch.zeros(num_tokens, q_size + 2 * kv_size),
+        torch.arange(num_tokens),
+        "layer",
+        "auto",
+        torch.empty(num_tokens, head_size),
+        torch.ones(head_size),
+        torch.ones(head_size),
+        1e-5,
+        head_size,
+        head_size,
+        q_size,
+        kv_size,
+        block_size,
+    )
+
+    assert len(lightop_calls) == 1
+    assert len(writer_calls) == 1
+    writer_key, writer_value, key_cache, value_cache, writer_slots, *_ = (
+        writer_calls[0]
+    )
+    assert writer_key is key
+    assert writer_value is value
+    assert writer_slots is slot_mapping
+    assert key_cache.stride(0) == 2 * block_size * head_size
+    assert value_cache.stride(0) == 2 * block_size * head_size
+    assert q.shape == (num_tokens, q_size // head_size, head_size)
 
 
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):

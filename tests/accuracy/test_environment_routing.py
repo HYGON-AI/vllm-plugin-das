@@ -209,7 +209,7 @@ def test_nn_layout_environment_reaches_mamba_path_selector(
 @pytest.mark.parametrize(
     ("values", "expected"),
     [
-        ({}, "custom"),
+        ({}, "cutlass"),
         ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
         (
             {

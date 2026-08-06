@@ -508,8 +508,19 @@ def test_e8m0_scale_decode_matches_exponent_reference(
     )
 
 
-@pytest.mark.parametrize("container", ["tuple", "list", "stacked"])
-def test_split_kv_cache_is_value_preserving(container: str) -> None:
+@pytest.mark.parametrize(
+    ("container", "kv_axis"),
+    [
+        ("tuple", 0),
+        ("list", 0),
+        ("stacked_custom", 0),
+        ("stacked_block_first", 1),
+    ],
+)
+def test_split_kv_cache_is_value_preserving(
+    container: str,
+    kv_axis: int,
+) -> None:
     key = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
     value = key.add(100)
     if container == "tuple":
@@ -517,9 +528,9 @@ def test_split_kv_cache_is_value_preserving(container: str) -> None:
     elif container == "list":
         cache = [key, value]
     else:
-        cache = torch.stack((key, value))
+        cache = torch.stack((key, value), dim=kv_axis)
 
-    actual_key, actual_value = split_kv_cache(cache)
+    actual_key, actual_value = split_kv_cache(cache, kv_axis=kv_axis)
 
     torch.testing.assert_close(actual_key, key, rtol=0, atol=0)
     torch.testing.assert_close(actual_value, value, rtol=0, atol=0)

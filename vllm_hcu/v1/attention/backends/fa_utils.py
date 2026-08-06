@@ -4,9 +4,16 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 from typing import Any
 
+from aiter.ops.cache import reshape_and_cache_flash
+from flash_attn import (
+    flash_attn_varlen_func,
+    hg_flash_attn_varlen_func,
+    varlen_fwd_unified,
+    vllm_flash_attn_varlen_func,
+)
+
 import vllm_hcu.hcu_ops as hcu_ops
-from vllm._custom_ops import reshape_and_cache_flash
-from flash_attn import flash_attn_varlen_func, vllm_flash_attn_varlen_func, hg_flash_attn_varlen_func,varlen_fwd_unified
+
 
 # Hcu doesn't use scheduler metadata (FA3 feature), provide stub
 def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]

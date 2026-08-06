@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
-    VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
+    VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = True
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
@@ -78,8 +78,8 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
     """Resolve an HCU flash-attention sub-mode without touching vLLM schema.
 
     An explicit sidecar value wins.  The legacy environment switches retain
-    their historical priority, and the flagless HCU default remains the
-    separate-cache custom implementation.
+    their historical priority, and the flagless HCU default uses the CUTLASS
+    unified implementation.
     """
 
     if explicit_mode is not None:
@@ -100,6 +100,9 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
         "VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False"
     ).lower() in ("true", "1"):
         return "custom"
+    # Only an explicitly enabled legacy switch participates in priority
+    # resolution. The flagless CUTLASS default is applied below, so an
+    # explicitly requested classic mode can still take effect.
     if os.environ.get(
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "False"
     ).lower() in ("true", "1"):
@@ -109,7 +112,7 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
         "1",
     ):
         return "classic"
-    return "custom"
+    return "cutlass"
 
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
@@ -124,7 +127,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     # vLLM will use FlashAttention Backend (varlen_fwd_unified) on hcu, cutlass attention layerout blocksize 64 for qwen3.5
     "VLLM_HCU_USE_FLASH_ATTN_UNIFIED":
-    lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "True").lower() in
              ("true", "1")),
     # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu,  not office attention layerout blocksize 64 
     "VLLM_HCU_USE_CUSTOM_FLASH_ATTN":

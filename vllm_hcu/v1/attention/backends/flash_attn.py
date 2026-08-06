@@ -177,7 +177,7 @@ class HcuFlashAttentionBackend(AttentionBackend):
                 (num_blocks, num_kv_heads, block_size, head_size),
                 (num_blocks, num_kv_heads, head_size, block_size),
             )
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @classmethod
     def get_kv_cache_block_dim(
@@ -216,11 +216,11 @@ class HcuFlashAttentionBackend(AttentionBackend):
             raise ValueError(f"Unknown cache layout format {cache_layout}.")
 
         if cache_layout == "NHD" and include_num_layers_dimension:
-            return (2, 0, 1, 3, 4, 5)
+            return (1, 0, 2, 3, 4, 5)
         if cache_layout == "NHD":
             return (0, 1, 2, 3, 4)
         if cache_layout == "HND" and include_num_layers_dimension:
-            return (2, 4, 0, 1, 3, 5)
+            return (1, 4, 0, 2, 3, 5)
         if cache_layout == "HND":
             return (0, 1, 3, 2, 4)
         raise ValueError(f"Unknown cache layout format {cache_layout}.")
@@ -256,6 +256,12 @@ class HcuFlashAttentionBackend(AttentionBackend):
         return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
     @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # HCU does not yet implement the complete target PrefixLM contract
+        # across prefill, decode, and CUDAGraph paths.
+        return False
+
+    @classmethod
     def supports_sink(cls) -> bool:
         if not is_flash_attn_varlen_func_available():
             return False
@@ -280,6 +286,11 @@ class HcuFlashAttentionBackend(AttentionBackend):
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
+        if use_mm_prefix:
+            return (
+                "mm_prefix (PrefixLM bidirectional attention) is not yet "
+                "supported by the complete HCU FlashAttention runtime"
+            )
         return None
 
 
@@ -317,7 +328,9 @@ class FlashAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
 
-    causal: bool = True
+    causal: bool | torch.Tensor = True
+
+    sliding_window: tuple[int, int] | None = None
 
 
 def _get_sliding_window_configs(
@@ -335,6 +348,28 @@ def _get_sliding_window_configs(
             continue
         sliding_window_configs.add(layer.impl.sliding_window)
     return sliding_window_configs
+
+
+def _maybe_symmetrize_window(
+    window: tuple[int, int] | None,
+    causal: bool | torch.Tensor,
+) -> tuple[int, int] | None:
+    """Match target vLLM's non-causal sliding-window semantics."""
+
+    non_causal = isinstance(causal, torch.Tensor) or causal is False
+    if window is not None and window[0] >= 0 and window[1] == 0 and non_causal:
+        return (window[0], window[0])
+    return window
+
+
+def _get_native_sliding_window(
+    metadata_window: tuple[int, int] | None,
+    fallback_window: tuple[int, int] | None,
+    causal: bool | torch.Tensor,
+) -> list[int] | None:
+    window = metadata_window if metadata_window is not None else fallback_window
+    window = _maybe_symmetrize_window(window, causal)
+    return list(window) if window is not None else None
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
@@ -378,6 +413,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        if getattr(vllm_config.model_config, "rswa_window", None) is not None:
+            raise NotImplementedError(
+                "R-SWA requires rswa_prefix_lens/rswa_window support in the "
+                "HCU FlashAttention native wrapper"
+            )
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
@@ -468,6 +508,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
+        if isinstance(causal, torch.Tensor):
+            raise NotImplementedError(
+                "Per-request causal masks require the target mask-mod API, "
+                "which is not yet supported by HCU FlashAttention"
+            )
 
         # Disable AOT schedule for spec-decode proposer (not worth the overhead)
         # and for batch invariance (schedule varies with max_seqlen_q/k).
@@ -529,7 +574,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     cu_seqlens_q=cu_query_lens,
                     page_size=self.block_size,
                     causal=causal,
-                    window_size=self.aot_sliding_window,
+                    window_size=_maybe_symmetrize_window(
+                        self.aot_sliding_window,
+                        causal,
+                    ),
                     num_splits=max_num_splits,
                 )
             return None
@@ -618,6 +666,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        group_sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
+        base_window = (
+            (-1, -1)
+            if group_sliding_window is None
+            else (group_sliding_window - 1, 0)
+        )
+        effective_sliding_window = _maybe_symmetrize_window(base_window, causal)
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -637,6 +693,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            sliding_window=effective_sliding_window,
         )
         return attn_metadata
 
@@ -681,7 +738,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.alibi_slopes = alibi_slopes
         if sliding_window is None:
             self.sliding_window = (-1, -1)
-        elif attn_type == AttentionType.ENCODER_ONLY:
+        elif attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
             self.sliding_window = (sliding_window - 1, sliding_window - 1)
         else:
             self.sliding_window = (sliding_window - 1, 0)
@@ -762,7 +819,9 @@ class FlashAttentionImpl(AttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
-                [2, num_blocks, block_size, num_kv_heads, head_size]
+                [num_blocks, 2, block_size, num_kv_heads, head_size]
+                for Classic/CUTLASS, or a separate (key_cache, value_cache)
+                tuple for CUSTOM.
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -813,7 +872,7 @@ class FlashAttentionImpl(AttentionImpl):
         if isinstance(kv_cache, tuple):
             key_cache, value_cache = kv_cache
         else:
-            key_cache, value_cache = kv_cache.unbind(0)
+            key_cache, value_cache = kv_cache.unbind(1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
         # FA3/4 on H100+ uses TMA, which requires ≥16-byte stride alignment.
         # See vllm.utils.torch_utils.canonicalize_singleton_dim_strides.
@@ -878,10 +937,10 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
-                sliding_window_size = (
-                    list(self.sliding_window)
-                    if self.sliding_window is not None
-                    else None
+                sliding_window_size = _get_native_sliding_window(
+                    attn_metadata.sliding_window,
+                    self.sliding_window,
+                    attn_metadata.causal,
                 )
                 if _get_flash_attn_mode() == "custom":
                     logger.info_once(
@@ -1012,7 +1071,7 @@ class FlashAttentionImpl(AttentionImpl):
         if isinstance(kv_cache, tuple):
             key_cache, value_cache = kv_cache
         else:
-            key_cache, value_cache = kv_cache.unbind(0)
+            key_cache, value_cache = kv_cache.unbind(1)
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
@@ -1067,8 +1126,15 @@ class FlashAttentionImpl(AttentionImpl):
 
         query = query.contiguous()
         query_across_dcp = get_dcp_group().all_gather(query, dim=1)
-        sliding_window_size = (
-            list(self.sliding_window) if self.sliding_window is not None else None
+        context_sliding_window_size = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            False,
+        )
+        query_sliding_window_size = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            attn_metadata.causal,
         )
         n = query_across_dcp.shape[0]
         (dcp_context_out,) = current_workspace_manager().get_simultaneous(
@@ -1090,7 +1156,7 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 causal=False,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
+                window_size=context_sliding_window_size,
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
@@ -1115,7 +1181,7 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 causal=False,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
+                window_size=context_sliding_window_size,
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
@@ -1151,7 +1217,7 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
+                window_size=query_sliding_window_size,
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
                 fa_version=self.vllm_flash_attn_version,
@@ -1174,7 +1240,7 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
+                window_size=query_sliding_window_size,
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
                 fa_version=self.vllm_flash_attn_version,
@@ -1234,8 +1300,10 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         # Call flash attention directly on Q, K, V tensors
-        sliding_window_size = (
-            list(self.sliding_window) if self.sliding_window is not None else None
+        sliding_window_size = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            False,
         )
         if _get_flash_attn_mode() == "custom":
             vllm_flash_attn_varlen_func(

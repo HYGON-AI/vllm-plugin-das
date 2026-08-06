@@ -165,8 +165,15 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
     attn_layer = forward_context.no_compile_layers[layer_name]
     kv_cache = attn_layer.kv_cache
 
-    if layer_slot_mapping is not None:
-        key_cache, value_cache = split_kv_cache(kv_cache)
+    from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
+
+    flash_attn_mode = get_hcu_flash_attn_mode()
+    kv_axis = 0 if flash_attn_mode == "custom" else 1
+    fused_cache_store = (
+        layer_slot_mapping is not None and flash_attn_mode == "custom"
+    )
+    if fused_cache_store:
+        key_cache, value_cache = split_kv_cache(kv_cache, kv_axis=kv_axis)
         if kv_cache_dtype.startswith("fp8"):
             from vllm_hcu.v1.attention.backends.flash_attn import (
                 HcuFlashAttentionBackend,
@@ -178,6 +185,10 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
             key_cache = key_cache.view(fp8_dtype)
             value_cache = value_cache.view(fp8_dtype)
     else:
+        # LightOp's fused writer follows CUSTOM's split K/V physical ABI.
+        # Non-custom caches use the target block-first ABI, so retain the
+        # fused QKV/RMS/RoPE compute and perform the cache write separately
+        # through AITER's stride-aware writer below.
         key_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
         value_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
 
@@ -198,7 +209,7 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
         page_size=block_size,
         k_buffer=key_cache,
         v_buffer=value_cache,
-        kv_cache_loc=layer_slot_mapping,
+        kv_cache_loc=layer_slot_mapping if fused_cache_store else None,
         is_neox=is_neox,
         weight_q=weight_q_norm,
         weight_k=weight_k_norm,
@@ -213,6 +224,34 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
     q = q.contiguous().view(num_tokens, q_size // head_size, head_size)
     k = k.contiguous().view(num_tokens, kv_size // head_size_v, head_size_v)
     v = v.contiguous().view(num_tokens, kv_size // head_size_v, head_size_v)
+
+    if layer_slot_mapping is not None and not fused_cache_store:
+        from aiter.ops.cache import reshape_and_cache_flash
+
+        target_key_cache, target_value_cache = split_kv_cache(
+            kv_cache,
+            kv_axis=kv_axis,
+        )
+        if kv_cache_dtype.startswith("fp8"):
+            from vllm_hcu.v1.attention.backends.flash_attn import (
+                HcuFlashAttentionBackend,
+            )
+
+            fp8_dtype = HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+                kv_cache_dtype
+            )
+            target_key_cache = target_key_cache.view(fp8_dtype)
+            target_value_cache = target_value_cache.view(fp8_dtype)
+        reshape_and_cache_flash(
+            k,
+            v,
+            target_key_cache,
+            target_value_cache,
+            layer_slot_mapping,
+            kv_cache_dtype,
+            attn_layer._k_scale,
+            attn_layer._v_scale,
+        )
     return q, k, v
 
 
