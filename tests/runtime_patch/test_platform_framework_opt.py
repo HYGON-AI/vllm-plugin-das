@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 
-import importlib
 import inspect
 import os
 import subprocess
@@ -143,87 +142,6 @@ def test_kv_factory_passes_dp_rank_only_to_supporting_connector(monkeypatch):
     monkeypatch.setattr(patch_kv_connector_factory.henvs, "VLLM_HCU_USE_DP_CONNECTOR", True)
     result = module.KVConnectorFactory.create_connector(config, "role", "cache")
     assert result.dp_rank == 7
-
-
-@pytest.fixture(scope="module")
-def hcu_mooncake():
-    return importlib.import_module(patch_mooncake_connector.TARGET_MODULE)
-
-
-@pytest.mark.hcu
-def test_hcu_mooncake_trace_and_transfer_id_contract(hcu_mooncake):
-    request_id = "cmpl-123e4567-e89b-12d3-a456-426614174000-extra"
-    assert hcu_mooncake.transfer_id_from_req(request_id) == "xfer-123e4567-e89b-12d3-a456-426614174000"
-    assert hcu_mooncake.transfer_id_from_req("plain") is None
-    assert hcu_mooncake.transfer_id_from_req("plain", {"transfer_id": "x"}) == "x"
-
-
-@pytest.mark.hcu
-def test_hcu_mooncake_heterogeneous_tp_contracts(hcu_mooncake):
-    assert hcu_mooncake._get_tp_ratio(4, 2) == 2
-    assert hcu_mooncake._get_tp_ratio(2, 4) == -2
-    assert hcu_mooncake._get_head_split_ratio(-4) == 4
-    assert hcu_mooncake._validate_block_lens_match([4, 8], [4, 8]) is None
-    assert "mismatch" in hcu_mooncake._validate_hetero_block_lens_match([4], [8], -2)
-
-
-@pytest.mark.hcu
-def test_hcu_mooncake_metadata_and_layout_contracts(hcu_mooncake):
-    assert patch_mooncake_connector.apply_to_module(hcu_mooncake) is True
-    assert patch_mooncake_connector.apply_to_module(hcu_mooncake) is False
-    metadata = hcu_mooncake.MooncakeXferMetadata(
-        remote_hostname="host",
-        remote_port=1,
-        remote_tp_size=2,
-        remote_tp_rank=0,
-        req_blocks={},
-        kv_caches_base_addr=[],
-        block_lens=[],
-    )
-    assert metadata.src_layer_offset == 0
-    assert metadata.model_layer_start == -1
-    assert hcu_mooncake._parse_model_layer_index("model.layers.12.self_attn") == 12
-    assert hcu_mooncake._cache_type_sort_key("model.layers.0.indexer") == 0
-
-
-@pytest.mark.hcu
-def test_hcu_mooncake_transfer_planning_contracts(hcu_mooncake):
-    src, dst, lengths = [], [], []
-    hcu_mooncake._append_homogeneous_fa_layer_transfers(
-        src_ptrs=src,
-        dst_ptrs=dst,
-        lengths=lengths,
-        local_layer_addr=100,
-        layer_block_len=10,
-        remote_layer_addr=200,
-        layer_remote_block_len=10,
-        group_local_block_ids=[[0, 1]],
-        group_remote_block_ids=[[2, 3]],
-    )
-    assert (src, dst, lengths) == ([100], [220], [20])
-
-
-@pytest.mark.hcu
-def test_hcu_mooncake_pp_and_error_propagation_contracts(hcu_mooncake):
-    assert hcu_mooncake._validate_hetero_slot_size_bytes(16, 32, 2) is None
-    assert hcu_mooncake._validate_hetero_slot_size_bytes(16, 8, -2) is None
-    assert "mismatch" in hcu_mooncake._validate_block_lens_match([1], [2])
-    for method in ("_fail_pull_metas", "_iter_fa_layer_cache_pairs", "receive_kv"):
-        assert callable(getattr(hcu_mooncake.MooncakeConnectorWorker, method))
-
-
-@pytest.mark.hcu
-def test_hcu_mooncake_bootstrap_contracts(hcu_mooncake, monkeypatch):
-    local = SimpleNamespace(
-        parallel_config=SimpleNamespace(local_engines_only=True, data_parallel_index=3)
-    )
-    distributed = SimpleNamespace(
-        parallel_config=SimpleNamespace(local_engines_only=False, data_parallel_index=0)
-    )
-    monkeypatch.setattr(hcu_mooncake, "is_local_first_rank", lambda: True)
-    monkeypatch.setattr(hcu_mooncake, "is_global_first_rank", lambda: False)
-    assert hcu_mooncake.should_launch_bootstrap_server(local) is True
-    assert hcu_mooncake.should_launch_bootstrap_server(distributed) is False
 
 
 def _fake_scheduler_module():

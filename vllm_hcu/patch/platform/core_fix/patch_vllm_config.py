@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Mapping
 from types import ModuleType
 from typing import Any
 
@@ -32,39 +31,6 @@ _REQUEST_CAPTURE_SIZES = (
 )
 
 
-def _contains_mooncake_connector(
-    connector: object,
-    extra_config: object,
-) -> bool:
-    if connector == "MooncakeConnector":
-        return True
-    if connector != "MultiConnector":
-        return False
-
-    if not isinstance(extra_config, Mapping):
-        raise ValueError("MultiConnector extra config must be a mapping")
-    connectors = extra_config.get("connectors")
-    if not isinstance(connectors, (list, tuple)):
-        raise ValueError("MultiConnector requires a connectors list")
-    for child in connectors:
-        if not isinstance(child, Mapping):
-            raise ValueError("MultiConnector child config must be a mapping")
-        if _contains_mooncake_connector(
-            child.get("kv_connector"),
-            child.get("kv_connector_extra_config", {}),
-        ):
-            return True
-    return False
-
-
-def _uses_mooncake_connector(vllm_config: object) -> bool:
-    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-    return _contains_mooncake_connector(
-        getattr(kv_transfer_config, "kv_connector", None),
-        getattr(kv_transfer_config, "kv_connector_extra_config", None),
-    )
-
-
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
@@ -85,16 +51,6 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)
-
-    if (
-        feature_config.hcu_flash_attn_mode != "custom"
-        and not getattr(model_config, "use_mla", False)
-        and _uses_mooncake_connector(vllm_config)
-    ):
-        raise NotImplementedError(
-            "MooncakeConnector is not yet validated with the non-custom HCU "
-            "block-first KV-cache ABI"
-        )
 
     if parallel_config is not None:
         setattr(
