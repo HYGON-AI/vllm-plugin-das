@@ -36,8 +36,15 @@ def apply_to_module(module: ModuleType) -> bool:
         "transfer_id_from_req": ("req_id", "kv_params"),
         "log_ttft_event": ("event",),
         "_get_tp_ratio": ("local_tp_size", "remote_tp_size"),
-        "_get_head_split_ratio": ("tp_ratio",),
-        "_validate_block_lens_match": ("local_block_lens", "remote_block_lens"),
+        "_expand_transfer_regions": (
+            "base_addrs",
+            "block_lens",
+            "kv_block_lens",
+            "layer_names",
+            "layer_indices",
+            "is_kv_layout_blocks_first",
+        ),
+        "_validate_phase1_metadata": (),
         "should_launch_bootstrap_server": ("vllm_config",),
     }
     for name, prefix in helper_contracts.items():
@@ -48,9 +55,11 @@ def apply_to_module(module: ModuleType) -> bool:
         "register_kv_caches",
         "receive_kv_from_single_worker",
         "process_pulling_result",
+        "_fail_pull_metas",
         "receive_kv",
         "record_send_reqs",
-        "_iter_fa_layer_cache_pairs",
+        "_get_transfer_regions",
+        "_get_sender_transfer_plan",
     ):
         require_callable(worker, name, f"{TARGET_MODULE}.MooncakeConnectorWorker.{name}")
     setattr(target, _MARKER, True)

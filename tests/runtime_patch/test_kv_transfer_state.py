@@ -45,6 +45,7 @@ def _scheduler(mooncake_module, *, role: str):
     scheduler._reqs_need_send = {}
     scheduler._reqs_not_processed = set()
     scheduler._is_hma_required = False
+    scheduler._has_mamba = False
     scheduler.blocks_per_sw = []
     return scheduler
 

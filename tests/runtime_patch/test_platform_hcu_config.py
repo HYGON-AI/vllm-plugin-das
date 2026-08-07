@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+"""Configuration contracts for maintained HCU runtime paths.
+
+Legacy custom FlashAttention plumbing remains in production code pending its
+unified cleanup, but it is intentionally not asserted as a supported mode here.
+"""
 
 from __future__ import annotations
 
@@ -201,7 +206,6 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     [
         ("FLASH_ATTN_CLASSIC", "classic"),
         ("flash_attn_cutlass", "cutlass"),
-        ("FLASH_ATTN_CUSTOM", "custom"),
     ],
 )
 def test_engine_args_normalizes_hcu_flash_attention_aliases(
@@ -743,7 +747,7 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
         moe_backend="dpsk_deep_gemm",
-        hcu_flash_attn_mode="custom",
+        hcu_flash_attn_mode="cutlass",
     )
     config = _validation_config(feature_config)
     assert patch_vllm_config.validate_and_update_hcu_config(config) == feature_config
@@ -765,7 +769,7 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
 def test_compilation_binding_is_recreated_after_pickle() -> None:
     feature_config = HcuFeatureConfig(
         enable_custom_sp=True,
-        hcu_flash_attn_mode="custom",
+        hcu_flash_attn_mode="cutlass",
     )
     config = _validation_config(feature_config)
     patch_vllm_config.validate_and_update_hcu_config(config)
@@ -921,7 +925,6 @@ def _vllm_hash(additional_config: dict[str, Any]) -> str:
         ({}, "cutlass"),
         ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
         ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
-        ({"VLLM_HCU_USE_CUSTOM_FLASH_ATTN": "1"}, "custom"),
     ],
 )
 def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
@@ -943,6 +946,18 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
 
     assert feature_config.hcu_flash_attn_mode == expected
     assert get_hcu_config(config) == feature_config
+
+
+def test_cutlass_block_first_mooncake_defers_to_worker_capability_gates() -> None:
+    config = _validation_config(HcuFeatureConfig(hcu_flash_attn_mode="cutlass"))
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MooncakeConnector",
+        kv_connector_extra_config={},
+    )
+
+    assert patch_vllm_config.validate_and_update_hcu_config(config) == (
+        HcuFeatureConfig(hcu_flash_attn_mode="cutlass")
+    )
 
 
 def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() -> None:
