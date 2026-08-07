@@ -154,12 +154,18 @@ def apply_to_module(module: ModuleType) -> bool:
         require_uniform=False,
         treat_short_extends_as_decodes=True,
     ):
+        # Warmup/capture placeholders do not carry request phase metadata.
+        # Preserve the target vLLM decode classification in that case, while
+        # retaining HCU's prefix-hit short-extend policy for real requests.
         del treat_short_extends_as_decodes
+        hcu_treat_short_extends_as_decodes = (
+            getattr(common_attn_metadata, "is_prefilling", None) is None
+        )
         return split_batch(
             common_attn_metadata,
             decode_threshold,
             require_uniform,
-            False,
+            hcu_treat_short_extends_as_decodes,
         )
 
     for function in (
