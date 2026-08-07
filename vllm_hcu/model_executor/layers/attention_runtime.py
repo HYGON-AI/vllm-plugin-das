@@ -226,7 +226,9 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
     v = v.contiguous().view(num_tokens, kv_size // head_size_v, head_size_v)
 
     if layer_slot_mapping is not None and not fused_cache_store:
-        from aiter.ops.cache import reshape_and_cache_flash
+        from vllm_hcu.v1.attention.backends.fa_utils import (
+            reshape_and_cache_flash,
+        )
 
         target_key_cache, target_value_cache = split_kv_cache(
             kv_cache,

@@ -121,9 +121,10 @@ def test_target_metadata_schema_and_round_trip(mooncake):
     assert decoded == metadata
 
 
-def test_hcu_mooncake_uses_nhd_until_hnd_backend_support(mooncake):
+def test_cutlass_mooncake_uses_target_hnd_layout(mooncake):
+    """Cover HND only for the supported CUTLASS deployment contract."""
     config = SimpleNamespace(model_config=SimpleNamespace(use_mla=False))
-    assert mooncake.MooncakeConnector.get_required_kvcache_layout(config) == "NHD"
+    assert mooncake.MooncakeConnector.get_required_kvcache_layout(config) == "HND"
 
     mla_config = SimpleNamespace(model_config=SimpleNamespace(use_mla=True))
     assert mooncake.MooncakeConnector.get_required_kvcache_layout(mla_config) is None
@@ -603,15 +604,46 @@ def test_transfer_planning_uses_only_uncached_suffix(mooncake):
     assert errors == [] and error is None
 
 
-def test_asymmetric_tp_fails_closed_without_hnd_backend_support(mooncake):
+@pytest.mark.parametrize(
+    (
+        "local_tp_rank",
+        "local_tp_size",
+        "remote_tp_rank",
+        "remote_tp_size",
+        "local_payload",
+        "remote_payload",
+        "expected_src",
+        "expected_dst",
+    ),
+    [
+        (0, 2, 0, 4, 8, 4, [1000, 1008], [2000, 2004]),
+        (0, 2, 1, 4, 8, 4, [1004, 1012], [2000, 2004]),
+        (0, 4, 0, 2, 4, 8, [1000, 1004], [2000, 2008]),
+        (1, 4, 0, 2, 4, 8, [1000, 1004], [2004, 2012]),
+    ],
+)
+def test_cutlass_asymmetric_tp_uses_hnd_head_slice_transfer_plan(
+    mooncake,
+    local_tp_rank,
+    local_tp_size,
+    remote_tp_rank,
+    remote_tp_size,
+    local_payload,
+    remote_payload,
+    expected_src,
+    expected_dst,
+):
+    """Cover asymmetric TP planning only for the CUTLASS/HND contract."""
     worker = _worker(mooncake, blocks_first=True)
+    worker.tp_rank = local_tp_rank
+    worker.tp_size = local_tp_size
     worker.kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]
     )
     local = mooncake._expand_transfer_regions(
         base_addrs=[1000],
         block_lens=[32],
-        kv_block_lens=[8],
+        kv_block_lens=[local_payload],
         layer_names=["model.layers.0.self_attn"],
         layer_indices=[0],
         group_indices=[0],
@@ -620,7 +652,7 @@ def test_asymmetric_tp_fails_closed_without_hnd_backend_support(mooncake):
     remote = mooncake._expand_transfer_regions(
         base_addrs=[2000],
         block_lens=[32],
-        kv_block_lens=[4],
+        kv_block_lens=[remote_payload],
         layer_names=["model.layers.0.self_attn"],
         layer_indices=[0],
         group_indices=[0],
@@ -630,14 +662,18 @@ def test_asymmetric_tp_fails_closed_without_hnd_backend_support(mooncake):
         p_req_id="p", transfer_id="x", local_block_ids=[[0]], ready=asyncio.Event()
     )
     metadata = _metadata(
-        mooncake, remote_tp_size=4, req_blocks={"d": ("x", [[0]])}
+        mooncake,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=remote_tp_size,
+        req_blocks={"d": ("x", [[0]])},
     )
     src, dst, lengths, errors, message = asyncio.run(
         worker._build_transfer_params([("d", send_meta)], metadata, local, remote)
     )
-    assert (src, dst, lengths) == ([], [], [])
-    assert errors == ["d"]
-    assert message is not None and "asymmetric TP transfer is disabled" in message
+    assert errors == [] and message is None
+    assert src == expected_src
+    assert dst == expected_dst
+    assert lengths == [min(local_payload, remote_payload)] * 2
 
 
 def test_contiguous_dense_blocks_can_coalesce(mooncake):
