@@ -88,11 +88,23 @@ def apply_to_module(module: ModuleType) -> bool:
                 topk_ids.numel() * block_size,
                 max_num_tokens_padded,
             )
-        sorted_ids = target.torch.empty(
-            (max_num_tokens_padded,),
-            dtype=target.torch.int32,
-            device=topk_ids.device,
-        )
+        if enabled:
+            # Triton treats ``topk_ids.numel()`` as the padding token.  The
+            # LightOP 0.6 out-parameter kernel only writes routed tokens even
+            # when its fused-fill argument is enabled, so an empty buffer can
+            # leave arbitrary token ids inside the valid padded range.
+            sorted_ids = target.torch.full(
+                (max_num_tokens_padded,),
+                fill_value=topk_ids.numel(),
+                dtype=target.torch.int32,
+                device=topk_ids.device,
+            )
+        else:
+            sorted_ids = target.torch.empty(
+                (max_num_tokens_padded,),
+                dtype=target.torch.int32,
+                device=topk_ids.device,
+            )
         max_blocks = target.triton.cdiv(max_num_tokens_padded, block_size)
         expert_ids = target.torch.empty(
             (max_blocks,), dtype=target.torch.int32, device=topk_ids.device
@@ -116,7 +128,11 @@ def apply_to_module(module: ModuleType) -> bool:
                     sorted_ids,
                     expert_ids,
                     num_tokens_post_pad,
-                    expert_map=None,
+                    expert_map if ignore_invalid_experts else None,
+                    None,  # expert_mask
+                    None,  # num_local_tokens
+                    False,  # Is_EP
+                    False,  # Is_fuse_fill; padding was initialized above
                 )
             except (TypeError, AttributeError) as exc:
                 raise RuntimeError(

@@ -1118,14 +1118,29 @@ def test_moe_align_feature_off_and_lightop_contract(
         expert_ids,
         num_tokens_post_pad,
         expert_map=None,
+        expert_mask=None,
+        num_local_tokens=None,
+        is_ep=False,
+        is_fuse_fill=True,
     ):
-        calls.append((topk_ids, num_experts, block_size, expert_map))
-        sorted_ids.fill_(topk_ids.numel())
-        sorted_ids[: topk_ids.numel()].copy_(
-            torch.arange(topk_ids.numel(), dtype=torch.int32)
+        calls.append(
+            (
+                topk_ids,
+                num_experts,
+                block_size,
+                expert_map,
+                expert_mask,
+                num_local_tokens,
+                is_ep,
+                is_fuse_fill,
+            )
         )
+        assert torch.all(sorted_ids == topk_ids.numel())
+        # Model one token per expert in a four-entry padded valid range.
+        sorted_ids[0] = 0
+        sorted_ids[2] = 1
         expert_ids.copy_(torch.arange(expert_ids.numel(), dtype=torch.int32))
-        num_tokens_post_pad.fill_(topk_ids.numel())
+        num_tokens_post_pad.fill_(sorted_ids.numel())
 
     lightop_package = ModuleType("lightop")
     lightop_package.op = SimpleNamespace(moe_align_block_size=lightop_align)
@@ -1133,10 +1148,34 @@ def test_moe_align_feature_off_and_lightop_contract(
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", True)
     sorted_ids, expert_ids, count = module.moe_align_block_size(ids, 2, 2)
-    assert calls[0][1:] == (2, 2, None)
-    assert torch.equal(sorted_ids[:2], torch.tensor([0, 1], dtype=torch.int32))
+    assert calls[0][1:] == (2, 2, None, None, None, False, False)
+    assert count.item() == 4
+    assert torch.equal(
+        sorted_ids[: count.item()],
+        torch.tensor([0, 2, 1, 2], dtype=torch.int32),
+    )
     assert torch.equal(expert_ids, torch.tensor([0, 1], dtype=torch.int32))
-    assert count.item() == 2
+
+    expert_map = torch.tensor([1, 0], dtype=torch.int32)
+    _, expert_ids, _ = module.moe_align_block_size(
+        ids,
+        2,
+        2,
+        expert_map,
+        ignore_invalid_experts=True,
+    )
+    assert calls[-1][3] is expert_map
+    assert torch.equal(expert_ids, torch.tensor([0, 1], dtype=torch.int32))
+
+    _, expert_ids, _ = module.moe_align_block_size(
+        ids,
+        2,
+        2,
+        expert_map,
+        ignore_invalid_experts=False,
+    )
+    assert calls[-1][3] is None
+    assert torch.equal(expert_ids, torch.tensor([1, 0], dtype=torch.int32))
 
 
 def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
