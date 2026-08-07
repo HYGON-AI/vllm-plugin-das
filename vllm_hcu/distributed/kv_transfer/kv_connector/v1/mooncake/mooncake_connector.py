@@ -695,12 +695,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             return None
         logger.info_once(
-            "HCU MooncakeConnector setting KV cache layout to NHD. "
-            "Asymmetric TP transfer remains disabled until the HCU "
-            "FlashAttention backends support the target HND cache-stride "
-            "contract."
+            "HCU MooncakeConnector setting KV cache layout to HND for "
+            "heterogeneous TP-safe KV transfer."
         )
-        return "NHD"
+        return "HND"
 
     ############################################################
     # Scheduler Side Methods
@@ -1683,18 +1681,6 @@ class MooncakeConnectorWorker:
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
-        if agent_meta.remote_tp_size != self.tp_size:
-            err_msg = (
-                "HCU Mooncake asymmetric TP transfer is disabled because the "
-                "HCU FlashAttention backends do not yet support the target "
-                "HND KV-cache stride contract: "
-                f"producer_tp={self.tp_size}, "
-                f"consumer_tp={agent_meta.remote_tp_size}."
-            )
-            err_reqs = [d_req_id for d_req_id, _ in ready_reqs]
-            logger.error(err_msg)
-            return [], [], [], err_reqs, err_msg
-
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
 

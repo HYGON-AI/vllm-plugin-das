@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Runtime contracts for PP partitioning and HCU attention mode routing."""
+"""Runtime contracts for PP partitioning and maintained HCU attention paths.
+
+Legacy custom FlashAttention code remains present but is outside this release's
+supported runtime contract; functional attention coverage is scoped accordingly.
+"""
 
 from __future__ import annotations
 
@@ -64,7 +68,6 @@ def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.Monkey
         (None, "cutlass"),
         ("VLLM_HCU_USE_FLASH_ATTN", "classic"),
         ("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "cutlass"),
-        ("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "custom"),
     ],
 )
 def test_flash_attention_mode_legacy_priority_and_default(
@@ -84,8 +87,7 @@ def test_flash_attention_mode_legacy_priority_and_default(
 def test_explicit_flash_attention_mode_wins_over_legacy_environment(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "1")
-    assert hcu_envs.resolve_hcu_flash_attn_mode("classic") == "classic"
+    monkeypatch.setenv("VLLM_HCU_USE_FLASH_ATTN", "1")
     assert hcu_envs.resolve_hcu_flash_attn_mode("unified") == "cutlass"
 
 
@@ -123,11 +125,6 @@ def test_platform_flash_attention_mode_rejects_invalid_sidecar(
 @pytest.mark.parametrize(
     ("mode", "expected_shape", "expected_block_dim"),
     [
-        (
-            "custom",
-            ((3, 4, 64, 128), (3, 4, 128, 64)),
-            0,
-        ),
         ("cutlass", (3, 2, 64, 4, 128), 0),
         ("classic", (3, 2, 64, 4, 128), 0),
     ],
@@ -146,26 +143,17 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
 
     assert backend.get_kv_cache_shape(3, 64, 4, 128) == expected_shape
     assert backend.get_kv_cache_block_dim(64, 4, 128) == expected_block_dim
-    if mode == "custom":
-        assert backend.indexes_kv_by_block_stride() is False
-        assert backend.get_kv_cache_stride_order() == (
-            (0, 1, 2, 3),
-            (0, 1, 2, 3),
-        )
-    else:
-        assert backend.indexes_kv_by_block_stride() is True
-        assert backend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
-        assert backend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4, 5)
+    assert backend.indexes_kv_by_block_stride() is True
+    assert backend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
+    assert backend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4, 5)
 
 
-@pytest.mark.parametrize("mode", ["classic", "cutlass"])
-def test_block_first_hnd_stride_contract(
+def test_cutlass_block_first_hnd_stride_contract(
     monkeypatch: pytest.MonkeyPatch,
-    mode: str,
 ):
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
 
-    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "cutlass")
     monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: "HND")
     backend = flash_attn.HcuFlashAttentionBackend
 
@@ -174,6 +162,60 @@ def test_block_first_hnd_stride_contract(
     assert backend.get_kv_cache_stride_order() == (0, 1, 3, 2, 4)
     assert backend.get_kv_cache_stride_order(True) == (1, 4, 0, 2, 3, 5)
     assert backend.indexes_kv_by_block_stride() is True
+
+
+@pytest.mark.parametrize(
+    ("layout", "expected_writer"),
+    [("NHD", "aiter"), ("HND", "triton")],
+)
+def test_flash_cache_writer_dispatches_by_physical_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    expected_writer: str,
+) -> None:
+    fa_utils = importlib.import_module(
+        "vllm_hcu.v1.attention.backends.fa_utils"
+    )
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    aiter_cache_module = ModuleType("aiter.ops.cache")
+    aiter_cache_module.reshape_and_cache_flash = (
+        lambda *args: calls.append(("aiter", args))
+    )
+    monkeypatch.setitem(sys.modules, "aiter.ops.cache", aiter_cache_module)
+
+    triton_module_name = (
+        "vllm.v1.attention.ops.triton_reshape_and_cache_flash"
+    )
+    triton_module = ModuleType(triton_module_name)
+    triton_module.triton_reshape_and_cache_flash = (
+        lambda *args: calls.append(("triton", args))
+    )
+    monkeypatch.setitem(sys.modules, triton_module_name, triton_module)
+
+    key = torch.zeros(2, 1, 8)
+    value = torch.ones_like(key)
+    if layout == "HND":
+        key_cache = torch.empty(3, 2, 4, 8).permute(0, 2, 1, 3)
+        value_cache = torch.empty(3, 2, 4, 8).permute(0, 2, 1, 3)
+    else:
+        key_cache = torch.empty(3, 4, 2, 8)
+        value_cache = torch.empty_like(key_cache)
+    slots = torch.tensor([0, 5])
+    scale = torch.tensor(1.0)
+    fa_utils.reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slots,
+        "auto",
+        scale,
+        scale,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == expected_writer
+    assert calls[0][1][:5] == (key, value, key_cache, value_cache, slots)
 
 
 def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(

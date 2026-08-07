@@ -185,7 +185,10 @@ def triton_rope_and_cache_impl(
 ) -> None:
     """Compose the RoPE and cache APIs exposed by HCU AITER."""
 
-    from aiter.ops.cache import reshape_and_cache, reshape_and_cache_flash
+    from aiter.ops.cache import reshape_and_cache
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        reshape_and_cache_flash,
+    )
     from aiter.ops.triton.rope import (
         rope_cached_thd_positions_2c_fwd_inplace,
     )
