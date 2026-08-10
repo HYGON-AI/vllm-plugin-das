@@ -22,10 +22,13 @@ def initialize_proposer(
     proposer._hcu_feature_config = config
     proposer.runner = runner
 
-    # HCU FlashMLA sparse explicitly supports speculative tokens as decode
-    # queries, but target vLLM v0.25.1 does not include its metadata class in
-    # the ROCm multi-step drafting allowlist.  Keep the target proposer and
-    # extend only the HCU-owned backend capability registration.
+    # HCU FlashAttention and FlashMLA sparse both support speculative tokens as
+    # decode queries, but target vLLM v0.25.1 does not include their metadata
+    # classes in the ROCm multi-step drafting allowlist. Keep the target
+    # proposer and extend only the HCU-owned backend capability registration.
+    from vllm_hcu.v1.attention.backends.flash_attn import FlashAttentionMetadata
+
+    hcu_attn_types = [FlashAttentionMetadata]
     try:
         from vllm.v1.attention.backends.mla.flashmla_sparse import (
             FlashMLASparseMetadata,
@@ -34,12 +37,15 @@ def initialize_proposer(
         if exc.name != "vllm.v1.attention.backends.mla.flashmla_sparse":
             raise
     else:
-        allowed_attn_types = getattr(proposer, "allowed_attn_types", None)
-        if (
-            allowed_attn_types is not None
-            and FlashMLASparseMetadata not in allowed_attn_types
-        ):
-            proposer.allowed_attn_types += (FlashMLASparseMetadata,)
+        hcu_attn_types.append(FlashMLASparseMetadata)
+
+    allowed_attn_types = getattr(proposer, "allowed_attn_types", None)
+    if allowed_attn_types is not None:
+        proposer.allowed_attn_types += tuple(
+            metadata_type
+            for metadata_type in hcu_attn_types
+            if metadata_type not in proposer.allowed_attn_types
+        )
 
     proposer.enable_multi_layers_mtp = config.enable_multi_layers_mtp
     proposer.enable_lightly_cp = config.enable_lightly_cp

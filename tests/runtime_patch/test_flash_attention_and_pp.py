@@ -122,6 +122,12 @@ def test_platform_flash_attention_mode_rejects_invalid_sidecar(
         hcu_module.get_hcu_flash_attn_mode()
 
 
+def test_hcu_platform_allows_explicit_fp8_e4m3_kv_cache() -> None:
+    from vllm_hcu.platforms.hcu import _validate_hcu_kv_cache_dtype
+
+    _validate_hcu_kv_cache_dtype("fp8_e4m3")
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_shape", "expected_block_dim"),
     [
@@ -148,6 +154,40 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
     assert backend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4, 5)
 
 
+def test_flash_attention_maps_explicit_fp8_e4m3_on_gfx938(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx938:sramecc+:xnack-"),
+    )
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    assert backend.supports_kv_cache_dtype("fp8_e4m3") is True
+    assert (
+        backend.get_fp8_dtype_for_flashattn("fp8_e4m3")
+        == torch.float8_e4m3fn
+    )
+
+
+def test_flash_attention_does_not_remap_explicit_fp8_e4m3_on_gfx936(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936:sramecc+:xnack-"),
+    )
+
+    with pytest.raises(ValueError, match="fp8_e4m3 only supported on gfx938"):
+        flash_attn.HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+            "fp8_e4m3"
+        )
+
+
 def test_cutlass_block_first_hnd_stride_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -165,12 +205,18 @@ def test_cutlass_block_first_hnd_stride_contract(
 
 
 @pytest.mark.parametrize(
-    ("layout", "expected_writer"),
-    [("NHD", "aiter"), ("HND", "triton")],
+    ("layout", "kv_cache_dtype", "expected_writer"),
+    [
+        ("NHD", "auto", "aiter"),
+        ("HND", "auto", "triton"),
+        ("NHD", "fp8_e4m3", "triton"),
+        ("HND", "fp8_e4m3", "triton"),
+    ],
 )
 def test_flash_cache_writer_dispatches_by_physical_layout(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
+    kv_cache_dtype: str,
     expected_writer: str,
 ) -> None:
     fa_utils = importlib.import_module(
@@ -208,7 +254,7 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
         key_cache,
         value_cache,
         slots,
-        "auto",
+        kv_cache_dtype,
         scale,
         scale,
     )
@@ -454,6 +500,86 @@ def test_hcu_flash_attention_forward_uses_metadata_window_with_fallback(
     )
 
     assert calls[0]["window_size"] == expected_window
+
+
+def test_cutlass_fp8_attention_passes_per_query_head_descales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "fp8_e4m3"
+    impl.num_heads = 4
+    impl.num_kv_heads = 2
+    impl.supports_quant_query_input = True
+    impl.dcp_world_size = 1
+    impl.scale = 1.0
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = 0.0
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "cutlass")
+    monkeypatch.setattr(
+        flash_attn,
+        "canonicalize_singleton_dim_strides",
+        lambda tensor: tensor,
+    )
+    monkeypatch.setattr(
+        flash_attn.HcuFlashAttentionBackend,
+        "get_fp8_dtype_for_flashattn",
+        staticmethod(lambda cache_dtype: torch.float8_e4m3fn),
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "varlen_fwd_unified",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        use_cascade=False,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        scheduler_metadata=None,
+        causal=True,
+        sliding_window=None,
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor([2.0, 3.0]),
+        _k_scale=torch.tensor([5.0, 7.0]),
+        _v_scale=torch.tensor([11.0, 13.0]),
+    )
+    query = torch.zeros(1, 4, 2).to(torch.float8_e4m3fn)
+    cache = torch.empty(1, 2, 1, 2, 2, dtype=torch.uint8)
+
+    impl.forward(
+        layer,
+        query,
+        torch.empty(1, 2, 2, dtype=torch.bfloat16),
+        torch.empty(1, 2, 2, dtype=torch.bfloat16),
+        cache,
+        metadata,
+        torch.empty(1, 4, 2, dtype=torch.bfloat16),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["q"].dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        calls[0]["q_descale"],
+        torch.tensor([[2.0, 2.0, 3.0, 3.0]]),
+    )
+    torch.testing.assert_close(
+        calls[0]["k_descale"], torch.tensor([[5.0, 7.0]])
+    )
+    torch.testing.assert_close(
+        calls[0]["v_descale"], torch.tensor([[11.0, 13.0]])
+    )
 
 
 def test_block_first_kv_update_passes_axis_one_views_to_aiter(

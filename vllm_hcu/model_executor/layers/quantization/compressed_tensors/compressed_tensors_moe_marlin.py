@@ -101,15 +101,39 @@ def _is_hcu_aiter_w8a8_moe_requested() -> bool:
 def get_w8a8_int8_marlin_weights(
          weight,
          k_tile=64):
-    # 7168, 512
-    weight = weight.T
-    size_k, size_n = weight.shape
-    assert size_k // k_tile
-    weight = weight.reshape(size_k // k_tile, k_tile, size_n)
-    weight = weight.transpose(1, 2)
-    weight = weight.reshape(size_k // k_tile, size_n * k_tile)
+    if weight.dim() == 2:
+        # [N, K] -> [K // k_tile, N * k_tile]
+        weight = weight.T
+        size_k, size_n = weight.shape
+        if size_k % k_tile != 0:
+            raise ValueError(
+                f"Marlin requires K ({size_k}) to be divisible by "
+                f"k_tile ({k_tile})"
+            )
+        weight = weight.reshape(size_k // k_tile, k_tile, size_n)
+        weight = weight.transpose(1, 2)
+        return weight.reshape(size_k // k_tile, size_n * k_tile)
 
-    return weight
+    if weight.dim() == 3:
+        # [E, N, K] -> [E, K // k_tile, N * k_tile].  Packing the full
+        # expert tensor avoids retaining one FP32 copy per expert while loading
+        # large models such as HY3.
+        num_experts, size_n, size_k = weight.shape
+        if size_k % k_tile != 0:
+            raise ValueError(
+                f"Marlin requires K ({size_k}) to be divisible by "
+                f"k_tile ({k_tile})"
+            )
+        weight = weight.transpose(1, 2)
+        weight = weight.reshape(
+            num_experts, size_k // k_tile, k_tile, size_n
+        )
+        weight = weight.transpose(2, 3)
+        return weight.reshape(
+            num_experts, size_k // k_tile, size_n * k_tile
+        )
+
+    raise ValueError(f"Expected a 2D or 3D weight, got {weight.dim()}D")
 
 
 def w8a8_nt_kpack2_marlin_weight(w8a8_w, # [size_n, size_k// 2 ]
@@ -123,17 +147,6 @@ def w8a8_nt_kpack2_marlin_weight(w8a8_w, # [size_n, size_k// 2 ]
     w8a8_w = w8a8_w.permute((0, 2, 1, 3)).contiguous()
     w8a8_w = w8a8_w.reshape((size_n // k_tile, size_k * k_tile))
     return w8a8_w
-
-def fp32_to_fp8_e4m3fn(t: torch.Tensor) -> torch.Tensor:
-    """更合理的FP32到Float8_e4m3fn转换，使用最近值而不是简单舍弃尾数"""
-    # torch.float8_e4m3fn的数值范围约[-448, 448]
-    fp8_min, fp8_max = -448.0, 448.0
-    t_clamped = t.clamp(min=fp8_min, max=fp8_max)
-    # 保证不会下溢到0
-    # 转换前到float16再转fp8可能提升精度（float8实现本身通常通过float16做rounding）
-    t_fp16 = t_clamped.to(torch.float16)
-    return t_fp16.to(torch.float8_e4m3fn)
-
 
 def w8a8_fp8_nt_kpack2_marlin_weight(w8a8_w,  # [size_n, size_k// 2 ]
                                      k_tile=16,
@@ -297,20 +310,22 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
             return
 
-        w1_marlin_list = []
-        for ii in range(layer.w13_weight.shape[0]):
-            w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
-            w1_marlin_list.append(w1_marlin_in.float() if w1_marlin_in.dtype == torch.float8_e4m3fn else w1_marlin_in)
-        w1_marlin = torch.stack(w1_marlin_list, dim=0)
-        w1_marlin = fp32_to_fp8_e4m3fn(w1_marlin)
+        if layer.w13_weight.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "FP8 W8A8 MoE expects w13_weight to be "
+                f"torch.float8_e4m3fn, got {layer.w13_weight.dtype}"
+            )
+        if layer.w2_weight.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "FP8 W8A8 MoE expects w2_weight to be "
+                f"torch.float8_e4m3fn, got {layer.w2_weight.dtype}"
+            )
 
-        del w1_marlin_list
-        w2_marlin_list = []
-        for ii in range(layer.w2_weight.shape[0]):
-            w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
-            w2_marlin_list.append(w2_marlin_in.float() if w2_marlin_in.dtype == torch.float8_e4m3fn else w2_marlin_in)
-        w2_marlin = torch.stack(w2_marlin_list, dim=0)
-        w2_marlin = fp32_to_fp8_e4m3fn(w2_marlin)
+        # The checkpoint is already FP8.  Marlin only needs a layout change;
+        # converting every expert through FP32/FP16 is both unnecessary and a
+        # large temporary-memory spike for HY3's 192 experts.
+        w1_marlin = get_w8a8_int8_marlin_weights(layer.w13_weight)
+        w2_marlin = get_w8a8_int8_marlin_weights(layer.w2_weight)
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
 
@@ -336,7 +351,11 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            # vLLM v0.25.1 removed the fused-MoE in-place output contract.
+            # More importantly, HY3 aliases x as the shared-expert input.  An
+            # in-place routed result makes the shared expert consume corrupted
+            # input (or races it when the auxiliary stream launches early).
+            inplace=False,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_fp8_w8a8=True,

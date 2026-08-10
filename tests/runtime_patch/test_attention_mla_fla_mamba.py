@@ -112,9 +112,6 @@ def test_dense_attention_layer_installs_hcu_runtime_and_preserves_fallback(
     runtime = _module(
         "vllm_hcu.model_executor.layers.attention_runtime",
         FusedQkvSplitRmsNormRopeAttention=FusedQkvSplitRmsNormRopeAttention,
-        init_kv_cache_quant_e5m2=lambda *args: (
-            calls.append(("hcu-init", *args)) or "hcu-init"
-        ),
         attention_forward=lambda *args: (
             calls.append(("hcu-forward", *args)) or "hcu-forward"
         ),
@@ -142,15 +139,12 @@ def test_dense_attention_layer_installs_hcu_runtime_and_preserves_fallback(
     instance = Attention()
     assert instance.forward("q", "k", "v") == "official-forward"
 
-    layer.kv_cache_dtype = "fp8_e5m2"
-    assert module._init_kv_cache_quant(layer, "quant", "prefix") == "hcu-init"
-    instance.kv_cache_dtype = "fp8_e5m2"
-    assert instance.forward("q", "k", "v") == "hcu-forward"
+    layer.kv_cache_dtype = "fp8_e4m3"
+    assert module._init_kv_cache_quant(layer, "quant", "prefix") == "official-init"
     assert [call[0] for call in calls] == [
         "official-init",
         "official-forward",
-        "hcu-init",
-        "hcu-forward",
+        "official-init",
     ]
 
 
@@ -325,6 +319,82 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     )
     assert output.dtype is torch.float64
     assert calls["dummy_device"] == query.device
+
+
+def test_fused_attention_quantizes_query_for_fp8_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    try:
+        runtime = importlib.import_module(
+            "vllm_hcu.model_executor.layers.attention_runtime"
+        )
+    except (ImportError, RuntimeError):
+        pytest.skip("vLLM custom-op registry is unavailable in this environment")
+
+    num_tokens, num_heads, num_kv_heads, head_size = 2, 2, 1, 2
+    q_size = num_heads * head_size
+    kv_size = num_kv_heads * head_size
+    qkv = torch.zeros(
+        num_tokens,
+        q_size + 2 * kv_size,
+        dtype=torch.bfloat16,
+    )
+    captured: dict[str, torch.dtype] = {}
+
+    def fused_qkv(**kwargs):
+        source = kwargs["qkv"]
+        return (
+            torch.zeros(num_tokens, num_heads, head_size, dtype=source.dtype),
+            torch.zeros(num_tokens, num_kv_heads, head_size, dtype=source.dtype),
+            torch.zeros(num_tokens, num_kv_heads, head_size, dtype=source.dtype),
+        )
+
+    def unified_attention(query, key, value, output, layer_name, **kwargs):
+        del key, value, layer_name, kwargs
+        captured["query"] = query.dtype
+        captured["output"] = output.dtype
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "fused_qkv_split_rmsnorm_rope_kv_store",
+        fused_qkv,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "unified_attention_with_output",
+        unified_attention,
+    )
+
+    layer = object.__new__(runtime.FusedQkvSplitRmsNormRopeAttention)
+    torch.nn.Module.__init__(layer)
+    layer.num_heads = num_heads
+    layer.num_kv_heads = num_kv_heads
+    layer.head_size = head_size
+    layer.head_size_v = head_size
+    layer.layer_name = "layer"
+    layer.kv_cache_dtype = "fp8_e4m3"
+    layer.block_size = 16
+    layer.impl = SimpleNamespace(supports_quant_query_input=True)
+    layer._q_scale = torch.tensor(1.0)
+    layer.query_quant = lambda query, scale: (
+        query.to(torch.float8_e4m3fn),
+        scale,
+    )
+
+    output = layer.forward(
+        qkv,
+        torch.arange(num_tokens),
+        torch.empty(1, dtype=torch.bfloat16),
+        torch.ones(head_size, dtype=torch.bfloat16),
+        torch.ones(head_size, dtype=torch.bfloat16),
+        1e-5,
+    )
+
+    assert captured == {
+        "query": torch.float8_e4m3fn,
+        "output": torch.bfloat16,
+    }
+    assert output.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize(

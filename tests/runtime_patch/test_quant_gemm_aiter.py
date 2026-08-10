@@ -706,6 +706,9 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
     def cache_flash(*args, **kwargs):
         calls.append(("cache_flash", args, kwargs))
 
+    def triton_cache_flash(*args, **kwargs):
+        calls.append(("triton_cache_flash", args, kwargs))
+
     def cache(*args, **kwargs):
         calls.append(("cache", args, kwargs))
 
@@ -726,6 +729,15 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
     monkeypatch.setitem(sys.modules, "aiter.ops.triton", triton)
     monkeypatch.setitem(sys.modules, "aiter.ops.cache", cache_module)
     monkeypatch.setitem(sys.modules, "aiter.ops.triton.rope", rope_module)
+    triton_cache_module = _module(
+        "vllm.v1.attention.ops.triton_reshape_and_cache_flash",
+        triton_reshape_and_cache_flash=triton_cache_flash,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.triton_reshape_and_cache_flash",
+        triton_cache_module,
+    )
 
     query = torch.zeros(2, 8)
     key = torch.zeros(2, 4)
@@ -753,7 +765,7 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
         True,
         True,
     )
-    assert [call[0] for call in calls] == ["rope", "cache_flash"]
+    assert [call[0] for call in calls] == ["rope", "triton_cache_flash"]
     assert calls[0][1][0].shape == (2, 2, 4)
     assert calls[0][1][1].shape == (2, 1, 4)
     assert calls[0][1][5] == 0

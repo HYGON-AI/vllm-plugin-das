@@ -15,6 +15,26 @@ from typing import Any
 import torch
 
 
+def quantize_attention_query(self: Any, query: torch.Tensor) -> torch.Tensor:
+    """Match the query dtype to a quantized KV cache when supported."""
+
+    if self.query_quant is None:
+        return query
+    if self.kv_cache_dtype not in {
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "nvfp4",
+    }:
+        raise ValueError(
+            "unsupported HCU quantized attention KV-cache dtype "
+            f"{self.kv_cache_dtype!r}"
+        )
+    if self.impl.supports_quant_query_input:
+        query, _ = self.query_quant(query, self._q_scale)
+    return query
+
+
 def attention_forward(
     upstream: ModuleType,
     self: Any,
@@ -35,14 +55,7 @@ def attention_forward(
         )
     if output_dtype is None:
         output_dtype = query.dtype
-    if self.query_quant is not None:
-        if self.kv_cache_dtype not in {"fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"}:
-            raise ValueError(
-                "unsupported HCU quantized attention KV-cache dtype "
-                f"{self.kv_cache_dtype!r}"
-            )
-        if self.impl.supports_quant_query_input:
-            query, _ = self.query_quant(query, self._q_scale)
+    query = quantize_attention_query(self, query)
 
     if output_shape is None:
         num_tokens = query.shape[0]
@@ -87,4 +100,4 @@ def attention_forward(
     return output.view(-1, hidden_size)
 
 
-__all__ = ["attention_forward"]
+__all__ = ["attention_forward", "quantize_attention_query"]

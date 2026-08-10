@@ -41,7 +41,15 @@ def reshape_and_cache_flash(
     # Logical cache views remain [block, token, head, dim] in both layouts.
     # HND is distinguishable by a token stride smaller than the head stride.
     # If either dimension is one, selecting NHD is also address-equivalent.
-    if key_cache.ndim == 4 and key_cache.stride(1) < key_cache.stride(2):
+    #
+    # AITER's flash cache writer corrupts FP8 E4M3 pages on HCU (including
+    # NaN bit patterns).  vLLM's Triton writer explicitly casts through the
+    # platform FP8 dtype and is stride-aware, so use it for FP8 caches as well
+    # as for HND storage. Keep other quantization formats on their existing
+    # route until they have an explicit HCU cache contract.
+    if kv_cache_dtype.startswith("fp8") or (
+        key_cache.ndim == 4 and key_cache.stride(1) < key_cache.stride(2)
+    ):
         from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
             triton_reshape_and_cache_flash,
         )

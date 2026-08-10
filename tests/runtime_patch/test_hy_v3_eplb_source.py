@@ -40,6 +40,60 @@ def test_hy_v3_decoder_layer_passes_enable_eplb_to_moe() -> None:
     assert ast.unparse(enable_eplb_kw.value) == "parallel_config.enable_eplb"
 
 
+def test_hy_v3_uses_v0251_expert_mapping_function() -> None:
+    for relative_path in (
+        "vllm_hcu/models/hy_v3.py",
+        "vllm_hcu/models/hy_v3_mtp.py",
+    ):
+        source = (ROOT / relative_path).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "vllm.model_executor.layers.fused_moe"
+            for alias in node.names
+        }
+        assert "fused_moe_make_expert_params_mapping" in imported_names
+
+        obsolete_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "FusedMoE"
+            and node.func.attr == "make_expert_params_mapping"
+        ]
+        assert obsolete_calls == []
+
+
+def test_hy_v3_uses_v0251_cache_scale_mapper_api() -> None:
+    sources = {
+        relative_path: (ROOT / relative_path).read_text(encoding="utf-8")
+        for relative_path in (
+            "vllm_hcu/models/hy_v3.py",
+            "vllm_hcu/models/hy_v3_mtp.py",
+        )
+    }
+
+    for source in sources.values():
+        tree = ast.parse(source)
+        obsolete_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_cache_scale"
+        ]
+        assert obsolete_calls == []
+
+    assert "get_cache_scale_mapper()" in sources[
+        "vllm_hcu/models/hy_v3_mtp.py"
+    ]
+
+
 def test_fp8_marlin_moe_method_allows_eplb() -> None:
     source = (
         ROOT

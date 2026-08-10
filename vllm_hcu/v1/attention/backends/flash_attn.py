@@ -228,14 +228,15 @@ class HcuFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-            if torch.cuda.get_device_properties("cuda").gcnArchName.split(':')[0] == "gfx938":
+            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+            if arch == "gfx938":
                 return torch.float8_e4m3fn
-            else:
-                raise ValueError(f"{kv_cache_dtype} only supported on nmz")
-        elif kv_cache_dtype in ("fp8_e5m2"):
+            raise ValueError(f"{kv_cache_dtype} only supported on gfx938")
+        if kv_cache_dtype == "fp8_e5m2":
+            # E5M2 is retained for gfx936. Do not impose a strict
+            # device/backend gate until CUTLASS FP8 coverage there is complete.
             return torch.float8_e5m2
-        else:
-            raise ValueError(f"Unrecognized FP8 dtype: {kv_cache_dtype}")
+        raise ValueError(f"Unrecognized FP8 dtype: {kv_cache_dtype}")
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -898,6 +899,13 @@ class FlashAttentionImpl(AttentionImpl):
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+            mode = _get_flash_attn_mode()
+            if (
+                mode == "cutlass"
+                and self.dcp_world_size <= 1
+                and query.dtype == torch.float8_e4m3fn
+            ):
+                query = query.view(dtype)
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
@@ -976,23 +984,45 @@ class FlashAttentionImpl(AttentionImpl):
                         "[HCU FLASH_ATTN PATH] unified_flash_attn",
                         scope="local",
                     )
+                    if (
+                        self.kv_cache_dtype.startswith("fp8")
+                        and query.dtype == torch.float8_e4m3fn
+                    ):
+                        num_seqs = cu_seqlens_q.shape[0] - 1
+                        if (
+                            layer._q_scale.numel() == self.num_kv_heads
+                            and self.num_heads % self.num_kv_heads == 0
+                        ):
+                            q_descale = layer._q_scale.reshape(
+                                1, self.num_kv_heads
+                            ).expand(num_seqs, self.num_kv_heads)
+                            q_descale = q_descale.repeat_interleave(
+                                self.num_heads // self.num_kv_heads, dim=-1
+                            )
+                        else:
+                            q_descale = layer._q_scale.expand(
+                                (num_seqs, self.num_heads)
+                            )
                     varlen_fwd_unified(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    cu_seqlens_q=cu_seqlens_q,
-                    seqused_k=seqused_k,
-                    block_table=block_table,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    softcap=self.logits_soft_cap,
-                    window_size=sliding_window_size,
-                    alibi_slopes=self.alibi_slopes,
-                    s_aux=self.sinks,
-                    out=output[:num_actual_tokens],
-                    )   
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        softcap=self.logits_soft_cap,
+                        window_size=sliding_window_size,
+                        alibi_slopes=self.alibi_slopes,
+                        s_aux=self.sinks,
+                        out=output[:num_actual_tokens],
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
 
                 else:
                     logger.info_once(

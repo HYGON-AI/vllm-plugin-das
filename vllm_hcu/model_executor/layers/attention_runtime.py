@@ -19,7 +19,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 
-from vllm_hcu.model_executor.layers.attention_forward_runtime import attention_forward
+from vllm_hcu.model_executor.layers.attention_forward_runtime import (
+    attention_forward,
+    quantize_attention_query,
+)
 from vllm_hcu.model_executor.layers.kv_cache_utils import split_kv_cache
 from vllm_hcu.platforms import envs as henvs
 
@@ -30,7 +33,7 @@ def init_kv_cache_quant_e5m2(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> None:
-    """v0.25.1 target ``_init_kv_cache_quant`` plus the HCU E5M2 delta."""
+    """Initialize the HCU E5M2 KV cache without the CUDA FP8 restriction."""
 
     upstream.set_default_quant_scales(layer, register_buffer=True)
     layer._o_scale_float = None
@@ -127,6 +130,9 @@ class FusedQkvSplitRmsNormRopeAttention(Attention):
             block_size=self.block_size,
             is_neox=is_neox,
         )
+        query_shape = query.shape
+        query = quantize_attention_query(self, query.reshape(num_tokens, -1))
+        query = query.view(query_shape)
         torch.ops.vllm.unified_attention_with_output(
             query,
             key,

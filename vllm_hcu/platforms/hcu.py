@@ -29,6 +29,26 @@ logger = init_logger(__name__)
 _ensure_platform_plugin_ready()
 
 
+# Recognition here only prevents an invalid format from reaching backend
+# selection. It does not claim that every backend/device pair is complete.
+_HCU_RECOGNIZED_FP8_KV_CACHE_DTYPES = frozenset(
+    {"fp8", "fp8_e4m3", "fp8_e5m2", "fp8_ds_mla"}
+)
+
+
+def _validate_hcu_kv_cache_dtype(cache_dtype: str) -> None:
+    """Reject unknown FP8 KV-cache formats before backend selection."""
+
+    if (
+        cache_dtype.startswith("fp8")
+        and cache_dtype not in _HCU_RECOGNIZED_FP8_KV_CACHE_DTYPES
+    ):
+        raise ValueError(
+            f"HCU does not recognize FP8 KV cache dtype {cache_dtype!r}; use "
+            "--kv-cache-dtype fp8, fp8_e4m3, fp8_e5m2, or fp8_ds_mla"
+        )
+
+
 def get_hcu_flash_attn_mode() -> str:
     """Resolve the HCU flash-attention sub-mode from serialized config."""
 
@@ -230,10 +250,22 @@ class HCUPlatform(Platform):
     
     @classmethod
     def import_kernels(cls) -> None:
-        """Import ROCm-specific kernels."""
+        """Import the vLLM and optional ROCm kernel extensions used by HCU."""
         super().import_kernels()
 
         import contextlib
+
+        # HCU derives directly from Platform rather than CudaPlatformBase, so
+        # the base implementation only imports vllm._C.  Cache operators such
+        # as ``_C_cache_ops::reshape_and_cache_flash`` live in the stable
+        # libtorch extension and must be imported explicitly to register their
+        # torch.ops schemas and CUDA/HIP implementations.
+        try:
+            import vllm._C_stable_libtorch  # noqa: F401
+        except ImportError as exc:
+            logger.warning_once(
+                "Failed to import vLLM stable-libtorch kernels: %r", exc
+            )
 
         # Import ROCm-specific extension
         with contextlib.suppress(ImportError):
@@ -526,6 +558,10 @@ class HCUPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        cache_config = vllm_config.cache_config
+        if cache_config is not None:
+            _validate_hcu_kv_cache_dtype(cache_config.cache_dtype)
+
         from vllm.config.compilation import CUDAGraphMode
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
         from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
@@ -548,7 +584,6 @@ class HCUPlatform(Platform):
         select_hcu_scheduler(vllm_config)
         select_hcu_multiproc_executor(vllm_config)
 
-        cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
         # if cache_config and cache_config.block_size is None:
