@@ -113,6 +113,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
 from vllm.utils.torch_utils import (
+    async_tensor_h2d,
     get_dtype_size,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
@@ -2793,53 +2794,22 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
 
-        # TODO: Optimize the CPU -> GPU copy.
-        # cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-        #     self.device, non_blocking=True
-        # )
-        # cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-        #     self.device, non_blocking=True
-        # )
-        # logits_indices = torch.from_numpy(logits_indices).to(
-        #     self.device, non_blocking=True
-        # )
-        # target_logits_indices = torch.from_numpy(target_logits_indices).to(
-        #     self.device, non_blocking=True
-        # )
-        # bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-        #     self.device, non_blocking=True
-        # )
-
-        # # Compute the draft token ids.
-        # # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        # draft_token_ids = self.input_ids.gpu[logits_indices]
-        # draft_token_ids = draft_token_ids[target_logits_indices + 1]
-
-        draft_token_indices = target_logits_indices + 1
-        # Optimize the H2D in the process of creating spec decode metadata
-        fused_meta_data = cu_num_draft_tokens.tolist() + cu_num_sampled_tokens.tolist()\
-              + logits_indices.tolist() + target_logits_indices.tolist() + bonus_logits_indices.tolist()\
-              + draft_token_indices.tolist()
-
-        fused_meta_data_len = np.array([len(cu_num_draft_tokens), len(cu_num_sampled_tokens),\
-                                        len(logits_indices), len(target_logits_indices),\
-                                            len(bonus_logits_indices), len(draft_token_indices)], dtype=np.int32)
-        cu_fused_meta_data_len = np.cumsum(fused_meta_data_len, dtype=np.int32)
-        fused_meta_data = torch.tensor(
-            fused_meta_data, dtype=torch.int32, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-
-        cu_num_draft_tokens = fused_meta_data[:cu_fused_meta_data_len[0]]
-        cu_num_sampled_tokens = fused_meta_data[cu_fused_meta_data_len[0]:cu_fused_meta_data_len[1]]
-        logits_indices = fused_meta_data[cu_fused_meta_data_len[1]:cu_fused_meta_data_len[2]]
-        target_logits_indices = fused_meta_data[cu_fused_meta_data_len[2]:cu_fused_meta_data_len[3]]
-        bonus_logits_indices = fused_meta_data[cu_fused_meta_data_len[3]:cu_fused_meta_data_len[4]]
-        draft_token_indices = fused_meta_data[cu_fused_meta_data_len[4]:cu_fused_meta_data_len[5]]
+        cu_num_draft_tokens = async_tensor_h2d(cu_num_draft_tokens, device=self.device)
+        cu_num_sampled_tokens = async_tensor_h2d(
+            cu_num_sampled_tokens, device=self.device
+        )
+        logits_indices = async_tensor_h2d(logits_indices, device=self.device)
+        target_logits_indices = async_tensor_h2d(
+            target_logits_indices, device=self.device
+        )
+        bonus_logits_indices = async_tensor_h2d(
+            bonus_logits_indices, device=self.device
+        )
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[draft_token_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -3444,6 +3414,13 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
+
+        # The async speculative scheduler may use -1 as a placeholder for
+        # requests that were not in the previous worker batch. Keep -1 in the
+        # speculative metadata so rejection sampling rejects those positions,
+        # but clamp it before the embedding lookup.
+        if self.speculative_config is not None:
+            self.input_ids.gpu[:num_input_tokens].clamp_(min=0)
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
