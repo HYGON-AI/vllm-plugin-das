@@ -150,11 +150,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         execute_model_state = self.execute_model_state
         if self.pcp_manager is not None and execute_model_state is not None:
             (
-                execute_model_state.hidden_states,
-                execute_model_state.input_batch,
+                restored_hidden_states,
+                restored_input_batch,
             ) = self.pcp_manager.restore_for_sampling(
                 execute_model_state.hidden_states
             )
+            execute_model_state = execute_model_state._replace(
+                hidden_states=restored_hidden_states,
+                input_batch=restored_input_batch,
+            )
+            self.execute_model_state = execute_model_state
         input_batch = (
             None
             if execute_model_state is None

@@ -12,6 +12,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from types import FunctionType, ModuleType, SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import pytest
@@ -90,6 +91,11 @@ def _config(pcp_size: int) -> object:
     )
 
 
+class _ExecuteModelState(NamedTuple):
+    input_batch: object
+    hidden_states: object
+
+
 def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
@@ -153,14 +159,16 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     assert prepared is local_batch
     assert runner.prepare_attn(prepared) == ("local-blocks", "gathered-slots")
 
-    state = SimpleNamespace(hidden_states=local_hidden, input_batch=local_batch)
+    state = _ExecuteModelState(local_batch, local_hidden)
     runner.execute_model_state = state
     runner.expected_hidden = global_hidden
     runner.expected_batch = global_batch
     assert runner.sample_tokens("grammar") == "sampled"
 
-    assert state.hidden_states is global_hidden
-    assert state.input_batch is global_batch
+    assert state.hidden_states is local_hidden
+    assert state.input_batch is local_batch
+    assert runner.execute_model_state.hidden_states is global_hidden
+    assert runner.execute_model_state.input_batch is global_batch
     assert synchronized_batches == [global_batch]
     assert events == [
         "super.initialize_kv_cache",
@@ -171,6 +179,44 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         "restore_for_sampling",
         "super.sample_tokens",
     ]
+
+
+def test_pcp_runner_replaces_immutable_execute_model_state(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.25.1 stores execution state in an immutable NamedTuple."""
+
+    runner_module, _ = pcp_runner_module
+    global_batch = object()
+    local_batch = object()
+    global_hidden = object()
+    local_hidden = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            assert hidden_states is local_hidden
+            return global_hidden, global_batch
+
+    monkeypatch.setattr(
+        runner_module,
+        "synchronize_pp_spec_draft_tokens",
+        lambda *args: False,
+    )
+    runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
+    runner.pcp_manager = Manager()
+    original_state = _ExecuteModelState(local_batch, local_hidden)
+    runner.execute_model_state = original_state
+    runner.expected_hidden = global_hidden
+    runner.expected_batch = global_batch
+
+    assert runner.sample_tokens("grammar") == "sampled"
+
+    assert original_state.input_batch is local_batch
+    assert original_state.hidden_states is local_hidden
+    assert runner.execute_model_state is not original_state
+    assert runner.execute_model_state.input_batch is global_batch
+    assert runner.execute_model_state.hidden_states is global_hidden
 
 
 def test_pcp_runner_routes_dummy_slots_through_manager(
