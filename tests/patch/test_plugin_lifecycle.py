@@ -231,6 +231,36 @@ def test_platform_reentry_preserves_an_authoritative_role(monkeypatch):
     assert PATCH_REGISTRY.process_role() is ProcessRole.ENGINE_CORE
 
 
+def test_pcp_kv_cache_callbacks_precede_mtp_coordinator_deterministically():
+    from vllm_hcu.patch.platform import platform_framework_callback_names
+
+    inventory = platform_framework_callback_names()
+    mtp_index = inventory.index(
+        (
+            "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
+            "vllm.v1.core.kv_cache_coordinator",
+        )
+    )
+    assert inventory[mtp_index - 4 : mtp_index] == (
+        (
+            "platform.framework_opt.pcp_kv_cache_utils",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.pcp_kv_cache_interface",
+            "vllm.v1.kv_cache_interface",
+        ),
+        (
+            "platform.framework_opt.pcp_single_type_kv_cache_manager",
+            "vllm.v1.core.single_type_kv_cache_manager",
+        ),
+        (
+            "platform.framework_opt.pcp_kv_cache_coordinator",
+            "vllm.v1.core.kv_cache_coordinator",
+        ),
+    )
+
+
 def test_platform_probe_failure_is_exposed_on_vllm_second_invocation(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(plugin, "_PLATFORM_INIT_FAILURE", None)
