@@ -741,7 +741,10 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
         model_config=SimpleNamespace(enforce_eager=True, use_mla=False),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
         kernel_config=SimpleNamespace(moe_backend="auto"),
         kv_transfer_config=None,
     )

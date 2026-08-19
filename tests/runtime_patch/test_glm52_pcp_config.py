@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from vllm.config.vllm import VllmConfig
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.platform.core_fix import patch_vllm_config
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
@@ -207,3 +208,45 @@ def test_pcp_patch_rejects_v0251_wrapper_signature_drift() -> None:
     )
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         patch_vllm_config.apply_to_module(module)
+
+
+class _LifecycleCompilationConfig:
+    def __init__(self) -> None:
+        self.cudagraph_mode = SimpleNamespace(has_full_cudagraphs=lambda: False)
+
+
+def test_forced_v1_pcp_is_rejected_during_platform_config_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    make_pcp_config,
+) -> None:
+    """Removing the platform gate would let forced V1 PCP finish validation."""
+
+    import torch
+
+    assert VllmConfig.__module__ == "vllm.config.vllm"
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx936"),
+    )
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_multiproc_executor,
+        patch_scheduler,
+    )
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.setattr(
+        patch_scheduler, "select_hcu_scheduler", lambda config: False
+    )
+    monkeypatch.setattr(
+        patch_multiproc_executor, "select_hcu_multiproc_executor", lambda config: False
+    )
+    config = make_pcp_config(use_v2=False, pcp=2)
+    config.compilation_config = _LifecycleCompilationConfig()
+    config.kernel_config = SimpleNamespace(moe_backend="auto")
+    config.cache_config.user_specified_block_size = True
+    config.parallel_config.worker_cls = "auto"
+
+    with pytest.raises(ValueError, match="Model Runner V2"):
+        HCUPlatform.check_and_update_config(config)

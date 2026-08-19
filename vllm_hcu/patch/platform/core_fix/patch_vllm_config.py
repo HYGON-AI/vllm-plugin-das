@@ -139,6 +139,7 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
+    _validate_hcu_pcp_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
     updates: dict[str, str] = {}
     if feature_config.hcu_flash_attn_mode is None:
