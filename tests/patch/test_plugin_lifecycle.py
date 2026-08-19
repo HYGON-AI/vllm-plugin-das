@@ -510,6 +510,9 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
     upstream_module = ModuleType(upstream_name)
 
     class UpstreamGPUModelRunner:
+        def __init__(self, vllm_config, device):
+            self.upstream_init = (vllm_config, device)
+
         def execute_model(self):
             return "upstream"
 
@@ -519,9 +522,14 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
 
     adapter_module = importlib.import_module(adapter_name)
     adapter = adapter_module.HcuGPUModelRunnerV2
+    config = object()
+    device = object()
+    runner = adapter(config, device)
 
     assert issubclass(adapter, UpstreamGPUModelRunner)
-    assert adapter().execute_model() == "upstream"
+    assert runner.upstream_init == (config, device)
+    assert runner.pcp_manager is None
+    assert runner.execute_model() == "upstream"
     assert "execute_model" not in adapter.__dict__
 
 

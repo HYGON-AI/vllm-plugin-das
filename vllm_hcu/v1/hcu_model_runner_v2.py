@@ -8,6 +8,7 @@ import functools
 import torch
 
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
 
 
 _FIXED_WIDTH_PP_BROADCAST_MARKER = "_vllm_hcu_fixed_width_pp_broadcast"
@@ -109,8 +110,51 @@ def synchronize_pp_spec_draft_tokens(
 class HcuGPUModelRunnerV2(GPUModelRunner):
     """HCU compatibility adapter around upstream v0.25.1 Model Runner V2."""
 
+    def __init__(self, vllm_config, device):
+        super().__init__(vllm_config, device)
+        self.pcp_manager = None
+
+    def initialize_kv_cache(self, kv_cache_config):
+        super().initialize_kv_cache(kv_cache_config)
+        if self.vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            self.pcp_manager = maybe_build_pcp_manager(
+                self.vllm_config,
+                self.device,
+                self.req_states,
+                self.block_tables,
+            )
+
+    def prepare_inputs(self, scheduler_output, batch_desc):
+        input_batch = super().prepare_inputs(scheduler_output, batch_desc)
+        if self.pcp_manager is None:
+            return input_batch
+        return self.pcp_manager.partition_batch(input_batch)
+
+    def prepare_attn(self, input_batch):
+        if self.pcp_manager is None:
+            return super().prepare_attn(input_batch)
+        return self.pcp_manager.prepare_attn(input_batch)
+
+    def prepare_dummy_attn(self, input_batch):
+        if self.pcp_manager is None:
+            return super().prepare_dummy_attn(input_batch)
+        block_tables = self.block_tables.get_dummy_block_tables(
+            input_batch.num_reqs
+        )
+        slot_mappings = self.pcp_manager.get_dummy_slot_mappings(
+            input_batch.num_tokens
+        )
+        return block_tables, slot_mappings
+
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
+        if self.pcp_manager is not None and execute_model_state is not None:
+            (
+                execute_model_state.hidden_states,
+                execute_model_state.input_batch,
+            ) = self.pcp_manager.restore_for_sampling(
+                execute_model_state.hidden_states
+            )
         input_batch = (
             None
             if execute_model_state is None
