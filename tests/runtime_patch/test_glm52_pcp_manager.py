@@ -281,6 +281,45 @@ def test_dual_chunk_swap_uses_symmetric_segments_and_keeps_empty_rows() -> None:
     assert any(segment.start == segment.stop for segment in segments)
 
 
+def test_two_token_warmup_prefill_drops_empty_runtime_rows() -> None:
+    """Zero-token chunks must not become bogus sparse-indexer decodes."""
+
+    global_batch = _make_batch(
+        [("warmup-prefill", [10, 11], 2, True)]
+    )
+    managers, _ = _make_managers()
+
+    for manager in managers:
+        local = manager.partition_batch(global_batch)
+        assert local.req_ids == ["warmup-prefill"]
+        assert local.num_reqs == 1
+        assert local.num_scheduled_tokens.tolist() == [1]
+        assert local.query_start_loc_np.tolist() == [0, 1]
+        assert local.is_prefilling_np.tolist() == [True]
+
+
+def test_one_token_prefill_keeps_one_dummy_row_on_the_empty_rank() -> None:
+    """An empty PCP rank still needs a valid prefill metadata row."""
+
+    global_batch = _make_batch(
+        [("one-token-prefill", [10], 1, True)]
+    )
+    managers, _ = _make_managers()
+    local_batches = [
+        manager.partition_batch(global_batch) for manager in managers
+    ]
+
+    assert local_batches[0].num_scheduled_tokens.tolist() == [1]
+    empty_rank = local_batches[1]
+    assert empty_rank.req_ids == ["one-token-prefill"]
+    assert empty_rank.num_reqs == 1
+    assert empty_rank.num_tokens == 0
+    assert empty_rank.num_tokens_after_padding == 1
+    assert empty_rank.num_scheduled_tokens.tolist() == [0]
+    assert empty_rank.query_start_loc_np.tolist() == [0, 0]
+    assert empty_rank.is_prefilling_np.tolist() == [True]
+
+
 def test_partition_creates_two_prefill_rows_and_replicates_decode() -> None:
     """Treating decode like prefill must desynchronize decode request rows."""
 

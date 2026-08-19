@@ -214,6 +214,8 @@ class HcuPCPManager:
             input_batch.num_scheduled_tokens
         ):
             query_len = int(query_len_value)
+            if query_len == 0:
+                continue
             global_start = int(input_batch.query_start_loc_np[req_idx])
             if bool(input_batch.is_prefilling_np[req_idx]):
                 rank_segments = self.rank_segments(
@@ -222,6 +224,8 @@ class HcuPCPManager:
             else:
                 rank_segments = (RankSegment(0, query_len),)
             for rank_segment in rank_segments:
+                if rank_segment.num_tokens == 0:
+                    continue
                 segment = _BatchSegment(
                     global_req_idx=req_idx,
                     global_slice=slice(
@@ -300,6 +304,16 @@ class HcuPCPManager:
         self._global_batch = input_batch
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(input_batch)
         segments = segments_by_rank[self.pcp_rank]
+        if not segments:
+            # Preserve one metadata row on a rank with no owned prefill tokens,
+            # while keeping empty DualChunkSwap intervals out of normal batches.
+            segments = [
+                _BatchSegment(
+                    global_req_idx=0,
+                    global_slice=slice(0, 0),
+                    local_slice=slice(0, 0),
+                )
+            ]
         num_local_reqs = len(segments)
         num_local_tokens = per_rank_num_tokens[self.pcp_rank]
         num_padded_tokens = max(per_rank_num_tokens, default=0)
