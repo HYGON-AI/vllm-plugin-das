@@ -4,31 +4,41 @@
 
 from __future__ import annotations
 
+import importlib
 import os
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
-# This test imports the HCU-owned runner directly, outside the runtime patch
-# coordinator that owns the upstream replacement target.
+# Defer the replacement import until fixture setup.  Pytest imports every test
+# module before running earlier platform fixtures, so a collection-time direct
+# import would race the coordinator that owns the canonical replacement target.
 os.environ["VLLM_PLUGINS"] = "__disabled__"
 from vllm.utils import torch_utils
 
-_register_custom_op = torch_utils.direct_register_custom_op
 
+@pytest.fixture(scope="module")
+def moe_runner_module() -> ModuleType:
+    from vllm_hcu.patch.platform import apply_platform_patches
 
-def _register_without_duplicate_moe_ops(op_name, *args, **kwargs):
-    if op_name in {"moe_forward", "moe_forward_shared"}:
-        return None
-    return _register_custom_op(op_name, *args, **kwargs)
+    apply_platform_patches()
+    register_custom_op = torch_utils.direct_register_custom_op
 
+    def register_without_duplicate_moe_ops(op_name, *args, **kwargs):
+        if op_name in {"moe_forward", "moe_forward_shared"}:
+            return None
+        return register_custom_op(op_name, *args, **kwargs)
 
-torch_utils.direct_register_custom_op = _register_without_duplicate_moe_ops
-
-from vllm_hcu.model_executor.layers.fused_moe import moe_runner
-
-torch_utils.direct_register_custom_op = _register_custom_op
+    torch_utils.direct_register_custom_op = register_without_duplicate_moe_ops
+    try:
+        module = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
+        )
+    finally:
+        torch_utils.direct_register_custom_op = register_custom_op
+    assert module.MoERunner.__module__.startswith("vllm_hcu.")
+    return module
 
 
 def make_hidden() -> torch.Tensor:
@@ -63,9 +73,12 @@ class _PCPCollectives:
 
 
 @pytest.fixture
-def make_runner(monkeypatch: pytest.MonkeyPatch):
+def make_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+):
     def make(pcp: int, use_all2all_kernels: bool):
-        runner = object.__new__(moe_runner.MoERunner)
+        runner = object.__new__(moe_runner_module.MoERunner)
         runner.moe_config = SimpleNamespace(
             pcp_size=pcp,
             dp_size=1,
@@ -79,7 +92,7 @@ def make_runner(monkeypatch: pytest.MonkeyPatch):
         )
         runner._shared_experts = None
         group = _PCPCollectives()
-        monkeypatch.setattr(moe_runner, "get_pcp_group", lambda: group)
+        monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: group)
         return runner, group
 
     return make
@@ -129,10 +142,11 @@ def test_pcp_dispatch_requires_router_logits(
 
 def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
 ) -> None:
     """Reordering either local output before the shared+routed add is a bug."""
 
-    runner = object.__new__(moe_runner.MoERunner)
+    runner = object.__new__(moe_runner_module.MoERunner)
     runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
     runner.routed_experts = SimpleNamespace(
         quant_method=SimpleNamespace(has_unpadded_output=False),
@@ -147,27 +161,27 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
         torch.tensor([[10.0, 11.0], [20.0, 21.0]]),
     )
     monkeypatch.setattr(
-        moe_runner.MoERunner,
+        moe_runner_module.MoERunner,
         "_maybe_pad_hidden_states",
         lambda self, shared, hidden: (hidden, None, None),
     )
     monkeypatch.setattr(
-        moe_runner.MoERunner,
+        moe_runner_module.MoERunner,
         "_encode_layer_name",
         lambda self: "test-layer",
     )
     monkeypatch.setattr(
-        moe_runner.MoERunner,
+        moe_runner_module.MoERunner,
         "_maybe_reduce_shared_expert_output",
         lambda self, shared: shared,
     )
     monkeypatch.setattr(
-        moe_runner.MoERunner,
+        moe_runner_module.MoERunner,
         "_maybe_reduce_final_output",
         lambda self, output, _truncate: output,
     )
     monkeypatch.setattr(
-        moe_runner.MoERunner,
+        moe_runner_module.MoERunner,
         "_maybe_add_zero_expert_output",
         lambda self, output: output,
     )
