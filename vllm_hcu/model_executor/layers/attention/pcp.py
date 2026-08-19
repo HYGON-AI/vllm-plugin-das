@@ -102,10 +102,6 @@ def _gather_prefill_cache_inputs(
     if world_size == 1 or metadata is None:
         return tensors, slot_mapping
 
-    num_prefills = getattr(metadata, "num_prefills", None)
-    if num_prefills == 0:
-        return tensors, slot_mapping
-
     num_decode_tokens = getattr(metadata, "num_decode_tokens", None)
     if num_decode_tokens is None:
         return tensors, slot_mapping
@@ -120,6 +116,12 @@ def _gather_prefill_cache_inputs(
         "PCP decode token count is outside the local tensor: "
         f"decode={num_decode_tokens}, local={local_num_tokens}"
     )
+    if num_decode_tokens == local_num_tokens:
+        return tensors, _decode_only_slot_mapping(
+            slot_mapping,
+            local_num_tokens,
+            metadata,
+        )
 
     pcp_group = get_pcp_group()
     assert int(pcp_group.world_size) == world_size, (
@@ -177,20 +179,19 @@ def maybe_gather_mla_latent_cache_inputs(
     world_size = _pcp_world_size(metadata)
     if world_size == 1 or metadata is None:
         return kv_c_normed, k_pe, slot_mapping
-    num_prefills = getattr(metadata, "num_prefills", None)
     num_decode_tokens = getattr(metadata, "num_decode_tokens", None)
     if num_decode_tokens is None:
         return kv_c_normed, k_pe, slot_mapping
-    if num_prefills == 0:
+    assert kv_c_normed.shape[0] == k_pe.shape[0], (
+        "PCP MLA latent KV and RoPE K must have the same token dimension"
+    )
+    if int(num_decode_tokens) == kv_c_normed.shape[0]:
         cache_slot_mapping = _decode_only_slot_mapping(
             slot_mapping,
             kv_c_normed.shape[0],
             metadata,
         )
         return kv_c_normed, k_pe, cache_slot_mapping
-    assert kv_c_normed.shape[0] == k_pe.shape[0], (
-        "PCP MLA latent KV and RoPE K must have the same token dimension"
-    )
 
     num_tokens = kv_c_normed.shape[0]
     k_pe_flat = k_pe.reshape(num_tokens, -1)
@@ -215,17 +216,9 @@ def maybe_gather_indexer_k(
     world_size = _pcp_world_size(metadata)
     if world_size == 1 or metadata is None:
         return k, slot_mapping
-    num_prefills = getattr(metadata, "num_prefills", None)
     num_decode_tokens = getattr(metadata, "num_decode_tokens", None)
     if num_decode_tokens is None:
         return k, slot_mapping
-    if num_prefills == 0:
-        cache_slot_mapping = _decode_only_slot_mapping(
-            slot_mapping,
-            k.shape[0],
-            metadata,
-        )
-        return k, cache_slot_mapping
     (cache_k,), cache_slot_mapping = _gather_prefill_cache_inputs(
         (k,),
         slot_mapping,

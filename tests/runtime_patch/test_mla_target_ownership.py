@@ -596,6 +596,84 @@ def test_mla_pcp_full_forward_gathers_cache_inputs_and_keeps_q_local(
     assert forwarded_args[4] is metadata
 
 
+def test_mla_pcp_profile_forward_skips_cache_without_metadata(monkeypatch):
+    adapter = _adapter()
+    target_calls = []
+    events = []
+    module = _fake_mla_module(adapter, target_calls, events)
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata=None,
+        slot_mapping={},
+    )
+    assert adapter.apply_to_module(module) is True
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    monkeypatch.setattr(
+        pcp,
+        "maybe_gather_mla_latent_cache_inputs",
+        lambda *args: pytest.fail("profile forward gathered cache inputs"),
+    )
+
+    class Impl:
+        def do_kv_cache_update(self, *args):
+            pytest.fail("profile forward inserted into the KV cache")
+
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_use_pcp = True
+    instance._hcu_pcp_world_size = 2
+    instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
+    instance.calculate_kv_scales = False
+    instance.layer_name = "layer"
+    instance.kv_cache = torch.empty(0)
+    instance.kv_cache_dtype = "auto"
+    instance._k_scale = torch.tensor(1.0)
+    instance.impl = Impl()
+    q = torch.tensor([[1.0], [2.0]])
+    local_kv = torch.tensor([[10.0], [11.0]])
+    local_rope = torch.tensor([[[20.0]], [[21.0]]])
+
+    result = instance.forward(
+        q,
+        local_kv,
+        local_rope,
+        output_shape=torch.Size([2, 1]),
+    )
+
+    assert result.shape == (2, 1)
+    assert events == ["forward_impl"]
+    assert len(target_calls) == 1
+    forwarded_args = target_calls[0][1]
+    assert forwarded_args[0] is q
+    assert forwarded_args[1] is local_kv
+    assert forwarded_args[2] is local_rope
+    assert forwarded_args[4] is None
+
+
+def test_mla_pcp_real_forward_rejects_missing_layer_slots():
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    metadata = SimpleNamespace(pcp_world_size=2)
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={"layer": metadata},
+        slot_mapping={},
+    )
+    assert adapter.apply_to_module(module) is True
+
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_use_pcp = True
+    instance._hcu_pcp_world_size = 2
+    instance.calculate_kv_scales = False
+    instance.layer_name = "layer"
+
+    with pytest.raises(RuntimeError, match="slot mapping is missing"):
+        instance.forward(
+            torch.ones(1, 1),
+            torch.ones(1, 1),
+            torch.ones(1, 1, 1),
+            output_shape=torch.Size([1, 1]),
+        )
+
+
 def test_mla_pcp_one_keeps_target_opaque_full_forward(monkeypatch):
     adapter = _adapter()
     events = []

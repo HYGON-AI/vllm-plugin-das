@@ -179,6 +179,167 @@ def test_indexer_prefill_gathers_k_and_matching_slots_in_rank_order(
     group.assert_exhausted()
 
 
+@pytest.mark.parametrize("kind", ["mla", "indexer"])
+def test_empty_shard_pure_prefill_still_joins_cache_collectives(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+):
+    pcp = _pcp_module()
+    expanded_slots = torch.tensor([-1, 200], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        pcp_world_size=2,
+        num_decode_tokens=0,
+        # This rank retains only an empty virtual prefill row. The peer owns
+        # a real prefill token, and Task 2 pads this rank to the same width.
+        num_prefills=0,
+    )
+    if kind == "mla":
+        local_k = torch.tensor([[-99.0]])
+        local_rope = torch.tensor([[[-199.0]]])
+        gathered_k = torch.tensor([[-99.0], [20.0]])
+        gathered_rope = torch.tensor([[[-199.0]], [[120.0]]])
+        group = _FakePCPGroup(
+            [
+                ("kv", local_k, gathered_k),
+                ("rope_k", local_rope.reshape(1, -1), gathered_rope.reshape(2, -1)),
+                (
+                    "slot_mapping",
+                    torch.tensor([-1], dtype=torch.int64),
+                    expanded_slots,
+                ),
+            ]
+        )
+        monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+
+        actual_k, actual_rope, actual_slots = (
+            pcp.maybe_gather_mla_latent_cache_inputs(
+                local_k,
+                local_rope,
+                expanded_slots,
+                metadata,
+            )
+        )
+
+        torch.testing.assert_close(actual_rope, gathered_rope)
+        expected_calls = ["kv", "rope_k", "slot_mapping"]
+    else:
+        local_k = torch.tensor([[-99.0, -98.0]])
+        gathered_k = torch.tensor([[-99.0, -98.0], [20.0, 21.0]])
+        group = _FakePCPGroup(
+            [
+                ("indexer_k", local_k, gathered_k),
+                (
+                    "slot_mapping",
+                    torch.tensor([-1], dtype=torch.int64),
+                    expanded_slots,
+                ),
+            ]
+        )
+        monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+
+        actual_k, actual_slots = pcp.maybe_gather_indexer_k(
+            local_k,
+            expanded_slots,
+            metadata,
+        )
+
+        expected_calls = ["indexer_k", "slot_mapping"]
+
+    torch.testing.assert_close(actual_k, gathered_k)
+    torch.testing.assert_close(actual_slots, expanded_slots)
+    assert group.calls == expected_calls
+    group.assert_exhausted()
+
+
+@pytest.mark.parametrize("kind", ["mla", "indexer"])
+def test_empty_shard_mixed_batch_still_joins_prefill_collectives(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+):
+    pcp = _pcp_module()
+    expanded_slots = torch.tensor([900, -1, -1, 200], dtype=torch.int64)
+    gathered_prefill_slots = torch.tensor([-1, 200], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        pcp_world_size=2,
+        num_decode_tokens=1,
+        # The decode row is replicated, while only the peer owns a nonempty
+        # prefill shard. The second local tensor row is Task 2 padding.
+        num_prefills=0,
+    )
+    if kind == "mla":
+        local_k = torch.tensor([[9.0], [-99.0]])
+        local_rope = torch.tensor([[[109.0]], [[-199.0]]])
+        gathered_prefill_k = torch.tensor([[-99.0], [20.0]])
+        gathered_prefill_rope = torch.tensor([[[-199.0]], [[120.0]]])
+        group = _FakePCPGroup(
+            [
+                ("kv", local_k[1:], gathered_prefill_k),
+                (
+                    "rope_k",
+                    local_rope[1:].reshape(1, -1),
+                    gathered_prefill_rope.reshape(2, -1),
+                ),
+                (
+                    "slot_mapping",
+                    torch.tensor([-1], dtype=torch.int64),
+                    gathered_prefill_slots,
+                ),
+            ]
+        )
+        monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+
+        actual_k, actual_rope, actual_slots = (
+            pcp.maybe_gather_mla_latent_cache_inputs(
+                local_k,
+                local_rope,
+                expanded_slots,
+                metadata,
+            )
+        )
+
+        torch.testing.assert_close(
+            actual_rope,
+            torch.tensor([[[109.0]], [[-199.0]], [[120.0]]]),
+        )
+        expected_calls = ["kv", "rope_k", "slot_mapping"]
+        expected_k = torch.tensor([[9.0], [-99.0], [20.0]])
+    else:
+        local_k = torch.tensor([[9.0, 10.0], [-99.0, -98.0]])
+        gathered_prefill_k = torch.tensor(
+            [[-99.0, -98.0], [20.0, 21.0]]
+        )
+        group = _FakePCPGroup(
+            [
+                ("indexer_k", local_k[1:], gathered_prefill_k),
+                (
+                    "slot_mapping",
+                    torch.tensor([-1], dtype=torch.int64),
+                    gathered_prefill_slots,
+                ),
+            ]
+        )
+        monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+
+        actual_k, actual_slots = pcp.maybe_gather_indexer_k(
+            local_k,
+            expanded_slots,
+            metadata,
+        )
+
+        expected_calls = ["indexer_k", "slot_mapping"]
+        expected_k = torch.tensor(
+            [[9.0, 10.0], [-99.0, -98.0], [20.0, 21.0]]
+        )
+
+    torch.testing.assert_close(actual_k, expected_k)
+    torch.testing.assert_close(
+        actual_slots,
+        torch.tensor([900, -1, 200], dtype=torch.int64),
+    )
+    assert group.calls == expected_calls
+    group.assert_exhausted()
+
+
 @pytest.mark.parametrize(
     ("pcp_world_size", "num_prefills", "num_decode_tokens"),
     [(1, 1, 0), (2, 0, 3)],

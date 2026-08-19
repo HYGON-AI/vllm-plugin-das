@@ -182,17 +182,18 @@ def apply_to_module(module: ModuleType) -> bool:
             attn_metadata = attn_metadata_raw[0][self.layer_name]
         else:
             attn_metadata = attn_metadata_raw
-        slot_mapping = forward_context.slot_mapping
-        if not isinstance(slot_mapping, dict):
-            raise RuntimeError(
-                "PCP MLA direct forward requires per-layer slot mappings"
-            )
-        layer_slot_mapping = slot_mapping.get(self.layer_name)
-        if layer_slot_mapping is None:
-            raise RuntimeError(
-                f"PCP MLA slot mapping is missing for layer {self.layer_name!r}"
-            )
         if attn_metadata is not None:
+            slot_mapping = forward_context.slot_mapping
+            if not isinstance(slot_mapping, dict):
+                raise RuntimeError(
+                    "PCP MLA direct forward requires per-layer slot mappings"
+                )
+            layer_slot_mapping = slot_mapping.get(self.layer_name)
+            if layer_slot_mapping is None:
+                raise RuntimeError(
+                    "PCP MLA slot mapping is missing for layer "
+                    f"{self.layer_name!r}"
+                )
             metadata_world_size = int(
                 getattr(attn_metadata, "pcp_world_size", 1)
             )
@@ -203,26 +204,26 @@ def apply_to_module(module: ModuleType) -> bool:
                     f"metadata={metadata_world_size}"
                 )
 
-        from vllm_hcu.model_executor.layers.attention.pcp import (
-            maybe_gather_mla_latent_cache_inputs,
-        )
-
-        kv_for_cache, kpe_for_cache, layer_slot_mapping = (
-            maybe_gather_mla_latent_cache_inputs(
-                kv_c_normed,
-                k_pe,
-                layer_slot_mapping,
-                attn_metadata,
+            from vllm_hcu.model_executor.layers.attention.pcp import (
+                maybe_gather_mla_latent_cache_inputs,
             )
-        )
-        self.impl.do_kv_cache_update(
-            kv_for_cache,
-            kpe_for_cache,
-            self.kv_cache,
-            layer_slot_mapping,
-            self.kv_cache_dtype,
-            self._k_scale,
-        )
+
+            kv_for_cache, kpe_for_cache, layer_slot_mapping = (
+                maybe_gather_mla_latent_cache_inputs(
+                    kv_c_normed,
+                    k_pe,
+                    layer_slot_mapping,
+                    attn_metadata,
+                )
+            )
+            self.impl.do_kv_cache_update(
+                kv_for_cache,
+                kpe_for_cache,
+                self.kv_cache,
+                layer_slot_mapping,
+                self.kv_cache_dtype,
+                self._k_scale,
+            )
         output = torch_module.empty(output_shape, dtype=q.dtype, device=q.device)
         self.forward_impl(
             q,
