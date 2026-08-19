@@ -7,7 +7,14 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
-from ._common import already_applied, load_exact_module, require_callable, require_class, require_exact_signature
+from ._common import (
+    PatchCompatibilityError,
+    already_applied,
+    load_exact_module,
+    require_callable,
+    require_class,
+    require_exact_signature,
+)
 
 TARGET_MODULE = "vllm.v1.attention.backends.mla.flashmla_sparse"
 PATCH_ID = "worker.op_opt.mla.flashmla_sparse_hcu"
@@ -82,6 +89,24 @@ def apply_to_module(module: ModuleType) -> bool:
             "num_kv_actual_tokens",
             common_attn_metadata.num_actual_tokens,
         )
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is None:
+            result.pcp_world_size = int(
+                getattr(common_attn_metadata, "pcp_world_size", 1)
+            )
+        else:
+            parallel_config = getattr(vllm_config, "parallel_config", None)
+            pcp_world_size = getattr(
+                parallel_config,
+                "prefill_context_parallel_size",
+                None,
+            )
+            if pcp_world_size is None:
+                raise PatchCompatibilityError(
+                    "required vLLM 0.25.1 prefill_context_parallel_size "
+                    "is missing from sparse MLA metadata builder"
+                )
+            result.pcp_world_size = int(pcp_world_size)
         return result
 
     @functools.wraps(fp8)

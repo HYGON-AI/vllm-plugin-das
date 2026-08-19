@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import ast
+import copy
+import importlib
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -41,6 +43,52 @@ def _load_model_helpers():
     }
     exec(compile(module, "deepseek_v2_helpers", "exec"), namespace)
     return namespace
+
+
+def _load_v32_sparse_indexer_contract(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "V32SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "v32_sparse_indexer_forward_hip", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
+def _load_v32_sparse_indexer_class():
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = copy.deepcopy(
+        next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "V32SparseAttnIndexer"
+        )
+    )
+    class_node.bases = [ast.Name(id="SparseAttnIndexer", ctx=ast.Load())]
+    module = ast.Module(body=[class_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"torch": torch, "SparseAttnIndexer": object}
+    exec(compile(module, "v32_sparse_indexer_class", "exec"), namespace)
+    return namespace["V32SparseAttnIndexer"]
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
@@ -137,3 +185,193 @@ def test_stacked_name_rewrite_source_contract_is_component_bounded():
     assert rewrite(name, "gate_proj", "gate_up_proj") == (
         "model.gate_proj_alias.gate_up_proj.weight"
     )
+
+
+def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
+    events: list[tuple[object, ...]] = []
+    local_k = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    gathered_k = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    )
+    expanded_slots = torch.tensor([10, 11, 20], dtype=torch.int64)
+    gathered_slots = torch.tensor([10, 11, 20], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        slot_mapping=expanded_slots,
+        pcp_world_size=2,
+        num_decode_tokens=0,
+        num_prefills=2,
+    )
+
+    def gather(k, slots, actual_metadata):
+        events.append(("gather", k, slots, actual_metadata))
+        return gathered_k, gathered_slots
+
+    def cache_insert(k, cache, slots, block_size, scale_fmt):
+        events.append(
+            ("cache", k, cache, slots, block_size, scale_fmt)
+        )
+
+    def hcu_op(*args):
+        events.append(("hcu_op", *args))
+        return "topk"
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        maybe_gather_indexer_k=gather,
+        ops=SimpleNamespace(indexer_k_quant_and_cache=cache_insert),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "gfx938 PCP cache write used the BF16 fallback"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    cache = object()
+    q_quant = torch.tensor([[7.0, 8.0]])
+    weights = torch.tensor([[9.0]])
+    hidden_states = torch.tensor([[10.0]])
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=True,
+        pcp_world_size=2,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert forward_hip(indexer, hidden_states, q_quant, local_k, weights) == "topk"
+
+    assert [event[0] for event in events] == ["gather", "cache", "hcu_op"]
+    assert events[0][1] is local_k
+    assert events[0][2] is expanded_slots
+    assert events[0][3] is metadata
+    assert events[1][1] is gathered_k
+    assert events[1][2] is cache
+    assert events[1][3] is gathered_slots
+    hcu_args = events[2][1:]
+    assert hcu_args[0] is hidden_states
+    assert hcu_args[3] is q_quant
+    assert hcu_args[4] is local_k
+    assert hcu_args[5] is weights
+    assert hcu_args[8] == 2048
+    assert hcu_args[-1] is True
+
+
+def test_v32_hcu_indexer_impl_advertises_pcp_capability():
+    assert _load_v32_sparse_indexer_class().supports_pcp is True
+
+
+def test_indexer_metadata_adapter_propagates_pcp_world_size():
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.op_opt.patch_mla_indexer"
+    )
+
+    def split_chunks(
+        seq_lens_cpu,
+        query_lens_cpu,
+        workspace_size,
+        max_logits_bytes,
+        request_offset=0,
+    ):
+        return [(slice(0, 1), slice(0, 1))]
+
+    def split_batch(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        return (0, 1, 0, common_attn_metadata.num_actual_tokens)
+
+    class Builder:
+        def build(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=False,
+        ):
+            return SimpleNamespace(decode=None)
+
+    module = ModuleType(adapter.TARGET_MODULE)
+    module.split_indexer_prefill_chunks = split_chunks
+    module.split_decodes_and_prefills = split_batch
+    module.DeepseekV32IndexerMetadataBuilder = Builder
+    module.current_platform = SimpleNamespace(is_rocm=lambda: False)
+    assert adapter.apply_to_module(module) is True
+    builder = Builder()
+    builder.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+    common = SimpleNamespace(
+        num_actual_tokens=2,
+        num_kv_actual_tokens=3,
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.pcp_world_size == 2
+
+
+def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+        return "topk"
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        get_forward_context=lambda: pytest.fail(
+            "PCP=1 inspected forward metadata outside the custom op"
+        ),
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "PCP=1 gathered sparse-indexer cache inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *args: pytest.fail(
+                "PCP=1 moved cache ownership outside the custom op"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "PCP=1 moved cache ownership outside the custom op"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    local_k = torch.ones(1, 2)
+    q_quant = torch.ones(1, 2)
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=False,
+        pcp_world_size=1,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
+    assert len(calls) == 1
+    assert calls[0][4] is local_k
+    assert calls[0][-1] is False

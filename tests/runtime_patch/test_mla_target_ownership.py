@@ -24,6 +24,8 @@ class _GenericStub:
 
 
 class _MLACommonImplStub(_GenericStub):
+    supports_pcp = False
+
     def __init__(
         self,
         num_heads,
@@ -187,8 +189,9 @@ def _adapter():
     )
 
 
-def _fake_mla_module(adapter, target_calls):
+def _fake_mla_module(adapter, target_calls, event_log=None):
     split_calls = []
+    full_forward_calls = []
 
     def split_decodes_and_prefills(
         common_attn_metadata,
@@ -244,6 +247,20 @@ def _fake_mla_module(adapter, target_calls):
                 topk_indices_buffer,
                 extra_impl_args,
             )
+            self.use_direct_call = False
+
+        def forward(
+            self,
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=None,
+        ):
+            args = (q, kv_c_normed, k_pe, output_shape)
+            full_forward_calls.append((self, args))
+            if event_log is not None:
+                event_log.append("opaque_forward")
+            return "target-opaque-v0.25.1"
 
         def forward_impl(
             self,
@@ -275,6 +292,8 @@ def _fake_mla_module(adapter, target_calls):
                 quant_tma_aligned,
             )
             target_calls.append((self, args))
+            if event_log is not None:
+                event_log.append("forward_impl")
             return "target-v0.25.1"
 
         def process_weights_after_loading(self, act_dtype):
@@ -302,6 +321,12 @@ def _fake_mla_module(adapter, target_calls):
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
     module.split_decodes_and_prefills = split_decodes_and_prefills
     module.split_calls = split_calls
+    module.full_forward_calls = full_forward_calls
+    module.get_forward_context = lambda: pytest.fail(
+        "test did not install a forward context"
+    )
+    module._encode_layer_name = lambda value: value
+    module.torch = torch
     module.current_platform = SimpleNamespace(
         is_rocm=lambda: pytest.fail(
             "feature ownership must not depend on the target platform"
@@ -428,6 +453,233 @@ def test_mla_feature_on_uses_hcu_lightly_cp_delta(monkeypatch):
     assert hcu_calls == [(module, instance, args)]
 
 
+@pytest.mark.parametrize(("pcp_size", "expected_direct"), [(1, False), (2, True)])
+def test_mla_init_enables_direct_calls_only_for_pcp(
+    monkeypatch,
+    pcp_size,
+    expected_direct,
+):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    monkeypatch.setattr(
+        adapter,
+        "get_hcu_config",
+        lambda config: SimpleNamespace(enable_lightly_cp=False),
+    )
+    import vllm.config as vllm_config_module
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size,
+        )
+    )
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: config,
+    )
+    assert adapter.apply_to_module(module) is True
+    assert adapter.apply_to_module(module) is False
+
+    instance = module.MLAAttention(1, 1.0, 1, 1, 1, None, 1, object())
+
+    assert instance.use_direct_call is expected_direct
+    assert instance._hcu_pcp_world_size == pcp_size
+
+
+def test_mla_init_rejects_combined_pcp_and_lightly_cp(monkeypatch):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    monkeypatch.setattr(
+        adapter,
+        "get_hcu_config",
+        lambda config: SimpleNamespace(enable_lightly_cp=True),
+    )
+    import vllm.config as vllm_config_module
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: config,
+    )
+    assert adapter.apply_to_module(module) is True
+
+    with pytest.raises(RuntimeError, match="PCP.*lightly-CP"):
+        module.MLAAttention(1, 1.0, 1, 1, 1, None, 1, object())
+
+
+def test_mla_pcp_full_forward_gathers_cache_inputs_and_keeps_q_local(
+    monkeypatch,
+):
+    adapter = _adapter()
+    target_calls = []
+    events = []
+    module = _fake_mla_module(adapter, target_calls, events)
+    context_holder = {}
+    module.get_forward_context = lambda: context_holder["context"]
+    assert adapter.apply_to_module(module) is True
+
+    q = torch.tensor([[1.0], [2.0]])
+    local_kv = torch.tensor([[10.0], [11.0]])
+    local_rope = torch.tensor([[[20.0]], [[21.0]]])
+    expanded_slots = torch.tensor([100, 101, 200], dtype=torch.int64)
+    gathered_kv = torch.tensor([[10.0], [11.0], [12.0]])
+    gathered_rope = torch.tensor([[[20.0]], [[21.0]], [[22.0]]])
+    gathered_slots = torch.tensor([100, 101, 200], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        pcp_world_size=2,
+        num_decode_tokens=0,
+        num_prefills=2,
+    )
+    context = SimpleNamespace(
+        attn_metadata={"layer": metadata},
+        slot_mapping={"layer": expanded_slots},
+    )
+    context_holder["context"] = context
+
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    def gather(kv, rope, slots, actual_metadata):
+        events.append("gather")
+        assert kv is local_kv
+        assert rope is local_rope
+        assert slots is expanded_slots
+        assert actual_metadata is metadata
+        return gathered_kv, gathered_rope, gathered_slots
+
+    monkeypatch.setattr(pcp, "maybe_gather_mla_latent_cache_inputs", gather)
+
+    class Impl:
+        def do_kv_cache_update(
+            self,
+            kv,
+            rope,
+            cache,
+            slots,
+            cache_dtype,
+            k_scale,
+        ):
+            events.append("cache")
+            assert kv is gathered_kv
+            assert rope is gathered_rope
+            assert slots is gathered_slots
+
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_use_pcp = True
+    instance._hcu_pcp_world_size = 2
+    instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
+    instance.calculate_kv_scales = False
+    instance.layer_name = "layer"
+    instance.kv_cache = torch.empty(0)
+    instance.kv_cache_dtype = "auto"
+    instance._k_scale = torch.tensor(1.0)
+    instance.impl = Impl()
+
+    result = instance.forward(
+        q,
+        local_kv,
+        local_rope,
+        output_shape=torch.Size([2, 1]),
+    )
+
+    assert result.shape == (2, 1)
+    assert events == ["gather", "cache", "forward_impl"]
+    assert module.full_forward_calls == []
+    assert len(target_calls) == 1
+    forwarded_args = target_calls[0][1]
+    assert forwarded_args[0] is q
+    assert forwarded_args[1] is local_kv
+    assert forwarded_args[2] is local_rope
+    assert forwarded_args[4] is metadata
+
+
+def test_mla_pcp_one_keeps_target_opaque_full_forward(monkeypatch):
+    adapter = _adapter()
+    events = []
+    module = _fake_mla_module(adapter, [], events)
+    assert adapter.apply_to_module(module) is True
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    monkeypatch.setattr(
+        pcp,
+        "maybe_gather_mla_latent_cache_inputs",
+        lambda *args: pytest.fail("PCP=1 gathered MLA cache inputs"),
+    )
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_use_pcp = False
+    q, kv, rope = object(), object(), object()
+
+    assert instance.forward(q, kv, rope) == "target-opaque-v0.25.1"
+    assert module.full_forward_calls == [(instance, (q, kv, rope, None))]
+    assert events == ["opaque_forward"]
+
+
+def test_dense_and_sparse_mla_metadata_carry_pcp_world_size(monkeypatch):
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    assert adapter.apply_to_module(module) is True
+    dense_builder = module.MLACommonMetadataBuilder()
+    dense_builder.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+    common = SimpleNamespace(num_actual_tokens=3, num_kv_actual_tokens=5)
+
+    dense_metadata = dense_builder.build(0, common)
+
+    assert dense_metadata.pcp_world_size == 2
+
+    sparse_adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.op_opt.patch_flashmla_sparse"
+    )
+
+    class FlashMLASparseMetadataBuilder:
+        def build(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=False,
+        ):
+            del common_prefix_len, common_attn_metadata, fast_build
+            return SimpleNamespace(fp8_use_mixed_batch=False)
+
+    class FlashMLASparseImpl:
+        def _fp8_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            kernel_metadata,
+        ):
+            return q
+
+        def _bf16_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_length=None,
+        ):
+            return q
+
+    sparse_module = ModuleType(sparse_adapter.TARGET_MODULE)
+    sparse_module.FlashMLASparseMetadataBuilder = FlashMLASparseMetadataBuilder
+    sparse_module.FlashMLASparseImpl = FlashMLASparseImpl
+    sparse_module.current_platform = SimpleNamespace(is_rocm=lambda: False)
+    sparse_module.torch = torch
+    assert sparse_adapter.apply_to_module(sparse_module) is True
+    sparse_builder = FlashMLASparseMetadataBuilder()
+    sparse_builder.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+
+    sparse_metadata = sparse_builder.build(0, common)
+
+    assert sparse_metadata.pcp_world_size == 2
+
+
 @pytest.mark.parametrize(
     ("is_gfx938", "use_cat_mla", "expected"),
     [
@@ -471,6 +723,46 @@ def test_flashmla_impl_owns_quant_query_capability(
         kv_sharing_target_layer_name=None,
     )
     assert impl.supports_quant_query_input is expected
+
+
+def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
+    monkeypatch,
+    cpu_flashmla,
+):
+    dense_impl = cpu_flashmla.HcuFlashMLABackend.get_impl_cls()
+    assert dense_impl is cpu_flashmla.FlashMLAImpl
+    assert dense_impl.supports_pcp is True
+    assert _MLACommonImplStub.supports_pcp is False
+
+    class UpstreamFlashMLASparseImpl:
+        supports_pcp = False
+
+    class UpstreamFlashMLASparseBackend:
+        @staticmethod
+        def get_impl_cls():
+            return UpstreamFlashMLASparseImpl
+
+    _install_stub(
+        monkeypatch,
+        "vllm.v1.attention.backends.mla.flashmla_sparse",
+        FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
+        FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+    )
+    module_name = "_vllm_hcu_cpu_test_flashmla_sparse_backend"
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/v1/attention/backends/mla/flashmla_sparse.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, source)
+    assert spec is not None and spec.loader is not None
+    sparse = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, sparse)
+    spec.loader.exec_module(sparse)
+
+    sparse_impl = sparse.HcuFlashMLASparseBackend.get_impl_cls()
+    assert sparse_impl is sparse.HcuFlashMLASparseImpl
+    assert sparse_impl.supports_pcp is True
+    assert UpstreamFlashMLASparseImpl.supports_pcp is False
 
 
 def test_flashmla_cat_route_consumes_split_query(

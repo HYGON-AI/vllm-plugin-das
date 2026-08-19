@@ -238,6 +238,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
 
 class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
+    supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
 
     def __init__(
