@@ -172,11 +172,16 @@ def _terminate_process_group(proc: subprocess.Popen, timeout_s: int) -> None:
         proc.wait(timeout=10)
 
 
-def _server_environment() -> dict[str, str]:
+def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("VLLM_PLUGINS", None)
     env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if config is not None:
+        configured = config.get("server", {}).get("environment", {})
+        if not isinstance(configured, dict):
+            raise TypeError("server.environment must be a mapping")
+        env.update({str(name): str(value) for name, value in configured.items()})
     return env
 
 
@@ -297,7 +302,7 @@ def run_evalscope_server_test(
     server_log_path = log_dir / "vllm_server.log"
     eval_log_path = log_dir / "evalscope.log"
 
-    env = _server_environment()
+    env = _server_environment(config)
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())

@@ -28,3 +28,11 @@ Override these paths with `VLLM_HCU_QWEN25_15B_MODEL`,
 `VLLM_HCU_QWEN3_RERANKER_06B_MODEL`.
 
 The real Mamba path can be overridden through `VLLM_HCU_FALCON_MAMBA_MODEL`.
+
+`test_glm52_pcp_mrv2.py` provides the eight-HCU GLM-5.2 PCP acceptance
+workload. It makes two fixed-ID deterministic smoke requests and verifies
+32K- and 64K-token prefills each produce decode token IDs while the server's
+worker group remains live. Per-case JSON artifacts include generated token
+IDs, latency, TTFT, aggregate token throughput, and peak observed device
+memory. Set `VLLM_HCU_TEST_ARTIFACT_DIR` to select the output directory; the
+default is `/tmp/vllm-hcu-integration/glm52-pcp`.

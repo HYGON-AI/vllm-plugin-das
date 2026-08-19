@@ -23,6 +23,9 @@ Current coverage:
 - `test_evalscope_deepseek_r1_gsm8k.py` starts `vllm serve` for
   DeepSeek-R1 Channel-FP8 W8A8 with TP=8, waits for `/health`, then runs
   EvalScope on GSM8K through the OpenAI API.
+- `test_evalscope_glm52_pcp_humaneval.py` checks the collection-safe
+  GLM-5.2 model-runner-v2 TP=4, PCP=2, EP, eager, Triton-MoE launch contract,
+  then runs 32 deterministic HumanEval samples through the OpenAI API.
 
 The Qwen3-8B smoke test needs one local HCU device, the checkpoint at
 `/models/llm-models/qwen3/Qwen3-8B`, `vllm`, and `evalscope`. Select it with
@@ -47,3 +50,10 @@ The DeepSeek-R1 test needs eight local HCU devices, the local model path,
 `vllm`, and `evalscope`. It is marked `hcu`, `model`, `multi_hcu`,
 `hcu_count(8)`, `slow`, `nightly`, and `external_service("evalscope")`, so it
 is excluded from `integration-smoke`.
+
+The GLM-5.2 acceptance server defaults to
+`/models/GLM-5___1-Channel-FP8-w8a8`; override it with
+`VLLM_HCU_GLM52_MODEL`. The EvalScope configuration itself can be replaced
+with `VLLM_HCU_GLM52_HUMANEVAL_CONFIG`. It requires eight HCU devices and
+EvalScope, and intentionally uses model-runner v2 with `TP=4`, `PCP=2`, EP,
+eager execution, and the Triton MoE backend.

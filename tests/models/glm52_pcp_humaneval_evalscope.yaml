@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: glm52_pcp_humaneval_evalscope
+model: /models/GLM-5___1-Channel-FP8-w8a8
+
+server:
+  host: 127.0.0.1
+  port: 10132
+  startup_timeout_s: 7200
+  shutdown_timeout_s: 120
+  environment:
+    VLLM_USE_V2_MODEL_RUNNER: "1"
+  args:
+    - --served-model-name
+    - GLM-5___1-Channel-FP8-w8a8
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "4"
+    - --prefill-context-parallel-size
+    - "2"
+    - --enable-expert-parallel
+    - --enforce-eager
+    - --moe-backend
+    - triton
+    - --max-model-len
+    - "69632"
+    - --default-chat-template-kwargs
+    - '{"enable_thinking":false}'
+
+evalscope:
+  work_dir: /tmp/vllm-hcu-evalscope/glm52_pcp_humaneval
+  api_key: EMPTY
+  eval_type: openai_api
+  generation_config:
+    temperature: 0
+    do_sample: false
+    max_tokens: 2048
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  stream: true
+  eval_batch_size: 1
+  timeout: 7200
+  limit: 32
+  datasets:
+    - humaneval
+  dataset_args:
+    humaneval: {}
+  no_timestamp: true
