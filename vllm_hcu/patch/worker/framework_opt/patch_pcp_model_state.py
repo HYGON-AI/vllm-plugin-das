@@ -13,6 +13,9 @@ changing the upstream helper's public signature.
 from __future__ import annotations
 
 import functools
+import hashlib
+import inspect
+import textwrap
 from types import ModuleType
 
 from ._common import (
@@ -32,6 +35,12 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_pcp_model_state_applied"
 _WRAPPER = "_vllm_hcu_pcp_model_state_wrapper"
+_V0251_PREPARE_ATTN_SOURCE_SHA256 = (
+    "f71a0efd2110430144bd006e9e478dcecb7b07d6eeb841a91c789a6301b9d0b9"
+)
+_V0251_BUILD_ATTN_METADATA_SOURCE_SHA256 = (
+    "62890a577c861312c50b7400cf00908e223999fe2e9e400a0738a469655d2cd1"
+)
 
 
 class _PCPRequestPhaseMetadata:
@@ -47,6 +56,23 @@ class _PCPRequestPhaseMetadata:
     def get_extra_attn_kwargs(self, attn_metadata_builder, num_reqs):
         del attn_metadata_builder, num_reqs
         return {}
+
+
+def _require_source_fingerprint(function, target: str, expected: str) -> None:
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+    except (OSError, TypeError) as exc:
+        raise PatchCompatibilityError(
+            f"required HCU patch target {target} source fingerprint could "
+            f"not be computed: expected sha256={expected}, "
+            f"actual=<unavailable>; {type(exc).__name__}: {exc}"
+        ) from exc
+    actual = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if actual != expected:
+        raise PatchCompatibilityError(
+            f"required HCU patch target {target} source fingerprint "
+            f"mismatch: expected sha256={expected}, actual sha256={actual}"
+        )
 
 
 def _validate_build_attn_metadata(build_attn_metadata) -> None:
@@ -86,6 +112,11 @@ def _validate_build_attn_metadata(build_attn_metadata) -> None:
             "rswa_prefix_lens": None,
         },
     )
+    _require_source_fingerprint(
+        build_attn_metadata,
+        TARGETS[1],
+        _V0251_BUILD_ATTN_METADATA_SOURCE_SHA256,
+    )
     function_globals = getattr(build_attn_metadata, "__globals__", {})
     metadata_class = function_globals.get("CommonAttentionMetadata")
     fields = getattr(metadata_class, "__dataclass_fields__", {})
@@ -124,6 +155,11 @@ def apply_to_module(module: ModuleType) -> bool:
             "for_capture",
         ),
         defaults={"for_capture": False},
+    )
+    _require_source_fingerprint(
+        original_prepare_attn,
+        TARGETS[0],
+        _V0251_PREPARE_ATTN_SOURCE_SHA256,
     )
     original_code = getattr(original_prepare_attn, "__code__", None)
     original_required_names = {

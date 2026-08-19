@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import inspect
 import sys
+import textwrap
 from dataclasses import dataclass
 from types import FunctionType, ModuleType, SimpleNamespace
 
@@ -333,6 +336,52 @@ def _build_attn_metadata(
     }
 
 
+def _build_attn_metadata_without_common_hook(
+    attn_groups,
+    num_reqs,
+    num_tokens,
+    query_start_loc_gpu,
+    query_start_loc_cpu,
+    max_query_len,
+    seq_lens,
+    max_seq_len,
+    block_tables,
+    slot_mappings,
+    kv_cache_config,
+    seq_lens_cpu_upper_bound=None,
+    dcp_local_seq_lens=None,
+    positions=None,
+    mm_req_doc_ranges=None,
+    model_specific_attn_metadata=None,
+    for_cudagraph_capture=False,
+    causal=True,
+    rswa_prefix_lens=None,
+):
+    del (
+        attn_groups,
+        num_reqs,
+        num_tokens,
+        max_query_len,
+        seq_lens,
+        max_seq_len,
+        block_tables,
+        slot_mappings,
+        kv_cache_config,
+        seq_lens_cpu_upper_bound,
+        dcp_local_seq_lens,
+        positions,
+        mm_req_doc_ranges,
+        model_specific_attn_metadata,
+        for_cudagraph_capture,
+        causal,
+        rswa_prefix_lens,
+    )
+    return CommonAttentionMetadata(
+        query_start_loc_gpu,
+        query_start_loc_cpu,
+    )
+
+
 build_attn_metadata = _build_attn_metadata
 
 
@@ -400,6 +449,62 @@ def _original_prepare_attn(
     )
 
 
+def _prepare_attn_with_request_sizing_drift(
+    self,
+    input_batch,
+    cudagraph_mode,
+    block_tables,
+    slot_mappings,
+    attn_groups,
+    kv_cache_config,
+    for_capture=False,
+):
+    if cudagraph_mode == CUDAGraphMode.FULL:
+        num_reqs = input_batch.num_reqs_after_padding
+        num_tokens = input_batch.num_tokens_after_padding
+    else:
+        # Same signature and audited names, but silently changes request sizing.
+        num_reqs = input_batch.num_reqs + 1
+        num_tokens = input_batch.num_tokens
+    query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+    max_query_len = input_batch.num_scheduled_tokens.max().item()
+    seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+    if for_capture:
+        max_seq_len = self.max_model_len
+    else:
+        max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+    req_doc_ranges = None
+    if (
+        self.supports_mm_inputs
+        and self.encoder_cache is not None
+        and self.model_config.is_mm_prefix_lm
+    ):
+        req_doc_ranges = compute_mm_prefix_ranges(
+            req_ids=input_batch.req_ids,
+            mm_features=self.encoder_cache.mm_features,
+            sliding_window=self.model_config.get_sliding_window(),
+        )
+    return build_attn_metadata(
+        attn_groups=attn_groups,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        query_start_loc_gpu=input_batch.query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        max_query_len=max_query_len,
+        seq_lens=input_batch.seq_lens,
+        max_seq_len=max_seq_len,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_cache_config,
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+        positions=input_batch.positions,
+        mm_req_doc_ranges=req_doc_ranges,
+        for_cudagraph_capture=for_capture,
+        rswa_prefix_lens=input_batch.prompt_lens,
+    )
+
+
 def _fake_default_model_state_module(adapter) -> ModuleType:
     target = ModuleType(adapter.TARGET_MODULE)
 
@@ -426,13 +531,40 @@ def _fake_default_model_state_module(adapter) -> ModuleType:
     return target
 
 
-def test_pcp_default_model_state_slices_metadata_and_propagates_phase() -> None:
+def _source_sha256(function) -> str:
+    source = textwrap.dedent(inspect.getsource(function))
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _accept_synthetic_model_state_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter,
+    target: ModuleType,
+) -> None:
+    monkeypatch.setattr(
+        adapter,
+        "_V0251_PREPARE_ATTN_SOURCE_SHA256",
+        _source_sha256(target.DefaultModelState.prepare_attn),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_V0251_BUILD_ATTN_METADATA_SOURCE_SHA256",
+        _source_sha256(target.build_attn_metadata),
+        raising=False,
+    )
+
+
+def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Trailing virtual rows or missing phase data break MLA classification."""
 
     adapter = importlib.import_module(
         "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
     )
     target = _fake_default_model_state_module(adapter)
+    _accept_synthetic_model_state_sources(monkeypatch, adapter, target)
     assert adapter.apply_to_module(target) is True
     assert adapter.apply_to_module(target) is False
 
@@ -514,6 +646,72 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase() -> None:
         "pcp_one_query_cpu": [0, 1, 3, 9, 9],
         "pcp_one_has_phase_adapter": False,
     }
+
+
+def test_pcp_default_model_state_rejects_same_signature_behavior_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed request-sizing body must fail before wrapper installation."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    target = _fake_default_model_state_module(adapter)
+    _accept_synthetic_model_state_sources(monkeypatch, adapter, target)
+    drifted = FunctionType(
+        _prepare_attn_with_request_sizing_drift.__code__,
+        target.__dict__,
+        name="prepare_attn",
+        argdefs=_prepare_attn_with_request_sizing_drift.__defaults__,
+    )
+    target.DefaultModelState.prepare_attn = drifted
+
+    with pytest.raises(
+        PatchCompatibilityError, match="source fingerprint"
+    ) as error:
+        adapter.apply_to_module(target)
+
+    message = str(error.value)
+    assert adapter.TARGETS[0] in message
+    assert "expected sha256=" in message
+    assert "actual sha256=" in message
+    assert target.DefaultModelState.prepare_attn is drifted
+    assert not hasattr(target.DefaultModelState, "_vllm_hcu_original_prepare_attn")
+    assert not getattr(target, "_vllm_hcu_pcp_model_state_applied", False)
+
+
+def test_pcp_default_model_state_rejects_common_hook_behavior_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A helper that drops model-specific common metadata must fail closed."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    target = _fake_default_model_state_module(adapter)
+    _accept_synthetic_model_state_sources(monkeypatch, adapter, target)
+    original_prepare_attn = target.DefaultModelState.prepare_attn
+    drifted = FunctionType(
+        _build_attn_metadata_without_common_hook.__code__,
+        target.__dict__,
+        name="build_attn_metadata",
+        argdefs=_build_attn_metadata_without_common_hook.__defaults__,
+    )
+    target.build_attn_metadata = drifted
+
+    with pytest.raises(
+        PatchCompatibilityError, match="source fingerprint"
+    ) as error:
+        adapter.apply_to_module(target)
+
+    message = str(error.value)
+    assert adapter.TARGETS[1] in message
+    assert "expected sha256=" in message
+    assert "actual sha256=" in message
+    assert target.build_attn_metadata is drifted
+    assert target.DefaultModelState.prepare_attn is original_prepare_attn
+    assert not hasattr(target.DefaultModelState, "_vllm_hcu_original_prepare_attn")
+    assert not getattr(target, "_vllm_hcu_pcp_model_state_applied", False)
 
 
 def test_pcp_default_model_state_rejects_signature_drift() -> None:
