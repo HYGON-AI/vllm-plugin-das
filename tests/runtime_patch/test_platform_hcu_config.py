@@ -590,6 +590,12 @@ def _make_vllm_module() -> ModuleType:
             self.compilation_config.post_init_cudagraph_sizes()
             return "upstream-result"
 
+        def _get_v2_model_runner_unsupported_features(self) -> list[str]:
+            return []
+
+        def _validate_v2_model_runner(self) -> None:
+            return None
+
     module.VllmConfig = FakeVllmConfig
     module.ModelConfig = _FakeModelConfig
     return module
