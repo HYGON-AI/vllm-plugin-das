@@ -88,3 +88,105 @@ also completed successfully. `ruff` is not installed in this environment.
 - Peak device memory is sampled from aggregate live device usage during each
   request, so Task 8 should run on an otherwise idle eight-HCU host for a clean
   measurement.
+
+## Fix Round 1
+
+Review identified two integration gaps: EvalScope addressed the checkpoint
+path while the server advertised a basename, and post-request liveness relied
+only on the parent process plus deterministic output parity.
+
+### RED: served/request model identity
+
+The new builder contract executed both consumers with the default checkpoint
+and an overridden `VLLM_HCU_GLM52_MODEL`:
+
+```text
+pytest -q tests/integration/server/test_evalscope_glm52_pcp_humaneval.py \
+  -k 'request_model_matches_served_model'
+
+2 failed, 4 deselected
+```
+
+The default case emitted `/models/GLM-5___1-Channel-FP8-w8a8` to EvalScope
+while advertising `GLM-5___1-Channel-FP8-w8a8`; the override case emitted the
+override checkpoint path while retaining that advertised basename.
+
+### GREEN: stable served/request model identity
+
+`server.served_model_name` is now the single stable request-facing identity.
+The server builder adds `--served-model-name` from it and the EvalScope builder
+uses the same value, while `VLLM_HCU_GLM52_MODEL` continues to select the
+checkpoint loaded by `vllm serve`.
+
+```text
+pytest -q tests/integration/server/test_evalscope_glm52_pcp_humaneval.py \
+  -k 'command_request_model_matches_served_model'
+
+2 passed, 4 deselected
+```
+
+### RED: acceptance-path worker-group health check
+
+A CPU integration test started a real loopback SSE completion endpoint and a
+real local `/health` endpoint. With the acceptance path's health call absent,
+the completion succeeded but the health endpoint was never reached:
+
+```text
+pytest -q tests/integration/models/test_glm52_pcp_mrv2.py \
+  -k 'health'
+
+1 failed, 4 deselected
+AssertionError: assert 0 == 1
+```
+
+### GREEN: post-request `/health`
+
+`_stream_completion` now requires an HTTP 200 from the existing OpenAI server
+`/health` endpoint after every smoke and 32K/64K completion. Deterministic token
+parity remains separately asserted; it is not represented as individual-rank
+telemetry.
+
+```text
+pytest -q tests/integration/models/test_glm52_pcp_mrv2.py \
+  -k 'health'
+
+1 passed, 4 deselected
+```
+
+The loopback test declares `NO_PROXY` so the environment's configured HTTP
+proxy cannot intercept the local health contract.
+
+Individual-rank failure evidence remains a Task 8 hardware-log check.
+
+### Fix Round 1 verification
+
+```text
+VLLM_HCU_GLM52_MODEL=/models/GLM-5___1-Channel-FP8-w8a8 \
+pytest --collect-only -q \
+  tests/integration/models/test_glm52_pcp_mrv2.py \
+  tests/integration/server/test_evalscope_glm52_pcp_humaneval.py
+
+11 tests collected
+```
+
+```text
+pytest -q \
+  tests/integration/models/test_glm52_pcp_mrv2.py \
+  tests/integration/server/test_evalscope_report_threshold.py \
+  tests/integration/server/test_evalscope_glm52_pcp_humaneval.py \
+  -k 'command or payload or config or health'
+
+7 passed, 7 deselected
+```
+
+```text
+pytest -q -m 'not hcu' \
+  tests/integration/models/test_glm52_pcp_mrv2.py \
+  tests/integration/server/test_evalscope_report_threshold.py \
+  tests/integration/server/test_evalscope_glm52_pcp_humaneval.py
+
+10 passed, 4 deselected
+```
+
+The modified Python files compile successfully and `git diff --check` is
+clean. No hardware or model server was started.

@@ -121,6 +121,38 @@ def test_glm52_humaneval_request_payload_is_deterministic(
     assert _option_value(command, "--datasets") == "humaneval"
 
 
+@pytest.mark.parametrize(
+    "model_override",
+    [None, "/models/overrides/GLM-5.2-FP8"],
+    ids=["default-model-path", "overridden-model-path"],
+)
+def test_glm52_evalscope_command_request_model_matches_served_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_override: str | None,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_GLM52_HUMANEVAL_CONFIG", raising=False)
+    if model_override is None:
+        monkeypatch.delenv(MODEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(MODEL_ENV, model_override)
+    config = load_config(DEFAULT_CONFIG, "VLLM_HCU_GLM52_HUMANEVAL_CONFIG")
+
+    server, host, port = server_command(config, model_env=MODEL_ENV)
+    evaluation = evalscope_command(
+        config,
+        model_env=MODEL_ENV,
+        host=host,
+        port=port,
+        work_dir=tmp_path,
+    )
+
+    assert _option_value(evaluation, "--model") == _option_value(
+        server,
+        "--served-model-name",
+    )
+
+
 @pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu

@@ -82,6 +82,9 @@ def server_command(
     host = os.environ.get("VLLM_HCU_SERVER_HOST", str(server.get("host", "127.0.0.1")))
     port = _maybe_int_env("VLLM_HCU_SERVER_PORT", int(server.get("port", 10128)))
     args = [str(item) for item in server.get("args", [])]
+    served_model_name = server.get("served_model_name")
+    if served_model_name is not None and "--served-model-name" not in args:
+        args.extend(["--served-model-name", str(served_model_name)])
     if "--port" not in args and "-p" not in args:
         args.extend(["--port", str(port)])
     return ["vllm", "serve", model, *args], host, port
@@ -96,7 +99,12 @@ def evalscope_command(
     work_dir: Path,
 ) -> list[str]:
     evalscope = config["evalscope"]
-    model = _model_path(config, model_env)
+    model = str(
+        config.get("server", {}).get(
+            "served_model_name",
+            _model_path(config, model_env),
+        )
+    )
     generation = evalscope["generation_config"]
     dataset_args = json.dumps(evalscope["dataset_args"], separators=(",", ":"))
     command = [

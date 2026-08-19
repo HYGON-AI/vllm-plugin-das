@@ -7,11 +7,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
@@ -33,6 +35,7 @@ from tests.integration.server.openai_server import OpenAIServer
 
 
 DEFAULT_MODEL = "/models/GLM-5___1-Channel-FP8-w8a8"
+DEFAULT_SERVED_MODEL = "GLM-5___1-Channel-FP8-w8a8"
 MODEL_ENV = "VLLM_HCU_GLM52_MODEL"
 DEFAULT_CONFIG = ROOT / "tests/models/glm52_pcp_humaneval_evalscope.yaml"
 
@@ -44,9 +47,57 @@ class CandidateServer:
     artifact_dir: Path
 
 
-def _chat_payload(request_id: str) -> dict[str, Any]:
+class _HealthHandler(BaseHTTPRequestHandler):
+    health_request_count = 0
+    completion_request_count = 0
+
+    def do_GET(self) -> None:
+        if self.path != "/health":
+            self.send_error(404)
+            return
+        type(self).health_request_count += 1
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_POST(self) -> None:
+        if self.path != "/v1/completions":
+            self.send_error(404)
+            return
+        type(self).completion_request_count += 1
+        content_length = int(self.headers["Content-Length"])
+        payload = json.loads(self.rfile.read(content_length))
+        response_id = f"cmpl-{payload['request_id']}"
+        chunks = [
+            {
+                "id": response_id,
+                "choices": [{"index": 0, "text": "ok", "token_ids": [17]}],
+            },
+            {
+                "id": response_id,
+                "choices": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        body += "data: [DONE]\n\n"
+        encoded = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
+
+
+def _chat_payload(
+    request_id: str,
+    model: str = DEFAULT_SERVED_MODEL,
+) -> dict[str, Any]:
     return {
-        "model": "GLM-5___1-Channel-FP8-w8a8",
+        "model": model,
         "request_id": request_id,
         "messages": [
             {
@@ -62,10 +113,12 @@ def _chat_payload(request_id: str) -> dict[str, Any]:
 
 
 def _completion_payload(
-    prompt_token_ids: list[int], request_id: str
+    prompt_token_ids: list[int],
+    request_id: str,
+    model: str = DEFAULT_SERVED_MODEL,
 ) -> dict[str, Any]:
     return {
-        "model": "GLM-5___1-Channel-FP8-w8a8",
+        "model": model,
         "request_id": request_id,
         "prompt": prompt_token_ids,
         "temperature": 0,
@@ -85,6 +138,56 @@ def test_glm52_smoke_payload_contract() -> None:
     assert payload["return_token_ids"] is True
 
 
+def test_stream_completion_checks_worker_group_health_after_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    _HealthHandler.health_request_count = 0
+    _HealthHandler.completion_request_count = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        host, port = server.server_address
+        candidate = CandidateServer(
+            api=OpenAIServer(
+                base_url=f"http://{host}:{port}",
+                model_name=DEFAULT_SERVED_MODEL,
+                log_path=tmp_path / "unused.log",
+            ),
+            process=process,
+            artifact_dir=tmp_path,
+        )
+
+        record = _stream_completion(
+            candidate,
+            "/v1/completions",
+            _completion_payload([11], "health-contract"),
+        )
+
+        assert record["token_ids"] == [17]
+        assert _HealthHandler.completion_request_count == 1
+        assert _HealthHandler.health_request_count == 1
+    finally:
+        _terminate_process_group(process, timeout_s=1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _assert_worker_group_healthy(api: OpenAIServer) -> None:
+    response = api.get_text("/health", timeout_s=30)
+    assert response.status == 200, (
+        f"worker-group health check failed with status={response.status}: "
+        f"{response.text[:1000]!r}; server_log={api.log_path}"
+    )
+
+
 @contextmanager
 def _serve_candidate(
     resources: HcuTestResources,
@@ -97,6 +200,7 @@ def _serve_candidate(
         hcu_count=8,
     )
     config = load_config(DEFAULT_CONFIG, "VLLM_HCU_GLM52_HUMANEVAL_CONFIG")
+    served_model_name = str(config["server"]["served_model_name"])
     command, host, port = server_command(config, model_env=MODEL_ENV)
     environment = _server_environment(config)
     artifact_dir = Path(
@@ -124,7 +228,7 @@ def _serve_candidate(
             yield CandidateServer(
                 api=OpenAIServer(
                     base_url=f"http://{host}:{port}",
-                    model_name="GLM-5___1-Channel-FP8-w8a8",
+                    model_name=served_model_name,
                     log_path=server_log_path,
                 ),
                 process=process,
@@ -217,7 +321,8 @@ def _stream_completion(
     assert response_id.endswith(payload["request_id"])
     assert token_ids, "the request must decode at least one token"
     assert first_token_at is not None
-    assert candidate.process.poll() is None, "a PCP worker rank exited during decode"
+    assert candidate.process.poll() is None, "the server process exited during decode"
+    _assert_worker_group_healthy(candidate.api)
     latency = finished - started
     prompt_count = int(usage.get("prompt_tokens", len(prompt_token_ids or [])))
     completion_count = int(usage.get("completion_tokens", len(token_ids)))
@@ -252,7 +357,7 @@ def test_glm52_pcp_deterministic_smoke(
     glm52_candidate_server: CandidateServer,
     request_id: str,
 ) -> None:
-    payload = _chat_payload(request_id)
+    payload = _chat_payload(request_id, glm52_candidate_server.api.model_name)
     payload["stream"] = True
     payload["stream_options"] = {"include_usage": True}
     first = _stream_completion(
@@ -267,18 +372,19 @@ def test_glm52_pcp_deterministic_smoke(
         second_payload,
     )
 
-    rank_converged = (
+    deterministic_token_parity = (
         glm52_candidate_server.process.poll() is None
         and first["token_ids"] == second["token_ids"]
     )
-    assert rank_converged
+    assert deterministic_token_parity
     _write_metrics(
         glm52_candidate_server,
         request_id,
         {
             "first": first,
             "second": second,
-            "rank_divergence": not rank_converged,
+            "deterministic_token_parity": deterministic_token_parity,
+            "worker_group_healthy": True,
         },
     )
 
@@ -318,7 +424,11 @@ def test_glm52_pcp_long_context_decodes_after_prefill(
     record = _stream_completion(
         glm52_candidate_server,
         "/v1/completions",
-        _completion_payload(repeated, request_id),
+        _completion_payload(
+            repeated,
+            request_id,
+            glm52_candidate_server.api.model_name,
+        ),
     )
 
     assert record["prompt_token_count"] == prompt_tokens
