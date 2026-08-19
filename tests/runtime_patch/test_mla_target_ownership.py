@@ -745,6 +745,12 @@ def test_dense_and_sparse_mla_metadata_carry_pcp_world_size(monkeypatch):
     sparse_module = ModuleType(sparse_adapter.TARGET_MODULE)
     sparse_module.FlashMLASparseMetadataBuilder = FlashMLASparseMetadataBuilder
     sparse_module.FlashMLASparseImpl = FlashMLASparseImpl
+    sparse_module.split_decodes_and_prefills = (
+        lambda common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True: (0, 0, 0, 0)
+    )
     sparse_module.current_platform = SimpleNamespace(is_rocm=lambda: False)
     sparse_module.torch = torch
     assert sparse_adapter.apply_to_module(sparse_module) is True

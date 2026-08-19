@@ -22,6 +22,7 @@ TARGETS = (
     f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder.build",
     f"{TARGET_MODULE}.FlashMLASparseImpl._fp8_flash_mla_kernel",
     f"{TARGET_MODULE}.FlashMLASparseImpl._bf16_flash_mla_kernel",
+    f"{TARGET_MODULE}.split_decodes_and_prefills",
 )
 _MARKER = "_vllm_hcu_flashmla_sparse_applied"
 _WRAPPER = "_vllm_hcu_flashmla_sparse_wrapper"
@@ -60,6 +61,24 @@ def apply_to_module(module: ModuleType) -> bool:
             "topk_length",
         ),
         defaults={"topk_length": None},
+    )
+    split_decodes_and_prefills = require_callable(
+        flash, "split_decodes_and_prefills", TARGETS[3]
+    )
+    require_exact_signature(
+        split_decodes_and_prefills,
+        TARGETS[3],
+        positional=(
+            "common_attn_metadata",
+            "decode_threshold",
+            "require_uniform",
+            "treat_short_extends_as_decodes",
+        ),
+        defaults={
+            "decode_threshold": 1,
+            "require_uniform": False,
+            "treat_short_extends_as_decodes": True,
+        },
     )
     # Swap only the function bindings consumed by this backend.  The official
     # backend class remains registered and no global module alias is installed.
@@ -107,6 +126,21 @@ def apply_to_module(module: ModuleType) -> bool:
                     "is missing from sparse MLA metadata builder"
                 )
             result.pcp_world_size = int(pcp_world_size)
+        if result.pcp_world_size > 1:
+            (
+                result.num_decodes,
+                result.num_prefills,
+                result.num_decode_tokens,
+                _,
+            ) = split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=getattr(
+                    self, "reorder_batch_threshold", None
+                )
+                or 1,
+                require_uniform=True,
+                treat_short_extends_as_decodes=False,
+            )
         return result
 
     @functools.wraps(fp8)
