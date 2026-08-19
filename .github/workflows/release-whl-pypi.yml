@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: hcu-release-pypi
+
+on:
+  push:
+    branches:
+      - v0.25.1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-release-pypi-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TORCH_VERSION: "2.11.0"
+  PIP_INDEX: ${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/
+  DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+
+jobs:
+  compile:
+    # 需要 docker 与内网 pip 源访问能力的自托管 runner
+    runs-on: self-hosted
+    container:
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      options: >-
+        --volume /opt/hyhal:/opt/hyhal:ro
+        --device /dev/kfd:/dev/kfd
+        --device /dev/dri:/dev/dri
+        --cap-add=SYS_PTRACE
+        --privileged
+    steps:
+      - name: 准备构建工具
+        run: |
+          apt-get update -y >/dev/null && apt-get install -y --no-install-recommends git ca-certificates >/dev/null || true
+          TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
+          mkdir -p ~/.pip && printf '%s\n' \
+            '[global]' \
+            "index-url = ${PIP_INDEX}" \
+            "trusted-host = ${TRUSTED_HOST}" \
+            > ~/.pip/pip.conf
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install DTK
+        run: |
+          cd /opt
+          wget -q $DTK_PKG_URL
+          tar -xzf $(basename $DTK_PKG_URL)
+          mv dtk-* dtk
+
+      - name: install deps
+        run: |
+          pip install --no-cache-dir torch==${TORCH_VERSION} ninja wheel setuptools ciupload
+
+      - name: build wheel
+        run: |
+          source /opt/dtk/env.sh
+          python3 setup.py bdist_wheel
+
+      - name: Apply DAS local version to wheels
+        run: |
+          DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+          WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
+          CIUpload REPAIR \
+            --dtk_version "${DTK_VER}" \
+            --torch_version "${TORCH_VERSION}" \
+            --git_commit "${WHEEL_COMMIT_SHA}" \
+            --outputdir output \
+            -f dist/*.whl
+          CIUpload --devpi_url ${{ vars.PYPI_URL }} --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+
+      # 容器内以 root 运行, workspace 里的文件会归 root 所有,
+      # 宿主机 job (release-docker-image) 的 checkout 无法清理, 退出前清空
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
