@@ -434,6 +434,63 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     )
 
 
+@pytest.mark.parametrize(
+    ("use_v2", "expected_module", "expected_class"),
+    [
+        (True, "vllm_hcu.v1.hcu_model_runner_v2", "HcuGPUModelRunnerV2"),
+        (False, "vllm_hcu.v1.hcu_model_runner", "GPUModelRunner"),
+    ],
+)
+def test_worker_selects_plugin_owned_model_runner(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+    use_v2,
+    expected_module,
+    expected_class,
+):
+    events: list[tuple[object, object]] = []
+    runner_module = ModuleType(expected_module)
+
+    class Runner:
+        def __init__(self, config, device):
+            events.append((config, device))
+
+    setattr(runner_module, expected_class, Runner)
+    monkeypatch.setitem(sys.modules, expected_module, runner_module)
+    config = object()
+    device = object()
+
+    result = cpu_safe_hcu_worker_module._create_model_runner(
+        config,
+        device,
+        use_v2_model_runner=use_v2,
+    )
+
+    assert isinstance(result, Runner)
+    assert events == [(config, device)]
+
+
+def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
+    upstream_name = "vllm.v1.worker.gpu.model_runner"
+    adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
+    upstream_module = ModuleType(upstream_name)
+
+    class UpstreamGPUModelRunner:
+        def execute_model(self):
+            return "upstream"
+
+    upstream_module.GPUModelRunner = UpstreamGPUModelRunner
+    monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
+    monkeypatch.delitem(sys.modules, adapter_name, raising=False)
+
+    adapter_module = importlib.import_module(adapter_name)
+    adapter = adapter_module.HcuGPUModelRunnerV2
+
+    assert issubclass(adapter, UpstreamGPUModelRunner)
+    assert adapter().execute_model() == "upstream"
+    assert "execute_model" not in adapter.__dict__
+
+
 def test_worker_does_not_terminal_validate_after_failed_parent_load(
     monkeypatch,
     cpu_safe_hcu_worker_module,

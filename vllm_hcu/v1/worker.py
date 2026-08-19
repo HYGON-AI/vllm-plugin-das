@@ -23,6 +23,22 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _create_model_runner(
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *,
+    use_v2_model_runner: bool,
+):
+    if use_v2_model_runner:
+        from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
+
+        return HcuGPUModelRunnerV2(vllm_config, device)
+
+    from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
+
+    return GPUModelRunner(vllm_config, device)
+
+
 class HcuGPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HCU.
     Each worker is associated with a single HCU. In case of
@@ -137,21 +153,11 @@ class HcuGPUWorker(Worker):
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
-        if self.use_v2_model_runner:
-            from vllm.v1.worker.gpu.model_runner import (
-                GPUModelRunner as GPUModelRunnerV2,
-            )
-
-            # HACK(woosuk): This is a temporary fix to avoid type errors.
-            self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
-                self.vllm_config, self.device
-            )
-        else:
-            from vllm_hcu.v1.hcu_model_runner import (
-                GPUModelRunner as GPUModelRunnerV1,
-            )
-
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+        self.model_runner: GPUModelRunner = _create_model_runner(  # type: ignore
+            self.vllm_config,
+            self.device,
+            use_v2_model_runner=self.use_v2_model_runner,
+        )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
