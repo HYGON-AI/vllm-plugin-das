@@ -26,6 +26,8 @@ The first release supports only this configuration family:
 - No LoRA, multimodal inputs, P/D disaggregation, KV offload, or data
   parallelism. Expert parallelism is supported and required by the acceptance
   topology.
+- HCU lightly-CP is disabled; it is a separate context-parallel algorithm and
+  cannot be combined with PCP in this release.
 
 The public interface remains vLLM's existing
 `--prefill-context-parallel-size`; the plugin does not add a second PCP flag.
@@ -248,7 +250,7 @@ separate designs and are explicitly outside this work.
 ## Out of Scope
 
 - PCP combined with PP, MTP, DCP, DP, CUDA/HIP graphs, LoRA, multimodal input,
-  P/D disaggregation, or KV offload.
+  P/D disaggregation, KV offload, or HCU lightly-CP.
 - PCP support for GQA, MHA, hybrid attention, sliding-window attention, Mamba,
   or non-causal models.
 - Multi-node PCP.
