@@ -24,7 +24,11 @@ def _load_model_helpers():
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name
-        in {"_try_load_quantized_indexer_wk", "_rewrite_stacked_param_name"}
+        in {
+            "_is_local_indexer_weight",
+            "_try_load_quantized_indexer_wk",
+            "_rewrite_stacked_param_name",
+        }
     ]
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
@@ -93,6 +97,38 @@ def test_quantized_indexer_wk_loader_source_contract_rejects_bad_scale_shape():
             {},
             set(),
         )
+
+
+def test_quantized_indexer_wk_loader_skips_pp_missing_layer_before_buffering():
+    loader = _load_model_helpers()["_try_load_quantized_indexer_wk"]
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    loaded: set[str] = set()
+
+    assert loader(
+        "model.layers.0.self_attn.indexer.wk.weight",
+        torch.ones((4, 8), dtype=torch.int8),
+        pending,
+        {},
+        loaded,
+        pp_missing_layer_names=("model.layers.0",),
+    )
+    assert pending == {}
+    assert loaded == set()
+
+
+def test_local_indexer_weight_filter_is_layer_specific():
+    is_local = _load_model_helpers()["_is_local_indexer_weight"]
+    local_prefixes = {"model.layers.40.self_attn"}
+
+    assert is_local(
+        "model.layers.40.self_attn.indexer.wk.weight",
+        local_prefixes,
+    )
+    assert not is_local(
+        "model.layers.41.self_attn.indexer.wk.weight",
+        local_prefixes,
+    )
+    assert is_local("model.layers.41.mlp.down_proj.weight", local_prefixes)
 
 
 def test_stacked_name_rewrite_source_contract_is_component_bounded():

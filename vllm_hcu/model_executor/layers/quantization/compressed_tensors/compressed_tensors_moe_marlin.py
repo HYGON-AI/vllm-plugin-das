@@ -297,20 +297,25 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
             return
 
-        w1_marlin_list = []
-        for ii in range(layer.w13_weight.shape[0]):
-            w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
-            w1_marlin_list.append(w1_marlin_in.float() if w1_marlin_in.dtype == torch.float8_e4m3fn else w1_marlin_in)
-        w1_marlin = torch.stack(w1_marlin_list, dim=0)
-        w1_marlin = fp32_to_fp8_e4m3fn(w1_marlin)
-
-        del w1_marlin_list
-        w2_marlin_list = []
-        for ii in range(layer.w2_weight.shape[0]):
-            w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
-            w2_marlin_list.append(w2_marlin_in.float() if w2_marlin_in.dtype == torch.float8_e4m3fn else w2_marlin_in)
-        w2_marlin = torch.stack(w2_marlin_list, dim=0)
-        w2_marlin = fp32_to_fp8_e4m3fn(w2_marlin)
+        # The checkpoint tensors are already FP8.  Repacking only permutes the
+        # weight layout, so widening every expert to FP32 and converting it
+        # back to FP8 is both numerically redundant and extremely expensive:
+        # a GLM-5.1 TP1 MoE layer needs a 24-GiB temporary allocation.  Stack
+        # the permuted FP8 tensors directly to keep the peak at FP8 size.
+        w1_marlin = torch.stack(
+            [
+                get_w8a8_int8_marlin_weights(weight)
+                for weight in layer.w13_weight
+            ],
+            dim=0,
+        )
+        w2_marlin = torch.stack(
+            [
+                get_w8a8_int8_marlin_weights(weight)
+                for weight in layer.w2_weight
+            ],
+            dim=0,
+        )
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
 

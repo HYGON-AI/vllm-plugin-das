@@ -30,9 +30,14 @@ def _create_model_runner(
     use_v2_model_runner: bool,
 ):
     if use_v2_model_runner:
-        from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
+        from vllm_hcu.v1.hcu_model_runner_v2 import (
+            HcuGPUModelRunnerV2,
+            install_fixed_width_pp_sample_broadcast,
+        )
 
-        return HcuGPUModelRunnerV2(vllm_config, device)
+        runner = HcuGPUModelRunnerV2(vllm_config, device)
+        install_fixed_width_pp_sample_broadcast(runner)
+        return runner
 
     from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
 
@@ -75,7 +80,21 @@ class HcuGPUWorker(Worker):
         from vllm_hcu.patch.worker import validate_worker_patches
 
         validate_worker_patches(require_applied=True)
-    
+
+    def compile_or_warm_up_model(self):
+        if (
+            self.use_v2_model_runner
+            and self.parallel_config.pipeline_parallel_size > 1
+            and self.vllm_config.speculative_config is not None
+        ):
+            from vllm_hcu.v1.worker_framework_runtime import (
+                suppress_pp_v2_warmup_sample_broadcast,
+            )
+
+            with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
+                return super().compile_or_warm_up_model()
+        return super().compile_or_warm_up_model()
+
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
@@ -120,6 +139,14 @@ class HcuGPUWorker(Worker):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            from vllm import envs
+
+            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+                from vllm_hcu.v1.worker_framework_runtime import (
+                    install_split_group_backend_compat,
+                )
+
+                install_split_group_backend_compat(torch.distributed)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,

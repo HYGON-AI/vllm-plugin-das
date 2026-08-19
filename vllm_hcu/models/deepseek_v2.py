@@ -110,6 +110,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    get_pp_missing_layer_names,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -863,8 +864,22 @@ class Indexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
+def _is_local_indexer_weight(
+    name: str,
+    indexer_present_prefixes: set[str],
+) -> bool:
+    if ".indexer." not in name:
+        return True
+    return name.rsplit(".indexer.", 1)[0] in indexer_present_prefixes
+
+
 def _try_load_quantized_indexer_wk(
-    name, tensor, buf, params_dict, loaded_params
+    name,
+    tensor,
+    buf,
+    params_dict,
+    loaded_params,
+    pp_missing_layer_names=(),
 ):
     """
     We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
@@ -882,8 +897,15 @@ def _try_load_quantized_indexer_wk(
     )
     if not is_weight and not is_scale:
         return False  # WK is not in a supported quantized format, ignore.
-    # Buffer this tensor (weight or scale) until both have arrived.
     layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
+
+    # Buffer this tensor (weight or scale) until both have arrived.
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -915,7 +937,6 @@ def _try_load_quantized_indexer_wk(
     del buf[layer_prefix]
 
     # Load the dequantized weight into shard 0 of the fused buffer.
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1547,6 +1568,7 @@ class DeepseekV2Model(nn.Module):
             num_redundant_experts=self.num_redundant_experts,
         )
 
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         use_fused_indexer = any(
@@ -1560,15 +1582,16 @@ class DeepseekV2Model(nn.Module):
                     ("wk_weights_proj", "weights_proj", 1),
                 ]
             )
-        # Determine whether to load the indexer weight
-        model_has_indexer = any("indexer" in param_name for param_name in params_dict.keys())
+        indexer_present_prefixes = {
+            name.rsplit(".indexer.", 1)[0]
+            for name in params_dict
+            if ".indexer." in name
+        }
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             
-            #  Skip loading indexer weights
-            if "indexer" in name and not model_has_indexer:
-                logger.info(f"Skipping indexer weight (DSA disabled): {name}")
+            if not _is_local_indexer_weight(name, indexer_present_prefixes):
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -1585,6 +1608,7 @@ class DeepseekV2Model(nn.Module):
                 _pending_quantized_wk,
                 params_dict,
                 loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 

@@ -13,6 +13,7 @@ import copy
 import dataclasses
 import inspect
 import json
+import math
 import multiprocessing
 import os
 import pickle
@@ -887,6 +888,56 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
         parameters = tuple(inspect.signature(method).parameters)
         assert parameters[: len(target_prefix)] == target_prefix
         assert parameters[len(target_prefix) :] == ("i_q", "i_s")
+
+
+def test_slimquant_fp8_moe_repack_preserves_fp8_without_widening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as moe_marlin,
+    )
+
+    method = object.__new__(
+        moe_marlin.CompressedTensorsW8A8FP8MarlinMoEMethod
+    )
+    method.use_deepep = False
+
+    def fp8_parameter(shape: tuple[int, ...]) -> torch.nn.Parameter:
+        values = torch.linspace(-1.0, 1.0, math.prod(shape)).reshape(shape)
+        return torch.nn.Parameter(
+            values.to(torch.float8_e4m3fn), requires_grad=False
+        )
+
+    layer = SimpleNamespace(
+        w13_weight=fp8_parameter((2, 128, 64)),
+        w2_weight=fp8_parameter((2, 64, 64)),
+    )
+    expected_w13 = torch.stack(
+        [
+            moe_marlin.get_w8a8_int8_marlin_weights(weight)
+            for weight in layer.w13_weight
+        ]
+    )
+    expected_w2 = torch.stack(
+        [
+            moe_marlin.get_w8a8_int8_marlin_weights(weight)
+            for weight in layer.w2_weight
+        ]
+    )
+
+    def reject_widening(_tensor: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("FP8 checkpoint weights must not widen through FP32")
+
+    monkeypatch.setattr(
+        moe_marlin, "fp32_to_fp8_e4m3fn", reject_widening
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight.dtype == torch.float8_e4m3fn
+    assert layer.w2_weight.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(layer.w13_weight.float(), expected_w13.float())
+    torch.testing.assert_close(layer.w2_weight.float(), expected_w2.float())
 
 
 class _HashableConfig:

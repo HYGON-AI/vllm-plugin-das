@@ -4,7 +4,74 @@
 
 from __future__ import annotations
 
+import functools
 import importlib
+import inspect
+from contextlib import contextmanager
+
+
+_SPLIT_GROUP_COMPAT_MARKER = "_vllm_hcu_backend_compat"
+
+
+def install_split_group_backend_compat(distributed: object) -> bool:
+    """Adapt vLLM's split_group call to Torch versions without ``backend``.
+
+    Torch 2.11 removed the keyword while vLLM 0.25.1 still supplies it.  The
+    vLLM split-group path creates a device-bound parent process group with
+    both Gloo and NCCL backends, so children can inherit those backends when
+    the obsolete selector is omitted.
+    """
+
+    split_group = getattr(distributed, "split_group")
+    if getattr(split_group, _SPLIT_GROUP_COMPAT_MARKER, False):
+        return False
+    try:
+        parameters = inspect.signature(split_group).parameters
+    except (TypeError, ValueError):
+        return False
+    if "backend" in parameters:
+        return False
+
+    @functools.wraps(split_group)
+    def split_group_compat(*args, backend=None, **kwargs):
+        del backend
+        return split_group(*args, **kwargs)
+
+    setattr(split_group_compat, _SPLIT_GROUP_COMPAT_MARKER, True)
+    setattr(distributed, "split_group", split_group_compat)
+    return True
+
+
+@contextmanager
+def suppress_pp_v2_warmup_sample_broadcast(model_runner: object):
+    """Skip synthetic sampled-token broadcasts during PP+spec warmup.
+
+    MRV2 warmup drives each PP rank with synthetic scheduler state.  With
+    speculative decoding, that state can make a non-last rank enqueue a
+    sampled-token receive when the last rank skips the matching broadcast.
+    The unmatched side-stream collective survives warmup and stalls the first
+    real request.  No rank consumes warmup samples, so suppress both sides and
+    retain the terminal device sync as a check that all real work completed.
+    """
+
+    pp_handler = getattr(model_runner, "pp_handler")
+    receive = getattr(pp_handler, "receive")
+    broadcast = getattr(pp_handler, "broadcast")
+    suppress_attr = "_vllm_hcu_suppress_pp_spec_draft_sync"
+    missing = object()
+    previous_suppress = getattr(model_runner, suppress_attr, missing)
+    setattr(model_runner, suppress_attr, True)
+    setattr(pp_handler, "receive", lambda *args, **kwargs: False)
+    setattr(pp_handler, "broadcast", lambda *args, **kwargs: None)
+    try:
+        yield
+    finally:
+        setattr(pp_handler, "receive", receive)
+        setattr(pp_handler, "broadcast", broadcast)
+        if previous_suppress is missing:
+            delattr(model_runner, suppress_attr)
+        else:
+            setattr(model_runner, suppress_attr, previous_suppress)
 
 
 def share_eagle_topk_buffer(target_model: object, eagle_model: object) -> object:
@@ -128,6 +195,8 @@ def maybe_create_ubatch_slices(
 __all__ = [
     "create_sm_control_context_without_compute",
     "deep_gemm_has_sms_api",
+    "install_split_group_backend_compat",
     "maybe_create_ubatch_slices",
     "share_eagle_topk_buffer",
+    "suppress_pp_v2_warmup_sample_broadcast",
 ]

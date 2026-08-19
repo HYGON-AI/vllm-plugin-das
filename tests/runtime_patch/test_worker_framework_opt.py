@@ -20,6 +20,7 @@ import torch
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import PatchRegistry
+from vllm_hcu.v1 import worker_framework_runtime
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all,
     patch_base_device_communicator,
@@ -1043,6 +1044,195 @@ def test_ubatch_sms_guard_disables_only_missing_compute_control(
     )
     patch_gpu_ubatch_wrapper.apply_to_module(module)
     assert UBatchWrapper._create_sm_control_context(object()) == "hcu-no-compute-sms"
+
+
+def test_split_group_compat_drops_removed_backend_keyword() -> None:
+    calls: list[dict[str, object]] = []
+
+    def torch_211_split_group(
+        parent_pg=None,
+        split_ranks=None,
+        timeout=None,
+        pg_options=None,
+        group_desc=None,
+    ):
+        calls.append(
+            {
+                "parent_pg": parent_pg,
+                "split_ranks": split_ranks,
+                "timeout": timeout,
+                "pg_options": pg_options,
+                "group_desc": group_desc,
+            }
+        )
+        return "group"
+
+    distributed = SimpleNamespace(split_group=torch_211_split_group)
+
+    assert worker_framework_runtime.install_split_group_backend_compat(
+        distributed
+    )
+    assert not worker_framework_runtime.install_split_group_backend_compat(
+        distributed
+    )
+    assert (
+        distributed.split_group(
+            split_ranks=[[0, 1]],
+            group_desc="pp:device",
+            backend="cuda:nccl",
+        )
+        == "group"
+    )
+    assert calls == [
+        {
+            "parent_pg": None,
+            "split_ranks": [[0, 1]],
+            "timeout": None,
+            "pg_options": None,
+            "group_desc": "pp:device",
+        }
+    ]
+
+
+def test_split_group_compat_preserves_native_backend_signature() -> None:
+    def split_group(*, backend=None):
+        return backend
+
+    distributed = SimpleNamespace(split_group=split_group)
+
+    assert not worker_framework_runtime.install_split_group_backend_compat(
+        distributed
+    )
+    assert distributed.split_group(backend="cuda:nccl") == "cuda:nccl"
+
+
+def test_pp_v2_spec_warmup_suppresses_and_restores_sample_broadcast() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class PPHandler:
+        def receive(self, input_batch: object) -> bool:
+            calls.append(("receive", input_batch))
+            return True
+
+        def broadcast(self, sampled_tokens: object) -> None:
+            calls.append(("broadcast", sampled_tokens))
+
+    handler = PPHandler()
+    receive = handler.receive
+    broadcast = handler.broadcast
+    model_runner = SimpleNamespace(pp_handler=handler)
+
+    with worker_framework_runtime.suppress_pp_v2_warmup_sample_broadcast(
+        model_runner
+    ):
+        assert model_runner._vllm_hcu_suppress_pp_spec_draft_sync is True
+        assert handler.receive("input") is False
+        assert handler.broadcast("tokens") is None
+        assert calls == []
+
+    assert not hasattr(model_runner, "_vllm_hcu_suppress_pp_spec_draft_sync")
+    assert handler.receive == receive
+    assert handler.broadcast == broadcast
+    assert handler.receive("input") is True
+    handler.broadcast("tokens")
+    assert calls == [("receive", "input"), ("broadcast", "tokens")]
+
+
+def test_pp_v2_spec_broadcast_pads_initial_sample_to_receiver_width() -> None:
+    from vllm_hcu.v1 import hcu_model_runner_v2
+
+    install_fixed_width_pp_sample_broadcast = (
+        hcu_model_runner_v2.install_fixed_width_pp_sample_broadcast
+    )
+
+    captured: list[torch.Tensor] = []
+
+    class PPHandler:
+        is_last_rank = True
+        max_sample_len = 6
+
+        def broadcast(self, sampled_token_ids: torch.Tensor, *args, **kwargs):
+            captured.append(sampled_token_ids)
+
+    handler = PPHandler()
+    runner = SimpleNamespace(pp_handler=handler)
+
+    assert install_fixed_width_pp_sample_broadcast(runner)
+    assert not install_fixed_width_pp_sample_broadcast(runner)
+    handler.broadcast(
+        torch.tensor([[42]], dtype=torch.int64),
+        object(),
+        object(),
+        object(),
+    )
+
+    assert len(captured) == 1
+    assert captured[0].shape == (1, 6)
+    assert captured[0].dtype == torch.int64
+    assert captured[0][0, 0].item() == 42
+    assert captured[0][0, 1:].tolist() == [0, 0, 0, 0, 0]
+
+
+def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.v1 import hcu_model_runner_v2
+
+    calls: list[tuple[str, object]] = []
+    payload = torch.tensor([[101, 102, 103]], dtype=torch.int64)
+
+    class Stream:
+        def wait_stream(self, stream: object) -> None:
+            calls.append(("wait", stream))
+
+        def synchronize(self) -> None:
+            calls.append(("sync", self))
+
+    main_stream = object()
+    broadcast_stream = Stream()
+    handler = SimpleNamespace(
+        is_last_rank=False,
+        last_rank=7,
+        broadcast_group="draft-group",
+        broadcast_stream=broadcast_stream,
+        main_stream=main_stream,
+    )
+    runner = SimpleNamespace(
+        pp_handler=handler,
+        num_speculative_steps=3,
+        device=torch.device("cpu"),
+        req_states=SimpleNamespace(
+            draft_tokens=torch.zeros((4, 3), dtype=torch.int64)
+        ),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=torch.tensor([2], dtype=torch.int64),
+    )
+
+    monkeypatch.setattr(
+        hcu_model_runner_v2.torch.cuda,
+        "stream",
+        lambda stream: contextlib.nullcontext(),
+    )
+
+    def broadcast(tensor, *, src, group):
+        calls.append(("broadcast", (src, group)))
+        tensor.copy_(payload)
+
+    monkeypatch.setattr(
+        hcu_model_runner_v2.torch.distributed, "broadcast", broadcast
+    )
+
+    assert hcu_model_runner_v2.synchronize_pp_spec_draft_tokens(
+        runner, input_batch
+    )
+    assert runner.req_states.draft_tokens[2].tolist() == [101, 102, 103]
+    assert calls == [
+        ("wait", main_stream),
+        ("broadcast", (7, "draft-group")),
+        ("sync", broadcast_stream),
+    ]
 
 
 def _fake_ubatch_module() -> ModuleType:

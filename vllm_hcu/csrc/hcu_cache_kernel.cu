@@ -879,7 +879,10 @@ void concat_and_cache_mla_hcu(
                                CALL_CONCAT_AND_CACHE_DS_MLA_HCU);
   } else {
     dim3 grid(num_tokens);
-    dim3 block(std::min(kv_lora_rank, 512));
+    // gfx938 HCU kernels are compiled with a 256-thread launch bound.  The
+    // kernel loops over the feature dimension with a blockDim.x stride, so a
+    // 256-thread block still covers kv_lora_rank=512 without changing output.
+    dim3 block(std::min(kv_lora_rank, 256));
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_MLA_HCU);
   }
