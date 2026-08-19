@@ -1989,6 +1989,49 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         shared_experts._layer = SharedLayer()
         value = shared_experts._run_layer(hidden, (quanted, scale))
         assert torch.equal(value, hidden + 2)
+
+        class PCPGroup:
+            def __init__(self):
+                self.gathers = 0
+                self.reduce_scatters = 0
+
+            def all_gather(self, tensor, dim=0):
+                del tensor
+                assert dim == 0
+                self.gathers += 1
+                raise AssertionError("all-to-all kernel must consume PCP-local input")
+
+            def reduce_scatter(self, tensor, dim=0):
+                del tensor
+                assert dim == 0
+                self.reduce_scatters += 1
+                raise AssertionError("all-to-all kernel must produce PCP-local output")
+
+        pcp_group = PCPGroup()
+        runner = object.__new__(runner_module.MoERunner)
+        runner.moe_config = SimpleNamespace(
+            pcp_size=2,
+            dp_size=1,
+            is_sequence_parallel=False,
+            moe_parallel_config=SimpleNamespace(use_all2all_kernels=True),
+        )
+        runner.routed_experts = SimpleNamespace(
+            quant_method=SimpleNamespace(supports_internal_mk=False),
+        )
+        runner._shared_experts = None
+        runner_module.get_pcp_group = lambda: pcp_group
+        local_hidden = torch.tensor([[10.0], [20.0]])
+        local_logits = torch.tensor([[1.0], [2.0]])
+        dispatched_hidden, dispatched_logits = runner._maybe_dispatch(
+            local_hidden, local_logits
+        )
+        combined = runner._maybe_combine(None, dispatched_hidden)
+        assert torch.equal(dispatched_hidden, local_hidden)
+        assert torch.equal(dispatched_logits, local_logits)
+        assert torch.equal(combined, local_hidden)
+        assert pcp_group.gathers == 0
+        assert pcp_group.reduce_scatters == 0
+
         shared_source = inspect.getsource(shared_module.SharedExperts)
         assert "_output_pending_on_stream" in shared_source
         assert "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH" in shared_source
