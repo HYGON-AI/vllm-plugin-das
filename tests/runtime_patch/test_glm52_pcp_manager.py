@@ -13,6 +13,7 @@ import torch
 
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm_hcu.patch.config import HcuFeatureConfig
+from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.v1.pcp_manager import (
     HcuPCPManager,
     RankSegment,
@@ -334,6 +335,8 @@ def test_partition_pads_each_rank_to_equal_width_and_remaps_logits() -> None:
             if count > 0
         ]
         assert local.logits_indices.tolist() == nonempty_stops
+        assert local.expanded_local_pos.dtype == torch.int32
+        assert local.expanded_local_pos.tolist() == [0] * len(nonempty_stops)
         assert local.cu_num_logits_np.tolist() == np.cumsum(
             [0]
             + [int(count > 0) for count in local.num_scheduled_tokens]
@@ -399,6 +402,36 @@ def test_prepare_attn_uses_local_rows_but_global_kv_slot_ownership() -> None:
         assert sorted(written_slots) == list(range(1000, 1008)) + [1116]
     for actual, expected in zip(block_tables.input_block_tables, runner_owned_tables):
         assert torch.equal(actual, expected)
+
+
+def test_prepare_attn_rejects_missing_canonical_block_storage() -> None:
+    """Falling back to gathered scratch rows could consume stale block IDs."""
+
+    block_tables = _InMemoryBlockTables()
+    managers, _ = _make_managers(block_tables=block_tables)
+    local_batch = managers[0].partition_batch(
+        _make_batch([("prefill", list(range(100, 108)), 8, True)])
+    )
+    del block_tables.block_tables
+
+    with pytest.raises(PatchCompatibilityError, match="canonical block_tables"):
+        managers[0].prepare_attn(local_batch)
+
+
+def test_prepare_attn_rejects_kv_group_count_mismatch() -> None:
+    """Silently truncating a KV group would leave its local table unprepared."""
+
+    block_tables = _InMemoryBlockTables()
+    block_tables.block_tables.append(
+        SimpleNamespace(gpu=block_tables.block_tables[0].gpu.clone())
+    )
+    managers, _ = _make_managers(block_tables=block_tables)
+    local_batch = managers[0].partition_batch(
+        _make_batch([("prefill", list(range(100, 108)), 8, True)])
+    )
+
+    with pytest.raises(PatchCompatibilityError, match="KV-group count"):
+        managers[0].prepare_attn(local_batch)
 
 
 def test_optional_helpers_are_true_noops_without_a_manager() -> None:

@@ -18,6 +18,7 @@ import torch
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
     _validate_hcu_pcp_scope,
 )
@@ -385,9 +386,9 @@ class HcuPCPManager:
         expanded_idx_mapping = local_idx_mapping[
             torch.from_numpy(nonempty_rows).to(self.device)
         ]
-        expanded_local_pos = seq_lens[
-            torch.from_numpy(nonempty_rows).to(self.device)
-        ] - 1
+        expanded_local_pos = torch.zeros(
+            num_logits, dtype=torch.int32, device=self.device
+        )
 
         return replace(
             input_batch,
@@ -433,15 +434,43 @@ class HcuPCPManager:
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Prepare local block rows and global-ownership slot mappings."""
 
-        assert self._local_block_tables
-        assert self._local_block_table_ptrs is not None
         canonical_tables = getattr(self._block_tables, "block_tables", None)
-        if canonical_tables is None:
-            source_tables = self._block_tables.input_block_tables
-        else:
-            source_tables = [
-                getattr(table, "gpu", table) for table in canonical_tables
-            ]
+        scratch_tables = getattr(
+            self._block_tables, "input_block_tables", None
+        )
+        declared_groups = getattr(
+            self._block_tables, "num_kv_cache_groups", None
+        )
+        if not isinstance(canonical_tables, list) or not canonical_tables:
+            raise PatchCompatibilityError(
+                "vLLM 0.25.1 BlockTables canonical block_tables storage is missing"
+            )
+        if not isinstance(scratch_tables, list) or not isinstance(
+            declared_groups, int
+        ):
+            raise PatchCompatibilityError(
+                "vLLM 0.25.1 BlockTables canonical block_tables contract changed"
+            )
+        group_counts = (
+            len(canonical_tables),
+            len(scratch_tables),
+            len(self._local_block_tables),
+            declared_groups,
+        )
+        if len(set(group_counts)) != 1:
+            raise PatchCompatibilityError(
+                "vLLM 0.25.1 BlockTables KV-group count mismatch: "
+                f"canonical/scratch/local/declared={group_counts}"
+            )
+        source_tables = []
+        for table in canonical_tables:
+            source = getattr(table, "gpu", None)
+            if not isinstance(source, torch.Tensor):
+                raise PatchCompatibilityError(
+                    "vLLM 0.25.1 BlockTables canonical block_tables GPU "
+                    "storage is missing"
+                )
+            source_tables.append(source)
         num_reqs = input_batch.num_reqs_after_padding
         for source, destination in zip(
             source_tables, self._local_block_tables
