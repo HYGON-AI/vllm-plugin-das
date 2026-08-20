@@ -312,7 +312,7 @@ def apply_to_module(module: ModuleType) -> bool:
     model_arch_signature = inspect.signature(get_model_arch_config)
     if tuple(model_arch_signature.parameters) != ("self",):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[2]} has incompatible "
+            f"required HCU patch target {TARGETS[4]} has incompatible "
             f"signature {model_arch_signature}"
         )
     with_hf_signature = inspect.signature(with_hf_config)

@@ -210,6 +210,22 @@ def test_pcp_patch_rejects_v0251_wrapper_signature_drift() -> None:
         patch_vllm_config.apply_to_module(module)
 
 
+def test_model_arch_config_signature_drift_names_exact_target() -> None:
+    module = _make_vllm_module()
+
+    def incompatible_model_arch_config(self, feature: object) -> object:
+        del self, feature
+        return None
+
+    module.ModelConfig.get_model_arch_config = incompatible_model_arch_config
+
+    with pytest.raises(PatchCompatibilityError) as error:
+        patch_vllm_config.apply_to_module(module)
+
+    assert patch_vllm_config.TARGETS[4] in str(error.value)
+    assert patch_vllm_config.TARGETS[2] not in str(error.value)
+
+
 class _LifecycleCompilationConfig:
     def __init__(self) -> None:
         self.cudagraph_mode = SimpleNamespace(has_full_cudagraphs=lambda: False)

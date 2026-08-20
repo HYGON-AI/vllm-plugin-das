@@ -16,6 +16,16 @@ import torch
 from vllm_hcu.model_executor.layers import mla_runtime
 
 
+def split_decodes_and_prefills(
+    common_attn_metadata,
+    decode_threshold=1,
+    require_uniform=False,
+    treat_short_extends_as_decodes=True,
+):
+    del decode_threshold, require_uniform, treat_short_extends_as_decodes
+    return 0, 1, 0, common_attn_metadata.num_actual_tokens
+
+
 class _GenericStub:
     @classmethod
     def __class_getitem__(cls, item):
@@ -714,6 +724,13 @@ def test_dense_and_sparse_mla_metadata_carry_pcp_world_size(monkeypatch):
     )
 
     class FlashMLASparseMetadataBuilder:
+        def _build_fp8_separate_prefill_decode(
+            self, common_attn_metadata
+        ):
+            del self
+            counts = split_decodes_and_prefills(common_attn_metadata)
+            return SimpleNamespace(num_prefills=counts[1])
+
         def build(
             self,
             common_prefix_len,

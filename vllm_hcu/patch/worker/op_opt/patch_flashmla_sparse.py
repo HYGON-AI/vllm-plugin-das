@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import functools
-from types import ModuleType
+from types import FunctionType, ModuleType
 
 from ._common import (
     PatchCompatibilityError,
@@ -23,6 +23,7 @@ TARGETS = (
     f"{TARGET_MODULE}.FlashMLASparseImpl._fp8_flash_mla_kernel",
     f"{TARGET_MODULE}.FlashMLASparseImpl._bf16_flash_mla_kernel",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
+    f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode",
 )
 _MARKER = "_vllm_hcu_flashmla_sparse_applied"
 _WRAPPER = "_vllm_hcu_flashmla_sparse_wrapper"
@@ -80,6 +81,58 @@ def apply_to_module(module: ModuleType) -> bool:
             "treat_short_extends_as_decodes": True,
         },
     )
+    build_fp8_separate_prefill_decode = require_callable(
+        builder_cls, "_build_fp8_separate_prefill_decode", TARGETS[4]
+    )
+    require_exact_signature(
+        build_fp8_separate_prefill_decode,
+        TARGETS[4],
+        positional=("self", "common_attn_metadata"),
+    )
+    if not isinstance(build_fp8_separate_prefill_decode, FunctionType):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[4]} must be a Python function"
+        )
+    if (
+        "split_decodes_and_prefills"
+        not in build_fp8_separate_prefill_decode.__code__.co_names
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[4]} no longer consumes "
+            "split_decodes_and_prefills"
+        )
+
+    def pcp_split_decodes_and_prefills(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        del treat_short_extends_as_decodes
+        return split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=decode_threshold,
+            require_uniform=require_uniform,
+            treat_short_extends_as_decodes=False,
+        )
+
+    # Execute the audited v0.25.1 helper bytecode with only its phase splitter
+    # rebound. This preserves its shape, workspace, and chunk construction
+    # without mutating module globals or copying that implementation here.
+    pcp_separate_globals = dict(build_fp8_separate_prefill_decode.__globals__)
+    pcp_separate_globals["split_decodes_and_prefills"] = (
+        pcp_split_decodes_and_prefills
+    )
+    pcp_build_fp8_separate_prefill_decode = FunctionType(
+        build_fp8_separate_prefill_decode.__code__,
+        pcp_separate_globals,
+        build_fp8_separate_prefill_decode.__name__,
+        build_fp8_separate_prefill_decode.__defaults__,
+        build_fp8_separate_prefill_decode.__closure__,
+    )
+    pcp_build_fp8_separate_prefill_decode.__kwdefaults__ = (
+        build_fp8_separate_prefill_decode.__kwdefaults__
+    )
     # Swap only the function bindings consumed by this backend.  The official
     # backend class remains registered and no global module alias is installed.
     from vllm_hcu.v1.attention.ops import flashmla as hcu_flashmla
@@ -95,22 +148,9 @@ def apply_to_module(module: ModuleType) -> bool:
         result = build(self, common_prefix_len, common_attn_metadata, fast_build)
         from vllm_hcu.platforms import envs as henvs
 
-        if (
-            getattr(result, "fp8_use_mixed_batch", False)
-            and not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH
-        ):
-            result.fp8_extra_metadata = self._build_fp8_separate_prefill_decode(
-                common_attn_metadata
-            )
-            result.fp8_use_mixed_batch = False
-        result.num_kv_actual_tokens = getattr(
-            common_attn_metadata,
-            "num_kv_actual_tokens",
-            common_attn_metadata.num_actual_tokens,
-        )
         vllm_config = getattr(self, "vllm_config", None)
         if vllm_config is None:
-            result.pcp_world_size = int(
+            pcp_world_size = int(
                 getattr(common_attn_metadata, "pcp_world_size", 1)
             )
         else:
@@ -125,7 +165,34 @@ def apply_to_module(module: ModuleType) -> bool:
                     "required vLLM 0.25.1 prefill_context_parallel_size "
                     "is missing from sparse MLA metadata builder"
                 )
-            result.pcp_world_size = int(pcp_world_size)
+            pcp_world_size = int(pcp_world_size)
+        if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
+            has_fp8_metadata = (
+                getattr(result, "fp8_extra_metadata", None) is not None
+            )
+            if pcp_world_size > 1 and (
+                getattr(result, "fp8_use_mixed_batch", False)
+                or has_fp8_metadata
+            ):
+                result.fp8_extra_metadata = (
+                    pcp_build_fp8_separate_prefill_decode(
+                        self, common_attn_metadata
+                    )
+                )
+                result.fp8_use_mixed_batch = False
+            elif getattr(result, "fp8_use_mixed_batch", False):
+                result.fp8_extra_metadata = (
+                    self._build_fp8_separate_prefill_decode(
+                        common_attn_metadata
+                    )
+                )
+                result.fp8_use_mixed_batch = False
+        result.num_kv_actual_tokens = getattr(
+            common_attn_metadata,
+            "num_kv_actual_tokens",
+            common_attn_metadata.num_actual_tokens,
+        )
+        result.pcp_world_size = pcp_world_size
         if result.pcp_world_size > 1:
             (
                 result.num_decodes,
