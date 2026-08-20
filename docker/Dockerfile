@@ -65,7 +65,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && pip install --no-cache-dir mooncake_transfer_engine \
     && das-install deep_ep ${TORCH_TAG} \
     && das-install tilelang ${TORCH_TAG} \
-    && das-install bolt_ops ${TORCH_TAG} \
+    && das-install boltops ${TORCH_TAG} \
     && das-install causal_conv1d==1.5.4 ${TORCH_TAG} \
     && das-install flash_mla ${TORCH_TAG} \
     && das-install fastsafetensors ${TORCH_TAG} \
