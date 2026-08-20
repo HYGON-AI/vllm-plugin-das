@@ -10,6 +10,8 @@ import torch
 
 from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v32_config,
+    patch_deepseek_v4_dspark_target,
+    patch_deepseek_v4_rocm_dspark_metadata,
     patch_gpt_oss_mlp_block,
     patch_qwen3_5_mamba_state_dtype,
     patch_qwen3_vl,
@@ -442,6 +444,8 @@ def test_callbacks_reject_wrong_exact_module():
     wrong = _module("vllm.model_executor.models.not_the_target")
     for patch_module in (
         patch_deepseek_v32_config,
+        patch_deepseek_v4_dspark_target,
+        patch_deepseek_v4_rocm_dspark_metadata,
         patch_gpt_oss_mlp_block,
         patch_qwen3_5_mamba_state_dtype,
         patch_qwen3_vl,
@@ -472,3 +476,95 @@ def test_import_callbacks_do_not_touch_runtime_registry(
     assert PATCH_REGISTRY.snapshot() == ()
     patch_gpt_oss_mlp_block.apply_to_module(module)
     assert PATCH_REGISTRY.snapshot() == ()
+
+
+def test_deepseek_v4_dspark_target_exposes_eagle3_protocol():
+    from vllm.model_executor.models.interfaces import supports_eagle3
+
+    class DeepseekV4Model:
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds=None):
+            raise AssertionError("original must not run after patching")
+
+    class DeepseekV4ForCausalLM:
+        pass
+
+    module = _module(
+        patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4Model=DeepseekV4Model,
+        DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
+    )
+    assert not supports_eagle3(DeepseekV4ForCausalLM)
+    assert patch_deepseek_v4_dspark_target.apply_to_module(module) is True
+    assert supports_eagle3(DeepseekV4ForCausalLM)
+    assert patch_deepseek_v4_dspark_target.apply_to_module(module) is False
+
+
+def test_deepseek_v4_dspark_ragged_buffer_uses_noncausal_width():
+    class DeepseekV4ROCMAiterSparseSWAMetadataBuilder:
+        def __init__(self):
+            self.is_dspark = True
+            self.window_size = 24
+            self.noncausal_index_width = 128
+            self._max_tokens = 16
+            self.device = "cpu"
+            self.decode_swa_ragged_indices_buffer = torch.empty(
+                self._max_tokens * self.window_size, dtype=torch.int32
+            )
+
+    def _copy_ragged_to_graph_buffers(*args, **kwargs):
+        raise AssertionError("original copy must not run after patching")
+
+    module = _module(
+        patch_deepseek_v4_rocm_dspark_metadata.TARGET_MODULE,
+        DeepseekV4ROCMAiterSparseSWAMetadataBuilder=(
+            DeepseekV4ROCMAiterSparseSWAMetadataBuilder
+        ),
+        _copy_ragged_to_graph_buffers=_copy_ragged_to_graph_buffers,
+    )
+    assert patch_deepseek_v4_rocm_dspark_metadata.apply_to_module(module) is True
+    builder = DeepseekV4ROCMAiterSparseSWAMetadataBuilder()
+    assert builder.decode_swa_ragged_indices_buffer.numel() == 16 * 128
+
+    ragged = torch.arange(768, dtype=torch.int32)
+    indptr = torch.arange(17, dtype=torch.int32) * 48
+    ragged_out, indptr_out = module._copy_ragged_to_graph_buffers(
+        ragged,
+        indptr,
+        builder.decode_swa_ragged_indices_buffer,
+        torch.empty(17, dtype=torch.int32),
+        16,
+        24,
+    )
+    assert ragged_out.numel() == 768
+    assert torch.equal(ragged_out, ragged)
+    assert torch.equal(indptr_out, indptr)
+
+
+def test_deepseek_v4_dspark_ragged_patch_preserves_baseline_copy():
+    class DeepseekV4ROCMAiterSparseSWAMetadataBuilder:
+        def __init__(self):
+            self.is_dspark = False
+
+    baseline_result = object()
+
+    def _copy_ragged_to_graph_buffers(*args, **kwargs):
+        return baseline_result
+
+    module = _module(
+        patch_deepseek_v4_rocm_dspark_metadata.TARGET_MODULE,
+        DeepseekV4ROCMAiterSparseSWAMetadataBuilder=(
+            DeepseekV4ROCMAiterSparseSWAMetadataBuilder
+        ),
+        _copy_ragged_to_graph_buffers=_copy_ragged_to_graph_buffers,
+    )
+    patch_deepseek_v4_rocm_dspark_metadata.apply_to_module(module)
+
+    result = module._copy_ragged_to_graph_buffers(
+        torch.arange(4, dtype=torch.int32),
+        torch.tensor([0, 4], dtype=torch.int32),
+        torch.empty(8, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        1,
+        8,
+    )
+    assert result is baseline_result
