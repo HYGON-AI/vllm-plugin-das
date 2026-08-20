@@ -123,9 +123,8 @@ class HcuUnquantizedFusedMoEMethod(_Original):
 
         _raise_if_aiter_moe_asm_blocked(self, layer)
 
-        layer.w13_weight.data = self._maybe_pad_weight(layer.w13_weight.data)
-        layer.w2_weight.data = self._maybe_pad_weight(layer.w2_weight.data)
-
+        # Generic ROCm MoE padding returns strided views, while the AITER
+        # W16A16 ASM kernels consume dense expert-weight layouts.
         w1 = layer.w13_weight
         w2 = layer.w2_weight
 

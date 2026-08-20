@@ -5,11 +5,19 @@
 from __future__ import annotations
 
 import functools
+import sys
 from types import ModuleType
 
-from ._common import load_exact_module, require_callable, require_class, require_parameter_names
+from ._common import (
+    PatchCompatibilityError,
+    load_exact_module,
+    require_callable,
+    require_class,
+    require_parameter_names,
+)
 
-TARGET_MODULE = "vllm.model_executor.layers.fused_moe.layer"
+TARGET_MODULE = "vllm.model_executor.layers.fused_moe"
+LAYER_MODULE = f"{TARGET_MODULE}.layer"
 PATCH_ID = "worker.op_opt.moe.layer"
 TARGETS = (
     f"{TARGET_MODULE}.FusedMoE",
@@ -23,9 +31,33 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(target, _MARKER, False):
         return False
     factory = require_callable(target, "FusedMoE", TARGETS[0])
+    layer_module = load_exact_module(
+        LAYER_MODULE,
+        sys.modules.get(LAYER_MODULE),
+    )
+    layer_factory = require_callable(
+        layer_module,
+        "FusedMoE",
+        f"{LAYER_MODULE}.FusedMoE",
+    )
+    if layer_factory is not factory:
+        raise PatchCompatibilityError(
+            f"{TARGETS[0]} does not reference the required v0.25.1 "
+            f"{LAYER_MODULE}.FusedMoE factory"
+        )
     routed_experts_cls = require_class(
         target, "RoutedExperts", f"{TARGET_MODULE}.RoutedExperts"
     )
+    layer_routed_experts_cls = require_class(
+        layer_module,
+        "RoutedExperts",
+        f"{LAYER_MODULE}.RoutedExperts",
+    )
+    if layer_routed_experts_cls is not routed_experts_cls:
+        raise PatchCompatibilityError(
+            f"{TARGET_MODULE}.RoutedExperts does not reference the required "
+            f"v0.25.1 {LAYER_MODULE}.RoutedExperts class"
+        )
     get_weights = require_callable(
         routed_experts_cls, "get_expert_weights", TARGETS[1]
     )
@@ -88,6 +120,8 @@ def apply_to_module(module: ModuleType) -> bool:
 
     target._vllm_hcu_original_fused_moe_factory = factory
     target.FusedMoE = hcu_factory
+    layer_module._vllm_hcu_original_fused_moe_factory = factory
+    layer_module.FusedMoE = hcu_factory
     routed_experts_cls._vllm_hcu_original_get_expert_weights = get_weights
     routed_experts_cls.get_expert_weights = hcu_get_expert_weights
     setattr(target, _MARKER, True)

@@ -993,6 +993,89 @@ def test_aiter_w16a16_asm_selection(monkeypatch: pytest.MonkeyPatch):
         )
 
 
+@pytest.mark.parametrize("use_shuffle", [False, True])
+def test_aiter_w16a16_weight_preparation_bypasses_rocm_padding(
+    monkeypatch: pytest.MonkeyPatch,
+    use_shuffle: bool,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as hcu_unquantized,
+    )
+
+    w13 = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    layer = SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_bias=None,
+        w2_bias=None,
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        layer_name="model.layers.0.mlp.experts",
+    )
+    method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace()
+    method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = lambda unused_layer: object()
+
+    def emulate_rocm_padding(weight: torch.Tensor) -> torch.Tensor:
+        padded = torch.nn.functional.pad(weight, (0, 1))[..., :-1]
+        assert not padded.is_contiguous()
+        return padded
+
+    method._maybe_pad_weight = emulate_rocm_padding
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "_is_hcu_aiter_moe_asm_requested",
+        lambda method=None: True,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "_raise_if_aiter_moe_asm_blocked",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized.henvs,
+        "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE",
+        use_shuffle,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "make_unquantized_moe_kernel",
+        lambda **kwargs: object(),
+    )
+
+    shuffle_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(w1, w2, unused_config):
+        shuffle_inputs.append((w1, w2))
+        return w1.contiguous(), w2.contiguous()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            AiterMoeConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+            MoeQuantType=SimpleNamespace(W16A16="w16a16"),
+            MoeSolutionType=SimpleNamespace(ASM="asm"),
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    if use_shuffle:
+        assert len(shuffle_inputs) == 1
+        assert all(weight.is_contiguous() for weight in shuffle_inputs[0])
+    else:
+        assert layer.w13_weight is w13
+        assert layer.w2_weight is w2
+        assert layer.w13_weight.is_contiguous()
+        assert layer.w2_weight.is_contiguous()
+
+
 def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
     monkeypatch: pytest.MonkeyPatch,
 ):
