@@ -31,16 +31,133 @@ def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
         flash_attn_extension.__name__,
         loader=None,
     )
+    def layout_entrypoint(
+        q=None,
+        k=None,
+        v=None,
+        *,
+        layout="bshd",
+        **kwargs,
+    ):
+        del q, k, v, layout, kwargs
+
+    for symbol in (
+        "flash_attn_varlen_func",
+        "hg_flash_attn_varlen_func",
+        "varlen_fwd_unified",
+    ):
+        setattr(flash_attn_extension, symbol, layout_entrypoint)
+    flash_attn_extension.vllm_flash_attn_varlen_func = (
+        lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
+
+    return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
+
+
+def _load_hcu_fa_utils_module(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    kv_cache_layout: str,
+    missing_layout_on: str | None = None,
+):
+    """Load the real HCU FA boundary against observable kernel doubles."""
+
+    from vllm.v1.attention.backends import utils as attention_utils
+
+    monkeypatch.setattr(
+        attention_utils,
+        "get_kv_cache_layout",
+        lambda: kv_cache_layout,
+    )
+
+    hcu_ops = ModuleType("vllm_hcu.hcu_ops")
+    hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
+    monkeypatch.setitem(sys.modules, hcu_ops.__name__, hcu_ops)
+
+    calls: dict[str, list[dict[str, object]]] = {}
+    flash_attn_extension = ModuleType("flash_attn")
+    flash_attn_extension.__spec__ = ModuleSpec(
+        flash_attn_extension.__name__,
+        loader=None,
+    )
+
+    def make_entrypoint(name: str):
+        calls[name] = []
+        if name == missing_layout_on:
+
+            def entrypoint(q=None, k=None, v=None, **kwargs):
+                calls[name].append(dict(kwargs))
+
+        else:
+
+            def entrypoint(
+                q=None,
+                k=None,
+                v=None,
+                *,
+                layout="unrouted",
+                **kwargs,
+            ):
+                calls[name].append({"layout": layout, **kwargs})
+
+        return entrypoint
+
     for symbol in (
         "flash_attn_varlen_func",
         "vllm_flash_attn_varlen_func",
         "hg_flash_attn_varlen_func",
         "varlen_fwd_unified",
     ):
-        setattr(flash_attn_extension, symbol, lambda *args, **kwargs: None)
+        setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
     monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        raising=False,
+    )
 
-    return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
+    module = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
+    return module, calls
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_layout", "expected_fa_layout"),
+    [("HND", "bhsd"), ("NHD", "bshd")],
+)
+@pytest.mark.parametrize(
+    "entrypoint_name",
+    [
+        "flash_attn_varlen_func",
+        "hg_flash_attn_varlen_func",
+        "varlen_fwd_unified",
+    ],
+)
+def test_hcu_fa_entrypoints_map_kv_cache_layout_to_kernel_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_layout: str,
+    expected_fa_layout: str,
+    entrypoint_name: str,
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout=kv_cache_layout,
+    )
+
+    getattr(fa_utils, entrypoint_name)(q="q", k="k", v="v")
+
+    assert calls[entrypoint_name] == [{"layout": expected_fa_layout}]
+
+
+def test_hcu_fa_boundary_rejects_interface_without_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="hg_flash_attn_varlen_func.*layout"):
+        _load_hcu_fa_utils_module(
+            monkeypatch,
+            kv_cache_layout="HND",
+            missing_layout_on="hg_flash_attn_varlen_func",
+        )
 
 
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
