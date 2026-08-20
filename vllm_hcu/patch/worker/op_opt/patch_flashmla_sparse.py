@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dis
 import functools
 from types import FunctionType, ModuleType
 
@@ -93,14 +94,38 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[4]} must be a Python function"
         )
-    if (
-        "split_decodes_and_prefills"
-        not in build_fp8_separate_prefill_decode.__code__.co_names
-    ):
+    if build_fp8_separate_prefill_decode.__globals__ is not flash.__dict__:
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[4]} no longer consumes "
+            f"required HCU patch target {TARGETS[4]} globals must be the "
+            "target module namespace"
+        )
+    directly_loads_splitter = any(
+        instruction.opname == "LOAD_GLOBAL"
+        and instruction.argval == "split_decodes_and_prefills"
+        for instruction in dis.Bytecode(build_fp8_separate_prefill_decode)
+    )
+    if not directly_loads_splitter:
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[4]} must use direct LOAD_GLOBAL "
             "split_decodes_and_prefills"
         )
+
+    # Validate and collect every replacement before mutating the target module.
+    from vllm_hcu.v1.attention.ops import flashmla as hcu_flashmla
+
+    hcu_bindings = {}
+    for name in (
+        "FlashMLASchedMeta",
+        "flash_mla_sparse_fwd",
+        "flash_mla_with_kvcache",
+        "get_mla_metadata",
+    ):
+        value = getattr(hcu_flashmla, name, None)
+        if value is None:
+            raise RuntimeError(
+                f"required HCU FlashMLA symbol {name} is unavailable"
+            )
+        hcu_bindings[name] = value
 
     def pcp_split_decodes_and_prefills(
         common_attn_metadata,
@@ -120,6 +145,7 @@ def apply_to_module(module: ModuleType) -> bool:
     # rebound. This preserves its shape, workspace, and chunk construction
     # without mutating module globals or copying that implementation here.
     pcp_separate_globals = dict(build_fp8_separate_prefill_decode.__globals__)
+    pcp_separate_globals.update(hcu_bindings)
     pcp_separate_globals["split_decodes_and_prefills"] = (
         pcp_split_decodes_and_prefills
     )
@@ -133,16 +159,6 @@ def apply_to_module(module: ModuleType) -> bool:
     pcp_build_fp8_separate_prefill_decode.__kwdefaults__ = (
         build_fp8_separate_prefill_decode.__kwdefaults__
     )
-    # Swap only the function bindings consumed by this backend.  The official
-    # backend class remains registered and no global module alias is installed.
-    from vllm_hcu.v1.attention.ops import flashmla as hcu_flashmla
-
-    for name in ("FlashMLASchedMeta", "flash_mla_sparse_fwd", "flash_mla_with_kvcache", "get_mla_metadata"):
-        value = getattr(hcu_flashmla, name, None)
-        if value is None:
-            raise RuntimeError(f"required HCU FlashMLA symbol {name} is unavailable")
-        setattr(flash, name, value)
-
     @functools.wraps(build)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         result = build(self, common_prefix_len, common_attn_metadata, fast_build)
@@ -256,6 +272,10 @@ def apply_to_module(module: ModuleType) -> bool:
 
     for function in (hcu_build, hcu_fp8, hcu_bf16):
         setattr(function, _WRAPPER, True)
+    # Apply all target mutations only after validation and wrapper construction.
+    # The official backend class remains registered and no module alias is used.
+    for name, value in hcu_bindings.items():
+        setattr(flash, name, value)
     setattr(builder_cls, "_vllm_hcu_original_build", build)
     setattr(impl_cls, "_vllm_hcu_original_fp8_kernel", fp8)
     setattr(impl_cls, "_vllm_hcu_original_bf16_kernel", bf16)
