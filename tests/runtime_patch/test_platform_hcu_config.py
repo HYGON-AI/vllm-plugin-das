@@ -928,9 +928,13 @@ def test_slimquant_fp8_moe_repack_preserves_fp8_without_widening(
     def reject_widening(_tensor: torch.Tensor) -> torch.Tensor:
         raise AssertionError("FP8 checkpoint weights must not widen through FP32")
 
+    def reject_per_expert_stack(*_args: Any, **_kwargs: Any) -> torch.Tensor:
+        raise AssertionError("FP8 MoE weights must be repacked as a full tensor")
+
     monkeypatch.setattr(
         moe_marlin, "fp32_to_fp8_e4m3fn", reject_widening
     )
+    monkeypatch.setattr(torch, "stack", reject_per_expert_stack)
 
     method.process_weights_after_loading(layer)
 
@@ -938,6 +942,48 @@ def test_slimquant_fp8_moe_repack_preserves_fp8_without_widening(
     assert layer.w2_weight.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(layer.w13_weight.float(), expected_w13.float())
     torch.testing.assert_close(layer.w2_weight.float(), expected_w2.float())
+
+
+def test_slimquant_marlin_repack_supports_full_expert_tensor() -> None:
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as moe_marlin,
+    )
+
+    weight = torch.arange(16, dtype=torch.int8).reshape(2, 2, 4)
+
+    actual = moe_marlin.get_w8a8_int8_marlin_weights(weight, k_tile=2)
+
+    expected = torch.tensor(
+        [
+            [[0, 1, 4, 5], [2, 3, 6, 7]],
+            [[8, 9, 12, 13], [10, 11, 14, 15]],
+        ],
+        dtype=torch.int8,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(4,), (1, 2, 3, 4)])
+def test_slimquant_marlin_repack_rejects_non_matrix_weights(
+    shape: tuple[int, ...],
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as moe_marlin,
+    )
+
+    with pytest.raises(ValueError, match="Expected 2D or 3D weight"):
+        moe_marlin.get_w8a8_int8_marlin_weights(torch.empty(shape))
+
+
+def test_slimquant_marlin_repack_rejects_unaligned_k_dimension() -> None:
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as moe_marlin,
+    )
+
+    with pytest.raises(AssertionError, match="K dimension must be divisible"):
+        moe_marlin.get_w8a8_int8_marlin_weights(
+            torch.empty((2, 3, 5)), k_tile=4
+        )
 
 
 class _HashableConfig:
