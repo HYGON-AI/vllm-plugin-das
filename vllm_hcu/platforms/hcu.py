@@ -607,6 +607,11 @@ class HCUPlatform(Platform):
                     logger.warning(
                         "[HCU FLASH_ATTN:custom]: Setting kv cache block size to 64."
                     )
+                elif mode == "varlen":
+                    cache_config.block_size = 64
+                    logger.warning(
+                        "[HCU FLASH_ATTN:varlen]: Setting kv cache block size to 64."
+                    )
                 elif (
                     henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None
                     and henvs.VLLM_HCU_USE_CUSTOM_OPS

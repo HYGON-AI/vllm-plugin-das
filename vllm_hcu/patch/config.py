@@ -24,7 +24,9 @@ _FEATURE_FIELDS = (
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "dpsk_deep_gemm"})
-_SUPPORTED_FLASH_ATTN_MODES = frozenset({"classic", "cutlass", "custom"})
+_SUPPORTED_FLASH_ATTN_MODES = frozenset(
+    {"classic", "cutlass", "custom", "varlen"}
+)
 
 
 @dataclass(frozen=True, slots=True)

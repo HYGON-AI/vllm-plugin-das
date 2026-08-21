@@ -423,7 +423,11 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
             if (not isinstance(kv_layer, tuple)):
                 if (isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3 or layer.shape[1] == 2):
                     return layer[block_ids, ...]
-                elif get_hcu_flash_attn_mode() not in ("classic", "cutlass"): # FlashAttention_NV
+                elif get_hcu_flash_attn_mode() not in (
+                    "classic",
+                    "cutlass",
+                    "varlen",
+                ):  # FlashAttention_NV
                     return layer[:, block_ids, ...]
                 else:
                     logger.error("🚧kv_cache not mla && gqa")
