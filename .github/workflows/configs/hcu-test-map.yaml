@@ -30,7 +30,7 @@
   ],
   "jobs": {
     "accuracy-gfx936": {
-      "runner": "hcu-linux-gfx936-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx936",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -39,7 +39,7 @@
       "requirements": []
     },
     "accuracy-gfx938": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -48,7 +48,7 @@
       "requirements": []
     },
     "contract-hcu-gfx936": {
-      "runner": "hcu-linux-gfx936-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx936",
       "cards": 1,
       "suite": "contract-hcu",
@@ -58,7 +58,7 @@
       "partitions": 2
     },
     "integration-smoke-gfx938": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "integration-smoke",
@@ -68,7 +68,7 @@
       "partitions": 2
     },
     "qwen35-smoke": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -86,7 +86,7 @@
       ]
     },
     "qwen35-graph": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -104,7 +104,7 @@
       ]
     },
     "engine-features": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -122,7 +122,7 @@
       ]
     },
     "lora": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -150,7 +150,7 @@
       ]
     },
     "spec-decode": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -179,7 +179,7 @@
       ]
     },
     "mamba-smoke": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -197,7 +197,7 @@
       ]
     },
     "kv-transfer": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -251,7 +251,7 @@
       ]
     },
     "qwen25-models": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -275,7 +275,7 @@
       ]
     },
     "qwen3-pooling": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -304,7 +304,7 @@
       ]
     },
     "qwen3-protocol": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -322,7 +322,7 @@
       ]
     },
     "qwen35-gsm8k": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -340,7 +340,7 @@
       ]
     },
     "qwen3-vl-mmmu": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -358,7 +358,7 @@
       ]
     },
     "qwen3-8b-gsm8k": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -394,7 +394,7 @@
       ]
     },
     "single-node-topology": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "hcu-ci-pr",
       "arch": "gfx938",
       "cards": 1,
       "suite": "distributed-single-node",

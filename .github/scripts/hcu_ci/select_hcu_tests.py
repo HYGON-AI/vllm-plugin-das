@@ -41,7 +41,7 @@ VALID_SUITES = {
     "nightly",
     "full",
 }
-RUNNER_RE = re.compile(r"^hcu-linux-(?:cpu|gfx9[0-9]{2}-[1-9][0-9]*)$")
+RUNNER_RE = re.compile(r"^(?:hcu-ci-pr|hcu-linux-(?:cpu|gfx9[0-9]{2}-[1-9][0-9]*))$")
 JOB_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
