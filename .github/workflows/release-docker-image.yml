@@ -112,7 +112,7 @@ jobs:
               set -euo pipefail
               source /opt/dtk/env.sh
               /usr/local/bin/python3.10 --version
-              /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+              /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-environment-only
               /usr/local/bin/python3.10 -c 'import importlib.metadata; import torch; [print(f\"{name}={importlib.metadata.version(name)}\") for name in (\"torch\", \"vllm\", \"vllm-hcu\", \"pytest\")]; print(f\"torch_hip={torch.version.hip}\")'
               /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
             "

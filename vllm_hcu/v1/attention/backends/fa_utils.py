@@ -5,7 +5,6 @@
 from typing import Any
 
 from flash_attn import (
-    flash_attn_varlen_func,
     hg_flash_attn_varlen_func,
     varlen_fwd_unified,
     vllm_flash_attn_varlen_func,

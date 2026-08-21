@@ -28,6 +28,28 @@ class PreflightError(RuntimeError):
     """Raised when the selected runner cannot execute its assigned job."""
 
 
+def _version_specification(value: object, *, name: str) -> dict[str, str]:
+    if isinstance(value, str):
+        return {"match": "exact", "version": value}
+    if not isinstance(value, dict):
+        raise PreflightError(f"{name} must be a version string or mapping")
+    match = value.get("match")
+    version = value.get("version")
+    if match not in {"exact", "prefix"} or not isinstance(version, str):
+        raise PreflightError(
+            f"{name} must declare match=exact|prefix and a version string"
+        )
+    return {"match": match, "version": version}
+
+
+def _matches_version(actual: str | None, specification: dict[str, str]) -> bool:
+    if actual is None:
+        return False
+    if specification["match"] == "prefix":
+        return actual.startswith(specification["version"])
+    return actual == specification["version"]
+
+
 def _distribution_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -92,8 +114,10 @@ def _load_environment_lock(path: Path) -> dict[str, Any]:
         raise PreflightError("environment lock must be a schema_version=1 mapping")
     if not isinstance(lock.get("python"), str):
         raise PreflightError("environment lock must declare an exact Python version")
-    if not isinstance(lock.get("torch_hip"), str):
-        raise PreflightError("environment lock must declare an exact torch HIP version")
+    lock["torch_hip"] = _version_specification(
+        lock.get("torch_hip"),
+        name="environment lock torch_hip",
+    )
     distributions = lock.get("distributions")
     if not isinstance(distributions, dict) or not distributions:
         raise PreflightError(
@@ -102,16 +126,10 @@ def _load_environment_lock(path: Path) -> dict[str, Any]:
     for name, specification in distributions.items():
         if not isinstance(name, str) or not name:
             raise PreflightError("environment lock distribution names must be strings")
-        if not isinstance(specification, dict):
-            raise PreflightError(f"environment lock entry {name!r} must be a mapping")
-        if specification.get("match") not in {"exact", "prefix"}:
-            raise PreflightError(
-                f"environment lock entry {name!r} has an invalid match mode"
-            )
-        if not isinstance(specification.get("version"), str):
-            raise PreflightError(
-                f"environment lock entry {name!r} must declare a version"
-            )
+        distributions[name] = _version_specification(
+            specification,
+            name=f"environment lock entry {name!r}",
+        )
     rocm = lock.get("rocm")
     if not isinstance(rocm, dict) or not all(
         isinstance(rocm.get(name), str) and rocm[name]
@@ -135,9 +153,10 @@ def _check_environment_lock(
             f"runner Python drift: expected {expected_python}, got {actual_python}"
         )
     expected_hip = lock["torch_hip"]
-    if torch_hip != expected_hip:
+    if not _matches_version(torch_hip, expected_hip):
         raise PreflightError(
-            f"runner torch HIP drift: expected {expected_hip}, got {torch_hip}"
+            "runner torch HIP drift: expected "
+            f"{expected_hip['match']} {expected_hip['version']}, got {torch_hip}"
         )
 
     for name, specification in lock["distributions"].items():
@@ -145,10 +164,7 @@ def _check_environment_lock(
         expected = specification["version"]
         if actual is None:
             raise PreflightError(f"locked distribution is missing: {name}")
-        matches = actual == expected
-        if specification["match"] == "prefix":
-            matches = actual.startswith(expected)
-        if not matches:
+        if not _matches_version(actual, specification):
             raise PreflightError(
                 f"runner distribution drift for {name}: expected "
                 f"{specification['match']} {expected}, got {actual}"
@@ -174,10 +190,28 @@ def _check_environment_lock(
     return {
         "path": str(path.resolve()),
         "python": expected_python,
-        "torch_hip": expected_hip,
+        "torch_hip": expected_hip["version"],
         "rocm": actual_rocm,
         "distributions": lock["distributions"],
     }
+
+
+def _collect_runtime_versions(torch: Any) -> tuple[dict[str, str | None], str | None]:
+    versions = {
+        name: _distribution_version(name)
+        for name in (
+            "torch",
+            "vllm",
+            "vllm-hcu",
+            "aiter",
+            "evalscope",
+            "pytest",
+        )
+    }
+    for mandatory in ("torch", "vllm"):
+        if versions[mandatory] is None:
+            raise PreflightError(f"required distribution is missing: {mandatory}")
+    return versions, getattr(getattr(torch, "version", None), "hip", None)
 
 
 def run_preflight(
@@ -235,21 +269,7 @@ def run_preflight(
         else None
     )
     resolved_requirements = _check_requirements(requirements, model_root)
-    versions = {
-        name: _distribution_version(name)
-        for name in (
-            "torch",
-            "vllm",
-            "vllm-hcu",
-            "aiter",
-            "evalscope",
-            "pytest",
-        )
-    }
-    for mandatory in ("torch", "vllm"):
-        if versions[mandatory] is None:
-            raise PreflightError(f"required distribution is missing: {mandatory}")
-    torch_hip = getattr(getattr(torch, "version", None), "hip", None)
+    versions, torch_hip = _collect_runtime_versions(torch)
     lock_report = (
         _check_environment_lock(
             environment_lock,
@@ -286,6 +306,7 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_ENVIRONMENT_LOCK,
     )
     parser.add_argument("--check-lock-only", action="store_true")
+    parser.add_argument("--check-environment-only", action="store_true")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -295,6 +316,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.check_lock_only:
             print(json.dumps(_load_environment_lock(args.environment_lock), indent=2))
+            return 0
+        if args.check_environment_only:
+            try:
+                import torch
+            except Exception:
+                raise PreflightError(
+                    "HCU runtime dependency initialization failed."
+                ) from None
+            versions, torch_hip = _collect_runtime_versions(torch)
+            print(
+                json.dumps(
+                    _check_environment_lock(
+                        args.environment_lock,
+                        versions=versions,
+                        torch_hip=torch_hip,
+                    ),
+                    indent=2,
+                )
+            )
             return 0
         if args.arch is None or args.cards is None:
             raise PreflightError(

@@ -23,6 +23,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 
+pytestmark = pytest.mark.hcu
+
 
 @pytest.fixture(scope="module")
 def runner_module():
