@@ -95,7 +95,12 @@ jobs:
 
       - name: Cleanup HCU CI container
         if: always()
-        run: bash scripts/ci/hcu/hcu_ci_cleanup_container.sh
+        run: |
+          if [[ -x scripts/ci/hcu/hcu_ci_cleanup_container.sh ]]; then
+            bash scripts/ci/hcu/hcu_ci_cleanup_container.sh
+          elif [[ -n "${HCU_CI_CONTAINER_NAME:-}" ]]; then
+            docker rm -f "$HCU_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+          fi
 
       - name: Report local HCU logs and reports
         if: always()
