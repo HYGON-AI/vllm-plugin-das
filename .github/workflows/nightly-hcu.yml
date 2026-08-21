@@ -55,17 +55,17 @@ jobs:
       - name: Build nightly matrix
         id: matrix
         run: |
-          python --version
-          python .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          python .github/scripts/hcu_ci/verify_hcu_registration.py
-          python .github/scripts/hcu_ci/build_hcu_matrix.py \
+          /usr/local/bin/python3.10 --version
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py \
             --profile nightly \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Build due-quarantine matrix
         id: quarantine
         run: >-
-          python .github/scripts/hcu_ci/build_hcu_matrix.py
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py
           --profile quarantine
           --github-output "$GITHUB_OUTPUT"
 
