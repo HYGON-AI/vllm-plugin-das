@@ -517,18 +517,27 @@ def test_aiter_and_triton_expert_capability_contract(
             return False
 
         @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+        @staticmethod
         def is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
         ):
             del cls, moe_config, weight_key, activation_key, activation_format
             return AiterExperts._supports_current_device(), None
 
+    int8_weight_key = object()
+    int8_activation_key = object()
     aiter_module = _module(
         patch_rocm_aiter_moe.TARGET_MODULE,
         IntEnum=IntEnum,
         ActivationMethod=ActivationMethod,
         MoEActivation=MoEActivation,
         kMxfp4Static=object(),
+        kInt8StaticChannelSym=int8_weight_key,
+        kInt8DynamicTokenSym=int8_activation_key,
         rocm_aiter_fused_experts=namespace["rocm_aiter_fused_experts"],
         AiterExperts=AiterExperts,
     )
@@ -552,6 +561,14 @@ def test_aiter_and_triton_expert_capability_contract(
     assert activation == aiter_module.ActivationMethod.GELU_TANH
     assert AiterExperts._supports_activation(MoEActivation.GELU_TANH) is True
     assert (
+        AiterExperts._supports_quant_scheme(
+            int8_weight_key,
+            int8_activation_key,
+        )
+        is True
+    )
+    assert AiterExperts._supports_quant_scheme(object(), object()) is False
+    assert (
         AiterExperts._supports_activation(
             MoEActivation.SWIGLUOAI_UNINTERLEAVE
         )
@@ -572,6 +589,52 @@ def test_aiter_and_triton_expert_capability_contract(
         None,
         None,
     )[0] is False
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    quantized_calls: list[dict[str, object]] = []
+
+    def quantized_runtime(**kwargs):
+        quantized_calls.append(kwargs)
+        return "public-aiter-quantized"
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_quantized_moe",
+        quantized_runtime,
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+    topk_weights = torch.ones((2, 2))
+    topk_ids = torch.zeros((2, 2), dtype=torch.int32)
+    vllm_moe_config = SimpleNamespace(num_experts=3)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+    )
+    expert_map = torch.tensor([0, 1, 2], dtype=torch.int32)
+    quantized_result = aiter_module.rocm_aiter_fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        vllm_moe_config,
+        MoEActivation.SILU,
+        False,
+        expert_map,
+        quant_config,
+        None,
+        None,
+        torch.bfloat16,
+    )
+    assert quantized_result == "public-aiter-quantized"
+    assert quantized_calls[0]["hidden_states"] is hidden_states
+    assert quantized_calls[0]["quant_config"] is quant_config
+    assert quantized_calls[0]["expert_map"] is expert_map
     assert AiterExperts.is_supported_config(
         AiterExperts,
         SimpleNamespace(moe_backend="aiter"),
