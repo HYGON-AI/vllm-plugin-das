@@ -108,6 +108,28 @@ jobs:
           --workspace "$GITHUB_WORKSPACE"
           --artifact-root "$HCU_CI_HOST_JOB_ROOT"
 
+      - name: Diagnose HCU container runtime
+        run: |
+          docker exec "$HCU_CI_CONTAINER_NAME" bash -lc '
+            set +e
+            source /opt/dtk/env.sh
+            echo "container=$(hostname)"
+            id
+            ls -ld /dev/kfd /dev/dri /opt/hyhal /opt/hyhal/lib 2>&1
+            ls -l /dev/dri 2>&1
+            ldconfig -p 2>/dev/null | grep -E "hydmi|hyhal|rocm_smi" || true
+            /usr/local/bin/python3.10 - <<'"'"'PY'"'"'
+          import torch
+          print("torch", torch.__version__)
+          print("hip", getattr(torch.version, "hip", None))
+          print("cuda_available", torch.cuda.is_available())
+          try:
+              print("device_count", torch.cuda.device_count())
+          except Exception as exc:
+              print("device_count_error", repr(exc))
+          PY
+          '
+
       - name: Install checked-out plugin without network access
         run: bash scripts/ci/hcu/hcu_ci_install_dependency.sh
 
