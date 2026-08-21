@@ -1311,6 +1311,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         DEEPGEMM = "DEEPGEMM"
         BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
         TRITON = "TRITON"
+        AITER = "AITER"
 
     def backend_to_kernel_cls(backend):
         return [backend]
@@ -1448,6 +1449,13 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
     ) == tensors
     assert module.convert_to_fp8_moe_kernel_format(
         module.Fp8MoeBackend.DEEPGEMM,
+        SimpleNamespace(weight_block_size=None),
+        *tensors,
+        None,
+        None,
+    ) == tensors
+    assert module.convert_to_fp8_moe_kernel_format(
+        module.Fp8MoeBackend.AITER,
         SimpleNamespace(weight_block_size=None),
         *tensors,
         None,

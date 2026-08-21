@@ -1934,11 +1934,6 @@ def test_moe_fp8_target_triton_owns_process_and_apply(
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
     target_process = method_class.process_weights_after_loading
     target_apply = method_class.apply
-    monkeypatch.setattr(
-        patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_moe_state",
-        lambda: (False, False),
-    )
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is True
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is False
     assert method_class.process_weights_after_loading is target_process
@@ -1964,41 +1959,41 @@ def test_moe_fp8_target_triton_owns_process_and_apply(
 
 @pytest.mark.parametrize(
     ("target_aiter", "hcu_aiter"),
-    [(False, True), (True, False), (True, True)],
+    [(False, False), (False, True), (True, False), (True, True)],
 )
-def test_moe_fp8_rejects_every_aiter_half_state_before_target_init(
+def test_moe_fp8_explicit_aiter_ignores_legacy_environment_half_states(
     monkeypatch: pytest.MonkeyPatch,
     target_aiter: bool,
     hcu_aiter: bool,
 ):
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
-    monkeypatch.setattr(
-        patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_moe_state",
-        lambda: (target_aiter, hcu_aiter),
-    )
-    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    with pytest.raises(RuntimeError, match="requires VLLM_ROCM_USE_AITER_MOE=0"):
-        method_class(
-            *_channel_fp8_moe_args(module),
-            SimpleNamespace(moe_backend="triton"),
+    method_class.selected_backend = "AITER"
+    if target_aiter:
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
+    else:
+        monkeypatch.delenv("VLLM_ROCM_USE_AITER_MOE", raising=False)
+    if hcu_aiter:
+        monkeypatch.setenv("VLLM_HCU_USE_AITER_W8A8_FP8_MOE", "1")
+    else:
+        monkeypatch.delenv(
+            "VLLM_HCU_USE_AITER_W8A8_FP8_MOE",
+            raising=False,
         )
-    assert method_class.init_calls == []
-
-
-def test_moe_fp8_requires_explicit_triton_and_checks_target_selection(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(
-        patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_moe_state",
-        lambda: (False, False),
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="aiter"),
     )
+    assert method.fp8_backend.value == "AITER"
+    assert len(method_class.init_calls) == 1
+
+
+def test_moe_fp8_requires_explicit_aiter_or_triton_and_checks_target_selection():
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    with pytest.raises(RuntimeError, match="--moe-backend triton"):
+    with pytest.raises(RuntimeError, match="--moe-backend aiter or triton"):
         method_class(
             *_channel_fp8_moe_args(module),
             SimpleNamespace(moe_backend="auto"),
@@ -2013,20 +2008,20 @@ def test_moe_fp8_requires_explicit_triton_and_checks_target_selection(
         )
     assert len(method_class.init_calls) == 1
 
+    method_class.selected_backend = "TRITON"
+    with pytest.raises(RuntimeError, match="selected='TRITON'"):
+        method_class(
+            *_channel_fp8_moe_args(module),
+            SimpleNamespace(moe_backend="aiter"),
+        )
+    assert len(method_class.init_calls) == 2
+
 
 def test_moe_fp8_non_channel_routes_delegate_target_without_triton_policy(
-    monkeypatch: pytest.MonkeyPatch,
 ):
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
     method_class.selected_backend = "AITER"
-    monkeypatch.setattr(
-        patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_moe_state",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("non-Channel route must not read Channel policy flags")
-        ),
-    )
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
     method = method_class(
         *_tensor_fp8_moe_args(module),
@@ -2455,14 +2450,8 @@ def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
 
 
 def test_moe_fp8_target_process_has_no_hcu_dpsk_postprocess(
-    monkeypatch: pytest.MonkeyPatch,
 ):
     module = _fake_moe_fp8_module()
-    monkeypatch.setattr(
-        patch_compressed_tensors_moe_w8a8_fp8,
-        "_aiter_moe_state",
-        lambda: (False, False),
-    )
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
     method = module.CompressedTensorsW8A8Fp8MoEMethod(
         *_channel_fp8_moe_args(module),
