@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Make the target vLLM mHC backend honor the HCU backend switch."""
 
 from __future__ import annotations
