@@ -84,6 +84,50 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
             raise ValueError(int8_backend)
         return w13 + 1, w2 + 1
 
+    def make_int8_moe_quant_config(
+        int8_backend,
+        w1_scale,
+        w2_scale,
+        a1_scale=None,
+        a2_scale=None,
+        w1_bias=None,
+        w2_bias=None,
+        per_act_token_quant=False,
+        layer=None,
+    ):
+        del (
+            int8_backend,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+            w1_bias,
+            w2_bias,
+            per_act_token_quant,
+            layer,
+        )
+        return "original-w8a16"
+
+    def int8_w8a8_moe_quant_config(
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        per_act_token_quant=False,
+    ):
+        return SimpleNamespace(
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            per_act_token_quant=per_act_token_quant,
+            use_int8_w8a8=True,
+        )
+
     target = _module(
         patch_int8_oracle.TARGET_MODULE,
         Enum=enum.Enum,
@@ -91,6 +135,8 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
         backend_to_kernel_cls=backend_to_kernel_cls,
         map_int8_backend=map_int8_backend,
         convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
+        make_int8_moe_quant_config=make_int8_moe_quant_config,
+        int8_w8a8_moe_quant_config=int8_w8a8_moe_quant_config,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -117,6 +163,19 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
     )
     assert converted_w13 is w13
     assert converted_w2 is w2
+
+    w1_scale = torch.ones((2, 4, 1))
+    w2_scale = torch.ones((2, 3, 1))
+    quant_config = target.make_int8_moe_quant_config(
+        target.Int8MoeBackend.AITER,
+        w1_scale,
+        w2_scale,
+        per_act_token_quant=True,
+    )
+    assert quant_config.use_int8_w8a8 is True
+    assert quant_config.per_act_token_quant is True
+    assert quant_config.a1_scale is None
+    assert quant_config.a2_scale is None
 
 
 def test_worker_registers_int8_aiter_oracle_before_quantized_methods():

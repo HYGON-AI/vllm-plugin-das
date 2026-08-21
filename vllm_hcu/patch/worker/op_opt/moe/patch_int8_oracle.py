@@ -22,6 +22,8 @@ TARGETS = (
     f"{TARGET_MODULE}.backend_to_kernel_cls",
     f"{TARGET_MODULE}.map_int8_backend",
     f"{TARGET_MODULE}.convert_to_int8_moe_kernel_format",
+    f"{TARGET_MODULE}.make_int8_moe_quant_config",
+    f"{TARGET_MODULE}.int8_w8a8_moe_quant_config",
 )
 _MARKER = "_vllm_hcu_int8_aiter_oracle_applied"
 
@@ -39,12 +41,37 @@ def apply_to_module(module: ModuleType) -> bool:
         "convert_to_int8_moe_kernel_format",
         TARGETS[3],
     )
+    make_quant_config = require_callable(
+        target,
+        "make_int8_moe_quant_config",
+        TARGETS[4],
+    )
+    make_w8a8_quant_config = require_callable(
+        target,
+        "int8_w8a8_moe_quant_config",
+        TARGETS[5],
+    )
     require_parameter_names(backend_to_cls, TARGETS[1], ("backend",))
     require_parameter_names(map_backend, TARGETS[2], ("runner_backend",))
     require_parameter_names(
         convert,
         TARGETS[3],
         ("int8_backend", "w13", "w2", "layer", "w13_scale"),
+    )
+    require_parameter_names(
+        make_quant_config,
+        TARGETS[4],
+        (
+            "int8_backend",
+            "w1_scale",
+            "w2_scale",
+            "a1_scale",
+            "a2_scale",
+            "w1_bias",
+            "w2_bias",
+            "per_act_token_quant",
+            "layer",
+        ),
     )
 
     values = {member.name: member.value for member in old_enum}
@@ -85,12 +112,48 @@ def apply_to_module(module: ModuleType) -> bool:
             return w13, w2
         return convert(int8_backend, w13, w2, layer, w13_scale)
 
+    @functools.wraps(make_quant_config)
+    def hcu_make_int8_moe_quant_config(
+        int8_backend,
+        w1_scale,
+        w2_scale,
+        a1_scale=None,
+        a2_scale=None,
+        w1_bias=None,
+        w2_bias=None,
+        per_act_token_quant=False,
+        layer=None,
+    ):
+        if int8_backend == hcu_enum.AITER and per_act_token_quant:
+            return make_w8a8_quant_config(
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                per_act_token_quant=True,
+            )
+        return make_quant_config(
+            int8_backend=int8_backend,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            per_act_token_quant=per_act_token_quant,
+            layer=layer,
+        )
+
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls
     target._vllm_hcu_original_map_int8_backend = map_backend
     target.map_int8_backend = hcu_map_int8_backend
     target._vllm_hcu_original_convert_to_int8_moe_kernel_format = convert
     target.convert_to_int8_moe_kernel_format = hcu_convert_to_int8_moe_kernel_format
+    target._vllm_hcu_original_make_int8_moe_quant_config = make_quant_config
+    target.make_int8_moe_quant_config = hcu_make_int8_moe_quant_config
     setattr(target, _MARKER, True)
     return True
 
