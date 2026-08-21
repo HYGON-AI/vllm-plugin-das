@@ -302,6 +302,7 @@ def test_environment_lock_allows_compatible_hip_prefix(
                 "distributions": {
                     "torch": {"match": "prefix", "version": "2.11.0+"},
                     "vllm-hcu": {"match": "prefix", "version": "0.25.1+"},
+                    "aiter": {"match": "prefix", "version": "0.1."},
                 },
             }
         ),
@@ -309,13 +310,21 @@ def test_environment_lock_allows_compatible_hip_prefix(
     )
     _check_environment_lock(
         lock,
-        versions={"torch": "2.11.0+build.1", "vllm-hcu": "0.25.1+build.1"},
+        versions={
+            "torch": "2.11.0+build.1",
+            "vllm-hcu": "0.25.1+build.1",
+            "aiter": "0.1.5+dtk2604.torch2110.2608211546.g6ddaa7",
+        },
         torch_hip="6.3.26093",
     )
     with pytest.raises(PreflightError, match="torch HIP drift"):
         _check_environment_lock(
             lock,
-            versions={"torch": "2.11.0+build.1", "vllm-hcu": "0.25.1+build.1"},
+            versions={
+                "torch": "2.11.0+build.1",
+                "vllm-hcu": "0.25.1+build.1",
+                "aiter": "0.1.5+dtk2604.torch2110.2608211546.g6ddaa7",
+            },
             torch_hip="6.4.0",
         )
 
