@@ -37,6 +37,15 @@ PATCH_ID = "worker.core_fix.deepseek_v4_amd.load_weights_scale_remap"
 TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Model.load_weights"
 _CLASS_MARKER = "_vllm_hcu_deepseek_v4_load_weights_applied"
 _WRAPPER_MARKER = "_vllm_hcu_deepseek_v4_load_weights_wrapper"
+_STACKED_PARAMS_MAPPING = (
+    # (param_name, shard_name, shard_id)
+    ("gate_up_proj", "w1", 0),
+    ("gate_up_proj", "w3", 1),
+    ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+    ("attn.fused_wqa_wkv", "attn.wkv", 1),
+    ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+    ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+)
 
 
 def _maybe_remap_scale(param_name: str, params_dict: dict) -> str:
@@ -61,6 +70,106 @@ def _maybe_remap_scale(param_name: str, params_dict: dict) -> str:
     return param_name
 
 
+def _load_stacked_parameter(
+    self,
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict,
+    is_pp_missing_parameter: Callable[[str, object], bool],
+) -> tuple[bool, str | None]:
+    """Load a stacked parameter and report whether the name was handled."""
+    if ".experts." in name:
+        return False, None
+
+    for param_name, weight_name, shard_id in _STACKED_PARAMS_MAPPING:
+        if weight_name not in name:
+            continue
+        name = name.replace(weight_name, param_name)
+        if is_pp_missing_parameter(name, self):
+            return True, None
+
+        name = _maybe_remap_scale(name, params_dict)
+        param = params_dict[name]
+        param.weight_loader(param, loaded_weight, shard_id)
+        return True, name
+
+    return False, None
+
+
+def _load_expert_parameter(
+    self,
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict,
+    expert_mapping: list[tuple],
+    is_pp_missing_parameter: Callable[[str, object], bool],
+) -> str:
+    """Load one expert parameter using the first successful replica mapping."""
+    if "weight_scale" in name and loaded_weight.dtype == torch.float8_e8m0fnu:
+        loaded_weight = loaded_weight.view(torch.uint8)
+
+    name_mapped = name
+    for param_name, weight_name, expert_id, expert_shard_id in expert_mapping:
+        if weight_name not in name:
+            continue
+        name_mapped = name.replace(weight_name, param_name)
+        if is_pp_missing_parameter(name_mapped, self):
+            continue
+
+        name_mapped = _maybe_remap_scale(name_mapped, params_dict)
+        param = params_dict[name_mapped]
+        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        success = weight_loader(
+            param,
+            loaded_weight,
+            name_mapped,
+            shard_id=expert_shard_id,
+            expert_id=expert_id,
+            return_success=True,
+        )
+        if success:
+            break
+
+    return name_mapped
+
+
+def _load_attention_sink(
+    self,
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict,
+    head_rank_start: int,
+    head_rank_end: int,
+    is_pp_missing_parameter: Callable[[str, object], bool],
+) -> str | None:
+    """Load the tensor-parallel slice of an attention-sink parameter."""
+    if is_pp_missing_parameter(name, self):
+        return None
+
+    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+    params_dict[name][: narrow_weight.shape[0]].copy_(narrow_weight)
+    return name
+
+
+def _load_default_parameter(
+    self,
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict,
+    default_weight_loader: Callable,
+    is_pp_missing_parameter: Callable[[str, object], bool],
+) -> str | None:
+    """Load a non-stacked, non-expert parameter."""
+    if is_pp_missing_parameter(name, self):
+        return None
+
+    name = _maybe_remap_scale(name, params_dict)
+    param = params_dict[name]
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, loaded_weight)
+    return name
+
+
 def _hcu_load_weights(
     self,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -81,15 +190,6 @@ def _hcu_load_weights(
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.model_executor.models.utils import is_pp_missing_parameter
 
-    stacked_params_mapping = [
-        # (param_name, shard_name, shard_id)
-        ("gate_up_proj", "w1", 0),
-        ("gate_up_proj", "w3", 1),
-        ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-        ("attn.fused_wqa_wkv", "attn.wkv", 1),
-        ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-        ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-    ]
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
 
@@ -103,73 +203,49 @@ def _hcu_load_weights(
     expert_mapping = self.get_expert_mapping()
 
     for name, loaded_weight in weights:
-        for param_name, weight_name, shard_id in stacked_params_mapping:
-            if ".experts." in name:
-                continue
-            if weight_name not in name:
-                continue
-            name = name.replace(weight_name, param_name)
+        handled, loaded_name = _load_stacked_parameter(
+            self,
+            name,
+            loaded_weight,
+            params_dict,
+            is_pp_missing_parameter,
+        )
+        if handled:
+            if loaded_name is not None:
+                loaded_params.add(loaded_name)
+            continue
 
-            if is_pp_missing_parameter(name, self):
-                break
-            name = _maybe_remap_scale(name, params_dict)
-            param = params_dict[name]
-            weight_loader = param.weight_loader
-            weight_loader(param, loaded_weight, shard_id)
-            loaded_params.add(name)
-            break
+        if ".experts." in name:
+            loaded_name = _load_expert_parameter(
+                self,
+                name,
+                loaded_weight,
+                params_dict,
+                expert_mapping,
+                is_pp_missing_parameter,
+            )
+        elif "attn_sink" in name:
+            loaded_name = _load_attention_sink(
+                self,
+                name,
+                loaded_weight,
+                params_dict,
+                head_rank_start,
+                head_rank_end,
+                is_pp_missing_parameter,
+            )
         else:
-            if ".experts." in name:
-                if (
-                    "weight_scale" in name
-                    and loaded_weight.dtype == torch.float8_e8m0fnu
-                ):
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                name_mapped = name
-                for mapping in expert_mapping:
-                    param_name, weight_name, expert_id, expert_shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name_mapped = name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name_mapped, self):
-                        continue
-                    name_mapped = _maybe_remap_scale(name_mapped, params_dict)
-                    param = params_dict[name_mapped]
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
-                    )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=expert_shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        name = name_mapped
-                        break
-                loaded_params.add(name_mapped)
-                continue
-            elif "attn_sink" in name:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                n = narrow_weight.shape[0]
-                params_dict[name][:n].copy_(narrow_weight)
-                loaded_params.add(name)
-                continue
-            else:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                name = _maybe_remap_scale(name, params_dict)
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-                continue
+            loaded_name = _load_default_parameter(
+                self,
+                name,
+                loaded_weight,
+                params_dict,
+                default_weight_loader,
+                is_pp_missing_parameter,
+            )
+
+        if loaded_name is not None:
+            loaded_params.add(loaded_name)
 
     return loaded_params
 
