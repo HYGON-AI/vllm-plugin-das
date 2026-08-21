@@ -40,6 +40,25 @@ jobs:
           clean: true
           fetch-depth: 0
 
+      - name: Diagnose HCU CI container runtime
+        env:
+          HCU_CI_IMAGE_CONFIGURED: ${{ vars.HCU_CI_IMAGE }}
+        run: |
+          echo "configured image: ${HCU_CI_IMAGE_CONFIGURED:-<unset>}"
+          echo "PATH=$PATH"
+          command -v -a python3.10 || true
+          for python_path in \
+            /usr/local/bin/python3.10 \
+            /usr/bin/python3.10 \
+            /home/github/.local/bin/python3.10; do
+            echo "== $python_path =="
+            ls -l "$python_path" 2>&1 || true
+            if [[ -x "$python_path" ]]; then
+              "$python_path" -c \
+                'import importlib.util, sys; print("executable=" + sys.executable); print("pytest=" + str(importlib.util.find_spec("pytest") is not None))'
+            fi
+          done
+
       - name: Verify patch contracts
         run: |
           /usr/local/bin/python3.10 --version
