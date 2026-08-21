@@ -52,7 +52,9 @@ jobs:
         run: /usr/local/bin/python3.10 -m compileall -q tools tests vllm_hcu
 
       - name: Run portable contract tests
-        run: /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
+        run: |
+          source /opt/dtk/env.sh
+          /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
 
       - name: Select HCU matrix
         id: select

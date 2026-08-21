@@ -12,10 +12,12 @@ fi
 
 if [[ "${HCU_CI_SKIP_PROJECT_INSTALL:-0}" != "1" ]]; then
   docker exec --workdir /vllm-plugin-das "$container_name" \
-    /usr/local/bin/python3.10 -m pip install --no-deps --no-build-isolation -e .
+    bash -lc \
+    'source /opt/dtk/env.sh && exec /usr/local/bin/python3.10 -m pip install --no-deps --no-build-isolation -e .'
 fi
 
-docker exec -i --workdir /vllm-plugin-das "$container_name" /usr/local/bin/python3.10 - <<'PY'
+docker exec -i --workdir /vllm-plugin-das "$container_name" \
+  bash -lc 'source /opt/dtk/env.sh && exec /usr/local/bin/python3.10 -' <<'PY'
 import importlib.metadata
 import sys
 

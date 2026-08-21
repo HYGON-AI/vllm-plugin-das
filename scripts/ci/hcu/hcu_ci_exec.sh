@@ -31,4 +31,5 @@ for name in \
   fi
 done
 
-docker "${exec_args[@]}" "$container_name" "$@"
+docker "${exec_args[@]}" "$container_name" \
+  bash -lc 'source /opt/dtk/env.sh && exec "$@"' -- "$@"
