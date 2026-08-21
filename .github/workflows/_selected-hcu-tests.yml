@@ -93,6 +93,13 @@ jobs:
           clean: true
           fetch-depth: 1
 
+      - name: Diagnose HCU host runtime
+        run: |
+          echo "runner=$RUNNER_NAME arch=$HCU_CI_ARCH cards=$HCU_CI_CARDS"
+          id
+          ls -ld /dev/kfd /dev/dri /opt/hyhal 2>&1 || true
+          ls -l /dev/dri 2>&1 || true
+
       - name: Start immutable HCU CI container
         run: >-
           bash scripts/ci/hcu/hcu_ci_start_container.sh

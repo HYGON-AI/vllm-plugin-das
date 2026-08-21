@@ -58,11 +58,22 @@ docker_args=(
   --env PYTHONPATH=/vllm-plugin-das
 )
 
+missing_devices=()
 for device in /dev/kfd /dev/dri; do
   if [[ -e "$device" ]]; then
     docker_args+=(--device "$device:$device")
+  else
+    missing_devices+=("$device")
   fi
 done
+if [[ "${#missing_devices[@]}" -gt 0 ]]; then
+  echo "HCU device nodes are unavailable on runner: ${missing_devices[*]}" >&2
+  echo "This self-hosted runner cannot execute HCU hardware tests." >&2
+  exit 2
+fi
+if [[ -d /opt/hyhal ]]; then
+  docker_args+=(--volume /opt/hyhal:/opt/hyhal:ro)
+fi
 
 if [[ -z "$model_root" && -d /models/llm-models ]]; then
   model_root=/models/llm-models
