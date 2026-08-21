@@ -13,4 +13,9 @@ if [[ ! "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
   echo "invalid HCU CI container name: $container_name" >&2
   exit 2
 fi
+if docker inspect "$container_name" >/dev/null 2>&1; then
+  docker exec "$container_name" \
+    chown -R "$(id -u):$(id -g)" /vllm-plugin-das /hcu-ci-artifacts \
+    >/dev/null 2>&1 || true
+fi
 docker rm -f "$container_name" >/dev/null 2>&1 || true
