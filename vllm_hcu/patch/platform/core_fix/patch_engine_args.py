@@ -49,6 +49,7 @@ _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CLASSIC": "classic",
     "FLASH_ATTN_CUTLASS": "cutlass",
     "FLASH_ATTN_CUSTOM": "custom",
+    "FLASH_ATTN_VARLEN": "varlen",
 }
 
 
