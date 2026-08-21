@@ -85,7 +85,7 @@ jobs:
           bash scripts/ci/hcu/hcu_ci_exec.sh
           --container-name "$HCU_CI_CONTAINER_NAME"
           -w /vllm-plugin-das
-          -- python .github/scripts/hcu_ci/run_hcu_ci_job.py
+          -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py
 
       - name: Cleanup HCU CI container
         if: always()

@@ -42,17 +42,17 @@ jobs:
 
       - name: Verify patch contracts
         run: |
-          python --version
-          python .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          python .github/scripts/hcu_ci/verify_hcu_registration.py
-          python .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
-          python .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+          /usr/local/bin/python3.10 --version
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
 
       - name: Compile Python sources
-        run: python -m compileall -q tools tests vllm_hcu
+        run: /usr/local/bin/python3.10 -m compileall -q tools tests vllm_hcu
 
       - name: Run portable contract tests
-        run: python tools/run_patch_tests.py --suite contract
+        run: /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
 
       - name: Select HCU matrix
         id: select
@@ -69,7 +69,7 @@ jobs:
           if [[ "$ACCURACY_HCU" == "true" ]]; then
             args+=(--accuracy)
           fi
-          python .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
 
   authorize-hcu:
     name: Authorize hardware execution
@@ -102,7 +102,7 @@ jobs:
         id: authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python .github/scripts/hcu_ci/check_hcu_ci_authorization.py
+        run: /usr/local/bin/python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
 
   selected-hcu-tests:
     name: Selected hardware tests

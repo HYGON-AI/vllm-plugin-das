@@ -35,9 +35,9 @@ jobs:
       - name: Check for a registered multi-node job
         id: registration
         run: |
-          python --version
+          /usr/local/bin/python3.10 --version
           targets="$RUNNER_TEMP/weekly-multi-node-targets.txt"
-          if python .github/scripts/hcu_ci/verify_hcu_registration.py \
+          if /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py \
               --job weekly-multi-node \
               --format pytest > "$targets"; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
@@ -84,7 +84,7 @@ jobs:
           HCU_CI_SUITE: distributed-multi-node
           HCU_CI_PYTEST_ARGS_JSON: "[]"
           HCU_CI_REQUIREMENTS_JSON: "[]"
-        run: python3 .github/scripts/hcu_ci/run_hcu_ci_job.py
+        run: python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py
 
       - name: Report local multi-node logs
         if: always()
