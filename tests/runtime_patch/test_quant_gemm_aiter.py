@@ -51,6 +51,91 @@ def _package(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
+
+    class Int8MoeBackend(enum.Enum):
+        TRITON = "TRITON"
+        HUMMING = "HUMMING"
+        CPU = "CPU"
+
+    class AiterExperts:
+        pass
+
+    def backend_to_kernel_cls(backend):
+        return [f"original:{backend.value}"]
+
+    def map_int8_backend(runner_backend):
+        if runner_backend == "triton":
+            return Int8MoeBackend.TRITON
+        raise ValueError(runner_backend)
+
+    def convert_to_int8_moe_kernel_format(
+        int8_backend,
+        w13,
+        w2,
+        layer=None,
+        w13_scale=None,
+    ):
+        del layer, w13_scale
+        if int8_backend != Int8MoeBackend.TRITON:
+            raise ValueError(int8_backend)
+        return w13 + 1, w2 + 1
+
+    target = _module(
+        patch_int8_oracle.TARGET_MODULE,
+        Enum=enum.Enum,
+        Int8MoeBackend=Int8MoeBackend,
+        backend_to_kernel_cls=backend_to_kernel_cls,
+        map_int8_backend=map_int8_backend,
+        convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
+        _module(
+            "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
+            AiterExperts=AiterExperts,
+        ),
+    )
+
+    assert patch_int8_oracle.apply_to_module(target) is True
+    assert target.map_int8_backend("aiter") == target.Int8MoeBackend.AITER
+    assert target.map_int8_backend("triton").value == "TRITON"
+    assert target.backend_to_kernel_cls(target.Int8MoeBackend.AITER) == [
+        AiterExperts
+    ]
+
+    w13 = torch.zeros((2, 4, 3), dtype=torch.int8)
+    w2 = torch.zeros((2, 3, 2), dtype=torch.int8)
+    converted_w13, converted_w2 = target.convert_to_int8_moe_kernel_format(
+        target.Int8MoeBackend.AITER,
+        w13,
+        w2,
+    )
+    assert converted_w13 is w13
+    assert converted_w2 is w2
+
+
+def test_worker_registers_int8_aiter_oracle_before_quantized_methods():
+    from vllm_hcu.patch import worker
+
+    callbacks = worker.worker_callback_names()
+    int8_entry = (
+        "worker.op_opt.moe.oracle.int8_aiter",
+        "vllm.model_executor.layers.fused_moe.oracle.int8",
+    )
+    fp8_method_entry = (
+        "worker.op_opt.compressed_tensors.moe_w8a8_fp8",
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8",
+    )
+    assert int8_entry in callbacks
+    assert callbacks.index(int8_entry) < callbacks.index(fp8_method_entry)
+
+
 def _install_fake_vllm_envs(
     monkeypatch: pytest.MonkeyPatch,
     **attributes: object,
