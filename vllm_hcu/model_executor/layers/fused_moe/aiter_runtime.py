@@ -47,6 +47,102 @@ _EXPLICIT_AITER_MOE: ContextVar[bool] = ContextVar(
 _AITER_MOE_GLOBAL_NUM_EXPERTS: ContextVar[int | None] = ContextVar(
     "vllm_hcu_aiter_moe_global_num_experts", default=None
 )
+_AITER_ASM_VLLM_SILU: ContextVar[bool] = ContextVar(
+    "vllm_hcu_aiter_asm_vllm_silu", default=False
+)
+_AITER_ASM_ACTIVATION_PARAMETERS = (
+    "activation",
+    "is_gated",
+    "activated_out",
+    "ffn1_out_2d",
+    "gemm1_alpha",
+    "gemm1_limit",
+)
+_AITER_ASM_SILU_WRAPPER_MARKER = "_vllm_hcu_aiter_asm_silu_wrapper"
+
+
+def _vllm_silu_and_mul(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """Apply vLLM's canonical gated SiLU operator."""
+
+    import_module("vllm._C_stable_libtorch")
+    operation = getattr(getattr(torch.ops, "_C", None), "silu_and_mul", None)
+    if not callable(operation):
+        raise HcuAiterRuntimeError(
+            "vLLM _C.silu_and_mul is unavailable for AITER ASM compatibility"
+        )
+    operation(output, input)
+
+
+def _install_aiter_asm_vllm_silu_wrapper() -> None:
+    module = import_module("aiter.fused_moe_asm_wna16")
+    current = getattr(module, "_apply_activation", None)
+    if not callable(current):
+        raise HcuAiterRuntimeError(
+            "AITER ASM exposes no callable _apply_activation compatibility point"
+        )
+    if bool(getattr(current, _AITER_ASM_SILU_WRAPPER_MARKER, False)):
+        return
+    try:
+        signature = inspect.signature(current)
+    except (TypeError, ValueError) as exc:
+        raise HcuAiterRuntimeError(
+            "AITER ASM _apply_activation has no inspectable compatibility ABI"
+        ) from exc
+    missing = tuple(
+        name
+        for name in _AITER_ASM_ACTIVATION_PARAMETERS
+        if name not in signature.parameters
+    )
+    if missing:
+        raise HcuAiterRuntimeError(
+            "AITER ASM _apply_activation has an incompatible ABI; missing "
+            f"parameters {missing!r}"
+        )
+    exact_audited_abi = (
+        tuple(signature.parameters) == _AITER_ASM_ACTIVATION_PARAMETERS
+    )
+
+    original = current
+
+    @functools.wraps(original)
+    def wrapped_activation(*args: Any, **kwargs: Any) -> Any:
+        if not _AITER_ASM_VLLM_SILU.get() or not exact_audited_abi:
+            return original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        if (
+            bound.arguments["activation"] == "silu"
+            and bool(bound.arguments["is_gated"])
+            and bound.arguments["gemm1_alpha"] is None
+            and bound.arguments["gemm1_limit"] is None
+        ):
+            _vllm_silu_and_mul(
+                bound.arguments["activated_out"],
+                bound.arguments["ffn1_out_2d"],
+            )
+            return None
+        return original(*args, **kwargs)
+
+    setattr(wrapped_activation, _AITER_ASM_SILU_WRAPPER_MARKER, True)
+    module._apply_activation = wrapped_activation
+
+
+@contextmanager
+def aiter_asm_vllm_silu_context(enabled: bool):
+    """Use vLLM SiLU only inside a selected quantized AITER ASM call."""
+
+    if not enabled:
+        yield
+        return
+    _install_aiter_asm_vllm_silu_wrapper()
+    token = _AITER_ASM_VLLM_SILU.set(True)
+    try:
+        yield
+    finally:
+        _AITER_ASM_VLLM_SILU.reset(token)
 
 
 def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
@@ -868,6 +964,7 @@ def get_aiter_activation_type(
 
 __all__ = [
     "HcuAiterRuntimeError",
+    "aiter_asm_vllm_silu_context",
     "aiter_gate_mode_kwargs",
     "fused_moe_impl",
     "get_aiter_activation_type",

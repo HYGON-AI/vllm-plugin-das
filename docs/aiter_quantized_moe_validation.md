@@ -6,6 +6,9 @@ support for compressed-tensors INT8 and channel-wise FP8 MoE models.
 ## Environment
 
 - vLLM source: `/models/zb/vllm_025/vllm`
+- AITER: `0.1.5+das185.dtk2604.torch2110.2608180853.g40a705`
+- Audited AITER activation ABI: `_apply_activation(activation, is_gated,
+  activated_out, ffn1_out_2d, gemm1_alpha, gemm1_limit)`
 - Plugin branch: `fix/hcu-v025-aiter-w8a8-quantized`
 - Model runner: V2 (`VLLM_USE_V2_MODEL_RUNNER=1`)
 - KV cache layout: HND
@@ -169,23 +172,24 @@ python3 -m evalscope.cli.cli eval \
   --no-timestamp
 ```
 
-The 1800-second request timeout is necessary because the INT8 AITER result for
-sample index 17 reaches the 32768-token generation limit at about 44 tokens/s.
-EvalScope's shorter default request timeout expires just before that request
-finishes.
+The 1800-second request timeout is required only to reproduce the original
+AITER-SiLU baseline: its sample index 17 reaches the 32768-token generation
+limit at about 44 tokens/s. The aligned run's longest output is 528 tokens.
 
 ## Results
 
 | Model | MoE path | HumanEval pass@1 | Correct | Max output tokens | Wall time |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Qwen3.5-35B-A3B-W8A8 | AITER W8A8 ASM | 0.7188 | 23/32 | 32768 | 885.88 s |
+| Qwen3.5-35B-A3B-W8A8 | AITER W8A8 ASM, original AITER SiLU | 0.7188 | 23/32 | 32768 | 885.88 s |
+| Qwen3.5-35B-A3B-W8A8 | AITER W8A8 ASM, vLLM-compatible SiLU | 0.9062 | 29/32 | 528 | 175.44 s |
 | Qwen3.5-35B-A3B-W8A8 | slimquant_marlin | 0.8438 | 27/32 | 261 | 154.69 s |
 | Qwen3.5-35B-A3B-CHANNEL-FP8 | AITER FP8 W8A8 ASM | 0.8125 | 26/32 | 213 | 167.46 s |
 | Qwen3.5-35B-A3B-CHANNEL-FP8 | Triton FP8 W8A8 | 0.8750 | 28/32 | 247 | 171.27 s |
 
-No Unicode replacement characters were found in any of the four 32-sample
-outputs. The INT8 AITER failure mode is a changed numerical/code-generation
-trajectory, not text encoding corruption.
+No Unicode replacement characters or NUL bytes were found in any of the
+32-sample outputs. The aligned INT8 run returned no request errors and failed
+only HumanEval indices 4, 19, and 20. The previous 32768-token runaway output
+was eliminated.
 
 ## Operator-level comparison with real checkpoint weights
 
@@ -203,6 +207,40 @@ and 128, with E=256, K=2048, N=512, and top-k=8.
 | FP8 W8A8 | 128 | 0.017578 | 0.0000319 | 0.20% |
 
 The INT8 weights, channel scales, and dynamic-token quantization metadata are
-loaded correctly by the plugin. The remaining INT8 accuracy gap is consistent
-with the larger numerical difference in the installed AITER INT8 ASM path and
-is reproducible independently of vLLM graph capture and EvalScope.
+loaded correctly by the plugin. Controlled stage capture showed that AITER ASM
+and vLLM's true-W8A8 Triton operator agree at GEMM1, while the installed
+AITER Triton SiLU implementation introduces the first material difference.
+
+The plugin therefore replaces the intermediate activation only while an
+explicit INT8-W8A8 AITER ASM call is active. It uses vLLM's canonical
+`_C.silu_and_mul` operator under a context-local guard. FP8, W16A16, other
+AITER solution types, and the official vLLM Triton MoE path retain their
+original behavior.
+
+The same real layer-0 weights were then compared against the unmodified vLLM
+Triton operator forced to true W8A8 at operator level. NMAE is normalized by
+the reference output mean absolute value.
+
+| M | Original AITER vs vLLM NMAE | Aligned AITER vs vLLM NMAE |
+| ---: | ---: | ---: |
+| 1 | 1.12132% | 0.00000% |
+| 16 | 0.88458% | 0.38930% |
+| 128 | 0.88683% | 0.26516% |
+
+The remaining M=16/128 difference comes after the activation boundary from
+GEMM2 and expert-combine numerical ordering. The graph-enabled service
+completed both PIECEWISE and FULL capture, served a normal request with
+`reasoning=null`, and completed the aligned 32-sample evaluation in 175.44
+seconds.
+
+Static verification after this alignment completed with `159 passed` and the
+same 14 pre-existing deprecation warnings:
+
+```bash
+python3 -m compileall -q vllm_hcu tests/runtime_patch
+VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm \
+python3 -m pytest -q \
+  tests/runtime_patch/test_quant_gemm_aiter.py \
+  tests/runtime_patch/test_moe_deepep.py \
+  tests/runtime_patch/test_platform_hcu_config.py
+```
