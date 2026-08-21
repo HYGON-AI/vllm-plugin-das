@@ -2188,6 +2188,272 @@ def test_moe_fp8_aiter_path_accepts_v0251_shared_expert_contract(
         )
 
 
+@pytest.mark.parametrize(
+    ("use_fp8", "use_int8", "expected_quant_type"),
+    [
+        (True, False, "fp8_w8a8"),
+        (False, True, "int8_w8a8"),
+    ],
+)
+def test_quantized_aiter_runtime_selects_exact_quant_type(
+    monkeypatch: pytest.MonkeyPatch,
+    use_fp8: bool,
+    use_int8: bool,
+    expected_quant_type: str,
+):
+    config_calls: list[dict[str, object]] = []
+    kernel_calls: list[dict[str, object]] = []
+    expected_output = torch.full((2, 4), 9.0)
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def get_config(**kwargs):
+        config_calls.append(kwargs)
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type="asm",
+            need_shuffle=False,
+        )
+
+    def aiter_moe(**kwargs):
+        kernel_calls.append(kwargs)
+        return expected_output
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+    topk_weights = torch.ones((2, 2), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((2, 2), dtype=torch.int64)
+    w1_scale = torch.ones((3, 8, 1), dtype=torch.float32)
+    w2_scale = torch.ones((3, 4, 1), dtype=torch.float32)
+    a1q_scale = torch.ones((2, 1), dtype=torch.float32)
+    expert_map = torch.tensor([0, 1, 2], dtype=torch.int32)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=use_fp8,
+        use_int8_w8a8=use_int8,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+
+    output = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        vllm_moe_config=SimpleNamespace(num_experts=3),
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=expert_map,
+        quant_config=quant_config,
+        a1q_scale=a1q_scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert output is expected_output
+    assert config_calls[0]["quant_type"] == expected_quant_type
+    assert config_calls[0]["M"] == 2
+    assert config_calls[0]["E"] == 3
+    assert config_calls[0]["top_k"] == 2
+    call = kernel_calls[0]
+    assert call["hidden_states"] is hidden_states
+    assert call["w1"] is w1 and call["w2"] is w2
+    assert call["w1_scale"] is w1_scale and call["w2_scale"] is w2_scale
+    assert call["a1_scale"] is a1q_scale
+    assert call["expert_map"] is expert_map
+    assert call["global_num_experts"] == 3
+    assert call["inplace"] is False
+    assert call["use_weight_shuffle"] is False
+    assert call["output_dtype"] is torch.bfloat16
+    assert call["topk_weights"].dtype is torch.float32
+    assert call["topk_ids"].dtype is torch.int32
+
+
+def test_quantized_aiter_runtime_caches_config_and_invalidates_shuffled_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_calls: list[dict[str, object]] = []
+    shuffle_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    kernel_calls: list[dict[str, object]] = []
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def get_config(**kwargs):
+        config_calls.append(kwargs)
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type="moe_c",
+            need_shuffle=True,
+        )
+
+    def shuffle_weights(w1, w2, config):
+        assert config.solution_type == "moe_c"
+        shuffle_calls.append((w1, w2))
+        return w1.clone(), w2.clone()
+
+    def aiter_moe(**kwargs):
+        kernel_calls.append(kwargs)
+        return kwargs["hidden_states"].clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe_shfl_weight=shuffle_weights,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+    topk_weights = torch.ones((2, 2))
+    topk_ids = torch.zeros((2, 2), dtype=torch.int64)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+
+    def run(x=hidden_states, weights=topk_weights, ids=topk_ids):
+        return compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=weights,
+            topk_ids=ids,
+            vllm_moe_config=SimpleNamespace(num_experts=3),
+            activation=SimpleNamespace(value="silu"),
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            quant_config=quant_config,
+        )
+
+    run()
+    run()
+    assert len(config_calls) == 1
+    assert len(shuffle_calls) == 1
+    assert kernel_calls[0]["w1"] is kernel_calls[1]["w1"]
+    assert kernel_calls[0]["use_weight_shuffle"] is True
+
+    w1.add_(1)
+    run()
+    assert len(config_calls) == 1
+    assert len(shuffle_calls) == 2
+    assert kernel_calls[2]["w1"] is not kernel_calls[1]["w1"]
+
+    larger_x = torch.ones((3, 4), dtype=torch.bfloat16)
+    run(larger_x, torch.ones((3, 2)), torch.zeros((3, 2), dtype=torch.int64))
+    assert len(config_calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "message"),
+    [
+        ("topk_shape", "matching rank-2 top-k"),
+        ("router_weight", "apply_router_weight_on_input=True"),
+        ("block_quant", "channel/token W8A8"),
+        ("ambiguous_quant", "exactly one FP8-W8A8 or INT8-W8A8"),
+        ("no_solution", "found no backend config"),
+    ],
+)
+def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_case: str,
+    message: str,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def get_config(**kwargs):
+        if invalid_case == "no_solution":
+            return False, None
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type="asm",
+            need_shuffle=False,
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"].clone(),
+        ),
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, 2))
+    topk_ids = torch.zeros((2, 2), dtype=torch.int64)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+    apply_router_weight_on_input = False
+    if invalid_case == "topk_shape":
+        topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+    elif invalid_case == "router_weight":
+        apply_router_weight_on_input = True
+    elif invalid_case == "block_quant":
+        quant_config.block_shape = [128, 128]
+    elif invalid_case == "ambiguous_quant":
+        quant_config.use_int8_w8a8 = False
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match=message,
+    ):
+        compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states=hidden_states,
+            w1=torch.zeros((3, 8, 4), dtype=torch.int8),
+            w2=torch.zeros((3, 4, 4), dtype=torch.int8),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            vllm_moe_config=SimpleNamespace(num_experts=3),
+            activation=SimpleNamespace(value="silu"),
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            expert_map=None,
+            quant_config=quant_config,
+        )
+
+
 def test_moe_fp8_target_process_has_no_hcu_dpsk_postprocess(
     monkeypatch: pytest.MonkeyPatch,
 ):
