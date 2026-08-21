@@ -256,46 +256,32 @@ def apply_aiter_quantized_moe(
         aiter_config,
     )
 
-    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
-        aiter_asm_vllm_silu_context,
+    return aiter_moe(
+        hidden_states=hidden_states,
+        w1=prepared_w1,
+        w2=prepared_w2,
+        topk_weights=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        moe_config=aiter_config,
+        inplace=False,
+        activation=activation_name,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=getattr(quant_config, "w1_zp", None),
+        w2_zp=getattr(quant_config, "w2_zp", None),
+        a1_scale=(
+            a1q_scale
+            if a1q_scale is not None
+            else getattr(quant_config, "a1_scale", None)
+        ),
+        a2_scale=getattr(quant_config, "a2_scale", None),
+        block_shape=None,
+        global_num_experts=getattr(vllm_moe_config, "num_experts", w1.shape[0]),
+        expert_map=expert_map,
+        routed_scaling_factor=1.0,
+        use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
+        output_dtype=output_dtype,
     )
-
-    use_vllm_silu = bool(
-        use_int8
-        and _enum_token(getattr(aiter_config, "solution_type", None)) == "ASM"
-        and activation_name.lower() == "silu"
-    )
-    with aiter_asm_vllm_silu_context(enabled=use_vllm_silu):
-        return aiter_moe(
-            hidden_states=hidden_states,
-            w1=prepared_w1,
-            w2=prepared_w2,
-            topk_weights=topk_weights.to(torch.float32),
-            topk_ids=topk_ids.to(torch.int32),
-            moe_config=aiter_config,
-            inplace=False,
-            activation=activation_name,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w1_zp=getattr(quant_config, "w1_zp", None),
-            w2_zp=getattr(quant_config, "w2_zp", None),
-            a1_scale=(
-                a1q_scale
-                if a1q_scale is not None
-                else getattr(quant_config, "a1_scale", None)
-            ),
-            a2_scale=getattr(quant_config, "a2_scale", None),
-            block_shape=None,
-            global_num_experts=getattr(
-                vllm_moe_config, "num_experts", w1.shape[0]
-            ),
-            expert_map=expert_map,
-            routed_scaling_factor=1.0,
-            use_weight_shuffle=bool(
-                getattr(aiter_config, "need_shuffle", False)
-            ),
-            output_dtype=output_dtype,
-        )
 
 
 def get_aiter_w8a8_runtime_config(
