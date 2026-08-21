@@ -56,6 +56,19 @@ jobs:
           source /opt/dtk/env.sh
           /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
 
+      - name: Fetch PR diff endpoints
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --no-recurse-submodules --depth=1 origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
+          test "$(git rev-parse "refs/remotes/origin/${BASE_REF}")" = "$BASE_SHA"
+          test "$(git rev-parse "refs/remotes/origin/pr/${PR_NUMBER}")" = "$HEAD_SHA"
+
       - name: Select HCU matrix
         id: select
         env:
