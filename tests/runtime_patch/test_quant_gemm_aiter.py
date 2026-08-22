@@ -51,6 +51,48 @@ def _package(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, object]] = []
+
+    def native_quant(x):
+        calls.append(("aiter", x))
+        return "native"
+
+    def boltops_quant(x):
+        calls.append(("boltops", x))
+        return "aligned"
+
+    asm_module = _module(
+        "aiter.fused_moe_asm_wna16",
+        per_token_quant_int8=native_quant,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        asm_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=boltops_quant,
+        ),
+    )
+
+    assert asm_module.per_token_quant_int8("before") == "native"
+    with aiter_runtime.aiter_asm_boltops_int8_quant_context(enabled=True):
+        assert asm_module.per_token_quant_int8("inside") == "aligned"
+    assert asm_module.per_token_quant_int8("after") == "native"
+    assert calls == [
+        ("aiter", "before"),
+        ("boltops", "inside"),
+        ("aiter", "after"),
+    ]
+
+
 def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2338,6 +2380,100 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
     assert call["output_dtype"] is torch.bfloat16
     assert call["topk_weights"].dtype is torch.float32
     assert call["topk_ids"].dtype is torch.int32
+
+
+@pytest.mark.parametrize(
+    ("use_fp8", "use_int8", "solution_type", "expected"),
+    [
+        (False, True, "asm", "aligned"),
+        (True, False, "asm", "native"),
+        (False, True, "moe_c", "native"),
+    ],
+)
+def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
+    monkeypatch: pytest.MonkeyPatch,
+    use_fp8: bool,
+    use_int8: bool,
+    solution_type: str,
+    expected: str,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def native_quant(x):
+        del x
+        return "native"
+
+    def boltops_quant(x):
+        del x
+        return "aligned"
+
+    asm_module = _module(
+        "aiter.fused_moe_asm_wna16",
+        per_token_quant_int8=native_quant,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        asm_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=boltops_quant,
+        ),
+    )
+
+    def get_config(**kwargs):
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type=solution_type,
+            need_shuffle=False,
+        )
+
+    def aiter_moe(**kwargs):
+        return asm_module.per_token_quant_int8(kwargs["hidden_states"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=use_fp8,
+        use_int8_w8a8=use_int8,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+
+    output = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=hidden_states,
+        w1=torch.zeros((3, 8, 4), dtype=torch.int8),
+        w2=torch.zeros((3, 4, 4), dtype=torch.int8),
+        topk_weights=torch.ones((2, 2)),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+        vllm_moe_config=SimpleNamespace(num_experts=3),
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=None,
+        quant_config=quant_config,
+    )
+
+    assert output == expected
 
 
 def test_quantized_aiter_runtime_caches_config_and_invalidates_shuffled_weights(

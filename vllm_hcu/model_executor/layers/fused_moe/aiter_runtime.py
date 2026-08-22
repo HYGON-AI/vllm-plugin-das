@@ -47,6 +47,75 @@ _EXPLICIT_AITER_MOE: ContextVar[bool] = ContextVar(
 _AITER_MOE_GLOBAL_NUM_EXPERTS: ContextVar[int | None] = ContextVar(
     "vllm_hcu_aiter_moe_global_num_experts", default=None
 )
+_AITER_ASM_BOLTOPS_INT8_QUANT: ContextVar[bool] = ContextVar(
+    "vllm_hcu_aiter_asm_boltops_int8_quant", default=False
+)
+_AITER_ASM_INT8_QUANT_WRAPPER_MARKER = (
+    "_vllm_hcu_aiter_asm_int8_quant_wrapper"
+)
+
+
+def _boltops_per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    try:
+        module = import_module("boltops.fused_moe.triton.moe_compat")
+    except ImportError as exc:
+        raise HcuAiterRuntimeError(
+            "AITER ASM INT8 MoE requires the BoltOps per-token quantizer"
+        ) from exc
+    operation = getattr(module, "per_token_quant_hip", None)
+    if not callable(operation):
+        raise HcuAiterRuntimeError(
+            "BoltOps exposes no callable per_token_quant_hip"
+        )
+    return operation(x)
+
+
+def _install_aiter_asm_int8_quant_wrapper() -> None:
+    module = import_module("aiter.fused_moe_asm_wna16")
+    current = getattr(module, "per_token_quant_int8", None)
+    if not callable(current):
+        raise HcuAiterRuntimeError(
+            "AITER ASM exposes no callable per_token_quant_int8"
+        )
+    if bool(getattr(current, _AITER_ASM_INT8_QUANT_WRAPPER_MARKER, False)):
+        return
+    try:
+        signature = inspect.signature(current)
+    except (TypeError, ValueError) as exc:
+        raise HcuAiterRuntimeError(
+            "AITER ASM per_token_quant_int8 has no inspectable ABI"
+        ) from exc
+    if tuple(signature.parameters) != ("x",):
+        raise HcuAiterRuntimeError(
+            "AITER ASM per_token_quant_int8 exposes unsupported arguments "
+            f"{tuple(signature.parameters)!r}"
+        )
+
+    original = current
+
+    @functools.wraps(original)
+    def wrapped_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if _AITER_ASM_BOLTOPS_INT8_QUANT.get():
+            return _boltops_per_token_quant_int8(x)
+        return original(x)
+
+    setattr(wrapped_quant, _AITER_ASM_INT8_QUANT_WRAPPER_MARKER, True)
+    module.per_token_quant_int8 = wrapped_quant
+
+
+@contextmanager
+def aiter_asm_boltops_int8_quant_context(enabled: bool):
+    """Align AITER ASM's dynamic INT8 quantization with BoltOps Triton."""
+
+    if not enabled:
+        yield
+        return
+    _install_aiter_asm_int8_quant_wrapper()
+    token = _AITER_ASM_BOLTOPS_INT8_QUANT.set(True)
+    try:
+        yield
+    finally:
+        _AITER_ASM_BOLTOPS_INT8_QUANT.reset(token)
 
 
 def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
@@ -868,6 +937,7 @@ def get_aiter_activation_type(
 
 __all__ = [
     "HcuAiterRuntimeError",
+    "aiter_asm_boltops_int8_quant_context",
     "aiter_gate_mode_kwargs",
     "fused_moe_impl",
     "get_aiter_activation_type",
