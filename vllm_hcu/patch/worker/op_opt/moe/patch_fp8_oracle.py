@@ -182,6 +182,8 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         if fp8_backend == hcu_enum.DPSK_DEEPGEMM:
             return w13, w2, w13_scale, w2_scale
+        if fp8_backend == hcu_enum.AITER:
+            return w13, w2, w13_scale, w2_scale
         if fp8_backend in (hcu_enum.DEEPGEMM, hcu_enum.BATCHED_DEEPGEMM) and getattr(
             layer, "weight_block_size", None
         ) is None:

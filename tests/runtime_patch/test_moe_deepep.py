@@ -517,18 +517,27 @@ def test_aiter_and_triton_expert_capability_contract(
             return False
 
         @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+        @staticmethod
         def is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
         ):
             del cls, moe_config, weight_key, activation_key, activation_format
             return AiterExperts._supports_current_device(), None
 
+    int8_weight_key = object()
+    int8_activation_key = object()
     aiter_module = _module(
         patch_rocm_aiter_moe.TARGET_MODULE,
         IntEnum=IntEnum,
         ActivationMethod=ActivationMethod,
         MoEActivation=MoEActivation,
         kMxfp4Static=object(),
+        kInt8StaticChannelSym=int8_weight_key,
+        kInt8DynamicTokenSym=int8_activation_key,
         rocm_aiter_fused_experts=namespace["rocm_aiter_fused_experts"],
         AiterExperts=AiterExperts,
     )
@@ -552,6 +561,14 @@ def test_aiter_and_triton_expert_capability_contract(
     assert activation == aiter_module.ActivationMethod.GELU_TANH
     assert AiterExperts._supports_activation(MoEActivation.GELU_TANH) is True
     assert (
+        AiterExperts._supports_quant_scheme(
+            int8_weight_key,
+            int8_activation_key,
+        )
+        is True
+    )
+    assert AiterExperts._supports_quant_scheme(object(), object()) is False
+    assert (
         AiterExperts._supports_activation(
             MoEActivation.SWIGLUOAI_UNINTERLEAVE
         )
@@ -572,6 +589,52 @@ def test_aiter_and_triton_expert_capability_contract(
         None,
         None,
     )[0] is False
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    quantized_calls: list[dict[str, object]] = []
+
+    def quantized_runtime(**kwargs):
+        quantized_calls.append(kwargs)
+        return "public-aiter-quantized"
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_quantized_moe",
+        quantized_runtime,
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+    topk_weights = torch.ones((2, 2))
+    topk_ids = torch.zeros((2, 2), dtype=torch.int32)
+    vllm_moe_config = SimpleNamespace(num_experts=3)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+    )
+    expert_map = torch.tensor([0, 1, 2], dtype=torch.int32)
+    quantized_result = aiter_module.rocm_aiter_fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        vllm_moe_config,
+        MoEActivation.SILU,
+        False,
+        expert_map,
+        quant_config,
+        None,
+        None,
+        torch.bfloat16,
+    )
+    assert quantized_result == "public-aiter-quantized"
+    assert quantized_calls[0]["hidden_states"] is hidden_states
+    assert quantized_calls[0]["quant_config"] is quant_config
+    assert quantized_calls[0]["expert_map"] is expert_map
     assert AiterExperts.is_supported_config(
         AiterExperts,
         SimpleNamespace(moe_backend="aiter"),
@@ -1007,12 +1070,23 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
             self._dsv4_channel_fp8_deepgemm_repacked = False
+            self.layer_name = "model.layers.0.mlp"
+            self.expert_mapping = []
+            self.official_loads = []
 
         def _replace_quant_method(self, method):
             self.quant_method = method
 
         def get_expert_weights(self):
             return "official-weights"
+
+        def get_expert_mapping(self, include_fused=False):
+            assert include_fused is True
+            return self.expert_mapping
+
+        def load_weights(self, weights):
+            self.official_loads.extend(weights)
+            yield "official-load"
 
     class Runner:
         def __init__(self):
@@ -1068,6 +1142,63 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         (2, 8),
         (2, 3),
         (2, 2),
+    ]
+
+    loaded = []
+
+    class ChannelScale:
+        quant_method = "channel"
+
+        @staticmethod
+        def weight_loader(**kwargs):
+            loaded.append(
+                (
+                    kwargs["shard_id"],
+                    kwargs["expert_id"],
+                    kwargs["loaded_weight"].clone(),
+                )
+            )
+            return True
+
+    experts.w13_weight_scale = ChannelScale()
+    experts.expert_mapping = [
+        ("w13_weight", "experts.gate_up_proj", 0, "w1"),
+        ("w13_weight", "experts.gate_up_proj", 1, "w3"),
+    ]
+    fused_scale = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
+    assert list(
+        experts.load_weights([("experts.gate_up_proj_scale", fused_scale)])
+    ) == ["w13_weight_scale"] * 4
+    assert experts.official_loads == []
+    assert [(shard, expert) for shard, expert, _ in loaded] == [
+        ("w1", 0),
+        ("w1", 1),
+        ("w3", 0),
+        ("w3", 1),
+    ]
+    torch.testing.assert_close(loaded[0][2], fused_scale[0, :2])
+    torch.testing.assert_close(loaded[1][2], fused_scale[1, :2])
+    torch.testing.assert_close(loaded[2][2], fused_scale[0, 2:])
+    torch.testing.assert_close(loaded[3][2], fused_scale[1, 2:])
+
+    loaded.clear()
+    experts.w2_weight_scale = ChannelScale()
+    experts.expert_mapping = [
+        ("w2_weight", "experts.down_proj", 0, "w2"),
+    ]
+    down_scale = torch.arange(6, dtype=torch.float32).reshape(2, 3, 1)
+    assert list(
+        experts.load_weights([("experts.down_proj_scale", down_scale)])
+    ) == ["w2_weight_scale"] * 2
+    assert [(shard, expert) for shard, expert, _ in loaded] == [
+        ("w2", 0),
+        ("w2", 1),
+    ]
+    torch.testing.assert_close(loaded[0][2], down_scale[0])
+    torch.testing.assert_close(loaded[1][2], down_scale[1])
+
+    assert list(experts.load_weights([("experts.down_proj", down_scale)])) == [
+        "official-load"
     ]
 
 
@@ -1248,6 +1379,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         DEEPGEMM = "DEEPGEMM"
         BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
         TRITON = "TRITON"
+        AITER = "AITER"
 
     def backend_to_kernel_cls(backend):
         return [backend]
@@ -1385,6 +1517,13 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
     ) == tensors
     assert module.convert_to_fp8_moe_kernel_format(
         module.Fp8MoeBackend.DEEPGEMM,
+        SimpleNamespace(weight_block_size=None),
+        *tensors,
+        None,
+        None,
+    ) == tensors
+    assert module.convert_to_fp8_moe_kernel_format(
+        module.Fp8MoeBackend.AITER,
         SimpleNamespace(weight_block_size=None),
         *tensors,
         None,
