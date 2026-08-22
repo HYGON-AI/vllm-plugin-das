@@ -82,13 +82,13 @@ def _get_flash_attn_mode() -> str:
     return get_hcu_flash_attn_mode()
 
 
-def _get_native_flash_attn_varlen_func():
+def _select_flash_attn_varlen_func():
     if _get_flash_attn_mode() == "varlen":
         return flash_attn_varlen_func
     return hg_flash_attn_varlen_func
 
 
-def _call_native_flash_attn_with_lse(**kwargs):
+def _call_select_flash_attn_with_lse(**kwargs):
     if _get_flash_attn_mode() == "varlen":
         # The raw interface has two distinct LSE controls. Unpacked Q/K/V
         # consumes return_attn_probs, while paged attention consumes
@@ -104,7 +104,7 @@ def _call_native_flash_attn_with_lse(**kwargs):
             window_size = kwargs.get("window_size")
             if window_size is None or tuple(window_size) == (-1, -1):
                 kwargs["window_size"] = [kwargs["max_seqlen_k"], -1]
-    result = _get_native_flash_attn_varlen_func()(**kwargs)
+    result = _select_flash_attn_varlen_func()(**kwargs)
     if not isinstance(result, tuple) or len(result) < 2:
         raise RuntimeError(
             "HCU native FlashAttention must return output and softmax LSE"
@@ -1035,7 +1035,7 @@ class FlashAttentionImpl(AttentionImpl):
                         f"[HCU FLASH_ATTN PATH] {path_name}",
                         scope="local",
                     )
-                    _get_native_flash_attn_varlen_func()(
+                    _select_flash_attn_varlen_func()(
                         q=query[:num_actual_tokens],
                         k=key_cache,
                         v=value_cache,
@@ -1205,7 +1205,7 @@ class FlashAttentionImpl(AttentionImpl):
                 is_prefix_cache=True,
             )
         else:
-            context_attn_out, context_lse = _call_native_flash_attn_with_lse(
+            context_attn_out, context_lse = _call_select_flash_attn_with_lse(
                 q=query_across_dcp,
                 k=key_cache,
                 v=value_cache,
@@ -1264,7 +1264,7 @@ class FlashAttentionImpl(AttentionImpl):
                 is_prefix_cache=True,
             )
         else:
-            query_attn_out, query_lse = _call_native_flash_attn_with_lse(
+            query_attn_out, query_lse = _call_select_flash_attn_with_lse(
                 q=query,
                 k=key,
                 v=value,
@@ -1364,7 +1364,7 @@ class FlashAttentionImpl(AttentionImpl):
                 is_prefix_cache=False,
             )
         else:
-            _get_native_flash_attn_varlen_func()(
+            _select_flash_attn_varlen_func()(
                 q=query,
                 k=key,
                 v=value,
@@ -1534,7 +1534,7 @@ def cascade_attention(
             is_prefix_cache=True,
         )
     else:
-        prefix_output, prefix_lse = _call_native_flash_attn_with_lse(
+        prefix_output, prefix_lse = _call_select_flash_attn_with_lse(
             q=query,
             k=key_cache,
             v=value_cache,
@@ -1587,7 +1587,7 @@ def cascade_attention(
             is_prefix_cache=True,
         )
     else:
-        suffix_output, suffix_lse = _call_native_flash_attn_with_lse(
+        suffix_output, suffix_lse = _call_select_flash_attn_with_lse(
             q=query,
             k=key_cache,
             v=value_cache,

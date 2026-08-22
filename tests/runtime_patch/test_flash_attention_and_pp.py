@@ -662,11 +662,11 @@ def test_hcu_native_varlen_lse_adapter_accepts_two_or_three_results(
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
     monkeypatch.setattr(
         flash_attn,
-        "_get_native_flash_attn_varlen_func",
+        "_select_flash_attn_varlen_func",
         lambda: lambda **kwargs: kernel_result,
     )
 
-    assert flash_attn._call_native_flash_attn_with_lse(q="query") == (
+    assert flash_attn._call_select_flash_attn_with_lse(q="query") == (
         "out",
         "lse",
     )
@@ -687,11 +687,11 @@ def test_hcu_native_varlen_lse_adapter_requests_nonpaged_lse_flag(
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
     monkeypatch.setattr(
         flash_attn,
-        "_get_native_flash_attn_varlen_func",
+        "_select_flash_attn_varlen_func",
         lambda: native,
     )
 
-    assert flash_attn._call_native_flash_attn_with_lse(
+    assert flash_attn._call_select_flash_attn_with_lse(
         q="query",
         block_table=None,
         return_softmax_lse=True,
@@ -721,11 +721,11 @@ def test_hcu_native_varlen_lse_adapter_bypasses_paged_decode_fast_path(
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
     monkeypatch.setattr(
         flash_attn,
-        "_get_native_flash_attn_varlen_func",
+        "_select_flash_attn_varlen_func",
         lambda: native,
     )
 
-    assert flash_attn._call_native_flash_attn_with_lse(
+    assert flash_attn._call_select_flash_attn_with_lse(
         q="query",
         block_table="paged-cache",
         max_seqlen_k=128,
@@ -752,7 +752,7 @@ def test_hcu_varlen_cascade_consumes_two_value_lse_result(
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
     monkeypatch.setattr(
         flash_attn,
-        "_get_native_flash_attn_varlen_func",
+        "_select_flash_attn_varlen_func",
         lambda: native,
     )
     monkeypatch.setattr(
@@ -826,7 +826,7 @@ def test_hcu_varlen_dcp_requests_lse_from_paged_and_nonpaged_calls(
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
     monkeypatch.setattr(
         flash_attn,
-        "_get_native_flash_attn_varlen_func",
+        "_select_flash_attn_varlen_func",
         lambda: native,
     )
     monkeypatch.setattr(flash_attn, "get_dcp_group", lambda: _DcpGroup())
