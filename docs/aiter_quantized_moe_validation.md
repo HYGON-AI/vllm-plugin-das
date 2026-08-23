@@ -180,7 +180,8 @@ finishes.
 | --- | --- | ---: | ---: | ---: | ---: |
 | Qwen3.5-35B-A3B-W8A8 | AITER W8A8 ASM | 0.7188 | 23/32 | 32768 | 885.88 s |
 | Qwen3.5-35B-A3B-W8A8 | slimquant_marlin | 0.8438 | 27/32 | 261 | 154.69 s |
-| Qwen3.5-35B-A3B-CHANNEL-FP8 | AITER FP8 W8A8 ASM | 0.8125 | 26/32 | 213 | 167.46 s |
+| Qwen3.5-35B-A3B-CHANNEL-FP8 | AITER FP8 W8A8 ASM, native | 0.8125 | 26/32 | 213 | 167.46 s |
+| Qwen3.5-35B-A3B-CHANNEL-FP8 | AITER FP8 W8A8 ASM, aligned | 0.8750 | 28/32 | 240 | 158.13 s |
 | Qwen3.5-35B-A3B-CHANNEL-FP8 | Triton FP8 W8A8 | 0.8750 | 28/32 | 247 | 171.27 s |
 
 No Unicode replacement characters were found in the recorded 32-sample
@@ -219,21 +220,60 @@ failures were `HumanEval/0`, `/1`, `/4`, `/18`, `/19`, and `/20`.
 | AITER ASM | 0.8125 | 26/32 | 156.23 s |
 | Official vLLM Triton | 0.9062 | 29/32 | 188.11 s |
 
-Operator diagnostics ruled out dynamic per-token FP8 quantization as the main
-source of the gap. vLLM, AITER, and BoltOps produced equivalent scales (the
-largest observed vLLM-to-AITER scale difference was approximately `1.86e-9`).
-Replacing AITER's FP8 quantizer therefore did not improve the end-to-end score
-and was not retained. A scoped experiment using vLLM's `_C.silu_and_mul`
-changed the single HumanEval run to 28/32, but the isolated SiLU operator test
-showed no precision defect. That experiment therefore does not establish a
-root cause and is not part of this branch. Further work must compare the
-GEMM1, activation, second quantization, GEMM2, and expert-combine boundaries
-before changing an operator implementation.
+The first isolated SiLU test used uniformly distributed random inputs and did
+not expose a meaningful difference. A second diagnostic loaded the model's
+real layer-0 expert weights and captured every boundary in the same call:
+input quantization, GEMM1, gated activation, bridge quantization, GEMM2, and
+expert reduction. This identified two sequential sources of drift:
+
+1. AITER's Triton `silu_and_mul` uses the Triton exponential approximation,
+   while official vLLM's MoE path uses `_C.silu_and_mul`. On the real GEMM1
+   distribution, the activation NMAE was about 0.14--0.17%, sufficient to
+   change following FP8 rounding decisions.
+2. After aligning SiLU, AITER's second per-token FP8 quantization still changed
+   bridge values. Aligning only that second quantization with vLLM's
+   `scaled_fp8_quant` removed the remaining M=1 and M=16 output difference.
+
+The first input quantization remains AITER-native. The alignment is scoped to
+the exact combination `FP8 W8A8 + ASM + gated SiLU`; INT8, MOE_C, GELU,
+non-gated activation, and unsupported alpha/limit variants retain their
+existing implementations. The compatibility wrappers validate the installed
+AITER call signatures and fail closed if the ABI changes.
+
+The staged diagnostic can be reproduced with:
+
+```bash
+HIP_VISIBLE_DEVICES=5 \
+PYTHONPATH=/models/zb/vllm_025_hcu/vllm-plugin-das \
+python3 tests/accuracy/diagnose_aiter_fp8_moe_stages.py \
+  --model /models/Qwen3.5-35B-A3B-CHANNEL-FP8 \
+  --tokens 1 16 128 \
+  --aiter-activation vllm \
+  --aiter-quant2 native \
+  --output /tmp/pr19-fp8-stage-production-fix.json
+```
+
+The `native` quant2 option above deliberately leaves the diagnostic's manual
+override disabled; the production scoped wrapper performs the alignment.
+
+| Tokens | Final output NMAE | Final max abs diff | Observation |
+| ---: | ---: | ---: | --- |
+| 1 | 0% | 0 | all captured stages match |
+| 16 | 0% | 0 | bridge quantization and final output match |
+| 128 | 0.02732% | 0.000793 | residual starts at the retained input quantizer |
+
+The graph-enabled V2 HumanEval run was then repeated twice on the same server.
+Both runs produced byte-identical generated code, scored 28/32 (0.875), and
+failed the same cases: `HumanEval/4`, `/19`, `/20`, and `/27`. No Unicode
+replacement characters or NUL bytes were present. Historical official Triton
+runs on the same model scored between 26/32 and 29/32, so the aligned AITER
+result is within the observed official range; the layer-level comparison is
+the direct numerical evidence for the fix.
 
 The startup log confirmed `Using AITER Fp8 MoE backend`, loaded both FP8 W8A8
 ASM stages, and completed PIECEWISE and FULL graph capture. Static regression
 verification completed with:
 
 ```text
-159 passed, 14 warnings in 63.70s
+174 passed, 14 warnings in 63.40s
 ```

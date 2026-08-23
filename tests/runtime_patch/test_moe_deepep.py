@@ -635,6 +635,29 @@ def test_aiter_and_triton_expert_capability_contract(
     assert quantized_calls[0]["hidden_states"] is hidden_states
     assert quantized_calls[0]["quant_config"] is quant_config
     assert quantized_calls[0]["expert_map"] is expert_map
+
+    fp8_quant_config = SimpleNamespace(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+    )
+    fp8_result = aiter_module.rocm_aiter_fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        vllm_moe_config,
+        MoEActivation.SILU,
+        False,
+        expert_map,
+        fp8_quant_config,
+        None,
+        None,
+        torch.bfloat16,
+    )
+    assert fp8_result == "public-aiter-quantized"
+    assert quantized_calls[1]["quant_config"] is fp8_quant_config
+    assert quantized_calls[1]["hidden_states"] is hidden_states
     assert AiterExperts.is_supported_config(
         AiterExperts,
         SimpleNamespace(moe_backend="aiter"),
