@@ -391,36 +391,79 @@ def test_partition_creates_two_prefill_rows_and_replicates_decode() -> None:
     _assert_batch_matches_snapshot(global_batch, snapshot)
 
 
-def test_partition_replicates_spec_decode_layout_on_every_pcp_rank() -> None:
+@pytest.mark.parametrize(
+    (
+        "requests",
+        "num_draft_tokens",
+        "draft_tokens_per_req",
+        "expanded_idx_mapping",
+        "expanded_local_pos",
+        "logits_indices",
+        "cu_num_logits",
+    ),
+    [
+        (
+            [
+                ("decode-a", [900, 901], 18, False),
+                ("decode-b", [800, 801], 12, False),
+            ],
+            2,
+            [1, 1],
+            [10, 10, 11, 11],
+            [0, 1, 0, 1],
+            [0, 1, 2, 3],
+            [0, 2, 4],
+        ),
+        (
+            [
+                ("decode-a", [900, 901, 902], 19, False),
+                ("decode-b", [800, 801, 802], 13, False),
+            ],
+            4,
+            [2, 2],
+            [10, 10, 10, 11, 11, 11],
+            [0, 1, 2, 0, 1, 2],
+            [0, 1, 2, 3, 4, 5],
+            [0, 3, 6],
+        ),
+    ],
+    ids=["mtp1", "mtp2"],
+)
+def test_partition_replicates_spec_decode_layout_on_every_pcp_rank(
+    requests,
+    num_draft_tokens,
+    draft_tokens_per_req,
+    expanded_idx_mapping,
+    expanded_local_pos,
+    logits_indices,
+    cu_num_logits,
+) -> None:
     """Dropping draft-token metadata disables target rejection sampling."""
 
-    base_batch = _make_batch(
-        [
-            ("decode-a", [900, 901], 18, False),
-            ("decode-b", [800, 801], 12, False),
-        ]
-    )
+    base_batch = _make_batch(requests)
     global_batch = replace(
         base_batch,
-        num_draft_tokens=2,
-        num_draft_tokens_per_req=np.asarray([1, 1], dtype=np.int32),
-        expanded_idx_mapping=torch.tensor([10, 10, 11, 11], dtype=torch.int32),
-        expanded_local_pos=torch.tensor([0, 1, 0, 1], dtype=torch.int32),
-        logits_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
-        cu_num_logits=torch.tensor([0, 2, 4], dtype=torch.int32),
-        cu_num_logits_np=np.asarray([0, 2, 4], dtype=np.int32),
+        num_draft_tokens=num_draft_tokens,
+        num_draft_tokens_per_req=np.asarray(draft_tokens_per_req, dtype=np.int32),
+        expanded_idx_mapping=torch.tensor(expanded_idx_mapping, dtype=torch.int32),
+        expanded_local_pos=torch.tensor(expanded_local_pos, dtype=torch.int32),
+        logits_indices=torch.tensor(logits_indices, dtype=torch.int64),
+        cu_num_logits=torch.tensor(cu_num_logits, dtype=torch.int32),
+        cu_num_logits_np=np.asarray(cu_num_logits, dtype=np.int32),
     )
     managers, _ = _make_managers()
 
     for manager in managers:
         local = manager.partition_batch(global_batch)
-        assert local.input_ids.tolist() == [900, 901, 800, 801]
-        assert local.num_draft_tokens == 2
-        assert local.num_draft_tokens_per_req.tolist() == [1, 1]
-        assert local.expanded_idx_mapping.tolist() == [10, 10, 11, 11]
-        assert local.expanded_local_pos.tolist() == [0, 1, 0, 1]
-        assert local.logits_indices.tolist() == [0, 1, 2, 3]
-        assert local.cu_num_logits_np.tolist() == [0, 2, 4]
+        assert local.input_ids.tolist() == [
+            token for _, tokens, _, _ in requests for token in tokens
+        ]
+        assert local.num_draft_tokens == num_draft_tokens
+        assert local.num_draft_tokens_per_req.tolist() == draft_tokens_per_req
+        assert local.expanded_idx_mapping.tolist() == expanded_idx_mapping
+        assert local.expanded_local_pos.tolist() == expanded_local_pos
+        assert local.logits_indices.tolist() == logits_indices
+        assert local.cu_num_logits_np.tolist() == cu_num_logits
 
 
 def test_uneven_prefill_and_mtp_decode_keep_equal_collective_shapes() -> None:

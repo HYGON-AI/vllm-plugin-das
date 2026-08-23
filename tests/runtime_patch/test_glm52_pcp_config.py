@@ -96,14 +96,17 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
-def test_glm52_pcp_allows_single_step_builtin_mtp(make_pcp_config) -> None:
-    """Restoring the blanket speculative-decode rejection breaks PCP+MTP."""
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_glm52_pcp_allows_validated_builtin_mtp_depths(
+    make_pcp_config, num_speculative_tokens: int
+) -> None:
+    """Rejecting either validated draft depth breaks PCP+MTP service startup."""
 
     config = make_pcp_config(
         pcp=2,
         speculative=True,
         speculative_method="mtp",
-        num_speculative_tokens=1,
+        num_speculative_tokens=num_speculative_tokens,
     )
 
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
@@ -124,8 +127,8 @@ def test_glm52_pcp_allows_single_step_builtin_mtp(make_pcp_config) -> None:
             "only supports built-in MTP",
         ),
         (
-            {"speculative": True, "num_speculative_tokens": 2},
-            "exactly one speculative token",
+            {"speculative": True, "num_speculative_tokens": 3},
+            "one or two speculative tokens",
         ),
         ({"enforce_eager": False}, "eager"),
         ({"lora": True}, "LoRA"),

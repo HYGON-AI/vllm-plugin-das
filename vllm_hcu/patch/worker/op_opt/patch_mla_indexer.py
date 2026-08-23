@@ -112,18 +112,11 @@ def apply_to_module(module: ModuleType) -> bool:
             result.pcp_world_size = effective_pcp_world_size(
                 int(pcp_world_size)
             )
-        if indexer.current_platform.is_rocm() and result.decode is not None:
-            try:
-                from lightop import gemmopt
-            except ImportError as exc:
-                raise RuntimeError("HCU sparse MLA indexer requires lightop.gemmopt") from exc
-            seq_lens = result.decode.seq_lens.contiguous()
-            result.decode.seq_lens = seq_lens
-            metadata = gemmopt.get_paged_mqa_logits_metadata(
-                seq_lens, self.kv_cache_spec.storage_block_size, self.num_sms
-            )
-            self.scheduler_metadata_buffer = metadata
-            result.decode.schedule_metadata = metadata
+        # HCU's AITER, lightop, and torch paged-MQA paths do not consume the
+        # upstream DeepGEMM schedule metadata. In particular, lightop builds
+        # its schedule internally when called with ``schedule_meta=None``.
+        # Precomputing it here rejects valid flattened MTP2 batch widths (for
+        # example 1024 requests x 3 target tokens) before model execution.
         return result
 
     for function in (hcu_split_chunks, hcu_split_batch, hcu_build):
