@@ -144,6 +144,15 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert "os.walk(" not in source
 
 
+def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
+    patch_id = "worker.framework_opt.pcp.default_model_state_metadata"
+    assert (
+        patch_id,
+        "vllm.v1.worker.gpu.model_states.default",
+    ) in worker_dispatcher.worker_callback_names()
+    assert worker_dispatcher._patch_features()[patch_id] == "always"
+
+
 def test_cold_replacement_metadata_matches_lazy_adapter_contracts():
     for spec in worker_dispatcher._COLD_REPLACEMENTS:
         adapter = importlib.import_module(spec.adapter)
@@ -677,3 +686,33 @@ def test_invalid_spawned_sidecar_fails_before_worker_registration():
     )
     assert result.returncode != 0
     assert "enable_lightly_cplb requires enable_lightly_cp" in result.stderr
+
+
+def test_pcp_model_state_adapter_matches_exact_v0251_target():
+    result = _run_fresh(
+        """
+import inspect
+import json
+
+from vllm.v1.worker.gpu.model_states import default
+from vllm_hcu.patch.worker.framework_opt import patch_pcp_model_state
+
+before = str(inspect.signature(default.DefaultModelState.prepare_attn))
+first = patch_pcp_model_state.apply_to_module(default)
+second = patch_pcp_model_state.apply_to_module(default)
+after = str(inspect.signature(default.DefaultModelState.prepare_attn))
+print(json.dumps({
+    "first": first,
+    "second": second,
+    "signature_preserved": before == after,
+}))
+""",
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "first": True,
+        "second": False,
+        "signature_preserved": True,
+    }

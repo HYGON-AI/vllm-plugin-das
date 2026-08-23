@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
+from vllm_hcu.model_executor.layers.attention.pcp import maybe_gather_indexer_k
 
 logger = init_logger(__name__)
 
@@ -686,7 +687,9 @@ direct_register_custom_op(
 
 
 if current_platform.is_rocm():
+    from vllm_hcu.platforms.hcu import on_gfx938
     from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        indexer_k_bf16_cache_triton,
         rocm_aiter_sparse_attn_indexer_fake,
         rocm_aiter_sparse_attn_indexer_native,
     )
@@ -813,6 +816,8 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.use_pcp = self.pcp_world_size > 1
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -938,6 +943,8 @@ class SparseAttnIndexer(CustomOp):
 class V32SparseAttnIndexer(SparseAttnIndexer):
     """Compile-isolated HCU fallback for V3.2/V4/GLM-5 indexers."""
 
+    supports_pcp: bool = True
+
     def forward_hip(
         self,
         hidden_states: torch.Tensor,
@@ -949,6 +956,43 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
+        skip_k_cache_insert = self.skip_k_cache_insert
+        if self.use_pcp and not skip_k_cache_insert:
+            attn_metadata = get_forward_context().attn_metadata
+            if isinstance(attn_metadata, dict):
+                layer_metadata = attn_metadata[self.k_cache.prefix]
+                metadata_world_size = int(
+                    getattr(layer_metadata, "pcp_world_size", 1)
+                )
+                if metadata_world_size != self.pcp_world_size:
+                    raise RuntimeError(
+                        "PCP sparse-indexer metadata world size mismatch: "
+                        f"indexer={self.pcp_world_size}, "
+                        f"metadata={metadata_world_size}"
+                    )
+                cache_k, cache_slots = maybe_gather_indexer_k(
+                    k,
+                    layer_metadata.slot_mapping,
+                    layer_metadata,
+                )
+                assert self.scale_fmt is not None
+                if on_gfx938():
+                    ops.indexer_k_quant_and_cache(
+                        cache_k,
+                        self.k_cache.kv_cache,
+                        cache_slots,
+                        self.quant_block_size,
+                        self.scale_fmt,
+                    )
+                else:
+                    indexer_k_bf16_cache_triton(
+                        cache_k,
+                        self.k_cache.kv_cache,
+                        cache_slots,
+                    )
+                # The complete cache write is explicit above.  Keep the
+                # existing HCU custom op for local Q/top-k work only.
+                skip_k_cache_insert = True
         return torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
@@ -963,5 +1007,5 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
-            self.skip_k_cache_insert,
+            skip_k_cache_insert,
         )

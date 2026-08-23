@@ -24,6 +24,10 @@ from .framework_opt import (
     patch_output_processor,
     patch_outputs,
     patch_parallel_state,
+    patch_pcp_kv_cache_coordinator,
+    patch_pcp_kv_cache_interface,
+    patch_pcp_kv_cache_utils,
+    patch_pcp_single_type_kv_cache_manager,
     patch_scheduler,
 )
 
@@ -36,12 +40,18 @@ _DISPATCH_LOCK = threading.RLock()
 # coordinator applies those callbacks immediately in the order below.  Keep
 # the HCU-owned Mooncake contract ahead of its factory registration, then arm
 # the vLLM integration points from low-level KV/distributed contracts through
-# scheduling and engine output.
+# scheduling and engine output.  PCP KV-ownership adapters must run before the
+# MTP coordinator wrapper so its base-constructor chain observes DCP-only
+# cache sizing while retaining the existing MTP group semantics.
 _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_distributed_utils,
     patch_mooncake_connector,
     patch_kv_connector_factory,
     patch_parallel_state,
+    patch_pcp_kv_cache_utils,
+    patch_pcp_kv_cache_interface,
+    patch_pcp_single_type_kv_cache_manager,
+    patch_pcp_kv_cache_coordinator,
     patch_kv_cache_coordinator,
     patch_scheduler,
     patch_engine_core,

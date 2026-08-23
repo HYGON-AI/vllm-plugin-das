@@ -82,6 +82,9 @@ def server_command(
     host = os.environ.get("VLLM_HCU_SERVER_HOST", str(server.get("host", "127.0.0.1")))
     port = _maybe_int_env("VLLM_HCU_SERVER_PORT", int(server.get("port", 10128)))
     args = [str(item) for item in server.get("args", [])]
+    served_model_name = server.get("served_model_name")
+    if served_model_name is not None and "--served-model-name" not in args:
+        args.extend(["--served-model-name", str(served_model_name)])
     if "--port" not in args and "-p" not in args:
         args.extend(["--port", str(port)])
     return ["vllm", "serve", model, *args], host, port
@@ -96,7 +99,12 @@ def evalscope_command(
     work_dir: Path,
 ) -> list[str]:
     evalscope = config["evalscope"]
-    model = _model_path(config, model_env)
+    model = str(
+        config.get("server", {}).get(
+            "served_model_name",
+            _model_path(config, model_env),
+        )
+    )
     generation = evalscope["generation_config"]
     dataset_args = json.dumps(evalscope["dataset_args"], separators=(",", ":"))
     command = [
@@ -172,11 +180,16 @@ def _terminate_process_group(proc: subprocess.Popen, timeout_s: int) -> None:
         proc.wait(timeout=10)
 
 
-def _server_environment() -> dict[str, str]:
+def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("VLLM_PLUGINS", None)
     env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if config is not None:
+        configured = config.get("server", {}).get("environment", {})
+        if not isinstance(configured, dict):
+            raise TypeError("server.environment must be a mapping")
+        env.update({str(name): str(value) for name, value in configured.items()})
     return env
 
 
@@ -297,7 +310,7 @@ def run_evalscope_server_test(
     server_log_path = log_dir / "vllm_server.log"
     eval_log_path = log_dir / "evalscope.log"
 
-    env = _server_environment()
+    env = _server_environment(config)
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())

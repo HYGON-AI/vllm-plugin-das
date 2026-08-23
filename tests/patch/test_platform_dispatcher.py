@@ -102,6 +102,22 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.distributed.parallel_state",
         ),
         (
+            "platform.framework_opt.pcp_kv_cache_utils",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.pcp_kv_cache_interface",
+            "vllm.v1.kv_cache_interface",
+        ),
+        (
+            "platform.framework_opt.pcp_single_type_kv_cache_manager",
+            "vllm.v1.core.single_type_kv_cache_manager",
+        ),
+        (
+            "platform.framework_opt.pcp_kv_cache_coordinator",
+            "vllm.v1.core.kv_cache_coordinator",
+        ),
+        (
             "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
             "vllm.v1.core.kv_cache_coordinator",
         ),
@@ -245,9 +261,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 37,
+        "count": 41,
         "replacements": 11,
-        "callbacks": 26,
+        "callbacks": 30,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

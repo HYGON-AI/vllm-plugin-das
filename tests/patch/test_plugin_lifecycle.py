@@ -231,6 +231,36 @@ def test_platform_reentry_preserves_an_authoritative_role(monkeypatch):
     assert PATCH_REGISTRY.process_role() is ProcessRole.ENGINE_CORE
 
 
+def test_pcp_kv_cache_callbacks_precede_mtp_coordinator_deterministically():
+    from vllm_hcu.patch.platform import platform_framework_callback_names
+
+    inventory = platform_framework_callback_names()
+    mtp_index = inventory.index(
+        (
+            "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
+            "vllm.v1.core.kv_cache_coordinator",
+        )
+    )
+    assert inventory[mtp_index - 4 : mtp_index] == (
+        (
+            "platform.framework_opt.pcp_kv_cache_utils",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
+            "platform.framework_opt.pcp_kv_cache_interface",
+            "vllm.v1.kv_cache_interface",
+        ),
+        (
+            "platform.framework_opt.pcp_single_type_kv_cache_manager",
+            "vllm.v1.core.single_type_kv_cache_manager",
+        ),
+        (
+            "platform.framework_opt.pcp_kv_cache_coordinator",
+            "vllm.v1.core.kv_cache_coordinator",
+        ),
+    )
+
+
 def test_platform_probe_failure_is_exposed_on_vllm_second_invocation(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(plugin, "_PLATFORM_INIT_FAILURE", None)
@@ -480,6 +510,9 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
     upstream_module = ModuleType(upstream_name)
 
     class UpstreamGPUModelRunner:
+        def __init__(self, vllm_config, device):
+            self.upstream_init = (vllm_config, device)
+
         def execute_model(self):
             return "upstream"
 
@@ -489,9 +522,14 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
 
     adapter_module = importlib.import_module(adapter_name)
     adapter = adapter_module.HcuGPUModelRunnerV2
+    config = object()
+    device = object()
+    runner = adapter(config, device)
 
     assert issubclass(adapter, UpstreamGPUModelRunner)
-    assert adapter().execute_model() == "upstream"
+    assert runner.upstream_init == (config, device)
+    assert runner.pcp_manager is None
+    assert runner.execute_model() == "upstream"
     assert "execute_model" not in adapter.__dict__
 
 

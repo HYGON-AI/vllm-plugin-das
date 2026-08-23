@@ -300,6 +300,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_mrv2_cudagraph_stream"),
     ),
     _CallbackSpec(
+        _adapter("framework_opt", "patch_pcp_model_state"),
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_dp_utils"),
         feature="deepep_low_latency",
     ),

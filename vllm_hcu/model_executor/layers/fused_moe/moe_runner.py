@@ -888,7 +888,11 @@ class MoERunner(MoERunnerInterface):
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
         # we should modify All2AllManager abstraction to better support PCP.
-        if self.moe_config.pcp_size > 1:
+        needs_fallback_pcp_collective = (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        )
+        if needs_fallback_pcp_collective:
             hidden_states = get_pcp_group().all_gather(
                 hidden_states,
                 dim=0,
@@ -910,7 +914,11 @@ class MoERunner(MoERunnerInterface):
                 hidden_states, self.moe_config.is_sequence_parallel
             )
 
-        if self.moe_config.pcp_size > 1:
+        needs_fallback_pcp_collective = (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        )
+        if needs_fallback_pcp_collective:
             hidden_states = get_pcp_group().reduce_scatter(
                 hidden_states,
                 dim=0,

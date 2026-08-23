@@ -591,6 +591,12 @@ def _make_vllm_module() -> ModuleType:
             self.compilation_config.post_init_cudagraph_sizes()
             return "upstream-result"
 
+        def _get_v2_model_runner_unsupported_features(self) -> list[str]:
+            return []
+
+        def _validate_v2_model_runner(self) -> None:
+            return None
+
     module.VllmConfig = FakeVllmConfig
     module.ModelConfig = _FakeModelConfig
     return module
@@ -736,7 +742,10 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
         model_config=SimpleNamespace(enforce_eager=True, use_mla=False),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
         kernel_config=SimpleNamespace(moe_backend="auto"),
         kv_transfer_config=None,
     )

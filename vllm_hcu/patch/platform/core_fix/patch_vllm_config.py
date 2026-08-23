@@ -19,6 +19,8 @@ PATCH_ID = "platform.core_fix.hcu_config.vllm"
 TARGETS = (
     f"{TARGET_MODULE}.VllmConfig.with_hf_config",
     f"{TARGET_MODULE}.VllmConfig._set_cudagraph_sizes",
+    f"{TARGET_MODULE}.VllmConfig._get_v2_model_runner_unsupported_features",
+    f"{TARGET_MODULE}.VllmConfig._validate_v2_model_runner",
     "vllm.config.model.ModelConfig.get_model_arch_config",
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
 )
@@ -31,9 +33,113 @@ _REQUEST_CAPTURE_SIZES = (
 )
 
 
+def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any:
+    try:
+        return getattr(owner, name)
+    except AttributeError as exc:
+        raise PatchCompatibilityError(
+            f"GLM-5.2 PCP requires {owner_name}.{name} in vLLM 0.25.1"
+        ) from exc
+
+
+def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
+    """Reject every Model Runner V2 PCP configuration outside HCU support."""
+
+    if not _require_hcu_pcp_attribute(
+        vllm_config, "use_v2_model_runner", "VllmConfig"
+    ):
+        raise ValueError("GLM-5.2 PCP requires Model Runner V2.")
+
+    model_config = _require_hcu_pcp_attribute(
+        vllm_config, "model_config", "VllmConfig"
+    )
+    parallel_config = _require_hcu_pcp_attribute(
+        vllm_config, "parallel_config", "VllmConfig"
+    )
+    cache_config = _require_hcu_pcp_attribute(
+        vllm_config, "cache_config", "VllmConfig"
+    )
+
+    architectures = _require_hcu_pcp_attribute(
+        model_config, "architectures", "ModelConfig"
+    )
+    if architectures != ["GlmMoeDsaForCausalLM"]:
+        raise ValueError(
+            "GLM-5.2 PCP only supports architecture "
+            "GlmMoeDsaForCausalLM."
+        )
+    if not _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig"):
+        raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if _require_hcu_pcp_attribute(
+        parallel_config, "pipeline_parallel_size", "ParallelConfig"
+    ) != 1:
+        raise ValueError("GLM-5.2 PCP does not support pipeline parallelism.")
+    if _require_hcu_pcp_attribute(
+        parallel_config, "decode_context_parallel_size", "ParallelConfig"
+    ) != 1:
+        raise ValueError(
+            "GLM-5.2 PCP does not support decode context parallelism."
+        )
+    if _require_hcu_pcp_attribute(
+        parallel_config, "data_parallel_size", "ParallelConfig"
+    ) != 1:
+        raise ValueError("GLM-5.2 PCP does not support data parallelism.")
+    if not _require_hcu_pcp_attribute(
+        parallel_config, "enable_expert_parallel", "ParallelConfig"
+    ):
+        raise ValueError("GLM-5.2 PCP requires expert parallelism.")
+    if not _require_hcu_pcp_attribute(model_config, "enforce_eager", "ModelConfig"):
+        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+    if _require_hcu_pcp_attribute(
+        vllm_config, "speculative_config", "VllmConfig"
+    ) is not None:
+        raise ValueError("GLM-5.2 PCP does not support speculative decoding or MTP.")
+    if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
+        raise ValueError("GLM-5.2 PCP does not support LoRA.")
+    if _require_hcu_pcp_attribute(
+        model_config, "is_multimodal_model", "ModelConfig"
+    ):
+        raise ValueError("GLM-5.2 PCP does not support multimodal models.")
+    if _require_hcu_pcp_attribute(
+        cache_config, "kv_offloading_size", "CacheConfig"
+    ) is not None:
+        raise ValueError("GLM-5.2 PCP does not support KV offload.")
+
+    kv_transfer_config = _require_hcu_pcp_attribute(
+        vllm_config, "kv_transfer_config", "VllmConfig"
+    )
+    if kv_transfer_config is not None and _require_hcu_pcp_attribute(
+        kv_transfer_config, "kv_connector", "KVTransferConfig"
+    ) is not None:
+        raise ValueError("GLM-5.2 PCP does not support P/D disaggregation.")
+
+    feature_config = get_hcu_config(vllm_config)
+    if feature_config.enable_lightly_cp:
+        raise ValueError("GLM-5.2 PCP does not support lightly-CP.")
+    if feature_config.enable_multi_layers_mtp:
+        raise ValueError("GLM-5.2 PCP does not support speculative decoding or MTP.")
+
+
+def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
+    """Return whether this configuration is in the HCU PCP support scope."""
+
+    parallel_config = _require_hcu_pcp_attribute(
+        vllm_config, "parallel_config", "VllmConfig"
+    )
+    pcp_size = _require_hcu_pcp_attribute(
+        parallel_config, "prefill_context_parallel_size", "ParallelConfig"
+    )
+    if pcp_size <= 1:
+        return False
+
+    _require_mrv2_mla_eager_pcp_contract(vllm_config)
+    return True
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
+    _validate_hcu_pcp_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
     updates: dict[str, str] = {}
     if feature_config.hcu_flash_attn_mode is None:
@@ -188,10 +294,16 @@ def apply_to_module(module: ModuleType) -> bool:
 
     with_hf_config = vars(vllm_config).get("with_hf_config")
     set_cudagraph_sizes = vars(vllm_config).get("_set_cudagraph_sizes")
+    get_v2_unsupported_features = vars(vllm_config).get(
+        "_get_v2_model_runner_unsupported_features"
+    )
+    validate_v2_model_runner = vars(vllm_config).get("_validate_v2_model_runner")
     get_model_arch_config = vars(model_config_class).get("get_model_arch_config")
     if (
         not callable(with_hf_config)
         or not callable(set_cudagraph_sizes)
+        or not callable(get_v2_unsupported_features)
+        or not callable(validate_v2_model_runner)
         or not callable(get_model_arch_config)
     ):
         raise PatchCompatibilityError(
@@ -200,7 +312,7 @@ def apply_to_module(module: ModuleType) -> bool:
     model_arch_signature = inspect.signature(get_model_arch_config)
     if tuple(model_arch_signature.parameters) != ("self",):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[2]} has incompatible "
+            f"required HCU patch target {TARGETS[4]} has incompatible "
             f"signature {model_arch_signature}"
         )
     with_hf_signature = inspect.signature(with_hf_config)
@@ -218,6 +330,18 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[1]} has incompatible "
             f"signature {cudagraph_signature}"
+        )
+    unsupported_features_signature = inspect.signature(get_v2_unsupported_features)
+    if tuple(unsupported_features_signature.parameters) != ("self",):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[2]} has incompatible "
+            f"signature {unsupported_features_signature}"
+        )
+    validate_v2_signature = inspect.signature(validate_v2_model_runner)
+    if tuple(validate_v2_signature.parameters) != ("self",):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[3]} has incompatible "
+            f"signature {validate_v2_signature}"
         )
 
     @functools.wraps(get_model_arch_config)
@@ -292,6 +416,40 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return result
 
+    @functools.wraps(get_v2_unsupported_features)
+    def hcu_get_v2_model_runner_unsupported_features(self) -> list[str]:
+        unsupported = get_v2_unsupported_features(self)
+        try:
+            hcu_pcp_enabled = _validate_hcu_pcp_scope(self)
+        except ValueError:
+            # Leave every out-of-scope PCP configuration on the exact upstream
+            # rejection path. The direct scope check provides its actionable
+            # diagnostic without relaxing vLLM's generic V2 contract.
+            return unsupported
+        if not hcu_pcp_enabled:
+            return unsupported
+        return [
+            feature
+            for feature in unsupported
+            if feature != "prefill context parallelism"
+        ]
+
+    @functools.wraps(validate_v2_model_runner)
+    def hcu_validate_v2_model_runner(self) -> Any:
+        parallel_config = _require_hcu_pcp_attribute(
+            self, "parallel_config", "VllmConfig"
+        )
+        pcp_size = _require_hcu_pcp_attribute(
+            parallel_config, "prefill_context_parallel_size", "ParallelConfig"
+        )
+        if pcp_size > 1:
+            try:
+                _validate_hcu_pcp_scope(self)
+            except ValueError:
+                # Preserve v0.25.1 validation for every rejected PCP shape.
+                return validate_v2_model_runner(self)
+        return validate_v2_model_runner(self)
+
     setattr(vllm_config, "_vllm_hcu_original_with_hf_config", with_hf_config)
     setattr(vllm_config, "with_hf_config", hcu_with_hf_config)
     setattr(
@@ -300,6 +458,26 @@ def apply_to_module(module: ModuleType) -> bool:
         set_cudagraph_sizes,
     )
     setattr(vllm_config, "_set_cudagraph_sizes", hcu_set_cudagraph_sizes)
+    setattr(
+        vllm_config,
+        "_vllm_hcu_original_get_v2_model_runner_unsupported_features",
+        get_v2_unsupported_features,
+    )
+    setattr(
+        vllm_config,
+        "_get_v2_model_runner_unsupported_features",
+        hcu_get_v2_model_runner_unsupported_features,
+    )
+    setattr(
+        vllm_config,
+        "_vllm_hcu_original_validate_v2_model_runner",
+        validate_v2_model_runner,
+    )
+    setattr(
+        vllm_config,
+        "_validate_v2_model_runner",
+        hcu_validate_v2_model_runner,
+    )
     setattr(vllm_config, _MARKER, True)
     return True
 
