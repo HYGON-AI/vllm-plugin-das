@@ -93,165 +93,60 @@ def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
     ]
 
 
-def test_aiter_asm_fp8_quant2_context_preserves_native_activation(
+def test_aiter_asm_boltops_fp8_quant_context_aligns_both_fp8_quant_calls(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    calls: list[str] = []
+    calls: list[tuple[str, object, object]] = []
 
-    def native_activation(
-        activation,
-        is_gated,
-        activated_out,
-        ffn1_out_2d,
-        gemm1_alpha,
-        gemm1_limit,
-    ):
-        del activation, is_gated, ffn1_out_2d, gemm1_alpha, gemm1_limit
-        calls.append("aiter")
-        activated_out.fill_(1)
+    def native_quant(x, quant_dtype=torch.int8):
+        calls.append(("aiter", x, quant_dtype))
+        return "aiter_quant"
+
+    def boltops_quant(x, scale=None, quant_dtype=torch.int8, **kwargs):
+        assert scale is None
+        assert kwargs == {}
+        calls.append(("boltops", x, quant_dtype))
+        return "boltops_quant"
 
     asm_module = _module(
         "aiter.fused_moe_asm_wna16",
-        _apply_activation=native_activation,
-        per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
-    )
-    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-
-    output = torch.empty((2, 4))
-    kwargs = {
-        "activation": "silu",
-        "is_gated": True,
-        "activated_out": output,
-        "ffn1_out_2d": torch.empty((2, 8)),
-        "gemm1_alpha": None,
-        "gemm1_limit": None,
-    }
-
-    asm_module._apply_activation(**kwargs)
-    torch.testing.assert_close(output, torch.ones_like(output))
-    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
-        asm_module._apply_activation(**kwargs)
-    torch.testing.assert_close(output, torch.ones_like(output))
-    asm_module._apply_activation(**kwargs)
-    torch.testing.assert_close(output, torch.ones_like(output))
-    assert calls == ["aiter", "aiter", "aiter"]
-
-
-def test_aiter_asm_fp8_quant2_context_aligns_only_following_bridge_quant(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls: list[str] = []
-
-    def native_activation(
-        activation,
-        is_gated,
-        activated_out,
-        ffn1_out_2d,
-        gemm1_alpha,
-        gemm1_limit,
-    ):
-        del activation, is_gated, ffn1_out_2d, gemm1_alpha, gemm1_limit
-        calls.append("aiter_activation")
-        activated_out.fill_(1)
-
-    def native_quant(x, quant_dtype=None):
-        del x, quant_dtype
-        calls.append("aiter_quant")
-        return "native_quant"
-
-    asm_module = _module(
-        "aiter.fused_moe_asm_wna16",
-        _apply_activation=native_activation,
         per_token_quant_hip=native_quant,
     )
-    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_per_token_quant_fp8",
-        lambda x: (calls.append("vllm_quant"), "vllm_quant")[1],
-        raising=False,
+    boltops_module = _module(
+        "boltops.fused_moe.triton.moe_compat",
+        per_token_quant_hip=boltops_quant,
     )
-    output = torch.empty((2, 4))
-    kwargs = {
-        "activation": "silu",
-        "is_gated": True,
-        "activated_out": output,
-        "ffn1_out_2d": torch.empty((2, 8)),
-        "gemm1_alpha": None,
-        "gemm1_limit": None,
-    }
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        boltops_module,
+    )
 
-    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
+    with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
         assert asm_module.per_token_quant_hip(
-            "input", quant_dtype=torch.float8_e4m3fn
-        ) == "native_quant"
-        asm_module._apply_activation(**kwargs)
-        torch.testing.assert_close(output, torch.ones_like(output))
+            "gemm1_input", quant_dtype=torch.float8_e4m3fn
+        ) == "boltops_quant"
         assert asm_module.per_token_quant_hip(
-            "bridge", quant_dtype=torch.float8_e4m3fn
-        ) == "vllm_quant"
+            "gemm2_input", quant_dtype=torch.float8_e4m3fn
+        ) == "boltops_quant"
         assert asm_module.per_token_quant_hip(
-            "later", quant_dtype=torch.float8_e4m3fn
-        ) == "native_quant"
+            "int8_input", quant_dtype=torch.int8
+        ) == "aiter_quant"
     assert asm_module.per_token_quant_hip(
         "outside", quant_dtype=torch.float8_e4m3fn
-    ) == "native_quant"
+    ) == "aiter_quant"
     assert calls == [
-        "aiter_quant",
-        "aiter_activation",
-        "vllm_quant",
-        "aiter_quant",
-        "aiter_quant",
+        ("boltops", "gemm1_input", torch.float8_e4m3fn),
+        ("boltops", "gemm2_input", torch.float8_e4m3fn),
+        ("aiter", "int8_input", torch.int8),
+        ("aiter", "outside", torch.float8_e4m3fn),
     ]
 
 
-def test_aiter_asm_fp8_quant2_context_clears_stale_bridge_trigger(
+def test_aiter_asm_boltops_fp8_quant_context_preserves_native_activation(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def native_activation(
-        activation,
-        is_gated,
-        activated_out,
-        ffn1_out_2d,
-        gemm1_alpha,
-        gemm1_limit,
-    ):
-        del activation, is_gated, activated_out, ffn1_out_2d
-        del gemm1_alpha, gemm1_limit
-
-    asm_module = _module(
-        "aiter.fused_moe_asm_wna16",
-        _apply_activation=native_activation,
-        per_token_quant_hip=lambda x, quant_dtype=None: "native_quant",
-    )
-    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_per_token_quant_fp8",
-        lambda x: "vllm_quant",
-    )
-    kwargs = {
-        "activation": "silu",
-        "is_gated": True,
-        "activated_out": torch.empty((2, 4)),
-        "ffn1_out_2d": torch.empty((2, 8)),
-        "gemm1_alpha": None,
-        "gemm1_limit": None,
-    }
-
-    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
-        asm_module._apply_activation(**kwargs)
-        asm_module._apply_activation(**(kwargs | {"activation": "gelu"}))
-        assert asm_module.per_token_quant_hip(
-            "later", quant_dtype=torch.float8_e4m3fn
-        ) == "native_quant"
-
-
-def test_aiter_asm_fp8_quant2_context_nested_disable_and_exception_restore_state(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls: list[str] = []
-
     def native_activation(
         activation,
         is_gated,
@@ -261,7 +156,6 @@ def test_aiter_asm_fp8_quant2_context_nested_disable_and_exception_restore_state
         gemm1_limit,
     ):
         del activation, is_gated, ffn1_out_2d, gemm1_alpha, gemm1_limit
-        calls.append("aiter")
         activated_out.fill_(1)
 
     asm_module = _module(
@@ -270,141 +164,125 @@ def test_aiter_asm_fp8_quant2_context_nested_disable_and_exception_restore_state
         per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=lambda x, **kwargs: (x, kwargs),
+        ),
+    )
     output = torch.empty((2, 4))
-    kwargs = {
-        "activation": SimpleNamespace(value="silu"),
-        "is_gated": True,
-        "activated_out": output,
-        "ffn1_out_2d": torch.empty((2, 8)),
-        "gemm1_alpha": None,
-        "gemm1_limit": None,
-    }
 
-    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
-        asm_module._apply_activation(**kwargs)
-        torch.testing.assert_close(output, torch.ones_like(output))
-        with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=False):
-            asm_module._apply_activation(**kwargs)
-            torch.testing.assert_close(output, torch.ones_like(output))
-        with pytest.raises(RuntimeError, match="cleanup"):
-            with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
-                raise RuntimeError("cleanup")
-
-    asm_module._apply_activation(**kwargs)
+    with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
+        assert asm_module._apply_activation is native_activation
+        asm_module._apply_activation(
+            "silu", True, output, torch.empty((2, 8)), None, None
+        )
     torch.testing.assert_close(output, torch.ones_like(output))
-    assert calls == ["aiter", "aiter", "aiter"]
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"activation": "gelu"},
-        {"is_gated": False},
-        {"gemm1_alpha": 1.0},
-        {"gemm1_limit": 7.0},
-    ],
-)
-def test_aiter_asm_fp8_quant2_context_preserves_other_activation_modes(
+def test_aiter_asm_boltops_fp8_quant_context_nested_disable_restores_state(
     monkeypatch: pytest.MonkeyPatch,
-    overrides: dict[str, object],
 ):
     calls: list[str] = []
 
-    def native_activation(
-        activation,
-        is_gated,
-        activated_out,
-        ffn1_out_2d,
-        gemm1_alpha,
-        gemm1_limit,
-    ):
-        del activation, is_gated, activated_out, ffn1_out_2d
-        del gemm1_alpha, gemm1_limit
+    def native_quant(x, quant_dtype=torch.int8):
+        del x, quant_dtype
         calls.append("aiter")
+        return "aiter"
 
     asm_module = _module(
         "aiter.fused_moe_asm_wna16",
-        _apply_activation=native_activation,
-        per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
+        per_token_quant_hip=native_quant,
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    kwargs = {
-        "activation": "silu",
-        "is_gated": True,
-        "activated_out": torch.empty((2, 4)),
-        "ffn1_out_2d": torch.empty((2, 8)),
-        "gemm1_alpha": None,
-        "gemm1_limit": None,
-    }
-    kwargs.update(overrides)
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=lambda x, **kwargs: (
+                calls.append("boltops"),
+                "boltops",
+            )[1],
+        ),
+    )
 
-    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
-        asm_module._apply_activation(**kwargs)
+    with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
+        assert asm_module.per_token_quant_hip(
+            "outer", quant_dtype=torch.float8_e4m3fn
+        ) == "boltops"
+        with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=False):
+            assert asm_module.per_token_quant_hip(
+                "disabled", quant_dtype=torch.float8_e4m3fn
+            ) == "aiter"
+        with pytest.raises(RuntimeError, match="cleanup"):
+            with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
+                raise RuntimeError("cleanup")
+        assert asm_module.per_token_quant_hip(
+            "outer-again", quant_dtype=torch.float8_e4m3fn
+        ) == "boltops"
+
+    assert asm_module.per_token_quant_hip(
+        "outside", quant_dtype=torch.float8_e4m3fn
+    ) == "aiter"
+    assert calls == ["boltops", "aiter", "boltops", "aiter"]
+
+
+@pytest.mark.parametrize(
+    "quant_kwargs",
+    [
+        {"quant_dtype": torch.int8},
+        {"quant_dtype": torch.float8_e4m3fn, "scale": torch.ones(1)},
+        {"quant_dtype": torch.float8_e4m3fn, "num_rows": torch.ones(1)},
+        {"quant_dtype": torch.float8_e4m3fn, "num_rows_factor": 2},
+    ],
+)
+def test_aiter_asm_boltops_fp8_quant_context_preserves_unsupported_quant_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_kwargs: dict[str, object],
+):
+    calls: list[str] = []
+
+    def native_quant(
+        x,
+        scale=None,
+        quant_dtype=torch.int8,
+        num_rows=None,
+        num_rows_factor=1,
+    ):
+        del x, scale, quant_dtype, num_rows, num_rows_factor
+        calls.append("aiter")
+        return "aiter"
+
+    asm_module = _module(
+        "aiter.fused_moe_asm_wna16",
+        per_token_quant_hip=native_quant,
+    )
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=lambda x, **kwargs: "boltops",
+        ),
+    )
+
+    with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
+        assert asm_module.per_token_quant_hip("input", **quant_kwargs) == "aiter"
     assert calls == ["aiter"]
 
 
-def test_aiter_asm_fp8_quant2_context_rejects_incompatible_activation_abi(
+def test_aiter_asm_boltops_fp8_quant_context_rejects_incompatible_quant_abi(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def incompatible(activation, activated_out):
-        del activation, activated_out
-
-    asm_module = _module(
-        "aiter.fused_moe_asm_wna16",
-        _apply_activation=incompatible,
-        per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
-    )
-    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-
-    with pytest.raises(
-        aiter_runtime.HcuAiterRuntimeError,
-        match="unsupported arguments",
-    ):
-        with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
-            pass
-    assert asm_module._apply_activation is incompatible
-
-
-def test_vllm_per_token_quant_fp8_wraps_extension_import_error(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    def missing_extension(name: str):
-        raise ImportError(name)
-
-    monkeypatch.setattr(aiter_runtime, "import_module", missing_extension)
-    with pytest.raises(
-        aiter_runtime.HcuAiterRuntimeError,
-        match="FP8 quantization is unavailable",
-    ):
-        aiter_runtime._vllm_per_token_quant_fp8(torch.empty(1))
-
-
-def test_aiter_asm_fp8_quant2_context_rejects_incompatible_quant_abi(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    def native_activation(
-        activation,
-        is_gated,
-        activated_out,
-        ffn1_out_2d,
-        gemm1_alpha,
-        gemm1_limit,
-    ):
-        del (
-            activation,
-            is_gated,
-            activated_out,
-            ffn1_out_2d,
-            gemm1_alpha,
-            gemm1_limit,
-        )
-
     def incompatible_quant(x):
         return x
 
     asm_module = _module(
         "aiter.fused_moe_asm_wna16",
-        _apply_activation=native_activation,
         per_token_quant_hip=incompatible_quant,
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
@@ -413,7 +291,7 @@ def test_aiter_asm_fp8_quant2_context_rejects_incompatible_quant_abi(
         aiter_runtime.HcuAiterRuntimeError,
         match="per_token_quant_hip exposes unsupported arguments",
     ):
-        with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
+        with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
             pass
     assert asm_module.per_token_quant_hip is incompatible_quant
 
@@ -2829,7 +2707,7 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
         (True, False, "asm", "gelu", 1.0),
     ],
 )
-def test_quantized_aiter_runtime_scopes_vllm_quant2_to_fp8_asm_silu(
+def test_quantized_aiter_runtime_scopes_boltops_quant_to_both_fp8_asm_stages(
     monkeypatch: pytest.MonkeyPatch,
     use_fp8: bool,
     use_int8: bool,
@@ -2867,20 +2745,20 @@ def test_quantized_aiter_runtime_scopes_vllm_quant2_to_fp8_asm_silu(
         per_token_quant_hip=native_fp8_quant,
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_per_token_quant_fp8",
-        lambda x: (
-            calls.append("vllm_fp8_quant"),
-            (x, torch.ones((x.shape[0], 1))),
-        )[1],
-    )
+
+    def boltops_fp8_quant(x, scale=None, quant_dtype=torch.int8, **kwargs):
+        assert scale is None
+        assert quant_dtype == torch.float8_e4m3fn
+        assert kwargs == {}
+        calls.append("boltops_fp8_quant")
+        return x, torch.ones((x.shape[0], 1))
+
     monkeypatch.setitem(
         sys.modules,
         "boltops.fused_moe.triton.moe_compat",
         _module(
             "boltops.fused_moe.triton.moe_compat",
-            per_token_quant_hip=lambda x: (x, torch.ones((x.shape[0], 1))),
+            per_token_quant_hip=boltops_fp8_quant,
         ),
     )
 
@@ -2893,7 +2771,10 @@ def test_quantized_aiter_runtime_scopes_vllm_quant2_to_fp8_asm_silu(
 
     def aiter_moe(**kwargs):
         if use_fp8:
-            asm_module.per_token_quant_hip(kwargs["hidden_states"])
+            asm_module.per_token_quant_hip(
+                kwargs["hidden_states"],
+                quant_dtype=torch.float8_e4m3fn,
+            )
         output = torch.empty((2, 4))
         asm_module._apply_activation(
             activation=kwargs["activation"],
@@ -2947,11 +2828,11 @@ def test_quantized_aiter_runtime_scopes_vllm_quant2_to_fp8_asm_silu(
 
     torch.testing.assert_close(output, torch.full_like(output, expected))
     if use_fp8:
-        if solution_type == "asm" and activation == "silu":
+        if solution_type == "asm":
             assert calls == [
-                "aiter_fp8_quant",
+                "boltops_fp8_quant",
                 "aiter_activation",
-                "vllm_fp8_quant",
+                "boltops_fp8_quant",
             ]
         else:
             assert calls == [
