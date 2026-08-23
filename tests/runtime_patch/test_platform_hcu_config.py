@@ -530,9 +530,13 @@ class _FakeModelConfig:
         self.hf_text_config = hf_config.get_text_config()
         self.model_arch_config = self.get_model_arch_config()
         self.enforce_eager = enforce_eager
+        self.use_mla = False
 
     def get_model_arch_config(self) -> str:
         return self.hf_text_config.name
+
+    def verify_with_parallel_config(self, parallel_config: object) -> object:
+        return parallel_config
 
 
 class _FakeCompilationConfig:

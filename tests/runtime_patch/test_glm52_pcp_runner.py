@@ -374,10 +374,14 @@ def _build_attn_metadata(
         **extra,
     )
     builder = attn_groups[0][0].get_metadata_builder(0)
+    attn_extra = model_specific_attn_metadata.get_extra_attn_kwargs(
+        builder, num_reqs
+    )
     return {
         "mla.layer": builder.build(
             common_prefix_len=0,
             common_attn_metadata=common,
+            **attn_extra,
         )
     }
 
@@ -615,8 +619,17 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
     assert adapter.apply_to_module(target) is False
 
     class Builder:
-        def build(self, *, common_prefix_len, common_attn_metadata):
+        supports_pcp_plan = True
+
+        def build(
+            self,
+            *,
+            common_prefix_len,
+            common_attn_metadata,
+            pcp_plan=None,
+        ):
             assert common_prefix_len == 0
+            common_attn_metadata.pcp_plan = pcp_plan
             return common_attn_metadata
 
     class Group:
@@ -645,6 +658,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         req_ids=["decode", "prefill"],
         is_prefilling_np=np.array([False, True], dtype=np.bool_),
         prompt_lens=None,
+        _vllm_hcu_pcp_plan="gqa-plan",
     )
     metadata = state.prepare_attn(
         input_batch,
@@ -676,6 +690,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_query_gpu": common.query_start_loc.tolist(),
         "pcp_query_cpu": common.query_start_loc_cpu.tolist(),
         "pcp_is_prefilling": common.is_prefilling.tolist(),
+        "pcp_plan": common.pcp_plan,
         "pcp_one_result": pcp_one,
         "pcp_one_query_gpu": captured["query_start_loc_gpu"].tolist(),
         "pcp_one_query_cpu": captured["query_start_loc_cpu"].tolist(),
@@ -687,11 +702,32 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_query_gpu": [0, 1, 3],
         "pcp_query_cpu": [0, 1, 3],
         "pcp_is_prefilling": [False, True],
+        "pcp_plan": "gqa-plan",
         "pcp_one_result": {"path": "original"},
         "pcp_one_query_gpu": [0, 1, 3, 9, 9],
         "pcp_one_query_cpu": [0, 1, 3, 9, 9],
         "pcp_one_has_phase_adapter": False,
     }
+
+
+def test_pcp_model_state_routes_plan_only_to_flash_attention_builder() -> None:
+    """Passing a GQA plan to MLA metadata would change its established ABI."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    plan = object()
+    request_metadata = adapter._PCPRequestPhaseMetadata(
+        torch.tensor([True]),
+        pcp_plan=plan,
+    )
+
+    flash_builder = SimpleNamespace(supports_pcp_plan=True)
+    mla_builder = SimpleNamespace()
+    assert request_metadata.get_extra_attn_kwargs(flash_builder, 1) == {
+        "pcp_plan": plan
+    }
+    assert request_metadata.get_extra_attn_kwargs(mla_builder, 1) == {}
 
 
 def test_pcp_default_model_state_rejects_same_signature_behavior_drift(

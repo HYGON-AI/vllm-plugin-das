@@ -393,6 +393,25 @@ def _bare_flash_attention_builder(flash_attn, *, sliding_window: int = 32):
     return builder
 
 
+def test_gqa_pcp_plan_reaches_flash_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping the per-step plan makes FlashAttention read local-row metadata."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    plan = object()
+
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=_common_attention_metadata(causal=True),
+        pcp_plan=plan,
+    )
+
+    assert flash_attn.FlashAttentionImpl.supports_pcp is True
+    assert metadata.pcp_plan is plan
+
+
 def _common_attention_metadata(*, causal: bool | torch.Tensor):
     return SimpleNamespace(
         num_reqs=1,
@@ -880,6 +899,130 @@ def test_hcu_varlen_dcp_requests_lse_from_paged_and_nonpaged_calls(
     assert len(merge_calls) == 1
 
 
+def test_hcu_varlen_pcp_dcp_splits_new_tokens_from_cached_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Using rank-local Q/K/V for both passes loses remote PCP token chunks."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    native_calls: list[dict[str, object]] = []
+    merge_calls: list[tuple[object, ...]] = []
+
+    def native(**kwargs):
+        native_calls.append(kwargs)
+        query = kwargs["q"]
+        fill = 2.0 if kwargs.get("block_table") is not None else 1.0
+        return torch.full_like(query, fill), torch.zeros(
+            query.shape[-2], query.shape[0]
+        )
+
+    class _PCPGroup:
+        @staticmethod
+        def all_gather(tensor, dim):
+            assert dim == 0
+            return torch.cat((tensor, tensor + 10), dim=0)
+
+    class _DCPGroup:
+        world_size = 2
+        rank_in_group = 0
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: native,
+    )
+    monkeypatch.setattr(flash_attn, "get_pcp_group", lambda: _PCPGroup())
+    monkeypatch.setattr(flash_attn, "get_dcp_group", lambda: _DCPGroup())
+    monkeypatch.setattr(
+        flash_attn,
+        "merge_attn_states",
+        lambda *args: merge_calls.append(args),
+    )
+
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.num_heads = 1
+    impl.num_kv_heads = 1
+    impl.dcp_world_size = 2
+    impl.head_size = 1
+    impl.scale = 1.0
+    impl.alibi_slopes = None
+    impl.sliding_window = (-1, -1)
+    impl.logits_soft_cap = 0.0
+    impl.supports_quant_query_input = False
+    impl.use_pcp = True
+    impl.dcp_combine = lambda out, lse, group, return_lse: (out, lse)
+    layer = SimpleNamespace(
+        layer_name="model.layers.0.self_attn",
+        _q_scale=torch.tensor(1.0),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+    gathered_key = torch.tensor([0.0, 1.0, 2.0, 3.0]).reshape(4, 1, 1)
+    gathered_value = gathered_key + 100
+    impl._pcp_kv = {layer.layer_name: (gathered_key, gathered_value)}
+
+    context = SimpleNamespace(
+        padded_num_tokens=2,
+        restore_idx=torch.tensor([0, 2, 1, 3]),
+        local_idx=torch.tensor([0, 2]),
+        cu_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+        max_q=2,
+        ctx_lens=torch.tensor([0, 2], dtype=torch.int32),
+        ctx_cu=torch.tensor([0, 0, 2], dtype=torch.int32),
+        max_ctx=2,
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    plan = SimpleNamespace(
+        new_kv_idx=torch.tensor([0, 2, 3]),
+        new_cu_kv=torch.tensor([0, 1, 3], dtype=torch.int32),
+        new_max_kv=2,
+        ctx=context,
+    )
+    metadata = SimpleNamespace(
+        pcp_plan=plan,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        sliding_window=None,
+        causal=True,
+        max_num_splits=0,
+        scheduler_metadata=None,
+        dcp_context_kv_lens=None,
+        max_dcp_context_kv_len=None,
+        block_table=torch.tensor([[9], [9]], dtype=torch.int32),
+    )
+    query = torch.tensor([0.0, 1.0]).reshape(2, 1, 1)
+    output = torch.empty_like(query)
+    cache = torch.zeros(2, 1, 1)
+
+    impl._forward_with_dcp(
+        query,
+        query,
+        query,
+        cache,
+        cache,
+        output,
+        metadata,
+        layer=layer,
+    )
+
+    assert len(native_calls) == 2
+    new_call, context_call = native_calls
+    assert new_call["causal"] is True
+    assert new_call["k"].flatten().tolist() == [0.0, 2.0, 3.0]
+    assert new_call["cu_seqlens_k"].tolist() == [0, 1, 3]
+    assert context_call["causal"] is False
+    assert context_call["q"].flatten().tolist() == [0.0, 10.0, 1.0, 11.0]
+    assert context_call["block_table"] is context.block_table
+    assert layer.layer_name not in impl._pcp_kv
+    assert len(merge_calls) == 1
+    merged_context_out = merge_calls[0][1]
+    merged_context_lse = merge_calls[0][2]
+    assert merged_context_out.flatten().tolist() == [0.0, 2.0]
+    assert merged_context_lse.flatten().tolist() == [float("-inf"), 0.0]
+
+
 def test_block_first_kv_update_passes_axis_one_views_to_aiter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -917,6 +1060,56 @@ def test_block_first_kv_update_passes_axis_one_views_to_aiter(
     assert value_cache.stride() == expected_value_cache.stride()
     assert key_cache.storage_offset() == expected_key_cache.storage_offset()
     assert value_cache.storage_offset() == expected_value_cache.storage_offset()
+
+
+def test_pcp_kv_update_gathers_new_tokens_before_cache_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Writing rank-local K/V into global PCP slots corrupts every remote chunk."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    impl.use_pcp = True
+    impl.pcp_world_size = 2
+    impl._pcp_kv = {}
+
+    class _PCPGroup:
+        @staticmethod
+        def all_gather(tensor, dim):
+            assert dim == 0
+            assert tensor.is_contiguous()
+            return torch.cat((tensor, tensor + 10), dim=0)
+
+    writes: list[tuple[object, ...]] = []
+    monkeypatch.setattr(flash_attn, "get_pcp_group", lambda: _PCPGroup())
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "reshape_and_cache_flash",
+        lambda *args: writes.append(args),
+    )
+    qkv = torch.arange(4, dtype=torch.float32).reshape(2, 2, 1, 1)
+    key = qkv[:, 0]
+    value = (qkv + 100)[:, 1]
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+    cache = torch.empty(4, 2, 1, 1, 1)
+    slots = torch.tensor([0, 1, 2, 3])
+    layer = SimpleNamespace(
+        layer_name="model.layers.0.self_attn",
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+
+    gathered_key, gathered_value = impl._pcp_kv[layer.layer_name]
+    assert gathered_key.flatten().tolist() == [0.0, 2.0, 10.0, 12.0]
+    assert gathered_value.flatten().tolist() == [101.0, 103.0, 111.0, 113.0]
+    assert writes[0][0] is gathered_key
+    assert writes[0][1] is gathered_value
 
 
 def test_platform_block_copy_and_swap_use_axis_zero():

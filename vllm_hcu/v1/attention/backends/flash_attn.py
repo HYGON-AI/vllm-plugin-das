@@ -6,7 +6,7 @@
 
 import copy
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -31,7 +31,7 @@ from vllm_hcu.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -57,7 +57,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv, round_up
@@ -73,6 +73,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 import vllm.envs as envs
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_hcu.v1.pcp_manager import PCPPlan
 
 
 def _get_flash_attn_mode() -> str:
@@ -354,6 +357,9 @@ class FlashAttentionMetadata:
     max_dcp_context_kv_len: int | None = None
     dcp_context_kv_lens: torch.Tensor | None = None
 
+    # Populated per step for a GQA PCP+DCP prefill.
+    pcp_plan: "PCPPlan | None" = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -428,6 +434,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
+    supports_pcp_plan: bool = True
 
     @classmethod
     def get_cudagraph_support(
@@ -435,6 +442,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         vllm_config: "VllmConfig",
         kv_cache_spec: "AttentionSpec",
     ) -> AttentionCGSupport:
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            return AttentionCGSupport.NEVER
         return cls._cudagraph_support
 
     def __init__(
@@ -480,6 +489,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
         )
+        self.use_pcp = self.parallel_config.prefill_context_parallel_size > 1
 
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -509,7 +519,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
 
         if self.dcp_world_size > 1:
-            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            max_num_reqs = vllm_config.scheduler_config.max_num_seqs * (
+                2 if self.use_pcp else 1
+            )
             self._dcp_context_kv_lens = torch.zeros(
                 max_num_reqs,
                 dtype=torch.int32,
@@ -525,6 +537,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        pcp_plan: "PCPPlan | None" = None,
     ) -> FlashAttentionMetadata:
         """
         fast_build disables AOT scheduling, used when there will be few
@@ -715,6 +728,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
+            pcp_plan=pcp_plan,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -745,6 +759,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    supports_pcp: bool = True
 
     def __init__(
         self,
@@ -825,7 +840,19 @@ class FlashAttentionImpl(AttentionImpl):
             and vllm_config.parallel_config.decode_context_parallel_size > 1
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
-        self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+        self.use_pcp = self.pcp_world_size > 1
+        if dcp_a2a:
+            self.dcp_combine = dcp_a2a_lse_reduce
+        elif self.use_pcp:
+            self.dcp_combine = cp_lse_ag_out_ar
+        else:
+            self.dcp_combine = cp_lse_ag_out_rs
+        if self.use_pcp and self.dcp_world_size > 1:
+            assert self.dcp_world_size == self.pcp_world_size, (
+                "FlashAttention PCP+DCP requires dcp == pcp, got "
+                f"dcp={self.dcp_world_size}, pcp={self.pcp_world_size}."
+            )
+        self._pcp_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self._dcp_dtype: torch.dtype | None = None
         if vllm_config is not None and self.dcp_world_size > 1:
@@ -904,6 +931,7 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache, value_cache = kv_cache
         else:
             key_cache, value_cache = kv_cache.unbind(1)
+
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
         # FA3/4 on H100+ uses TMA, which requires ≥16-byte stride alignment.
         # See vllm.utils.torch_utils.canonicalize_singleton_dim_strides.
@@ -955,7 +983,7 @@ class FlashAttentionImpl(AttentionImpl):
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
-                    query[:num_actual_tokens],
+                    query,
                     key[:num_actual_tokens],
                     value[:num_actual_tokens],
                     key_cache,
@@ -965,6 +993,7 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    layer=layer,
                 )
                 return output
             else:
@@ -1109,6 +1138,20 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             key_cache, value_cache = kv_cache.unbind(1)
 
+        if (
+            getattr(self, "use_pcp", False)
+            and slot_mapping.shape[0] > key.shape[0]
+        ):
+            num_local_tokens = slot_mapping.shape[0] // self.pcp_world_size
+            pcp_group = get_pcp_group()
+            key = pcp_group.all_gather(
+                key[:num_local_tokens].contiguous(), dim=0
+            )
+            value = pcp_group.all_gather(
+                value[:num_local_tokens].contiguous(), dim=0
+            )
+            self._pcp_kv[layer.layer_name] = (key, value)
+
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
         # NOTE(woosuk): Here, key and value are padded while slot_mapping is
@@ -1151,17 +1194,37 @@ class FlashAttentionImpl(AttentionImpl):
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
         )
+
+        plan = getattr(attn_metadata, "pcp_plan", None)
+        if plan is not None:
+            assert layer is not None
+            return self._forward_with_pcp_dcp(
+                query,
+                key_cache,
+                value_cache,
+                output,
+                attn_metadata,
+                layer,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
 
         cu_seqlens_q = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
         block_table = attn_metadata.block_table
 
         query = query.contiguous()
-        query_across_dcp = get_dcp_group().all_gather(query, dim=1)
+        query = query[: output.shape[0]]
+        use_pcp = getattr(self, "use_pcp", False)
+        query_across_dcp = (
+            query if use_pcp else get_dcp_group().all_gather(query, dim=1)
+        )
         context_sliding_window_size = _get_native_sliding_window(
             attn_metadata.sliding_window,
             self.sliding_window,
@@ -1173,9 +1236,12 @@ class FlashAttentionImpl(AttentionImpl):
             attn_metadata.causal,
         )
         n = query_across_dcp.shape[0]
+        context_heads = self.num_heads if use_pcp else (
+            self.num_heads * self.dcp_world_size
+        )
         (dcp_context_out,) = current_workspace_manager().get_simultaneous(
             (
-                (n, self.num_heads * self.dcp_world_size, self.head_size),
+                (n, context_heads, self.head_size),
                 self._dcp_dtype,
             ),
         )
@@ -1294,6 +1360,139 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+        return output
+
+    def _forward_with_pcp_dcp(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        layer: torch.nn.Module,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run exact GQA PCP attention over new tokens and sharded context."""
+
+        plan = attn_metadata.pcp_plan
+        assert plan is not None
+        num_tokens = output.shape[0]
+        query = query.contiguous()
+        gathered_kv = self._pcp_kv.pop(layer.layer_name, None)
+        assert gathered_kv is not None, (
+            "PCP+DCP step is missing write-gathered K/V for "
+            f"{layer.layer_name}."
+        )
+        new_key = gathered_kv[0][plan.new_kv_idx]
+        new_value = gathered_kv[1][plan.new_kv_idx]
+        query_window = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            attn_metadata.causal,
+        )
+
+        def call_flash_with_lse(**kwargs):
+            if _get_flash_attn_mode() == "custom":
+                kwargs["is_prefix_cache"] = True
+                result = vllm_flash_attn_varlen_func(**kwargs)
+                if not isinstance(result, tuple) or len(result) < 2:
+                    raise RuntimeError(
+                        "HCU custom FlashAttention must return output and LSE"
+                    )
+                return result[0], result[1]
+            return _call_select_flash_attn_with_lse(**kwargs)
+
+        _, new_lse = call_flash_with_lse(
+            q=query[:num_tokens],
+            k=new_key,
+            v=new_value,
+            out=output,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            cu_seqlens_k=plan.new_cu_kv,
+            max_seqlen_k=plan.new_max_kv,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=query_window,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+        context = plan.ctx
+        if context is None:
+            return output
+        context_query = get_pcp_group().all_gather(
+            query[: context.padded_num_tokens], dim=0
+        )[context.restore_idx]
+        context_window = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            False,
+        )
+        if _get_flash_attn_mode() == "custom":
+            context_q_descale = None
+            context_k_descale = layer._k_scale
+            context_v_descale = layer._v_scale
+        else:
+            descale_shape = (context.cu_q.shape[0] - 1, self.num_kv_heads)
+            context_q_descale = (
+                layer._q_scale.expand(descale_shape)
+                if self.supports_quant_query_input
+                else None
+            )
+            context_k_descale = layer._k_scale.expand(descale_shape)
+            context_v_descale = layer._v_scale.expand(descale_shape)
+        context_out, context_lse = call_flash_with_lse(
+            q=context_query,
+            k=key_cache,
+            v=value_cache,
+            out=None,
+            cu_seqlens_q=context.cu_q,
+            max_seqlen_q=context.max_q,
+            seqused_k=context.ctx_lens,
+            max_seqlen_k=context.max_ctx,
+            softmax_scale=self.scale,
+            causal=False,
+            alibi_slopes=self.alibi_slopes,
+            window_size=context_window,
+            block_table=context.block_table,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=context_q_descale,
+            k_descale=context_k_descale,
+            v_descale=context_v_descale,
+        )
+        empty_context = context.ctx_cu[1:] == context.ctx_cu[:-1]
+        query_lens = context.cu_q[1:] - context.cu_q[:-1]
+        empty_tokens = torch.repeat_interleave(empty_context, query_lens)
+        context_lse.masked_fill_(empty_tokens.unsqueeze(0), float("-inf"))
+        context_out.masked_fill_(empty_tokens[:, None, None], 0.0)
+
+        context_out, context_lse = self.dcp_combine(
+            context_out,
+            context_lse.transpose(0, 1),
+            get_dcp_group(),
+            return_lse=True,
+        )
+        context_lse = context_lse.transpose(0, 1).contiguous()
+        context_out = context_out[context.local_idx]
+        context_lse = context_lse[:, context.local_idx]
+        merge_attn_states(
+            output,
+            context_out,
+            context_lse,
+            output,
+            new_lse,
+        )
+        return output
 
     def _forward_encoder_attention(
         self,

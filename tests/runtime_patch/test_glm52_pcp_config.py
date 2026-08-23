@@ -83,6 +83,37 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config, dcp: int) -> None:
+    """GQA PCP must not remain trapped behind the former MLA-only gate."""
+
+    config = make_pcp_config(
+        architecture="Qwen3ForCausalLM",
+        use_mla=False,
+        pcp=2,
+        tp=2,
+        dcp=dcp,
+        enable_expert_parallel=False,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_gqa_pcp_allows_piecewise_graph_execution(make_pcp_config) -> None:
+    """FlashAttention opts out of capture itself, so global eager is unnecessary."""
+
+    config = make_pcp_config(
+        architecture="Qwen3ForCausalLM",
+        use_mla=False,
+        pcp=2,
+        dcp=1,
+        enable_expert_parallel=False,
+        enforce_eager=False,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
@@ -119,6 +150,13 @@ def _make_vllm_module() -> ModuleType:
     class ModelConfig:
         def get_model_arch_config(self) -> object:
             return None
+
+        def verify_with_parallel_config(self, parallel_config) -> None:
+            if (
+                parallel_config.decode_context_parallel_size > 1
+                and not self.use_mla
+            ):
+                raise AssertionError("legacy GQA DCP head constraint")
 
     class VllmConfig:
         def with_hf_config(self, hf_config: object, architectures=None):
@@ -164,6 +202,22 @@ def test_valid_glm52_pcp_removes_only_the_upstream_pcp_rejection(
     config._validate_v2_model_runner()
 
 
+def test_gqa_pcp_dcp_skips_only_the_legacy_head_partition_constraint() -> None:
+    """DCP==PCP carries replicated Q heads and must not apply pure-DCP checks."""
+
+    module = _make_vllm_module()
+    assert patch_vllm_config.apply_to_module(module) is True
+    model_config = module.ModelConfig()
+    model_config.use_mla = False
+    parallel_config = SimpleNamespace(
+        prefill_context_parallel_size=2,
+        decode_context_parallel_size=2,
+    )
+
+    model_config.verify_with_parallel_config(parallel_config)
+    assert parallel_config.decode_context_parallel_size == 2
+
+
 def test_pcp1_preserves_upstream_v2_unsupported_feature_and_validation(
     make_pcp_config,
 ) -> None:
@@ -184,7 +238,14 @@ def test_invalid_pcp_preserves_upstream_pcp_rejection(make_pcp_config) -> None:
     module = _make_vllm_module()
     assert patch_vllm_config.apply_to_module(module) is True
     config = _as_fake_vllm_config(
-        module, make_pcp_config(pcp=2, use_mla=False)
+        module,
+        make_pcp_config(
+            architecture="Qwen3ForCausalLM",
+            use_mla=False,
+            pcp=2,
+            dcp=4,
+            enable_expert_parallel=False,
+        ),
     )
 
     assert config._get_v2_model_runner_unsupported_features() == [

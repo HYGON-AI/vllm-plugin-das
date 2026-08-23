@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+from copy import copy
 from types import ModuleType
 from typing import Any
 
@@ -23,6 +24,7 @@ TARGETS = (
     f"{TARGET_MODULE}.VllmConfig._validate_v2_model_runner",
     "vllm.config.model.ModelConfig.get_model_arch_config",
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
+    "vllm.config.model.ModelConfig.verify_with_parallel_config",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _REQUEST_CAPTURE_SIZES = (
@@ -38,17 +40,17 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         return getattr(owner, name)
     except AttributeError as exc:
         raise PatchCompatibilityError(
-            f"GLM-5.2 PCP requires {owner_name}.{name} in vLLM 0.25.1"
+            f"HCU PCP requires {owner_name}.{name} in vLLM 0.25.1"
         ) from exc
 
 
-def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
+def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
     if not _require_hcu_pcp_attribute(
         vllm_config, "use_v2_model_runner", "VllmConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires Model Runner V2.")
+        raise ValueError("HCU PCP requires Model Runner V2.")
 
     model_config = _require_hcu_pcp_attribute(
         vllm_config, "model_config", "VllmConfig"
@@ -63,47 +65,63 @@ def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
     architectures = _require_hcu_pcp_attribute(
         model_config, "architectures", "ModelConfig"
     )
-    if architectures != ["GlmMoeDsaForCausalLM"]:
+    use_mla = bool(
+        _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
+    )
+    is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
+    if use_mla and not is_glm52:
         raise ValueError(
             "GLM-5.2 PCP only supports architecture "
             "GlmMoeDsaForCausalLM."
         )
-    if not _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig"):
+    if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
     ) != 1:
-        raise ValueError("GLM-5.2 PCP does not support pipeline parallelism.")
-    if _require_hcu_pcp_attribute(
-        parallel_config, "decode_context_parallel_size", "ParallelConfig"
-    ) != 1:
+        raise ValueError("HCU PCP does not support pipeline parallelism.")
+    dcp_size = int(
+        _require_hcu_pcp_attribute(
+            parallel_config, "decode_context_parallel_size", "ParallelConfig"
+        )
+    )
+    pcp_size = int(
+        _require_hcu_pcp_attribute(
+            parallel_config, "prefill_context_parallel_size", "ParallelConfig"
+        )
+    )
+    if use_mla and dcp_size != 1:
+        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+    if not use_mla and dcp_size not in (1, pcp_size):
         raise ValueError(
-            "GLM-5.2 PCP does not support decode context parallelism."
+            "FlashAttention PCP requires DCP to be disabled or equal to PCP."
         )
     if _require_hcu_pcp_attribute(
         parallel_config, "data_parallel_size", "ParallelConfig"
     ) != 1:
-        raise ValueError("GLM-5.2 PCP does not support data parallelism.")
-    if not _require_hcu_pcp_attribute(
+        raise ValueError("HCU PCP does not support data parallelism.")
+    if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if not _require_hcu_pcp_attribute(model_config, "enforce_eager", "ModelConfig"):
+    if use_mla and not _require_hcu_pcp_attribute(
+        model_config, "enforce_eager", "ModelConfig"
+    ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
     if _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     ) is not None:
-        raise ValueError("GLM-5.2 PCP does not support speculative decoding or MTP.")
+        raise ValueError("HCU PCP does not support speculative decoding or MTP.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
-        raise ValueError("GLM-5.2 PCP does not support LoRA.")
+        raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
         model_config, "is_multimodal_model", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP does not support multimodal models.")
+        raise ValueError("HCU PCP does not support multimodal models.")
     if _require_hcu_pcp_attribute(
         cache_config, "kv_offloading_size", "CacheConfig"
     ) is not None:
-        raise ValueError("GLM-5.2 PCP does not support KV offload.")
+        raise ValueError("HCU PCP does not support KV offload.")
 
     kv_transfer_config = _require_hcu_pcp_attribute(
         vllm_config, "kv_transfer_config", "VllmConfig"
@@ -111,13 +129,13 @@ def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
     if kv_transfer_config is not None and _require_hcu_pcp_attribute(
         kv_transfer_config, "kv_connector", "KVTransferConfig"
     ) is not None:
-        raise ValueError("GLM-5.2 PCP does not support P/D disaggregation.")
+        raise ValueError("HCU PCP does not support P/D disaggregation.")
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:
-        raise ValueError("GLM-5.2 PCP does not support lightly-CP.")
+        raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:
-        raise ValueError("GLM-5.2 PCP does not support speculative decoding or MTP.")
+        raise ValueError("HCU PCP does not support speculative decoding or MTP.")
 
 
 def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
@@ -132,7 +150,7 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     if pcp_size <= 1:
         return False
 
-    _require_mrv2_mla_eager_pcp_contract(vllm_config)
+    _require_mrv2_pcp_contract(vllm_config)
     return True
 
 
@@ -299,12 +317,16 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     validate_v2_model_runner = vars(vllm_config).get("_validate_v2_model_runner")
     get_model_arch_config = vars(model_config_class).get("get_model_arch_config")
+    verify_with_parallel_config = vars(model_config_class).get(
+        "verify_with_parallel_config"
+    )
     if (
         not callable(with_hf_config)
         or not callable(set_cudagraph_sizes)
         or not callable(get_v2_unsupported_features)
         or not callable(validate_v2_model_runner)
         or not callable(get_model_arch_config)
+        or not callable(verify_with_parallel_config)
     ):
         raise PatchCompatibilityError(
             "required HCU VllmConfig compatibility methods are missing"
@@ -314,6 +336,12 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[4]} has incompatible "
             f"signature {model_arch_signature}"
+        )
+    verify_parallel_signature = inspect.signature(verify_with_parallel_config)
+    if tuple(verify_parallel_signature.parameters) != ("self", "parallel_config"):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[6]} has incompatible "
+            f"signature {verify_parallel_signature}"
         )
     with_hf_signature = inspect.signature(with_hf_config)
     if tuple(with_hf_signature.parameters) != (
@@ -364,6 +392,26 @@ def apply_to_module(module: ModuleType) -> bool:
         model_config_class,
         "get_model_arch_config",
         hcu_get_model_arch_config,
+    )
+
+    @functools.wraps(verify_with_parallel_config)
+    def hcu_verify_with_parallel_config(self, parallel_config):
+        pcp_size = int(parallel_config.prefill_context_parallel_size)
+        dcp_size = int(parallel_config.decode_context_parallel_size)
+        if pcp_size > 1 and dcp_size == pcp_size and not self.use_mla:
+            parallel_config = copy(parallel_config)
+            parallel_config.decode_context_parallel_size = 1
+        return verify_with_parallel_config(self, parallel_config)
+
+    setattr(
+        model_config_class,
+        "_vllm_hcu_original_verify_with_parallel_config",
+        verify_with_parallel_config,
+    )
+    setattr(
+        model_config_class,
+        "verify_with_parallel_config",
+        hcu_verify_with_parallel_config,
     )
 
     @functools.wraps(with_hf_config)

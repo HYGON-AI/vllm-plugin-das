@@ -44,17 +44,23 @@ _V0251_BUILD_ATTN_METADATA_SOURCE_SHA256 = (
 
 
 class _PCPRequestPhaseMetadata:
-    """Supply request phase through v0.25.1's existing metadata hook."""
+    """Supply request phase and GQA PCP plan through the metadata hook."""
 
-    def __init__(self, is_prefilling):
+    def __init__(self, is_prefilling, pcp_plan=None):
         self.is_prefilling = is_prefilling
+        self.pcp_plan = pcp_plan
 
     def get_extra_common_attn_kwargs(self, kv_cache_group_id, num_reqs):
         del kv_cache_group_id
         return {"is_prefilling": self.is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(self, attn_metadata_builder, num_reqs):
-        del attn_metadata_builder, num_reqs
+        del num_reqs
+        if (
+            self.pcp_plan is not None
+            and getattr(attn_metadata_builder, "supports_pcp_plan", False)
+        ):
+            return {"pcp_plan": self.pcp_plan}
         return {}
 
 
@@ -254,7 +260,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 sliding_window=self.model_config.get_sliding_window(),
             )
         request_phase = _PCPRequestPhaseMetadata(
-            torch.from_numpy(input_batch.is_prefilling_np)
+            torch.from_numpy(input_batch.is_prefilling_np),
+            pcp_plan=getattr(input_batch, "_vllm_hcu_pcp_plan", None),
         )
         return build_attn_metadata(
             attn_groups=attn_groups,
