@@ -181,7 +181,6 @@ finishes.
 | Qwen3.5-35B-A3B-W8A8 | AITER W8A8 ASM | 0.7188 | 23/32 | 32768 | 885.88 s |
 | Qwen3.5-35B-A3B-W8A8 | slimquant_marlin | 0.8438 | 27/32 | 261 | 154.69 s |
 | Qwen3.5-35B-A3B-CHANNEL-FP8 | AITER FP8 W8A8 ASM | 0.8125 | 26/32 | 213 | 167.46 s |
-| Qwen3.5-35B-A3B-CHANNEL-FP8 | AITER FP8 W8A8 ASM, vLLM SiLU | 0.8750 | 28/32 | 253 | 163.76 s |
 | Qwen3.5-35B-A3B-CHANNEL-FP8 | Triton FP8 W8A8 | 0.8750 | 28/32 | 247 | 171.27 s |
 
 No Unicode replacement characters were found in the recorded 32-sample
@@ -214,32 +213,27 @@ The graph-enabled V2 runner was revalidated on GPU 5 with the server and
 EvalScope commands above. A fresh official Triton run scored 29/32 (0.9062),
 while the unmodified AITER ASM path reproduced 26/32 (0.8125). The AITER
 failures were `HumanEval/0`, `/1`, `/4`, `/18`, `/19`, and `/20`.
-The retained implementation is code commit `555269b` on
-`fix/hcu-v0251-aiter-int8-quant-alignment`.
 
 | Fresh run | Score | Correct | Wall time |
 | --- | ---: | ---: | ---: |
-| AITER ASM before alignment | 0.8125 | 26/32 | 156.23 s |
+| AITER ASM | 0.8125 | 26/32 | 156.23 s |
 | Official vLLM Triton | 0.9062 | 29/32 | 188.11 s |
-| AITER ASM with scoped vLLM SiLU | 0.8750 | 28/32 | 163.76 s |
 
 Operator diagnostics ruled out dynamic per-token FP8 quantization as the main
 source of the gap. vLLM, AITER, and BoltOps produced equivalent scales (the
 largest observed vLLM-to-AITER scale difference was approximately `1.86e-9`).
 Replacing AITER's FP8 quantizer therefore did not improve the end-to-end score
-and was not retained.
-
-The retained change uses vLLM's canonical `_C.silu_and_mul` only while an
-explicit channel-FP8 AITER ASM call is active. INT8, AITER MOE_C, and the
-official Triton MoE path remain unchanged. The aligned AITER run scored 28/32
-(0.8750), failed only `HumanEval/1`, `/4`, `/19`, and `/20`, and completed in
-163.76 seconds. Its longest output was 253 tokens; no Unicode replacement
-characters or NUL bytes were present.
+and was not retained. A scoped experiment using vLLM's `_C.silu_and_mul`
+changed the single HumanEval run to 28/32, but the isolated SiLU operator test
+showed no precision defect. That experiment therefore does not establish a
+root cause and is not part of this branch. Further work must compare the
+GEMM1, activation, second quantization, GEMM2, and expert-combine boundaries
+before changing an operator implementation.
 
 The startup log confirmed `Using AITER Fp8 MoE backend`, loaded both FP8 W8A8
 ASM stages, and completed PIECEWISE and FULL graph capture. Static regression
 verification completed with:
 
 ```text
-168 passed, 14 warnings in 64.14s
+159 passed, 14 warnings in 63.70s
 ```
