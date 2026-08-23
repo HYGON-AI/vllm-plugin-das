@@ -487,8 +487,10 @@ def test_aiter_and_triton_expert_capability_contract(
             """
             def rocm_aiter_fused_experts(
                 hidden_states, w1, w2, topk_weights, topk_ids, moe_config,
-                activation, apply_router_weight_on_input, expert_map,
-                quant_config, a1q_scale, num_local_tokens, output_dtype,
+                activation=MoEActivation.SILU,
+                apply_router_weight_on_input=False,
+                expert_map=None, quant_config=None, a1q_scale=None,
+                num_local_tokens=None, output_dtype=None,
                 moe_sorting_dispatch_policy=0,
             ):
                 del hidden_states, w1, w2, topk_weights, topk_ids, moe_config
@@ -658,6 +660,37 @@ def test_aiter_and_triton_expert_capability_contract(
     assert fp8_result == "public-aiter-quantized"
     assert quantized_calls[1]["quant_config"] is fp8_quant_config
     assert quantized_calls[1]["hidden_states"] is hidden_states
+
+    default_result = aiter_module.rocm_aiter_fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        vllm_moe_config,
+        quant_config=fp8_quant_config,
+    )
+    assert default_result == "public-aiter-quantized"
+    assert quantized_calls[2]["activation"] is MoEActivation.SILU
+    assert quantized_calls[2]["apply_router_weight_on_input"] is False
+    assert quantized_calls[2]["num_local_tokens"] is None
+    assert quantized_calls[2]["moe_sorting_dispatch_policy"] == 0
+
+    token_metadata = torch.tensor([2], dtype=torch.int32)
+    forwarded_result = aiter_module.rocm_aiter_fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        vllm_moe_config,
+        quant_config=fp8_quant_config,
+        num_local_tokens=token_metadata,
+        moe_sorting_dispatch_policy=7,
+    )
+    assert forwarded_result == "public-aiter-quantized"
+    assert quantized_calls[3]["num_local_tokens"] is token_metadata
+    assert quantized_calls[3]["moe_sorting_dispatch_policy"] == 7
     assert AiterExperts.is_supported_config(
         AiterExperts,
         SimpleNamespace(moe_backend="aiter"),

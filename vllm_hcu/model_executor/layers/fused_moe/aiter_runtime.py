@@ -57,6 +57,13 @@ _AITER_ASM_INT8_QUANT_WRAPPER_MARKER = (
     "_vllm_hcu_aiter_asm_int8_quant_wrapper"
 )
 _AITER_ASM_FP8_QUANT_WRAPPER_MARKER = "_vllm_hcu_aiter_asm_fp8_quant_wrapper"
+_AITER_ASM_FP8_QUANT_PARAMETERS = (
+    "x",
+    "scale",
+    "quant_dtype",
+    "num_rows",
+    "num_rows_factor",
+)
 
 
 def _boltops_per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -86,7 +93,22 @@ def _boltops_per_token_quant_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.T
         raise HcuAiterRuntimeError(
             "BoltOps exposes no callable per_token_quant_hip"
         )
-    return operation(x, quant_dtype=torch.float8_e4m3fn)
+    quantized, scale = operation(x, quant_dtype=torch.float8_e4m3fn)
+    zero_scale = scale == 0
+    quantized = torch.where(
+        zero_scale.expand_as(quantized),
+        torch.zeros_like(quantized),
+        quantized,
+    )
+    minimum_scale = torch.full_like(scale, 1.0e-10) * (
+        1.0 / torch.finfo(torch.float8_e4m3fn).max
+    )
+    scale = torch.where(
+        zero_scale,
+        minimum_scale,
+        scale,
+    )
+    return quantized, scale
 
 
 def _install_aiter_asm_int8_quant_wrapper() -> None:
@@ -137,10 +159,22 @@ def _install_aiter_asm_fp8_quant_wrapper() -> None:
         raise HcuAiterRuntimeError(
             "AITER ASM per_token_quant_hip has no inspectable ABI"
         ) from exc
-    if "x" not in signature.parameters or "quant_dtype" not in signature.parameters:
+    parameters = signature.parameters
+    expected_defaults = {
+        "x": inspect.Parameter.empty,
+        "scale": None,
+        "quant_dtype": torch.int8,
+        "num_rows": None,
+        "num_rows_factor": 1,
+    }
+    if tuple(parameters) != _AITER_ASM_FP8_QUANT_PARAMETERS or any(
+        parameters[name].kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+        or parameters[name].default != expected_default
+        for name, expected_default in expected_defaults.items()
+    ):
         raise HcuAiterRuntimeError(
             "AITER ASM per_token_quant_hip exposes unsupported arguments "
-            f"{tuple(signature.parameters)!r}"
+            f"{signature}"
         )
 
     original = current
@@ -1010,6 +1044,7 @@ def get_aiter_activation_type(
 
 __all__ = [
     "HcuAiterRuntimeError",
+    "aiter_asm_boltops_fp8_quant_context",
     "aiter_asm_boltops_int8_quant_context",
     "aiter_gate_mode_kwargs",
     "fused_moe_impl",

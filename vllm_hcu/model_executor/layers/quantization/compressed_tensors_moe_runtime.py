@@ -191,7 +191,9 @@ def apply_aiter_quantized_moe(
     expert_map: torch.Tensor | None,
     quant_config: object,
     a1q_scale: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    moe_sorting_dispatch_policy: int = 0,
 ) -> torch.Tensor:
     """Run v0.25 FP8/INT8 W8A8 experts through the public HCU AITER API."""
 
@@ -207,6 +209,15 @@ def apply_aiter_quantized_moe(
     if apply_router_weight_on_input:
         raise HcuCompressedTensorsMoeError(
             "AITER quantized MoE does not support apply_router_weight_on_input=True"
+        )
+    if num_local_tokens is not None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE does not support num_local_tokens"
+        )
+    if moe_sorting_dispatch_policy != 0:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE does not support "
+            "moe_sorting_dispatch_policy != 0"
         )
     if getattr(quant_config, "block_shape", None) is not None:
         raise HcuCompressedTensorsMoeError(
@@ -266,6 +277,23 @@ def apply_aiter_quantized_moe(
     )
     align_int8_quant = bool(use_int8 and is_asm_solution)
     align_fp8_quant = bool(use_fp8 and is_asm_solution)
+    aiter_expert_map = expert_map
+    if is_asm_solution and expert_map is not None:
+        global_num_experts = getattr(vllm_moe_config, "num_experts", None)
+        if (
+            expert_map.ndim != 1
+            or expert_map.dtype not in (torch.int32, torch.int64)
+            or (
+                isinstance(global_num_experts, int)
+                and global_num_experts > 0
+                and expert_map.numel() != global_num_experts
+            )
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "AITER ASM requires a rank-1 integer expert_map matching "
+                "the global expert count"
+            )
+        aiter_expert_map = (expert_map >= 0).to(torch.int32)
     with (
         aiter_asm_boltops_int8_quant_context(enabled=align_int8_quant),
         aiter_asm_boltops_fp8_quant_context(enabled=align_fp8_quant),
@@ -293,7 +321,7 @@ def apply_aiter_quantized_moe(
             global_num_experts=getattr(
                 vllm_moe_config, "num_experts", w1.shape[0]
             ),
-            expert_map=expert_map,
+            expert_map=aiter_expert_map,
             routed_scaling_factor=1.0,
             use_weight_shuffle=bool(
                 getattr(aiter_config, "need_shuffle", False)

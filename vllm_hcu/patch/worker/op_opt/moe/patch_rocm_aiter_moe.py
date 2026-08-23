@@ -208,7 +208,8 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(fused_experts)
     def hcu_fused_experts(*args, **kwargs):
-        bound = fused_experts_signature.bind_partial(*args, **kwargs)
+        bound = fused_experts_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
         arguments = bound.arguments
         activation = arguments.get("activation")
         moe_config = arguments.get("moe_config")
@@ -239,7 +240,11 @@ def apply_to_module(module: ModuleType) -> bool:
                     expert_map=arguments.get("expert_map"),
                     quant_config=quant_config,
                     a1q_scale=arguments.get("a1q_scale"),
+                    num_local_tokens=arguments["num_local_tokens"],
                     output_dtype=arguments.get("output_dtype"),
+                    moe_sorting_dispatch_policy=arguments[
+                        "moe_sorting_dispatch_policy"
+                    ],
                 )
             if activation == gelu_tanh:
                 return special_impl(*args, **kwargs)

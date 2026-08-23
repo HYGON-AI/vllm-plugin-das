@@ -51,6 +51,17 @@ def _package(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def _fp8_quant_abi_stub(
+    x,
+    scale=None,
+    quant_dtype=torch.int8,
+    num_rows=None,
+    num_rows_factor=1,
+):
+    del quant_dtype, num_rows, num_rows_factor
+    return x, scale
+
+
 def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -98,15 +109,25 @@ def test_aiter_asm_boltops_fp8_quant_context_aligns_both_fp8_quant_calls(
 ):
     calls: list[tuple[str, object, object]] = []
 
-    def native_quant(x, quant_dtype=torch.int8):
+    def native_quant(
+        x,
+        scale=None,
+        quant_dtype=torch.int8,
+        num_rows=None,
+        num_rows_factor=1,
+    ):
+        del scale, num_rows, num_rows_factor
         calls.append(("aiter", x, quant_dtype))
         return "aiter_quant"
+
+    boltops_output = torch.ones((1, 1), dtype=torch.float8_e4m3fn)
+    boltops_scale = torch.ones((1, 1), dtype=torch.float32)
 
     def boltops_quant(x, scale=None, quant_dtype=torch.int8, **kwargs):
         assert scale is None
         assert kwargs == {}
         calls.append(("boltops", x, quant_dtype))
-        return "boltops_quant"
+        return boltops_output, boltops_scale
 
     asm_module = _module(
         "aiter.fused_moe_asm_wna16",
@@ -124,12 +145,16 @@ def test_aiter_asm_boltops_fp8_quant_context_aligns_both_fp8_quant_calls(
     )
 
     with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
-        assert asm_module.per_token_quant_hip(
+        gemm1_output = asm_module.per_token_quant_hip(
             "gemm1_input", quant_dtype=torch.float8_e4m3fn
-        ) == "boltops_quant"
-        assert asm_module.per_token_quant_hip(
+        )
+        gemm2_output = asm_module.per_token_quant_hip(
             "gemm2_input", quant_dtype=torch.float8_e4m3fn
-        ) == "boltops_quant"
+        )
+        torch.testing.assert_close(gemm1_output[0], boltops_output)
+        torch.testing.assert_close(gemm1_output[1], boltops_scale)
+        torch.testing.assert_close(gemm2_output[0], boltops_output)
+        torch.testing.assert_close(gemm2_output[1], boltops_scale)
         assert asm_module.per_token_quant_hip(
             "int8_input", quant_dtype=torch.int8
         ) == "aiter_quant"
@@ -142,6 +167,33 @@ def test_aiter_asm_boltops_fp8_quant_context_aligns_both_fp8_quant_calls(
         ("aiter", "int8_input", torch.int8),
         ("aiter", "outside", torch.float8_e4m3fn),
     ]
+
+
+def test_aiter_asm_boltops_fp8_quant_repairs_zero_scale_rows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    quantized = torch.full((2, 4), float("nan"), dtype=torch.float8_e4m3fn)
+    scales = torch.zeros((2, 1), dtype=torch.float32)
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=lambda x, **kwargs: (quantized, scales),
+        ),
+    )
+
+    output, output_scales = aiter_runtime._boltops_per_token_quant_fp8(
+        torch.zeros((2, 4), dtype=torch.bfloat16)
+    )
+
+    torch.testing.assert_close(output.float(), torch.zeros((2, 4)))
+    assert torch.isfinite(output.float()).all()
+    torch.testing.assert_close(
+        output_scales,
+        torch.full_like(scales, 1.0e-10)
+        * (1.0 / torch.finfo(torch.float8_e4m3fn).max),
+    )
 
 
 def test_aiter_asm_boltops_fp8_quant_context_preserves_native_activation(
@@ -161,7 +213,7 @@ def test_aiter_asm_boltops_fp8_quant_context_preserves_native_activation(
     asm_module = _module(
         "aiter.fused_moe_asm_wna16",
         _apply_activation=native_activation,
-        per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
+        per_token_quant_hip=_fp8_quant_abi_stub,
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
     monkeypatch.setitem(
@@ -187,10 +239,24 @@ def test_aiter_asm_boltops_fp8_quant_context_nested_disable_restores_state(
 ):
     calls: list[str] = []
 
-    def native_quant(x, quant_dtype=torch.int8):
-        del x, quant_dtype
+    def native_quant(
+        x,
+        scale=None,
+        quant_dtype=torch.int8,
+        num_rows=None,
+        num_rows_factor=1,
+    ):
+        del x, scale, quant_dtype, num_rows, num_rows_factor
         calls.append("aiter")
         return "aiter"
+
+    boltops_output = torch.ones((1, 1), dtype=torch.float8_e4m3fn)
+    boltops_scale = torch.ones((1, 1), dtype=torch.float32)
+
+    def boltops_quant(x, **kwargs):
+        del x, kwargs
+        calls.append("boltops")
+        return boltops_output, boltops_scale
 
     asm_module = _module(
         "aiter.fused_moe_asm_wna16",
@@ -202,17 +268,17 @@ def test_aiter_asm_boltops_fp8_quant_context_nested_disable_restores_state(
         "boltops.fused_moe.triton.moe_compat",
         _module(
             "boltops.fused_moe.triton.moe_compat",
-            per_token_quant_hip=lambda x, **kwargs: (
-                calls.append("boltops"),
-                "boltops",
-            )[1],
+            per_token_quant_hip=boltops_quant,
         ),
     )
 
     with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
-        assert asm_module.per_token_quant_hip(
-            "outer", quant_dtype=torch.float8_e4m3fn
-        ) == "boltops"
+        torch.testing.assert_close(
+            asm_module.per_token_quant_hip(
+                "outer", quant_dtype=torch.float8_e4m3fn
+            )[0],
+            boltops_output,
+        )
         with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=False):
             assert asm_module.per_token_quant_hip(
                 "disabled", quant_dtype=torch.float8_e4m3fn
@@ -220,9 +286,12 @@ def test_aiter_asm_boltops_fp8_quant_context_nested_disable_restores_state(
         with pytest.raises(RuntimeError, match="cleanup"):
             with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
                 raise RuntimeError("cleanup")
-        assert asm_module.per_token_quant_hip(
-            "outer-again", quant_dtype=torch.float8_e4m3fn
-        ) == "boltops"
+        torch.testing.assert_close(
+            asm_module.per_token_quant_hip(
+                "outer-again", quant_dtype=torch.float8_e4m3fn
+            )[0],
+            boltops_output,
+        )
 
     assert asm_module.per_token_quant_hip(
         "outside", quant_dtype=torch.float8_e4m3fn
@@ -290,6 +359,49 @@ def test_aiter_asm_boltops_fp8_quant_context_rejects_incompatible_quant_abi(
     with pytest.raises(
         aiter_runtime.HcuAiterRuntimeError,
         match="per_token_quant_hip exposes unsupported arguments",
+    ):
+        with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
+            pass
+    assert asm_module.per_token_quant_hip is incompatible_quant
+
+
+@pytest.mark.parametrize("abi_change", ["extra_parameter", "changed_default"])
+def test_aiter_asm_boltops_fp8_quant_context_rejects_subtle_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    abi_change: str,
+):
+    if abi_change == "extra_parameter":
+
+        def incompatible_quant(
+            x,
+            scale=None,
+            quant_dtype=torch.int8,
+            num_rows=None,
+            num_rows_factor=1,
+            stochastic=False,
+        ):
+            del x, scale, quant_dtype, num_rows, num_rows_factor, stochastic
+
+    else:
+
+        def incompatible_quant(
+            x,
+            scale=None,
+            quant_dtype=torch.int8,
+            num_rows=None,
+            num_rows_factor=2,
+        ):
+            del x, scale, quant_dtype, num_rows, num_rows_factor
+
+    asm_module = _module(
+        "aiter.fused_moe_asm_wna16",
+        per_token_quant_hip=incompatible_quant,
+    )
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="per_token_quant_hip exposes unsupported",
     ):
         with aiter_runtime.aiter_asm_boltops_fp8_quant_context(enabled=True):
             pass
@@ -2576,13 +2688,163 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
     assert call["w1"] is w1 and call["w2"] is w2
     assert call["w1_scale"] is w1_scale and call["w2_scale"] is w2_scale
     assert call["a1_scale"] is a1q_scale
-    assert call["expert_map"] is expert_map
+    torch.testing.assert_close(
+        call["expert_map"], torch.ones_like(expert_map, dtype=torch.int32)
+    )
     assert call["global_num_experts"] == 3
     assert call["inplace"] is False
     assert call["use_weight_shuffle"] is False
     assert call["output_dtype"] is torch.bfloat16
     assert call["topk_weights"].dtype is torch.float32
     assert call["topk_ids"].dtype is torch.int32
+
+
+@pytest.mark.parametrize(
+    ("use_fp8", "use_int8"),
+    [(True, False), (False, True)],
+)
+@pytest.mark.parametrize(
+    ("solution_type", "expected_map"),
+    [
+        ("ASM", [0, 1, 1, 0]),
+        ("MOE_C", [-1, 0, 1, -1]),
+    ],
+)
+def test_quantized_aiter_runtime_converts_only_asm_ep_map_to_binary_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    use_fp8: bool,
+    use_int8: bool,
+    solution_type: str,
+    expected_map: list[int],
+):
+    calls: list[dict[str, object]] = []
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def get_config(**kwargs):
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type=solution_type,
+            need_shuffle=False,
+        )
+
+    def aiter_moe(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros((2, 4))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+
+    def native_fp8_quant(
+        x,
+        scale=None,
+        quant_dtype=torch.int8,
+        num_rows=None,
+        num_rows_factor=1,
+    ):
+        del scale, quant_dtype, num_rows, num_rows_factor
+        return x, torch.ones((*x.shape[:-1], 1), dtype=torch.float32)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            per_token_quant_int8=lambda x: (x, torch.ones((x.shape[0], 1))),
+            per_token_quant_hip=native_fp8_quant,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.moe_compat",
+        _module(
+            "boltops.fused_moe.triton.moe_compat",
+            per_token_quant_hip=native_fp8_quant,
+        ),
+    )
+
+    expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int64)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=use_fp8,
+        use_int8_w8a8=use_int8,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+    compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+        w1=torch.zeros((2, 8, 4), dtype=torch.int8),
+        w2=torch.zeros((2, 4, 4), dtype=torch.int8),
+        topk_weights=torch.ones((2, 2)),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+        vllm_moe_config=SimpleNamespace(num_experts=4),
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=expert_map,
+        quant_config=quant_config,
+    )
+
+    passed_map = calls[0]["expert_map"]
+    assert isinstance(passed_map, torch.Tensor)
+    expected_dtype = torch.int32 if solution_type == "ASM" else torch.int64
+    assert passed_map.dtype is expected_dtype
+    torch.testing.assert_close(
+        passed_map.cpu(),
+        torch.tensor(expected_map, dtype=passed_map.dtype),
+    )
+    if solution_type == "MOE_C":
+        assert passed_map is expert_map
+
+
+@pytest.mark.parametrize(
+    ("runtime_kwargs", "message"),
+    [
+        ({"num_local_tokens": torch.tensor([2], dtype=torch.int32)}, "num_local_tokens"),
+        ({"moe_sorting_dispatch_policy": 7}, "moe_sorting_dispatch_policy"),
+    ],
+)
+def test_quantized_aiter_runtime_rejects_unsupported_parallel_metadata(
+    runtime_kwargs: dict[str, object],
+    message: str,
+):
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        block_shape=None,
+    )
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match=message,
+    ):
+        compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+            w1=torch.zeros((2, 8, 4), dtype=torch.int8),
+            w2=torch.zeros((2, 4, 4), dtype=torch.int8),
+            topk_weights=torch.ones((2, 2)),
+            topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+            vllm_moe_config=SimpleNamespace(num_experts=2),
+            activation=SimpleNamespace(value="silu"),
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            quant_config=quant_config,
+            **runtime_kwargs,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2633,7 +2895,7 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
         "aiter.fused_moe_asm_wna16",
         per_token_quant_int8=native_quant,
         _apply_activation=native_activation,
-        per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
+        per_token_quant_hip=_fp8_quant_abi_stub,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -2733,8 +2995,14 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_both_fp8_asm_stages(
         calls.append("aiter_activation")
         activated_out.fill_(1)
 
-    def native_fp8_quant(x, quant_dtype=None):
-        del quant_dtype
+    def native_fp8_quant(
+        x,
+        scale=None,
+        quant_dtype=torch.int8,
+        num_rows=None,
+        num_rows_factor=1,
+    ):
+        del scale, quant_dtype, num_rows, num_rows_factor
         calls.append("aiter_fp8_quant")
         return x, torch.ones((x.shape[0], 1))
 
