@@ -279,3 +279,70 @@ verification completed with:
 ```text
 174 passed, 14 warnings in 63.40s
 ```
+
+### Native-SiLU retained-policy validation on latest v0.25.1
+
+The retained policy was also applied without conflicts on top of plugin
+`v0.25.1@47d3fb884fdb9e4f03d1ddc993af5d31f18cc865` and tested against vLLM
+`7b108ad1a51b217e9abec0ddc047978405481bae`. The service used Model Runner V2,
+FULL and PIECEWISE graph capture, NHD KV-cache layout, parameterized
+`FLASH_ATTN_VARLEN`, and parameterized AITER MoE. No legacy AITER or unified-FA
+environment gate was set.
+
+```bash
+export HIP_VISIBLE_DEVICES=5
+export PYTHONPATH=/models/zb/vllm_025_hcu/vllm-plugin-das
+export VLLM_CACHE_ROOT=/tmp/vllm-cache-pr19-native-silu-varlen-aiter
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KV_CACHE_LAYOUT=NHD
+unset VLLM_HCU_USE_FLASH_ATTN_UNIFIED
+unset VLLM_HCU_USE_FLASH_ATTN_VARLEN
+unset VLLM_ROCM_USE_AITER
+unset VLLM_ROCM_USE_AITER_MOE
+
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /models/Qwen3.5-35B-A3B-CHANNEL-FP8 \
+  --served-model-name qwen35-fp8-varlen-aiter-native-silu \
+  --port 8016 \
+  --trust-remote-code \
+  --max-model-len 65536 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 8 \
+  --attention-backend FLASH_ATTN_VARLEN \
+  --moe-backend aiter
+```
+
+```bash
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u http_proxy -u https_proxy \
+  PYTHONPATH=/tmp/evalscope-target-v025 \
+  python3 -m evalscope.cli.cli eval \
+    --model qwen35-fp8-varlen-aiter-native-silu \
+    --model-id qwen35-fp8-varlen-aiter-native-silu \
+    --api-url http://127.0.0.1:8016/v1 \
+    --api-key EMPTY \
+    --eval-type openai_api \
+    --datasets humaneval \
+    --dataset-hub modelscope \
+    --limit 32 \
+    --eval-batch-size 1 \
+    --generation-config '{"temperature":0,"max_tokens":32768,"timeout":1800,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+    --seed 0 \
+    --no-collect-perf \
+    --work-dir /tmp/evalscope-pr19-native-silu-varlen-aiter-32 \
+    --no-timestamp
+```
+
+The run scored 32/32 (`mean_acc=1.0`, `pass@1=1.0`) with no request errors,
+Unicode replacement characters, or NUL bytes. Mean recorded request latency
+was 1.736 s (minimum 0.372 s, maximum 3.368 s), and the 32 responses contained
+3,595 output tokens. The output-content SHA-256 was
+`636736abda369ce7a41f9ddbb74aa199b066591a4f97134f4d166dd48f1bd495`.
+The startup log confirmed the `FLASH_ATTN_VARLEN` argument, selected the AITER
+FP8 MoE backend, loaded both AITER FP8 W8A8 ASM stages, and completed graph
+capture. The scoped regression suite passed with:
+
+```text
+138 passed, 18 warnings in 36.38s
+```
