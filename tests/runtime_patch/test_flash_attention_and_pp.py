@@ -31,16 +31,133 @@ def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
         flash_attn_extension.__name__,
         loader=None,
     )
+    def layout_entrypoint(
+        q=None,
+        k=None,
+        v=None,
+        *,
+        layout="bshd",
+        **kwargs,
+    ):
+        del q, k, v, layout, kwargs
+
+    for symbol in (
+        "flash_attn_varlen_func",
+        "hg_flash_attn_varlen_func",
+        "varlen_fwd_unified",
+    ):
+        setattr(flash_attn_extension, symbol, layout_entrypoint)
+    flash_attn_extension.vllm_flash_attn_varlen_func = (
+        lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
+
+    return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
+
+
+def _load_hcu_fa_utils_module(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    kv_cache_layout: str,
+    missing_layout_on: str | None = None,
+):
+    """Load the real HCU FA boundary against observable kernel doubles."""
+
+    from vllm.v1.attention.backends import utils as attention_utils
+
+    monkeypatch.setattr(
+        attention_utils,
+        "get_kv_cache_layout",
+        lambda: kv_cache_layout,
+    )
+
+    hcu_ops = ModuleType("vllm_hcu.hcu_ops")
+    hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
+    monkeypatch.setitem(sys.modules, hcu_ops.__name__, hcu_ops)
+
+    calls: dict[str, list[dict[str, object]]] = {}
+    flash_attn_extension = ModuleType("flash_attn")
+    flash_attn_extension.__spec__ = ModuleSpec(
+        flash_attn_extension.__name__,
+        loader=None,
+    )
+
+    def make_entrypoint(name: str):
+        calls[name] = []
+        if name == missing_layout_on:
+
+            def entrypoint(q=None, k=None, v=None, **kwargs):
+                calls[name].append(dict(kwargs))
+
+        else:
+
+            def entrypoint(
+                q=None,
+                k=None,
+                v=None,
+                *,
+                layout="unrouted",
+                **kwargs,
+            ):
+                calls[name].append({"layout": layout, **kwargs})
+
+        return entrypoint
+
     for symbol in (
         "flash_attn_varlen_func",
         "vllm_flash_attn_varlen_func",
         "hg_flash_attn_varlen_func",
         "varlen_fwd_unified",
     ):
-        setattr(flash_attn_extension, symbol, lambda *args, **kwargs: None)
+        setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
     monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        raising=False,
+    )
 
-    return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
+    module = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
+    return module, calls
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_layout", "expected_fa_layout"),
+    [("HND", "bhsd"), ("NHD", "bshd")],
+)
+@pytest.mark.parametrize(
+    "entrypoint_name",
+    [
+        "flash_attn_varlen_func",
+        "hg_flash_attn_varlen_func",
+        "varlen_fwd_unified",
+    ],
+)
+def test_hcu_fa_entrypoints_map_kv_cache_layout_to_kernel_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_layout: str,
+    expected_fa_layout: str,
+    entrypoint_name: str,
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout=kv_cache_layout,
+    )
+
+    getattr(fa_utils, entrypoint_name)(q="q", k="k", v="v")
+
+    assert calls[entrypoint_name] == [{"layout": expected_fa_layout}]
+
+
+def test_hcu_fa_boundary_rejects_interface_without_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="hg_flash_attn_varlen_func.*layout"):
+        _load_hcu_fa_utils_module(
+            monkeypatch,
+            kv_cache_layout="HND",
+            missing_layout_on="hg_flash_attn_varlen_func",
+        )
 
 
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
@@ -68,6 +185,7 @@ def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.Monkey
         (None, "cutlass"),
         ("VLLM_HCU_USE_FLASH_ATTN", "classic"),
         ("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "cutlass"),
+        ("VLLM_HCU_USE_FLASH_ATTN_VARLEN", "varlen"),
     ],
 )
 def test_flash_attention_mode_legacy_priority_and_default(
@@ -76,6 +194,7 @@ def test_flash_attention_mode_legacy_priority_and_default(
     for variable in (
         "VLLM_HCU_USE_FLASH_ATTN",
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
         "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
     ):
         monkeypatch.delenv(variable, raising=False)
@@ -127,6 +246,7 @@ def test_platform_flash_attention_mode_rejects_invalid_sidecar(
     [
         ("cutlass", (3, 2, 64, 4, 128), 0),
         ("classic", (3, 2, 64, 4, 128), 0),
+        ("varlen", (3, 2, 64, 4, 128), 0),
     ],
 )
 def test_flash_attention_kv_cache_contract_follows_resolved_mode(
@@ -454,6 +574,310 @@ def test_hcu_flash_attention_forward_uses_metadata_window_with_fallback(
     )
 
     assert calls[0]["window_size"] == expected_window
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_layout", "expected_fa_layout"),
+    [("HND", "bhsd"), ("NHD", "bshd")],
+)
+def test_hcu_flash_attention_varlen_mode_routes_layout_to_native_interface(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_layout: str,
+    expected_fa_layout: str,
+) -> None:
+    _, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout=kv_cache_layout,
+    )
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.flash_attn",
+        raising=False,
+    )
+    flash_attn = importlib.import_module(
+        "vllm_hcu.v1.attention.backends.flash_attn"
+    )
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    impl.num_kv_heads = 1
+    impl.supports_quant_query_input = False
+    impl.dcp_world_size = 1
+    impl.scale = 1.0
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = 0.0
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "canonicalize_singleton_dim_strides",
+        lambda tensor: tensor,
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        use_cascade=False,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        scheduler_metadata=None,
+        causal=True,
+        sliding_window=None,
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(1.0),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+    query = torch.zeros(1, 1, 2)
+
+    impl.forward(
+        layer,
+        query,
+        query,
+        query,
+        torch.zeros(1, 2, 1, 1, 2),
+        metadata,
+        torch.empty_like(query),
+    )
+
+    assert len(calls["flash_attn_varlen_func"]) == 1
+    assert calls["flash_attn_varlen_func"][0]["layout"] == expected_fa_layout
+    assert calls["hg_flash_attn_varlen_func"] == []
+    assert calls["varlen_fwd_unified"] == []
+
+
+@pytest.mark.parametrize(
+    "kernel_result",
+    [("out", "lse"), ("out", "lse", "attention-probabilities")],
+)
+def test_hcu_native_varlen_lse_adapter_accepts_two_or_three_results(
+    monkeypatch: pytest.MonkeyPatch,
+    kernel_result: tuple[str, ...],
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: lambda **kwargs: kernel_result,
+    )
+
+    assert flash_attn._call_select_flash_attn_with_lse(q="query") == (
+        "out",
+        "lse",
+    )
+
+
+def test_hcu_native_varlen_lse_adapter_requests_nonpaged_lse_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    calls: list[dict[str, object]] = []
+
+    def native(**kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("return_attn_probs"):
+            return "out-only"
+        return "out", "lse", "attention-probabilities"
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: native,
+    )
+
+    assert flash_attn._call_select_flash_attn_with_lse(
+        q="query",
+        block_table=None,
+        return_softmax_lse=True,
+    ) == ("out", "lse")
+    assert calls == [
+        {
+            "q": "query",
+            "block_table": None,
+            "return_softmax_lse": True,
+            "return_attn_probs": True,
+        }
+    ]
+
+
+def test_hcu_native_varlen_lse_adapter_bypasses_paged_decode_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    calls: list[dict[str, object]] = []
+
+    def native(**kwargs):
+        calls.append(kwargs)
+        if kwargs["window_size"] == [-1, -1]:
+            return "out-only"
+        return "out", "lse"
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: native,
+    )
+
+    assert flash_attn._call_select_flash_attn_with_lse(
+        q="query",
+        block_table="paged-cache",
+        max_seqlen_k=128,
+        window_size=[-1, -1],
+        return_softmax_lse=True,
+    ) == ("out", "lse")
+    assert calls[0]["window_size"] == [128, -1]
+
+
+def test_hcu_varlen_cascade_consumes_two_value_lse_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    native_calls: list[dict[str, object]] = []
+    merge_calls: list[tuple[object, ...]] = []
+
+    def native(**kwargs):
+        native_calls.append(kwargs)
+        query = kwargs["q"]
+        return torch.zeros_like(query), torch.zeros(
+            query.shape[-2], query.shape[0]
+        )
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: native,
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "merge_attn_states",
+        lambda *args: merge_calls.append(args),
+    )
+    query = torch.zeros(2, 1, 64)
+    output = torch.empty_like(query)
+    cache = torch.zeros(4, 64, 1, 64)
+
+    flash_attn.cascade_attention(
+        output,
+        query,
+        cache,
+        cache,
+        cu_query_lens=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        cu_prefix_query_lens=torch.tensor([0, 2], dtype=torch.int32),
+        prefix_kv_lens=torch.tensor([128], dtype=torch.int32),
+        suffix_kv_lens=torch.tensor([64, 64], dtype=torch.int32),
+        max_kv_len=192,
+        softmax_scale=1.0,
+        alibi_slopes=None,
+        sliding_window=(-1, -1),
+        logits_soft_cap=0.0,
+        block_table=torch.tensor([[0, 1, 2], [0, 1, 3]], dtype=torch.int32),
+        common_prefix_len=128,
+        max_num_splits=0,
+        fa_version=3,
+    )
+
+    assert len(native_calls) == 2
+    assert [call["window_size"] for call in native_calls] == [
+        [128, -1],
+        [64, -1],
+    ]
+    assert len(merge_calls) == 1
+
+
+def test_hcu_varlen_dcp_requests_lse_from_paged_and_nonpaged_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    native_calls: list[dict[str, object]] = []
+    merge_calls: list[tuple[object, ...]] = []
+
+    def native(**kwargs):
+        native_calls.append(kwargs)
+        if kwargs.get("block_table") is None:
+            assert kwargs["return_attn_probs"] is True
+        else:
+            assert kwargs["window_size"] == [8, -1]
+        query = kwargs["q"]
+        return torch.zeros_like(query), torch.zeros(
+            query.shape[-2], query.shape[0]
+        )
+
+    class _DcpGroup:
+        @staticmethod
+        def all_gather(tensor, dim):
+            assert dim == 1
+            return tensor
+
+    class _Workspace:
+        @staticmethod
+        def get_simultaneous(spec):
+            shape, dtype = spec
+            return (torch.empty(shape, dtype=dtype),)
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: native,
+    )
+    monkeypatch.setattr(flash_attn, "get_dcp_group", lambda: _DcpGroup())
+    monkeypatch.setattr(
+        flash_attn,
+        "current_workspace_manager",
+        lambda: _Workspace(),
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "merge_attn_states",
+        lambda *args: merge_calls.append(args),
+    )
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.num_heads = 1
+    impl.dcp_world_size = 1
+    impl.head_size = 64
+    impl._dcp_dtype = torch.float32
+    impl.scale = 1.0
+    impl.alibi_slopes = None
+    impl.sliding_window = (-1, -1)
+    impl.logits_soft_cap = 0.0
+    impl.dcp_combine = lambda out, lse, group, return_lse: (out, lse)
+    query = torch.zeros(1, 1, 64)
+    cache = torch.zeros(2, 64, 1, 64)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        sliding_window=None,
+        causal=True,
+        dcp_context_kv_lens=torch.tensor([8], dtype=torch.int32),
+        max_dcp_context_kv_len=8,
+        scheduler_metadata=None,
+    )
+
+    impl._forward_with_dcp(
+        query,
+        query,
+        query,
+        cache,
+        cache,
+        torch.empty_like(query),
+        metadata,
+    )
+
+    assert len(native_calls) == 2
+    assert native_calls[0]["block_table"] is metadata.block_table
+    assert native_calls[1].get("block_table") is None
+    assert len(merge_calls) == 1
 
 
 def test_block_first_kv_update_passes_axis_one_views_to_aiter(

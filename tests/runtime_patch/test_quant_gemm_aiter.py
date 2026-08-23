@@ -1494,6 +1494,89 @@ def test_aiter_w16a16_asm_selection(monkeypatch: pytest.MonkeyPatch):
         )
 
 
+@pytest.mark.parametrize("use_shuffle", [False, True])
+def test_aiter_w16a16_weight_preparation_bypasses_rocm_padding(
+    monkeypatch: pytest.MonkeyPatch,
+    use_shuffle: bool,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as hcu_unquantized,
+    )
+
+    w13 = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    layer = SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_bias=None,
+        w2_bias=None,
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        layer_name="model.layers.0.mlp.experts",
+    )
+    method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace()
+    method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = lambda unused_layer: object()
+
+    def emulate_rocm_padding(weight: torch.Tensor) -> torch.Tensor:
+        padded = torch.nn.functional.pad(weight, (0, 1))[..., :-1]
+        assert not padded.is_contiguous()
+        return padded
+
+    method._maybe_pad_weight = emulate_rocm_padding
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "_is_hcu_aiter_moe_asm_requested",
+        lambda method=None: True,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "_raise_if_aiter_moe_asm_blocked",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized.henvs,
+        "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE",
+        use_shuffle,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "make_unquantized_moe_kernel",
+        lambda **kwargs: object(),
+    )
+
+    shuffle_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(w1, w2, unused_config):
+        shuffle_inputs.append((w1, w2))
+        return w1.contiguous(), w2.contiguous()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            AiterMoeConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+            MoeQuantType=SimpleNamespace(W16A16="w16a16"),
+            MoeSolutionType=SimpleNamespace(ASM="asm"),
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    if use_shuffle:
+        assert len(shuffle_inputs) == 1
+        assert all(weight.is_contiguous() for weight in shuffle_inputs[0])
+    else:
+        assert layer.w13_weight is w13
+        assert layer.w2_weight is w2
+        assert layer.w13_weight.is_contiguous()
+        assert layer.w2_weight.is_contiguous()
+
+
 def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1561,6 +1644,79 @@ def test_explicit_aiter_backend_enables_mask_construction_from_current_config(
     assert aiter_runtime.is_aiter_moe_requested()
 
 
+def test_configured_w16a16_prefers_direct_asm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    _install_fake_vllm_envs(
+        monkeypatch,
+        VLLM_ROCM_USE_AITER=True,
+        VLLM_ROCM_USE_AITER_MOE=True,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", True)
+    monkeypatch.setattr(
+        aiter_runtime,
+        "get_w16a16_moe_config",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        aiter_runtime,
+        "get_w16a16_moe_solution_id",
+        lambda *args, **kwargs: "4+9",
+    )
+
+    def unified_aiter(**kwargs):
+        pytest.fail("configured W16A16 must not call aiter.moe.aiter_moe")
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def direct_asm(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "direct-asm"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe=unified_aiter),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            fused_experts_asm_impl=direct_asm,
+        ),
+    )
+
+    hidden_states = torch.ones(2, 6, dtype=torch.bfloat16)
+    w1 = torch.ones(3, 8, 6, dtype=torch.bfloat16)
+    w2 = torch.ones(3, 6, 4, dtype=torch.bfloat16)
+    topk_weight = torch.ones(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int64)
+
+    assert (
+        aiter_runtime.fused_moe_impl(
+            lambda *unused: pytest.fail("AITER ASM must not delegate"),
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+        )
+        == "direct-asm"
+    )
+    assert calls[0][1] == {
+        "activation": "silu",
+        "global_num_experts": 3,
+        "expert_map": None,
+        "use_shuffle": 1,
+        "solution_id": "4+9",
+    }
+
+
 def test_aiter_w16a16_solution_lookup_uses_w2_output_dim(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1576,21 +1732,25 @@ def test_aiter_w16a16_solution_lookup_uses_w2_output_dim(
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", True)
     captured: dict[str, object] = {}
     calls: list[dict[str, object]] = []
-    moe_config = object()
 
-    def get_config(**kwargs):
+    def get_solution(**kwargs):
         captured.update(kwargs)
-        return moe_config
+        return "4+9"
 
-    def aiter_moe(**kwargs):
+    def direct_asm(*args, **kwargs):
         calls.append(kwargs)
-        return "unified-aiter"
+        return "direct-aiter"
 
-    monkeypatch.setattr(aiter_runtime, "get_w16a16_moe_config", get_config)
+    monkeypatch.setattr(
+        aiter_runtime, "get_w16a16_moe_solution_id", get_solution
+    )
     monkeypatch.setitem(
         sys.modules,
-        "aiter.moe",
-        _module("aiter.moe", aiter_moe=aiter_moe),
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            fused_experts_asm_impl=direct_asm,
+        ),
     )
     x = torch.ones(2, 6, dtype=torch.bfloat16)
     w1 = torch.ones(3, 8, 6, dtype=torch.bfloat16)
@@ -1607,15 +1767,15 @@ def test_aiter_w16a16_solution_lookup_uses_w2_output_dim(
             topk_weight,
             topk_ids,
         )
-        == "unified-aiter"
+        == "direct-aiter"
     )
 
     assert captured["N1"] == 8
     assert captured["E"] == 3
     assert captured["N2"] == 6
     assert captured["K"] == 6
-    assert calls[0]["moe_config"] is moe_config
-    assert calls[0]["use_weight_shuffle"] is True
+    assert calls[0]["solution_id"] == "4+9"
+    assert calls[0]["use_shuffle"] == 1
 
     with pytest.raises(ValueError, match="unexpected MoE weight layout"):
         aiter_runtime.fused_moe_impl(
@@ -1643,21 +1803,25 @@ def test_aiter_w16a16_solution_lookup_uses_global_expert_count_for_ep(
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", True)
     captured: dict[str, object] = {}
     calls: list[dict[str, object]] = []
-    moe_config = object()
 
-    def get_config(**kwargs):
+    def get_solution(**kwargs):
         captured.update(kwargs)
-        return moe_config
+        return "4+9"
 
-    def aiter_moe(**kwargs):
+    def direct_asm(*args, **kwargs):
         calls.append(kwargs)
-        return "unified-aiter"
+        return "direct-aiter"
 
-    monkeypatch.setattr(aiter_runtime, "get_w16a16_moe_config", get_config)
+    monkeypatch.setattr(
+        aiter_runtime, "get_w16a16_moe_solution_id", get_solution
+    )
     monkeypatch.setitem(
         sys.modules,
-        "aiter.moe",
-        _module("aiter.moe", aiter_moe=aiter_moe),
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            fused_experts_asm_impl=direct_asm,
+        ),
     )
     x = torch.ones(2, 6, dtype=torch.bfloat16)
     w1 = torch.ones(2, 8, 6, dtype=torch.bfloat16)
@@ -1679,12 +1843,13 @@ def test_aiter_w16a16_solution_lookup_uses_global_expert_count_for_ep(
                 topk_ids,
                 expert_mask=expert_mask,
             )
-            == "unified-aiter"
+            == "direct-aiter"
         )
 
     assert captured["E"] == 4
     assert calls[0]["global_num_experts"] == 4
     assert calls[0]["expert_map"] is expert_mask
+    assert calls[0]["solution_id"] == "4+9"
 
 
 def test_aiter_w16a16_asm_requires_mask_sentinel_and_rejects_expert_map(

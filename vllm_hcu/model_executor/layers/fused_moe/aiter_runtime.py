@@ -915,8 +915,16 @@ def fused_moe_impl(
             f"w2.shape={tuple(w2.shape)}"
         )
 
+    direct_kwargs: dict[str, object] = {
+        "activation": activation,
+        "global_num_experts": global_num_experts,
+        "expert_map": expert_mask,
+        "use_shuffle": use_shuffle,
+    }
+    if swiglu_limit:
+        direct_kwargs["gemm1_limit"] = swiglu_limit
     if bool(henvs.VLLM_HCU_USE_AITER_MOE_CONFIG):
-        moe_config = get_w16a16_moe_config(
+        direct_kwargs["solution_id"] = get_w16a16_moe_solution_id(
             M=int(hidden_states.shape[0]),
             E=global_num_experts,
             N1=int(w1.shape[1]),
@@ -927,28 +935,6 @@ def fused_moe_impl(
             activation=activation,
             use_shuffle=use_shuffle,
         )
-        try:
-            from aiter.moe import aiter_moe
-        except Exception as exc:
-            raise HcuAiterRuntimeError(
-                "HCU AITER W16A16 MoE config was selected, but "
-                "aiter.moe.aiter_moe is unavailable"
-            ) from exc
-        return aiter_moe(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weight,
-            topk_ids=topk_ids,
-            moe_config=moe_config,
-            inplace=False,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_mask,
-            use_weight_shuffle=bool(use_shuffle),
-            output_dtype=output_dtype or hidden_states.dtype,
-            gemm1_limit=swiglu_limit or None,
-        )
 
     try:
         from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
@@ -957,14 +943,6 @@ def fused_moe_impl(
             "HCU AITER direct W16A16 ASM path was selected, but "
             "aiter.fused_moe_asm_wna16.fused_experts_asm_impl is unavailable"
         ) from exc
-    direct_kwargs: dict[str, object] = {
-        "activation": activation,
-        "global_num_experts": global_num_experts,
-        "expert_map": expert_mask,
-        "use_shuffle": use_shuffle,
-    }
-    if swiglu_limit:
-        direct_kwargs["gemm1_limit"] = swiglu_limit
     return fused_experts_asm_impl(
         hidden_states,
         w1,

@@ -1152,8 +1152,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         def _replace_quant_method(self, method):
             self.replaced = method
 
-    module = _module(
-        patch_layer.TARGET_MODULE,
+    layer_module = _module(
+        "vllm.model_executor.layers.fused_moe.layer",
         UnquantizedFusedMoEMethod=UnquantizedFusedMoEMethod,
         RoutedExperts=RoutedExperts,
         Runner=Runner,
@@ -1163,7 +1163,23 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         + ", ".join(f"{name}=None" for name in factory_names)
         + "):\n    return Runner()\n"
     )
-    exec(source, module.__dict__)
+    exec(source, layer_module.__dict__)
+    fused_moe_package = _module(
+        "vllm.model_executor.layers.fused_moe",
+        FusedMoE=layer_module.FusedMoE,
+        UnquantizedFusedMoEMethod=UnquantizedFusedMoEMethod,
+        RoutedExperts=RoutedExperts,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe",
+        fused_moe_package,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.layer",
+        layer_module,
+    )
 
     class HcuUnquantizedFusedMoEMethod:
         def __init__(self, moe_config):
@@ -1180,8 +1196,9 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     )
     monkeypatch.setitem(sys.modules, hcu_module_name, hcu_module)
 
-    assert patch_layer.apply_to_module(module) is True
-    runner = module.FusedMoE()
+    assert patch_layer.apply_to_module(fused_moe_package) is True
+    assert fused_moe_package.FusedMoE is layer_module.FusedMoE
+    runner = fused_moe_package.FusedMoE()
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"

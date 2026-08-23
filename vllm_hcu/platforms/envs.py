@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = True
+    VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = False
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
@@ -88,6 +89,7 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
             "unified": "cutlass",
             "classic": "classic",
             "cutlass": "cutlass",
+            "varlen": "varlen",
             "custom": "custom",
         }
         if normalized not in aliases:
@@ -100,6 +102,10 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
         "VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False"
     ).lower() in ("true", "1"):
         return "custom"
+    if os.environ.get(
+        "VLLM_HCU_USE_FLASH_ATTN_VARLEN", "False"
+    ).lower() in ("true", "1"):
+        return "varlen"
     # Only an explicitly enabled legacy switch participates in priority
     # resolution. The flagless CUTLASS default is applied below, so an
     # explicitly requested classic mode can still take effect.
@@ -128,6 +134,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashAttention Backend (varlen_fwd_unified) on hcu, cutlass attention layerout blocksize 64 for qwen3.5
     "VLLM_HCU_USE_FLASH_ATTN_UNIFIED":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "True").lower() in
+             ("true", "1")),
+    # Select flash_attn.flash_attn_varlen_func without changing legacy paths.
+    "VLLM_HCU_USE_FLASH_ATTN_VARLEN":
+    lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_VARLEN", "False").lower() in
              ("true", "1")),
     # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu,  not office attention layerout blocksize 64 
     "VLLM_HCU_USE_CUSTOM_FLASH_ATTN":
