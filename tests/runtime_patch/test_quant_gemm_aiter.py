@@ -93,7 +93,7 @@ def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
     ]
 
 
-def test_aiter_asm_fp8_silu_context_uses_vllm_activation_and_restores_native(
+def test_aiter_asm_fp8_quant2_context_preserves_native_activation(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[str] = []
@@ -117,17 +117,6 @@ def test_aiter_asm_fp8_silu_context_uses_vllm_activation_and_restores_native(
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
 
-    def vllm_activation(output, input):
-        del input
-        calls.append("vllm")
-        output.fill_(2)
-
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_silu_and_mul",
-        vllm_activation,
-        raising=False,
-    )
     output = torch.empty((2, 4))
     kwargs = {
         "activation": "silu",
@@ -140,15 +129,15 @@ def test_aiter_asm_fp8_silu_context_uses_vllm_activation_and_restores_native(
 
     asm_module._apply_activation(**kwargs)
     torch.testing.assert_close(output, torch.ones_like(output))
-    with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
         asm_module._apply_activation(**kwargs)
-    torch.testing.assert_close(output, torch.full_like(output, 2))
+    torch.testing.assert_close(output, torch.ones_like(output))
     asm_module._apply_activation(**kwargs)
     torch.testing.assert_close(output, torch.ones_like(output))
-    assert calls == ["aiter", "vllm", "aiter"]
+    assert calls == ["aiter", "aiter", "aiter"]
 
 
-def test_aiter_asm_fp8_silu_context_aligns_only_following_bridge_quant(
+def test_aiter_asm_fp8_quant2_context_aligns_only_following_bridge_quant(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[str] = []
@@ -178,11 +167,6 @@ def test_aiter_asm_fp8_silu_context_aligns_only_following_bridge_quant(
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
     monkeypatch.setattr(
         aiter_runtime,
-        "_vllm_silu_and_mul",
-        lambda output, input: (calls.append("vllm_activation"), output.fill_(2)),
-    )
-    monkeypatch.setattr(
-        aiter_runtime,
         "_vllm_per_token_quant_fp8",
         lambda x: (calls.append("vllm_quant"), "vllm_quant")[1],
         raising=False,
@@ -197,11 +181,12 @@ def test_aiter_asm_fp8_silu_context_aligns_only_following_bridge_quant(
         "gemm1_limit": None,
     }
 
-    with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
         assert asm_module.per_token_quant_hip(
             "input", quant_dtype=torch.float8_e4m3fn
         ) == "native_quant"
         asm_module._apply_activation(**kwargs)
+        torch.testing.assert_close(output, torch.ones_like(output))
         assert asm_module.per_token_quant_hip(
             "bridge", quant_dtype=torch.float8_e4m3fn
         ) == "vllm_quant"
@@ -213,14 +198,56 @@ def test_aiter_asm_fp8_silu_context_aligns_only_following_bridge_quant(
     ) == "native_quant"
     assert calls == [
         "aiter_quant",
-        "vllm_activation",
+        "aiter_activation",
         "vllm_quant",
         "aiter_quant",
         "aiter_quant",
     ]
 
 
-def test_aiter_asm_fp8_silu_context_nested_disable_and_exception_restore_state(
+def test_aiter_asm_fp8_quant2_context_clears_stale_bridge_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def native_activation(
+        activation,
+        is_gated,
+        activated_out,
+        ffn1_out_2d,
+        gemm1_alpha,
+        gemm1_limit,
+    ):
+        del activation, is_gated, activated_out, ffn1_out_2d
+        del gemm1_alpha, gemm1_limit
+
+    asm_module = _module(
+        "aiter.fused_moe_asm_wna16",
+        _apply_activation=native_activation,
+        per_token_quant_hip=lambda x, quant_dtype=None: "native_quant",
+    )
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
+    monkeypatch.setattr(
+        aiter_runtime,
+        "_vllm_per_token_quant_fp8",
+        lambda x: "vllm_quant",
+    )
+    kwargs = {
+        "activation": "silu",
+        "is_gated": True,
+        "activated_out": torch.empty((2, 4)),
+        "ffn1_out_2d": torch.empty((2, 8)),
+        "gemm1_alpha": None,
+        "gemm1_limit": None,
+    }
+
+    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
+        asm_module._apply_activation(**kwargs)
+        asm_module._apply_activation(**(kwargs | {"activation": "gelu"}))
+        assert asm_module.per_token_quant_hip(
+            "later", quant_dtype=torch.float8_e4m3fn
+        ) == "native_quant"
+
+
+def test_aiter_asm_fp8_quant2_context_nested_disable_and_exception_restore_state(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[str] = []
@@ -243,11 +270,6 @@ def test_aiter_asm_fp8_silu_context_nested_disable_and_exception_restore_state(
         per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_silu_and_mul",
-        lambda output, input: (calls.append("vllm"), output.fill_(2)),
-    )
     output = torch.empty((2, 4))
     kwargs = {
         "activation": SimpleNamespace(value="silu"),
@@ -258,19 +280,19 @@ def test_aiter_asm_fp8_silu_context_nested_disable_and_exception_restore_state(
         "gemm1_limit": None,
     }
 
-    with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
         asm_module._apply_activation(**kwargs)
-        torch.testing.assert_close(output, torch.full_like(output, 2))
-        with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=False):
+        torch.testing.assert_close(output, torch.ones_like(output))
+        with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=False):
             asm_module._apply_activation(**kwargs)
             torch.testing.assert_close(output, torch.ones_like(output))
         with pytest.raises(RuntimeError, match="cleanup"):
-            with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+            with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
                 raise RuntimeError("cleanup")
 
     asm_module._apply_activation(**kwargs)
     torch.testing.assert_close(output, torch.ones_like(output))
-    assert calls == ["vllm", "aiter", "aiter"]
+    assert calls == ["aiter", "aiter", "aiter"]
 
 
 @pytest.mark.parametrize(
@@ -282,7 +304,7 @@ def test_aiter_asm_fp8_silu_context_nested_disable_and_exception_restore_state(
         {"gemm1_limit": 7.0},
     ],
 )
-def test_aiter_asm_fp8_silu_context_preserves_other_activation_modes(
+def test_aiter_asm_fp8_quant2_context_preserves_other_activation_modes(
     monkeypatch: pytest.MonkeyPatch,
     overrides: dict[str, object],
 ):
@@ -306,11 +328,6 @@ def test_aiter_asm_fp8_silu_context_preserves_other_activation_modes(
         per_token_quant_hip=lambda x, quant_dtype=None: (x, quant_dtype),
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_silu_and_mul",
-        lambda output, input: calls.append("vllm"),
-    )
     kwargs = {
         "activation": "silu",
         "is_gated": True,
@@ -321,12 +338,12 @@ def test_aiter_asm_fp8_silu_context_preserves_other_activation_modes(
     }
     kwargs.update(overrides)
 
-    with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+    with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
         asm_module._apply_activation(**kwargs)
     assert calls == ["aiter"]
 
 
-def test_aiter_asm_fp8_silu_context_rejects_incompatible_activation_abi(
+def test_aiter_asm_fp8_quant2_context_rejects_incompatible_activation_abi(
     monkeypatch: pytest.MonkeyPatch,
 ):
     def incompatible(activation, activated_out):
@@ -343,23 +360,9 @@ def test_aiter_asm_fp8_silu_context_rejects_incompatible_activation_abi(
         aiter_runtime.HcuAiterRuntimeError,
         match="unsupported arguments",
     ):
-        with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+        with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
             pass
     assert asm_module._apply_activation is incompatible
-
-
-def test_vllm_silu_and_mul_wraps_stable_extension_import_error(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    def missing_extension(name: str):
-        raise ImportError(name)
-
-    monkeypatch.setattr(aiter_runtime, "import_module", missing_extension)
-    with pytest.raises(
-        aiter_runtime.HcuAiterRuntimeError,
-        match="stable extension is unavailable",
-    ):
-        aiter_runtime._vllm_silu_and_mul(torch.empty(1), torch.empty(2))
 
 
 def test_vllm_per_token_quant_fp8_wraps_extension_import_error(
@@ -376,7 +379,7 @@ def test_vllm_per_token_quant_fp8_wraps_extension_import_error(
         aiter_runtime._vllm_per_token_quant_fp8(torch.empty(1))
 
 
-def test_aiter_asm_fp8_silu_context_rejects_incompatible_quant_abi(
+def test_aiter_asm_fp8_quant2_context_rejects_incompatible_quant_abi(
     monkeypatch: pytest.MonkeyPatch,
 ):
     def native_activation(
@@ -410,7 +413,7 @@ def test_aiter_asm_fp8_silu_context_rejects_incompatible_quant_abi(
         aiter_runtime.HcuAiterRuntimeError,
         match="per_token_quant_hip exposes unsupported arguments",
     ):
-        with aiter_runtime.aiter_asm_vllm_fp8_silu_context(enabled=True):
+        with aiter_runtime.aiter_asm_vllm_fp8_quant2_context(enabled=True):
             pass
     assert asm_module.per_token_quant_hip is incompatible_quant
 
@@ -2820,13 +2823,13 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
 @pytest.mark.parametrize(
     ("use_fp8", "use_int8", "solution_type", "activation", "expected"),
     [
-        (True, False, "asm", "silu", 2.0),
+        (True, False, "asm", "silu", 1.0),
         (False, True, "asm", "silu", 1.0),
         (True, False, "moe_c", "silu", 1.0),
         (True, False, "asm", "gelu", 1.0),
     ],
 )
-def test_quantized_aiter_runtime_scopes_vllm_silu_to_fp8_asm(
+def test_quantized_aiter_runtime_scopes_vllm_quant2_to_fp8_asm_silu(
     monkeypatch: pytest.MonkeyPatch,
     use_fp8: bool,
     use_int8: bool,
@@ -2864,11 +2867,6 @@ def test_quantized_aiter_runtime_scopes_vllm_silu_to_fp8_asm(
         per_token_quant_hip=native_fp8_quant,
     )
     monkeypatch.setitem(sys.modules, "aiter.fused_moe_asm_wna16", asm_module)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "_vllm_silu_and_mul",
-        lambda output, input: (calls.append("vllm_activation"), output.fill_(2)),
-    )
     monkeypatch.setattr(
         aiter_runtime,
         "_vllm_per_token_quant_fp8",
@@ -2952,7 +2950,7 @@ def test_quantized_aiter_runtime_scopes_vllm_silu_to_fp8_asm(
         if solution_type == "asm" and activation == "silu":
             assert calls == [
                 "aiter_fp8_quant",
-                "vllm_activation",
+                "aiter_activation",
                 "vllm_fp8_quant",
             ]
         else:

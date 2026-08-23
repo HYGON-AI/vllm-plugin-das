@@ -234,10 +234,6 @@ def _run_aiter(
         aiter_moe_shfl_weight,
         get_aiter_moe_config,
     )
-    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
-        aiter_asm_vllm_fp8_silu_context,
-    )
-
     status, config = get_aiter_moe_config(
         M=hidden.shape[0],
         E=tensors["w1"].shape[0],
@@ -259,23 +255,22 @@ def _run_aiter(
         w1, w2 = aiter_moe_shfl_weight(tensors["w1"], tensors["w2"], config)
     else:
         w1, w2 = tensors["w1"], tensors["w2"]
-    with aiter_asm_vllm_fp8_silu_context(enabled=activation_mode == "vllm"):
-        with _capture_aiter_stages("native", quant2_mode) as captures:
-            output = aiter_moe(
-                hidden_states=hidden,
-                w1=w1,
-                w2=w2,
-                topk_weights=topk_weights.float(),
-                topk_ids=topk_ids.int(),
-                moe_config=config,
-                inplace=False,
-                activation="silu",
-                w1_scale=tensors["w1_scale"],
-                w2_scale=tensors["w2_scale"],
-                global_num_experts=tensors["w1"].shape[0],
-                use_weight_shuffle=bool(getattr(config, "need_shuffle", False)),
-                output_dtype=hidden.dtype,
-            )
+    with _capture_aiter_stages(activation_mode, quant2_mode) as captures:
+        output = aiter_moe(
+            hidden_states=hidden,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights.float(),
+            topk_ids=topk_ids.int(),
+            moe_config=config,
+            inplace=False,
+            activation="silu",
+            w1_scale=tensors["w1_scale"],
+            w2_scale=tensors["w2_scale"],
+            global_num_experts=tensors["w1"].shape[0],
+            use_weight_shuffle=bool(getattr(config, "need_shuffle", False)),
+            output_dtype=hidden.dtype,
+        )
     torch.cuda.synchronize()
     return output, captures, solution
 

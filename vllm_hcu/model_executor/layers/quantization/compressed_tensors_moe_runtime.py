@@ -258,19 +258,19 @@ def apply_aiter_quantized_moe(
 
     from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
         aiter_asm_boltops_int8_quant_context,
-        aiter_asm_vllm_fp8_silu_context,
+        aiter_asm_vllm_fp8_quant2_context,
     )
 
     is_asm_solution = (
         _enum_token(getattr(aiter_config, "solution_type", None)) == "ASM"
     )
     align_int8_quant = bool(use_int8 and is_asm_solution)
-    align_fp8_silu = bool(
+    align_fp8_quant2 = bool(
         use_fp8 and is_asm_solution and activation_name.lower() == "silu"
     )
     with (
         aiter_asm_boltops_int8_quant_context(enabled=align_int8_quant),
-        aiter_asm_vllm_fp8_silu_context(enabled=align_fp8_silu),
+        aiter_asm_vllm_fp8_quant2_context(enabled=align_fp8_quant2),
     ):
         return aiter_moe(
             hidden_states=hidden_states,

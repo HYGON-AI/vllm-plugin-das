@@ -50,8 +50,8 @@ _AITER_MOE_GLOBAL_NUM_EXPERTS: ContextVar[int | None] = ContextVar(
 _AITER_ASM_BOLTOPS_INT8_QUANT: ContextVar[bool] = ContextVar(
     "vllm_hcu_aiter_asm_boltops_int8_quant", default=False
 )
-_AITER_ASM_VLLM_FP8_SILU: ContextVar[bool] = ContextVar(
-    "vllm_hcu_aiter_asm_vllm_fp8_silu", default=False
+_AITER_ASM_VLLM_FP8_QUANT2: ContextVar[bool] = ContextVar(
+    "vllm_hcu_aiter_asm_vllm_fp8_quant2", default=False
 )
 _AITER_ASM_FP8_BRIDGE_QUANT: ContextVar[bool] = ContextVar(
     "vllm_hcu_aiter_asm_fp8_bridge_quant", default=False
@@ -59,7 +59,9 @@ _AITER_ASM_FP8_BRIDGE_QUANT: ContextVar[bool] = ContextVar(
 _AITER_ASM_INT8_QUANT_WRAPPER_MARKER = (
     "_vllm_hcu_aiter_asm_int8_quant_wrapper"
 )
-_AITER_ASM_FP8_SILU_WRAPPER_MARKER = "_vllm_hcu_aiter_asm_fp8_silu_wrapper"
+_AITER_ASM_FP8_QUANT2_TRIGGER_WRAPPER_MARKER = (
+    "_vllm_hcu_aiter_asm_fp8_quant2_trigger_wrapper"
+)
 _AITER_ASM_FP8_QUANT_WRAPPER_MARKER = "_vllm_hcu_aiter_asm_fp8_quant_wrapper"
 _AITER_ASM_ACTIVATION_PARAMETERS = (
     "activation",
@@ -119,23 +121,6 @@ def _install_aiter_asm_int8_quant_wrapper() -> None:
     module.per_token_quant_int8 = wrapped_quant
 
 
-def _vllm_silu_and_mul(output: torch.Tensor, input: torch.Tensor) -> None:
-    """Apply the gated SiLU implementation used by vLLM's Triton MoE."""
-
-    try:
-        import_module("vllm._C_stable_libtorch")
-    except ImportError as exc:
-        raise HcuAiterRuntimeError(
-            "vLLM stable extension is unavailable for AITER ASM FP8 alignment"
-        ) from exc
-    operation = getattr(getattr(torch.ops, "_C", None), "silu_and_mul", None)
-    if not callable(operation):
-        raise HcuAiterRuntimeError(
-            "vLLM _C.silu_and_mul is unavailable for AITER ASM FP8 alignment"
-        )
-    operation(output, input)
-
-
 def _vllm_per_token_quant_fp8(
     input: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -182,7 +167,7 @@ def _install_aiter_asm_fp8_quant_wrapper() -> None:
     @functools.wraps(original)
     def wrapped_quant(*args: Any, **kwargs: Any) -> Any:
         if not (
-            _AITER_ASM_VLLM_FP8_SILU.get()
+            _AITER_ASM_VLLM_FP8_QUANT2.get()
             and _AITER_ASM_FP8_BRIDGE_QUANT.get()
         ):
             return original(*args, **kwargs)
@@ -203,14 +188,16 @@ def _install_aiter_asm_fp8_quant_wrapper() -> None:
     module.per_token_quant_hip = wrapped_quant
 
 
-def _install_aiter_asm_fp8_silu_wrapper() -> None:
+def _install_aiter_asm_fp8_quant2_trigger_wrapper() -> None:
     module = import_module("aiter.fused_moe_asm_wna16")
     current = getattr(module, "_apply_activation", None)
     if not callable(current):
         raise HcuAiterRuntimeError(
             "AITER ASM exposes no callable _apply_activation compatibility point"
         )
-    if bool(getattr(current, _AITER_ASM_FP8_SILU_WRAPPER_MARKER, False)):
+    if bool(
+        getattr(current, _AITER_ASM_FP8_QUANT2_TRIGGER_WRAPPER_MARKER, False)
+    ):
         return
     try:
         signature = inspect.signature(current)
@@ -228,10 +215,12 @@ def _install_aiter_asm_fp8_silu_wrapper() -> None:
 
     @functools.wraps(original)
     def wrapped_activation(*args: Any, **kwargs: Any) -> Any:
-        if not _AITER_ASM_VLLM_FP8_SILU.get():
+        if not _AITER_ASM_VLLM_FP8_QUANT2.get():
             return original(*args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        _AITER_ASM_FP8_BRIDGE_QUANT.set(False)
+        result = original(*args, **kwargs)
         activation = bound.arguments["activation"]
         activation_token = getattr(activation, "value", activation)
         if (
@@ -240,15 +229,14 @@ def _install_aiter_asm_fp8_silu_wrapper() -> None:
             and bound.arguments["gemm1_alpha"] is None
             and bound.arguments["gemm1_limit"] is None
         ):
-            _vllm_silu_and_mul(
-                bound.arguments["activated_out"],
-                bound.arguments["ffn1_out_2d"],
-            )
             _AITER_ASM_FP8_BRIDGE_QUANT.set(True)
-            return None
-        return original(*args, **kwargs)
+        return result
 
-    setattr(wrapped_activation, _AITER_ASM_FP8_SILU_WRAPPER_MARKER, True)
+    setattr(
+        wrapped_activation,
+        _AITER_ASM_FP8_QUANT2_TRIGGER_WRAPPER_MARKER,
+        True,
+    )
     module._apply_activation = wrapped_activation
 
 
@@ -268,19 +256,19 @@ def aiter_asm_boltops_int8_quant_context(enabled: bool):
 
 
 @contextmanager
-def aiter_asm_vllm_fp8_silu_context(enabled: bool):
-    """Use vLLM's gated SiLU only for an explicitly scoped AITER call."""
+def aiter_asm_vllm_fp8_quant2_context(enabled: bool):
+    """Align only AITER ASM's post-activation FP8 quantization with vLLM."""
 
     if enabled:
         _install_aiter_asm_fp8_quant_wrapper()
-        _install_aiter_asm_fp8_silu_wrapper()
-    token = _AITER_ASM_VLLM_FP8_SILU.set(bool(enabled))
+        _install_aiter_asm_fp8_quant2_trigger_wrapper()
+    token = _AITER_ASM_VLLM_FP8_QUANT2.set(bool(enabled))
     bridge_token = _AITER_ASM_FP8_BRIDGE_QUANT.set(False)
     try:
         yield
     finally:
         _AITER_ASM_FP8_BRIDGE_QUANT.reset(bridge_token)
-        _AITER_ASM_VLLM_FP8_SILU.reset(token)
+        _AITER_ASM_VLLM_FP8_QUANT2.reset(token)
 
 
 def is_aiter_moe_requested(moe_config: object | None = None) -> bool:

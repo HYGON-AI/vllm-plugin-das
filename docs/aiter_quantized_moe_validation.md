@@ -220,25 +220,33 @@ failures were `HumanEval/0`, `/1`, `/4`, `/18`, `/19`, and `/20`.
 | AITER ASM | 0.8125 | 26/32 | 156.23 s |
 | Official vLLM Triton | 0.9062 | 29/32 | 188.11 s |
 
-The first isolated SiLU test used uniformly distributed random inputs and did
-not expose a meaningful difference. A second diagnostic loaded the model's
-real layer-0 expert weights and captured every boundary in the same call:
+The isolated SiLU test does not establish an AITER correctness defect. A fresh
+run with uniformly distributed BF16 inputs measured about 0.141% NMAE for
+AITER versus FP32 and about 0.193% for vLLM versus FP32. The two implementations
+are numerically different, but AITER was not less accurate against that
+reference.
+
+A second diagnostic loaded the model's real layer-0 expert weights and captured
 input quantization, GEMM1, gated activation, bridge quantization, GEMM2, and
-expert reduction. This identified two sequential sources of drift:
+expert reduction. A complete two-variable ablation compared the activation and
+second per-token FP8 quantizer independently:
 
-1. AITER's Triton `silu_and_mul` uses the Triton exponential approximation,
-   while official vLLM's MoE path uses `_C.silu_and_mul`. On the real GEMM1
-   distribution, the activation NMAE was about 0.14--0.17%, sufficient to
-   change following FP8 rounding decisions.
-2. After aligning SiLU, AITER's second per-token FP8 quantization still changed
-   bridge values. Aligning only that second quantization with vLLM's
-   `scaled_fp8_quant` removed the remaining M=1 and M=16 output difference.
+| AITER activation | Second FP8 quantizer | M=1 output NMAE | M=16 | M=128 |
+| --- | --- | ---: | ---: | ---: |
+| native | native | 1.80010% | 1.17462% | 1.24115% |
+| native | vLLM | 1.80010% | 1.16848% | 1.22752% |
+| vLLM | native | 0.09349% | 0.08673% | 0.10758% |
+| vLLM | vLLM | 0% | 0% | 0.02732% |
 
-The first input quantization remains AITER-native. The alignment is scoped to
-the exact combination `FP8 W8A8 + ASM + gated SiLU`; INT8, MOE_C, GELU,
-non-gated activation, and unsupported alpha/limit variants retain their
-existing implementations. The compatibility wrappers validate the installed
-AITER call signatures and fail closed if the ABI changes.
+This proves only numerical alignment with the official Triton path, not that
+AITER's SiLU is incorrect. The retained production policy therefore preserves
+AITER's native gated-SiLU implementation. Only the immediately following FP8
+bridge quantization uses vLLM's `scaled_fp8_quant`; the first input
+quantization remains AITER-native. The quantizer substitution is scoped to the
+exact combination `FP8 W8A8 + ASM + gated SiLU`. INT8, MOE_C, GELU, non-gated
+activation, and unsupported alpha/limit variants retain their existing
+implementations. The compatibility wrappers validate the installed AITER call
+signatures and fail closed if the ABI changes.
 
 The staged diagnostic can be reproduced with:
 
@@ -248,27 +256,21 @@ PYTHONPATH=/models/zb/vllm_025_hcu/vllm-plugin-das \
 python3 tests/accuracy/diagnose_aiter_fp8_moe_stages.py \
   --model /models/Qwen3.5-35B-A3B-CHANNEL-FP8 \
   --tokens 1 16 128 \
-  --aiter-activation vllm \
-  --aiter-quant2 native \
-  --output /tmp/pr19-fp8-stage-production-fix.json
+  --aiter-activation native \
+  --aiter-quant2 vllm \
+  --output /tmp/pr19-fp8-stage-native-silu-vllm-quant2.json
 ```
 
-The `native` quant2 option above deliberately leaves the diagnostic's manual
-override disabled; the production scoped wrapper performs the alignment.
+The diagnostic's manual quant2 option isolates the same quantizer used by the
+production scoped wrapper while leaving AITER activation native.
 
-| Tokens | Final output NMAE | Final max abs diff | Observation |
-| ---: | ---: | ---: | --- |
-| 1 | 0% | 0 | all captured stages match |
-| 16 | 0% | 0 | bridge quantization and final output match |
-| 128 | 0.02732% | 0.000793 | residual starts at the retained input quantizer |
-
-The graph-enabled V2 HumanEval run was then repeated twice on the same server.
-Both runs produced byte-identical generated code, scored 28/32 (0.875), and
-failed the same cases: `HumanEval/4`, `/19`, `/20`, and `/27`. No Unicode
-replacement characters or NUL bytes were present. Historical official Triton
-runs on the same model scored between 26/32 and 29/32, so the aligned AITER
-result is within the observed official range; the layer-level comparison is
-the direct numerical evidence for the fix.
+For historical context, the experiment that replaced both SiLU and quant2 was
+repeated twice on one graph-enabled V2 server. Both runs produced
+byte-identical generated code, scored 28/32 (0.875), and failed the same cases:
+`HumanEval/4`, `/19`, `/20`, and `/27`. This result motivated the staged
+diagnostic but is not evidence that AITER's native SiLU is incorrect, and that
+SiLU replacement is no longer retained. No Unicode replacement characters or
+NUL bytes were present.
 
 The startup log confirmed `Using AITER Fp8 MoE backend`, loaded both FP8 W8A8
 ASM stages, and completed PIECEWISE and FULL graph capture. Static regression
