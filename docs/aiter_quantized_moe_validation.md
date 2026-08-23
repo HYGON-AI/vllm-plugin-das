@@ -240,13 +240,18 @@ second per-token FP8 quantizer independently:
 
 This proves only numerical alignment with the official Triton path, not that
 AITER's SiLU is incorrect. The retained production policy therefore preserves
-AITER's native gated-SiLU implementation. Only the immediately following FP8
-bridge quantization uses vLLM's `scaled_fp8_quant`; the first input
-quantization remains AITER-native. The quantizer substitution is scoped to the
-exact combination `FP8 W8A8 + ASM + gated SiLU`. INT8, MOE_C, GELU, non-gated
-activation, and unsupported alpha/limit variants retain their existing
-implementations. The compatibility wrappers validate the installed AITER call
-signatures and fail closed if the ABI changes.
+AITER's native activation and both AITER ASM GEMMs. For `FP8 W8A8 + ASM`, both
+dynamic per-token FP8 stages (before GEMM1 and before GEMM2) now use BoltOps
+`per_token_quant_hip(..., quant_dtype=torch.float8_e4m3fn)`. Static-scale and
+non-default row-count calls fall back to AITER. INT8 and MOE_C keep their
+existing paths. The compatibility wrapper validates the installed AITER call
+signature and fails closed if the ABI changes.
+
+An isolated compatibility check covered token counts 1, 16, and 128 with
+hidden sizes 2,048 and 512. BoltOps and vLLM produced identical FP32 scale
+tensors; their FP8 tensors were approximately 99.8% to 100% element-identical,
+with effectively identical dequantized NMAE. AITER's scale difference was at
+most approximately `9.3e-10` in the observed cases.
 
 The staged diagnostic can be reproduced with:
 
@@ -261,8 +266,9 @@ python3 tests/accuracy/diagnose_aiter_fp8_moe_stages.py \
   --output /tmp/pr19-fp8-stage-native-silu-vllm-quant2.json
 ```
 
-The diagnostic's manual quant2 option isolates the same quantizer used by the
-production scoped wrapper while leaving AITER activation native.
+The diagnostic's manual quant2 option records the historical single-stage
+vLLM experiment. The production wrapper now applies the BoltOps quantizer to
+both dynamic FP8 stages while leaving AITER activation native.
 
 For historical context, the experiment that replaced both SiLU and quant2 was
 repeated twice on one graph-enabled V2 server. Both runs produced
@@ -280,9 +286,10 @@ verification completed with:
 174 passed, 14 warnings in 63.40s
 ```
 
-### Native-SiLU retained-policy validation on latest v0.25.1
+### BoltOps FP8 quant1/quant2 validation on latest v0.25.1
 
-The retained policy was also applied without conflicts on top of plugin
+Candidate `80b8e7f4abab52db79f561e20c38da6b432bde2d` was merged without
+conflicts on top of plugin
 `v0.25.1@47d3fb884fdb9e4f03d1ddc993af5d31f18cc865` and tested against vLLM
 `7b108ad1a51b217e9abec0ddc047978405481bae`. The service used Model Runner V2,
 FULL and PIECEWISE graph capture, NHD KV-cache layout, parameterized
@@ -292,7 +299,7 @@ environment gate was set.
 ```bash
 export HIP_VISIBLE_DEVICES=5
 export PYTHONPATH=/models/zb/vllm_025_hcu/vllm-plugin-das
-export VLLM_CACHE_ROOT=/tmp/vllm-cache-pr19-native-silu-varlen-aiter
+export VLLM_CACHE_ROOT=/tmp/vllm-cache-pr19-boltops-fp8-varlen-aiter
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_KV_CACHE_LAYOUT=NHD
 unset VLLM_HCU_USE_FLASH_ATTN_UNIFIED
@@ -302,7 +309,7 @@ unset VLLM_ROCM_USE_AITER_MOE
 
 python3 -m vllm.entrypoints.openai.api_server \
   --model /models/Qwen3.5-35B-A3B-CHANNEL-FP8 \
-  --served-model-name qwen35-fp8-varlen-aiter-native-silu \
+  --served-model-name qwen35-fp8-varlen-aiter-boltops-quant12 \
   --port 8016 \
   --trust-remote-code \
   --max-model-len 65536 \
@@ -318,8 +325,8 @@ env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
     -u all_proxy -u http_proxy -u https_proxy \
   PYTHONPATH=/tmp/evalscope-target-v025 \
   python3 -m evalscope.cli.cli eval \
-    --model qwen35-fp8-varlen-aiter-native-silu \
-    --model-id qwen35-fp8-varlen-aiter-native-silu \
+    --model qwen35-fp8-varlen-aiter-boltops-quant12 \
+    --model-id qwen35-fp8-varlen-aiter-boltops-quant12 \
     --api-url http://127.0.0.1:8016/v1 \
     --api-key EMPTY \
     --eval-type openai_api \
@@ -330,19 +337,23 @@ env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
     --generation-config '{"temperature":0,"max_tokens":32768,"timeout":1800,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
     --seed 0 \
     --no-collect-perf \
-    --work-dir /tmp/evalscope-pr19-native-silu-varlen-aiter-32 \
+    --work-dir /tmp/evalscope-pr19-boltops-quant12-varlen-aiter-32 \
     --no-timestamp
 ```
 
 The run scored 32/32 (`mean_acc=1.0`, `pass@1=1.0`) with no request errors,
 Unicode replacement characters, or NUL bytes. Mean recorded request latency
-was 1.736 s (minimum 0.372 s, maximum 3.368 s), and the 32 responses contained
-3,595 output tokens. The output-content SHA-256 was
-`636736abda369ce7a41f9ddbb74aa199b066591a4f97134f4d166dd48f1bd495`.
+was 1.832 s (minimum 0.374 s, maximum 4.219 s). The 32 responses contained
+4,395 input and 3,826 output tokens. The output-content SHA-256 was
+`68df659b6e5fd45a4c375ff2ed2525b94bbcc7961a3bed7a9313f6506477fff2`.
 The startup log confirmed the `FLASH_ATTN_VARLEN` argument, selected the AITER
 FP8 MoE backend, loaded both AITER FP8 W8A8 ASM stages, and completed graph
-capture. The scoped regression suite passed with:
+capture. During inference the JIT monitor reported
+`_dynamic_per_token_quant_fp8_i8_kernel`, confirming that the BoltOps quantizer
+was reached. All 33 API requests (one sanity request plus 32 evaluation
+requests) returned HTTP 200. The scoped regression suite on the merged latest
+base passed with:
 
 ```text
-138 passed, 18 warnings in 36.38s
+138 passed, 18 warnings in 36.45s
 ```
