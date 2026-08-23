@@ -28,11 +28,14 @@ def _make_pcp_config(**overrides: object) -> object:
     enable_expert_parallel = overrides.pop("enable_expert_parallel", True)
     enforce_eager = overrides.pop("enforce_eager", True)
     speculative = overrides.pop("speculative", False)
+    speculative_method = overrides.pop("speculative_method", "mtp")
+    num_speculative_tokens = overrides.pop("num_speculative_tokens", 1)
     lora = overrides.pop("lora", False)
     multimodal = overrides.pop("multimodal", False)
     kv_offload = overrides.pop("kv_offload", False)
     kv_transfer = overrides.pop("kv_transfer", False)
     enable_lightly_cp = overrides.pop("enable_lightly_cp", False)
+    enable_multi_layers_mtp = overrides.pop("enable_multi_layers_mtp", False)
     if overrides:
         raise AssertionError(f"unknown PCP fixture override(s): {sorted(overrides)}")
 
@@ -52,14 +55,24 @@ def _make_pcp_config(**overrides: object) -> object:
             data_parallel_size=dp,
             enable_expert_parallel=enable_expert_parallel,
         ),
-        speculative_config=(SimpleNamespace(method="mtp") if speculative else None),
+        speculative_config=(
+            SimpleNamespace(
+                method=speculative_method,
+                num_speculative_tokens=num_speculative_tokens,
+            )
+            if speculative
+            else None
+        ),
         lora_config=(SimpleNamespace() if lora else None),
         cache_config=SimpleNamespace(kv_offloading_size=(1.0 if kv_offload else None)),
         kv_transfer_config=(
             SimpleNamespace(kv_connector="MooncakeConnector") if kv_transfer else None
         ),
         additional_config={
-            "hcu": HcuFeatureConfig(enable_lightly_cp=enable_lightly_cp).to_dict()
+            "hcu": HcuFeatureConfig(
+                enable_lightly_cp=enable_lightly_cp,
+                enable_multi_layers_mtp=enable_multi_layers_mtp,
+            ).to_dict()
         },
     )
 
@@ -83,6 +96,19 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+def test_glm52_pcp_allows_single_step_builtin_mtp(make_pcp_config) -> None:
+    """Restoring the blanket speculative-decode rejection breaks PCP+MTP."""
+
+    config = make_pcp_config(
+        pcp=2,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=1,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
@@ -93,13 +119,21 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
         ({"dcp": 2}, "decode context parallel"),
         ({"dp": 2}, "data parallel"),
         ({"enable_expert_parallel": False}, "expert parallel"),
-        ({"speculative": True}, "speculative decoding"),
+        (
+            {"speculative": True, "speculative_method": "eagle"},
+            "only supports built-in MTP",
+        ),
+        (
+            {"speculative": True, "num_speculative_tokens": 2},
+            "exactly one speculative token",
+        ),
         ({"enforce_eager": False}, "eager"),
         ({"lora": True}, "LoRA"),
         ({"multimodal": True}, "multimodal"),
         ({"kv_offload": True}, "KV offload"),
         ({"kv_transfer": True}, "P/D disaggregation"),
         ({"enable_lightly_cp": True}, "lightly-CP"),
+        ({"enable_multi_layers_mtp": True}, "multi-layer MTP"),
     ],
 )
 def test_glm52_pcp_scope_rejects_unsupported_combinations(

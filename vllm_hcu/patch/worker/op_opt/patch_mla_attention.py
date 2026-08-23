@@ -131,7 +131,11 @@ def apply_to_module(module: ModuleType) -> bool:
             raise PatchCompatibilityError(
                 f"invalid prefill_context_parallel_size={world_size}"
             )
-        return world_size
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            effective_pcp_world_size,
+        )
+
+        return effective_pcp_world_size(world_size)
 
     @functools.wraps(original_init)
     def hcu_init(self, *args, **kwargs):
@@ -158,6 +162,18 @@ def apply_to_module(module: ModuleType) -> bool:
         output_shape=None,
     ):
         if not getattr(self, "_hcu_use_pcp", False):
+            return original_full_forward(
+                self,
+                q,
+                kv_c_normed,
+                k_pe,
+                output_shape,
+            )
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            in_replicated_mtp_batch,
+        )
+
+        if in_replicated_mtp_batch():
             return original_full_forward(
                 self,
                 q,

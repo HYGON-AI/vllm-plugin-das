@@ -4,10 +4,16 @@
 """HCU integration boundary for vLLM's Model Runner V2."""
 
 import functools
+from contextlib import nullcontext
 
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm_hcu.model_executor.layers.attention.pcp import (
+    replicated_mtp_batch_scope,
+)
 from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
 
 
@@ -148,6 +154,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
+        use_replicated_mtp_batch = False
         if self.pcp_manager is not None and execute_model_state is not None:
             (
                 restored_hidden_states,
@@ -159,13 +166,42 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
+            use_replicated_mtp_batch = getattr(self, "speculator", None) is not None
             self.execute_model_state = execute_model_state
         input_batch = (
             None
             if execute_model_state is None
             else execute_model_state.input_batch
         )
-        output = super().sample_tokens(grammar_output)
+        scope = (
+            replicated_mtp_batch_scope()
+            if use_replicated_mtp_batch
+            else nullcontext()
+        )
+        with scope:
+            if use_replicated_mtp_batch:
+                assert execute_model_state is not None
+                assert input_batch is not None
+                block_tables, slot_mappings = GPUModelRunner.prepare_attn(
+                    self, input_batch
+                )
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
+                )
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    CUDAGraphMode.NONE,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                )
+                execute_model_state = execute_model_state._replace(
+                    attn_metadata=attn_metadata,
+                    slot_mappings_by_layer=slot_mappings_by_layer,
+                )
+                self.execute_model_state = execute_model_state
+            output = super().sample_tokens(grammar_output)
         if input_batch is not None:
             synchronize_pp_spec_draft_tokens(self, input_batch)
         return output

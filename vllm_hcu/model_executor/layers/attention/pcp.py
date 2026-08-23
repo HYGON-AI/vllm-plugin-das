@@ -11,9 +11,42 @@ rank-ordered slot mappings produced by :class:`HcuPCPManager`.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import torch
 
 from vllm.distributed.parallel_state import get_pcp_group
+
+
+_REPLICATED_MTP_BATCH = ContextVar(
+    "vllm_hcu_replicated_mtp_batch",
+    default=False,
+)
+
+
+@contextmanager
+def replicated_mtp_batch_scope() -> Iterator[None]:
+    """Run a restored global MTP batch without reapplying PCP attention."""
+
+    token = _REPLICATED_MTP_BATCH.set(True)
+    try:
+        yield
+    finally:
+        _REPLICATED_MTP_BATCH.reset(token)
+
+
+def in_replicated_mtp_batch() -> bool:
+    return bool(_REPLICATED_MTP_BATCH.get())
+
+
+def effective_pcp_world_size(configured_world_size: int) -> int:
+    """Return the logical PCP width for the current model invocation."""
+
+    if in_replicated_mtp_batch():
+        return 1
+    return configured_world_size
 
 
 def _pcp_world_size(metadata: object | None) -> int:
@@ -228,6 +261,9 @@ def maybe_gather_indexer_k(
 
 
 __all__ = (
+    "effective_pcp_world_size",
+    "in_replicated_mtp_batch",
     "maybe_gather_indexer_k",
     "maybe_gather_mla_latent_cache_inputs",
+    "replicated_mtp_batch_scope",
 )

@@ -221,6 +221,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     )
     forward_hip = _load_v32_sparse_indexer_contract(
         torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
         get_forward_context=lambda: SimpleNamespace(
             attn_metadata={"indexer": metadata}
         ),
@@ -267,6 +268,62 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     assert hcu_args[5] is weights
     assert hcu_args[8] == 2048
     assert hcu_args[-1] is True
+
+
+def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
+    """The global MTP draft must use one-rank metadata and cache ownership."""
+
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+        return "topk"
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        effective_pcp_world_size=lambda _value: 1,
+        get_forward_context=lambda: pytest.fail(
+            "replicated MTP draft re-entered PCP indexer cache gathering"
+        ),
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "replicated MTP draft gathered PCP indexer inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *args: pytest.fail(
+                "replicated MTP draft used external PCP cache insertion"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "replicated MTP draft used PCP BF16 cache insertion"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    local_k = torch.ones(2, 2)
+    q_quant = torch.ones(2, 2)
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=True,
+        pcp_world_size=2,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
+    assert len(calls) == 1
+    assert calls[0][4] is local_k
+    assert calls[0][-1] is False
 
 
 def test_v32_hcu_indexer_impl_advertises_pcp_capability():
@@ -337,6 +394,7 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
     )
     forward_hip = _load_v32_sparse_indexer_contract(
         torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
         get_forward_context=lambda: pytest.fail(
             "PCP=1 inspected forward metadata outside the custom op"
         ),

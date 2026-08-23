@@ -37,7 +37,10 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
-from vllm_hcu.model_executor.layers.attention.pcp import maybe_gather_indexer_k
+from vllm_hcu.model_executor.layers.attention.pcp import (
+    effective_pcp_world_size,
+    maybe_gather_indexer_k,
+)
 
 logger = init_logger(__name__)
 
@@ -957,17 +960,18 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
         skip_k_cache_insert = self.skip_k_cache_insert
-        if self.use_pcp and not skip_k_cache_insert:
+        pcp_world_size = effective_pcp_world_size(self.pcp_world_size)
+        if pcp_world_size > 1 and not skip_k_cache_insert:
             attn_metadata = get_forward_context().attn_metadata
             if isinstance(attn_metadata, dict):
                 layer_metadata = attn_metadata[self.k_cache.prefix]
                 metadata_world_size = int(
                     getattr(layer_metadata, "pcp_world_size", 1)
                 )
-                if metadata_world_size != self.pcp_world_size:
+                if metadata_world_size != pcp_world_size:
                     raise RuntimeError(
                         "PCP sparse-indexer metadata world size mismatch: "
-                        f"indexer={self.pcp_world_size}, "
+                        f"indexer={pcp_world_size}, "
                         f"metadata={metadata_world_size}"
                     )
                 cache_k, cache_slots = maybe_gather_indexer_k(
