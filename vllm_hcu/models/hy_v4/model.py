@@ -184,6 +184,59 @@ def _try_load_fp8_indexer_projection(
     return True
 
 
+def _try_load_fp8_router_gate(
+    name: str,
+    tensor: torch.Tensor,
+    buffer: dict[str, dict[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+    loaded_params: set[str],
+    pp_missing_layer_names: set[str],
+) -> bool:
+    """Dequantize a channel-wise FP8 MoE router into its FP32 gate."""
+    mapped_name = _rewrite_hyv4_weight_name(name)
+    if not mapped_name.endswith((".mlp.gate.weight", ".mlp.gate.weight_scale")):
+        return False
+
+    is_weight = mapped_name.endswith(".weight") and tensor.dtype in {
+        torch.float8_e4m3fn,
+        getattr(torch, "float8_e4m3fnuz", torch.float8_e4m3fn),
+    }
+    is_scale = mapped_name.endswith(".weight_scale")
+    if not is_weight and not is_scale:
+        return False
+    if any(name.startswith(missing) for missing in pp_missing_layer_names):
+        return True
+
+    parameter_name = (
+        mapped_name.removesuffix("_scale") if is_scale else mapped_name
+    )
+    entry = buffer.setdefault(parameter_name, {})
+    entry["weight" if is_weight else "scale"] = tensor
+    if entry.keys() < {"weight", "scale"}:
+        return True
+    if parameter_name not in params_dict:
+        raise RuntimeError(
+            f"Unknown HY V4 FP8 router parameter: {parameter_name}"
+        )
+
+    weight = entry["weight"]
+    scale = entry["scale"]
+    expected_scale_shape = (weight.shape[0], 1)
+    if weight.ndim != 2 or tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "HY V4 router FP8 scale must be per-output-channel with shape "
+            f"{expected_scale_shape}; got weight={tuple(weight.shape)}, "
+            f"scale={tuple(scale.shape)}."
+        )
+    dequantized = weight.float() * scale.float()
+    param = params_dict[parameter_name]
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, dequantized)
+    loaded_params.add(parameter_name)
+    del buffer[parameter_name]
+    return True
+
+
 def _normalize_hyv4_config(config: PretrainedConfig) -> PretrainedConfig:
     """Populate the aliases consumed by the shared MoE implementation."""
     config.router_scaling_factor = config.routed_scaling_factor
@@ -544,6 +597,7 @@ class HYV4Model(nn.Module):
         # FP8 indexer projection buffers (weights/scales can be in different
         # checkpoint shards and therefore arrive in either order).
         pending_indexer_fp8: dict[str, dict[str, torch.Tensor]] = {}
+        pending_router_fp8: dict[str, dict[str, torch.Tensor]] = {}
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         skip_topk_layers = compute_skip_topk_layers(self.config)
 
@@ -596,6 +650,15 @@ class HYV4Model(nn.Module):
                 name,
                 loaded_weight,
                 pending_indexer_fp8,
+                params_dict,
+                loaded_params,
+                pp_missing_layer_names,
+            ):
+                continue
+            if _try_load_fp8_router_gate(
+                name,
+                loaded_weight,
+                pending_router_fp8,
                 params_dict,
                 loaded_params,
                 pp_missing_layer_names,
@@ -770,6 +833,14 @@ class HYV4Model(nn.Module):
             raise RuntimeError(
                 "Incomplete HY V4 FP8 indexer projection pairs: "
                 f"{missing_parts}"
+            )
+        if pending_router_fp8:
+            missing_parts = {
+                key: sorted({"weight", "scale"} - set(parts))
+                for key, parts in pending_router_fp8.items()
+            }
+            raise RuntimeError(
+                f"Incomplete HY V4 FP8 router pairs: {missing_parts}"
             )
         return loaded_params
 

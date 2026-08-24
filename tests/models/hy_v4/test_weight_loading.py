@@ -14,6 +14,7 @@ from vllm_hcu.models.hy_v4.model import (
     _rewrite_hyv4_weight_name,
     _slice_sink_for_tp,
     _try_load_fp8_indexer_projection,
+    _try_load_fp8_router_gate,
 )
 
 
@@ -178,3 +179,49 @@ def test_fp8_indexer_projection_pair_loads_the_correct_fused_shard(
         actual_weight,
         (weight.float() * scale).to(torch.bfloat16),
     )
+
+
+@pytest.mark.parametrize(
+    "checkpoint_prefix",
+    ["layers.10.mlp.gate", "layers.10.mlp.router.gate"],
+)
+def test_fp8_router_gate_pair_dequantizes_to_fp32(
+    checkpoint_prefix: str,
+) -> None:
+    loaded_tensors: list[torch.Tensor] = []
+
+    class FakeParameter:
+        @staticmethod
+        def weight_loader(param, weight) -> None:
+            del param
+            loaded_tensors.append(weight)
+
+    parameter_name = "layers.10.mlp.gate.weight"
+    params = {parameter_name: FakeParameter()}
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    loaded: set[str] = set()
+    weight = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25], [0.5]])
+
+    assert _try_load_fp8_router_gate(
+        f"{checkpoint_prefix}.weight_scale",
+        scale,
+        pending,
+        params,
+        loaded,
+        set(),
+    )
+    assert _try_load_fp8_router_gate(
+        f"{checkpoint_prefix}.weight",
+        weight,
+        pending,
+        params,
+        loaded,
+        set(),
+    )
+
+    assert pending == {}
+    assert loaded == {parameter_name}
+    assert len(loaded_tensors) == 1
+    assert loaded_tensors[0].dtype == torch.float32
+    torch.testing.assert_close(loaded_tensors[0], weight.float() * scale)
