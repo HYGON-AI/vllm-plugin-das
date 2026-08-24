@@ -49,7 +49,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import (
-    _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
@@ -114,6 +113,75 @@ def _slice_sink_for_tp(
         )
     local_heads = num_heads // tp_size
     return loaded_weight.narrow(0, tp_rank * local_heads, local_heads)
+
+
+def _dequantize_indexer_channel_fp8(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize an indexer projection exported with channel-wise FP8."""
+    expected_scale_shape = (weight.shape[0], 1)
+    if weight.ndim != 2 or tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "HY V4 indexer FP8 scale must be per-output-channel with shape "
+            f"{expected_scale_shape}; got weight={tuple(weight.shape)}, "
+            f"scale={tuple(scale.shape)}."
+        )
+    return (weight.float() * scale.float()).to(torch.bfloat16)
+
+
+def _try_load_fp8_indexer_projection(
+    name: str,
+    tensor: torch.Tensor,
+    buffer: dict[str, dict[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+    loaded_params: set[str],
+    pp_missing_layer_names: set[str],
+) -> bool:
+    """Dequantize and load fused ``wk``/``weights_proj`` FP8 shards."""
+    marker = ".indexer."
+    if marker not in name:
+        return False
+    layer_prefix, suffix = name.rsplit(marker, 1)
+    projection = suffix.split(".", 1)[0]
+    if projection not in {"wk", "weights_proj"}:
+        return False
+
+    is_weight = suffix == f"{projection}.weight" and tensor.dtype in {
+        torch.float8_e4m3fn,
+        getattr(torch, "float8_e4m3fnuz", torch.float8_e4m3fn),
+    }
+    is_scale = suffix in {
+        f"{projection}.weight_scale",
+        f"{projection}.weight_scale_inv",
+    }
+    if not is_weight and not is_scale:
+        return False
+    if any(name.startswith(missing) for missing in pp_missing_layer_names):
+        return True
+
+    indexer_prefix = f"{layer_prefix}{marker[:-1]}"
+    fused_name = f"{indexer_prefix}.wk_weights_proj.weight"
+    key_prefix = f"{indexer_prefix}.{projection}"
+    entry = buffer.setdefault(key_prefix, {})
+    entry["weight" if is_weight else "scale"] = tensor
+    if entry.keys() < {"weight", "scale"}:
+        return True
+
+    if fused_name not in params_dict:
+        raise RuntimeError(
+            f"Unknown HY V4 fused indexer parameter: {fused_name}"
+        )
+    dequantized = _dequantize_indexer_channel_fp8(
+        entry["weight"],
+        entry["scale"],
+    )
+    shard_id = 0 if projection == "wk" else 1
+    param = params_dict[fused_name]
+    param.weight_loader(param, dequantized, shard_id)
+    loaded_params.add(fused_name)
+    del buffer[key_prefix]
+    return True
 
 
 def _normalize_hyv4_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -473,8 +541,9 @@ class HYV4Model(nn.Module):
             ("wk_weights_proj", "wk", 0),
             ("wk_weights_proj", "weights_proj", 1),
         ]
-        # FP8 indexer wk dequant buffer (weight and scale arrive separately).
-        pending_wk_fp8: dict[str, dict[str, torch.Tensor]] = {}
+        # FP8 indexer projection buffers (weights/scales can be in different
+        # checkpoint shards and therefore arrive in either order).
+        pending_indexer_fp8: dict[str, dict[str, torch.Tensor]] = {}
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         skip_topk_layers = compute_skip_topk_layers(self.config)
 
@@ -523,10 +592,10 @@ class HYV4Model(nn.Module):
         for name, loaded_weight in weights:
             if is_skip_topk_indexer_weight(name, skip_topk_layers):
                 continue
-            if _try_load_fp8_indexer_wk(
+            if _try_load_fp8_indexer_projection(
                 name,
                 loaded_weight,
-                pending_wk_fp8,
+                pending_indexer_fp8,
                 params_dict,
                 loaded_params,
                 pp_missing_layer_names,
@@ -693,6 +762,15 @@ class HYV4Model(nn.Module):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        if pending_indexer_fp8:
+            missing_parts = {
+                key: sorted({"weight", "scale"} - set(parts))
+                for key, parts in pending_indexer_fp8.items()
+            }
+            raise RuntimeError(
+                "Incomplete HY V4 FP8 indexer projection pairs: "
+                f"{missing_parts}"
+            )
         return loaded_params
 
 
