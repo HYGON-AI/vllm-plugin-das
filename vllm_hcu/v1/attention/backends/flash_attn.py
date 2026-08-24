@@ -848,10 +848,12 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             self.dcp_combine = cp_lse_ag_out_rs
         if self.use_pcp and self.dcp_world_size > 1:
-            assert self.dcp_world_size == self.pcp_world_size, (
-                "FlashAttention PCP+DCP requires dcp == pcp, got "
-                f"dcp={self.dcp_world_size}, pcp={self.pcp_world_size}."
+            raise ValueError(
+                "FlashAttention PCP does not support decode context "
+                "parallelism."
             )
+        # Retained only for the quarantined legacy PCP+DCP helper below. No
+        # supported topology writes tensors into this dictionary.
         self._pcp_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self._dcp_dtype: torch.dtype | None = None
@@ -1150,7 +1152,6 @@ class FlashAttentionImpl(AttentionImpl):
             value = pcp_group.all_gather(
                 value[:num_local_tokens].contiguous(), dim=0
             )
-            self._pcp_kv[layer.layer_name] = (key, value)
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
@@ -1374,7 +1375,12 @@ class FlashAttentionImpl(AttentionImpl):
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run exact GQA PCP attention over new tokens and sharded context."""
+        """Legacy PCP+DCP experiment, unreachable by supported construction.
+
+        FlashAttentionImpl.__init__ rejects every PCP+DCP topology. This
+        helper remains temporarily to keep the v0.25.1 backport diff local,
+        but production code cannot populate its per-layer K/V input.
+        """
 
         plan = attn_metadata.pcp_plan
         assert plan is not None

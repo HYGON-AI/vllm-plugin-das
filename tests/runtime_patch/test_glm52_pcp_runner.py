@@ -176,7 +176,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     runner.global_batch = global_batch
     events.clear()
 
-    runner.initialize_kv_cache("kv-config")
+    runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     assert runner.pcp_manager is manager
     prepared = runner.prepare_inputs("scheduler-output", "batch-desc")
     assert prepared is local_batch
@@ -202,6 +202,41 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         "restore_for_sampling",
         "super.sample_tokens",
     ]
+
+
+def test_pcp_runner_rejects_multiple_resolved_kv_cache_groups(
+    pcp_runner_module,
+) -> None:
+    """PCP metadata has one block table and cannot address two cache groups."""
+
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+
+    runner_module, events = pcp_runner_module
+    runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
+    events.clear()
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full.layer"], spec),
+            KVCacheGroupSpec(["sliding.layer"], spec),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="exactly one KV cache group"):
+        runner.initialize_kv_cache(kv_cache_config)
+
+    assert events == []
 
 
 def test_pcp_runner_replaces_immutable_execute_model_state(
@@ -354,7 +389,7 @@ def test_pcp_runner_routes_dummy_slots_through_manager(
     )
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
-    runner.initialize_kv_cache("kv-config")
+    runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     events.clear()
 
     assert runner.prepare_dummy_attn(input_batch) == (

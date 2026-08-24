@@ -121,8 +121,15 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self.pcp_manager = None
 
     def initialize_kv_cache(self, kv_cache_config):
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        if pcp_size > 1 and len(kv_cache_config.kv_cache_groups) != 1:
+            raise ValueError(
+                "HCU PCP requires exactly one KV cache group."
+            )
         super().initialize_kv_cache(kv_cache_config)
-        if self.vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        if pcp_size > 1:
             self.pcp_manager = maybe_build_pcp_manager(
                 self.vllm_config,
                 self.device,

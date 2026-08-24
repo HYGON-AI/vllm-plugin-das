@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-from copy import copy
 from types import ModuleType
 from typing import Any
 
@@ -24,7 +23,6 @@ TARGETS = (
     f"{TARGET_MODULE}.VllmConfig._validate_v2_model_runner",
     "vllm.config.model.ModelConfig.get_model_arch_config",
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
-    "vllm.config.model.ModelConfig.verify_with_parallel_config",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _REQUEST_CAPTURE_SIZES = (
@@ -76,6 +74,12 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if not use_mla and _require_hcu_pcp_attribute(
+        model_config, "is_hybrid", "ModelConfig"
+    ):
+        raise ValueError(
+            "FlashAttention PCP does not support hybrid KV cache groups."
+        )
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
     ) != 1:
@@ -85,16 +89,11 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             parallel_config, "decode_context_parallel_size", "ParallelConfig"
         )
     )
-    pcp_size = int(
-        _require_hcu_pcp_attribute(
-            parallel_config, "prefill_context_parallel_size", "ParallelConfig"
-        )
-    )
     if use_mla and dcp_size != 1:
         raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
-    if not use_mla and dcp_size not in (1, pcp_size):
+    if not use_mla and dcp_size != 1:
         raise ValueError(
-            "FlashAttention PCP requires DCP to be disabled or equal to PCP."
+            "FlashAttention PCP does not support decode context parallelism."
         )
     if _require_hcu_pcp_attribute(
         parallel_config, "data_parallel_size", "ParallelConfig"
@@ -337,16 +336,12 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     validate_v2_model_runner = vars(vllm_config).get("_validate_v2_model_runner")
     get_model_arch_config = vars(model_config_class).get("get_model_arch_config")
-    verify_with_parallel_config = vars(model_config_class).get(
-        "verify_with_parallel_config"
-    )
     if (
         not callable(with_hf_config)
         or not callable(set_cudagraph_sizes)
         or not callable(get_v2_unsupported_features)
         or not callable(validate_v2_model_runner)
         or not callable(get_model_arch_config)
-        or not callable(verify_with_parallel_config)
     ):
         raise PatchCompatibilityError(
             "required HCU VllmConfig compatibility methods are missing"
@@ -356,12 +351,6 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[4]} has incompatible "
             f"signature {model_arch_signature}"
-        )
-    verify_parallel_signature = inspect.signature(verify_with_parallel_config)
-    if tuple(verify_parallel_signature.parameters) != ("self", "parallel_config"):
-        raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[6]} has incompatible "
-            f"signature {verify_parallel_signature}"
         )
     with_hf_signature = inspect.signature(with_hf_config)
     if tuple(with_hf_signature.parameters) != (
@@ -412,26 +401,6 @@ def apply_to_module(module: ModuleType) -> bool:
         model_config_class,
         "get_model_arch_config",
         hcu_get_model_arch_config,
-    )
-
-    @functools.wraps(verify_with_parallel_config)
-    def hcu_verify_with_parallel_config(self, parallel_config):
-        pcp_size = int(parallel_config.prefill_context_parallel_size)
-        dcp_size = int(parallel_config.decode_context_parallel_size)
-        if pcp_size > 1 and dcp_size == pcp_size and not self.use_mla:
-            parallel_config = copy(parallel_config)
-            parallel_config.decode_context_parallel_size = 1
-        return verify_with_parallel_config(self, parallel_config)
-
-    setattr(
-        model_config_class,
-        "_vllm_hcu_original_verify_with_parallel_config",
-        verify_with_parallel_config,
-    )
-    setattr(
-        model_config_class,
-        "verify_with_parallel_config",
-        hcu_verify_with_parallel_config,
     )
 
     @functools.wraps(with_hf_config)

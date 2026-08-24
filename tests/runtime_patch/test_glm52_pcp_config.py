@@ -32,6 +32,7 @@ def _make_pcp_config(**overrides: object) -> object:
     num_speculative_tokens = overrides.pop("num_speculative_tokens", 1)
     lora = overrides.pop("lora", False)
     multimodal = overrides.pop("multimodal", False)
+    hybrid = overrides.pop("hybrid", False)
     kv_offload = overrides.pop("kv_offload", False)
     kv_transfer = overrides.pop("kv_transfer", False)
     enable_lightly_cp = overrides.pop("enable_lightly_cp", False)
@@ -46,6 +47,7 @@ def _make_pcp_config(**overrides: object) -> object:
             use_mla=use_mla,
             enforce_eager=enforce_eager,
             is_multimodal_model=multimodal,
+            is_hybrid=hybrid,
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp,
@@ -96,8 +98,7 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
-@pytest.mark.parametrize("dcp", [1, 2])
-def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config, dcp: int) -> None:
+def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config) -> None:
     """GQA PCP must not remain trapped behind the former MLA-only gate."""
 
     config = make_pcp_config(
@@ -105,11 +106,27 @@ def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config, dcp: int) -> None:
         use_mla=False,
         pcp=2,
         tp=2,
-        dcp=dcp,
+        dcp=1,
         enable_expert_parallel=False,
     )
 
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_gqa_pcp_rejects_decode_context_parallelism(make_pcp_config) -> None:
+    """DCP reuses TP ranks, so it cannot be treated as the PCP rank group."""
+
+    config = make_pcp_config(
+        architecture="Qwen3ForCausalLM",
+        use_mla=False,
+        pcp=2,
+        tp=2,
+        dcp=2,
+        enable_expert_parallel=False,
+    )
+
+    with pytest.raises(ValueError, match="does not support decode context"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
 def test_gqa_pcp_allows_piecewise_graph_execution(make_pcp_config) -> None:
@@ -156,6 +173,22 @@ def test_gqa_pcp_rejects_speculative_decoding(make_pcp_config) -> None:
     )
 
     with pytest.raises(ValueError, match="speculative decoding"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
+    """One PCP plan cannot address distinct block tables for hybrid KV groups."""
+
+    config = make_pcp_config(
+        architecture="Qwen3ForCausalLM",
+        use_mla=False,
+        pcp=2,
+        tp=2,
+        enable_expert_parallel=False,
+        hybrid=True,
+    )
+
+    with pytest.raises(ValueError, match="hybrid"):
         patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
@@ -255,8 +288,8 @@ def test_valid_glm52_pcp_removes_only_the_upstream_pcp_rejection(
     config._validate_v2_model_runner()
 
 
-def test_gqa_pcp_dcp_skips_only_the_legacy_head_partition_constraint() -> None:
-    """DCP==PCP carries replicated Q heads and must not apply pure-DCP checks."""
+def test_gqa_pcp_dcp_preserves_upstream_head_partition_constraint() -> None:
+    """PCP and DCP use different rank groups, so upstream DCP checks must run."""
 
     module = _make_vllm_module()
     assert patch_vllm_config.apply_to_module(module) is True
@@ -267,7 +300,8 @@ def test_gqa_pcp_dcp_skips_only_the_legacy_head_partition_constraint() -> None:
         decode_context_parallel_size=2,
     )
 
-    model_config.verify_with_parallel_config(parallel_config)
+    with pytest.raises(AssertionError, match="legacy GQA DCP head constraint"):
+        model_config.verify_with_parallel_config(parallel_config)
     assert parallel_config.decode_context_parallel_size == 2
 
 
