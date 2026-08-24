@@ -178,7 +178,8 @@ def _indexer_k_quant_and_cache_kernel(
     slot_id = tl.load(slot_mapping_ptr + tid)
     if slot_id < 0:
         return
-    block_id = slot_id // block_size
+    # Packed cache strides can make block_id * stride exceed 32-bit range.
+    block_id = (slot_id // block_size).to(tl.int64)
     block_offset = slot_id % block_size
     tile_block_id = block_offset // BLOCK_TILE_SIZE
     tile_block_offset = block_offset % BLOCK_TILE_SIZE
@@ -229,6 +230,7 @@ def indexer_k_quant_and_cache_triton(
     kv_cache_value = kv_cache[:, : block_size * head_dim].view(fp8_dtype)
     kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
     head_tile_size = head_tile_size // kv_cache.element_size()
+    layout = "NORMAL" if block_size == 1 else "SHUFFLE"
     grid = (num_tokens,)
     _indexer_k_quant_and_cache_kernel[grid](
         k,
@@ -240,7 +242,7 @@ def indexer_k_quant_and_cache_triton(
         block_size,
         num_tokens,
         head_dim,
-        "SHUFFLE",
+        layout,
         block_tile_size,
         head_tile_size,
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
@@ -266,35 +268,58 @@ def _cp_gather_indexer_quant_cache_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+    NUM_BATCHES: tl.constexpr,
+    BLOCK_TABLE_WIDTH: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, HEAD_DIM)
-    batch_id = tl.load(token_to_seq_ptr + tid)
-    batch_start = tl.load(cu_seqlen_ptr + batch_id)
-    batch_end = tl.load(cu_seqlen_ptr + batch_id + 1)
+    valid_tid = tid < NUM_TOKENS
+    batch_id = tl.load(token_to_seq_ptr + tid, mask=valid_tid, other=-1)
+    valid_batch = (batch_id >= 0) & (batch_id < NUM_BATCHES)
+    safe_batch_id = tl.where(valid_batch, batch_id, 0)
+    batch_start = tl.load(cu_seqlen_ptr + safe_batch_id, mask=valid_batch, other=0)
+    batch_end = tl.load(cu_seqlen_ptr + safe_batch_id + 1, mask=valid_batch, other=0)
     batch_offset = tid - batch_start
-    if tid >= batch_end:
+    valid_token = valid_tid & valid_batch & (tid >= batch_start) & (tid < batch_end)
+    if not valid_token:
         return
     block_table_id = batch_offset // block_size
     block_offset = batch_offset % block_size
-    block_table_offset = batch_id * block_table_stride + block_table_id
-    block_id = tl.load(block_table_ptr + block_table_offset)
-    tiled_block_id = block_offset // BLOCK_TILE_SIZE
-    tiled_block_offset = block_offset % BLOCK_TILE_SIZE
+    valid_block_table = (
+        valid_token
+        & (block_table_id >= 0)
+        & (block_table_id < BLOCK_TABLE_WIDTH)
+        & (block_offset >= 0)
+        & (block_offset < block_size)
+    )
+    safe_block_table_id = tl.where(valid_block_table, block_table_id, 0)
+    block_table_offset = safe_batch_id * block_table_stride + safe_block_table_id
+    block_id = tl.load(
+        block_table_ptr + block_table_offset, mask=valid_block_table, other=-1
+    )
+    valid_block = valid_block_table & (block_id >= 0) & (block_id < NUM_BLOCKS)
+    # Packed cache strides can make block_id * stride exceed 32-bit range.
+    safe_block_id = tl.where(valid_block, block_id, 0).to(tl.int64)
+    safe_block_offset = tl.where(valid_block, block_offset, 0)
+    tiled_block_offset = safe_block_offset % BLOCK_TILE_SIZE
     if LAYOUT == "SHUFFLE":
         src_cache_offset = (
-            block_id * kv_cache_stride
-            + tiled_block_id * HEAD_DIM * BLOCK_TILE_SIZE
+            safe_block_id * kv_cache_stride
+            + (safe_block_offset // BLOCK_TILE_SIZE) * HEAD_DIM * BLOCK_TILE_SIZE
             + tiled_block_offset * HEAD_TILE_SIZE
         )
     else:
-        src_cache_offset = block_id * kv_cache_stride + block_offset * HEAD_DIM
-    src_scale_offset = block_id * kv_cache_scale_stride + block_offset
+        src_cache_offset = (
+            safe_block_id * kv_cache_stride + safe_block_offset * HEAD_DIM
+        )
+    src_scale_offset = safe_block_id * kv_cache_scale_stride + safe_block_offset
     dst_offset = tid * HEAD_DIM
     src_scale_ptr = kv_cache_scale_ptr + src_scale_offset
     src_cache_ptr = kv_cache_ptr + src_cache_offset
     dst_k_ptr = k_fp8_ptr + dst_offset
-    scale_val = tl.load(src_scale_ptr)
+    scale_val = tl.load(src_scale_ptr, mask=valid_block, other=0.0)
     tl.store(k_scale_ptr + tid, scale_val)
     if LAYOUT == "SHUFFLE":
         tiled_src_offset = (
@@ -304,7 +329,7 @@ def _cp_gather_indexer_quant_cache_kernel(
     else:
         tiled_src_offset = offset
     val = tl.load(src_cache_ptr + tiled_src_offset)
-    tl.store(dst_k_ptr + offset, val)
+    tl.store(dst_k_ptr + offset, val, mask=valid_block)
 
 
 def cp_gather_indexer_k_quant_cache_triton(
@@ -329,6 +354,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
+    layout = "NORMAL" if block_size == 1 else "SHUFFLE"
     _cp_gather_indexer_quant_cache_kernel[grid](
         k_cache_value,
         k_cache_scale,
@@ -341,10 +367,14 @@ def cp_gather_indexer_k_quant_cache_triton(
         block_table_stride,
         k_cache_value.stride(0),
         k_cache_scale.stride(0),
-        "SHUFFLE",
+        layout,
         head_dim,
         block_tile_size,
         head_tile_size,
+        num_tokens,
+        cu_seqlen.shape[0] - 1,
+        block_table.shape[1],
+        num_blocks,
     )
 
 
@@ -1148,8 +1178,16 @@ def rocm_aiter_sparse_attn_indexer_native(
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
     if not skip_k_cache_insert:
-        if not current_platform.is_rocm() or on_gfx938():
+        if not current_platform.is_rocm():
             ops.indexer_k_quant_and_cache(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
+        elif on_gfx938():
+            indexer_k_quant_and_cache_triton(
                 k,
                 kv_cache,
                 slot_mapping,
@@ -1185,13 +1223,22 @@ def rocm_aiter_sparse_attn_indexer_native(
                 device=device,
                 dtype=torch.uint8,
             )
-            if not current_platform.is_rocm() or on_gfx938():
+            if not current_platform.is_rocm():
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_fp8,
                     k_scale,
                     chunk.block_table,
                     chunk.cu_seq_lens,
+                )
+            elif on_gfx938():
+                cp_gather_indexer_k_quant_cache_triton(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
                 )
             else:
                 cp_gather_indexer_k_bf16_cache_triton(

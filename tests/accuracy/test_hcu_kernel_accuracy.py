@@ -500,6 +500,79 @@ def test_hcu_native_dynamic_per_token_fp8_matches_reference() -> None:
     )
 
 
+@pytest.mark.parametrize("block_size", [1, 16])
+def test_hcu_indexer_fp8_cache_roundtrip_matches_ue8m0_reference(
+    block_size: int,
+) -> None:
+    device = _hcu_device()
+    from vllm.platforms import current_platform
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        cp_gather_indexer_k_quant_cache_triton,
+        indexer_k_quant_and_cache_triton,
+    )
+
+    num_tokens = 17
+    head_dim = 128
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    generator = torch.Generator(device=device).manual_seed(20260827 + block_size)
+    source = torch.randn(
+        (num_tokens, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    source[0].zero_()
+    cache = torch.zeros(
+        (num_blocks, block_size, head_dim + 4),
+        device=device,
+        dtype=torch.uint8,
+    )
+    slots = torch.arange(num_tokens, device=device, dtype=torch.int64)
+
+    indexer_k_quant_and_cache_triton(
+        source,
+        cache,
+        slots,
+        quant_block_size=head_dim,
+        scale_fmt="ue8m0",
+    )
+
+    fp8_dtype = current_platform.fp8_dtype()
+    gathered = torch.empty(
+        (num_tokens, head_dim), device=device, dtype=fp8_dtype
+    )
+    gathered_scale_bytes = torch.empty(
+        (num_tokens, 4), device=device, dtype=torch.uint8
+    )
+    block_table = torch.arange(
+        num_blocks, device=device, dtype=torch.int32
+    ).unsqueeze(0)
+    cu_seqlen = torch.tensor(
+        [0, num_tokens], device=device, dtype=torch.int32
+    )
+    token_to_seq = torch.zeros(num_tokens, device=device, dtype=torch.int32)
+    cp_gather_indexer_k_quant_cache_triton(
+        cache,
+        gathered,
+        gathered_scale_bytes,
+        block_table,
+        cu_seqlen,
+        token_to_seq,
+    )
+
+    fp8_max = 224.0 if fp8_dtype == torch.float8_e4m3fnuz else 448.0
+    raw_scale = source.float().abs().amax(dim=-1).clamp_min(1e-4) / fp8_max
+    expected_scale = torch.exp2(torch.ceil(torch.log2(raw_scale)))
+    actual_scale = gathered_scale_bytes.view(torch.float32).squeeze(-1)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+    torch.testing.assert_close(
+        gathered.float() * actual_scale.unsqueeze(-1),
+        source.float(),
+        rtol=1.25e-1,
+        atol=2e-2,
+    )
+
+
 def test_lightop_moe_align_matches_reference_assignment() -> None:
     device = _hcu_device()
     try:

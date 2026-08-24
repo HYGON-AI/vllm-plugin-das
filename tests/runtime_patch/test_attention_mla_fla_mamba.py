@@ -1518,6 +1518,161 @@ def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
     assert Builder().build(0, common).num_kv_actual_tokens == 5
 
 
+def test_gfx938_sparse_indexer_uses_triton_fp8_cache_insert(monkeypatch):
+    from vllm import _custom_ops as ops
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    calls = []
+
+    class Metadata:
+        slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
+        num_kv_actual_tokens = 2
+        num_decodes = 0
+        num_prefills = 0
+        num_decode_tokens = 0
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", Metadata)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer": Metadata()}),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "current_platform",
+        SimpleNamespace(
+            is_rocm=lambda: True,
+            fp8_dtype=lambda: torch.float8_e4m3fn,
+        ),
+    )
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "indexer_k_quant_and_cache_triton",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        ops,
+        "indexer_k_quant_and_cache",
+        lambda *args: pytest.fail("NVIDIA cache insert must not run on HCU"),
+    )
+
+    topk_indices = torch.empty((2, 1), dtype=torch.int32)
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((2, 4)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 16, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((2, 128), dtype=torch.float8_e4m3fn),
+        k=torch.zeros((2, 128), dtype=torch.bfloat16),
+        weights=torch.ones((2, 1)),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=1,
+        head_dim=128,
+        max_model_len=16,
+        total_seq_lens=2,
+        topk_indices_buffer=topk_indices,
+    )
+
+    assert result is topk_indices
+    assert len(calls) == 1
+    assert calls[0][1].shape == (1, 16, 132)
+    assert calls[0][2].tolist() == [0, 1]
+    torch.testing.assert_close(topk_indices, torch.full_like(topk_indices, -1))
+
+
+def test_gfx938_sparse_indexer_prefill_uses_triton_fp8_cache_gather(
+    monkeypatch,
+):
+    from vllm import _custom_ops as ops
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    calls = []
+    chunk = SimpleNamespace(
+        total_seq_lens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        token_to_seq=torch.tensor([0], dtype=torch.int32),
+        token_start=0,
+        token_end=1,
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([1], dtype=torch.int32),
+    )
+
+    class Metadata:
+        slot_mapping = torch.tensor([0], dtype=torch.int64)
+        num_kv_actual_tokens = 1
+        num_decodes = 0
+        num_prefills = 1
+        num_decode_tokens = 0
+        prefill = SimpleNamespace(chunks=[chunk])
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", Metadata)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer": Metadata()}),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "current_platform",
+        SimpleNamespace(
+            is_rocm=lambda: True,
+            fp8_dtype=lambda: torch.float8_e4m3fn,
+        ),
+    )
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+
+    def gather(*args, **kwargs):
+        calls.append((args, kwargs))
+        args[1].zero_()
+        args[2].view(torch.float32).fill_(1.0)
+
+    monkeypatch.setattr(sparse, "cp_gather_indexer_k_quant_cache_triton", gather)
+    monkeypatch.setattr(
+        ops,
+        "cp_gather_indexer_k_quant_cache",
+        lambda *args: pytest.fail("NVIDIA cache gather must not run on HCU"),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "rocm_fp8_mqa_logits",
+        lambda *args: torch.tensor([[1.0]]),
+    )
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "_topk_indices_torch",
+        lambda logits, topk: torch.zeros(
+            (logits.shape[0], topk), dtype=torch.int32
+        ),
+    )
+
+    topk_indices = torch.empty((1, 1), dtype=torch.int32)
+    sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 4)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 16, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 128), dtype=torch.float8_e4m3fn),
+        k=None,
+        weights=torch.ones((1, 1)),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=1,
+        head_dim=128,
+        max_model_len=16,
+        total_seq_lens=1,
+        topk_indices_buffer=topk_indices,
+        skip_k_cache_insert=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0][3] is chunk.block_table
+    assert calls[0][0][4] is chunk.cu_seq_lens
+    assert calls[0][1]["token_to_seq"] is chunk.token_to_seq
+    torch.testing.assert_close(topk_indices, torch.zeros_like(topk_indices))
+
+
 def test_mla_forward_slices_kv_with_independent_token_count():
     from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
