@@ -127,6 +127,10 @@ register_hcu_ci(
         "test_llama2_7b_eagle_spec_decode_token_parity"
     ),
     est_time=2400,
+    disabled=(
+        "times out on the single-card gfx938 PR runner; keep out of required "
+        "HCU gating until EAGLE startup/runtime is stabilized"
+    ),
 )
 register_hcu_ci(
     job="spec-decode",

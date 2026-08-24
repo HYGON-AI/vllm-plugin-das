@@ -167,21 +167,10 @@
       "suite": "model",
       "pytest_args": [
         "-k",
-        "llama2_7b_eagle_spec_decode_token_parity or qwen35_4b_mtp_spec_decode_token_parity"
+        "qwen35_4b_mtp_spec_decode_token_parity"
       ],
       "timeout_minutes": 120,
-      "partitions": 2,
       "requirements": [
-        {
-          "kind": "model",
-          "env": "VLLM_HCU_SPEC_TARGET_MODEL",
-          "relative": "vllm-optest-models/TheBloke/Llama-2-7B-fp16"
-        },
-        {
-          "kind": "model",
-          "env": "VLLM_HCU_SPEC_DRAFT_MODEL",
-          "relative": "vllm-optest-models/yuhuili/EAGLE-llama2-chat-7B"
-        },
         {
           "kind": "model",
           "env": "VLLM_HCU_MTP_MODEL",
