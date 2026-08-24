@@ -36,9 +36,6 @@ jobs:
       - self-hosted
       - ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
-    concurrency:
-      group: hcu-runner-${{ matrix.runner }}-${{ matrix.partition_id }}
-      cancel-in-progress: false
     env:
       HCU_CI_JOB_ID: ${{ matrix.id }}
       HCU_CI_REGISTRY_JOB: ${{ matrix.registry_job }}
@@ -118,6 +115,8 @@ jobs:
             id
             ls -ld /dev/kfd /dev/dri /opt/hyhal /opt/hyhal/lib 2>&1
             ls -l /dev/dri 2>&1
+            echo "VLLM_HCU_TEST_MODEL_ROOT=${VLLM_HCU_TEST_MODEL_ROOT:-<unset>}"
+            ls -ld /models/llm-models /models/llm-models/qwen3.5 /models/llm-models/vllm-optest-models 2>&1
             ldconfig -p 2>/dev/null | grep -E "hydmi|hyhal|rocm_smi" || true
             /usr/local/bin/python3.10 - <<'"'"'PY'"'"'
           import torch
