@@ -123,11 +123,15 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
     checkpoint_name = "model.layers.15.mlp.gate.e_score_correction_bias"
     parameter = torch.nn.Parameter(torch.full((4,), float("nan")))
     loaded_weight = torch.tensor([0.25, -0.5, 0.75, -1.0])
+    norm_name = "model.norm.weight"
+    norm_parameter = torch.nn.Parameter(torch.full((4,), float("nan")))
+    norm_weight = torch.tensor([1.0, 1.25, 1.5, 1.75])
 
     class InnerModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.expert_bias = parameter
+            self.norm_weight = norm_parameter
             self.config = SimpleNamespace(
                 tie_word_embeddings=False,
                 num_experts=4,
@@ -136,7 +140,12 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
 
         def named_parameters(self, *args, **kwargs):
             del args, kwargs
-            return iter([("layers.15.mlp.expert_bias", self.expert_bias)])
+            return iter(
+                [
+                    ("layers.15.mlp.expert_bias", self.expert_bias),
+                    ("norm.weight", self.norm_weight),
+                ]
+            )
 
         @staticmethod
         def get_expert_mapping():
@@ -158,7 +167,12 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
 
         def named_parameters(self, *args, **kwargs):
             del args, kwargs
-            return iter([(parameter_name, self.model.expert_bias)])
+            return iter(
+                [
+                    (parameter_name, self.model.expert_bias),
+                    (norm_name, self.model.norm_weight),
+                ]
+            )
 
     monkeypatch.setattr(
         hy_v4_model, "get_pp_missing_layer_names", lambda model: set()
@@ -175,13 +189,23 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
     model = OuterModel()
     loaded = hy_v4_model.HYV4ForCausalLM.load_weights(
         model,
-        [(checkpoint_name, loaded_weight)],
+        [
+            (checkpoint_name, loaded_weight),
+            (norm_name, norm_weight),
+        ],
     )
-    assert loaded == {parameter_name}
+    assert loaded == {parameter_name, norm_name}
     torch.testing.assert_close(parameter, loaded_weight)
+    torch.testing.assert_close(norm_parameter, norm_weight)
 
-    with pytest.raises(RuntimeError, match="Missing HY V4 expert correction biases"):
+    with pytest.raises(RuntimeError, match=r"model\.layers\.15\.mlp\.expert_bias"):
         hy_v4_model.HYV4ForCausalLM.load_weights(model, [])
+
+    with pytest.raises(RuntimeError, match=r"model\.norm\.weight"):
+        hy_v4_model.HYV4ForCausalLM.load_weights(
+            model,
+            [(checkpoint_name, loaded_weight)],
+        )
 
 
 def test_slice_sink_for_tp_uses_contiguous_attention_head_shards() -> None:
