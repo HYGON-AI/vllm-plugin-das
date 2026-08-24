@@ -23,6 +23,11 @@ register_hcu_ci(
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_aiter_silu_and_mul.py",
+    est_time=300,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -224,6 +229,16 @@ register_hcu_ci(
         "tests/integration/server/test_evalscope_deepseek_r1_gsm8k.py::"
         "test_deepseek_r1_channel_fp8_gsm8k_evalscope_server"
     ),
+    est_time=14400,
+)
+register_hcu_ci(
+    job="glm52-pcp",
+    target="tests/integration/models/test_glm52_pcp_mrv2.py",
+    est_time=14400,
+)
+register_hcu_ci(
+    job="glm52-pcp",
+    target="tests/integration/server/test_evalscope_glm52_pcp_humaneval.py",
     est_time=14400,
 )
 register_hcu_ci(

@@ -2807,6 +2807,15 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
             aiter_moe=aiter_moe,
         ),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            per_token_quant_int8=lambda x: (x, None),
+            per_token_quant_hip=_fp8_quant_abi_stub,
+        ),
+    )
     hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
     w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
     w2 = torch.zeros((3, 4, 4), dtype=torch.int8)

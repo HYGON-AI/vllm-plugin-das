@@ -393,6 +393,24 @@
         }
       ]
     },
+    "glm52-pcp": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "glm52_pcp"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_GLM52_MODEL",
+          "relative": "GLM-5___1-Channel-FP8-w8a8"
+        }
+      ]
+    },
     "single-node-topology": {
       "runner": "nmz36",
       "arch": "gfx938",
@@ -424,6 +442,7 @@
     {"job": "qwen3-vl-mmmu", "timeout_minutes": 150},
     {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
     {"job": "deepseek-gsm8k", "timeout_minutes": 360},
+    {"job": "glm52-pcp", "timeout_minutes": 360},
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
@@ -445,7 +464,8 @@
     },
     "kernel-accuracy-tests": {
       "patterns": [
-        "tests/accuracy/test_hcu_kernel_accuracy.py"
+        "tests/accuracy/test_hcu_kernel_accuracy.py",
+        "tests/accuracy/test_aiter_silu_and_mul.py"
       ],
       "jobs": [
         "accuracy-gfx936",
@@ -592,6 +612,16 @@
       ],
       "jobs": [
         "deepseek-gsm8k"
+      ]
+    },
+    "glm52-pcp": {
+      "patterns": [
+        "tests/integration/models/test_glm52_pcp_mrv2.py",
+        "tests/integration/server/test_evalscope_glm52_pcp_humaneval.py",
+        "tests/models/glm52_pcp_humaneval_evalscope.yaml"
+      ],
+      "jobs": [
+        "glm52-pcp"
       ]
     },
     "model-runtime-helper": {
