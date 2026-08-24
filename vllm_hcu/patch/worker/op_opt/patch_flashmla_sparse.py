@@ -163,6 +163,9 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         result = build(self, common_prefix_len, common_attn_metadata, fast_build)
         from vllm_hcu.platforms import envs as henvs
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            effective_pcp_world_size,
+        )
 
         vllm_config = getattr(self, "vllm_config", None)
         if vllm_config is None:
@@ -182,6 +185,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     "is missing from sparse MLA metadata builder"
                 )
             pcp_world_size = int(pcp_world_size)
+        pcp_world_size = effective_pcp_world_size(pcp_world_size)
         if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
             has_fp8_metadata = (
                 getattr(result, "fp8_extra_metadata", None) is not None

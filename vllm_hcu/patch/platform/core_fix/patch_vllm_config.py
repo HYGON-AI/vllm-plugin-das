@@ -108,10 +108,28 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         model_config, "enforce_eager", "ModelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
-    if _require_hcu_pcp_attribute(
+    speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
-    ) is not None:
-        raise ValueError("HCU PCP does not support speculative decoding or MTP.")
+    )
+    if speculative_config is not None:
+        if not use_mla:
+            raise ValueError(
+                "FlashAttention PCP does not support speculative decoding or MTP."
+            )
+        method = _require_hcu_pcp_attribute(
+            speculative_config, "method", "SpeculativeConfig"
+        )
+        if method != "mtp":
+            raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
+        num_speculative_tokens = _require_hcu_pcp_attribute(
+            speculative_config,
+            "num_speculative_tokens",
+            "SpeculativeConfig",
+        )
+        if num_speculative_tokens not in (1, 2):
+            raise ValueError(
+                "GLM-5.2 PCP+MTP requires one or two speculative tokens."
+            )
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
@@ -135,7 +153,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if feature_config.enable_lightly_cp:
         raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:
-        raise ValueError("HCU PCP does not support speculative decoding or MTP.")
+        if use_mla:
+            raise ValueError("GLM-5.2 PCP does not support HCU multi-layer MTP.")
+        raise ValueError("FlashAttention PCP does not support multi-layer MTP.")
 
 
 def _validate_hcu_pcp_scope(vllm_config: object) -> bool:

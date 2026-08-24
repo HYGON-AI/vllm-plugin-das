@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -55,14 +56,24 @@ class _InMemoryBlockTables:
         self.input_block_tables = [torch.full_like(canonical, -77)]
         self.num_kv_cache_groups = 1
         self.slot_mappings = torch.empty((1, 128), dtype=torch.int64)
+        self.allow_global_gather = False
+        self.global_gather_calls = 0
+        self.slot_mapping_calls = 0
 
     def gather_block_tables(
         self,
         idx_mapping: torch.Tensor,
-        num_reqs: int,
+        num_reqs_padded: int,
     ) -> tuple[torch.Tensor, ...]:
-        raise AssertionError(
-            "PCP must not gather into runner-owned v0.25.1 input block tables"
+        if not self.allow_global_gather:
+            raise AssertionError(
+                "PCP target attention must not gather into runner-owned "
+                "v0.25.1 input block tables"
+            )
+        self.global_gather_calls += 1
+        assert num_reqs_padded == idx_mapping.numel()
+        return tuple(
+            table.gpu[idx_mapping.to(torch.int64)] for table in self.block_tables
         )
 
     def compute_slot_mappings(
@@ -72,6 +83,7 @@ class _InMemoryBlockTables:
         positions: torch.Tensor,
         num_tokens: int,
     ) -> torch.Tensor:
+        self.slot_mapping_calls += 1
         for req_idx in range(idx_mapping.numel()):
             start = int(query_start_loc[req_idx])
             stop = int(query_start_loc[req_idx + 1])
@@ -304,8 +316,8 @@ def test_two_token_warmup_prefill_drops_empty_runtime_rows() -> None:
         assert local.is_prefilling_np.tolist() == [True]
 
 
-def test_one_token_prefill_keeps_one_dummy_row_on_the_empty_rank() -> None:
-    """An empty PCP rank still needs a valid prefill metadata row."""
+def test_one_token_prefill_materializes_padding_on_the_empty_rank() -> None:
+    """An empty rank needs a padding-only row with the peer's token width."""
 
     global_batch = _make_batch(
         [("one-token-prefill", [10], 1, True)]
@@ -319,11 +331,60 @@ def test_one_token_prefill_keeps_one_dummy_row_on_the_empty_rank() -> None:
     empty_rank = local_batches[1]
     assert empty_rank.req_ids == ["one-token-prefill"]
     assert empty_rank.num_reqs == 1
-    assert empty_rank.num_tokens == 0
+    assert empty_rank.num_tokens == 1
     assert empty_rank.num_tokens_after_padding == 1
-    assert empty_rank.num_scheduled_tokens.tolist() == [0]
-    assert empty_rank.query_start_loc_np.tolist() == [0, 0]
+    assert empty_rank.num_scheduled_tokens.tolist() == [1]
+    assert empty_rank.query_start_loc_np.tolist() == [0, 1]
     assert empty_rank.is_prefilling_np.tolist() == [True]
+    assert empty_rank.is_padding.tolist() == [True]
+    assert empty_rank.logits_indices.numel() == 0
+
+
+@pytest.mark.parametrize("length", [1, 3, 5, 7])
+def test_uneven_prefill_builds_equal_attention_consumable_virtual_batches(
+    length: int,
+) -> None:
+    """HCU PCP collectives require equal eager-attention shapes on every rank."""
+
+    global_batch = _make_batch(
+        [("uneven-prefill", list(range(100, 100 + length)), length, True)]
+    )
+    managers, _ = _make_managers()
+    local_batches = [manager.partition_batch(global_batch) for manager in managers]
+
+    assert len({local.num_reqs for local in local_batches}) == 1
+    assert len({local.num_tokens for local in local_batches}) == 1
+    assert all(
+        local.num_tokens == local.num_tokens_after_padding
+        for local in local_batches
+    )
+    for local in local_batches:
+        assert local.query_start_loc_np[-1] == local.num_tokens
+        assert int(local.num_scheduled_tokens.sum()) == local.num_tokens
+        assert local.is_padding.numel() == local.num_tokens
+        assert local.input_ids[local.is_padding].tolist() == [
+            0
+        ] * int(local.is_padding.sum())
+        assert local.positions[local.is_padding].tolist() == [
+            0
+        ] * int(local.is_padding.sum())
+        assert not torch.any(local.is_padding[local.logits_indices])
+        for row in range(local.num_reqs):
+            start = int(local.query_start_loc_np[row])
+            stop = int(local.query_start_loc_np[row + 1])
+            actual_positions = local.positions[start:stop][
+                ~local.is_padding[start:stop]
+            ]
+            expected_seq_len = (
+                int(actual_positions[-1]) + 1
+                if actual_positions.numel()
+                else int(local.num_scheduled_tokens[row])
+            )
+            assert int(local.seq_lens[row]) == expected_seq_len
+
+    assert sum(
+        int((~local.is_padding).sum()) for local in local_batches
+    ) == length
 
 
 def test_partition_creates_two_prefill_rows_and_replicates_decode() -> None:
@@ -359,6 +420,287 @@ def test_partition_creates_two_prefill_rows_and_replicates_decode() -> None:
     _assert_batch_matches_snapshot(global_batch, snapshot)
 
 
+@pytest.mark.parametrize(
+    (
+        "requests",
+        "num_draft_tokens",
+        "draft_tokens_per_req",
+        "expanded_idx_mapping",
+        "expanded_local_pos",
+        "logits_indices",
+        "cu_num_logits",
+    ),
+    [
+        (
+            [
+                ("decode-a", [900, 901], 18, False),
+                ("decode-b", [800, 801], 12, False),
+            ],
+            2,
+            [1, 1],
+            [10, 10, 11, 11],
+            [0, 1, 0, 1],
+            [0, 1, 2, 3],
+            [0, 2, 4],
+        ),
+        (
+            [
+                ("decode-a", [900, 901, 902], 19, False),
+                ("decode-b", [800, 801, 802], 13, False),
+            ],
+            4,
+            [2, 2],
+            [10, 10, 10, 11, 11, 11],
+            [0, 1, 2, 0, 1, 2],
+            [0, 1, 2, 3, 4, 5],
+            [0, 3, 6],
+        ),
+    ],
+    ids=["mtp1", "mtp2"],
+)
+def test_partition_replicates_spec_decode_layout_on_every_pcp_rank(
+    requests,
+    num_draft_tokens,
+    draft_tokens_per_req,
+    expanded_idx_mapping,
+    expanded_local_pos,
+    logits_indices,
+    cu_num_logits,
+) -> None:
+    """Dropping draft-token metadata disables target rejection sampling."""
+
+    base_batch = _make_batch(requests)
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=num_draft_tokens,
+        num_draft_tokens_per_req=np.asarray(draft_tokens_per_req, dtype=np.int32),
+        expanded_idx_mapping=torch.tensor(expanded_idx_mapping, dtype=torch.int32),
+        expanded_local_pos=torch.tensor(expanded_local_pos, dtype=torch.int32),
+        logits_indices=torch.tensor(logits_indices, dtype=torch.int64),
+        cu_num_logits=torch.tensor(cu_num_logits, dtype=torch.int32),
+        cu_num_logits_np=np.asarray(cu_num_logits, dtype=np.int32),
+    )
+    managers, _ = _make_managers()
+
+    for manager in managers:
+        local = manager.partition_batch(global_batch)
+        assert local.input_ids.tolist() == [
+            token for _, tokens, _, _ in requests for token in tokens
+        ]
+        assert local.num_draft_tokens == num_draft_tokens
+        assert local.num_draft_tokens_per_req.tolist() == draft_tokens_per_req
+        assert local.expanded_idx_mapping.tolist() == expanded_idx_mapping
+        assert local.expanded_local_pos.tolist() == expanded_local_pos
+        assert local.logits_indices.tolist() == logits_indices
+        assert local.cu_num_logits_np.tolist() == cu_num_logits
+
+
+def test_partition_passes_known_sampler_mapping_size_to_repeat_interleave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting the known output size forces a GPU sync to infer it."""
+
+    base_batch = _make_batch(
+        [
+            ("decode-a", [900, 901, 902], 19, False),
+            ("decode-b", [800, 801, 802], 13, False),
+        ]
+    )
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=4,
+        num_draft_tokens_per_req=np.asarray([2, 2], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor(
+            [10, 10, 10, 11, 11, 11], dtype=torch.int32
+        ),
+        expanded_local_pos=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32),
+        logits_indices=torch.arange(6, dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 3, 6], dtype=np.int32),
+    )
+    manager = _make_managers()[0][0]
+    original_repeat_interleave = torch.repeat_interleave
+
+    def require_known_output_size(input, repeats, *args, **kwargs):
+        assert kwargs.get("output_size") == 6
+        return original_repeat_interleave(input, repeats, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "repeat_interleave", require_known_output_size)
+
+    local = manager.partition_batch(global_batch)
+
+    assert local.expanded_idx_mapping.tolist() == [10, 10, 10, 11, 11, 11]
+
+
+def test_partition_builds_sampler_positions_without_per_request_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampler positions must not launch one arange operation per request."""
+
+    base_batch = _make_batch(
+        [
+            ("decode-a", [900, 901, 902], 19, False),
+            ("decode-b", [800, 801, 802], 13, False),
+        ]
+    )
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=4,
+        num_draft_tokens_per_req=np.asarray([2, 2], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor(
+            [10, 10, 10, 11, 11, 11], dtype=torch.int32
+        ),
+        expanded_local_pos=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32),
+        logits_indices=torch.arange(6, dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 3, 6], dtype=np.int32),
+    )
+    manager = _make_managers()[0][0]
+    original_arange = torch.arange
+    arange_calls = 0
+
+    def count_arange(*args, **kwargs):
+        nonlocal arange_calls
+        arange_calls += 1
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", count_arange)
+
+    local = manager.partition_batch(global_batch)
+
+    assert local.expanded_local_pos.tolist() == [0, 1, 2, 0, 1, 2]
+    assert arange_calls == 1
+
+
+def test_async_mtp_partition_preserves_gpu_corrected_positions_and_seq_lens() -> None:
+    """PCP must not rebuild rejection-corrected GPU state from its CPU upper bound."""
+
+    base_batch = _make_batch([("decode", [900, 901, 902], 20, False)])
+    global_batch = replace(
+        base_batch,
+        # MRV2 async MTP keeps this CPU mirror optimistic until the scheduler
+        # observes the sampled output. The device tensors above are already
+        # corrected for two rejected draft tokens.
+        num_computed_tokens_np=np.asarray([19], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([22], dtype=torch.int32),
+        num_draft_tokens=2,
+        num_draft_tokens_per_req=np.asarray([2], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor([10, 10, 10], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0, 1, 2], dtype=torch.int32),
+        logits_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 3], dtype=np.int32),
+    )
+    managers, _ = _make_managers()
+
+    for manager in managers:
+        local = manager.partition_batch(global_batch)
+        assert local.positions.tolist() == [17, 18, 19]
+        assert local.seq_lens.tolist() == [20]
+        # CPU metadata remains a safe optimistic upper bound.
+        assert local.seq_lens_cpu_upper_bound.tolist() == [22]
+
+
+def test_uneven_prefill_and_mtp_decode_keep_equal_collective_shapes() -> None:
+    """Virtual prefill rows must not alter a replicated MTP decode row."""
+
+    base_batch = _make_batch(
+        [
+            ("prefill", [100, 101, 102], 3, True),
+            ("decode", [900, 901], 18, False),
+        ]
+    )
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=1,
+        num_draft_tokens_per_req=np.asarray([0, 1], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor([11, 11], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0, 1], dtype=torch.int32),
+        logits_indices=torch.tensor([3, 4], dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 0, 2], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 0, 2], dtype=np.int32),
+    )
+    managers, _ = _make_managers()
+    local_batches = [manager.partition_batch(global_batch) for manager in managers]
+
+    assert len({local.num_reqs for local in local_batches}) == 1
+    assert len({local.num_tokens for local in local_batches}) == 1
+    for local in local_batches:
+        decode_row = local.req_ids.index("decode")
+        decode_start = int(local.query_start_loc_np[decode_row])
+        decode_stop = int(local.query_start_loc_np[decode_row + 1])
+        assert local.input_ids[decode_start:decode_stop].tolist() == [900, 901]
+        assert not torch.any(local.is_padding[decode_start:decode_stop])
+        assert local.num_draft_tokens == 1
+        assert local.num_draft_tokens_per_req[decode_row] == 1
+        assert local.logits_indices.tolist() == [decode_start, decode_start + 1]
+
+
+def test_uneven_prefill_padding_never_owns_a_kv_slot() -> None:
+    """The virtual row must not overwrite the global request's first KV slot."""
+
+    block_tables = _InMemoryBlockTables()
+    global_batch = _make_batch(
+        [("uneven-prefill", [100, 101, 102], 3, True)]
+    )
+    managers, _ = _make_managers(block_tables=block_tables)
+    local_batches = [manager.partition_batch(global_batch) for manager in managers]
+
+    for manager, local in zip(managers, local_batches):
+        _, gathered_slots = manager.prepare_attn(local)
+        assert sorted(gathered_slots[gathered_slots != -1].tolist()) == [
+            1000,
+            1001,
+            1002,
+        ]
+        assert int((gathered_slots == -1).sum()) == 1
+
+
+def test_global_mtp_attention_reuses_target_slot_mappings() -> None:
+    """Recomputing global slots in the sampling path adds avoidable ITL."""
+
+    block_tables = _InMemoryBlockTables()
+    global_batch = _make_batch(
+        [
+            ("decode-a", [900, 901, 902], 19, False),
+            ("decode-b", [800, 801, 802], 13, False),
+        ]
+    )
+    manager = _make_managers(block_tables=block_tables)[0][0]
+    local_batch = manager.partition_batch(global_batch)
+    manager.prepare_attn(local_batch)
+    expected_slots = torch.tensor(
+        [[1016, 1017, 1018, 1110, 1111, 1112]], dtype=torch.int64
+    )
+    assert block_tables.slot_mapping_calls == 1
+    block_tables.allow_global_gather = True
+
+    global_blocks, global_slots = manager.prepare_global_attn()
+
+    assert block_tables.global_gather_calls == 1
+    assert block_tables.slot_mapping_calls == 1
+    assert torch.equal(
+        global_blocks[0],
+        block_tables.block_tables[0].gpu[global_batch.idx_mapping.to(torch.int64)],
+    )
+    assert torch.equal(global_slots, expected_slots)
+
+
+def test_global_mtp_attention_rejects_unprepared_slot_mappings() -> None:
+    """A new batch must not reuse stale global slots from an older target run."""
+
+    block_tables = _InMemoryBlockTables()
+    manager = _make_managers(block_tables=block_tables)[0][0]
+    old_batch = manager.partition_batch(
+        _make_batch([("old-decode", [900], 19, False)])
+    )
+    manager.prepare_attn(old_batch)
+    manager.partition_batch(_make_batch([("new-decode", [800], 13, False)]))
+
+    with pytest.raises(RuntimeError, match="not prepared"):
+        manager.prepare_global_attn()
+
+
 def test_partition_pads_each_rank_to_equal_width_and_remaps_logits() -> None:
     """Unequal rank widths would make the hidden-state collective invalid."""
 
@@ -374,17 +716,36 @@ def test_partition_pads_each_rank_to_equal_width_and_remaps_logits() -> None:
         assert local.num_tokens == int(local.num_scheduled_tokens.sum())
         assert local.input_ids.shape == local.positions.shape == local.is_padding.shape
         assert local.input_ids.numel() == local.num_tokens_after_padding
-        nonempty_stops = [
+        real_row_stops = [
             int(local.query_start_loc_np[row + 1] - 1)
             for row, count in enumerate(local.num_scheduled_tokens)
             if count > 0
+            and not torch.all(
+                local.is_padding[
+                    int(local.query_start_loc_np[row]) : int(
+                        local.query_start_loc_np[row + 1]
+                    )
+                ]
+            )
         ]
-        assert local.logits_indices.tolist() == nonempty_stops
+        assert local.logits_indices.tolist() == real_row_stops
         assert local.expanded_local_pos.dtype == torch.int32
-        assert local.expanded_local_pos.tolist() == [0] * len(nonempty_stops)
+        assert local.expanded_local_pos.tolist() == [0] * len(real_row_stops)
         assert local.cu_num_logits_np.tolist() == np.cumsum(
             [0]
-            + [int(count > 0) for count in local.num_scheduled_tokens]
+            + [
+                int(
+                    count > 0
+                    and not torch.all(
+                        local.is_padding[
+                            int(local.query_start_loc_np[row]) : int(
+                                local.query_start_loc_np[row + 1]
+                            )
+                        ]
+                    )
+                )
+                for row, count in enumerate(local.num_scheduled_tokens)
+            ]
         ).tolist()
 
 

@@ -73,6 +73,20 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             assert grammar_output == "grammar"
             assert self.execute_model_state.hidden_states is self.expected_hidden
             assert self.execute_model_state.input_batch is self.expected_batch
+            if hasattr(self, "expected_attn_metadata"):
+                assert (
+                    self.execute_model_state.attn_metadata
+                    == self.expected_attn_metadata
+                )
+                assert (
+                    self.execute_model_state.slot_mappings_by_layer
+                    == self.expected_slot_mappings_by_layer
+                )
+                from vllm_hcu.model_executor.layers.attention import pcp
+
+                assert getattr(
+                    pcp, "in_replicated_mtp_batch", lambda: False
+                )()
             return "sampled"
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
@@ -94,6 +108,15 @@ def _config(pcp_size: int) -> object:
 class _ExecuteModelState(NamedTuple):
     input_batch: object
     hidden_states: object
+
+
+class _MTPExecuteModelState(NamedTuple):
+    input_batch: object
+    attn_metadata: object
+    slot_mappings_by_layer: object
+    hidden_states: object
+    aux_hidden_states: object
+    finished_req_ids: object
 
 
 def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
@@ -217,6 +240,95 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     assert runner.execute_model_state is not original_state
     assert runner.execute_model_state.input_batch is global_batch
     assert runner.execute_model_state.hidden_states is global_hidden
+
+
+def test_pcp_mtp_rebuilds_global_drafter_attention_state(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing rank-local target metadata corrupts the global MTP proposal."""
+
+    runner_module, events = pcp_runner_module
+    global_batch = object()
+    local_batch = object()
+    global_hidden = object()
+    local_hidden = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            events.append("restore_for_sampling")
+            assert hidden_states is local_hidden
+            return global_hidden, global_batch
+
+        def prepare_global_attn(self):
+            events.append("pcp.prepare_global_attn")
+            return ("cached-global-blocks", global_batch), "cached-global-slots"
+
+    class ModelState:
+        def prepare_attn(
+            self,
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+        ):
+            events.append("model_state.prepare_global_mtp_attn")
+            assert input_batch is global_batch
+            assert cudagraph_mode.name == "NONE"
+            assert block_tables == ("cached-global-blocks", global_batch)
+            assert slot_mappings == "cached-global-slots"
+            assert attn_groups == "attn-groups"
+            assert kv_cache_config == "kv-config"
+            return "global-mtp-attn-metadata"
+
+    def build_slots(slot_mappings, kv_cache_config):
+        events.append("build_global_slot_mappings_by_layer")
+        assert slot_mappings == "cached-global-slots"
+        assert kv_cache_config == "kv-config"
+        return "global-mtp-slots-by-layer"
+
+    monkeypatch.setattr(
+        runner_module,
+        "build_slot_mappings_by_layer",
+        build_slots,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "synchronize_pp_spec_draft_tokens",
+        lambda *args: False,
+    )
+
+    runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
+    runner.pcp_manager = Manager()
+    runner.speculator = object()
+    runner.model_state = ModelState()
+    runner.kv_cache_config = "kv-config"
+    runner.attn_groups = "attn-groups"
+    runner.expected_hidden = global_hidden
+    runner.expected_batch = global_batch
+    runner.expected_attn_metadata = "global-mtp-attn-metadata"
+    runner.expected_slot_mappings_by_layer = "global-mtp-slots-by-layer"
+    runner.execute_model_state = _MTPExecuteModelState(
+        input_batch=local_batch,
+        attn_metadata="local-attn-metadata",
+        slot_mappings_by_layer="local-slots-by-layer",
+        hidden_states=local_hidden,
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    events.clear()
+
+    assert runner.sample_tokens("grammar") == "sampled"
+    assert events == [
+        "restore_for_sampling",
+        "pcp.prepare_global_attn",
+        "build_global_slot_mappings_by_layer",
+        "model_state.prepare_global_mtp_attn",
+        "super.sample_tokens",
+    ]
 
 
 def test_pcp_runner_routes_dummy_slots_through_manager(

@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -695,6 +696,40 @@ def test_mla_pcp_one_keeps_target_opaque_full_forward(monkeypatch):
     assert events == ["opaque_forward"]
 
 
+def test_replicated_mtp_scope_uses_target_mla_forward(monkeypatch):
+    """A restored global MTP batch must not enter PCP cache gathers again."""
+
+    adapter = _adapter()
+    events = []
+    module = _fake_mla_module(adapter, [], events)
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={"layer": SimpleNamespace(pcp_world_size=2)},
+        slot_mapping={"layer": torch.tensor([0], dtype=torch.int64)},
+    )
+    assert adapter.apply_to_module(module) is True
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    monkeypatch.setattr(
+        pcp,
+        "maybe_gather_mla_latent_cache_inputs",
+        lambda *args: pytest.fail("global MTP input entered a PCP cache gather"),
+    )
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_use_pcp = True
+    instance._hcu_pcp_world_size = 2
+    instance.calculate_kv_scales = False
+    instance.layer_name = "layer"
+    q, kv, rope = object(), object(), object()
+    scope = getattr(pcp, "replicated_mtp_batch_scope", nullcontext)
+
+    with scope():
+        result = instance.forward(q, kv, rope)
+
+    assert result == "target-opaque-v0.25.1"
+    assert module.full_forward_calls == [(instance, (q, kv, rope, None))]
+    assert events == ["opaque_forward"]
+
+
 def test_dense_and_sparse_mla_metadata_carry_pcp_world_size(monkeypatch):
     adapter = _adapter()
     module = _fake_mla_module(adapter, [])
@@ -774,6 +809,16 @@ def _build_fp8_separate_prefill_decode(self, common_attn_metadata):
     sparse_metadata = sparse_builder.build(0, common)
 
     assert sparse_metadata.pcp_world_size == 2
+
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    scope = getattr(pcp, "replicated_mtp_batch_scope", nullcontext)
+    with scope():
+        replicated_dense_metadata = dense_builder.build(0, common)
+        replicated_sparse_metadata = sparse_builder.build(0, common)
+
+    assert replicated_dense_metadata.pcp_world_size == 1
+    assert replicated_sparse_metadata.pcp_world_size == 1
 
 
 @pytest.mark.parametrize(

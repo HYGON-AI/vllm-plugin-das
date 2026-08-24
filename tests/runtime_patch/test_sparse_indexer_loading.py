@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import copy
 import importlib
+import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -221,6 +222,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     )
     forward_hip = _load_v32_sparse_indexer_contract(
         torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
         get_forward_context=lambda: SimpleNamespace(
             attn_metadata={"indexer": metadata}
         ),
@@ -267,6 +269,62 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     assert hcu_args[5] is weights
     assert hcu_args[8] == 2048
     assert hcu_args[-1] is True
+
+
+def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
+    """The global MTP draft must use one-rank metadata and cache ownership."""
+
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+        return "topk"
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        effective_pcp_world_size=lambda _value: 1,
+        get_forward_context=lambda: pytest.fail(
+            "replicated MTP draft re-entered PCP indexer cache gathering"
+        ),
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "replicated MTP draft gathered PCP indexer inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *args: pytest.fail(
+                "replicated MTP draft used external PCP cache insertion"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "replicated MTP draft used PCP BF16 cache insertion"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    local_k = torch.ones(2, 2)
+    q_quant = torch.ones(2, 2)
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=True,
+        pcp_world_size=2,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
+    assert len(calls) == 1
+    assert calls[0][4] is local_k
+    assert calls[0][-1] is False
 
 
 def test_v32_hcu_indexer_impl_advertises_pcp_capability():
@@ -324,6 +382,129 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
     assert metadata.pcp_world_size == 2
 
 
+def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MTP2 flattening must not call a schedule builder no HCU path consumes."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.op_opt.patch_mla_indexer"
+    )
+
+    def split_chunks(
+        seq_lens_cpu,
+        query_lens_cpu,
+        workspace_size,
+        max_logits_bytes,
+        request_offset=0,
+    ):
+        del (
+            seq_lens_cpu,
+            query_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+            request_offset,
+        )
+        return []
+
+    def split_batch(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        del (
+            common_attn_metadata,
+            decode_threshold,
+            require_uniform,
+            treat_short_extends_as_decodes,
+        )
+        return (1, 0, 3, 0)
+
+    upstream_schedule = object()
+
+    class Builder:
+        def build(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=False,
+        ):
+            del common_prefix_len, common_attn_metadata, fast_build
+            return SimpleNamespace(
+                decode=SimpleNamespace(
+                    seq_lens=torch.tensor([[5], [6], [7]], dtype=torch.int32),
+                    schedule_metadata=upstream_schedule,
+                )
+            )
+
+    module = ModuleType(adapter.TARGET_MODULE)
+    module.split_indexer_prefill_chunks = split_chunks
+    module.split_decodes_and_prefills = split_batch
+    module.DeepseekV32IndexerMetadataBuilder = Builder
+    module.current_platform = SimpleNamespace(is_rocm=lambda: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "lightop",
+        SimpleNamespace(
+            gemmopt=SimpleNamespace(
+                get_paged_mqa_logits_metadata=lambda *args: pytest.fail(
+                    "ROCm built unused lightop schedule metadata"
+                )
+            )
+        ),
+    )
+    assert adapter.apply_to_module(module) is True
+    builder = Builder()
+    builder.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+    builder.kv_cache_spec = SimpleNamespace(storage_block_size=64)
+    builder.num_sms = 64
+    common = SimpleNamespace(num_actual_tokens=3)
+
+    metadata = builder.build(0, common)
+
+    assert metadata.decode.schedule_metadata is upstream_schedule
+
+
+def test_rocm_lightop_paged_mqa_builds_its_schedule_internally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime contract permits the metadata adapter to skip precompute."""
+
+    runtime = importlib.import_module(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def paged_mqa_logits(*args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime.gemmopt, "paged_mqa_logits", paged_mqa_logits)
+    supplied_schedule = object()
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        torch.empty((2, 1, 8, 128)),
+        torch.empty((1, 64, 1, 132), dtype=torch.uint8),
+        torch.empty((2, 8)),
+        torch.ones((2, 1), dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        supplied_schedule,
+        64,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][5] is None
+
+
 def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
     calls: list[tuple[object, ...]] = []
 
@@ -337,6 +518,7 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
     )
     forward_hip = _load_v32_sparse_indexer_contract(
         torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
         get_forward_context=lambda: pytest.fail(
             "PCP=1 inspected forward metadata outside the custom op"
         ),
