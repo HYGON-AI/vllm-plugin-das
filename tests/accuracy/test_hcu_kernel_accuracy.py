@@ -432,3 +432,37 @@ def test_hcu_interleaved_rotary_matches_float32_reference() -> None:
     torch.testing.assert_close(
         actual_key.float(), reference(key), rtol=2e-2, atol=2e-2
     )
+
+
+def test_hcu_triton_group_fp8_ue8m0_matches_reference() -> None:
+    device = _hcu_device()
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        get_fp8_min_max,
+    )
+    from vllm_hcu.model_executor.layers.quantization.group_fp8_runtime import (
+        per_token_group_quant_fp8,
+    )
+
+    generator = torch.Generator(device=device).manual_seed(20260825)
+    value = torch.randn(
+        (7, 256), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    value[0].zero_()
+
+    quantized, scales = per_token_group_quant_fp8(
+        value,
+        group_size=128,
+        use_ue8m0=True,
+    )
+
+    _, fp8_max = get_fp8_min_max()
+    grouped = value.float().view(7, 2, 128)
+    raw_scales = grouped.abs().amax(dim=-1).clamp_min(1e-10) / fp8_max
+    expected_scales = torch.exp2(torch.ceil(torch.log2(raw_scales)))
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(
+        quantized.float().view_as(grouped) * scales.unsqueeze(-1),
+        grouped,
+        rtol=1.25e-1,
+        atol=2e-2,
+    )
