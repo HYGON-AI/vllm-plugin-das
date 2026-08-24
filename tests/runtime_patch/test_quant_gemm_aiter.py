@@ -8,6 +8,7 @@ import enum
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -232,6 +233,33 @@ def test_aiter_asm_boltops_fp8_quant_context_preserves_native_activation(
             "silu", True, output, torch.empty((2, 8)), None, None
         )
     torch.testing.assert_close(output, torch.ones_like(output))
+
+
+def test_aiter_dynamo_metrics_patch_preserves_nonserializable_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import torch._dynamo.utils as dynamo_utils
+
+    calls = 0
+
+    def nonserializable_config():
+        nonlocal calls
+        calls += 1
+        raise TypeError("Object of type function is not JSON serializable")
+
+    monkeypatch.setattr(
+        dynamo_utils,
+        "_get_dynamo_config_for_logging",
+        nonserializable_config,
+    )
+
+    aiter_runtime._install_aiter_dynamo_metrics_logging_patch()
+    patched = dynamo_utils._get_dynamo_config_for_logging
+
+    assert patched() == "Dynamo Config is not JSON serializable"
+    assert calls == 1
+    aiter_runtime._install_aiter_dynamo_metrics_logging_patch()
+    assert dynamo_utils._get_dynamo_config_for_logging is patched
 
 
 def test_aiter_asm_boltops_fp8_quant_context_nested_disable_restores_state(
@@ -3275,6 +3303,100 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_both_fp8_asm_stages(
             ]
 
 
+def test_quantized_aiter_moe_c_preserves_swiglu_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, float | None]] = []
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def native_silu(output, input, rows_per_block=1, vec_size=2):
+        del input, rows_per_block, vec_size
+        calls.append(("native", None))
+        output.fill_(1)
+
+    def aligned_activation(
+        activation,
+        is_gated,
+        activated_out,
+        ffn1_out_2d,
+        gemm1_alpha,
+        gemm1_limit,
+    ):
+        del activation, is_gated, ffn1_out_2d, gemm1_alpha
+        calls.append(("aligned", gemm1_limit))
+        activated_out.fill_(2)
+
+    moe_c_module = _module(
+        "aiter.fused_moe_c",
+        moe_c_silu_and_mul=native_silu,
+        _apply_activation=aligned_activation,
+    )
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe_c", moe_c_module)
+
+    def get_config(**kwargs):
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type="moe_c",
+            need_shuffle=False,
+        )
+
+    kernel_calls: list[dict[str, object]] = []
+
+    def aiter_moe(**kwargs):
+        kernel_calls.append(kwargs)
+        output = torch.empty((2, 4))
+        moe_c_module.moe_c_silu_and_mul(output, torch.empty((2, 8)))
+        return output
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+
+    output = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+        w1=torch.zeros((3, 8, 4), dtype=torch.int8),
+        w2=torch.zeros((3, 4, 4), dtype=torch.int8),
+        topk_weights=torch.ones((2, 2)),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+        vllm_moe_config=SimpleNamespace(
+            num_experts=3,
+            swiglu_limit=10.0,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+        ),
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=None,
+        quant_config=quant_config,
+    )
+
+    torch.testing.assert_close(output, torch.full_like(output, 2))
+    assert calls == [("aligned", 10.0)]
+    assert kernel_calls[0]["gemm1_alpha"] is None
+    assert kernel_calls[0]["gemm1_limit"] == 10.0
+
+
 def test_quantized_aiter_runtime_caches_config_and_invalidates_shuffled_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3361,6 +3483,678 @@ def test_quantized_aiter_runtime_caches_config_and_invalidates_shuffled_weights(
     larger_x = torch.ones((3, 4), dtype=torch.bfloat16)
     run(larger_x, torch.ones((3, 2)), torch.zeros((3, 2), dtype=torch.int64))
     assert len(config_calls) == 2
+
+
+def test_quantized_aiter_runtime_pins_destructive_shuffle_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_calls: list[dict[str, object]] = []
+
+    def get_config(**kwargs):
+        config_calls.append(kwargs)
+        requested = kwargs.get("spec_sol_type")
+        solution = "moe_c" if requested is None else requested
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type=solution,
+            need_shuffle=solution == "moe_c",
+        )
+
+    monkeypatch.delenv(
+        "VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", raising=False
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+
+    compressed_tensors_moe_runtime._get_aiter_quantized_runtime_config(
+        torch.ones((2, 4), dtype=torch.bfloat16),
+        w1,
+        w2,
+        torch.zeros((2, 2), dtype=torch.int64),
+        "fp8_w8a8",
+        "silu",
+    )
+    compressed_tensors_moe_runtime._get_aiter_quantized_runtime_config(
+        torch.ones((3, 4), dtype=torch.bfloat16),
+        w1,
+        w2,
+        torch.zeros((3, 2), dtype=torch.int64),
+        "fp8_w8a8",
+        "silu",
+    )
+
+    assert config_calls[0].get("spec_sol_type") is None
+    assert config_calls[1]["spec_sol_type"] == "moe_c"
+
+
+def test_quantized_aiter_runtime_serializes_solution_pin(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    first_config_entered = threading.Event()
+    release_first_config = threading.Event()
+    config_calls: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def get_config(**kwargs):
+        config_calls.append(kwargs)
+        if len(config_calls) == 1:
+            first_config_entered.set()
+            assert release_first_config.wait(timeout=5)
+        requested = kwargs.get("spec_sol_type")
+        solution = "moe_c" if requested is None else requested
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type=solution,
+            need_shuffle=solution == "moe_c",
+        )
+
+    monkeypatch.delenv(
+        "VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", raising=False
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+
+    def resolve(tokens):
+        try:
+            compressed_tensors_moe_runtime._get_aiter_quantized_runtime_config(
+                torch.ones((tokens, 4), dtype=torch.bfloat16),
+                w1,
+                w2,
+                torch.zeros((tokens, 2), dtype=torch.int64),
+                "fp8_w8a8",
+                "silu",
+            )
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    first = threading.Thread(target=resolve, args=(2,))
+    second = threading.Thread(target=resolve, args=(3,))
+    first.start()
+    assert first_config_entered.wait(timeout=5)
+    second.start()
+    assert len(config_calls) == 1
+    release_first_config.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not errors
+    assert len(config_calls) == 2
+    assert config_calls[1]["spec_sol_type"] == "moe_c"
+
+
+def test_hcu_model_runner_wraps_complete_reload_transaction():
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text()
+    tree = ast.parse(source)
+    reload_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "reload_weights"
+    )
+    called_names = {
+        node.func.id
+        for node in ast.walk(reload_method)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert {
+        "begin_aiter_weight_reload",
+        "commit_aiter_weight_reload",
+        "abort_aiter_weight_reload",
+    } <= called_names
+
+
+def test_quantized_aiter_runtime_chunked_inplace_shuffle_avoids_full_weight_copy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    shuffle_batch_sizes: list[int] = []
+
+    def shuffle_weights(w1, w2, config):
+        assert config.solution_type == "moe_c"
+        shuffle_batch_sizes.append(w1.shape[0])
+        return w1 + 1, w2 + 2
+
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+    )
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+
+    prepared_w1, prepared_w2 = (
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+            w1,
+            w2,
+            config,
+        )
+    )
+
+    assert prepared_w1 is w1 and prepared_w2 is w2
+    assert shuffle_batch_sizes == [1, 1, 1]
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.full_like(w2, 2))
+
+    cached_w1, cached_w2 = (
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+            w1,
+            w2,
+            config,
+        )
+    )
+    assert cached_w1 is w1 and cached_w2 is w2
+    assert shuffle_batch_sizes == [1, 1, 1]
+
+
+def test_quantized_aiter_runtime_automatically_chunks_fp8_moe_c_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    shuffle_batch_sizes: list[int] = []
+
+    def shuffle_weights(w1, w2, config):
+        assert config.solution_type == "moe_c"
+        shuffle_batch_sizes.append(w1.shape[0])
+        return w1 + 1, w2 + 2
+
+    monkeypatch.delenv(
+        "VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VLLM_HCU_AITER_MOE_SHUFFLE_CHUNK_EXPERTS",
+        raising=False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+    )
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+
+    prepared_w1, prepared_w2 = (
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+            w1,
+            w2,
+            config,
+        )
+    )
+
+    assert prepared_w1 is w1 and prepared_w2 is w2
+    assert shuffle_batch_sizes == [1, 1, 1]
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.full_like(w2, 2))
+
+
+def test_quantized_aiter_runtime_invalidates_inplace_shuffle_via_weight_loader(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    shuffle_calls = 0
+
+    def shuffle_weights(w1, w2, config):
+        nonlocal shuffle_calls
+        shuffle_calls += 1
+        return w1 + 1, w2 + 2
+
+    def weight_loader(param, loaded_weight):
+        param.data.copy_(loaded_weight)
+
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle_weights),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+    )
+    w1 = torch.nn.Parameter(torch.zeros((1, 8, 4)), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.zeros((1, 4, 4)), requires_grad=False)
+    w1.weight_loader = weight_loader
+    w2.weight_loader = weight_loader
+
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+    assert shuffle_calls == 1
+    assert w1._version == 1
+
+    w1.weight_loader(w1, torch.zeros_like(w1))
+    w2.weight_loader(w2, torch.zeros_like(w2))
+    assert w1._version == 1
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+
+    assert shuffle_calls == 2
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.full_like(w2, 2))
+
+
+def test_quantized_aiter_runtime_rejects_layout_transition_after_inplace_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=lambda w1, w2, config: (w1 + 1, w2 + 2),
+        ),
+    )
+    shuffled = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+    )
+    canonical = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="asm",
+        need_shuffle=False,
+    )
+    w1 = torch.zeros((1, 8, 4))
+    w2 = torch.zeros((1, 4, 4))
+
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+        w1, w2, shuffled
+    )
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="layout transition",
+    ):
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+            w1, w2, canonical
+        )
+
+
+def test_quantized_aiter_runtime_serializes_inplace_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    shuffle_calls = 0
+    results: list[tuple[torch.Tensor, torch.Tensor]] = []
+    errors: list[BaseException] = []
+
+    def shuffle_weights(w1, w2, config):
+        nonlocal shuffle_calls
+        shuffle_calls += 1
+        if shuffle_calls == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        return w1 + 1, w2 + 2
+
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle_weights),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+    )
+    w1 = torch.zeros((2, 8, 4))
+    w2 = torch.zeros((2, 4, 4))
+
+    def prepare():
+        try:
+            results.append(
+                compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+                    w1, w2, config
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    first = threading.Thread(target=prepare)
+    second = threading.Thread(target=prepare)
+    first.start()
+    assert entered.wait(timeout=5)
+    second.start()
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not errors
+    assert len(results) == 2
+    assert shuffle_calls == 2
+    assert all(pair == (w1, w2) for pair in results)
+
+
+def test_quantized_aiter_runtime_quarantines_partial_shuffle_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    shuffle_calls = 0
+
+    def shuffle_weights(w1, w2, config):
+        nonlocal shuffle_calls
+        shuffle_calls += 1
+        if shuffle_calls == 2:
+            raise RuntimeError("synthetic chunk failure")
+        return w1 + 1, w2 + 2
+
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle_weights),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+    )
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+
+    with pytest.raises(RuntimeError, match="synthetic chunk failure"):
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+            w1, w2, config
+        )
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="partially shuffled",
+    ):
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+            w1, w2, config
+        )
+    assert shuffle_calls == 2
+
+
+def test_quantized_aiter_runtime_reload_transaction_commits_kernel_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    shuffle_calls = 0
+
+    def shuffle_weights(w1, w2, config):
+        nonlocal shuffle_calls
+        shuffle_calls += 1
+        return w1 + 1, w2 + 2
+
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle_weights),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8", solution_type="moe_c", need_shuffle=True
+    )
+    w1 = torch.nn.Parameter(torch.zeros((1, 8, 4)), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.zeros((1, 4, 4)), requires_grad=False)
+
+    class Model:
+        def named_parameters(self):
+            return iter((("experts.w13_weight", w1), ("experts.w2_weight", w2)))
+
+        def get_parameter(self, name):
+            return dict(self.named_parameters())[name]
+
+    model = Model()
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+    transaction = compressed_tensors_moe_runtime.begin_aiter_weight_reload(model)
+    with torch.no_grad():
+        w1.copy_(torch.zeros_like(w1))
+        w2.copy_(torch.zeros_like(w2))
+    compressed_tensors_moe_runtime.commit_aiter_weight_reload(transaction)
+
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+    assert shuffle_calls == 2
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.full_like(w2, 2))
+
+
+def test_quantized_aiter_runtime_reload_transaction_quarantines_abort(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=lambda w1, w2, config: (w1 + 1, w2 + 2),
+        ),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8", solution_type="moe_c", need_shuffle=True
+    )
+    w1 = torch.nn.Parameter(torch.zeros((1, 8, 4)), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.zeros((1, 4, 4)), requires_grad=False)
+
+    class Model:
+        def named_parameters(self):
+            return iter((("experts.w13_weight", w1), ("experts.w2_weight", w2)))
+
+        def get_parameter(self, name):
+            return dict(self.named_parameters())[name]
+
+    model = Model()
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+    transaction = compressed_tensors_moe_runtime.begin_aiter_weight_reload(model)
+    with torch.no_grad():
+        w1.copy_(torch.zeros_like(w1))
+    compressed_tensors_moe_runtime.abort_aiter_weight_reload(transaction)
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="partially shuffled|reload",
+    ):
+        compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+
+
+def test_quantized_aiter_runtime_reload_transaction_blocks_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    reload_started = threading.Event()
+    finish_reload = threading.Event()
+    prepare_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    monkeypatch.setenv("VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=lambda w1, w2, config: (w1 + 1, w2 + 2),
+        ),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8", solution_type="moe_c", need_shuffle=True
+    )
+    w1 = torch.nn.Parameter(torch.zeros((1, 8, 4)), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.zeros((1, 4, 4)), requires_grad=False)
+
+    class Model:
+        def named_parameters(self):
+            return iter((("experts.w13_weight", w1), ("experts.w2_weight", w2)))
+
+        def get_parameter(self, name):
+            return dict(self.named_parameters())[name]
+
+    model = Model()
+    compressed_tensors_moe_runtime._get_aiter_quantized_weights(w1, w2, config)
+
+    def reload():
+        transaction = compressed_tensors_moe_runtime.begin_aiter_weight_reload(model)
+        reload_started.set()
+        assert finish_reload.wait(timeout=5)
+        with torch.no_grad():
+            w1.copy_(torch.zeros_like(w1))
+            w2.copy_(torch.zeros_like(w2))
+        compressed_tensors_moe_runtime.commit_aiter_weight_reload(transaction)
+
+    def prepare():
+        try:
+            compressed_tensors_moe_runtime._get_aiter_quantized_weights(
+                w1, w2, config
+            )
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+        finally:
+            prepare_finished.set()
+
+    reload_thread = threading.Thread(target=reload)
+    prepare_thread = threading.Thread(target=prepare)
+    reload_thread.start()
+    assert reload_started.wait(timeout=5)
+    prepare_thread.start()
+    assert not prepare_finished.wait(timeout=0.1)
+    finish_reload.set()
+    reload_thread.join(timeout=5)
+    prepare_thread.join(timeout=5)
+
+    assert not errors
+    assert prepare_finished.is_set()
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.full_like(w2, 2))
+
+
+def test_quantized_aiter_runtime_kernel_lease_blocks_reload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    kernel_entered = threading.Event()
+    release_kernel = threading.Event()
+    reload_acquired = threading.Event()
+    errors: list[BaseException] = []
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    def get_config(**kwargs):
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type="triton",
+            need_shuffle=False,
+        )
+
+    def aiter_moe(**kwargs):
+        kernel_entered.set()
+        assert release_kernel.wait(timeout=5)
+        return kwargs["hidden_states"].clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    w1 = torch.nn.Parameter(torch.ones((1, 8, 4)), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones((1, 4, 4)), requires_grad=False)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        w1_scale=torch.ones((1, 8, 1)),
+        w2_scale=torch.ones((1, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+
+    class Model:
+        def named_parameters(self):
+            return iter((("experts.w13_weight", w1), ("experts.w2_weight", w2)))
+
+        def get_parameter(self, name):
+            return dict(self.named_parameters())[name]
+
+    model = Model()
+
+    def infer():
+        try:
+            compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+                hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+                w1=w1,
+                w2=w2,
+                topk_weights=torch.ones((2, 1)),
+                topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+                vllm_moe_config=SimpleNamespace(num_experts=1),
+                activation=SimpleNamespace(value="silu"),
+                apply_router_weight_on_input=False,
+                expert_map=None,
+                quant_config=quant_config,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    def reload():
+        transaction = compressed_tensors_moe_runtime.begin_aiter_weight_reload(model)
+        reload_acquired.set()
+        with torch.no_grad():
+            w1.copy_(torch.zeros_like(w1))
+            w2.copy_(torch.zeros_like(w2))
+        compressed_tensors_moe_runtime.commit_aiter_weight_reload(transaction)
+
+    infer_thread = threading.Thread(target=infer)
+    reload_thread = threading.Thread(target=reload)
+    infer_thread.start()
+    assert kernel_entered.wait(timeout=5)
+    reload_thread.start()
+    assert not reload_acquired.wait(timeout=0.1)
+    release_kernel.set()
+    infer_thread.join(timeout=5)
+    reload_thread.join(timeout=5)
+
+    assert not errors
+    assert reload_acquired.is_set()
+    torch.testing.assert_close(w1, torch.zeros_like(w1))
+    torch.testing.assert_close(w2, torch.zeros_like(w2))
+
+
+def test_quantized_aiter_runtime_synchronizes_every_weight_use_stream():
+    synchronized: list[int] = []
+
+    class Event:
+        def __init__(self, stream_id):
+            self.stream_id = stream_id
+
+        def synchronize(self):
+            synchronized.append(self.stream_id)
+
+    w1 = torch.zeros((1, 8, 4))
+    w2 = torch.zeros((1, 4, 4))
+    state = compressed_tensors_moe_runtime._AiterInplaceShuffleState(w1, w2)
+    state.use_events = {11: Event(11), 22: Event(22)}
+
+    compressed_tensors_moe_runtime._synchronize_weight_use_events(state)
+
+    assert synchronized == [11, 22]
+    assert state.use_events == {}
 
 
 @pytest.mark.parametrize(

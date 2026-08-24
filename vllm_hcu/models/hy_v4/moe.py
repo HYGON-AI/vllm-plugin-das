@@ -33,13 +33,7 @@ def _require_supported_moe_backend(
             "--moe-backend aiter route; "
             f"got {backend!r}."
         )
-    swiglu_limit = float(getattr(model_config, "swiglu_limit", 0) or 0)
-    if backend == "aiter" and swiglu_limit > 0:
-        raise RuntimeError(
-            "HY V4 cannot use the installed AITER MoE-C backend because its "
-            f"SILU path does not preserve swiglu_limit={swiglu_limit:g}; "
-            "use --moe-backend triton for accuracy."
-        )
+    del model_config
 
 
 class HYV4FeedForward(nn.Module):

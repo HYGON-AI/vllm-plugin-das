@@ -77,13 +77,11 @@ def test_hy_v4_rejects_non_triton_moe_backend() -> None:
         )
 
 
-def test_hy_v4_rejects_aiter_moe_without_hard_swiglu_clamp() -> None:
-    with pytest.raises(RuntimeError, match="does not preserve swiglu_limit=10"):
-        moe.HYV4MoEFused(
-            config=_hf_config(),
-            vllm_config=_vllm_config("aiter", enable_expert_parallel=False),
-            prefix="model.layers.1.mlp",
-        )
+def test_hy_v4_accepts_aiter_moe_with_clamped_swiglu_runtime() -> None:
+    moe._require_supported_moe_backend(
+        _vllm_config("aiter", enable_expert_parallel=False),
+        _hf_config(),
+    )
 
 
 def test_hy_v4_moe_preserves_router_and_clamp_contract(monkeypatch) -> None:
