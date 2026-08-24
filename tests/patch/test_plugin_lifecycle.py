@@ -343,11 +343,14 @@ def test_engine_core_first_import_does_not_patch_partial_modules_or_fallback():
 @pytest.mark.hcu
 def test_arg_utils_first_import_applies_sidecar_before_first_construction():
     result = _fresh_python(
-        "import dataclasses,json; "
+        "import dataclasses,json,tempfile; "
+        "from pathlib import Path; "
         "import vllm.engine.arg_utils as arg_utils; "
         "from vllm_hcu.patch import patch_report; "
         "from vllm_hcu.patch.config import get_hcu_config; "
-        "args=arg_utils.EngineArgs(enable_custom_sp=True,"
+        "model_dir=tempfile.TemporaryDirectory(); "
+        "Path(model_dir.name,'config.json').write_text('{}'); "
+        "args=arg_utils.EngineArgs(model=model_dir.name,enable_custom_sp=True,"
         "enable_multi_layers_mtp=True,moe_backend='dpsk_deep_gemm'); "
         "feature=get_hcu_config(args); "
         "record=patch_report()['patches']["
@@ -377,11 +380,14 @@ def test_arg_utils_first_import_applies_sidecar_before_first_construction():
 
 def test_engine_args_normal_cold_post_import_callback_still_applies():
     result = _fresh_python(
-        "import dataclasses,json,vllm_hcu; "
+        "import dataclasses,json,tempfile,vllm_hcu; "
+        "from pathlib import Path; "
         "vllm_hcu.hcu_platform_plugin(); "
         "import vllm.engine.arg_utils as arg_utils; "
         "from vllm_hcu.patch import patch_report; "
-        "args=arg_utils.EngineArgs(enable_custom_sp=True); "
+        "model_dir=tempfile.TemporaryDirectory(); "
+        "Path(model_dir.name,'config.json').write_text('{}'); "
+        "args=arg_utils.EngineArgs(model=model_dir.name,enable_custom_sp=True); "
         "record=patch_report()['patches']["
         "'platform.core_fix.hcu_config.engine_args']; "
         "print(json.dumps({'marker':getattr(arg_utils,"
