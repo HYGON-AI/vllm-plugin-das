@@ -715,6 +715,10 @@ def test_aiter_and_triton_expert_capability_contract(
             del weight_key, activation_key
             return False
 
+        def moe_sum(self, input, output):
+            del self, input, output
+            raise AssertionError("NVIDIA MoE sum must not run on HCU")
+
     triton_module = _module(
         patch_triton_moe.TARGET_MODULE,
         current_platform=SimpleNamespace(is_rocm=lambda: True),
@@ -725,6 +729,16 @@ def test_aiter_and_triton_expert_capability_contract(
     assert patch_triton_moe.apply_to_module(triton_module) is True
     assert TritonExperts._supports_quant_scheme(weight_key, activation_key) is True
     assert TritonExperts._supports_quant_scheme(object(), object()) is False
+    expert_output = torch.tensor(
+        [[[1.0, 2.0], [3.0, 4.0]], [[-1.0, 0.5], [2.0, 1.5]]],
+        dtype=torch.bfloat16,
+    )
+    reduced = torch.empty((2, 2), dtype=torch.bfloat16)
+    TritonExperts().moe_sum(expert_output, reduced)
+    assert torch.equal(
+        reduced,
+        torch.tensor([[4.0, 6.0], [1.0, 2.0]], dtype=torch.bfloat16),
+    )
 
 
 def test_aiter_expert_wrapper_removes_flydsl_import(

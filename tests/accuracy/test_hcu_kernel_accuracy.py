@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import ModuleType, SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as functional
@@ -539,3 +541,41 @@ def test_lightop_moe_align_matches_reference_assignment() -> None:
         block = sorted_ids[expert * 4 : (expert + 1) * 4]
         actual = {int(token) for token in block.tolist() if token != padding_id}
         assert actual == expected
+
+
+def test_triton_moe_sum_uses_fp32_accumulation_on_hcu() -> None:
+    device = _hcu_device()
+    from vllm_hcu.patch.worker.op_opt.moe import patch_triton_moe
+
+    class TritonExperts:
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+        def moe_sum(self, input, output):
+            del self, input, output
+            raise AssertionError("NVIDIA MoE sum must not run on HCU")
+
+    weight_key = object()
+    activation_key = object()
+    module = ModuleType(patch_triton_moe.TARGET_MODULE)
+    module.current_platform = SimpleNamespace(is_rocm=lambda: True)
+    module.kInt8StaticChannelSym = weight_key
+    module.kInt8DynamicTokenSym = activation_key
+    module.TritonExperts = TritonExperts
+    assert patch_triton_moe.apply_to_module(module) is True
+
+    generator = torch.Generator(device=device).manual_seed(20260824)
+    expert_output = torch.randn(
+        (17, 8, 511),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    reduced = torch.empty((17, 511), device=device, dtype=torch.bfloat16)
+
+    TritonExperts().moe_sum(expert_output, reduced)
+
+    expected = expert_output.float().sum(dim=1).to(torch.bfloat16)
+    torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
