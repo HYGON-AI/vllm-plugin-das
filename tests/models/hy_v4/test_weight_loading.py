@@ -126,12 +126,35 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
     norm_name = "model.norm.weight"
     norm_parameter = torch.nn.Parameter(torch.full((4,), float("nan")))
     norm_weight = torch.tensor([1.0, 1.25, 1.5, 1.75])
+    linear_name = "model.hc_fn.weight"
+    linear_parameter = torch.nn.Parameter(torch.full((2, 2), float("nan")))
+    linear_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    quant_projection_name = "model.q_proj.weight"
+    quant_projection_parameter = torch.nn.Parameter(
+        torch.full((2, 2), float("nan"))
+    )
+    quant_projection_weight = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    class CheckpointLinear(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = linear_parameter
+
+    class QuantizedProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = quant_projection_parameter
+            self.quant_method = SimpleNamespace(
+                process_weights_after_loading=lambda module: None
+            )
 
     class InnerModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.expert_bias = parameter
             self.norm_weight = norm_parameter
+            self.hc_fn = CheckpointLinear()
+            self.q_proj = QuantizedProjection()
             self.config = SimpleNamespace(
                 tie_word_embeddings=False,
                 num_experts=4,
@@ -143,7 +166,9 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
             return iter(
                 [
                     ("layers.15.mlp.expert_bias", self.expert_bias),
-                    ("norm.weight", self.norm_weight),
+                        ("norm.weight", self.norm_weight),
+                        ("hc_fn.weight", self.hc_fn.weight),
+                        ("q_proj.weight", self.q_proj.weight),
                 ]
             )
 
@@ -171,6 +196,8 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
                 [
                     (parameter_name, self.model.expert_bias),
                     (norm_name, self.model.norm_weight),
+                    (linear_name, self.model.hc_fn.weight),
+                    (quant_projection_name, self.model.q_proj.weight),
                 ]
             )
 
@@ -192,11 +219,23 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
         [
             (checkpoint_name, loaded_weight),
             (norm_name, norm_weight),
+            (linear_name, linear_weight),
+            (quant_projection_name, quant_projection_weight),
         ],
     )
-    assert loaded == {parameter_name, norm_name}
+    assert loaded == {
+        parameter_name,
+        norm_name,
+        linear_name,
+        quant_projection_name,
+    }
     torch.testing.assert_close(parameter, loaded_weight)
     torch.testing.assert_close(norm_parameter, norm_weight)
+    torch.testing.assert_close(linear_parameter, linear_weight)
+    torch.testing.assert_close(
+        quant_projection_parameter,
+        quant_projection_weight,
+    )
 
     with pytest.raises(RuntimeError, match=r"model\.layers\.15\.mlp\.expert_bias"):
         hy_v4_model.HYV4ForCausalLM.load_weights(model, [])
@@ -205,6 +244,26 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
         hy_v4_model.HYV4ForCausalLM.load_weights(
             model,
             [(checkpoint_name, loaded_weight)],
+        )
+
+    with pytest.raises(RuntimeError, match=r"model\.hc_fn\.weight"):
+        hy_v4_model.HYV4ForCausalLM.load_weights(
+            model,
+            [
+                (checkpoint_name, loaded_weight),
+                (norm_name, norm_weight),
+                (quant_projection_name, quant_projection_weight),
+            ],
+        )
+
+    with pytest.raises(RuntimeError, match=r"model\.q_proj\.weight"):
+        hy_v4_model.HYV4ForCausalLM.load_weights(
+            model,
+            [
+                (checkpoint_name, loaded_weight),
+                (norm_name, norm_weight),
+                (linear_name, linear_weight),
+            ],
         )
 
 

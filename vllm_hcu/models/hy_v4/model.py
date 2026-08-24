@@ -950,26 +950,8 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         loaded_params = loader.load_weights(_filter_weights(weights))
-        initialized_params = set(loaded_params)
-        # Match vLLM's weight-tracking exclusions for parameters generated or
-        # replaced by a quant method during post-load processing.  Everything
-        # else in this HY V4 model is checkpoint-owned and must be present.
-        for module_name, module in self.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            has_online_quant = getattr(quant_method, "uses_meta_device", False)
-            has_postprocess_quant = getattr(
-                quant_method, "process_weights_after_loading", None
-            )
-            if has_online_quant or has_postprocess_quant:
-                for param_name, _ in module.named_parameters():
-                    full_name = (
-                        f"{module_name}.{param_name}"
-                        if module_name
-                        else param_name
-                    )
-                    initialized_params.add(full_name)
         required_params = {name for name, _ in self.named_parameters()}
-        missing_params = required_params - initialized_params
+        missing_params = required_params - loaded_params
         if missing_params:
             raise RuntimeError(
                 "Missing HY V4 checkpoint parameters: "
