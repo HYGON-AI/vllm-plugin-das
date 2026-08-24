@@ -1029,6 +1029,7 @@ def _case_tp_ep_smoke(
     tensor_parallel_size: int,
     gpu_memory_utilization: float,
     moe_backend: str,
+    enable_expert_parallel: bool = True,
 ) -> dict[str, Any]:
     from vllm import LLM
 
@@ -1037,7 +1038,7 @@ def _case_tp_ep_smoke(
             model_path,
             enforce_eager=True,
             tensor_parallel_size=tensor_parallel_size,
-            enable_expert_parallel=True,
+            enable_expert_parallel=enable_expert_parallel,
             max_model_len=512,
             max_num_batched_tokens=512,
             max_num_seqs=2,
@@ -1059,7 +1060,7 @@ def _case_tp_ep_smoke(
         _shutdown_llm(llm)
     return {
         "requested_tensor_parallel_size": tensor_parallel_size,
-        "requested_enable_expert_parallel": True,
+        "requested_enable_expert_parallel": enable_expert_parallel,
         "requested_gpu_memory_utilization": gpu_memory_utilization,
         "requested_moe_backend": moe_backend,
         "parallel_config": parallel_config,
@@ -1095,6 +1096,11 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--moe-backend", default="auto")
+    parser.add_argument(
+        "--disable-expert-parallel",
+        action="store_true",
+        help="Exercise tensor-parallel MoE without expert parallelism.",
+    )
     args = parser.parse_args(argv)
 
     if args.case == "smoke":
@@ -1137,6 +1143,7 @@ def _main(argv: list[str] | None = None) -> int:
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             moe_backend=args.moe_backend,
+            enable_expert_parallel=not args.disable_expert_parallel,
         )
     print(RESULT_PREFIX + json.dumps(payload, sort_keys=True))
     return 0

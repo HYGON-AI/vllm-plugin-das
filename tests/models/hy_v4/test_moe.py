@@ -56,10 +56,13 @@ def _hf_config() -> SimpleNamespace:
     )
 
 
-def _vllm_config(backend: str) -> SimpleNamespace:
+def _vllm_config(
+    backend: str, *, enable_expert_parallel: bool = True
+) -> SimpleNamespace:
     return SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend=backend),
         parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_expert_parallel,
             eplb_config=SimpleNamespace(num_redundant_experts=0)
         ),
     )
@@ -70,6 +73,15 @@ def test_hy_v4_rejects_non_triton_moe_backend() -> None:
         moe.HYV4MoEFused(
             config=_hf_config(),
             vllm_config=_vllm_config("auto"),
+            prefix="model.layers.1.mlp",
+        )
+
+
+def test_hy_v4_rejects_aiter_moe_without_hard_swiglu_clamp() -> None:
+    with pytest.raises(RuntimeError, match="does not preserve swiglu_limit=10"):
+        moe.HYV4MoEFused(
+            config=_hf_config(),
+            vllm_config=_vllm_config("aiter", enable_expert_parallel=False),
             prefix="model.layers.1.mlp",
         )
 
@@ -122,3 +134,32 @@ def test_hy_v4_moe_preserves_router_and_clamp_contract(monkeypatch) -> None:
     torch.testing.assert_close(actual, hidden + 1)
     assert fake_experts.last_router_logits is not None
     assert fake_experts.last_router_logits.dtype == torch.float32
+
+
+def test_hy_v4_pure_tp_keeps_all_experts_in_local_metadata(monkeypatch) -> None:
+    fake_group = SimpleNamespace(size=lambda: 8)
+    monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(
+        moe,
+        "get_ep_group",
+        lambda: SimpleNamespace(device_group=fake_group, rank_in_group=5),
+    )
+    monkeypatch.setattr(moe, "GateLinear", lambda *args, **kwargs: _FakeGate())
+    monkeypatch.setattr(
+        moe,
+        "HYV4FeedForward",
+        lambda *args, **kwargs: _FakeSharedExperts(),
+    )
+    monkeypatch.setattr(moe, "FusedMoE", lambda **kwargs: _FakeExperts())
+
+    layer = moe.HYV4MoEFused(
+        config=_hf_config(),
+        vllm_config=_vllm_config("triton", enable_expert_parallel=False),
+        prefix="model.layers.1.mlp",
+    )
+
+    assert layer.ep_size == 1
+    assert layer.ep_rank == 0
+    assert layer.n_local_physical_experts == 16
+    assert layer.physical_expert_start == 0
+    assert layer.physical_expert_end == 16

@@ -10,6 +10,7 @@ import torch
 
 from vllm_hcu.models.hy_v4 import hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
+    _require_accuracy_safe_kv_cache_dtype,
     _require_sparse_mqa_backend,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
@@ -20,6 +21,19 @@ from vllm_hcu.models.hy_v4.hcu_sparse import (
     HYV4FlashMLASparseBackend,
     HYV4FlashMLASparseImpl,
 )
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3", "fp8_ds_mla"])
+def test_hy_v4_rejects_accuracy_unsafe_kv_cache_dtype(
+    cache_dtype: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="use --kv-cache-dtype auto"):
+        _require_accuracy_safe_kv_cache_dtype(cache_dtype)
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16"])
+def test_hy_v4_accepts_accuracy_safe_kv_cache_dtype(cache_dtype: str) -> None:
+    _require_accuracy_safe_kv_cache_dtype(cache_dtype)
 
 
 def test_full_and_shared_indexer_pattern() -> None:

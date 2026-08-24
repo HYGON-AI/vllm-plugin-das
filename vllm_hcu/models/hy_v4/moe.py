@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-"""Dense feed-forward and Triton MoE blocks for HY V4 on HCU."""
+"""Dense feed-forward and fused MoE blocks for HY V4 on HCU."""
 
 import torch
 from torch import nn
@@ -22,12 +22,23 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 logger = init_logger(__name__)
 
 
-def _require_triton_moe_backend(vllm_config: VllmConfig) -> None:
+def _require_supported_moe_backend(
+    vllm_config: VllmConfig,
+    model_config: PretrainedConfig,
+) -> None:
     backend = vllm_config.kernel_config.moe_backend
-    if backend != "triton":
+    if backend not in ("triton", "aiter"):
         raise RuntimeError(
-            "HY V4 FP8 W8A8 currently requires --moe-backend triton; "
+            "HY V4 FP8 W8A8 requires an explicit --moe-backend triton or "
+            "--moe-backend aiter route; "
             f"got {backend!r}."
+        )
+    swiglu_limit = float(getattr(model_config, "swiglu_limit", 0) or 0)
+    if backend == "aiter" and swiglu_limit > 0:
+        raise RuntimeError(
+            "HY V4 cannot use the installed AITER MoE-C backend because its "
+            f"SILU path does not preserve swiglu_limit={swiglu_limit:g}; "
+            "use --moe-backend triton for accuracy."
         )
 
 
@@ -73,7 +84,7 @@ class HYV4FeedForward(nn.Module):
 
 
 class HYV4MoEFused(nn.Module):
-    """HY V4 sigmoid-routed MoE backed by vLLM's Triton experts."""
+    """HY V4 sigmoid-routed MoE backed by an explicit HCU expert backend."""
 
     def __init__(
         self,
@@ -86,12 +97,20 @@ class HYV4MoEFused(nn.Module):
         super().__init__()
         if vllm_config is None:
             vllm_config = get_current_vllm_config()
-        _require_triton_moe_backend(vllm_config)
+        _require_supported_moe_backend(vllm_config, config)
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_group = get_ep_group().device_group
-        self.ep_rank = get_ep_group().rank_in_group
-        self.ep_size = self.ep_group.size()
+        if vllm_config.parallel_config.enable_expert_parallel:
+            self.ep_rank = get_ep_group().rank_in_group
+            self.ep_size = self.ep_group.size()
+        else:
+            # vLLM creates an EP communication group for every MoE model even
+            # when expert parallelism is disabled.  In pure TP that group spans
+            # all TP ranks, but every rank still owns all experts and shards
+            # only the intermediate dimension.
+            self.ep_rank = 0
+            self.ep_size = 1
         self.n_routed_experts = config.num_experts
         if self.tp_size > config.num_experts:
             raise ValueError(

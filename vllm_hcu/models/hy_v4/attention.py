@@ -48,6 +48,17 @@ _SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention"
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
+def _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype: str) -> None:
+    """Reject HY V4 KV-cache formats without verified output parity."""
+    if kv_cache_dtype not in ("auto", "bfloat16"):
+        raise RuntimeError(
+            "HY V4 accuracy-first inference currently supports only auto or "
+            f"bfloat16 KV cache; got {kv_cache_dtype!r}. "
+            "use --kv-cache-dtype auto until quantized KV-cache parity is "
+            "restored."
+        )
+
+
 def require_hyv4_sink_backend(
     backend: type[AttentionBackend],
 ) -> type[AttentionBackend]:
@@ -386,6 +397,7 @@ class HYV4MLAAttention(nn.Module):
         # Do not silently degrade sparse layers into dense attention. Probe the
         # sparse MLA backend directly and fail fast with the real error.
         kv_cache_dtype = cache_config.cache_dtype if cache_config else "auto"
+        _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype)
         if self.is_sparse:
             try:
                 get_attn_backend(

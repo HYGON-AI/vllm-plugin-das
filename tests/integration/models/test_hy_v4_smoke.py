@@ -67,3 +67,42 @@ def test_hy_v4_tp8_ep8_triton_greedy_generation(
     assert len(result["output"]) == 2
     for record in result["output"]:
         _assert_completion(record)
+
+
+def test_hy_v4_pure_tp8_triton_greedy_generation(
+    hcu_test_resources: HcuTestResources,
+) -> None:
+    model_path = require_model_runtime(
+        hcu_test_resources,
+        env_name="VLLM_HCU_HY_V4_MODEL",
+        relative_path=HY_V4_MODEL,
+        label="HY V4 FP8 W8A8 pure TP8 Triton",
+        hcu_count=8,
+    )
+
+    common_args = [
+        "--tensor-parallel-size",
+        "8",
+        "--disable-expert-parallel",
+        "--gpu-memory-utilization",
+        "0.95",
+    ]
+    result = run_vllm_case(
+        "tp-ep-smoke",
+        model_path,
+        timeout_s=7200,
+        log_label="hy-v4-tp8-triton",
+        extra_env={
+            "VLLM_ROCM_USE_AITER_MOE": "0",
+            "VLLM_HCU_USE_AITER_W8A8_FP8_MOE": "0",
+        },
+        extra_args=[*common_args, "--moe-backend", "triton"],
+    )
+    assert result["requested_tensor_parallel_size"] == 8
+    assert result["requested_enable_expert_parallel"] is False
+    assert result["requested_moe_backend"] == "triton"
+    assert result["parallel_config"]["tensor_parallel_size"] == 8
+    assert result["parallel_config"]["enable_expert_parallel"] is False
+    assert len(result["output"]) == 2
+    for record in result["output"]:
+        _assert_completion(record)
