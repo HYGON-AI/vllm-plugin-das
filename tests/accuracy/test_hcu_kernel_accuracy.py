@@ -466,3 +466,33 @@ def test_hcu_triton_group_fp8_ue8m0_matches_reference() -> None:
         rtol=1.25e-1,
         atol=2e-2,
     )
+
+
+def test_hcu_native_dynamic_per_token_fp8_matches_reference() -> None:
+    device = _hcu_device()
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        get_fp8_min_max,
+    )
+    from vllm_hcu.model_executor.layers.quantization.native_fp8_runtime import (
+        dynamic_per_token_quant_fp8,
+    )
+
+    generator = torch.Generator(device=device).manual_seed(20260826)
+    value = torch.randn(
+        (5, 6144), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    value[0].zero_()
+
+    quantized, scales = dynamic_per_token_quant_fp8(value)
+
+    _, fp8_max = get_fp8_min_max()
+    expected_scales = (value.abs().amax(dim=-1, keepdim=True).float() / fp8_max).clamp(
+        min=1.0 / (fp8_max * 512.0)
+    )
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(
+        quantized.float() * scales,
+        value.float(),
+        rtol=1.25e-1,
+        atol=2e-2,
+    )

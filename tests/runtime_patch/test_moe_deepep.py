@@ -2281,6 +2281,10 @@ def test_int8_expert_quant_adapter_contract(
     module = _module(
         patch_utils.TARGET_MODULE,
         _int8_quantize=official,
+        _fp8_quantize=lambda A, A_scale, per_act_token, block_shape=None: (
+            A,
+            A_scale,
+        ),
     )
     assert patch_utils.apply_to_module(module) is True
     tensor = torch.ones((1, 2, 2))
@@ -2339,7 +2343,9 @@ def test_int8_expert_quant_adapter_contract(
                 for row in range(valid):
                     source = values[0, row].float()
                     scale_value = source.abs().max().clamp_min(1e-10) / 127.0
-                    output[0, row].copy_(torch.round(source / scale_value).to(torch.int8))
+                    output[0, row].copy_(
+                        torch.round(source / scale_value).to(torch.int8)
+                    )
                     output_scales[0, row, 0] = scale_value
 
             return launch
@@ -2361,6 +2367,36 @@ def test_int8_expert_quant_adapter_contract(
     assert torch.isclose(scales[0, 0, 0], expected_scale)
     assert torch.equal(quanted[0, 0], torch.tensor([64, -127], dtype=torch.int8))
 
+
+def test_fp8_moe_dynamic_per_token_quant_uses_hcu_native(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    official_calls = []
+
+    def official_fp8(A, A_scale, per_act_token, block_shape=None):
+        official_calls.append((A, A_scale, per_act_token, block_shape))
+        return "official-fp8"
+
+    module = _module(
+        patch_utils.TARGET_MODULE,
+        _int8_quantize=lambda A, A_scale, per_act_token, block_shape: "int8",
+        _fp8_quantize=official_fp8,
+    )
+    assert patch_utils.apply_to_module(module) is True
+    value = torch.ones((2, 8))
+    runtime_name = (
+        "vllm_hcu.model_executor.layers.quantization.native_fp8_runtime"
+    )
+    runtime = _module(
+        runtime_name,
+        dynamic_per_token_quant_fp8=lambda x: ("hcu-fp8", x),
+    )
+    monkeypatch.setitem(sys.modules, runtime_name, runtime)
+
+    assert module._fp8_quantize(value, None, True, None)[0] == "hcu-fp8"
+    assert official_calls == []
+    assert module._fp8_quantize(value, None, False, None) == "official-fp8"
+    assert official_calls == [(value, None, False, None)]
 
 def test_importing_adapters_does_not_eager_import_optional_moe_stacks():
     optional = ("deep_ep", "deepgemm", "lightop")
