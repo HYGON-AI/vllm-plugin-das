@@ -1299,6 +1299,11 @@ def test_moe_align_feature_off_and_lightop_contract(
     module = _module(
         patch_moe_align_block_size.TARGET_MODULE,
         torch=torch,
+        ops=SimpleNamespace(
+            moe_align_block_size=lambda *args: (_ for _ in ()).throw(
+                AssertionError("NVIDIA MoE align must not run on HCU")
+            )
+        ),
         triton=SimpleNamespace(
             cdiv=lambda value, block: (value + block - 1) // block
         ),
@@ -1380,6 +1385,23 @@ def test_moe_align_feature_off_and_lightop_contract(
     )
     assert calls[-1][3] is None
     assert torch.equal(expert_ids, torch.tensor([1, 0], dtype=torch.int32))
+
+    # Call the low-level op through the module object captured by stale
+    # ``from ... import moe_align_block_size`` consumers.
+    low_sorted = torch.full((4,), ids.numel(), dtype=torch.int32)
+    low_experts = torch.empty((2,), dtype=torch.int32)
+    low_count = torch.empty((1,), dtype=torch.int32)
+    module.ops.moe_align_block_size(
+        ids,
+        2,
+        2,
+        low_sorted,
+        low_experts,
+        low_count,
+        None,
+    )
+    assert len(calls) == 4
+    assert low_count.item() == 4
 
 
 def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(

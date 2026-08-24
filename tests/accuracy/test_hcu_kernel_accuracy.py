@@ -496,3 +496,46 @@ def test_hcu_native_dynamic_per_token_fp8_matches_reference() -> None:
         rtol=1.25e-1,
         atol=2e-2,
     )
+
+
+def test_lightop_moe_align_matches_reference_assignment() -> None:
+    device = _hcu_device()
+    try:
+        from lightop import op
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop MoE align kernel is unavailable: {exc}")
+
+    topk_ids = torch.tensor(
+        [[0, 2], [1, 2], [0, 3]], device=device, dtype=torch.int32
+    )
+    padding_id = topk_ids.numel()
+    sorted_ids = torch.full(
+        (18,), padding_id, device=device, dtype=torch.int32
+    )
+    expert_ids = torch.empty((5,), device=device, dtype=torch.int32)
+    num_tokens_post_pad = torch.empty((1,), device=device, dtype=torch.int32)
+
+    op.moe_align_block_size(
+        topk_ids,
+        4,
+        4,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        None,
+        None,
+        None,
+        False,
+        False,
+    )
+
+    assert num_tokens_post_pad.item() == 16
+    torch.testing.assert_close(
+        expert_ids[:4],
+        torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32),
+    )
+    expected_tokens = ({0, 4}, {2}, {1, 3}, {5})
+    for expert, expected in enumerate(expected_tokens):
+        block = sorted_ids[expert * 4 : (expert + 1) * 4]
+        actual = {int(token) for token in block.tolist() if token != padding_id}
+        assert actual == expected
