@@ -377,3 +377,58 @@ def test_lightop_per_token_fp8_quant_matches_dequant_reference(
         rtol=1.2e-1,
         atol=1.2e-1,
     )
+
+
+def test_hcu_interleaved_rotary_matches_float32_reference() -> None:
+    device = _hcu_device()
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm_hcu.ops.rotary_embedding import HcuRotaryEmbedding
+
+    head_size = 64
+    base = 10_000
+    with set_current_vllm_config(VllmConfig()):
+        op = HcuRotaryEmbedding(
+            head_size=head_size,
+            rotary_dim=head_size,
+            max_position_embeddings=512,
+            base=base,
+            is_neox_style=False,
+            dtype=torch.bfloat16,
+        )
+    positions = torch.tensor([0, 1, 7, 127, 511], device=device)
+    generator = torch.Generator(device=device).manual_seed(20260824)
+    query = torch.randn(
+        5, 4, head_size, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn(
+        5, 1, head_size, generator=generator, device=device, dtype=torch.bfloat16
+    )
+
+    actual_query, actual_key = op.forward_hip(positions, query, key)
+
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, head_size, 2, device=device, dtype=torch.float32)
+            / head_size
+        )
+    )
+    angles = positions.float().unsqueeze(-1) * inv_freq.unsqueeze(0)
+    cos = angles.cos().unsqueeze(-2)
+    sin = angles.sin().unsqueeze(-2)
+
+    def reference(value: torch.Tensor) -> torch.Tensor:
+        value = value.float()
+        even = value[..., ::2]
+        odd = value[..., 1::2]
+        return torch.stack(
+            (even * cos - odd * sin, odd * cos + even * sin), dim=-1
+        ).flatten(-2)
+
+    torch.testing.assert_close(
+        actual_query.float(), reference(query), rtol=2e-2, atol=2e-2
+    )
+    assert actual_key is not None
+    torch.testing.assert_close(
+        actual_key.float(), reference(key), rtol=2e-2, atol=2e-2
+    )
