@@ -573,6 +573,41 @@ def test_hcu_indexer_fp8_cache_roundtrip_matches_ue8m0_reference(
     )
 
 
+def test_hcu_mla_query_concat_preserves_noncontiguous_input_bits() -> None:
+    device = _hcu_device()
+    from vllm_hcu.patch.worker.op_opt.patch_flashmla_sparse import (
+        _concat_mla_q,
+    )
+
+    num_tokens, num_heads = 3, 8
+    nope_dim, rope_dim = 512, 64
+    nope_bits = torch.arange(
+        num_heads * num_tokens * nope_dim,
+        device=device,
+        dtype=torch.int16,
+    ).view(num_heads, num_tokens, nope_dim)
+    ql_nope = nope_bits.transpose(0, 1).view(torch.bfloat16)
+    rope_storage_bits = torch.arange(
+        num_tokens * num_heads * (rope_dim + 16),
+        device=device,
+        dtype=torch.int16,
+    ).view(num_tokens, num_heads, rope_dim + 16)
+    q_pe = rope_storage_bits[..., 16:].view(torch.bfloat16)
+    assert not ql_nope.is_contiguous()
+    assert not q_pe.is_contiguous()
+    output = torch.empty(
+        (num_tokens, num_heads, nope_dim + rope_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    _concat_mla_q(ql_nope, q_pe, output)
+
+    output_bits = output.view(torch.int16)
+    assert torch.equal(output_bits[..., :nope_dim], ql_nope.view(torch.int16))
+    assert torch.equal(output_bits[..., nope_dim:], q_pe.view(torch.int16))
+
+
 def test_lightop_moe_align_matches_reference_assignment() -> None:
     device = _hcu_device()
     try:

@@ -25,9 +25,22 @@ TARGETS = (
     f"{TARGET_MODULE}.FlashMLASparseImpl._bf16_flash_mla_kernel",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode",
+    f"{TARGET_MODULE}.FlashMLASparseImpl.forward_mqa",
 )
 _MARKER = "_vllm_hcu_flashmla_sparse_applied"
 _WRAPPER = "_vllm_hcu_flashmla_sparse_wrapper"
+
+
+def _concat_mla_q(ql_nope, q_pe, q_out) -> None:
+    nope_dim = ql_nope.shape[-1]
+    rope_dim = q_pe.shape[-1]
+    if q_out.shape[-1] != nope_dim + rope_dim:
+        raise ValueError(
+            "MLA query concat buffer has incompatible head dimension: "
+            f"{q_out.shape[-1]} != {nope_dim} + {rope_dim}"
+        )
+    q_out[..., :nope_dim].copy_(ql_nope)
+    q_out[..., nope_dim:].copy_(q_pe)
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -38,6 +51,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (builder_cls, "build", TARGETS[0], _WRAPPER),
         (impl_cls, "_fp8_flash_mla_kernel", TARGETS[1], _WRAPPER),
         (impl_cls, "_bf16_flash_mla_kernel", TARGETS[2], _WRAPPER),
+        (impl_cls, "forward_mqa", TARGETS[5], _WRAPPER),
     )
     if already_applied(flash, _MARKER, wrapped):
         return False
@@ -111,6 +125,18 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
     # Validate and collect every replacement before mutating the target module.
+    forward_mqa = require_callable(impl_cls, "forward_mqa", TARGETS[5])
+    require_exact_signature(
+        forward_mqa,
+        TARGETS[5],
+        positional=(
+            "self",
+            "q",
+            "kv_c_and_k_pe_cache",
+            "attn_metadata",
+            "layer",
+        ),
+    )
     from vllm_hcu.v1.attention.ops import flashmla as hcu_flashmla
 
     hcu_bindings = {}
@@ -274,7 +300,27 @@ def apply_to_module(module: ModuleType) -> bool:
             topk_length=topk_length,
         )[0][:, :self.num_heads, :]
 
-    for function in (hcu_build, hcu_fp8, hcu_bf16):
+    @functools.wraps(forward_mqa)
+    def hcu_forward_mqa(
+        self,
+        q,
+        kv_c_and_k_pe_cache,
+        attn_metadata,
+        layer,
+    ):
+        if flash.current_platform.is_rocm() and isinstance(q, tuple):
+            ql_nope, q_pe = q
+            q = self.q_concat_buffer[: ql_nope.shape[0]]
+            _concat_mla_q(ql_nope, q_pe, q)
+        return forward_mqa(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            attn_metadata,
+            layer,
+        )
+
+    for function in (hcu_build, hcu_fp8, hcu_bf16, hcu_forward_mqa):
         setattr(function, _WRAPPER, True)
     # Apply all target mutations only after validation and wrapper construction.
     # The official backend class remains registered and no module alias is used.
@@ -283,9 +329,11 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(builder_cls, "_vllm_hcu_original_build", build)
     setattr(impl_cls, "_vllm_hcu_original_fp8_kernel", fp8)
     setattr(impl_cls, "_vllm_hcu_original_bf16_kernel", bf16)
+    setattr(impl_cls, "_vllm_hcu_original_forward_mqa", forward_mqa)
     setattr(builder_cls, "build", hcu_build)
     setattr(impl_cls, "_fp8_flash_mla_kernel", hcu_fp8)
     setattr(impl_cls, "_bf16_flash_mla_kernel", hcu_bf16)
+    setattr(impl_cls, "forward_mqa", hcu_forward_mqa)
     setattr(flash, _MARKER, True)
     return True
 

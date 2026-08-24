@@ -239,6 +239,7 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     class FlashMLASparseImpl:
         softmax_scale = 0.25
         num_heads = 2
+        q_concat_buffer = torch.empty(2, 2, 6)
 
         def _fp8_flash_mla_kernel(
             self,
@@ -261,6 +262,11 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
                 ("official", q, kv_c_and_k_pe_cache, topk_indices, topk_length)
             )
             return "official-bf16"
+
+        def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+            del self, kv_c_and_k_pe_cache, attn_metadata, layer
+            calls.append(("official-forward-mqa", q))
+            return q, None
 
     def sparse_fwd(q, cache, indices, softmax_scale, *, topk_length=None):
         calls.append(("hcu", q, cache, indices, softmax_scale, topk_length))
@@ -323,6 +329,23 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     )
     assert output.shape == (2, 2, 4)
     assert calls[-1][-1] is topk_length
+
+    nope_storage = torch.arange(16.0).view(2, 2, 4).transpose(0, 1)
+    rope_storage = torch.arange(24.0).view(2, 2, 6)
+    ql_nope = nope_storage
+    q_pe = rope_storage[..., 4:]
+    assert not ql_nope.is_contiguous()
+    assert not q_pe.is_contiguous()
+    concatenated, lse = impl.forward_mqa(
+        (ql_nope, q_pe),
+        torch.empty(0),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+    assert lse is None
+    torch.testing.assert_close(concatenated, torch.cat((ql_nope, q_pe), dim=-1))
+    assert calls[-1][0] == "official-forward-mqa"
+    assert isinstance(calls[-1][1], torch.Tensor)
 
     platform.is_rocm = lambda: False
     assert (
