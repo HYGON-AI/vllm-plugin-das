@@ -7,6 +7,7 @@ import ast
 import contextlib
 import dataclasses
 import enum
+import importlib
 import os
 import subprocess
 import sys
@@ -46,6 +47,50 @@ def _module(name: str, **attributes: object) -> ModuleType:
 def _config(**updates: object) -> SimpleNamespace:
     values = HcuFeatureConfig(**updates).to_dict()
     return SimpleNamespace(additional_config={"hcu": values})
+
+
+def test_kernel_warmup_skips_cuda_only_minimax_import_on_hcu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        patch_kernel_warmup = importlib.import_module(
+            "vllm_hcu.patch.worker.op_opt.patch_kernel_warmup"
+        )
+    except ModuleNotFoundError:
+        pytest.fail("the HCU kernel-warmup adapter is missing")
+
+    minimax_module_name = (
+        "vllm.model_executor.warmup.minimax_m3_msa_warmup"
+    )
+    cuda_only_module = ModuleType(minimax_module_name)
+
+    def cuda_only_warmup(worker):
+        del worker
+        raise AssertionError("NVIDIA-only MiniMax warmup must not run on HCU")
+
+    cuda_only_module.minimax_m3_msa_warmup = cuda_only_warmup
+    monkeypatch.setitem(sys.modules, minimax_module_name, cuda_only_module)
+    calls = []
+
+    def official_kernel_warmup(worker):
+        from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+            minimax_m3_msa_warmup,
+        )
+
+        calls.append(worker)
+        minimax_m3_msa_warmup(worker)
+
+    module = _module(
+        patch_kernel_warmup.TARGET_MODULE,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        kernel_warmup=official_kernel_warmup,
+    )
+    assert patch_kernel_warmup.apply_to_module(module) is True
+
+    module.kernel_warmup("worker")
+
+    assert calls == ["worker"]
+    assert sys.modules[minimax_module_name] is cuda_only_module
 
 
 def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
