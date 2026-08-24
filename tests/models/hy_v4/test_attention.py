@@ -10,6 +10,7 @@ import torch
 
 from vllm_hcu.models.hy_v4 import hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
+    _require_sparse_mqa_backend,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
     require_hyv4_sink_backend,
@@ -61,6 +62,22 @@ def test_hcu_backend_advertises_sink_support() -> None:
     assert HYV4FlashMLASparseBackend.is_sparse()
     assert HYV4FlashMLASparseBackend.get_name() == "FLASHMLA_SPARSE"
     assert HYV4FlashMLASparseBackend.get_impl_cls() is HYV4FlashMLASparseImpl
+
+
+def test_sink_prefill_requires_sparse_mqa_impl_without_global_config_flag() -> None:
+    _require_sparse_mqa_backend(HYV4FlashMLASparseBackend)
+
+    class DenseBackend:
+        @staticmethod
+        def get_impl_cls():
+            return object
+
+        @staticmethod
+        def get_name() -> str:
+            return "DENSE"
+
+    with pytest.raises(RuntimeError, match="sparse MQA"):
+        _require_sparse_mqa_backend(DenseBackend)
 
 
 @pytest.mark.parametrize(

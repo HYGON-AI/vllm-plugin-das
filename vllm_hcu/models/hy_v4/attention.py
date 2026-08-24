@@ -35,7 +35,11 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
-from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionType,
+    SparseMLAAttentionImpl,
+)
 from vllm.v1.attention.selector import get_attn_backend
 
 logger = init_logger(__name__)
@@ -54,6 +58,18 @@ def require_hyv4_sink_backend(
             f"for both prefill and decode; got {backend.get_name()}."
         )
     return backend
+
+
+def _require_sparse_mqa_backend(backend: type[AttentionBackend]) -> None:
+    """Verify that prefill and decode both use sparse MQA dispatch."""
+    impl_cls = backend.get_impl_cls()
+    if not isinstance(impl_cls, type) or not issubclass(
+        impl_cls, SparseMLAAttentionImpl
+    ):
+        raise RuntimeError(
+            "HY V4 learnable sink requires a sparse MQA implementation for "
+            f"prefill and decode; got {backend.get_name()}."
+        )
 
 
 def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
@@ -500,7 +516,7 @@ class HYV4MLAAttention(nn.Module):
             )
             if enable_sink:
                 sinks = self.learnable_sink_param
-                self._force_sparse_mqa()
+                _require_sparse_mqa_backend(sink_backend)
 
         extra_impl_args = {} if sinks is None else {"sinks": sinks}
         self.mla_attn = MLAAttention(
@@ -579,29 +595,6 @@ class HYV4MLAAttention(nn.Module):
                 + ", ".join(invalid_reasons)
             )
         return require_hyv4_sink_backend(HYV4FlashMLASparseBackend)
-
-    def _force_sparse_mqa(self) -> None:
-        """Keep every token on the sink-capable sparse MQA path.
-
-        ``_resolve_sink_backend`` only binds the backend that serves decode.
-        ``MLAAttention`` additionally routes short prefills to a separate dense
-        MLA prefill backend, and none of those accept ``attn_sink``, so prefill
-        would silently drop the sink while decode applies it. Such a partially
-        applied sink is not the trained architecture and corrupts the output, so
-        opt out of the dense split instead.
-
-        Prefills up to ``index_topk`` keep every token inside the sparse top-k,
-        making the sparse path numerically equivalent to the dense one apart from
-        also applying the sink.
-        """
-        attention_config = get_current_vllm_config().attention_config
-        if attention_config.sparse_mla_force_mqa:
-            return
-        attention_config.sparse_mla_force_mqa = True
-        logger.info_once(
-            "HYV4 learnable sink enabled: forcing sparse MQA for prefill too, "
-            "as the dense MLA prefill backends cannot apply sinks."
-        )
 
     def forward(
         self,
@@ -703,4 +696,3 @@ __all__ = [
     "is_skip_topk_indexer_weight",
     "require_hyv4_sink_backend",
 ]
-
