@@ -5,6 +5,7 @@ import os
 import torch
 
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.custom_op import CustomOp
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_hcu.platforms import envs as henvs
 
@@ -36,8 +37,17 @@ direct_register_custom_op(
 @SiluAndMul.register_oot
 class HcuSiluAndMul(SiluAndMul):
 
+    def __init__(self, *, compile_native: bool = True) -> None:
+        # The upstream constructor eagerly binds torch.ops._C.silu_and_mul on
+        # every CUDA-alike platform. That namespace belongs to vLLM's NVIDIA
+        # extension and is intentionally absent in a source-tree HCU install.
+        CustomOp.__init__(self, compile_native=compile_native)
+
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_SILU_AND_MUL:
             return torch.ops.vllm.silu_and_mul_opt_lightop(x)
 
-        return super().forward_cuda(x)
+        return self.forward_native(x)
+
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_hip(x)
