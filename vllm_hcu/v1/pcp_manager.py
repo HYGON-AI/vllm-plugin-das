@@ -100,6 +100,9 @@ class HcuPCPManager:
         self._seq_lens = torch.empty(
             self._max_local_reqs, dtype=torch.int32, device=device
         )
+        self._seq_lens_i64 = torch.empty(
+            self._max_local_reqs, dtype=torch.int64, device=device
+        )
         self._query_start_loc = torch.empty(
             self._max_local_reqs + 1, dtype=torch.int32, device=device
         )
@@ -430,9 +433,6 @@ class HcuPCPManager:
             count=num_local_reqs,
         )
         seq_lens = self._seq_lens[:num_local_reqs]
-        seq_lens.copy_(
-            torch.from_numpy(local_start_pos_np + local_lengths).to(self.device)
-        )
 
         input_ids = self._input_ids[:num_padded_tokens]
         positions = self._positions[:num_padded_tokens]
@@ -451,15 +451,81 @@ class HcuPCPManager:
             input_ids[actual_slice].copy_(
                 input_batch.input_ids[segment.global_slice]
             )
+            # MRV2 async MTP keeps num_computed_tokens_np as an optimistic CPU
+            # upper bound. Rejections are already reflected in these device
+            # positions, so preserve them instead of rebuilding from the CPU
+            # mirror. Derive the device seq_len from the same corrected source.
             positions[actual_slice].copy_(
-                torch.arange(
-                    int(local_start_pos_np[row]),
-                    int(local_start_pos_np[row] + segment.num_actual_tokens),
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                input_batch.positions[segment.global_slice]
             )
             is_padding[actual_slice] = False
+
+        # A full request row can reuse MRV2's rejection-corrected device
+        # seq_len directly. This is the common decode path and keeps the
+        # async-MTP fix to one batched gather instead of one device op per row.
+        full_request_rows = all(
+            segment.num_actual_tokens > 0
+            and segment.global_slice.start
+            == int(input_batch.query_start_loc_np[segment.global_req_idx])
+            and segment.global_slice.stop
+            == int(input_batch.query_start_loc_np[segment.global_req_idx + 1])
+            for segment in segments
+        )
+        seq_scratch_np = self._cu_num_logits_np[:num_local_reqs]
+        seq_index = self._logits_indices[:num_local_reqs]
+        if full_request_rows:
+            seq_scratch_np[:] = global_req_indices
+            seq_index.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            torch.index_select(
+                input_batch.seq_lens,
+                0,
+                seq_index,
+                out=seq_lens,
+            )
+        else:
+            # Split prefill rows use the last preserved position as their local
+            # sequence end. Padding-only rows retain their virtual row width.
+            seq_scratch_np[:] = [segment.padding_tokens for segment in segments]
+            seq_lens.copy_(torch.from_numpy(seq_scratch_np).to(self.device))
+            actual_rows = [
+                row
+                for row, segment in enumerate(segments)
+                if segment.num_actual_tokens > 0
+            ]
+            if actual_rows:
+                num_actual_rows = len(actual_rows)
+                seq_scratch_np[:num_actual_rows] = [
+                    segments[row].local_slice.start
+                    + segments[row].num_actual_tokens
+                    - 1
+                    for row in actual_rows
+                ]
+                actual_last_index = self._logits_indices[:num_actual_rows]
+                actual_last_index.copy_(
+                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
+                        self.device
+                    )
+                )
+                actual_seq_lens_i64 = self._seq_lens_i64[:num_actual_rows]
+                torch.index_select(
+                    positions,
+                    0,
+                    actual_last_index,
+                    out=actual_seq_lens_i64,
+                )
+                actual_seq_lens_i64.add_(1)
+                seq_scratch_np[:num_actual_rows] = actual_rows
+                actual_row_index = self._logits_indices[:num_actual_rows]
+                actual_row_index.copy_(
+                    torch.from_numpy(seq_scratch_np[:num_actual_rows]).to(
+                        self.device
+                    )
+                )
+                seq_lens.index_copy_(
+                    0,
+                    actual_row_index,
+                    actual_seq_lens_i64.to(dtype=seq_lens.dtype),
+                )
 
         global_num_logits = np.diff(input_batch.cu_num_logits_np)
         local_num_logits = global_num_logits[global_req_indices].copy()

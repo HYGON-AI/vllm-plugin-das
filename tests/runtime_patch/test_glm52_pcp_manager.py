@@ -352,6 +352,18 @@ def test_uneven_prefill_builds_equal_attention_consumable_virtual_batches(
             0
         ] * int(local.is_padding.sum())
         assert not torch.any(local.is_padding[local.logits_indices])
+        for row in range(local.num_reqs):
+            start = int(local.query_start_loc_np[row])
+            stop = int(local.query_start_loc_np[row + 1])
+            actual_positions = local.positions[start:stop][
+                ~local.is_padding[start:stop]
+            ]
+            expected_seq_len = (
+                int(actual_positions[-1]) + 1
+                if actual_positions.numel()
+                else int(local.num_scheduled_tokens[row])
+            )
+            assert int(local.seq_lens[row]) == expected_seq_len
 
     assert sum(
         int((~local.is_padding).sum()) for local in local_batches
@@ -464,6 +476,35 @@ def test_partition_replicates_spec_decode_layout_on_every_pcp_rank(
         assert local.expanded_local_pos.tolist() == expanded_local_pos
         assert local.logits_indices.tolist() == logits_indices
         assert local.cu_num_logits_np.tolist() == cu_num_logits
+
+
+def test_async_mtp_partition_preserves_gpu_corrected_positions_and_seq_lens() -> None:
+    """PCP must not rebuild rejection-corrected GPU state from its CPU upper bound."""
+
+    base_batch = _make_batch([("decode", [900, 901, 902], 20, False)])
+    global_batch = replace(
+        base_batch,
+        # MRV2 async MTP keeps this CPU mirror optimistic until the scheduler
+        # observes the sampled output. The device tensors above are already
+        # corrected for two rejected draft tokens.
+        num_computed_tokens_np=np.asarray([19], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([22], dtype=torch.int32),
+        num_draft_tokens=2,
+        num_draft_tokens_per_req=np.asarray([2], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor([10, 10, 10], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0, 1, 2], dtype=torch.int32),
+        logits_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 3], dtype=np.int32),
+    )
+    managers, _ = _make_managers()
+
+    for manager in managers:
+        local = manager.partition_batch(global_batch)
+        assert local.positions.tolist() == [17, 18, 19]
+        assert local.seq_lens.tolist() == [20]
+        # CPU metadata remains a safe optimistic upper bound.
+        assert local.seq_lens_cpu_upper_bound.tolist() == [22]
 
 
 def test_uneven_prefill_and_mtp_decode_keep_equal_collective_shapes() -> None:
