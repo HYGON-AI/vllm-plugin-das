@@ -473,17 +473,26 @@ def test_rocm_lightop_paged_mqa_builds_its_schedule_internally(
 ) -> None:
     """The runtime contract permits the metadata adapter to skip precompute."""
 
-    runtime = importlib.import_module(
-        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
-    )
-    from vllm._aiter_ops import rocm_aiter_ops
-
     calls: list[tuple[object, ...]] = []
     output = object()
 
     def paged_mqa_logits(*args):
         calls.append(args)
         return output
+
+    fake_lightop = ModuleType("lightop")
+    fake_lightop.op = SimpleNamespace()
+    fake_lightop.gemmopt = SimpleNamespace(paged_mqa_logits=paged_mqa_logits)
+    monkeypatch.setitem(sys.modules, "lightop", fake_lightop)
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse",
+        raising=False,
+    )
+    runtime = importlib.import_module(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
 
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
