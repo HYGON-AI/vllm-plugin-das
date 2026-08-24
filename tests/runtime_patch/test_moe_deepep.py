@@ -1318,6 +1318,7 @@ def test_moe_align_feature_off_and_lightop_contract(
     assert module.moe_align_block_size(ids, 2, 2) == "official"
 
     calls = []
+    require_initialized_outputs = False
 
     def lightop_align(
         topk_ids,
@@ -1332,6 +1333,9 @@ def test_moe_align_feature_off_and_lightop_contract(
         is_ep=False,
         is_fuse_fill=True,
     ):
+        if require_initialized_outputs:
+            assert torch.all(sorted_ids == topk_ids.numel())
+            assert torch.all(expert_ids == 0)
         calls.append(
             (
                 topk_ids,
@@ -1388,9 +1392,10 @@ def test_moe_align_feature_off_and_lightop_contract(
 
     # Call the low-level op through the module object captured by stale
     # ``from ... import moe_align_block_size`` consumers.
-    low_sorted = torch.full((4,), ids.numel(), dtype=torch.int32)
-    low_experts = torch.empty((2,), dtype=torch.int32)
+    low_sorted = torch.full((4,), -999, dtype=torch.int32)
+    low_experts = torch.full((2,), -999, dtype=torch.int32)
     low_count = torch.empty((1,), dtype=torch.int32)
+    require_initialized_outputs = True
     module.ops.moe_align_block_size(
         ids,
         2,

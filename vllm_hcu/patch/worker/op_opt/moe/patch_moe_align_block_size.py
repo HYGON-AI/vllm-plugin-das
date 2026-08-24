@@ -85,6 +85,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN is enabled, but "
                 "lightop.op is unavailable"
             ) from exc
+        # Stale high-level vLLM bindings allocate these out-parameters with
+        # ``torch.empty`` before resolving ``ops.moe_align_block_size`` at
+        # call time.  LightOP does not fill padding slots when Is_fuse_fill
+        # is false, and upstream remaps the entire expert buffer under EP.
+        sorted_ids.fill_(topk_ids.numel())
+        expert_ids.zero_()
         lightop.moe_align_block_size(
             topk_ids,
             num_experts,
@@ -96,7 +102,7 @@ def apply_to_module(module: ModuleType) -> bool:
             None,  # expert_mask
             None,  # num_local_tokens
             False,  # Is_EP
-            False,  # Is_fuse_fill; caller owns padding initialization
+            False,  # Is_fuse_fill; the wrapper initialized outputs above
         )
 
     @functools.wraps(original)
