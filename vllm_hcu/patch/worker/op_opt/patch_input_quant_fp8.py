@@ -42,16 +42,20 @@ def _lightop_requested() -> bool:
         ) from exc
 
 
-def _maybe_lightop(module, instance, x, scale, scale_ub):
-    if not _lightop_requested():
-        return _NOT_ELIGIBLE
-    if not (
+def _is_dynamic_per_token(module, instance, x, scale, scale_ub) -> bool:
+    return bool(
         scale is None
         and scale_ub is None
         and instance.group_shape == module.GroupShape.PER_TOKEN
         and instance.num_token_padding is None
         and x.is_contiguous()
-    ):
+    )
+
+
+def _maybe_lightop(module, instance, x, scale, scale_ub):
+    if not _is_dynamic_per_token(module, instance, x, scale, scale_ub):
+        return _NOT_ELIGIBLE
+    if not _lightop_requested():
         return _NOT_ELIGIBLE
 
     try:
@@ -112,6 +116,13 @@ def apply_to_module(module: ModuleType) -> bool:
         result = _maybe_lightop(input_quant, self, x, scale, scale_ub)
         if result is not _NOT_ELIGIBLE:
             return result
+        # vLLM's CUDA implementation dispatches dynamic per-token FP8
+        # quantization to torch.ops._C.  That extension is NVIDIA-owned and is
+        # unavailable on HCU.  Keep the optional LightOp fast path above, but
+        # use vLLM's numerically equivalent native implementation as the HCU
+        # accuracy-first fallback.
+        if _is_dynamic_per_token(input_quant, self, x, scale, scale_ub):
+            return original_native(self, x, scale, scale_ub, use_triton)
         return original_cuda(self, x, scale, scale_ub, use_triton)
 
     @functools.wraps(original_native)

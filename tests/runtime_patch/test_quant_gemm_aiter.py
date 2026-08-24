@@ -3930,7 +3930,23 @@ def test_quant_fp8_eligibility_and_feature_off(
     assert method(x)[0] == "lightop"
     assert method(x.t())[0] == method_name.removeprefix("forward_")
     monkeypatch.setattr(patch_input_quant_fp8, "_lightop_requested", lambda: False)
-    assert method(x)[0] == method_name.removeprefix("forward_")
+    assert method(x)[0] == "native"
+
+
+def test_quant_fp8_feature_off_preserves_cuda_for_ineligible_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_vllm_torch_utils(monkeypatch)
+    module, per_token = _fake_input_quant_module()
+    patch_input_quant_fp8.apply_to_module(module)
+    instance = module.QuantFP8()
+    instance.group_shape = per_token
+    instance.num_token_padding = None
+    monkeypatch.setattr(patch_input_quant_fp8, "_lightop_requested", lambda: False)
+
+    result = instance.forward_cuda(torch.ones(2, 4).t())
+
+    assert result[0] == "cuda"
 
 
 def test_weight8bit_marlin2_layout_2d_3d_and_validation():
