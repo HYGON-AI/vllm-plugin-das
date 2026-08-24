@@ -50,14 +50,24 @@ class _InMemoryBlockTables:
         self.input_block_tables = [torch.full_like(canonical, -77)]
         self.num_kv_cache_groups = 1
         self.slot_mappings = torch.empty((1, 128), dtype=torch.int64)
+        self.allow_global_gather = False
+        self.global_gather_calls = 0
+        self.slot_mapping_calls = 0
 
     def gather_block_tables(
         self,
         idx_mapping: torch.Tensor,
-        num_reqs: int,
+        num_reqs_padded: int,
     ) -> tuple[torch.Tensor, ...]:
-        raise AssertionError(
-            "PCP must not gather into runner-owned v0.25.1 input block tables"
+        if not self.allow_global_gather:
+            raise AssertionError(
+                "PCP target attention must not gather into runner-owned "
+                "v0.25.1 input block tables"
+            )
+        self.global_gather_calls += 1
+        assert num_reqs_padded == idx_mapping.numel()
+        return tuple(
+            table.gpu[idx_mapping.to(torch.int64)] for table in self.block_tables
         )
 
     def compute_slot_mappings(
@@ -67,6 +77,7 @@ class _InMemoryBlockTables:
         positions: torch.Tensor,
         num_tokens: int,
     ) -> torch.Tensor:
+        self.slot_mapping_calls += 1
         for req_idx in range(idx_mapping.numel()):
             start = int(query_start_loc[req_idx])
             stop = int(query_start_loc[req_idx + 1])
@@ -478,6 +489,83 @@ def test_partition_replicates_spec_decode_layout_on_every_pcp_rank(
         assert local.cu_num_logits_np.tolist() == cu_num_logits
 
 
+def test_partition_passes_known_sampler_mapping_size_to_repeat_interleave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting the known output size forces a GPU sync to infer it."""
+
+    base_batch = _make_batch(
+        [
+            ("decode-a", [900, 901, 902], 19, False),
+            ("decode-b", [800, 801, 802], 13, False),
+        ]
+    )
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=4,
+        num_draft_tokens_per_req=np.asarray([2, 2], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor(
+            [10, 10, 10, 11, 11, 11], dtype=torch.int32
+        ),
+        expanded_local_pos=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32),
+        logits_indices=torch.arange(6, dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 3, 6], dtype=np.int32),
+    )
+    manager = _make_managers()[0][0]
+    original_repeat_interleave = torch.repeat_interleave
+
+    def require_known_output_size(input, repeats, *args, **kwargs):
+        assert kwargs.get("output_size") == 6
+        return original_repeat_interleave(input, repeats, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "repeat_interleave", require_known_output_size)
+
+    local = manager.partition_batch(global_batch)
+
+    assert local.expanded_idx_mapping.tolist() == [10, 10, 10, 11, 11, 11]
+
+
+def test_partition_builds_sampler_positions_without_per_request_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampler positions must not launch one arange operation per request."""
+
+    base_batch = _make_batch(
+        [
+            ("decode-a", [900, 901, 902], 19, False),
+            ("decode-b", [800, 801, 802], 13, False),
+        ]
+    )
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=4,
+        num_draft_tokens_per_req=np.asarray([2, 2], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor(
+            [10, 10, 10, 11, 11, 11], dtype=torch.int32
+        ),
+        expanded_local_pos=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32),
+        logits_indices=torch.arange(6, dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 3, 6], dtype=np.int32),
+    )
+    manager = _make_managers()[0][0]
+    original_arange = torch.arange
+    arange_calls = 0
+
+    def count_arange(*args, **kwargs):
+        nonlocal arange_calls
+        arange_calls += 1
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", count_arange)
+
+    local = manager.partition_batch(global_batch)
+
+    assert local.expanded_local_pos.tolist() == [0, 1, 2, 0, 1, 2]
+    assert arange_calls == 1
+
+
 def test_async_mtp_partition_preserves_gpu_corrected_positions_and_seq_lens() -> None:
     """PCP must not rebuild rejection-corrected GPU state from its CPU upper bound."""
 
@@ -560,6 +648,51 @@ def test_uneven_prefill_padding_never_owns_a_kv_slot() -> None:
             1002,
         ]
         assert int((gathered_slots == -1).sum()) == 1
+
+
+def test_global_mtp_attention_reuses_target_slot_mappings() -> None:
+    """Recomputing global slots in the sampling path adds avoidable ITL."""
+
+    block_tables = _InMemoryBlockTables()
+    global_batch = _make_batch(
+        [
+            ("decode-a", [900, 901, 902], 19, False),
+            ("decode-b", [800, 801, 802], 13, False),
+        ]
+    )
+    manager = _make_managers(block_tables=block_tables)[0][0]
+    local_batch = manager.partition_batch(global_batch)
+    manager.prepare_attn(local_batch)
+    expected_slots = torch.tensor(
+        [[1016, 1017, 1018, 1110, 1111, 1112]], dtype=torch.int64
+    )
+    assert block_tables.slot_mapping_calls == 1
+    block_tables.allow_global_gather = True
+
+    global_blocks, global_slots = manager.prepare_global_attn()
+
+    assert block_tables.global_gather_calls == 1
+    assert block_tables.slot_mapping_calls == 1
+    assert torch.equal(
+        global_blocks[0],
+        block_tables.block_tables[0].gpu[global_batch.idx_mapping.to(torch.int64)],
+    )
+    assert torch.equal(global_slots, expected_slots)
+
+
+def test_global_mtp_attention_rejects_unprepared_slot_mappings() -> None:
+    """A new batch must not reuse stale global slots from an older target run."""
+
+    block_tables = _InMemoryBlockTables()
+    manager = _make_managers(block_tables=block_tables)[0][0]
+    old_batch = manager.partition_batch(
+        _make_batch([("old-decode", [900], 19, False)])
+    )
+    manager.prepare_attn(old_batch)
+    manager.partition_batch(_make_batch([("new-decode", [800], 13, False)]))
+
+    with pytest.raises(RuntimeError, match="not prepared"):
+        manager.prepare_global_attn()
 
 
 def test_partition_pads_each_rank_to_equal_width_and_remaps_logits() -> None:

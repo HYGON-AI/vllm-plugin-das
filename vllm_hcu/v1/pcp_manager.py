@@ -76,6 +76,7 @@ class HcuPCPManager:
         self._req_states = req_states
         self._block_tables = block_tables
         self._global_batch: InputBatch | None = None
+        self._global_attn_ready = False
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
@@ -382,6 +383,7 @@ class HcuPCPManager:
                 "PCP spec decode requires per-request draft-token counts"
             )
         self._global_batch = input_batch
+        self._global_attn_ready = False
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(input_batch)
         segments = segments_by_rank[self.pcp_rank]
         if not segments:
@@ -560,18 +562,32 @@ class HcuPCPManager:
         cu_num_logits = self._cu_num_logits[: num_local_reqs + 1]
         cu_num_logits.copy_(torch.from_numpy(cu_num_logits_np).to(self.device))
 
-        expanded_idx_mapping = torch.repeat_interleave(
-            local_idx_mapping,
-            torch.from_numpy(local_num_logits).to(self.device),
-        )
-        expanded_local_pos = torch.cat(
-            [
-                torch.arange(int(count), dtype=torch.int32, device=self.device)
-                for count in local_num_logits
-                if count > 0
-            ],
-            dim=0,
-        ) if num_logits else torch.empty(0, dtype=torch.int32, device=self.device)
+        if num_logits:
+            local_num_logits_tensor = torch.from_numpy(local_num_logits).to(
+                self.device
+            )
+            expanded_idx_mapping = torch.repeat_interleave(
+                local_idx_mapping,
+                local_num_logits_tensor,
+                output_size=num_logits,
+            )
+            expanded_row_starts = torch.repeat_interleave(
+                cu_num_logits[:-1],
+                local_num_logits_tensor,
+                output_size=num_logits,
+            )
+            expanded_local_pos = torch.arange(
+                num_logits,
+                dtype=torch.int32,
+                device=self.device,
+            ).sub_(expanded_row_starts)
+        else:
+            expanded_idx_mapping = torch.empty(
+                0, dtype=local_idx_mapping.dtype, device=self.device
+            )
+            expanded_local_pos = torch.empty(
+                0, dtype=torch.int32, device=self.device
+            )
 
         local_prefill_len = input_batch.prefill_len_np[global_req_indices].copy()
         local_num_computed_prefill = np.minimum(
@@ -699,7 +715,26 @@ class HcuPCPManager:
             :, : self._global_batch.num_tokens
         ]
         global_slots.copy_(computed_slots)
+        self._global_attn_ready = True
         return local_tables, self._convert_slot_mappings(global_slots)
+
+    def prepare_global_attn(
+        self,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Reuse target-prepared global slots for the replicated MTP drafter."""
+
+        if not self._global_attn_ready:
+            raise RuntimeError("PCP global attention slots are not prepared")
+        assert self._global_batch is not None
+        assert self._global_slot_mappings is not None
+        block_tables = self._block_tables.gather_block_tables(
+            self._global_batch.idx_mapping,
+            num_reqs_padded=self._global_batch.num_reqs_after_padding,
+        )
+        global_slots = self._global_slot_mappings[
+            :, : self._global_batch.num_tokens
+        ]
+        return block_tables, global_slots
 
     def _convert_slot_mappings(self, global_slots: torch.Tensor) -> torch.Tensor:
         assert self._padded_gather_idx is not None

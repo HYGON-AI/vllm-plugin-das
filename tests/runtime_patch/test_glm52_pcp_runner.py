@@ -260,6 +260,10 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
             assert hidden_states is local_hidden
             return global_hidden, global_batch
 
+        def prepare_global_attn(self):
+            events.append("pcp.prepare_global_attn")
+            return ("cached-global-blocks", global_batch), "cached-global-slots"
+
     class ModelState:
         def prepare_attn(
             self,
@@ -273,15 +277,15 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
             events.append("model_state.prepare_global_mtp_attn")
             assert input_batch is global_batch
             assert cudagraph_mode.name == "NONE"
-            assert block_tables == ("global-blocks", global_batch)
-            assert slot_mappings == "global-slots"
+            assert block_tables == ("cached-global-blocks", global_batch)
+            assert slot_mappings == "cached-global-slots"
             assert attn_groups == "attn-groups"
             assert kv_cache_config == "kv-config"
             return "global-mtp-attn-metadata"
 
     def build_slots(slot_mappings, kv_cache_config):
         events.append("build_global_slot_mappings_by_layer")
-        assert slot_mappings == "global-slots"
+        assert slot_mappings == "cached-global-slots"
         assert kv_cache_config == "kv-config"
         return "global-mtp-slots-by-layer"
 
@@ -320,7 +324,7 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     assert runner.sample_tokens("grammar") == "sampled"
     assert events == [
         "restore_for_sampling",
-        "super.prepare_attn",
+        "pcp.prepare_global_attn",
         "build_global_slot_mappings_by_layer",
         "model_state.prepare_global_mtp_attn",
         "super.sample_tokens",

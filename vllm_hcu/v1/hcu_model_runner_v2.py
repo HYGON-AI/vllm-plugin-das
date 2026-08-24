@@ -182,9 +182,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if use_replicated_mtp_batch:
                 assert execute_model_state is not None
                 assert input_batch is not None
-                block_tables, slot_mappings = GPUModelRunner.prepare_attn(
-                    self, input_batch
-                )
+                block_tables, slot_mappings = self.pcp_manager.prepare_global_attn()
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
                     slot_mappings, self.kv_cache_config
                 )
