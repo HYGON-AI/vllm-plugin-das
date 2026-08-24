@@ -249,11 +249,51 @@ def mla_forward_impl(
     return output_padded
 
 
+def _get_mla_kv_b_proj_weight(upstream, layer, out_dtype):
+    """Return logical ``[K, N]`` weight without executing an FP8 linear.
+
+    Channel-wise CompressedTensors weights have already been normalized to the
+    HCU column-major ``[K, N]`` layout before MLA post-processing.  Calling the
+    upstream generic fallback would build an identity matrix and dynamically
+    quantize it through NVIDIA-only operators.  The stored per-output scale is
+    sufficient to dequantize the weight directly and exactly.
+    """
+    weight = getattr(layer, "weight", None)
+    fp8_dtypes = {
+        torch.float8_e4m3fn,
+        getattr(torch, "float8_e4m3fnuz", torch.float8_e4m3fn),
+    }
+    is_hcu_channel_layout = (
+        isinstance(weight, torch.Tensor)
+        and weight.ndim == 2
+        and weight.dtype in fp8_dtypes
+        and getattr(weight, "input_dim", None) == 0
+        and getattr(weight, "output_dim", None) == 1
+    )
+    if not is_hcu_channel_layout:
+        return upstream.get_and_maybe_dequant_weights(
+            layer,
+            out_dtype=out_dtype,
+        )
+
+    scale = getattr(layer, "weight_scale", None)
+    if not isinstance(scale, torch.Tensor) or scale.numel() != weight.shape[1]:
+        scale_shape = None if scale is None else tuple(scale.shape)
+        raise ValueError(
+            "HCU MLA Channel-FP8 scale must contain one value per output "
+            f"channel: weight={tuple(weight.shape)}, scale={scale_shape}."
+        )
+    scale = scale.reshape(1, weight.shape[1]).float()
+    return (weight.float() * scale).to(out_dtype)
+
+
 def mla_process_weights_nn(upstream, self, act_dtype):
     """Normalize either HCU NN or upstream weight layout before MLA BMM setup."""
 
-    kv_b_proj_weight = upstream.get_and_maybe_dequant_weights(
-        self.kv_b_proj, out_dtype=act_dtype
+    kv_b_proj_weight = _get_mla_kv_b_proj_weight(
+        upstream,
+        self.kv_b_proj,
+        act_dtype,
     )
     expected = (
         self.kv_lora_rank,
