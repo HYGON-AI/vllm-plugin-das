@@ -271,4 +271,3 @@ class HYV4FlashMLASparseBackend(HcuFlashMLASparseBackend):
     @classmethod
     def supports_sink(cls) -> bool:
         return True
-

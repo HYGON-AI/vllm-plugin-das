@@ -105,6 +105,15 @@ def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
             raise ValueError(
                 f"indexer_types only supports 'full' and 'shared', got {invalid_types}."
             )
+        seen_full = False
+        for layer_idx, indexer_type in enumerate(indexer_types):
+            if indexer_type == "full":
+                seen_full = True
+            elif not seen_full:
+                raise ValueError(
+                    "A 'shared' indexer requires a preceding 'full' producer; "
+                    f"layer {layer_idx} has none."
+                )
         return {
             layer_idx
             for layer_idx, indexer_type in enumerate(indexer_types)
@@ -124,6 +133,28 @@ def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
         elif 0 <= layer_idx < len(pattern) and pattern[layer_idx] == "S":
             skip_layers.add(layer_idx)
     return skip_layers
+
+
+def require_local_indexer_producer(
+    config: PretrainedConfig,
+    *,
+    start_layer: int,
+    end_layer: int,
+) -> None:
+    """Reject PP stages that cannot obtain shared top-k indexer results."""
+    if not hasattr(config, "index_topk") or start_layer == end_layer:
+        return
+    if not 0 <= start_layer < end_layer <= config.num_hidden_layers:
+        raise ValueError(
+            "Invalid HY V4 pipeline layer range: "
+            f"[{start_layer}, {end_layer}) for {config.num_hidden_layers} layers."
+        )
+    if start_layer in compute_skip_topk_layers(config):
+        raise ValueError(
+            "HY V4 pipeline stage starts at shared indexer layer "
+            f"{start_layer}, but top-k indices are not transferred between "
+            "pipeline stages; align the partition to a 'full' indexer layer."
+        )
 
 
 def is_skip_topk_indexer_weight(weight_name: str, skip_topk_layers: set[int]) -> bool:
@@ -694,5 +725,6 @@ __all__ = [
     "Indexer",
     "compute_skip_topk_layers",
     "is_skip_topk_indexer_weight",
+    "require_local_indexer_producer",
     "require_hyv4_sink_backend",
 ]

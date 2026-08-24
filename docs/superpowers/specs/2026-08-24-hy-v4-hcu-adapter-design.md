@@ -202,4 +202,3 @@ comparisons.
   checkpoint.
 - Documented first-delivery limitations: no MTP, reasoning parser, tool parser,
   or performance guarantee.
-

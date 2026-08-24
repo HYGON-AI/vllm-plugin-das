@@ -13,6 +13,7 @@ from vllm_hcu.models.hy_v4.attention import (
     _require_sparse_mqa_backend,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
+    require_local_indexer_producer,
     require_hyv4_sink_backend,
 )
 from vllm_hcu.models.hy_v4.hcu_sparse import (
@@ -37,6 +38,30 @@ def test_full_and_shared_indexer_pattern() -> None:
         "model.layers.3.self_attn.indexer.wq_b.weight",
         {1, 2, 4, 5},
     )
+
+
+def test_shared_indexer_pattern_requires_a_preceding_full_producer() -> None:
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=3,
+        indexer_types=["shared", "shared", "full"],
+    )
+
+    with pytest.raises(ValueError, match="preceding 'full'"):
+        compute_skip_topk_layers(config)
+
+
+def test_pipeline_stage_must_start_with_a_local_full_indexer() -> None:
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=6,
+        indexer_types=["full", "shared", "shared", "full", "shared", "shared"],
+    )
+
+    require_local_indexer_producer(config, start_layer=0, end_layer=3)
+    require_local_indexer_producer(config, start_layer=3, end_layer=6)
+    with pytest.raises(ValueError, match="pipeline stage starts at shared"):
+        require_local_indexer_producer(config, start_layer=2, end_layer=5)
 
 
 def test_sink_incapable_backend_fails_closed() -> None:

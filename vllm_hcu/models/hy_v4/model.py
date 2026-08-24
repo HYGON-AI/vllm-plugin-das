@@ -68,6 +68,7 @@ from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
+    require_local_indexer_producer,
 )
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused
@@ -423,6 +424,11 @@ class HYV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        require_local_indexer_producer(
+            config,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         else:
@@ -645,6 +651,19 @@ class HYV4Model(nn.Module):
 
         for name, loaded_weight in weights:
             if is_skip_topk_indexer_weight(name, skip_topk_layers):
+                continue
+            mapped_name = _rewrite_hyv4_weight_name(name)
+            if mapped_name != name and mapped_name.endswith(".expert_bias"):
+                if is_pp_missing_parameter(mapped_name, self):
+                    continue
+                if mapped_name not in params_dict:
+                    raise RuntimeError(
+                        "Unknown HY V4 expert correction bias after mapping: "
+                        f"{mapped_name}"
+                    )
+                param = params_dict[mapped_name]
+                default_weight_loader(param, loaded_weight)
+                loaded_params.add(mapped_name)
                 continue
             if _try_load_fp8_indexer_projection(
                 name,
@@ -930,7 +949,19 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(_filter_weights(weights))
+        loaded_params = loader.load_weights(_filter_weights(weights))
+        required_expert_biases = {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith(".expert_bias")
+        }
+        missing_expert_biases = required_expert_biases - loaded_params
+        if missing_expert_biases:
+            raise RuntimeError(
+                "Missing HY V4 expert correction biases: "
+                f"{sorted(missing_expert_biases)}"
+            )
+        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

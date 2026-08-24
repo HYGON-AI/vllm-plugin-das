@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_hcu.models.hy_v4 import model as hy_v4_model
 from vllm_hcu.models.hy_v4.model import (
+    HYV4Model,
     _dequantize_indexer_channel_fp8,
     _normalize_hyv4_config,
     _rewrite_hyv4_weight_name,
@@ -66,6 +68,120 @@ def test_rewrite_hyv4_weight_name_is_exact_and_idempotent(
 ) -> None:
     assert _rewrite_hyv4_weight_name(checkpoint_name) == parameter_name
     assert _rewrite_hyv4_weight_name(parameter_name) == parameter_name
+
+
+def test_load_weights_maps_router_correction_bias_before_unknown_bias_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AutoWeightsLoader removes the outer ``model.`` prefix before invoking
+    # HYV4Model.load_weights.
+    parameter_name = "layers.15.mlp.expert_bias"
+    checkpoint_name = "layers.15.mlp.gate.e_score_correction_bias"
+    parameter = torch.nn.Parameter(torch.full((4,), float("nan")))
+    loaded_weight = torch.tensor([0.25, -0.5, 0.75, -1.0])
+
+    class MinimalModel:
+        config = SimpleNamespace(
+            tie_word_embeddings=False,
+            num_experts=4,
+            num_attention_heads=8,
+        )
+
+        @staticmethod
+        def named_parameters():
+            return [(parameter_name, parameter)]
+
+        @staticmethod
+        def get_expert_mapping():
+            return []
+
+    monkeypatch.setattr(
+        hy_v4_model, "get_pp_missing_layer_names", lambda model: set()
+    )
+    monkeypatch.setattr(hy_v4_model, "compute_skip_topk_layers", lambda config: set())
+    monkeypatch.setattr(
+        hy_v4_model, "is_pp_missing_parameter", lambda name, model: False
+    )
+    monkeypatch.setattr(
+        hy_v4_model, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(hy_v4_model, "get_tensor_model_parallel_rank", lambda: 0)
+
+    loaded = HYV4Model.load_weights(
+        MinimalModel(),
+        [(checkpoint_name, loaded_weight)],
+    )
+
+    assert loaded == {parameter_name}
+    torch.testing.assert_close(parameter, loaded_weight)
+
+
+def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_name = "model.layers.15.mlp.expert_bias"
+    checkpoint_name = "model.layers.15.mlp.gate.e_score_correction_bias"
+    parameter = torch.nn.Parameter(torch.full((4,), float("nan")))
+    loaded_weight = torch.tensor([0.25, -0.5, 0.75, -1.0])
+
+    class InnerModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.expert_bias = parameter
+            self.config = SimpleNamespace(
+                tie_word_embeddings=False,
+                num_experts=4,
+                num_attention_heads=8,
+            )
+
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            return iter([("layers.15.mlp.expert_bias", self.expert_bias)])
+
+        @staticmethod
+        def get_expert_mapping():
+            return []
+
+        def load_weights(self, weights):
+            return HYV4Model.load_weights(self, weights)
+
+    class OuterModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = InnerModel()
+            self.config = SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=78,
+                num_nextn_predict_layers=1,
+            )
+            self.quant_config = None
+
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            return iter([(parameter_name, self.model.expert_bias)])
+
+    monkeypatch.setattr(
+        hy_v4_model, "get_pp_missing_layer_names", lambda model: set()
+    )
+    monkeypatch.setattr(hy_v4_model, "compute_skip_topk_layers", lambda config: set())
+    monkeypatch.setattr(
+        hy_v4_model, "is_pp_missing_parameter", lambda name, model: False
+    )
+    monkeypatch.setattr(
+        hy_v4_model, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(hy_v4_model, "get_tensor_model_parallel_rank", lambda: 0)
+
+    model = OuterModel()
+    loaded = hy_v4_model.HYV4ForCausalLM.load_weights(
+        model,
+        [(checkpoint_name, loaded_weight)],
+    )
+    assert loaded == {parameter_name}
+    torch.testing.assert_close(parameter, loaded_weight)
+
+    with pytest.raises(RuntimeError, match="Missing HY V4 expert correction biases"):
+        hy_v4_model.HYV4ForCausalLM.load_weights(model, [])
 
 
 def test_slice_sink_for_tp_uses_contiguous_attention_head_shards() -> None:
