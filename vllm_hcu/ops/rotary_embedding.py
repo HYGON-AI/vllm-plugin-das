@@ -12,4 +12,4 @@ class HcuRotaryEmbedding(RotaryEmbedding):
     """Original rotary positional embedding."""
 
     def forward_hip(self, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_cuda(*args, **kwargs)
+        return self.forward_native(*args, **kwargs)
