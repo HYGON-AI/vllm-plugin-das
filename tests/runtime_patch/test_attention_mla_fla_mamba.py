@@ -395,6 +395,10 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
         ):
             del self, q, kv_c_and_k_pe_cache, topk_indices, topk_length
 
+        def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+            del self, kv_c_and_k_pe_cache, attn_metadata, layer
+            return q, None
+
     def split_decodes_and_prefills(
         common_attn_metadata,
         decode_threshold=1,
@@ -505,6 +509,10 @@ def _make_flashmla_sparse_separate_metadata_module(
             topk_length=None,
         ):
             del self, q, kv_c_and_k_pe_cache, topk_indices, topk_length
+
+        def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+            del self, kv_c_and_k_pe_cache, attn_metadata, layer
+            return q, None
 
     def split_decodes_and_prefills(
         common_attn_metadata,
