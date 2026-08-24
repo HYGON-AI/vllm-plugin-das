@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from transformers import AutoConfig
 
 from vllm_hcu.models.hy_v4.config import HYV4Config, register_hy_v4_config
@@ -79,3 +82,14 @@ def test_hy_v4_registry_is_backbone_only(monkeypatch) -> None:
         "vllm_hcu.models.hy_v4:HYV4ForCausalLM",
     ) in calls
     assert all(name != "HYV4MTPModel" for name, _ in calls)
+
+
+def test_config_registration_does_not_eagerly_import_model() -> None:
+    code = """
+import sys
+import vllm_hcu.models.hy_v4.config
+assert 'vllm_hcu.models.hy_v4.model' not in sys.modules
+from vllm_hcu.models.hy_v4 import HYV4ForCausalLM
+assert HYV4ForCausalLM.__name__ == 'HYV4ForCausalLM'
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
