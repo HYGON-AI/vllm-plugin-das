@@ -64,7 +64,18 @@
       "suite": "integration-smoke",
       "pytest_args": [],
       "timeout_minutes": 45,
-      "requirements": [],
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_GRAPH_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN35_9B_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        }
+      ],
       "partitions": 2
     },
     "qwen35-smoke": {
