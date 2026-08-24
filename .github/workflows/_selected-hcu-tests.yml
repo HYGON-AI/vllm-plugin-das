@@ -99,6 +99,7 @@ jobs:
           id
           ls -ld /dev/kfd /dev/dri /opt/hyhal 2>&1 || true
           ls -l /dev/dri 2>&1 || true
+          ls -ld /models/llm-models /public/opendas/DL_DATA/llm-models /public/opendas/DL_DATA 2>&1 || true
 
       - name: Start immutable HCU CI container
         run: >-

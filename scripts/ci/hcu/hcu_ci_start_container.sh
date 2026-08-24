@@ -75,8 +75,16 @@ if [[ -d /opt/hyhal ]]; then
   docker_args+=(--volume /opt/hyhal:/opt/hyhal:ro)
 fi
 
-if [[ -z "$model_root" && -d /models/llm-models ]]; then
-  model_root=/models/llm-models
+if [[ -z "$model_root" ]]; then
+  for candidate in \
+    /models/llm-models \
+    /public/opendas/DL_DATA/llm-models \
+    /public/opendas/DL_DATA; do
+    if [[ -d "$candidate/qwen3.5" || -d "$candidate/vllm-optest-models" ]]; then
+      model_root="$candidate"
+      break
+    fi
+  done
 fi
 if [[ -n "$model_root" ]]; then
   model_root="$(realpath "$model_root")"
