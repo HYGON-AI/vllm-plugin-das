@@ -80,11 +80,23 @@ if [[ -z "$model_root" ]]; then
     /models/llm-models \
     /public/opendas/DL_DATA/llm-models \
     /public/opendas/DL_DATA; do
-    if [[ -d "$candidate/qwen3.5" || -d "$candidate/vllm-optest-models" ]]; then
+    echo "checking HCU model root candidate: $candidate"
+    if [[ -d "$candidate" ]]; then
       model_root="$candidate"
       break
     fi
   done
+fi
+if [[ -z "$model_root" && "${HCU_CI_REQUIREMENTS_JSON:-}" == *'"kind": "model"'* ]]; then
+  echo "HCU model requirements were selected, but no model root was found on this runner." >&2
+  echo "Set HCU_CI_MODEL_ROOT to the runner host path or create one of these layouts:" >&2
+  for candidate in \
+    /models/llm-models \
+    /public/opendas/DL_DATA/llm-models \
+    /public/opendas/DL_DATA; do
+    ls -ld "$candidate" "$candidate/qwen3.5" "$candidate/vllm-optest-models" >&2 || true
+  done
+  exit 2
 fi
 if [[ -n "$model_root" ]]; then
   model_root="$(realpath "$model_root")"
@@ -92,6 +104,7 @@ if [[ -n "$model_root" ]]; then
     echo "HCU model root does not exist: $model_root" >&2
     exit 2
   fi
+  echo "using HCU model root: $model_root"
   docker_args+=(
     --volume "$model_root:/models/llm-models:ro"
     --env VLLM_HCU_TEST_MODEL_ROOT=/models/llm-models
