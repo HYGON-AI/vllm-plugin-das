@@ -408,7 +408,7 @@ def test_aiter_asm_boltops_fp8_quant_context_rejects_subtle_abi_drift(
     assert asm_module.per_token_quant_hip is incompatible_quant
 
 
-def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
+def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
@@ -635,13 +635,27 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
     )
     assert experts is BatchedDeepGemmExperts
 
+    dpsk_w13 = torch.arange(2 * 16 * 64, dtype=torch.int32).to(torch.int8)
+    dpsk_w13 = dpsk_w13.reshape(2, 16, 64)
+    dpsk_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
+    dpsk_w2 = dpsk_w2.reshape(2, 64, 64)
     converted_w13, converted_w2 = target.convert_to_int8_moe_kernel_format(
         backend,
-        w13,
-        w2,
+        dpsk_w13,
+        dpsk_w2,
     )
-    assert converted_w13 is w13
-    assert converted_w2 is w2
+    from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+        weight8bit_nt_kpack2_marlin2,
+    )
+
+    torch.testing.assert_close(
+        converted_w13,
+        weight8bit_nt_kpack2_marlin2(dpsk_w13),
+    )
+    torch.testing.assert_close(
+        converted_w2,
+        weight8bit_nt_kpack2_marlin2(dpsk_w2),
+    )
 
     config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "auto"
     assert target.select_int8_moe_backend(

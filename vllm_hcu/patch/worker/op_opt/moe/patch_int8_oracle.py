@@ -173,8 +173,17 @@ def apply_to_module(module: ModuleType) -> bool:
         layer=None,
         w13_scale=None,
     ):
-        if int8_backend in (hcu_enum.AITER, hcu_enum.DPSK_DEEPGEMM):
+        if int8_backend == hcu_enum.AITER:
             return w13, w2
+        if int8_backend == hcu_enum.DPSK_DEEPGEMM:
+            from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+                weight8bit_nt_kpack2_marlin2,
+            )
+
+            return (
+                weight8bit_nt_kpack2_marlin2(w13),
+                weight8bit_nt_kpack2_marlin2(w2),
+            )
         return convert(int8_backend, w13, w2, layer, w13_scale)
 
     @functools.wraps(make_quant_config)
