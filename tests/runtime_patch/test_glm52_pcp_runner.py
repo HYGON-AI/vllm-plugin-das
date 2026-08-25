@@ -21,6 +21,21 @@ import torch
 from vllm_hcu.patch.worker.framework_opt._common import PatchCompatibilityError
 
 
+def test_unitary_pcp_world_size_is_fullgraph_compilable() -> None:
+    """TP/DCP-only GLM execution must not inspect dynamic PCP/MTP state."""
+
+    from vllm_hcu.model_executor.layers.attention.pcp import (
+        effective_pcp_world_size,
+    )
+
+    def resolve_world_size(value: torch.Tensor) -> torch.Tensor:
+        return value + effective_pcp_world_size(1)
+
+    compiled = torch.compile(resolve_world_size, backend="eager", fullgraph=True)
+
+    torch.testing.assert_close(compiled(torch.tensor(1)), torch.tensor(2))
+
+
 @pytest.fixture
 def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
     """Load the HCU runner over a behavior-recording upstream MRV2 base."""

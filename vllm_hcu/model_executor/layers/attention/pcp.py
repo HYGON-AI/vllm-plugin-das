@@ -44,6 +44,12 @@ def in_replicated_mtp_batch() -> bool:
 def effective_pcp_world_size(configured_world_size: int) -> int:
     """Return the logical PCP width for the current model invocation."""
 
+    # TP/DCP-only execution is compiled as a full graph.  Avoid consulting the
+    # dynamic MTP scope in that common case because Dynamo cannot trace
+    # ContextVar.get().  A unitary PCP group is already unaffected by replicated
+    # MTP execution, so the lookup cannot change the result.
+    if configured_world_size == 1:
+        return 1
     if in_replicated_mtp_batch():
         return 1
     return configured_world_size
