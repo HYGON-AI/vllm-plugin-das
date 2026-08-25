@@ -3,6 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+from contextlib import nullcontext
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -415,8 +417,14 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
         # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
         # otherwise the scheduler can pick the wrong expert id from m_indices
-        # under cudagraph replay.
-        with mk_alignment_scope(align_used):
+        # under cudagraph replay. HCU LightOP consumes its fixed 256-row layout
+        # directly and has no upstream DeepGEMM alignment context.
+        alignment_scope = (
+            nullcontext()
+            if current_platform.is_rocm() and self.quant_config.use_int8_w8a8
+            else mk_alignment_scope(align_used)
+        )
+        with alignment_scope:
             mm1_out = _resize_cache(workspace2, (M_sum, N))
             if self.quant_config.use_int8_w8a8:
                 if activation != MoEActivation.SILU:
