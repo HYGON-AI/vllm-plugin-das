@@ -9,13 +9,11 @@ from contextlib import nullcontext
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_hcu.model_executor.layers.attention.pcp import (
     replicated_mtp_batch_scope,
 )
-from vllm_hcu.v1.async_utils import HcuAsyncOutput
 from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
 
 
@@ -119,9 +117,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     """HCU compatibility adapter around upstream v0.25.1 Model Runner V2."""
 
     def __init__(self, vllm_config, device):
-        # Upstream resolves AsyncOutput from its module globals at sample time.
-        # Route only HCU MRV2 workers to the accelerator-generic event path.
-        upstream_model_runner.AsyncOutput = HcuAsyncOutput
         super().__init__(vllm_config, device)
         self.pcp_manager = None
 
