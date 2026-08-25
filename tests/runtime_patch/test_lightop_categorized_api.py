@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 import sys
 from importlib import import_module
 from types import SimpleNamespace
@@ -74,7 +77,7 @@ def test_categorized_lightop_exports(
     device_properties = SimpleNamespace(
         gcnArchName="gfx936:sramecc+:xnack-",
         multi_processor_count=80,
-        name="HYGON DCU",
+        name="HYGON HCU",
         major=9,
         minor=3,
         total_memory=64 << 30,
