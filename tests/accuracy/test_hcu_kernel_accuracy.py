@@ -27,7 +27,7 @@ def test_lightop_silu_and_mul_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import op
+        from lightop.activation import silu_and_mul_opt
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop silu_and_mul kernel is unavailable: {exc}")
 
@@ -43,7 +43,7 @@ def test_lightop_silu_and_mul_matches_float32_reference(
         device=device,
         dtype=value.dtype,
     )
-    op.silu_and_mul_opt(actual, value)
+    silu_and_mul_opt(actual, value)
     left, right = value.float().chunk(2, dim=-1)
     reference = functional.silu(left) * right
 
@@ -70,7 +70,7 @@ def test_lightop_fused_add_rms_norm_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import fused_add_rms_norm
+        from lightop.norm import fused_add_rms_norm
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop fused_add_rms_norm kernel is unavailable: {exc}")
 
@@ -180,7 +180,7 @@ def test_lightop_rms_norm_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop.op import rmsnorm_forward_autograd
+        from lightop.norm import rmsnorm_forward_autograd
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop RMSNorm kernel is unavailable: {exc}")
 
@@ -215,7 +215,7 @@ def test_lightop_gemma_rms_norm_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import op
+        from lightop.norm import gemma_rmsnorm
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop Gemma RMSNorm kernel is unavailable: {exc}")
 
@@ -234,7 +234,7 @@ def test_lightop_gemma_rms_norm_matches_float32_reference(
     )
     epsilon = 1e-6
     actual = torch.empty_like(value)
-    op.gemma_rmsnorm(actual, value, weight, epsilon)
+    gemma_rmsnorm(value, weight, epsilon, out=actual)
     normalized = value.float() * torch.rsqrt(
         value.float().square().mean(dim=-1, keepdim=True) + epsilon
     )
@@ -254,7 +254,7 @@ def test_lightop_fused_silu_quant_has_bounded_dequant_error(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import fuse_silu_mul_per_token_quant
+        from lightop.activation import fuse_silu_mul_per_token_quant
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop fused SiluAndMul quant kernel is unavailable: {exc}")
 
@@ -296,7 +296,7 @@ def test_lightop_fused_rms_quant_has_bounded_dequant_error(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop.op import rms_norm_dynamic_per_token_quant
+        from lightop.norm import rms_norm_dynamic_per_token_quant
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop fused RMS quant kernel is unavailable: {exc}")
 
@@ -314,17 +314,14 @@ def test_lightop_fused_rms_quant_has_bounded_dequant_error(
         dtype=torch.bfloat16,
     )
     original_value = value.float().clone()
-    output = torch.empty_like(value, dtype=torch.int8)
-    scales = torch.empty((shape[0], 1), device=device, dtype=torch.float32)
     epsilon = 1e-6
-    rms_norm_dynamic_per_token_quant(
-        output,
+    output, scales = rms_norm_dynamic_per_token_quant(
         value,
         weight,
-        scales,
         epsilon,
-        None,
-        True,
+        torch.int8,
+        residual=None,
+        update_input=True,
     )
     reference = (
         original_value
@@ -350,7 +347,7 @@ def test_lightop_per_token_fp8_quant_matches_dequant_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import op
+        from lightop.quant import per_token_quant_fp8
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop per-token FP8 kernel is unavailable: {exc}")
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
@@ -368,7 +365,12 @@ def test_lightop_per_token_fp8_quant_matches_dequant_reference(
     )
     output = torch.empty_like(value, dtype=fp8_dtype)
     scales = torch.empty((shape[0], 1), device=device, dtype=torch.float32)
-    op.per_token_quant_fp8(output, value, scales)
+    per_token_quant_fp8(
+        value,
+        dtype=fp8_dtype,
+        out_q=output,
+        out_scale=scales,
+    )
     dequantized = output.float() * scales
 
     torch.testing.assert_close(
