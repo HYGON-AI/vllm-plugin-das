@@ -53,7 +53,7 @@ jobs:
 
       - name: Run portable contract tests
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc 'source /opt/dtk/env.sh && python3.10 tools/run_patch_tests.py --suite contract'
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc 'source /opt/dtk/env.sh && python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache'
 
       - name: Fetch PR diff endpoints
         env:
