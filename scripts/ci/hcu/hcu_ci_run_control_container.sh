@@ -57,18 +57,8 @@ for name in \
   fi
 done
 
-docker_args+=(
-  --env "HCU_CI_HOST_UID=$(id -u)"
-  --env "HCU_CI_HOST_GID=$(id -g)"
-)
-
 docker "${docker_args[@]}" "$image" bash -lc '
-  set +e
+  set -e
   mkdir -p "$HOME" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
-  "$@"
-  status=$?
-  if [[ -n "${GITHUB_WORKSPACE:-}" && -d "${GITHUB_WORKSPACE:-}" ]]; then
-    chown -R "$HCU_CI_HOST_UID:$HCU_CI_HOST_GID" "$GITHUB_WORKSPACE" 2>/dev/null || true
-  fi
-  exit "$status"
+  exec "$@"
 ' -- "$@"

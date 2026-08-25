@@ -76,14 +76,19 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
-            git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            git fetch --no-tags --no-recurse-submodules --depth=200 origin \
-              "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
-              "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
-            git cat-file -e "${BASE_SHA}^{commit}"
-            git cat-file -e "${HEAD_SHA}^{commit}"
-          '
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags --no-recurse-submodules --depth=200 origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
+          if ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            git fetch --no-tags --no-recurse-submodules --depth=1 origin "$BASE_SHA"
+          fi
+          if ! git cat-file -e "${HEAD_SHA}^{commit}"; then
+            git fetch --no-tags --no-recurse-submodules --depth=1 origin "$HEAD_SHA"
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
 
       - name: Verify patch contracts
         env:
@@ -93,11 +98,12 @@ jobs:
           bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
             set -euo pipefail
             python3.10 --version
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            python3.10 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
             python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
             python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
-            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
-            python3.10 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
+            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
+            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine >/dev/null
             source /opt/dtk/env.sh
             python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
           '
@@ -115,9 +121,6 @@ jobs:
           bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
             set -euo pipefail
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            git fetch --no-tags --no-recurse-submodules --depth=200 origin \
-              "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
-              "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
             git cat-file -e "${BASE_SHA}^{commit}"
             git cat-file -e "${HEAD_SHA}^{commit}"
             args=(--base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT")
