@@ -4,8 +4,10 @@
 import torch
 import torch.nn as nn
 
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+logger = init_logger(__name__)
 
 class FusedSiluAndMulAndQuant(nn.Module):
     """Fuse silu and mul and int8 quant.
@@ -20,7 +22,18 @@ class FusedSiluAndMulAndQuant(nn.Module):
 def fuse_silu_mul_quant_real(input: torch.Tensor,
                              quant_dtype: torch.dtype
                                    ) -> tuple[torch.Tensor, torch.Tensor]:
-    from lightop import fuse_silu_mul_per_token_quant as fuse_silu_mul_quant_lightop
+    try:
+        from lightop.activation import (
+            fuse_silu_mul_per_token_quant as fuse_silu_mul_quant_lightop,
+        )
+    except (ImportError, AttributeError):
+        from lightop import (
+            fuse_silu_mul_per_token_quant as fuse_silu_mul_quant_lightop,
+        )
+        logger.warning_once(
+            "Using deprecated lightop.fuse_silu_mul_per_token_quant because "
+            "lightop.activation is unavailable; upgrade LightOp."
+        )
     output = torch.empty(input.shape[0], input.shape[-1] // 2, dtype=quant_dtype, device=input.device)
     scales = torch.empty((input.shape[0], 1),
                         device=input.device,

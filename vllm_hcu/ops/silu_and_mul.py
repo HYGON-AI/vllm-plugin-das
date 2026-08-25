@@ -5,10 +5,21 @@ import os
 import torch
 
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_hcu.platforms import envs as henvs
 
-import lightop.op as op
+logger = init_logger(__name__)
+
+try:
+    from lightop import activation as op
+except (ImportError, AttributeError):
+    import lightop.op as op
+
+    logger.warning_once(
+        "Using deprecated lightop.op activation API because "
+        "lightop.activation is unavailable; upgrade LightOp."
+    )
 
 
 def silu_and_mul_opt_lightop_impl(input: torch.Tensor) -> torch.Tensor:

@@ -47,9 +47,16 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
-from lightop import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
-
 logger = init_logger(__name__)
+
+try:
+    from lightop.activation import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
+except (ImportError, AttributeError):
+    from lightop import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
+
+    logger.warning_once(
+        "Using deprecated top-level LightOp activation APIs; upgrade LightOp."
+    )
 
 
 class DeepEPDeepGemmContiguousExperts(TritonExperts):
