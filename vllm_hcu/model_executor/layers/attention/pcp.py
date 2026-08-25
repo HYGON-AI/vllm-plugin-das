@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from threading import local
 
 import torch
 
@@ -24,6 +25,7 @@ _REPLICATED_MTP_BATCH = ContextVar(
     "vllm_hcu_replicated_mtp_batch",
     default=False,
 )
+_REPLICATED_MTP_GRAPH_STATE = local()
 
 
 @contextmanager
@@ -31,13 +33,22 @@ def replicated_mtp_batch_scope() -> Iterator[None]:
     """Run a restored global MTP batch without reapplying PCP attention."""
 
     token = _REPLICATED_MTP_BATCH.set(True)
+    previous_graph_depth = getattr(_REPLICATED_MTP_GRAPH_STATE, "depth", 0)
+    _REPLICATED_MTP_GRAPH_STATE.depth = previous_graph_depth + 1
     try:
         yield
     finally:
+        _REPLICATED_MTP_GRAPH_STATE.depth = previous_graph_depth
         _REPLICATED_MTP_BATCH.reset(token)
 
 
 def in_replicated_mtp_batch() -> bool:
+    # Dynamo cannot trace ContextVar.get(). Model-runner sampling scopes and
+    # their compiled forwards execute synchronously on one worker thread, so
+    # mirror only the nesting depth needed while Dynamo captures that graph.
+    # Eager callers retain ContextVar's task-local semantics.
+    if torch.compiler.is_compiling():
+        return bool(getattr(_REPLICATED_MTP_GRAPH_STATE, "depth", 0))
     return bool(_REPLICATED_MTP_BATCH.get())
 
 
