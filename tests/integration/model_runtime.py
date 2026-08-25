@@ -48,13 +48,19 @@ class _DataParallelTerminationHandler:
         if self.defer_termination:
             self.deferred_signum = signum
             return
-        _raise_data_parallel_termination(signum, frame)
+        _raise_data_parallel_signal(signum, frame)
 
     def raise_if_deferred(self) -> None:
         signum = self.deferred_signum
         self.deferred_signum = None
         if signum is not None:
-            _raise_data_parallel_termination(signum, None)
+            _raise_data_parallel_signal(signum, None)
+
+
+def _raise_data_parallel_signal(signum: int, frame: Any) -> None:
+    if signum == signal.SIGINT:
+        signal.default_int_handler(signum, frame)
+    _raise_data_parallel_termination(signum, frame)
 
 
 def _raise_data_parallel_termination(signum: int, frame: Any) -> None:
@@ -1248,6 +1254,7 @@ def _tp_ep_data_parallel_rank(
     start_gate: Any,
 ) -> None:
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     with process_group_lock:
         if process_group_id.value == 0:
             os.setpgid(0, 0)
@@ -1315,20 +1322,20 @@ def _case_tp_ep_smoke_data_parallel(
     ]
     started_processes = []
     completed = False
-    sigterm_handler = _DataParallelTerminationHandler()
-    previous_sigterm_handler = signal.signal(
-        signal.SIGTERM,
-        sigterm_handler,
-    )
+    termination_handler = _DataParallelTerminationHandler()
+    previous_signal_handlers = {
+        sig: signal.signal(sig, termination_handler)
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
     try:
         for process in processes:
             started_processes.append(process)
-            sigterm_handler.defer_termination = True
+            termination_handler.defer_termination = True
             try:
                 process.start()
             finally:
-                sigterm_handler.defer_termination = False
-            sigterm_handler.raise_if_deferred()
+                termination_handler.defer_termination = False
+            termination_handler.raise_if_deferred()
 
         for process, ready in zip(processes, process_group_ready, strict=True):
             while not ready.wait(timeout=0.1):
@@ -1364,16 +1371,17 @@ def _case_tp_ep_smoke_data_parallel(
     finally:
         try:
             if not completed:
-                sigterm_handler.defer_termination = True
+                termination_handler.defer_termination = True
                 _terminate_data_parallel_process_groups(
                     started_processes,
                     process_group_ready[: len(started_processes)],
                     process_group_id,
                 )
         finally:
-            signal.signal(signal.SIGTERM, previous_sigterm_handler)
-            sigterm_handler.defer_termination = False
-        sigterm_handler.raise_if_deferred()
+            for sig, previous_handler in previous_signal_handlers.items():
+                signal.signal(sig, previous_handler)
+            termination_handler.defer_termination = False
+        termination_handler.raise_if_deferred()
 
 
 def _terminate_data_parallel_process_groups(
