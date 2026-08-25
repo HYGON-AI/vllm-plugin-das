@@ -42,18 +42,18 @@ jobs:
 
       - name: Verify patch contracts
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 --version
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 --version
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
 
       - name: Compile Python sources
-        run: bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 -m compileall -q tools tests vllm_hcu
+        run: bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 -m compileall -q tools tests vllm_hcu
 
       - name: Run portable contract tests
         run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc 'source /opt/dtk/env.sh && /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract'
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc 'source /opt/dtk/env.sh && python3.10 tools/run_patch_tests.py --suite contract'
 
       - name: Fetch PR diff endpoints
         env:
@@ -86,7 +86,7 @@ jobs:
           if [[ "$ACCURACY_HCU" == "true" ]]; then
             args+=(--accuracy)
           fi
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
 
   authorize-hcu:
     name: Authorize hardware execution
@@ -131,7 +131,7 @@ jobs:
         id: authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
+        run: bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
 
   selected-hcu-tests:
     name: Selected hardware tests

@@ -74,10 +74,10 @@ jobs:
               )"
             fi
             if [[ -n "$candidate" ]]; then
-              if ! docker run --rm --entrypoint /bin/bash "$candidate" -lc 'test -x /usr/local/bin/python3.10'; then
+              if ! docker run --rm --entrypoint /bin/bash "$candidate" -lc 'command -v python3.10 >/dev/null 2>&1'; then
                 docker pull "$candidate" >/dev/null 2>&1 || true
               fi
-              if docker run --rm --entrypoint /bin/bash "$candidate" -lc 'test -x /usr/local/bin/python3.10'; then
+              if docker run --rm --entrypoint /bin/bash "$candidate" -lc 'command -v python3.10 >/dev/null 2>&1'; then
                 HCU_CI_IMAGE="$(
                   docker image inspect "$candidate" \
                     --format '{{range .RepoDigests}}{{println .}}{{end}}' \
@@ -89,7 +89,7 @@ jobs:
                 fi
                 echo "HCU_CI_IMAGE=$HCU_CI_IMAGE" >> "$GITHUB_ENV"
               else
-                echo "Skipping HCU CI image candidate without /usr/local/bin/python3.10: $candidate" >&2
+                echo "Skipping HCU CI image candidate without python3.10: $candidate" >&2
               fi
             fi
           fi
