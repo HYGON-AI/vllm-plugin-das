@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import ast
 import copy
+import importlib
+import logging
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Optional
 
 import pytest
 import torch
+from vllm import logger as vllm_logger
 
 from vllm_hcu.model_executor.layers.quantization import lightop_fp8_runtime
 from vllm_hcu.ops import test_concat
@@ -22,57 +25,53 @@ from vllm_hcu.ops import test_concat
 REPO = Path(__file__).resolve().parents[2]
 
 
-def test_decode_concat_falls_back_to_torch_cat(
+_MISSING = object()
+
+
+@contextmanager
+def _isolated_concat_module(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A missing ds_cat kernel must still produce the decoded concatenation."""
-    monkeypatch.setattr(test_concat, "ds_cat", None)
-    left = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
-    right = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+    *,
+    tensor_ds_cat: object = _MISSING,
+    legacy_ds_cat: object = _MISSING,
+):
+    """Reload test_concat against an isolated LightOp package hierarchy."""
+    original_ds_cat = test_concat.ds_cat
+    vllm_logger._print_warning_once.cache_clear()
+    try:
+        with monkeypatch.context() as isolated:
+            lightop = ModuleType("lightop")
+            lightop.__path__ = []  # type: ignore[attr-defined]
+            isolated.setitem(sys.modules, "lightop", lightop)
+            isolated.delitem(sys.modules, "lightop.tensor", raising=False)
+            isolated.delitem(sys.modules, "lightop.ds_cat", raising=False)
 
-    torch.testing.assert_close(
-        test_concat.concat_helper_decode(left, right, dim=2),
-        torch.cat((left, right), dim=2),
+            if tensor_ds_cat is not _MISSING:
+                tensor = ModuleType("lightop.tensor")
+                tensor.ds_cat = tensor_ds_cat
+                lightop.tensor = tensor
+                isolated.setitem(sys.modules, "lightop.tensor", tensor)
+            if legacy_ds_cat is not _MISSING:
+                lightop.ds_cat = legacy_ds_cat
+
+            yield importlib.reload(test_concat)
+    finally:
+        test_concat.ds_cat = original_ds_cat
+        vllm_logger._print_warning_once.cache_clear()
+
+
+def _concat_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.arange(12, dtype=torch.float32).reshape(2, 2, 3),
+        torch.arange(8, dtype=torch.float32).reshape(2, 2, 2),
     )
-
-
-def test_prefill_concat_falls_back_to_torch_cat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A missing ds_cat kernel must still produce the prefill concatenation."""
-    monkeypatch.setattr(test_concat, "ds_cat", None)
-    left = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
-    right = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
-
-    torch.testing.assert_close(
-        test_concat.lightop_concat_prefill_helper(left, right, dim=2),
-        torch.cat((left, right), dim=2),
-    )
-
-
-def _execute_concat_import_boundary(namespace: dict[str, object]) -> None:
-    """Execute test_concat's real eager three-level LightOp import boundary."""
-    boundary = copy.deepcopy(
-        next(
-            node
-            for node in _module("vllm_hcu/ops/test_concat.py").body
-            if isinstance(node, ast.Try)
-            and any(
-                isinstance(item, ast.ImportFrom)
-                and item.module == "lightop.tensor"
-                for item in node.body
-            )
-        )
-    )
-    module = ast.Module(body=[boundary], type_ignores=[])
-    ast.fix_missing_locations(module)
-    exec(compile(module, "test_concat_import_boundary", "exec"), namespace)
 
 
 def test_concat_prefers_tensor_ds_cat_and_preserves_kernel_modes(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Categorized ds_cat must be used for decode mode 0 and prefill mode 6."""
+    """The real eager module uses categorized ds_cat for modes 0 and 6."""
     calls: list[int] = []
 
     def categorized(
@@ -81,59 +80,96 @@ def test_concat_prefers_tensor_ds_cat_and_preserves_kernel_modes(
         calls.append(mode)
         output.copy_(torch.cat((left, right), dim=2))
 
-    _install_lightop_submodule(monkeypatch, "tensor", ds_cat=categorized)
-    namespace: dict[str, object] = {"logger": _WarningLogger()}
-    _execute_concat_import_boundary(namespace)
-    monkeypatch.setattr(test_concat, "ds_cat", namespace["ds_cat"])
-    left = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
-    right = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+    caplog.set_level(logging.WARNING, logger="vllm_hcu.ops.test_concat")
+    with _isolated_concat_module(monkeypatch, tensor_ds_cat=categorized) as module:
+        left, right = _concat_inputs()
+        decoded = module.concat_helper_decode(left, right, dim=2)
+        prefilled = module.lightop_concat_prefill_helper(left, right, dim=2)
 
-    decoded = test_concat.concat_helper_decode(left, right, dim=2)
-    prefilled = test_concat.lightop_concat_prefill_helper(left, right, dim=2)
+        assert module.ds_cat is categorized
+        torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
 
-    torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
-    torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
     assert calls == [0, 6]
-    assert namespace["logger"].messages == []
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "vllm_hcu.ops.test_concat"
+    ]
 
 
-def test_concat_legacy_ds_cat_warns_once_when_tensor_api_is_missing(
+def test_concat_legacy_ds_cat_warns_once_and_executes_real_helpers(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The compatible top-level ds_cat remains available with one warning."""
-    legacy = ModuleType("lightop")
-    legacy.__path__ = []  # type: ignore[attr-defined]
-    legacy.ds_cat = lambda *_args: None
-    logger = _WarningLogger()
-    monkeypatch.setitem(sys.modules, "lightop", legacy)
-    monkeypatch.delitem(sys.modules, "lightop.tensor", raising=False)
-    namespace: dict[str, object] = {"logger": logger}
+    """The real eager module accepts legacy ds_cat and logs once across reloads."""
+    calls: list[int] = []
 
-    _execute_concat_import_boundary(namespace)
-    _execute_concat_import_boundary(namespace)
+    def legacy(
+        left: torch.Tensor, right: torch.Tensor, output: torch.Tensor, mode: int
+    ) -> None:
+        calls.append(mode)
+        output.copy_(torch.cat((left, right), dim=2))
 
-    assert namespace["ds_cat"] is legacy.ds_cat
-    assert logger.messages == [
+    caplog.set_level(logging.WARNING, logger="vllm_hcu.ops.test_concat")
+    with _isolated_concat_module(monkeypatch, legacy_ds_cat=legacy) as module:
+        left, right = _concat_inputs()
+        decoded = module.concat_helper_decode(left, right, dim=2)
+        prefilled = module.lightop_concat_prefill_helper(left, right, dim=2)
+        module = importlib.reload(module)
+        decoded_after_reload = module.concat_helper_decode(left, right, dim=2)
+        prefilled_after_reload = module.lightop_concat_prefill_helper(
+            left, right, dim=2
+        )
+
+        assert module.ds_cat is legacy
+        torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(decoded_after_reload, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(
+            prefilled_after_reload, torch.cat((left, right), dim=2)
+        )
+
+    assert calls == [0, 6, 0, 6]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "vllm_hcu.ops.test_concat"
+    ] == [
         "Using deprecated top-level lightop.ds_cat because "
         "lightop.tensor is unavailable; upgrade LightOp."
     ]
 
 
-def test_concat_missing_ds_cat_warns_once_and_uses_fallback(
+def test_concat_missing_ds_cat_warns_once_and_falls_back_to_torch_cat(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """No available LightOp concat kernel must select the torch fallback."""
-    _install_lightop(monkeypatch)
-    monkeypatch.delitem(sys.modules, "lightop.tensor", raising=False)
-    monkeypatch.delitem(sys.modules, "lightop.ds_cat", raising=False)
-    logger = _WarningLogger()
-    namespace: dict[str, object] = {"logger": logger}
+    """The real eager module returns torch.cat results when ds_cat is absent."""
+    caplog.set_level(logging.WARNING, logger="vllm_hcu.ops.test_concat")
+    with _isolated_concat_module(monkeypatch) as module:
+        left, right = _concat_inputs()
+        decoded = module.concat_helper_decode(left, right, dim=2)
+        prefilled = module.lightop_concat_prefill_helper(left, right, dim=2)
+        module = importlib.reload(module)
+        decoded_after_reload = module.concat_helper_decode(left, right, dim=2)
+        prefilled_after_reload = module.lightop_concat_prefill_helper(
+            left, right, dim=2
+        )
 
-    _execute_concat_import_boundary(namespace)
-    _execute_concat_import_boundary(namespace)
+        assert module.ds_cat is None
+        torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(decoded_after_reload, torch.cat((left, right), dim=2))
+        torch.testing.assert_close(
+            prefilled_after_reload, torch.cat((left, right), dim=2)
+        )
 
-    assert namespace["ds_cat"] is None
-    assert logger.messages == ["LightOp ds_cat is unavailable; using torch.cat."]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "vllm_hcu.ops.test_concat"
+    ] == ["LightOp ds_cat is unavailable; using torch.cat."]
 
 
 class _WarningLogger:
