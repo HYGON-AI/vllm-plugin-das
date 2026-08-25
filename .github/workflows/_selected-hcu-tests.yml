@@ -62,6 +62,30 @@ jobs:
       - name: Repair self-hosted workspace before checkout
         run: |
           set -euo pipefail
+          if [[ -z "${HCU_CI_IMAGE:-}" ]] && command -v docker >/dev/null 2>&1; then
+            candidate=
+            if docker image inspect vllm-hcu-ci:current >/dev/null 2>&1; then
+              candidate=vllm-hcu-ci:current
+            else
+              candidate="$(
+                docker image ls \
+                  --format '{{.Repository}}:{{.Tag}}' \
+                  | awk '$1 !~ /<none>/ && $1 ~ /(^|\/)vllm:/ && $1 ~ /latest$/ {print; exit}'
+              )"
+            fi
+            if [[ -n "$candidate" ]]; then
+              HCU_CI_IMAGE="$(
+                docker image inspect "$candidate" \
+                  --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                  | sed '/^$/d' \
+                  | head -n1
+              )"
+              if [[ -z "$HCU_CI_IMAGE" ]]; then
+                HCU_CI_IMAGE="$(docker image inspect "$candidate" --format '{{.Id}}')"
+              fi
+              echo "HCU_CI_IMAGE=$HCU_CI_IMAGE" >> "$GITHUB_ENV"
+            fi
+          fi
           mkdir -p "$GITHUB_WORKSPACE"
           uid="$(id -u)"
           gid="$(id -g)"

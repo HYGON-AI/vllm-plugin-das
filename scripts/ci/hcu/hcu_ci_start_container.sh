@@ -21,6 +21,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$image" ]]; then
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  image="$("$script_dir/hcu_ci_resolve_image.sh")"
+fi
+
 if [[ -z "$image" || -z "$container_name" || -z "$artifact_root" ]]; then
   echo "HCU CI image, container name, and host artifact root are required" >&2
   exit 2
@@ -29,8 +34,10 @@ if [[ ! "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
   echo "invalid HCU CI container name: $container_name" >&2
   exit 2
 fi
-if [[ "${HCU_CI_ALLOW_MUTABLE_IMAGE:-0}" != "1" && ! "$image" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
-  echo "HCU_CI_IMAGE must be pinned by sha256 digest; set HCU_CI_ALLOW_MUTABLE_IMAGE=1 only for local debugging" >&2
+if [[ "${HCU_CI_ALLOW_MUTABLE_IMAGE:-0}" != "1" \
+    && ! "$image" =~ @sha256:[0-9a-fA-F]{64}$ \
+    && ! "$image" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+  echo "HCU_CI_IMAGE must be pinned by sha256 digest or local image id; set HCU_CI_ALLOW_MUTABLE_IMAGE=1 only for local debugging" >&2
   exit 2
 fi
 
@@ -38,7 +45,7 @@ workspace="$(realpath "$workspace")"
 mkdir -p "$artifact_root"
 artifact_root="$(realpath "$artifact_root")"
 
-if [[ "${HCU_CI_SKIP_PULL:-0}" != "1" ]]; then
+if [[ "${HCU_CI_SKIP_PULL:-0}" != "1" && ! "$image" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
   docker pull "$image"
 fi
 docker rm -f "$container_name" >/dev/null 2>&1 || true

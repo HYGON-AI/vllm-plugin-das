@@ -22,11 +22,11 @@ jobs:
     runs-on:
       - self-hosted
       - hcu-ci-pr
-    container:
-      image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
       run:
         shell: bash
+    env:
+      HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       has_jobs: ${{ steps.select.outputs.has_jobs }}
@@ -42,19 +42,18 @@ jobs:
 
       - name: Verify patch contracts
         run: |
-          /usr/local/bin/python3.10 --version
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 --version
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
 
       - name: Compile Python sources
-        run: /usr/local/bin/python3.10 -m compileall -q tools tests vllm_hcu
+        run: bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 -m compileall -q tools tests vllm_hcu
 
       - name: Run portable contract tests
         run: |
-          source /opt/dtk/env.sh
-          /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc 'source /opt/dtk/env.sh && /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract'
 
       - name: Fetch PR diff endpoints
         env:
@@ -63,12 +62,14 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch --no-tags --no-recurse-submodules --depth=1 origin \
-            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
-            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
-          git cat-file -e "${BASE_SHA}^{commit}"
-          git cat-file -e "${HEAD_SHA}^{commit}"
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git fetch --no-tags --no-recurse-submodules --depth=1 origin \
+              "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
+              "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
+            git cat-file -e "${BASE_SHA}^{commit}"
+            git cat-file -e "${HEAD_SHA}^{commit}"
+          '
 
       - name: Select HCU matrix
         id: select
@@ -85,7 +86,7 @@ jobs:
           if [[ "$ACCURACY_HCU" == "true" ]]; then
             args+=(--accuracy)
           fi
-          /usr/local/bin/python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
 
   authorize-hcu:
     name: Authorize hardware execution
@@ -93,11 +94,11 @@ jobs:
     runs-on:
       - self-hosted
       - hcu-ci-pr
-    container:
-      image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
       run:
         shell: bash
+    env:
+      HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
     permissions:
       contents: read
       issues: read
@@ -107,6 +108,18 @@ jobs:
       actor: ${{ steps.authorization.outputs.actor }}
       permission: ${{ steps.authorization.outputs.permission }}
     steps:
+      - name: Checkout PR runner helpers
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Preserve PR runner helpers
+        run: |
+          mkdir -p "$RUNNER_TEMP/hcu-ci-scripts"
+          cp scripts/ci/hcu/hcu_ci_resolve_image.sh "$RUNNER_TEMP/hcu-ci-scripts/"
+          cp scripts/ci/hcu/hcu_ci_run_control_container.sh "$RUNNER_TEMP/hcu-ci-scripts/"
+
       - name: Checkout trusted authorization helper
         uses: actions/checkout@v4
         with:
@@ -118,7 +131,7 @@ jobs:
         id: authorization
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: /usr/local/bin/python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
+        run: bash "$RUNNER_TEMP/hcu-ci-scripts/hcu_ci_run_control_container.sh" -- /usr/local/bin/python3.10 .github/scripts/hcu_ci/check_hcu_ci_authorization.py
 
   selected-hcu-tests:
     name: Selected hardware tests
