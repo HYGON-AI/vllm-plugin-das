@@ -468,7 +468,7 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
     assert metadata.decode.schedule_metadata is upstream_schedule
 
 
-def test_rocm_lightop_paged_mqa_builds_its_schedule_internally(
+def test_rocm_lightop_paged_mqa_uses_categorized_kernel_and_builds_its_schedule_internally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The runtime contract permits the metadata adapter to skip precompute."""
@@ -487,13 +487,20 @@ def test_rocm_lightop_paged_mqa_builds_its_schedule_internally(
 
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(runtime.gemmopt, "paged_mqa_logits", paged_mqa_logits)
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(paged_mqa_logits=paged_mqa_logits),
+        raising=False,
+    )
+    monkeypatch.delattr(runtime, "gemmopt", raising=False)
     supplied_schedule = object()
+    weights = torch.arange(16, dtype=torch.float16).reshape(8, 2).transpose(0, 1)
 
     result = runtime.rocm_fp8_paged_mqa_logits(
         torch.empty((2, 1, 8, 128)),
         torch.empty((1, 64, 1, 132), dtype=torch.uint8),
-        torch.empty((2, 8)),
+        weights,
         torch.ones((2, 1), dtype=torch.int32),
         torch.zeros((2, 1), dtype=torch.int32),
         supplied_schedule,
@@ -503,6 +510,10 @@ def test_rocm_lightop_paged_mqa_builds_its_schedule_internally(
     assert result is output
     assert len(calls) == 1
     assert calls[0][5] is None
+    assert calls[0][-1] is True
+    assert calls[0][2].dtype is torch.float32
+    assert calls[0][2].is_contiguous()
+    assert torch.equal(calls[0][2], weights.float().contiguous())
 
 
 def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():

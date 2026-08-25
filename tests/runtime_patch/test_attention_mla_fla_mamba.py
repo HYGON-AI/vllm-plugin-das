@@ -851,6 +851,7 @@ def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
         fake_lightop
     )
     monkeypatch.setitem(sys.modules, "lightop", lightop_module)
+    monkeypatch.delitem(sys.modules, "lightop.attention", raising=False)
 
     writer_calls: list[tuple[object, ...]] = []
     aiter_cache_module = ModuleType("aiter.ops.cache")
