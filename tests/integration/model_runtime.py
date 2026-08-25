@@ -39,6 +39,24 @@ class _DataParallelTermination(BaseException):
     pass
 
 
+class _DataParallelTerminationHandler:
+    def __init__(self) -> None:
+        self.defer_termination = False
+        self.deferred_signum: int | None = None
+
+    def __call__(self, signum: int, frame: Any) -> None:
+        if self.defer_termination:
+            self.deferred_signum = signum
+            return
+        _raise_data_parallel_termination(signum, frame)
+
+    def raise_if_deferred(self) -> None:
+        signum = self.deferred_signum
+        self.deferred_signum = None
+        if signum is not None:
+            _raise_data_parallel_termination(signum, None)
+
+
 def _raise_data_parallel_termination(signum: int, frame: Any) -> None:
     del frame
     raise _DataParallelTermination(
@@ -490,7 +508,12 @@ def _terminate_owned_process_groups(
     owned_groups = {int(process_group_id) for process_group_id in process_group_ids}
     if not owned_groups:
         return
-    if min(owned_groups) <= 1 or os.getpgrp() in owned_groups:
+    protected_groups = {os.getpgrp()}
+    try:
+        protected_groups.add(os.getpgid(os.getppid()))
+    except ProcessLookupError:
+        pass
+    if min(owned_groups) <= 1 or owned_groups & protected_groups:
         raise RuntimeError(
             f"refusing to signal unvalidated process groups {sorted(owned_groups)}"
         )
@@ -1292,14 +1315,20 @@ def _case_tp_ep_smoke_data_parallel(
     ]
     started_processes = []
     completed = False
+    sigterm_handler = _DataParallelTerminationHandler()
     previous_sigterm_handler = signal.signal(
         signal.SIGTERM,
-        _raise_data_parallel_termination,
+        sigterm_handler,
     )
     try:
         for process in processes:
-            process.start()
             started_processes.append(process)
+            sigterm_handler.defer_termination = True
+            try:
+                process.start()
+            finally:
+                sigterm_handler.defer_termination = False
+            sigterm_handler.raise_if_deferred()
 
         for process, ready in zip(processes, process_group_ready, strict=True):
             while not ready.wait(timeout=0.1):
@@ -1333,13 +1362,18 @@ def _case_tp_ep_smoke_data_parallel(
         completed = True
         return results[0]
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm_handler)
-        if not completed:
-            _terminate_data_parallel_process_groups(
-                started_processes,
-                process_group_ready[: len(started_processes)],
-                process_group_id,
-            )
+        try:
+            if not completed:
+                sigterm_handler.defer_termination = True
+                _terminate_data_parallel_process_groups(
+                    started_processes,
+                    process_group_ready[: len(started_processes)],
+                    process_group_id,
+                )
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            sigterm_handler.defer_termination = False
+        sigterm_handler.raise_if_deferred()
 
 
 def _terminate_data_parallel_process_groups(
@@ -1350,10 +1384,13 @@ def _terminate_data_parallel_process_groups(
     if len(processes) != len(process_group_ready):
         raise RuntimeError("rank process/group-ready tracking is inconsistent")
 
+    started_processes = [
+        process for process in processes if process.pid is not None
+    ]
     unready_processes = [
         process
         for process, ready in zip(processes, process_group_ready, strict=True)
-        if not ready.is_set()
+        if process.pid is not None and not ready.is_set()
     ]
 
     for process in unready_processes:
@@ -1364,19 +1401,21 @@ def _terminate_data_parallel_process_groups(
     if owned_group_id > 1:
         _terminate_owned_process_groups(
             [owned_group_id],
-            process_leaders=processes,
+            process_leaders=started_processes,
             term_timeout_s=10,
             kill_timeout_s=5,
         )
 
-    for process in processes:
+    for process in started_processes:
         process.join(timeout=10)
-    survivors = [process for process in processes if process.is_alive()]
+    survivors = [process for process in started_processes if process.is_alive()]
     for process in survivors:
         process.kill()
     for process in survivors:
         process.join(timeout=10)
-    survivors = [process.pid for process in processes if process.is_alive()]
+    survivors = [
+        process.pid for process in started_processes if process.is_alive()
+    ]
     if survivors:
         raise RuntimeError(
             f"data-parallel rank parents survived cleanup: {survivors}"

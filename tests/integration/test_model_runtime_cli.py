@@ -39,16 +39,21 @@ class _FakeResultQueue:
 
 
 class _FakeRankProcess:
-    def __init__(self, pid, exitcode, args, join_error=None):
-        self.pid = pid
+    def __init__(self, pid, exitcode, args, join_error=None, start_hook=None):
+        self.pid = None
+        self._started_pid = pid
         self.exitcode = exitcode
         self.args = args
         self.join_error = join_error
+        self.start_hook = start_hook
 
     def start(self):
+        self.pid = self._started_pid
         for value in self.args:
             if isinstance(value, _FakeEvent):
                 value.set()
+        if self.start_hook is not None:
+            self.start_hook()
 
     def join(self, timeout=None):
         del timeout
@@ -66,11 +71,19 @@ class _FakeRankProcess:
 
 
 class _FakeMultiprocessingContext:
-    def __init__(self, exitcodes, *, join_error=None, queue_error=None):
+    def __init__(
+        self,
+        exitcodes,
+        *,
+        join_error=None,
+        queue_error=None,
+        start_hook=None,
+    ):
         self.exitcodes = list(exitcodes)
         self.join_error = join_error
         self.queue = _FakeResultQueue(queue_error)
         self.processes = []
+        self.start_hook = start_hook
 
     def Event(self):
         return _FakeEvent()
@@ -99,6 +112,7 @@ class _FakeMultiprocessingContext:
             self.exitcodes[index],
             args,
             join_error=self.join_error,
+            start_hook=self.start_hook,
         )
         self.processes.append(process)
         return process
@@ -261,6 +275,80 @@ def test_tp_ep_dp_installs_sigterm_cleanup_handler(monkeypatch):
     assert handlers[-1] == (signal.SIGTERM, signal.SIG_DFL)
 
 
+def test_tp_ep_dp_tracks_rank_if_sigterm_interrupts_process_start(monkeypatch):
+    active_handler = {"value": signal.SIG_DFL}
+
+    def fake_signal(sig, handler):
+        assert sig == signal.SIGTERM
+        previous = active_handler["value"]
+        active_handler["value"] = handler
+        return previous
+
+    def interrupt_start():
+        active_handler["value"](signal.SIGTERM, None)
+
+    context = _FakeMultiprocessingContext([None], start_hook=interrupt_start)
+    cleaned, kwargs = _run_fake_dp_case(monkeypatch, context)
+    monkeypatch.setattr(model_runtime.signal, "signal", fake_signal)
+
+    with pytest.raises(
+        model_runtime._DataParallelTermination,
+        match="received signal 15",
+    ):
+        model_runtime._case_tp_ep_smoke_data_parallel(Path("/models/fake"), **kwargs)
+
+    assert [entry[0] for entry in cleaned] == [[1000]]
+    assert active_handler["value"] == signal.SIG_DFL
+
+
+def test_tp_ep_dp_tracks_rank_if_keyboard_interrupts_process_start(monkeypatch):
+    context = _FakeMultiprocessingContext(
+        [None],
+        start_hook=lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    cleaned, kwargs = _run_fake_dp_case(monkeypatch, context)
+
+    with pytest.raises(KeyboardInterrupt):
+        model_runtime._case_tp_ep_smoke_data_parallel(Path("/models/fake"), **kwargs)
+
+    assert [entry[0] for entry in cleaned] == [[1000]]
+
+
+def test_tp_ep_dp_defers_second_sigterm_until_cleanup_finishes(monkeypatch):
+    active_handler = {"value": signal.SIG_DFL}
+    cleanup_finished = []
+
+    def fake_signal(sig, handler):
+        assert sig == signal.SIGTERM
+        previous = active_handler["value"]
+        active_handler["value"] = handler
+        return previous
+
+    context = _FakeMultiprocessingContext([1])
+    _, kwargs = _run_fake_dp_case(monkeypatch, context)
+    monkeypatch.setattr(model_runtime.signal, "signal", fake_signal)
+
+    def cleanup(processes, ready_events, process_group_id):
+        del processes, ready_events, process_group_id
+        active_handler["value"](signal.SIGTERM, None)
+        cleanup_finished.append(True)
+
+    monkeypatch.setattr(
+        model_runtime,
+        "_terminate_data_parallel_process_groups",
+        cleanup,
+    )
+
+    with pytest.raises(
+        model_runtime._DataParallelTermination,
+        match="received signal 15",
+    ):
+        model_runtime._case_tp_ep_smoke_data_parallel(Path("/models/fake"), **kwargs)
+
+    assert cleanup_finished == [True]
+    assert active_handler["value"] == signal.SIG_DFL
+
+
 def test_tp_ep_dp_cleans_every_rank_group_after_interruption(monkeypatch):
     context = _FakeMultiprocessingContext(
         [None, None],
@@ -313,6 +401,15 @@ def test_owned_process_group_cleanup_escalates_and_verifies(monkeypatch):
         (1001, signal.SIGTERM),
         (1001, signal.SIGKILL),
     ]
+
+
+def test_owned_process_group_cleanup_rejects_parent_group(monkeypatch):
+    monkeypatch.setattr(model_runtime.os, "getpgrp", lambda: 2000)
+    monkeypatch.setattr(model_runtime.os, "getppid", lambda: 2999)
+    monkeypatch.setattr(model_runtime.os, "getpgid", lambda pid: 3000)
+
+    with pytest.raises(RuntimeError, match="unvalidated process groups.*3000"):
+        model_runtime._terminate_owned_process_groups([3000])
 
 
 def test_owned_process_group_cleanup_reaps_leaders_while_waiting(monkeypatch):
