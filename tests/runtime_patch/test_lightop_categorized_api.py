@@ -1,6 +1,9 @@
+import sys
 from importlib import import_module
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 REQUIRED_EXPORTS = {
@@ -46,9 +49,44 @@ REQUIRED_EXPORTS = {
 }
 
 
+@pytest.fixture
+def isolated_lightop_modules():
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "lightop" or name.startswith("lightop.")
+    }
+    try:
+        yield
+    finally:
+        for name in tuple(sys.modules):
+            if name == "lightop" or name.startswith("lightop."):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_modules)
+
+
+@pytest.mark.usefixtures("isolated_lightop_modules")
 @pytest.mark.parametrize("module_name", sorted(REQUIRED_EXPORTS))
-def test_categorized_lightop_exports(module_name: str) -> None:
-    pytest.importorskip("lightop")
+def test_categorized_lightop_exports(
+    module_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device_properties = SimpleNamespace(
+        gcnArchName="gfx936:sramecc+:xnack-",
+        multi_processor_count=80,
+        name="HYGON DCU",
+        major=9,
+        minor=3,
+        total_memory=64 << 30,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *args, **kwargs: device_properties,
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    import_module("lightop")
     module = import_module(module_name)
     missing = sorted(
         name for name in REQUIRED_EXPORTS[module_name] if not hasattr(module, name)

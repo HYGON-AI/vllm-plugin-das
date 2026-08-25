@@ -1414,11 +1414,18 @@ def test_moe_align_requires_categorized_out_api(
     assert patch_moe_align_block_size.apply_to_module(module) is True
     from vllm_hcu.platforms import envs as henvs
 
+    def stale_kernel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("cached lightop.moe must not leak into this test")
+
+    stale_moe = _module("lightop.moe", moe_align_block_size_out=stale_kernel)
+    monkeypatch.setitem(sys.modules, "lightop.moe", stale_moe)
     legacy = _module("lightop.op", moe_align_block_size=lambda *args: None)
     lightop = _module("lightop", op=legacy)
     lightop.__path__ = []
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.op", legacy)
+    monkeypatch.delitem(sys.modules, "lightop.moe", raising=False)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", True)
 
