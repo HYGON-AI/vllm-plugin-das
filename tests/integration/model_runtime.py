@@ -35,6 +35,17 @@ RESULT_PREFIX = "VLLM_HCU_RESULT="
 UNIFIED_ATTENTION_HEAD_DIMS = {128, 192, 256, 512}
 
 
+class _DataParallelTermination(BaseException):
+    pass
+
+
+def _raise_data_parallel_termination(signum: int, frame: Any) -> None:
+    del frame
+    raise _DataParallelTermination(
+        f"data-parallel launcher received signal {signum}"
+    )
+
+
 def available_hcu_count() -> int:
     try:
         import torch
@@ -346,49 +357,57 @@ def run_vllm_case(
     if extra_args:
         command.extend(extra_args)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log:
-        log.write(_case_log_header(command, env=env, extra_env=extra_env))
-        log.flush()
-        proc = subprocess.Popen(
-            command,
-            cwd=Path(__file__).resolve().parents[2],
-            env=env,
-            text=True,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
-            returncode = proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            _terminate_case_process_group(proc)
-            output = log_path.read_text(encoding="utf-8", errors="replace")
+    proc = None
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write(_case_log_header(command, env=env, extra_env=extra_env))
+            log.flush()
+            proc = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parents[2],
+                env=env,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                returncode = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                output = log_path.read_text(encoding="utf-8", errors="replace")
+                raise AssertionError(
+                    f"vLLM integration case {case!r} timed out after "
+                    f"{timeout_s}s\n"
+                    f"command={' '.join(command)}\n"
+                    f"log={log_path}\n"
+                    f"{output}"
+                ) from None
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        if returncode != 0:
             raise AssertionError(
-                f"vLLM integration case {case!r} timed out after {timeout_s}s\n"
+                f"vLLM integration case {case!r} failed with rc={returncode}\n"
                 f"command={' '.join(command)}\n"
                 f"log={log_path}\n"
                 f"{output}"
-            ) from None
-    output = log_path.read_text(encoding="utf-8", errors="replace")
-    if returncode != 0:
+            )
+        for line in reversed(output.splitlines()):
+            if line.startswith(RESULT_PREFIX):
+                payload = line.removeprefix(RESULT_PREFIX)
+                parsed = json.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise AssertionError(
+                        f"invalid result payload for {case!r}: {payload}"
+                    )
+                return parsed
         raise AssertionError(
-            f"vLLM integration case {case!r} failed with rc={returncode}\n"
-            f"command={' '.join(command)}\n"
+            f"vLLM integration case {case!r} did not emit {RESULT_PREFIX!r}\n"
             f"log={log_path}\n"
             f"{output}"
         )
-    for line in reversed(output.splitlines()):
-        if line.startswith(RESULT_PREFIX):
-            payload = line.removeprefix(RESULT_PREFIX)
-            parsed = json.loads(payload)
-            if not isinstance(parsed, dict):
-                raise AssertionError(f"invalid result payload for {case!r}: {payload}")
-            return parsed
-    raise AssertionError(
-        f"vLLM integration case {case!r} did not emit {RESULT_PREFIX!r}\n"
-        f"log={log_path}\n"
-        f"{output}"
-    )
+    except BaseException:
+        if proc is not None:
+            _terminate_case_process_group(proc)
+        raise
 
 
 def _case_log_path(case: str, model_path: Path) -> Path:
@@ -418,18 +437,96 @@ def _case_log_header(
     return header
 
 
-def _terminate_case_process_group(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=30)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_groups(
+    process_group_ids: set[int],
+    timeout_s: float,
+    *,
+    process_leaders: list[Any] | None = None,
+) -> set[int]:
+    remaining = set(process_group_ids)
+    deadline = time.monotonic() + timeout_s
+    while remaining:
+        for process in process_leaders or ():
+            if hasattr(process, "poll"):
+                process.poll()
+            else:
+                process.join(timeout=0)
+        remaining = {
+            process_group_id
+            for process_group_id in remaining
+            if _process_group_exists(process_group_id)
+        }
+        if not remaining or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    return remaining
+
+
+def _signal_process_groups(process_group_ids: set[int], sig: signal.Signals) -> None:
+    for process_group_id in sorted(process_group_ids):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(process_group_id, sig)
         except ProcessLookupError:
-            return
-        proc.wait(timeout=10)
+            pass
+
+
+def _terminate_owned_process_groups(
+    process_group_ids: list[int] | set[int],
+    *,
+    process_leaders: list[Any] | None = None,
+    term_timeout_s: float = 30,
+    kill_timeout_s: float = 10,
+) -> None:
+    owned_groups = {int(process_group_id) for process_group_id in process_group_ids}
+    if not owned_groups:
+        return
+    if min(owned_groups) <= 1 or os.getpgrp() in owned_groups:
+        raise RuntimeError(
+            f"refusing to signal unvalidated process groups {sorted(owned_groups)}"
+        )
+
+    wait_kwargs = (
+        {"process_leaders": process_leaders}
+        if process_leaders is not None
+        else {}
+    )
+    _signal_process_groups(owned_groups, signal.SIGTERM)
+    remaining = _wait_for_process_groups(
+        owned_groups,
+        term_timeout_s,
+        **wait_kwargs,
+    )
+    if remaining:
+        _signal_process_groups(remaining, signal.SIGKILL)
+        remaining = _wait_for_process_groups(
+            remaining,
+            kill_timeout_s,
+            **wait_kwargs,
+        )
+    if remaining:
+        raise RuntimeError(
+            f"task-owned process groups survived cleanup: {sorted(remaining)}"
+        )
+
+
+def _terminate_case_process_group(proc: subprocess.Popen) -> None:
+    _terminate_owned_process_groups([proc.pid], process_leaders=[proc])
+    try:
+        proc.wait(timeout=0)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"case process {proc.pid} survived process-group cleanup"
+        ) from exc
 
 
 def _llm_kwargs(
@@ -1122,7 +1219,20 @@ def _tp_ep_data_parallel_rank(
     all2all_backend: str | None,
     moe_backend: str,
     result_queue: Any,
+    process_group_id: Any,
+    process_group_lock: Any,
+    process_group_ready: Any,
+    start_gate: Any,
 ) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    with process_group_lock:
+        if process_group_id.value == 0:
+            os.setpgid(0, 0)
+            process_group_id.value = os.getpid()
+        else:
+            os.setpgid(0, process_group_id.value)
+    process_group_ready.set()
+    start_gate.wait()
     os.environ["VLLM_DP_RANK"] = str(local_dp_rank)
     os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
     os.environ["VLLM_DP_SIZE"] = str(data_parallel_size)
@@ -1154,6 +1264,10 @@ def _case_tp_ep_smoke_data_parallel(
 
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
+    process_group_id = context.Value("q", 0)
+    process_group_lock = context.Lock()
+    process_group_ready = [context.Event() for _ in range(data_parallel_size)]
+    start_gate = context.Event()
     processes = [
         context.Process(
             target=_tp_ep_data_parallel_rank,
@@ -1168,37 +1282,105 @@ def _case_tp_ep_smoke_data_parallel(
                 all2all_backend,
                 moe_backend,
                 result_queue,
+                process_group_id,
+                process_group_lock,
+                process_group_ready[rank],
+                start_gate,
             ),
         )
         for rank in range(data_parallel_size)
     ]
-    for process in processes:
-        process.start()
+    started_processes = []
+    completed = False
+    previous_sigterm_handler = signal.signal(
+        signal.SIGTERM,
+        _raise_data_parallel_termination,
+    )
+    try:
+        for process in processes:
+            process.start()
+            started_processes.append(process)
 
-    pending = set(processes)
-    while pending:
-        for process in tuple(pending):
-            process.join(timeout=0.1)
-            if process.exitcode is None:
-                continue
-            pending.remove(process)
-            if process.exitcode != 0:
-                for peer in pending:
-                    peer.terminate()
-                for peer in pending:
-                    peer.join(timeout=30)
-                raise RuntimeError(
-                    f"data-parallel rank process {process.pid} failed with "
-                    f"exit code {process.exitcode}"
-                )
+        for process, ready in zip(processes, process_group_ready, strict=True):
+            while not ready.wait(timeout=0.1):
+                if process.exitcode is not None:
+                    raise RuntimeError(
+                        f"data-parallel rank process {process.pid} failed "
+                        f"before process-group setup with exit code "
+                        f"{process.exitcode}"
+                    )
+        start_gate.set()
 
-    results = dict(result_queue.get(timeout=10) for _ in processes)
-    if len(results) != data_parallel_size:
-        raise RuntimeError(
-            f"expected {data_parallel_size} data-parallel rank results, "
-            f"got {len(results)}"
+        pending = set(processes)
+        while pending:
+            for process in tuple(pending):
+                process.join(timeout=0.1)
+                if process.exitcode is None:
+                    continue
+                pending.remove(process)
+                if process.exitcode != 0:
+                    raise RuntimeError(
+                        f"data-parallel rank process {process.pid} failed with "
+                        f"exit code {process.exitcode}"
+                    )
+
+        results = dict(result_queue.get(timeout=10) for _ in processes)
+        if len(results) != data_parallel_size:
+            raise RuntimeError(
+                f"expected {data_parallel_size} data-parallel rank results, "
+                f"got {len(results)}"
+            )
+        completed = True
+        return results[0]
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
+        if not completed:
+            _terminate_data_parallel_process_groups(
+                started_processes,
+                process_group_ready[: len(started_processes)],
+                process_group_id,
+            )
+
+
+def _terminate_data_parallel_process_groups(
+    processes: list[Any],
+    process_group_ready: list[Any],
+    process_group_id: Any,
+) -> None:
+    if len(processes) != len(process_group_ready):
+        raise RuntimeError("rank process/group-ready tracking is inconsistent")
+
+    unready_processes = [
+        process
+        for process, ready in zip(processes, process_group_ready, strict=True)
+        if not ready.is_set()
+    ]
+
+    for process in unready_processes:
+        if process.is_alive():
+            process.terminate()
+
+    owned_group_id = int(process_group_id.value)
+    if owned_group_id > 1:
+        _terminate_owned_process_groups(
+            [owned_group_id],
+            process_leaders=processes,
+            term_timeout_s=10,
+            kill_timeout_s=5,
         )
-    return results[0]
+
+    for process in processes:
+        process.join(timeout=10)
+    survivors = [process for process in processes if process.is_alive()]
+    for process in survivors:
+        process.kill()
+    for process in survivors:
+        process.join(timeout=10)
+    survivors = [process.pid for process in processes if process.is_alive()]
+    if survivors:
+        raise RuntimeError(
+            f"data-parallel rank parents survived cleanup: {survivors}"
+        )
 
 
 def _main(argv: list[str] | None = None) -> int:
