@@ -13,7 +13,7 @@ inspect_ref() {
       --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
       | sed '/^$/d' \
       | head -n1
-  )"
+  )" || true
   if [[ -n "$digest" ]]; then
     printf '%s\n' "$digest"
     return 0
@@ -25,6 +25,23 @@ inspect_ref() {
     return 0
   fi
   return 1
+}
+
+has_control_python() {
+  local ref="$1"
+
+  docker run --rm --entrypoint /bin/bash "$ref" \
+    -lc 'test -x /usr/local/bin/python3.10' >/dev/null 2>&1
+}
+
+emit_usable_ref() {
+  local ref="$1"
+
+  if ! has_control_python "$ref"; then
+    echo "skipping HCU CI image candidate without /usr/local/bin/python3.10: $ref" >&2
+    return 1
+  fi
+  inspect_ref "$ref"
 }
 
 if [[ -n "${HCU_CI_IMAGE:-}" ]]; then
@@ -45,13 +62,13 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 2
 fi
 
-if inspect_ref vllm-hcu-ci:current; then
+if emit_usable_ref vllm-hcu-ci:current; then
   exit 0
 fi
 
 while IFS= read -r ref; do
   [[ -n "$ref" ]] || continue
-  if inspect_ref "$ref"; then
+  if emit_usable_ref "$ref"; then
     exit 0
   fi
 done < <(

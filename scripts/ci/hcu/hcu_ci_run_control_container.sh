@@ -19,6 +19,7 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 image="$("$script_dir/hcu_ci_resolve_image.sh")"
+echo "using HCU CI control image: $image" >&2
 workspace="$(realpath "${GITHUB_WORKSPACE:-$workdir}")"
 workdir="$(realpath "$workdir")"
 

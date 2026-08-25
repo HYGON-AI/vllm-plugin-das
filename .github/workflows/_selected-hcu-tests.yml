@@ -74,16 +74,20 @@ jobs:
               )"
             fi
             if [[ -n "$candidate" ]]; then
-              HCU_CI_IMAGE="$(
-                docker image inspect "$candidate" \
-                  --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-                  | sed '/^$/d' \
-                  | head -n1
-              )"
-              if [[ -z "$HCU_CI_IMAGE" ]]; then
-                HCU_CI_IMAGE="$(docker image inspect "$candidate" --format '{{.Id}}')"
+              if docker run --rm --entrypoint /bin/bash "$candidate" -lc 'test -x /usr/local/bin/python3.10'; then
+                HCU_CI_IMAGE="$(
+                  docker image inspect "$candidate" \
+                    --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                    | sed '/^$/d' \
+                    | head -n1
+                )"
+                if [[ -z "$HCU_CI_IMAGE" ]]; then
+                  HCU_CI_IMAGE="$(docker image inspect "$candidate" --format '{{.Id}}')"
+                fi
+                echo "HCU_CI_IMAGE=$HCU_CI_IMAGE" >> "$GITHUB_ENV"
+              else
+                echo "Skipping HCU CI image candidate without /usr/local/bin/python3.10: $candidate" >&2
               fi
-              echo "HCU_CI_IMAGE=$HCU_CI_IMAGE" >> "$GITHUB_ENV"
             fi
           fi
           mkdir -p "$GITHUB_WORKSPACE"
