@@ -1014,6 +1014,11 @@ def _parallel_config_summary(llm: Any) -> dict[str, Any]:
             "data_parallel_size",
             None,
         ),
+        "all2all_backend": getattr(
+            parallel_config,
+            "all2all_backend",
+            None,
+        ),
         "enable_expert_parallel": getattr(
             parallel_config,
             "enable_expert_parallel",
@@ -1027,7 +1032,9 @@ def _case_tp_ep_smoke(
     model_path: Path,
     *,
     tensor_parallel_size: int,
+    data_parallel_size: int,
     gpu_memory_utilization: float,
+    all2all_backend: str | None,
     moe_backend: str,
 ) -> dict[str, Any]:
     from vllm import LLM
@@ -1037,6 +1044,8 @@ def _case_tp_ep_smoke(
             model_path,
             enforce_eager=True,
             tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            all2all_backend=all2all_backend,
             enable_expert_parallel=True,
             max_model_len=512,
             max_num_batched_tokens=512,
@@ -1059,6 +1068,8 @@ def _case_tp_ep_smoke(
         _shutdown_llm(llm)
     return {
         "requested_tensor_parallel_size": tensor_parallel_size,
+        "requested_data_parallel_size": data_parallel_size,
+        "requested_all2all_backend": all2all_backend,
         "requested_enable_expert_parallel": True,
         "requested_gpu_memory_utilization": gpu_memory_utilization,
         "requested_moe_backend": moe_backend,
@@ -1093,7 +1104,9 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lora-b", type=Path)
     parser.add_argument("--draft-model", type=Path)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--all2all-backend", default=None)
     parser.add_argument("--moe-backend", default="auto")
     args = parser.parse_args(argv)
 
@@ -1135,7 +1148,9 @@ def _main(argv: list[str] | None = None) -> int:
         payload = _case_tp_ep_smoke(
             args.model,
             tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=args.data_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            all2all_backend=args.all2all_backend,
             moe_backend=args.moe_backend,
         )
     print(RESULT_PREFIX + json.dumps(payload, sort_keys=True))
