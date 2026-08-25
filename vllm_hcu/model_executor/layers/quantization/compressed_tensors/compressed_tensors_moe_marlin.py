@@ -339,7 +339,17 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             i_q: torch.Tensor | None = None,
             i_s: torch.Tensor | None = None,
     ):
-        from lmslim.layers.fused_moe.fuse_moe_fp8_marlin import fused_experts_impl_fp8_marlin
+        try:
+            from lightop.moe import fused_experts_impl_fp8_marlin
+        except (ImportError, AttributeError):
+            from lmslim.layers.fused_moe.fuse_moe_fp8_marlin import (
+                fused_experts_impl_fp8_marlin,
+            )
+
+            logger.warning_once(
+                "Using deprecated LMSlim FP8 Marlin API because lightop.moe is "
+                "unavailable; upgrade LightOp."
+            )
         return fused_experts_impl_fp8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -747,7 +757,17 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
         # Default Marlin INT8 path
 
-        from lmslim.layers.fused_moe.fuse_moe_int8_marlin import fused_experts_impl_int8_marlin
+        try:
+            from lightop.moe import fused_experts_impl_int8_marlin
+        except (ImportError, AttributeError):
+            from lmslim.layers.fused_moe.fuse_moe_int8_marlin import (
+                fused_experts_impl_int8_marlin,
+            )
+
+            logger.warning_once(
+                "Using deprecated LMSlim INT8 Marlin API because lightop.moe is "
+                "unavailable; upgrade LightOp."
+            )
         return fused_experts_impl_int8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,

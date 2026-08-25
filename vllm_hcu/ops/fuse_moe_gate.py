@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
-import os
 import torch
-import lightop.op as op
 import vllm_hcu.platforms.envs as henvs
-from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import grouped_topk
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
+
+
+logger = init_logger(__name__)
 
 class HcuGroupedTopKRouter(GroupedTopKRouter):
     def _valid_grouping(self, router_logits: torch.Tensor) -> bool:
@@ -26,7 +27,16 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
         condition = self._valid_grouping(router_logits) and self.e_score_correction_bias is not None and henvs.VLLM_HCU_USE_FUSE_MOE_GATE and henvs.VLLM_HCU_USE_CUSTOM_OPS
         enable_shared_experts_fusion = False
         if condition:
-            topk_weights, topk_ids = op.moe_fused_gate(
+            try:
+                from lightop import moe as lightop_moe
+            except (ImportError, AttributeError):
+                from lightop import op as lightop_moe
+
+                logger.warning_once(
+                    "Using deprecated lightop.op MoE APIs because lightop.moe is "
+                    "unavailable; upgrade LightOp."
+                )
+            topk_weights, topk_ids = lightop_moe.moe_fused_gate(
                 router_logits,
                 self.e_score_correction_bias,
                 self.num_expert_group,

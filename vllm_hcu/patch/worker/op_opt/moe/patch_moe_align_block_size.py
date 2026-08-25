@@ -114,30 +114,25 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         if enabled:
             try:
-                from lightop import op as lightop
+                from lightop.moe import moe_align_block_size_out
             except (ImportError, AttributeError) as exc:
                 raise RuntimeError(
-                    "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN is enabled, but "
-                    "lightop.op is unavailable"
+                    "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN requires "
+                    "lightop.moe.moe_align_block_size_out; upgrade LightOp"
                 ) from exc
-            try:
-                lightop.moe_align_block_size(
-                    topk_ids,
-                    num_experts,
-                    block_size,
-                    sorted_ids,
-                    expert_ids,
-                    num_tokens_post_pad,
-                    expert_map if ignore_invalid_experts else None,
-                    None,  # expert_mask
-                    None,  # num_local_tokens
-                    False,  # Is_EP
-                    False,  # Is_fuse_fill; padding was initialized above
-                )
-            except (TypeError, AttributeError) as exc:
-                raise RuntimeError(
-                    "installed LightOP lacks the required HCU MoE align API"
-                ) from exc
+            moe_align_block_size_out(
+                topk_ids,
+                num_experts,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                expert_map if ignore_invalid_experts else None,
+                None,
+                None,
+                is_ep=False,
+                is_fuse_fill=False,
+            )
         else:
             target.ops.moe_align_block_size(
                 topk_ids,

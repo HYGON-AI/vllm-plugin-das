@@ -51,6 +51,17 @@ def _package(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def _install_lightop_moe(
+    monkeypatch: pytest.MonkeyPatch, **exports: object
+) -> ModuleType:
+    lightop = _package("lightop")
+    moe = _module("lightop.moe", **exports)
+    lightop.moe = moe
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.moe", moe)
+    return moe
+
+
 def _fp8_quant_abi_stub(
     x,
     scale=None,
@@ -3954,6 +3965,112 @@ def test_weight8bit_marlin2_layout_2d_3d_and_validation():
     assert result_3d.shape == (2, 1, 1024)
     with pytest.raises(ValueError, match="rank 2 or 3"):
         module.weight8bit_nt_kpack2_marlin2(torch.ones(16, dtype=torch.int8))
+
+
+def test_marlin_moe_prefers_categorized_lightop_implementations(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def fp8_kernel(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"] + 2
+
+    def int8_kernel(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"] + 3
+
+    _install_lightop_moe(
+        monkeypatch,
+        fused_experts_impl_fp8_marlin=fp8_kernel,
+        fused_experts_impl_int8_marlin=int8_kernel,
+    )
+    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: False)
+    layer = _fp8_moe_layer()
+    x = torch.ones(2, 4)
+    weights = torch.ones(2, 2)
+    ids = torch.zeros(2, 2, dtype=torch.int64)
+
+    fp8_method = object.__new__(marlin.CompressedTensorsW8A8FP8MarlinMoEMethod)
+    fp8_output = fp8_method.fused_moe_forward(layer, x, weights, ids)
+    torch.testing.assert_close(fp8_output, x + 2)
+    assert calls[0]["hidden_states"] is x
+    assert calls[0]["topk_ids"] is ids
+    assert calls[0]["use_fp8_w8a8"] is True
+
+    int8_method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
+    int8_method.moe_quant_config = "int8-config"
+    int8_output = int8_method.apply(layer, x, weights, ids, None, None)
+    torch.testing.assert_close(int8_output, x + 3)
+    assert calls[1]["hidden_states"] is x
+    assert calls[1]["topk_ids"] is ids
+    assert calls[1]["quant_config"] == "int8-config"
+    assert calls[1]["use_int8_w8a8"] is True
+
+
+def test_marlin_moe_falls_back_to_lmslim_when_lightop_moe_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    lightop = _package("lightop")
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.delitem(sys.modules, "lightop.moe", raising=False)
+    lmslim = _package("lmslim")
+    layers = _package("lmslim.layers")
+    fused_moe = _package("lmslim.layers.fused_moe")
+    fp8_module = _module(
+        "lmslim.layers.fused_moe.fuse_moe_fp8_marlin",
+        fused_experts_impl_fp8_marlin=lambda **kwargs: kwargs["hidden_states"] + 5,
+    )
+    int8_module = _module(
+        "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
+        fused_experts_impl_int8_marlin=lambda **kwargs: kwargs["hidden_states"] + 6,
+    )
+    monkeypatch.setitem(sys.modules, "lmslim", lmslim)
+    monkeypatch.setitem(sys.modules, "lmslim.layers", layers)
+    monkeypatch.setitem(sys.modules, "lmslim.layers.fused_moe", fused_moe)
+    monkeypatch.setitem(
+        sys.modules,
+        "lmslim.layers.fused_moe.fuse_moe_fp8_marlin",
+        fp8_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
+        int8_module,
+    )
+    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: False)
+
+    layer = _fp8_moe_layer()
+    x = torch.ones(2, 4)
+    output = object.__new__(
+        marlin.CompressedTensorsW8A8FP8MarlinMoEMethod
+    ).fused_moe_forward(
+        layer,
+        x,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+    )
+    torch.testing.assert_close(output, x + 5)
+
+    int8_method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
+    int8_method.moe_quant_config = "int8-config"
+    int8_output = int8_method.apply(
+        layer,
+        x,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        None,
+        None,
+    )
+    torch.testing.assert_close(int8_output, x + 6)
 
 
 def test_slimquant_marlin_module_imports_before_worker_patch():

@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
 
 def eplb_map_to_physical_and_record(
     module,
@@ -91,25 +95,23 @@ def make_hcu_grouped_topk_router(base_class):
                     input_ids=input_ids,
                 )
             try:
-                from lightop import op as lightop
-            except (ImportError, AttributeError) as exc:
-                raise RuntimeError(
-                    "VLLM_HCU_USE_FUSE_MOE_GATE is enabled, but lightop.op is unavailable"
-                ) from exc
-            try:
-                topk_weights, topk_ids = lightop.moe_fused_gate(
-                    router_logits,
-                    self.e_score_correction_bias,
-                    self.num_expert_group,
-                    self.topk_group,
-                    self.top_k,
-                    0,
-                    self.routed_scaling_factor,
+                from lightop import moe as lightop_moe
+            except (ImportError, AttributeError):
+                from lightop import op as lightop_moe
+
+                logger.warning_once(
+                    "Using deprecated lightop.op MoE APIs because lightop.moe is "
+                    "unavailable; upgrade LightOp."
                 )
-            except (TypeError, AttributeError) as exc:
-                raise RuntimeError(
-                    "installed LightOP lacks the required HCU fused gate API"
-                ) from exc
+            topk_weights, topk_ids = lightop_moe.moe_fused_gate(
+                router_logits,
+                self.e_score_correction_bias,
+                self.num_expert_group,
+                self.topk_group,
+                self.top_k,
+                0,
+                self.routed_scaling_factor,
+            )
             if indices_type is not None and topk_ids.dtype != indices_type:
                 topk_ids = topk_ids.to(indices_type)
             return topk_weights, topk_ids
