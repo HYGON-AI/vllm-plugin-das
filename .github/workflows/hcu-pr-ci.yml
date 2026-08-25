@@ -64,7 +64,7 @@ jobs:
         run: |
           bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            git fetch --no-tags --no-recurse-submodules --depth=1 origin \
+            git fetch --no-tags --no-recurse-submodules --depth=200 origin \
               "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
               "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
             git cat-file -e "${BASE_SHA}^{commit}"
@@ -79,14 +79,23 @@ jobs:
           FULL_HCU: ${{ contains(github.event.pull_request.labels.*.name, 'full-hcu') }}
           ACCURACY_HCU: ${{ contains(github.event.pull_request.labels.*.name, 'accuracy-hcu') }}
         run: |
-          args=(--base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT")
-          if [[ "$FULL_HCU" == "true" ]]; then
-            args+=(--full)
-          fi
-          if [[ "$ACCURACY_HCU" == "true" ]]; then
-            args+=(--accuracy)
-          fi
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            set -euo pipefail
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git fetch --no-tags --no-recurse-submodules --depth=200 origin \
+              "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
+              "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
+            git cat-file -e "${BASE_SHA}^{commit}"
+            git cat-file -e "${HEAD_SHA}^{commit}"
+            args=(--base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT")
+            if [[ "$FULL_HCU" == "true" ]]; then
+              args+=(--full)
+            fi
+            if [[ "$ACCURACY_HCU" == "true" ]]; then
+              args+=(--accuracy)
+            fi
+            python3.10 .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
+          '
 
   authorize-hcu:
     name: Authorize hardware execution
