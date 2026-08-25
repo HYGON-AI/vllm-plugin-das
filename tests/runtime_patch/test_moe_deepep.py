@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import linecache
+import logging
 import os
 import subprocess
 import sys
@@ -1476,6 +1477,7 @@ def test_deep_gemm_ep_uses_categorized_lightop_kernels(
     script = """
 import sys
 from types import ModuleType
+import logging
 import torch
 
 lightop = ModuleType("lightop")
@@ -1525,6 +1527,58 @@ assert torch.equal(gather_out, torch.full((2, 2), 9.0))
 assert calls[1][0] == "gather"
 assert calls[1][1][0] is recv_x
 assert calls[1][1][-1] is gather_out
+
+del sys.modules["lightop.moe"]
+delattr(lightop, "moe")
+legacy_calls = []
+op = ModuleType("lightop.op")
+def legacy_ep_scatter(*args):
+    legacy_calls.append(("scatter", args))
+    args[5].fill_(11)
+def legacy_ep_gather(*args):
+    legacy_calls.append(("gather", args))
+    args[-1].fill_(13)
+op.ep_scatter = legacy_ep_scatter
+op.ep_gather = legacy_ep_gather
+lightop.op = op
+sys.modules["lightop.op"] = op
+from vllm import logger as vllm_logger
+records = []
+class Capture(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+handler = Capture()
+vllm_logger._print_warning_once.cache_clear()
+deep_gemm_utils.logger.addHandler(handler)
+try:
+    legacy_scatter_out = torch.zeros(2, 2)
+    deep_gemm_utils.ep_scatter(
+        recv_x, recv_x_scale, recv_topk, counts, None,
+        torch.tensor([0], dtype=torch.int32), legacy_scatter_out, torch.zeros(2, 1),
+        torch.empty(128, dtype=torch.int32), torch.empty(2, 1, dtype=torch.int32),
+        align_m=128,
+    )
+    legacy_gather_out = torch.zeros(2, 2)
+    deep_gemm_utils.ep_gather(
+        recv_x, recv_topk, torch.ones(2, 1),
+        torch.zeros(2, 1, dtype=torch.int32), None, legacy_gather_out,
+    )
+finally:
+    deep_gemm_utils.logger.removeHandler(handler)
+assert torch.equal(legacy_scatter_out, torch.full((2, 2), 11.0))
+assert torch.equal(legacy_gather_out, torch.full((2, 2), 13.0))
+assert legacy_calls[0][0] == "scatter"
+assert legacy_calls[0][1][0] is recv_x
+assert legacy_calls[0][1][4] is counts
+assert legacy_calls[0][1][5] is legacy_scatter_out
+assert legacy_calls[0][1][-2:] == (1, 128)
+assert legacy_calls[1][0] == "gather"
+assert legacy_calls[1][1][0] is recv_x
+assert legacy_calls[1][1][-1] is legacy_gather_out
+assert records == [
+    "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+    "upgrade LightOp."
+]
 """
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
@@ -2032,7 +2086,51 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert ids.item() == 3
     assert routed[0][0] is logits
 
+    legacy_calls: list[tuple[object, ...]] = []
 
+    def legacy_moe_fused_gate(*args):
+        legacy_calls.append(args)
+        return torch.full((1, 1), 0.25), torch.tensor([[1]], dtype=torch.int64)
+
+    lightop = sys.modules["lightop"]
+    monkeypatch.delitem(sys.modules, "lightop.moe")
+    delattr(lightop, "moe")
+    legacy_op = _module("lightop.op", moe_fused_gate=legacy_moe_fused_gate)
+    lightop.op = legacy_op
+    monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
+    from vllm import logger as vllm_logger
+    from vllm_hcu.model_executor.layers.fused_moe import router_runtime
+
+    warning_messages: list[str] = []
+    vllm_logger._print_warning_once.cache_clear()
+    monkeypatch.setattr(
+        router_runtime.logger,
+        "warning",
+        lambda message, *args, **kwargs: warning_messages.append(message % args),
+    )
+    legacy_weights, legacy_ids = router._compute_routing(None, logits, torch.int32)
+    router._compute_routing(None, logits, torch.int32)
+    torch.testing.assert_close(legacy_weights, torch.full((1, 1), 0.25))
+    assert legacy_ids.dtype == torch.int32
+    assert legacy_ids.item() == 1
+    assert legacy_calls[0][0] is logits
+    assert legacy_calls[0][1] is router.e_score_correction_bias
+    assert legacy_calls[0][2:] == (
+        router.num_expert_group,
+        router.topk_group,
+        router.top_k,
+        0,
+        router.routed_scaling_factor,
+    )
+    assert warning_messages == [
+        "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+        "upgrade LightOp."
+    ]
+
+
+@pytest.mark.filterwarnings(
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
+)
 def test_fuse_moe_gate_routes_through_categorized_lightop(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2069,6 +2167,71 @@ def test_fuse_moe_gate_routes_through_categorized_lightop(
     torch.testing.assert_close(weights, torch.full((1, 1), 0.5))
     assert ids.item() == 2
     assert calls[0][0] is logits
+
+
+@pytest.mark.filterwarnings(
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
+)
+def test_fuse_moe_gate_eagerly_falls_back_to_legacy_lightop_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    from vllm import logger as vllm_logger
+
+    calls: list[tuple[object, ...]] = []
+
+    def moe_fused_gate(*args):
+        calls.append(args)
+        return torch.full((1, 1), 0.75), torch.tensor([[0]], dtype=torch.int64)
+
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    legacy_op = _module("lightop.op", moe_fused_gate=moe_fused_gate)
+    activation = _module("lightop.activation", silu_and_mul_opt=lambda *args: None)
+    lightop.op = legacy_op
+    lightop.activation = activation
+    lightop.fused_add_rms_norm = lambda *args: None
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
+    monkeypatch.setitem(sys.modules, "lightop.activation", activation)
+    from vllm_hcu.ops import fuse_moe_gate
+    from vllm_hcu.platforms import envs as henvs
+
+    vllm_logger._print_warning_once.cache_clear()
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    fuse_moe_gate = importlib.reload(fuse_moe_gate)
+    fuse_moe_gate = importlib.reload(fuse_moe_gate)
+    warning = (
+        "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+        "upgrade LightOp."
+    )
+    assert [
+        record.getMessage() for record in caplog.records if record.getMessage() == warning
+    ] == [warning]
+
+    router = object.__new__(fuse_moe_gate.HcuGroupedTopKRouter)
+    router.num_expert_group = 2
+    router.topk_group = 1
+    router.top_k = 1
+    router.num_fused_shared_experts = 0
+    router.e_score_correction_bias = torch.ones(4)
+    router.routed_scaling_factor = 1.0
+    logits = torch.ones((1, 4))
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
+    weights, ids = router._compute_routing(None, logits, torch.int32)
+    torch.testing.assert_close(weights, torch.full((1, 1), 0.75))
+    assert ids.item() == 0
+    assert calls[0][0] is logits
+    assert calls[0][1] is router.e_score_correction_bias
+    assert calls[0][2:] == (
+        router.num_expert_group,
+        router.topk_group,
+        router.top_k,
+        0,
+        router.routed_scaling_factor,
+    )
 
 
 def _fake_deepep_ll_module() -> ModuleType:
