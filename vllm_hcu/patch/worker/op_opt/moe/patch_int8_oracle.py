@@ -189,7 +189,10 @@ def apply_to_module(module: ModuleType) -> bool:
         per_act_token_quant=False,
         layer=None,
     ):
-        if int8_backend == hcu_enum.AITER and per_act_token_quant:
+        if int8_backend in (
+            hcu_enum.AITER,
+            hcu_enum.DPSK_DEEPGEMM,
+        ) and per_act_token_quant:
             return make_w8a8_quant_config(
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,

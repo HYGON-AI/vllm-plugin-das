@@ -13,9 +13,11 @@ import argparse
 import gc
 import json
 import math
+import multiprocessing
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -1037,6 +1039,35 @@ def _case_tp_ep_smoke(
     all2all_backend: str | None,
     moe_backend: str,
 ) -> dict[str, Any]:
+    if data_parallel_size > 1:
+        return _case_tp_ep_smoke_data_parallel(
+            model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            all2all_backend=all2all_backend,
+            moe_backend=moe_backend,
+        )
+
+    return _case_tp_ep_smoke_rank(
+        model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        all2all_backend=all2all_backend,
+        moe_backend=moe_backend,
+    )
+
+
+def _case_tp_ep_smoke_rank(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    gpu_memory_utilization: float,
+    all2all_backend: str | None,
+    moe_backend: str,
+) -> dict[str, Any]:
     from vllm import LLM
 
     llm = LLM(
@@ -1044,7 +1075,6 @@ def _case_tp_ep_smoke(
             model_path,
             enforce_eager=True,
             tensor_parallel_size=tensor_parallel_size,
-            data_parallel_size=data_parallel_size,
             all2all_backend=all2all_backend,
             enable_expert_parallel=True,
             max_model_len=512,
@@ -1076,6 +1106,96 @@ def _case_tp_ep_smoke(
         "parallel_config": parallel_config,
         "output": output,
     }
+
+
+def _tp_ep_data_parallel_rank(
+    local_dp_rank: int,
+    data_parallel_size: int,
+    dp_master_ip: str,
+    dp_master_port: int,
+    model_path: Path,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    all2all_backend: str | None,
+    moe_backend: str,
+    result_queue: Any,
+) -> None:
+    os.environ["VLLM_DP_RANK"] = str(local_dp_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
+    os.environ["VLLM_DP_SIZE"] = str(data_parallel_size)
+    os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
+    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+    result = _case_tp_ep_smoke_rank(
+        model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        all2all_backend=all2all_backend,
+        moe_backend=moe_backend,
+    )
+    result_queue.put((local_dp_rank, result))
+
+
+def _case_tp_ep_smoke_data_parallel(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    gpu_memory_utilization: float,
+    all2all_backend: str | None,
+    moe_backend: str,
+) -> dict[str, Any]:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        dp_master_port = int(listener.getsockname()[1])
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_tp_ep_data_parallel_rank,
+            args=(
+                rank,
+                data_parallel_size,
+                "127.0.0.1",
+                dp_master_port,
+                model_path,
+                tensor_parallel_size,
+                gpu_memory_utilization,
+                all2all_backend,
+                moe_backend,
+                result_queue,
+            ),
+        )
+        for rank in range(data_parallel_size)
+    ]
+    for process in processes:
+        process.start()
+
+    pending = set(processes)
+    while pending:
+        for process in tuple(pending):
+            process.join(timeout=0.1)
+            if process.exitcode is None:
+                continue
+            pending.remove(process)
+            if process.exitcode != 0:
+                for peer in pending:
+                    peer.terminate()
+                for peer in pending:
+                    peer.join(timeout=30)
+                raise RuntimeError(
+                    f"data-parallel rank process {process.pid} failed with "
+                    f"exit code {process.exitcode}"
+                )
+
+    results = dict(result_queue.get(timeout=10) for _ in processes)
+    if len(results) != data_parallel_size:
+        raise RuntimeError(
+            f"expected {data_parallel_size} data-parallel rank results, "
+            f"got {len(results)}"
+        )
+    return results[0]
 
 
 def _main(argv: list[str] | None = None) -> int:

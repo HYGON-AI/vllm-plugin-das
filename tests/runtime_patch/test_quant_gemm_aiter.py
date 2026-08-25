@@ -620,6 +620,14 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
     assert backend is target.Int8MoeBackend.DPSK_DEEPGEMM
     assert experts is DeepGemmExperts
     assert target.map_int8_backend("dpsk_deep_gemm") is backend
+    dpsk_quant_config = target.make_int8_moe_quant_config(
+        backend,
+        w1_scale,
+        w2_scale,
+        per_act_token_quant=True,
+    )
+    assert getattr(dpsk_quant_config, "use_int8_w8a8", False) is True
+    assert dpsk_quant_config.per_act_token_quant is True
 
     config.moe_parallel_config.use_batched_activation_format = True
     backend, experts = target.select_int8_moe_backend(
@@ -663,6 +671,36 @@ def test_worker_registers_int8_aiter_oracle_before_quantized_methods():
     )
     assert int8_entry in callbacks
     assert callbacks.index(int8_entry) < callbacks.index(fp8_method_entry)
+
+
+def test_hcu_deep_gemm_experts_accept_rocm_lightop_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.model_executor.layers.fused_moe  # noqa: F401
+
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe,
+        deep_gemm_moe,
+    )
+
+    monkeypatch.setattr(
+        deep_gemm_moe.current_platform,
+        "is_rocm",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        deep_gemm_moe,
+        "is_deep_gemm_supported",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        batched_deep_gemm_moe,
+        "is_deep_gemm_supported",
+        lambda: False,
+    )
+
+    assert deep_gemm_moe.DeepGemmExperts._supports_current_device()
+    assert batched_deep_gemm_moe.BatchedDeepGemmExperts._supports_current_device()
 
 
 def _install_fake_vllm_envs(

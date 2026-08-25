@@ -180,7 +180,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return is_deep_gemm_supported()
+        return current_platform.is_rocm() or is_deep_gemm_supported()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
