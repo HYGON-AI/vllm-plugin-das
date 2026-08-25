@@ -9,6 +9,8 @@ import inspect
 from types import ModuleType
 from typing import Any
 
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -74,6 +76,17 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if not use_mla:
+        attention_config = _require_hcu_pcp_attribute(
+            vllm_config, "attention_config", "VllmConfig"
+        )
+        attention_backend = _require_hcu_pcp_attribute(
+            attention_config, "backend", "AttentionConfig"
+        )
+        if attention_backend != AttentionBackendEnum.FLASH_ATTN:
+            raise ValueError(
+                "FlashAttention GQA PCP only supports FLASH_ATTN attention backend."
+            )
     if not use_mla and _require_hcu_pcp_attribute(
         model_config, "is_hybrid", "ModelConfig"
     ):

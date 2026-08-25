@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from vllm.config.vllm import VllmConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.platform.core_fix import patch_vllm_config
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
@@ -37,6 +38,9 @@ def _make_pcp_config(**overrides: object) -> object:
     kv_transfer = overrides.pop("kv_transfer", False)
     enable_lightly_cp = overrides.pop("enable_lightly_cp", False)
     enable_multi_layers_mtp = overrides.pop("enable_multi_layers_mtp", False)
+    attention_backend = overrides.pop(
+        "attention_backend", AttentionBackendEnum.FLASH_ATTN
+    )
     if overrides:
         raise AssertionError(f"unknown PCP fixture override(s): {sorted(overrides)}")
 
@@ -57,6 +61,7 @@ def _make_pcp_config(**overrides: object) -> object:
             data_parallel_size=dp,
             enable_expert_parallel=enable_expert_parallel,
         ),
+        attention_config=SimpleNamespace(backend=attention_backend),
         speculative_config=(
             SimpleNamespace(
                 method=speculative_method,
@@ -111,6 +116,40 @@ def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config) -> None:
     )
 
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_gqa_pcp_rejects_triton_attention_backend(make_pcp_config) -> None:
+    """Triton lacks the PCP KV gather and metadata path used during prefill."""
+
+    config = make_pcp_config(
+        architecture="Qwen3ForCausalLM",
+        use_mla=False,
+        pcp=2,
+        tp=2,
+        dcp=1,
+        enable_expert_parallel=False,
+        attention_backend=AttentionBackendEnum.TRITON_ATTN,
+    )
+
+    with pytest.raises(ValueError, match="only supports FLASH_ATTN"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+def test_gqa_pcp_rejects_automatic_attention_backend(make_pcp_config) -> None:
+    """Fail closed instead of allowing auto-selection to fall back to Triton."""
+
+    config = make_pcp_config(
+        architecture="Qwen3ForCausalLM",
+        use_mla=False,
+        pcp=2,
+        tp=2,
+        dcp=1,
+        enable_expert_parallel=False,
+        attention_backend=None,
+    )
+
+    with pytest.raises(ValueError, match="only supports FLASH_ATTN"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
 def test_gqa_pcp_rejects_decode_context_parallelism(make_pcp_config) -> None:
