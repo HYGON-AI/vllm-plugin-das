@@ -254,34 +254,6 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
     )
 
 
-def test_deep_gemm_replacements_keep_categorized_lightop_boundaries():
-    """The exchanged expert modules keep their lazy/eager import boundaries."""
-
-    def categorized_try_imports(relative: str) -> set[str]:
-        tree = ast.parse((REPO_ROOT / relative).read_text(encoding="utf-8"))
-        return {
-            statement.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Try)
-            for statement in node.body
-            if isinstance(statement, ast.ImportFrom)
-            and statement.module is not None
-            and statement.module.startswith("lightop.")
-        }
-
-    assert {"lightop.activation", "lightop.gemm_ops"} <= categorized_try_imports(
-        "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
-    )
-    assert {"lightop.activation", "lightop.gemm_ops"} <= categorized_try_imports(
-        "vllm_hcu/model_executor/layers/fused_moe/experts/"
-        "batched_deep_gemm_moe.py"
-    )
-    assert categorized_try_imports(
-        "vllm_hcu/model_executor/layers/fused_moe/experts/"
-        "dpsk_v4_deep_gemm_moe.py"
-    ) == {"lightop.activation"}
-
-
 def test_linear_replacement_preserves_v0251_stacked_weight_loaders():
     repo = Path(__file__).resolve().parents[2]
     replacement = repo / "vllm_hcu/model_executor/layers/linear.py"

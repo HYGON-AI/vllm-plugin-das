@@ -830,7 +830,7 @@ def rocm_fp8_paged_mqa_logits(
             block_tables,
             None, 
             max_model_len, 
-            True,
+            False,
         )
     else:
         return fp8_paged_mqa_logits_torch(

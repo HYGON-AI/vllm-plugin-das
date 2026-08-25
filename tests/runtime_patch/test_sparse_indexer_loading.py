@@ -468,10 +468,10 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
     assert metadata.decode.schedule_metadata is upstream_schedule
 
 
-def test_rocm_lightop_paged_mqa_uses_categorized_kernel_and_builds_its_schedule_internally(
+def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The runtime contract permits the metadata adapter to skip precompute."""
+    """Paged LightOp keeps cleanup disabled while skipping metadata precompute."""
 
     runtime = importlib.import_module(
         "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
@@ -481,8 +481,28 @@ def test_rocm_lightop_paged_mqa_uses_categorized_kernel_and_builds_its_schedule_
     calls: list[tuple[object, ...]] = []
     output = object()
 
-    def paged_mqa_logits(*args):
-        calls.append(args)
+    def paged_mqa_logits(
+        q,
+        kv_cache,
+        normalized_weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        clean_logits,
+    ):
+        calls.append(
+            (
+                q,
+                kv_cache,
+                normalized_weights,
+                context_lens,
+                block_tables,
+                schedule_metadata,
+                max_model_len,
+                clean_logits,
+            )
+        )
         return output
 
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
@@ -510,7 +530,7 @@ def test_rocm_lightop_paged_mqa_uses_categorized_kernel_and_builds_its_schedule_
     assert result is output
     assert len(calls) == 1
     assert calls[0][5] is None
-    assert calls[0][-1] is True
+    assert calls[0][-1] is False
     assert calls[0][2].dtype is torch.float32
     assert calls[0][2].is_contiguous()
     assert torch.equal(calls[0][2], weights.float().contiguous())

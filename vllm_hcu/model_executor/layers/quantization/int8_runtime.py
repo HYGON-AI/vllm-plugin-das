@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""HCU-owned INT8 linear implementation backed by LMSlim hipBLASLt."""
+"""HCU-owned INT8 linear implementation backed by W8A8 hipBLASLt."""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def apply_int8_linear(
         except (ImportError, AttributeError):
             try:
                 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-            except Exception as exc:
+            except (ImportError, AttributeError) as exc:
                 raise HcuInt8LinearError(
                     "HCU W8A8 linear is enabled, but LMSlim per-token INT8 "
                     "quantization is unavailable"
@@ -162,7 +162,7 @@ def apply_int8_linear(
     except (ImportError, AttributeError):
         try:
             from lmslim import quant_ops
-        except Exception as exc:
+        except (ImportError, AttributeError) as exc:
             raise HcuInt8LinearError(
                 "HCU W8A8 linear is enabled, but LMSlim quant_ops is unavailable"
             ) from exc
@@ -190,11 +190,11 @@ def apply_int8_linear(
         )
     except Exception as exc:
         raise HcuInt8LinearError(
-            f"LMSlim hipBLASLt W8A8 GEMM failed for M={m}, N={n}, K={k}"
+            f"HCU hipBLASLt W8A8 GEMM failed for M={m}, N={n}, K={k}"
         ) from exc
     if status is not True or output.shape != (m, n):
         raise HcuInt8LinearError(
-            "LMSlim hipBLASLt W8A8 GEMM returned an invalid status or shape"
+            "HCU hipBLASLt W8A8 GEMM returned an invalid status or shape"
         )
     if bias is not None:
         output = output + bias

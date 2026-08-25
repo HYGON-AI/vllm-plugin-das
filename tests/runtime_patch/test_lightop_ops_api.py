@@ -421,18 +421,56 @@ def test_fp8_quant_rejects_legacy_output_first_api(
 def test_dynamic_rms_quant_consumes_returned_tensors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    input_tensor = torch.ones((2, 4))
+    weight = torch.ones(4)
+    residual = torch.full_like(input_tensor, 2)
     expected_q = torch.ones((2, 4), dtype=torch.int8)
     expected_s = torch.ones((2, 1), dtype=torch.float32)
+    calls: list[tuple[object, ...]] = []
+
+    def dynamic_rms_quant(
+        actual_input: torch.Tensor,
+        actual_weight: torch.Tensor,
+        epsilon: float,
+        quant_dtype: torch.dtype,
+        *,
+        residual: torch.Tensor | None,
+        update_input: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(
+            (
+                actual_input,
+                actual_weight,
+                epsilon,
+                quant_dtype,
+                residual,
+                update_input,
+            )
+        )
+        return expected_q, expected_s
+
     _install_lightop_submodule(
         monkeypatch,
         "norm",
-        rms_norm_dynamic_per_token_quant=lambda *args, **kwargs: (expected_q, expected_s),
+        rms_norm_dynamic_per_token_quant=dynamic_rms_quant,
     )
 
     actual_q, actual_s = _fused_rmsquant_impl()(
-        torch.ones((2, 4)), torch.ones(4), 1e-6, torch.int8
+        input_tensor,
+        weight,
+        1e-6,
+        torch.int8,
+        residual=residual,
+        update_input=None,
     )
 
+    assert len(calls) == 1
+    assert calls[0][0] is input_tensor
+    assert calls[0][1] is weight
+    assert calls[0][2] == 1e-6
+    assert calls[0][3] is torch.int8
+    assert calls[0][4] is residual
+    assert calls[0][5] is False
     assert actual_q is expected_q
     assert actual_s is expected_s
 
