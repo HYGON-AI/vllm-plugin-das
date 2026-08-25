@@ -147,8 +147,9 @@ The new flow is therefore:
 1. Apply `self.q_norm` to QR only.
 2. Leave KV unnormalized until cache insertion.
 3. Project normalized QR with `wq_b`.
-4. Call the categorized fused kernel with Q, raw KV,
-   `self.kv_norm.weight`, cache, int32 slot mapping, positions, RoPE cache,
+4. Call the categorized `_int32` fused kernel with Q, raw KV,
+   `self.kv_norm.weight`, cache, the existing contiguous int64 slot mapping,
+   positions, RoPE cache,
    epsilon, and block size.
 
 This preserves one KV normalization and moves it into the new fused kernel.
