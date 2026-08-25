@@ -1070,6 +1070,9 @@ def _case_tp_ep_smoke_rank(
 ) -> dict[str, Any]:
     from vllm import LLM
 
+    max_num_batched_tokens = (
+        256 if all2all_backend == "deepep_low_latency" else 512
+    )
     llm = LLM(
         **_llm_kwargs(
             model_path,
@@ -1078,7 +1081,7 @@ def _case_tp_ep_smoke_rank(
             all2all_backend=all2all_backend,
             enable_expert_parallel=True,
             max_model_len=512,
-            max_num_batched_tokens=512,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=2,
             gpu_memory_utilization=gpu_memory_utilization,
             moe_backend=moe_backend,

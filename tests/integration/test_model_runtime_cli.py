@@ -82,3 +82,27 @@ def test_tp_ep_cli_forwards_data_parallel_and_all2all(monkeypatch, capsys):
         "moe_backend": "dpsk_deep_gemm",
     }
     assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
+
+
+def test_tp_ep_ll_uses_supported_deepep_token_capacity(monkeypatch):
+    captured = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.llm_engine = SimpleNamespace(vllm_config=None)
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FakeLLM))
+    monkeypatch.setattr(model_runtime, "_generate_with_llm", lambda *args, **kwargs: [])
+    monkeypatch.setattr(model_runtime, "_shutdown_llm", lambda llm: None)
+
+    model_runtime._case_tp_ep_smoke_rank(
+        Path("/models/fake"),
+        tensor_parallel_size=1,
+        data_parallel_size=8,
+        gpu_memory_utilization=0.9,
+        all2all_backend="deepep_low_latency",
+        moe_backend="dpsk_deep_gemm",
+    )
+
+    assert captured["max_num_batched_tokens"] == 256
