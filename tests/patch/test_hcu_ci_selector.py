@@ -30,6 +30,8 @@ from select_hcu_tests import (  # noqa: E402
 from hcu_ci_preflight import PreflightError, run_preflight  # noqa: E402
 from hcu_ci_preflight import _check_environment_lock  # noqa: E402
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
+from compile_changed_python import _compile as compile_python_file  # noqa: E402
+from compile_changed_python import main as compile_changed_python_main  # noqa: E402
 from hcu_ci_register import (  # noqa: E402
     HCURegistry,
     RegistrationError,
@@ -93,6 +95,29 @@ def test_static_hcu_registry_rejects_runtime_generated_metadata(
     )
     with pytest.raises(RegistrationError, match="est_time must be a Python literal"):
         parse_registry(registry)
+
+
+def test_changed_python_checker_compiles_critical_sources(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert compile_changed_python_main([]) == 0
+    assert "Python syntax check passed" in capsys.readouterr().out
+
+
+def test_changed_python_checker_rejects_syntax_error(tmp_path: Path) -> None:
+    broken = tmp_path / "broken.py"
+    broken.write_text("def broken(:\n    pass\n", encoding="utf-8")
+    with pytest.raises(SyntaxError):
+        compile_python_file(broken)
+
+
+def test_changed_python_checker_fails_closed_when_diff_is_unavailable() -> None:
+    assert (
+        compile_changed_python_main(
+            ["--base", "not-a-real-commit", "--head", "HEAD"]
+        )
+        == 2
+    )
 
 
 def test_lpt_partitioning_is_deterministic_and_balances_longest_first() -> None:

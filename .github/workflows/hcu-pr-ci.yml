@@ -40,20 +40,6 @@ jobs:
           clean: true
           fetch-depth: 0
 
-      - name: Verify patch contracts
-        run: |
-          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
-            set -euo pipefail
-            python3.10 --version
-            python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
-            python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
-            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
-            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
-            python3.10 -m compileall -q tools tests vllm_hcu
-            source /opt/dtk/env.sh
-            python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
-          '
-
       - name: Fetch PR diff endpoints
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -68,6 +54,23 @@ jobs:
               "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
             git cat-file -e "${BASE_SHA}^{commit}"
             git cat-file -e "${HEAD_SHA}^{commit}"
+          '
+
+      - name: Verify patch contracts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bash scripts/ci/hcu/hcu_ci_run_control_container.sh -- bash -lc '
+            set -euo pipefail
+            python3.10 --version
+            python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+            python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly
+            python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+            python3.10 .github/scripts/hcu_ci/compile_changed_python.py --base "$BASE_SHA" --head "$HEAD_SHA"
+            source /opt/dtk/env.sh
+            python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
           '
 
       - name: Select HCU matrix
