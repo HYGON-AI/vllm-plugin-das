@@ -31,7 +31,10 @@ docker_args=(
   --volume "$workspace:$workspace"
   --env CI=1
   --env HOME=/tmp/hcu-ci-home
+  --env PYTHONDONTWRITEBYTECODE=1
   --env PYTHONPATH="$workspace"
+  --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
+  --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
 )
 
 if [[ -n "${RUNNER_TEMP:-}" && -d "${RUNNER_TEMP:-}" ]]; then
@@ -54,10 +57,18 @@ for name in \
   fi
 done
 
-uid="$(id -u)"
-gid="$(id -g)"
-if docker run --rm --user "$uid:$gid" "$image" id >/dev/null 2>&1; then
-  docker_args+=(--user "$uid:$gid")
-fi
+docker_args+=(
+  --env "HCU_CI_HOST_UID=$(id -u)"
+  --env "HCU_CI_HOST_GID=$(id -g)"
+)
 
-docker "${docker_args[@]}" "$image" bash -lc 'mkdir -p "$HOME" && exec "$@"' -- "$@"
+docker "${docker_args[@]}" "$image" bash -lc '
+  set +e
+  mkdir -p "$HOME" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
+  "$@"
+  status=$?
+  if [[ -n "${GITHUB_WORKSPACE:-}" && -d "${GITHUB_WORKSPACE:-}" ]]; then
+    chown -R "$HCU_CI_HOST_UID:$HCU_CI_HOST_GID" "$GITHUB_WORKSPACE" 2>/dev/null || true
+  fi
+  exit "$status"
+' -- "$@"
