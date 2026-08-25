@@ -23,7 +23,7 @@ jobs:
       - self-hosted
       - hcu-ci-pr
     container:
-      image: ${{ vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm@sha256:44439f6b8860c79c0d19e5f4a79bd095aa25c2be89747690972fec4ceb784099' }}
+      image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
       run:
         shell: bash
@@ -94,7 +94,7 @@ jobs:
       - self-hosted
       - hcu-ci-pr
     container:
-      image: ${{ vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm@sha256:44439f6b8860c79c0d19e5f4a79bd095aa25c2be89747690972fec4ceb784099' }}
+      image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
       run:
         shell: bash
@@ -132,7 +132,7 @@ jobs:
     with:
       matrix: ${{ needs.static-and-select.outputs.matrix }}
       tested_ref: ${{ github.event.pull_request.merge_commit_sha }}
-      image: ${{ vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm@sha256:44439f6b8860c79c0d19e5f4a79bd095aa25c2be89747690972fec4ceb784099' }}
+      image: ${{ vars.HCU_CI_IMAGE }}
     permissions:
       contents: read
 
