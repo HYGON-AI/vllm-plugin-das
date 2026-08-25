@@ -363,8 +363,6 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         assert self.w2_scale is not None
 
         a1q = hidden_states
-        _, N, K = w1.size()
-
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
@@ -373,6 +371,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             N = self._hcu_logical_n
             K = self._hcu_logical_k
         else:
+            _, N, K = w1.size()
             assert w2.size(1) == K
 
         M_sum, _ = compute_aligned_M_and_alignment(
@@ -417,8 +416,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
         # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
         # otherwise the scheduler can pick the wrong expert id from m_indices
-        # under cudagraph replay. HCU LightOP consumes its fixed 256-row layout
-        # directly and has no upstream DeepGEMM alignment context.
+        # under cudagraph replay. HCU's INT8 front end consumes its fixed
+        # 256-row layout directly and has no upstream alignment context.
         alignment_scope = (
             nullcontext()
             if current_platform.is_rocm() and self.quant_config.use_int8_w8a8
@@ -431,12 +430,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     raise ValueError(
                         "HCU Channel INT8 DeepGEMM supports only SiLU activation"
                     )
-                from lightop import (
-                    fuse_silu_mul_quant,
-                    m_grouped_w8a8_gemm_nt_contig_asm,
-                )
+                from deepgemm import m_grouped_i8_gemm_nt_contiguous
+                from lightop import fuse_silu_mul_quant
 
-                m_grouped_w8a8_gemm_nt_contig_asm(
+                m_grouped_i8_gemm_nt_contiguous(
                     (a1q, a1q_scale),
                     (w1, self.w1_scale),
                     mm1_out,
@@ -453,7 +450,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     expert_ids=expert_ids,
                 )
                 mm2_out = _resize_cache(workspace2, (M_sum, K))
-                m_grouped_w8a8_gemm_nt_contig_asm(
+                m_grouped_i8_gemm_nt_contiguous(
                     (a2q, a2q_scale),
                     (w2, self.w2_scale),
                     mm2_out,

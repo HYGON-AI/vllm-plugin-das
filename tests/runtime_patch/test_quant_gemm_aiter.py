@@ -639,22 +639,23 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
     dpsk_w13 = dpsk_w13.reshape(2, 16, 64)
     dpsk_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
     dpsk_w2 = dpsk_w2.reshape(2, 64, 64)
+    from deepgemm import marlin_i8_contiguous_weight
+
+    expected_w13 = marlin_i8_contiguous_weight(dpsk_w13.clone())
+    expected_w2 = marlin_i8_contiguous_weight(dpsk_w2.clone())
     converted_w13, converted_w2 = target.convert_to_int8_moe_kernel_format(
         backend,
         dpsk_w13,
         dpsk_w2,
     )
-    from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
-        weight8bit_nt_kpack2_marlin2,
-    )
 
     torch.testing.assert_close(
         converted_w13,
-        weight8bit_nt_kpack2_marlin2(dpsk_w13),
+        expected_w13,
     )
     torch.testing.assert_close(
         converted_w2,
-        weight8bit_nt_kpack2_marlin2(dpsk_w2),
+        expected_w2,
     )
 
     config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "auto"
