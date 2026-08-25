@@ -21,6 +21,7 @@ TARGETS = (
     f"{TARGET_MODULE}.DeepEPAll2AllManagerBase.__init__",
     f"{TARGET_MODULE}.DeepEPHTAll2AllManager._make_all2all_kwargs",
     f"{TARGET_MODULE}.DeepEPHTAll2AllManager.set_num_sms",
+    f"{TARGET_MODULE}.DeepEPLLAll2AllManager._make_all2all_kwargs",
     f"{TARGET_MODULE}.DeepEPAutoAll2AllManager",
 )
 _MARKER = "_vllm_hcu_deep_ep_runtime_applied"
@@ -35,10 +36,14 @@ def apply_to_module(module: ModuleType) -> bool:
     ht = require_class(
         all2all, "DeepEPHTAll2AllManager", f"{TARGET_MODULE}.DeepEPHTAll2AllManager"
     )
+    ll = require_class(
+        all2all, "DeepEPLLAll2AllManager", f"{TARGET_MODULE}.DeepEPLLAll2AllManager"
+    )
     wrapped = (
         (base, "__init__", TARGETS[0], _WRAPPER),
         (ht, "_make_all2all_kwargs", TARGETS[1], _WRAPPER),
         (ht, "set_num_sms", TARGETS[2], _WRAPPER),
+        (ll, "_make_all2all_kwargs", TARGETS[3], _WRAPPER),
     )
     if already_applied(all2all, _MARKER, wrapped):
         auto = getattr(all2all, "DeepEPAutoAll2AllManager", None)
@@ -61,6 +66,19 @@ def apply_to_module(module: ModuleType) -> bool:
     require_exact_signature(
         original_set_sms, TARGETS[2], positional=("self", "num_sms")
     )
+    original_ll_kwargs = require_callable(ll, "_make_all2all_kwargs", TARGETS[3])
+    require_exact_signature(
+        original_ll_kwargs,
+        TARGETS[3],
+        positional=(
+            "self",
+            "max_num_tokens_per_dp_rank",
+            "token_hidden_size",
+            "num_ep_ranks",
+            "num_global_experts",
+            "num_local_experts",
+        ),
+    )
 
     from vllm_hcu.distributed.device_communicators import framework_runtime
 
@@ -79,14 +97,45 @@ def apply_to_module(module: ModuleType) -> bool:
             self, framework_runtime.requested_deep_ep_sms(num_sms)
         )
 
-    for function in (hcu_init, hcu_make_kwargs, hcu_set_num_sms):
+    @functools.wraps(original_ll_kwargs)
+    def hcu_make_ll_kwargs(
+        self,
+        max_num_tokens_per_dp_rank,
+        token_hidden_size,
+        num_ep_ranks,
+        num_global_experts,
+        num_local_experts,
+    ):
+        kwargs = original_ll_kwargs(
+            self,
+            max_num_tokens_per_dp_rank,
+            token_hidden_size,
+            num_ep_ranks,
+            num_global_experts,
+            num_local_experts,
+        )
+        kwargs["num_rdma_bytes"] = (
+            framework_runtime.recover_deep_ep_ll_size_hint(
+                kwargs["num_rdma_bytes"]
+            )
+        )
+        return kwargs
+
+    for function in (
+        hcu_init,
+        hcu_make_kwargs,
+        hcu_set_num_sms,
+        hcu_make_ll_kwargs,
+    ):
         setattr(function, _WRAPPER, True)
     setattr(base, "_vllm_hcu_original_init", original_init)
     setattr(ht, "_vllm_hcu_original_make_all2all_kwargs", original_kwargs)
     setattr(ht, "_vllm_hcu_original_set_num_sms", original_set_sms)
+    setattr(ll, "_vllm_hcu_original_make_all2all_kwargs", original_ll_kwargs)
     setattr(base, "__init__", hcu_init)
     setattr(ht, "_make_all2all_kwargs", hcu_make_kwargs)
     setattr(ht, "set_num_sms", hcu_set_num_sms)
+    setattr(ll, "_make_all2all_kwargs", hcu_make_ll_kwargs)
     framework_runtime.install_deep_ep_auto_manager(all2all)
     setattr(all2all, _MARKER, True)
     return True

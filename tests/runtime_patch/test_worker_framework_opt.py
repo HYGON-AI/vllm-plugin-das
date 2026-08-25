@@ -213,6 +213,33 @@ def _fake_all2all_module() -> ModuleType:
             super().__init__(cpu_group, tcp_store_group)
             self.support_fault_tolerance = False
 
+        def _make_all2all_kwargs(
+            self,
+            max_num_tokens_per_dp_rank: int,
+            token_hidden_size: int,
+            num_ep_ranks: int,
+            num_global_experts: int,
+            num_local_experts: int,
+        ):
+            import deep_ep
+
+            return {
+                "group": self.cpu_group,
+                "num_nvl_bytes": 256 * 1024 * 1024,
+                "num_rdma_bytes": deep_ep.Buffer.get_low_latency_rdma_size_hint(
+                    num_max_dispatch_tokens_per_rank=max_num_tokens_per_dp_rank,
+                    hidden=token_hidden_size,
+                    num_ranks=num_ep_ranks,
+                    num_experts=num_global_experts,
+                ),
+                "low_latency_mode": True,
+                "num_qps_per_rank": num_local_experts,
+                "allow_nvlink_for_low_latency_mode": True,
+                "allow_mnnvl": False,
+                "explicitly_destroy": True,
+                "enable_shrink": self.support_fault_tolerance,
+            }
+
     return _module(
         patch_all2all.TARGET_MODULE,
         DeepEPAll2AllManagerBase=DeepEPAll2AllManagerBase,
@@ -254,6 +281,38 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     assert intranode.num_sms == 60
     assert intranode_kwargs["num_rdma_bytes"] == 0
     assert intranode_kwargs["num_qps_per_rank"] == 1
+
+
+def test_deep_ep_adapter_recovers_signed_ll_rdma_size_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            assert kwargs == {
+                "num_max_dispatch_tokens_per_rank": 512,
+                "hidden": 6144,
+                "num_ranks": 8,
+                "num_experts": 256,
+            }
+            return 18_446_744_072_686_145_664
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+
+    manager = module.DeepEPLLAll2AllManager("group")
+    kwargs = manager._make_all2all_kwargs(
+        max_num_tokens_per_dp_rank=512,
+        token_hidden_size=6144,
+        num_ep_ranks=8,
+        num_global_experts=256,
+        num_local_experts=32,
+    )
+
+    assert kwargs["num_rdma_bytes"] == 3_271_561_344
+    assert kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
+    assert kwargs["num_qps_per_rank"] == 32
 
 
 def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(

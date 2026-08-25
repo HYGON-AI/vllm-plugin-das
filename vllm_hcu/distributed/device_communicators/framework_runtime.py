@@ -9,6 +9,8 @@ from typing import Any
 
 _HT_NVL_BUFFER_BYTES = 1_000_000_000
 _HT_RDMA_BUFFER_BYTES = 500_000_000
+_INT64_MAX = (1 << 63) - 1
+_UINT32_MASK = (1 << 32) - 1
 
 
 def initialize_deep_ep_manager(manager: object) -> None:
@@ -48,6 +50,14 @@ def requested_deep_ep_sms(num_sms: int) -> int:
 
     override = henvs.VLLM_HCU_DEEPEP_NUM_SMS
     return int(num_sms if override is None else override)
+
+
+def recover_deep_ep_ll_size_hint(num_rdma_bytes: int) -> int:
+    """Recover a DeepEP LL size hint sign-extended from 32 bits."""
+
+    if num_rdma_bytes > _INT64_MAX:
+        return num_rdma_bytes & _UINT32_MASK
+    return num_rdma_bytes
 
 
 def install_deep_ep_auto_manager(module: object) -> type:
@@ -125,6 +135,7 @@ __all__ = [
     "all_to_all_single",
     "initialize_deep_ep_manager",
     "make_deep_ep_ht_kwargs",
+    "recover_deep_ep_ll_size_hint",
     "install_deep_ep_auto_manager",
     "requested_deep_ep_sms",
 ]
