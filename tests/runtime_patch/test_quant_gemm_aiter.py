@@ -413,6 +413,8 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
 
+    import vllm.config as vllm_config_module
+
     class Int8MoeBackend(enum.Enum):
         TRITON = "TRITON"
         HUMMING = "HUMMING"
@@ -428,6 +430,10 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
         if runner_backend == "triton":
             return Int8MoeBackend.TRITON
         raise ValueError(runner_backend)
+
+    def select_int8_moe_backend(config, weight_key, activation_key):
+        del config, weight_key, activation_key
+        return "official-select", "official-experts"
 
     def convert_to_int8_moe_kernel_format(
         int8_backend,
@@ -491,9 +497,16 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
         Int8MoeBackend=Int8MoeBackend,
         backend_to_kernel_cls=backend_to_kernel_cls,
         map_int8_backend=map_int8_backend,
+        select_int8_moe_backend=select_int8_moe_backend,
         convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
         make_int8_moe_quant_config=make_int8_moe_quant_config,
         int8_w8a8_moe_quant_config=int8_w8a8_moe_quant_config,
+        mk=SimpleNamespace(
+            FusedMoEActivationFormat=SimpleNamespace(
+                Standard="standard",
+                BatchedExperts="batched",
+            )
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -502,6 +515,60 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
             "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
             AiterExperts=AiterExperts,
         ),
+    )
+
+    class DeepGemmExperts:
+        @staticmethod
+        def is_supported_config(
+            cls,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        ):
+            del cls, config
+            return (
+                (weight_key, activation_key, activation_format)
+                == ("weight", "activation", "standard"),
+                "requires standard activation format",
+            )
+
+    class BatchedDeepGemmExperts:
+        @staticmethod
+        def is_supported_config(
+            cls,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        ):
+            del cls, config
+            return (
+                (weight_key, activation_key, activation_format)
+                == ("weight", "activation", "batched"),
+                "requires batched activation format",
+            )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+        _module(
+            "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+            DeepGemmExperts=DeepGemmExperts,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
+        _module(
+            "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
+            BatchedDeepGemmExperts=BatchedDeepGemmExperts,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: None,
     )
 
     assert patch_int8_oracle.apply_to_module(target) is True
@@ -533,6 +600,52 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
     assert quant_config.per_act_token_quant is True
     assert quant_config.a1_scale is None
     assert quant_config.a2_scale is None
+
+    config = SimpleNamespace(
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            use_batched_activation_format=False,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            additional_config={
+                "hcu": {
+                    "moe_backend": "dpsk_deep_gemm",
+                }
+            }
+        ),
+    )
+    backend, experts = target.select_int8_moe_backend(
+        config, "weight", "activation"
+    )
+    assert backend is target.Int8MoeBackend.DPSK_DEEPGEMM
+    assert experts is DeepGemmExperts
+    assert target.map_int8_backend("dpsk_deep_gemm") is backend
+
+    config.moe_parallel_config.use_batched_activation_format = True
+    backend, experts = target.select_int8_moe_backend(
+        config, "weight", "activation"
+    )
+    assert experts is BatchedDeepGemmExperts
+
+    converted_w13, converted_w2 = target.convert_to_int8_moe_kernel_format(
+        backend,
+        w13,
+        w2,
+    )
+    assert converted_w13 is w13
+    assert converted_w2 is w2
+
+    config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "auto"
+    assert target.select_int8_moe_backend(
+        config, "weight", "activation"
+    ) == ("official-select", "official-experts")
+
+    config._hcu_vllm_config.additional_config["hcu"][
+        "moe_backend"
+    ] = "dpsk_deep_gemm"
+    config.moe_backend = "triton"
+    with pytest.raises(ValueError, match="official backend must remain 'auto'"):
+        target.select_int8_moe_backend(config, "weight", "activation")
 
 
 def test_worker_registers_int8_aiter_oracle_before_quantized_methods():
