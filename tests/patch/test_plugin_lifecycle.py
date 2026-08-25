@@ -507,6 +507,14 @@ def test_worker_selects_plugin_owned_model_runner(
 def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
     upstream_name = "vllm.v1.worker.gpu.model_runner"
     adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
+    adapter_attribute = "hcu_model_runner_v2"
+    missing = object()
+    import vllm_hcu.v1 as hcu_v1_package
+
+    previous_adapter = sys.modules.get(adapter_name, missing)
+    previous_adapter_attribute = hcu_v1_package.__dict__.get(
+        adapter_attribute, missing
+    )
     upstream_module = ModuleType(upstream_name)
 
     class UpstreamGPUModelRunner:
@@ -518,19 +526,31 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
-    monkeypatch.delitem(sys.modules, adapter_name, raising=False)
+    sys.modules.pop(adapter_name, None)
+    hcu_v1_package.__dict__.pop(adapter_attribute, None)
 
-    adapter_module = importlib.import_module(adapter_name)
-    adapter = adapter_module.HcuGPUModelRunnerV2
-    config = object()
-    device = object()
-    runner = adapter(config, device)
+    try:
+        adapter_module = importlib.import_module(adapter_name)
+        adapter = adapter_module.HcuGPUModelRunnerV2
+        config = object()
+        device = object()
+        runner = adapter(config, device)
 
-    assert issubclass(adapter, UpstreamGPUModelRunner)
-    assert runner.upstream_init == (config, device)
-    assert runner.pcp_manager is None
-    assert runner.execute_model() == "upstream"
-    assert "execute_model" not in adapter.__dict__
+        assert issubclass(adapter, UpstreamGPUModelRunner)
+        assert runner.upstream_init == (config, device)
+        assert runner.pcp_manager is None
+        assert runner.execute_model() == "upstream"
+        assert "execute_model" not in adapter.__dict__
+    finally:
+        sys.modules.pop(adapter_name, None)
+        if previous_adapter is not missing:
+            sys.modules[adapter_name] = previous_adapter
+        if previous_adapter_attribute is missing:
+            hcu_v1_package.__dict__.pop(adapter_attribute, None)
+        else:
+            hcu_v1_package.__dict__[adapter_attribute] = (
+                previous_adapter_attribute
+            )
 
 
 def test_worker_does_not_terminal_validate_after_failed_parent_load(
