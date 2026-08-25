@@ -61,8 +61,12 @@ docker_args=(
   --workdir /vllm-plugin-das
   --volume "$workspace:/vllm-plugin-das"
   --volume "$artifact_root:/hcu-ci-artifacts"
+  --env HOME=/tmp/hcu-ci-home
+  --env PYTHONDONTWRITEBYTECODE=1
   --env VLLM_HCU_IS_IN_CI=1
   --env PYTHONPATH=/vllm-plugin-das
+  --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
+  --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
 )
 
 missing_devices=()

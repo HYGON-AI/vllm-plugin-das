@@ -170,6 +170,7 @@ def main() -> int:
         )
 
         junit_path = job_root / "pytest.xml"
+        pytest_cache = job_root / "pytest-cache"
         command = [
             sys.executable,
             "tools/run_patch_tests.py",
@@ -183,6 +184,10 @@ def main() -> int:
             "--",
             *pytest_args,
             "-rsxX",
+            "-o",
+            f"cache_dir={pytest_cache}",
+            "--durations=20",
+            "--durations-min=1.0",
             f"--junitxml={junit_path}",
         ]
         command_text = " ".join(command)
