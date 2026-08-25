@@ -74,6 +74,9 @@ jobs:
               )"
             fi
             if [[ -n "$candidate" ]]; then
+              if ! docker run --rm --entrypoint /bin/bash "$candidate" -lc 'test -x /usr/local/bin/python3.10'; then
+                docker pull "$candidate" >/dev/null 2>&1 || true
+              fi
               if docker run --rm --entrypoint /bin/bash "$candidate" -lc 'test -x /usr/local/bin/python3.10'; then
                 HCU_CI_IMAGE="$(
                   docker image inspect "$candidate" \

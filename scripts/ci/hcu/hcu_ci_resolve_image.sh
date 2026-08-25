@@ -34,9 +34,21 @@ has_control_python() {
     -lc 'test -x /usr/local/bin/python3.10' >/dev/null 2>&1
 }
 
+refresh_ref() {
+  local ref="$1"
+
+  if [[ "$ref" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    return 1
+  fi
+  docker pull "$ref" >/dev/null 2>&1
+}
+
 emit_usable_ref() {
   local ref="$1"
 
+  if ! has_control_python "$ref"; then
+    refresh_ref "$ref" || true
+  fi
   if ! has_control_python "$ref"; then
     echo "skipping HCU CI image candidate without /usr/local/bin/python3.10: $ref" >&2
     return 1
