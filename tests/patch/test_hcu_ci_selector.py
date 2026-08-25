@@ -58,6 +58,16 @@ def test_moe_change_selects_kernel_and_tp_ep_jobs() -> None:
     assert fallback is False
 
 
+def test_deepseek_runtime_change_selects_gfx938_accuracy() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["vllm_hcu/model_executor/layers/deepseek_v4_attention.py"],
+    )
+    assert "accuracy-gfx938" in {job["id"] for job in jobs}
+    assert "deepseek" in groups
+    assert fallback is False
+
+
 def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),

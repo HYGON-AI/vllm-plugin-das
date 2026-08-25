@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 import sys
-from importlib import import_module
-from types import SimpleNamespace
+from importlib import import_module, invalidate_caches
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -59,13 +59,37 @@ def isolated_lightop_modules():
         for name, module in sys.modules.items()
         if name == "lightop" or name.startswith("lightop.")
     }
+    for name in tuple(original_modules):
+        sys.modules.pop(name, None)
+    invalidate_caches()
     try:
         yield
     finally:
         for name in tuple(sys.modules):
             if name == "lightop" or name.startswith("lightop."):
                 sys.modules.pop(name, None)
+        invalidate_caches()
         sys.modules.update(original_modules)
+
+
+def test_isolated_lightop_modules_evicts_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached test double must not satisfy the installed-wheel contract."""
+    stale_lightop = ModuleType("lightop")
+    stale_activation = ModuleType("lightop.activation")
+    stale_lightop.activation = stale_activation  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "lightop", stale_lightop)
+    monkeypatch.setitem(sys.modules, "lightop.activation", stale_activation)
+
+    lifecycle = isolated_lightop_modules.__wrapped__()
+    next(lifecycle)
+    try:
+        assert "lightop" not in sys.modules
+        assert "lightop.activation" not in sys.modules
+    finally:
+        with pytest.raises(StopIteration):
+            next(lifecycle)
 
 
 @pytest.mark.usefixtures("isolated_lightop_modules")

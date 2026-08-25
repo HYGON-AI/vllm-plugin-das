@@ -95,15 +95,15 @@ def make_hcu_grouped_topk_router(base_class):
                     input_ids=input_ids,
                 )
             try:
-                from lightop import moe as lightop_moe
+                from lightop.moe import moe_fused_gate
             except (ImportError, AttributeError):
-                from lightop import op as lightop_moe
+                from lightop.op import moe_fused_gate
 
                 logger.warning_once(
                     "Using deprecated lightop.op MoE APIs because lightop.moe is "
                     "unavailable; upgrade LightOp."
                 )
-            topk_weights, topk_ids = lightop_moe.moe_fused_gate(
+            topk_weights, topk_ids = moe_fused_gate(
                 router_logits,
                 self.e_score_correction_bias,
                 self.num_expert_group,

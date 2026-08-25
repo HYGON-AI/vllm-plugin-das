@@ -12,9 +12,9 @@ from vllm_hcu.platforms import envs as henvs
 logger = init_logger(__name__)
 
 try:
-    from lightop import activation as op
+    from lightop.activation import silu_and_mul_opt
 except (ImportError, AttributeError):
-    import lightop.op as op
+    from lightop.op import silu_and_mul_opt
 
     logger.warning_once(
         "Using deprecated lightop.op activation API because "
@@ -26,7 +26,7 @@ def silu_and_mul_opt_lightop_impl(input: torch.Tensor) -> torch.Tensor:
     d = input.shape[-1] // 2
     output_shape = input.shape[:-1] + (d,)
     out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-    op.silu_and_mul_opt(out, input)
+    silu_and_mul_opt(out, input)
     return out
 
 

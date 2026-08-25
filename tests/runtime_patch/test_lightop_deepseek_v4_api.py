@@ -131,7 +131,7 @@ def _install_attention_module(
 def _fused_self() -> tuple[object, dict[str, object]]:
     cache_2d = object()
     kv_weight = object()
-    slot_mapping = object()
+    slot_mapping = torch.tensor([0, 99, 1, 99], dtype=torch.int64)[::2]
     cos_sin_cache = object()
 
     class Cache:
@@ -157,7 +157,7 @@ def _fused_self() -> tuple[object, dict[str, object]]:
     }
 
 
-def test_fused_insert_passes_raw_kv_and_all_nine_categorized_arguments(
+def test_fused_insert_converts_slot_mapping_for_categorized_int32_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Wrong kernel, normalization ownership, or argument order changes output data flow."""
@@ -176,19 +176,25 @@ def test_fused_insert_passes_raw_kv_and_all_nine_categorized_arguments(
     converted_positions = object()
     fused_insert(self, q, raw_kv, Positions(), {"swa": expected["metadata"]})
 
-    assert calls == [
-        (
-            q,
-            raw_kv,
-            expected["kv_weight"],
-            expected["cache_2d"],
-            expected["slot_mapping"],
-            converted_positions,
-            expected["cos_sin_cache"],
-            1e-6,
-            64,
-        )
-    ]
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[:4] == (
+        q,
+        raw_kv,
+        expected["kv_weight"],
+        expected["cache_2d"],
+    )
+    converted_slots = args[4]
+    assert isinstance(converted_slots, torch.Tensor)
+    assert converted_slots.dtype is torch.int32
+    assert converted_slots.is_contiguous()
+    assert torch.equal(converted_slots, torch.tensor([0, 1], dtype=torch.int32))
+    assert args[5:] == (
+        converted_positions,
+        expected["cos_sin_cache"],
+        1e-6,
+        64,
+    )
 
 
 def test_fused_insert_requires_categorized_kernel(

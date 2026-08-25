@@ -586,6 +586,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        swa_slot_mapping_i32 = swa_metadata.slot_mapping.to(
+            dtype=torch.int32
+        ).contiguous()
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
@@ -607,7 +610,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv,
             self.kv_norm.weight.data,
             swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
+            swa_slot_mapping_i32,
             positions.to(torch.int64),
             self.rotary_emb.cos_sin_cache,
             self.eps,

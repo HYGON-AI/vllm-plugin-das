@@ -509,6 +509,7 @@
         "tests/integration/server/test_evalscope_deepseek*"
       ],
       "jobs": [
+        "accuracy-gfx938",
         "deepseek-tp-ep",
         "deepseek-gsm8k"
       ]

@@ -648,8 +648,8 @@ def _execute_silu_module_selection(namespace: dict[str, object]) -> None:
             if isinstance(node, ast.Try)
             and any(
                 isinstance(item, ast.ImportFrom)
-                and item.module == "lightop"
-                and any(alias.name == "activation" for alias in item.names)
+                and item.module == "lightop.activation"
+                and any(alias.name == "silu_and_mul_opt" for alias in item.names)
                 for item in node.body
             )
         )
@@ -662,10 +662,15 @@ def _execute_silu_module_selection(namespace: dict[str, object]) -> None:
 def test_silu_and_mul_uses_legacy_module_once_when_categorized_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    incomplete_activation = ModuleType("lightop.activation")
     legacy_op = ModuleType("lightop.op")
     legacy_op.silu_and_mul_opt = lambda output, _input: output.fill_(5)
     logger = _WarningLogger()
-    _install_lightop(monkeypatch, op=legacy_op)
+    _install_lightop(
+        monkeypatch,
+        activation=incomplete_activation,
+        op=legacy_op,
+    )
     namespace: dict[str, object] = {"torch": torch, "logger": logger}
 
     _execute_silu_module_selection(namespace)

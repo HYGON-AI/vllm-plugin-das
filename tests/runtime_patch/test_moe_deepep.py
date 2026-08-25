@@ -2100,8 +2100,9 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
         return torch.full((1, 1), 0.25), torch.tensor([[1]], dtype=torch.int64)
 
     lightop = sys.modules["lightop"]
-    monkeypatch.delitem(sys.modules, "lightop.moe")
-    delattr(lightop, "moe")
+    incomplete_moe = _module("lightop.moe")
+    lightop.moe = incomplete_moe
+    monkeypatch.setitem(sys.modules, "lightop.moe", incomplete_moe)
     legacy_op = _module("lightop.op", moe_fused_gate=legacy_moe_fused_gate)
     lightop.op = legacy_op
     monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
@@ -2138,107 +2139,161 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
 @pytest.mark.filterwarnings(
     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
 )
-def test_fuse_moe_gate_routes_through_categorized_lightop(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_hcu.platforms import envs as henvs
+def test_fuse_moe_gate_routes_through_categorized_lightop() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    module_path = repo / "vllm_hcu/ops/fuse_moe_gate.py"
+    script = f"""
+import importlib.util
+import sys
+from types import ModuleType
 
-    calls: list[tuple[object, ...]] = []
+import torch
 
-    def moe_fused_gate(*args):
-        calls.append(args)
-        return torch.full((1, 1), 0.5), torch.tensor([[2]], dtype=torch.int64)
+from vllm_hcu.platforms import envs as henvs
 
-    _install_lightop_moe(monkeypatch, moe_fused_gate=moe_fused_gate)
-    activation = _module("lightop.activation", silu_and_mul_opt=lambda *args: None)
-    legacy_op = _module("lightop.op", rmsnorm_forward_autograd=lambda *args: None)
-    sys.modules["lightop"].activation = activation
-    sys.modules["lightop"].op = legacy_op
-    sys.modules["lightop"].fused_add_rms_norm = lambda *args: None
-    monkeypatch.setitem(sys.modules, "lightop.activation", activation)
-    monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
-    from vllm_hcu.ops import fuse_moe_gate
+calls = []
+def moe_fused_gate(*args):
+    calls.append(args)
+    return torch.full((1, 1), 0.5), torch.tensor([[2]], dtype=torch.int64)
 
-    router = object.__new__(fuse_moe_gate.HcuGroupedTopKRouter)
-    router.num_expert_group = 2
-    router.topk_group = 1
-    router.top_k = 1
-    router.num_fused_shared_experts = 0
-    router.e_score_correction_bias = torch.ones(4)
-    router.routed_scaling_factor = 1.0
-    logits = torch.ones((1, 4))
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
+lightop = ModuleType("lightop")
+lightop.__path__ = []
+moe = ModuleType("lightop.moe")
+moe.moe_fused_gate = moe_fused_gate
+lightop.moe = moe
+sys.modules["lightop"] = lightop
+sys.modules["lightop.moe"] = moe
 
-    weights, ids = router._compute_routing(None, logits, torch.int32)
-    torch.testing.assert_close(weights, torch.full((1, 1), 0.5))
-    assert ids.item() == 2
-    assert calls[0][0] is logits
+spec = importlib.util.spec_from_file_location(
+    "_hcu_fuse_moe_gate_categorized_probe", {str(module_path)!r}
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+router = object.__new__(module.HcuGroupedTopKRouter)
+router.num_expert_group = 2
+router.topk_group = 1
+router.top_k = 1
+router.num_fused_shared_experts = 0
+router.e_score_correction_bias = torch.ones(4)
+router.routed_scaling_factor = 1.0
+logits = torch.ones((1, 4))
+henvs.VLLM_HCU_USE_CUSTOM_OPS = True
+henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
+weights, ids = router._compute_routing(None, logits, torch.int32)
+torch.testing.assert_close(weights, torch.full((1, 1), 0.5))
+assert ids.item() == 2
+assert calls[0][0] is logits
+"""
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.filterwarnings(
     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
 )
-def test_fuse_moe_gate_eagerly_falls_back_to_legacy_lightop_once(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-):
-    from vllm import logger as vllm_logger
+def test_fuse_moe_gate_eagerly_falls_back_to_legacy_lightop_once() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    module_path = repo / "vllm_hcu/ops/fuse_moe_gate.py"
+    script = f"""
+import importlib.util
+import logging
+import sys
+from types import ModuleType
 
-    calls: list[tuple[object, ...]] = []
+import torch
 
-    def moe_fused_gate(*args):
-        calls.append(args)
-        return torch.full((1, 1), 0.75), torch.tensor([[0]], dtype=torch.int64)
+from vllm import logger as vllm_logger
+from vllm_hcu.platforms import envs as henvs
 
-    lightop = _module("lightop")
-    lightop.__path__ = []
-    legacy_op = _module("lightop.op", moe_fused_gate=moe_fused_gate)
-    activation = _module("lightop.activation", silu_and_mul_opt=lambda *args: None)
-    lightop.op = legacy_op
-    lightop.activation = activation
-    lightop.fused_add_rms_norm = lambda *args: None
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
-    monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
-    monkeypatch.setitem(sys.modules, "lightop.activation", activation)
-    from vllm_hcu.ops import fuse_moe_gate
-    from vllm_hcu.platforms import envs as henvs
+calls = []
+def moe_fused_gate(*args):
+    calls.append(args)
+    return torch.full((1, 1), 0.75), torch.tensor([[0]], dtype=torch.int64)
 
-    vllm_logger._print_warning_once.cache_clear()
-    caplog.set_level(logging.WARNING)
-    caplog.clear()
-    fuse_moe_gate = importlib.reload(fuse_moe_gate)
-    fuse_moe_gate = importlib.reload(fuse_moe_gate)
-    warning = (
-        "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
-        "upgrade LightOp."
+lightop = ModuleType("lightop")
+lightop.__path__ = []
+incomplete_moe = ModuleType("lightop.moe")
+legacy_op = ModuleType("lightop.op")
+legacy_op.moe_fused_gate = moe_fused_gate
+lightop.moe = incomplete_moe
+lightop.op = legacy_op
+sys.modules["lightop"] = lightop
+sys.modules["lightop.moe"] = incomplete_moe
+sys.modules["lightop.op"] = legacy_op
+
+records = []
+class Capture(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+
+vllm_logger._print_warning_once.cache_clear()
+module_name = "_hcu_fuse_moe_gate_fallback_probe"
+module = None
+handler = Capture()
+try:
+    for _ in range(2):
+        spec = importlib.util.spec_from_file_location(module_name, {str(module_path)!r})
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        module.logger = logging.getLogger(module_name)
+        module.logger.addHandler(handler)
+        spec.loader.exec_module(module)
+        module.logger.removeHandler(handler)
+finally:
+    if module is not None and handler in module.logger.handlers:
+        module.logger.removeHandler(handler)
+
+warning = (
+    "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+    "upgrade LightOp."
+)
+assert [message for message in records if message == warning] == [warning]
+
+router = object.__new__(module.HcuGroupedTopKRouter)
+router.num_expert_group = 2
+router.topk_group = 1
+router.top_k = 1
+router.num_fused_shared_experts = 0
+router.e_score_correction_bias = torch.ones(4)
+router.routed_scaling_factor = 1.0
+logits = torch.ones((1, 4))
+henvs.VLLM_HCU_USE_CUSTOM_OPS = True
+henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
+weights, ids = router._compute_routing(None, logits, torch.int32)
+torch.testing.assert_close(weights, torch.full((1, 1), 0.75))
+assert ids.item() == 0
+assert calls[0][0] is logits
+assert calls[0][1] is router.e_score_correction_bias
+assert calls[0][2:] == (
+    router.num_expert_group,
+    router.topk_group,
+    router.top_k,
+    0,
+    router.routed_scaling_factor,
+)
+"""
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
     )
-    assert [
-        record.getMessage() for record in caplog.records if record.getMessage() == warning
-    ] == [warning]
-
-    router = object.__new__(fuse_moe_gate.HcuGroupedTopKRouter)
-    router.num_expert_group = 2
-    router.topk_group = 1
-    router.top_k = 1
-    router.num_fused_shared_experts = 0
-    router.e_score_correction_bias = torch.ones(4)
-    router.routed_scaling_factor = 1.0
-    logits = torch.ones((1, 4))
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
-    weights, ids = router._compute_routing(None, logits, torch.int32)
-    torch.testing.assert_close(weights, torch.full((1, 1), 0.75))
-    assert ids.item() == 0
-    assert calls[0][0] is logits
-    assert calls[0][1] is router.e_score_correction_bias
-    assert calls[0][2:] == (
-        router.num_expert_group,
-        router.topk_group,
-        router.top_k,
-        0,
-        router.routed_scaling_factor,
-    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _fake_deepep_ll_module() -> ModuleType:
