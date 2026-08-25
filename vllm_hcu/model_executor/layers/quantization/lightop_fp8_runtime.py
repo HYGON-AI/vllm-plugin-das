@@ -26,17 +26,21 @@ def _lightop_per_token_quant_fp8(
     if _FP8_DTYPE is None:
         raise HcuLightOpRegistrationError("LightOp FP8 dtype was not initialized")
     try:
-        from lightop import op
-    except Exception as exc:
+        from lightop.quant import per_token_quant_fp8
+    except (ImportError, AttributeError) as exc:
         raise HcuLightOpRegistrationError(
-            "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8 is enabled, but "
-            "the lightop package is unavailable"
+            "lightop.quant.per_token_quant_fp8 is required; upgrade LightOp"
         ) from exc
 
     out = torch.empty_like(x, dtype=_FP8_DTYPE)
     scale = torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32)
     try:
-        op.per_token_quant_fp8(out, x, scale)
+        per_token_quant_fp8(
+            x,
+            dtype=_FP8_DTYPE,
+            out_q=out,
+            out_scale=scale,
+        )
     except Exception as exc:
         raise HcuLightOpRegistrationError(
             "LightOp per_token_quant_fp8 kernel execution failed"

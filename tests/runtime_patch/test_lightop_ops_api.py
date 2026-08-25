@@ -11,10 +11,12 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
 
+from vllm_hcu.model_executor.layers.quantization import lightop_fp8_runtime
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -116,6 +118,227 @@ def _install_lightop(
             monkeypatch.delitem(sys.modules, name, raising=False)
         else:
             monkeypatch.setitem(sys.modules, name, module)
+
+
+def _install_lightop_submodule(
+    monkeypatch: pytest.MonkeyPatch, name: str, **exports: object
+) -> ModuleType:
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []
+    submodule = ModuleType(f"lightop.{name}")
+    submodule.__dict__.update(exports)
+    setattr(lightop, name, submodule)
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, f"lightop.{name}", submodule)
+    return submodule
+
+
+def _fused_rmsquant_impl():
+    return _function(
+        "vllm_hcu/ops/fuse_rms_norm_quant.py",
+        "fused_rmsquant_impl",
+        {"torch": torch, "Optional": Optional},
+    )
+
+
+def _execute_rmsnorm_import_boundary(namespace: dict[str, object]) -> None:
+    boundary = copy.deepcopy(
+        next(
+            node
+            for node in _module("vllm_hcu/ops/rms_norm.py").body
+            if isinstance(node, ast.Try)
+            and any(
+                isinstance(item, ast.ImportFrom) and item.module == "lightop.norm"
+                for item in node.body
+            )
+        )
+    )
+    module = ast.Module(body=[boundary], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, "rms_norm_import_boundary", "exec"), namespace)
+
+
+def test_rmsnorm_prefers_categorized_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = torch.full((1, 4), 5.0)
+    calls: list[tuple[object, ...]] = []
+
+    def categorized_forward(*args: object) -> torch.Tensor:
+        calls.append(args)
+        return expected
+
+    def categorized_fused(*args: object) -> None:
+        calls.append(args)
+
+    _install_lightop_submodule(
+        monkeypatch,
+        "norm",
+        rmsnorm_forward_autograd=categorized_forward,
+        fused_add_rms_norm=categorized_fused,
+    )
+    namespace: dict[str, object] = {"logger": _WarningLogger()}
+    _execute_rmsnorm_import_boundary(namespace)
+    forward = _function(
+        "vllm_hcu/ops/rms_norm.py",
+        "_hcu_rmsnorm_forward_autograd_impl",
+        {"torch": torch, **namespace},
+    )
+    fused = _function(
+        "vllm_hcu/ops/rms_norm.py",
+        "_hcu_fused_add_rms_norm_impl",
+        {"torch": torch, **namespace},
+    )
+    x = torch.ones((1, 4))
+    residual = torch.zeros_like(x)
+
+    assert forward(x, torch.ones(4), 1e-6, False) is expected
+    fused_result = fused(x, residual, torch.ones(4), 1e-6)
+    assert fused_result[0] is x
+    assert fused_result[1] is residual
+    assert len(calls) == 2
+
+
+def test_rmsnorm_legacy_fallback_warns_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = ModuleType("lightop")
+    legacy.__path__ = []
+    legacy.fused_add_rms_norm = lambda *args: None
+    legacy_op = ModuleType("lightop.op")
+    legacy_op.rmsnorm_forward_autograd = lambda *args: args[0]
+    legacy.op = legacy_op
+    logger = _WarningLogger()
+    monkeypatch.setitem(sys.modules, "lightop", legacy)
+    monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
+    monkeypatch.delitem(sys.modules, "lightop.norm", raising=False)
+    namespace: dict[str, object] = {"logger": logger}
+
+    _execute_rmsnorm_import_boundary(namespace)
+    _execute_rmsnorm_import_boundary(namespace)
+
+    assert namespace["rmsnorm_forward_autograd"] is legacy_op.rmsnorm_forward_autograd
+    assert namespace["fused_add_rms_norm"] is legacy.fused_add_rms_norm
+    assert len(logger.messages) == 1
+
+
+def test_fp8_quant_uses_categorized_output_keywords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[torch.Tensor, torch.dtype, torch.Tensor, torch.Tensor]] = []
+
+    def per_token_quant_fp8(
+        x: torch.Tensor, *, dtype: torch.dtype, out_q: torch.Tensor, out_scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append((x, dtype, out_q, out_scale))
+        return out_q, out_scale
+
+    _install_lightop_submodule(
+        monkeypatch, "quant", per_token_quant_fp8=per_token_quant_fp8
+    )
+    monkeypatch.setattr(lightop_fp8_runtime, "_FP8_DTYPE", torch.float8_e4m3fn)
+    x = torch.ones((2, 8), dtype=torch.bfloat16)
+
+    output, scale = lightop_fp8_runtime._lightop_per_token_quant_fp8(x)
+
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is torch.float8_e4m3fn
+    assert calls[0][2] is output
+    assert calls[0][3] is scale
+
+
+def test_fp8_quant_rejects_legacy_output_first_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []
+    lightop.op = SimpleNamespace(per_token_quant_fp8=lambda out, x, scale: None)
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.delitem(sys.modules, "lightop.quant", raising=False)
+    monkeypatch.setattr(lightop_fp8_runtime, "_FP8_DTYPE", torch.float8_e4m3fn)
+
+    with pytest.raises(
+        lightop_fp8_runtime.HcuLightOpRegistrationError,
+        match="lightop.quant.per_token_quant_fp8",
+    ):
+        lightop_fp8_runtime._lightop_per_token_quant_fp8(
+            torch.ones((2, 8), dtype=torch.bfloat16)
+        )
+
+
+def test_dynamic_rms_quant_consumes_returned_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_q = torch.ones((2, 4), dtype=torch.int8)
+    expected_s = torch.ones((2, 1), dtype=torch.float32)
+    _install_lightop_submodule(
+        monkeypatch,
+        "norm",
+        rms_norm_dynamic_per_token_quant=lambda *args, **kwargs: (expected_q, expected_s),
+    )
+
+    actual_q, actual_s = _fused_rmsquant_impl()(
+        torch.ones((2, 4)), torch.ones(4), 1e-6, torch.int8
+    )
+
+    assert actual_q is expected_q
+    assert actual_s is expected_s
+
+
+def _load_gemma_forward(gemma_rmsnorm: object):
+    method = copy.deepcopy(
+        next(
+            node
+            for node in next(
+                node
+                for node in _module("vllm_hcu/ops/gemma_rms_norm.py").body
+                if isinstance(node, ast.ClassDef) and node.name == "HcuGemmaRMSNorm"
+            ).body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {
+        "torch": torch,
+        "henvs": SimpleNamespace(
+            VLLM_HCU_USE_CUSTOM_OPS=True,
+            VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM=True,
+        ),
+        "gemma_rmsnorm": gemma_rmsnorm,
+        "gemma_fused_add_rmsnorm": lambda *args: None,
+    }
+    exec(compile(module, "gemma_forward_contract", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
+def test_gemma_rmsnorm_uses_new_out_keyword() -> None:
+    calls: list[tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]] = []
+
+    def gemma_rmsnorm(
+        x: torch.Tensor, weight: torch.Tensor, epsilon: float, *, out: torch.Tensor
+    ) -> None:
+        calls.append((x, weight, epsilon, out))
+
+    forward = _load_gemma_forward(gemma_rmsnorm)
+    owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+    x = torch.ones((2, 4))
+    actual = forward(owner, x)
+
+    assert calls[0][0] is x
+    assert calls[0][1] is owner.weight
+    assert calls[0][2] == owner.variance_epsilon
+    assert calls[0][3] is actual
+
+
+def test_gemma_rmsnorm_rejects_legacy_only_installation() -> None:
+    forward = _load_gemma_forward(None)
+    owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+
+    with pytest.raises(RuntimeError, match="lightop.norm.gemma_rmsnorm"):
+        forward(owner, torch.ones((2, 4)))
 
 
 def test_fuse_silu_quant_prefers_categorized_kernel_and_consumes_result(

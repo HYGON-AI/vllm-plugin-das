@@ -3730,11 +3730,14 @@ def test_int8_hcu_owned_kernel_validates_and_computes_shapes(
         output = (a.float() * scale_a) @ (b.float() * scale_b).t()
         return True, output.to(out_dtype)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "lmslim",
-        _module("lmslim", quant_ops=SimpleNamespace(hipblaslt_w8a8_gemm=gemm)),
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    gemm_ops = _module(
+        "lightop.gemm_ops", hipblaslt_w8a8_channelwise_gemm=gemm
     )
+    lightop.gemm_ops = gemm_ops
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
     x = torch.ones(1, 2, 3, dtype=torch.bfloat16)
     x_q = torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=torch.int8)
     x_scale = torch.tensor([[[0.5], [0.25]]], dtype=torch.float32)
@@ -3771,6 +3774,56 @@ def test_int8_hcu_owned_kernel_validates_and_computes_shapes(
             input_zero_point=torch.ones(1, dtype=torch.int8),
             x_and_scale_quanted=(x_q, x_scale),
         )
+
+
+def test_int8_linear_prefers_categorized_lightop_quant_and_gemm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", False)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def quant(value: torch.Tensor):
+        calls.append(("quant", (value,)))
+        return torch.ones_like(value, dtype=torch.int8), torch.ones(
+            (*value.shape[:-1], 1), dtype=torch.float32
+        )
+
+    def gemm(*args: object):
+        calls.append(("gemm", args))
+        activation, weight, activation_scale, weight_scale, m, n, k, layout, dtype = args
+        assert activation.shape == (m, k)
+        assert weight.shape == (n, k)
+        assert activation_scale.shape == (m, 1)
+        assert weight_scale.shape == (n, 1)
+        assert layout == "NT"
+        return True, torch.full((m, n), 3, dtype=dtype)
+
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    quant_module = _module("lightop.quant", per_token_quant_int8=quant)
+    gemm_module = _module(
+        "lightop.gemm_ops", hipblaslt_w8a8_channelwise_gemm=gemm
+    )
+    lightop.quant = quant_module
+    lightop.gemm_ops = gemm_module
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.quant", quant_module)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_module)
+
+    input = torch.ones((1, 2, 3), dtype=torch.bfloat16)
+    weight = torch.ones((4, 3), dtype=torch.int8)
+    weight_scale = torch.ones((4, 1), dtype=torch.float32)
+    actual = int8_runtime.apply_int8_linear(
+        input, weight, weight_scale, torch.bfloat16
+    )
+
+    assert [name for name, _ in calls] == ["quant", "gemm"]
+    assert actual.shape == (1, 2, 4)
+    assert torch.equal(actual, torch.full_like(actual, 3))
 
 
 def _fake_int8_scheme_module():

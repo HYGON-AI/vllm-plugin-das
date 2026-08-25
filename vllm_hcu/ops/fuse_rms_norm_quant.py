@@ -61,16 +61,21 @@ def fused_rmsquant_impl(
     residual: Optional[torch.Tensor] = None,
     update_input: Optional[bool] = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    output = torch.empty_like(input, device=input.device, dtype=quant_dtype)
-    scales = torch.empty((input.numel() // input.shape[-1], 1),
-                        device=input.device,
-                        dtype=torch.float32)
-    
-    from lightop.op import rms_norm_dynamic_per_token_quant as ligtop_rms_norm_dynamic_per_token_quant
-    ligtop_rms_norm_dynamic_per_token_quant(output, input, weight,
-                                               scales, epsilon,
-                                               residual, update_input)
-    return output, scales
+    try:
+        from lightop.norm import rms_norm_dynamic_per_token_quant
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "lightop.norm.rms_norm_dynamic_per_token_quant is required; "
+            "upgrade LightOp"
+        ) from exc
+    return rms_norm_dynamic_per_token_quant(
+        input,
+        weight,
+        epsilon,
+        quant_dtype,
+        residual=residual,
+        update_input=bool(update_input),
+    )
 
 def fused_rmsquant_fake(
     input: torch.Tensor,
