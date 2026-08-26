@@ -23,11 +23,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
     os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
 ).resolve()
-# Do not resolve this symlink: resolving it would lose the venv package view.
+# Prefer a checkout-local environment when one exists.  Source-only target
+# checkouts use the current interpreter's matching binary-extension view.
+_CHECKOUT_PYTHON = TARGET_VLLM_ROOT / ".venv/bin/python"
 TARGET_PYTHON = Path(
     os.environ.get(
         "VLLM_V0251_PYTHON",
-        TARGET_VLLM_ROOT / ".venv/bin/python",
+        _CHECKOUT_PYTHON if _CHECKOUT_PYTHON.is_file() else sys.executable,
     )
 )
 QWEN_MODULE = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
