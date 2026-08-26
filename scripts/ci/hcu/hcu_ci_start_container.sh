@@ -65,6 +65,7 @@ docker_args=(
   --env PYTHONDONTWRITEBYTECODE=1
   --env VLLM_HCU_IS_IN_CI=1
   --env PYTHONPATH=/vllm-plugin-das
+  --env HCU_CI_ENVIRONMENT_LOCK=/vllm-plugin-das/.github/workflows/configs/hcu-runner-environment.json
   --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
   --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
 )

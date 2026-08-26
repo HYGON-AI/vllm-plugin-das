@@ -417,6 +417,16 @@ def test_distribution_requirement_is_checked_on_demand(
     ]
 
 
+def test_hcu_container_uses_checked_out_environment_lock() -> None:
+    source = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_start_container.sh"
+    ).read_text(encoding="utf-8")
+    assert (
+        "HCU_CI_ENVIRONMENT_LOCK=/vllm-plugin-das/.github/workflows/"
+        "configs/hcu-runner-environment.json"
+    ) in source
+
+
 def test_docs_only_change_does_not_select_hardware() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
