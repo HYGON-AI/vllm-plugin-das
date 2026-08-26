@@ -9,6 +9,7 @@ import threading
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounter
 
 from vllm_hcu.model_executor.layers.attention import pcp
 
@@ -17,20 +18,25 @@ def test_effective_pcp_world_size_is_fullgraph_compilable_across_scope() -> None
     """Reading replicated-MTP state inside a full graph must stay traceable."""
 
     torch._dynamo.reset()
+    compile_counter = CompileCounter()
 
-    def pcp_width() -> int:
-        return pcp.effective_pcp_world_size(2)
+    def add_pcp_width(value: torch.Tensor) -> torch.Tensor:
+        return value + pcp.effective_pcp_world_size(2)
 
-    compiled_width = torch.compile(
-        pcp_width,
-        backend="eager",
+    compiled_add_pcp_width = torch.compile(
+        add_pcp_width,
+        backend=compile_counter,
         fullgraph=True,
     )
 
-    assert compiled_width() == 2
+    value = torch.tensor(0)
+    assert compiled_add_pcp_width(value).item() == 2
+    assert compile_counter.frame_count == 1
     with pcp.replicated_mtp_batch_scope():
-        assert compiled_width() == 1
-    assert compiled_width() == 2
+        assert compiled_add_pcp_width(value).item() == 1
+    assert compiled_add_pcp_width(value).item() == 2
+    assert compile_counter.frame_count >= 2
+    assert compile_counter.op_count >= 2
 
 
 def test_replicated_mtp_scope_restores_nested_and_exception_state() -> None:
@@ -58,33 +64,38 @@ def test_compiled_replicated_mtp_state_is_thread_local() -> None:
     """A sampling scope in one worker thread must not affect another."""
 
     torch._dynamo.reset()
+    compile_counter = CompileCounter()
 
-    def pcp_width() -> int:
-        return pcp.effective_pcp_world_size(2)
+    def add_pcp_width(value: torch.Tensor) -> torch.Tensor:
+        return value + pcp.effective_pcp_world_size(2)
 
-    compiled_width = torch.compile(
-        pcp_width,
-        backend="eager",
+    compiled_add_pcp_width = torch.compile(
+        add_pcp_width,
+        backend=compile_counter,
         fullgraph=True,
     )
-    assert compiled_width() == 2
+    value = torch.tensor(0)
+    assert compiled_add_pcp_width(value).item() == 2
+    assert compile_counter.frame_count == 1
     results: list[int] = []
 
     def run_in_worker_thread() -> None:
-        results.append(compiled_width())
+        results.append(compiled_add_pcp_width(value).item())
         with pcp.replicated_mtp_batch_scope():
-            results.append(compiled_width())
-        results.append(compiled_width())
+            results.append(compiled_add_pcp_width(value).item())
+        results.append(compiled_add_pcp_width(value).item())
 
     with pcp.replicated_mtp_batch_scope():
-        assert compiled_width() == 1
+        assert compiled_add_pcp_width(value).item() == 1
         worker = threading.Thread(target=run_in_worker_thread)
         worker.start()
         worker.join()
-        assert compiled_width() == 1
+        assert compiled_add_pcp_width(value).item() == 1
 
     assert results == [2, 1, 2]
-    assert compiled_width() == 2
+    assert compiled_add_pcp_width(value).item() == 2
+    assert compile_counter.frame_count >= 2
+    assert compile_counter.op_count >= 2
 
 
 def test_eager_replicated_mtp_state_remains_task_local() -> None:

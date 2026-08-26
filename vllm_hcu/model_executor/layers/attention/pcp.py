@@ -30,7 +30,14 @@ _REPLICATED_MTP_GRAPH_STATE = local()
 
 @contextmanager
 def replicated_mtp_batch_scope() -> Iterator[None]:
-    """Run a restored global MTP batch without reapplying PCP attention."""
+    """Run a restored global MTP batch without reapplying PCP attention.
+
+    The scope and any compiled forward that consumes it must execute
+    synchronously on the same worker thread.  The graph-safe mirror is
+    thread-local and therefore must not cross an ``await`` or thread handoff.
+    ``HcuGPUModelRunnerV2.sample_tokens`` satisfies this contract by entering
+    the scope immediately around its synchronous ``super().sample_tokens``.
+    """
 
     token = _REPLICATED_MTP_BATCH.set(True)
     previous_graph_depth = getattr(_REPLICATED_MTP_GRAPH_STATE, "depth", 0)
