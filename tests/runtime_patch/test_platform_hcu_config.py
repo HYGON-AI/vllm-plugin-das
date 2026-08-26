@@ -745,14 +745,62 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
     return SimpleNamespace(
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
-        model_config=SimpleNamespace(enforce_eager=True, use_mla=False),
+        model_config=SimpleNamespace(
+            enforce_eager=True,
+            use_mla=False,
+            max_model_len=4096,
+        ),
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
         ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         kernel_config=SimpleNamespace(moe_backend="auto"),
         kv_transfer_config=None,
     )
+
+
+def test_deepep_low_latency_rejects_unsafe_scheduler_capacity() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(moe_backend="dpsk_deep_gemm")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.scheduler_config.max_num_batched_tokens = 512
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"deepep_low_latency.*max_num_batched_tokens=512.*maximum supported "
+            r"value is 256"
+        ),
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_low_latency_capacity_does_not_truncate_long_prompts() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(moe_backend="dpsk_deep_gemm")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    # max_num_batched_tokens limits each chunked-prefill scheduler iteration;
+    # it must not reduce the accepted model/prompt length.
+    assert config.scheduler_config.max_num_batched_tokens == 256
+    assert config.model_config.max_model_len == 4096
+
+
+def test_deepep_high_throughput_keeps_larger_scheduler_capacity() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(moe_backend="dpsk_deep_gemm")
+    )
+    config.parallel_config.all2all_backend = "deepep_high_throughput"
+    config.scheduler_config.max_num_batched_tokens = 512
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert config.scheduler_config.max_num_batched_tokens == 512
 
 
 def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:

@@ -151,8 +151,10 @@ def hcu_select_int8_moe_backend(config, weight_key, activation_key):
     )
 ```
 
-Treat both AITER and DPSK canonical INT8 weight conversion as no-ops. Do not
-special-case quant-config or modular-kernel construction for DPSK.
+Keep AITER canonical INT8 weight conversion as a no-op. For DPSK, pack both
+expert weights with DeepGEMM's architecture-aware
+`marlin_i8_contiguous_weight` conversion; retain the official modular-kernel
+construction and the HCU W8A8 quant-config adapter.
 
 - [ ] **Step 5: Run the focused test and verify GREEN**
 

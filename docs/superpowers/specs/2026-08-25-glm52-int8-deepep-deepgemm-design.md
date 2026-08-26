@@ -58,11 +58,10 @@ implementations:
 - `BatchedDeepGemmExperts`: batched activation format used by DeepEP
   low-latency.
 
-The target oracle will still own quant-config creation, prepare/finalize
-construction, and kernel assembly. HCU only supplies backend registration,
-selection, and the no-op canonical INT8 weight conversion required by the
-existing HCU kernels. This keeps the implementation aligned with v0.25.1's
-modular MoE architecture.
+The target oracle will still own prepare/finalize construction and kernel
+assembly. HCU supplies backend registration, selection, its W8A8 quant-config
+adapter, and the DeepGEMM architecture-aware canonical INT8 weight packing.
+This keeps the implementation aligned with v0.25.1's modular MoE architecture.
 
 The alternatives were rejected:
 
