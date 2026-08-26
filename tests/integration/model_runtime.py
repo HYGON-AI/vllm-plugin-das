@@ -26,6 +26,12 @@ from typing import Any
 
 import pytest
 
+REPOSITORY = Path(__file__).resolve().parents[2]
+if os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1":
+    repository_text = str(REPOSITORY)
+    if repository_text not in sys.path:
+        sys.path.append(repository_text)
+
 from tests.fixtures.resources import TestResources as HcuTestResources
 
 
@@ -370,14 +376,29 @@ def run_vllm_case(
     if extra_env:
         env.update(extra_env)
     log_path = _case_log_path(log_label or case, model_path)
-    command = [
-        sys.executable,
-        "-m",
-        "tests.integration.model_runtime",
-        case,
-        "--model",
-        str(model_path),
-    ]
+    release_wheel = os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1"
+    if release_wheel:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            case,
+            "--model",
+            str(model_path),
+        ]
+        child_cwd = Path(
+            os.environ.get("HCU_CI_JOB_ROOT", "/tmp/vllm-hcu-release-wheel")
+        ) / "model-subprocess"
+        child_cwd.mkdir(parents=True, exist_ok=True)
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "tests.integration.model_runtime",
+            case,
+            "--model",
+            str(model_path),
+        ]
+        child_cwd = REPOSITORY
     if extra_args:
         command.extend(extra_args)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -388,7 +409,7 @@ def run_vllm_case(
             log.flush()
             proc = subprocess.Popen(
                 command,
-                cwd=Path(__file__).resolve().parents[2],
+                cwd=child_cwd,
                 env=env,
                 text=True,
                 stdout=log,
@@ -398,6 +419,7 @@ def run_vllm_case(
             try:
                 returncode = proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
+                _terminate_case_process_group(proc)
                 output = log_path.read_text(encoding="utf-8", errors="replace")
                 raise AssertionError(
                     f"vLLM integration case {case!r} timed out after "

@@ -325,6 +325,13 @@ def serve_openai_protocol_model(
     env.pop("VLLM_PLUGINS", None)
     env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1":
+        server_cwd = Path(
+            os.environ.get("HCU_CI_JOB_ROOT", "/tmp/vllm-hcu-release-wheel")
+        ) / "server-subprocess"
+        server_cwd.mkdir(parents=True, exist_ok=True)
+    else:
+        server_cwd = ROOT
     log_dir = Path(
         os.environ.get("VLLM_HCU_INTEGRATION_LOG_DIR", DEFAULT_LOG_DIR)
     )
@@ -337,7 +344,7 @@ def serve_openai_protocol_model(
         log.flush()
         proc = subprocess.Popen(
             command,
-            cwd=ROOT,
+            cwd=server_cwd,
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,

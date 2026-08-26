@@ -7,6 +7,17 @@ on:
   schedule:
     - cron: "0 18 * * *"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to test
+        required: true
+        default: v0.25.1
+        type: string
+      image:
+        description: Optional immutable HCU CI image override
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -16,137 +27,144 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    container:
+      image: ${{ vars.HCU_CI_IMAGE }}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      quarantine_matrix: ${{ steps.quarantine.outputs.matrix }}
+      tested_sha: ${{ steps.revision.outputs.tested_sha }}
+    steps:
+      - name: Checkout nightly revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'v0.25.1' }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Resolve tested revision
+        id: revision
+        run: echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build nightly matrix
+        id: matrix
+        run: |
+          /usr/local/bin/python3.10 --version
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py \
+            --profile nightly \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Build due-quarantine matrix
+        id: quarantine
+        run: >-
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py
+          --profile quarantine
+          --github-output "$GITHUB_OUTPUT"
+
   hardware:
+    needs: prepare
     uses: ./.github/workflows/_selected-hcu-tests.yml
     with:
-      matrix: >-
-        [
-          {
-            "id":"nightly-accuracy-gfx936",
-            "runner":"hcu-linux-gfx936-1",
-            "arch":"gfx936",
-            "cards":1,
-            "suite":"accuracy-hcu",
-            "pytest_args":[],
-            "timeout_minutes":45,
-            "requirements":[]
-          },
-          {
-            "id":"nightly-contract-hcu-gfx936",
-            "runner":"hcu-linux-gfx936-1",
-            "arch":"gfx936",
-            "cards":1,
-            "suite":"contract-hcu",
-            "pytest_args":[],
-            "timeout_minutes":60,
-            "requirements":[]
-          },
-          {
-            "id":"nightly-single-model-gfx938",
-            "runner":"hcu-linux-gfx938-1",
-            "arch":"gfx938",
-            "cards":1,
-            "suite":"model",
-            "pytest_args":["-k","qwen35_9b or qwen3_4b or llama2_7b_eagle or example_connector"],
-            "timeout_minutes":240,
-            "requirements":[]
-          },
-          {
-            "id":"nightly-qwen35-tp-ep",
-            "runner":"hcu-linux-gfx938-4",
-            "arch":"gfx938",
-            "cards":4,
-            "suite":"model",
-            "pytest_args":["-k","qwen35_35b_a3b_tp_ep_smoke"],
-            "timeout_minutes":300,
-            "requirements":[
-              {
-                "kind":"model",
-                "env":"VLLM_HCU_QWEN35_35B_A3B_MODEL",
-                "relative":"qwen3.5/Qwen3.5-35B-A3B"
-              }
-            ]
-          },
-          {
-            "id":"nightly-deepseek-tp-ep",
-            "runner":"hcu-linux-gfx938-8",
-            "arch":"gfx938",
-            "cards":8,
-            "suite":"model",
-            "pytest_args":["-k","deepseek_r1_channel_int8_tp_ep_smoke"],
-            "timeout_minutes":360,
-            "requirements":[
-              {
-                "kind":"model",
-                "env":"VLLM_HCU_DEEPSEEK_R1_CHANNEL_INT8_MODEL",
-                "relative":"vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8"
-              }
-            ]
-          },
-          {
-            "id":"nightly-qwen35-gsm8k",
-            "runner":"hcu-linux-gfx938-1",
-            "arch":"gfx938",
-            "cards":1,
-            "suite":"model",
-            "pytest_args":["-k","qwen35_9b_gsm8k_evalscope_server"],
-            "timeout_minutes":120,
-            "requirements":[
-              {
-                "kind":"model",
-                "env":"VLLM_HCU_QWEN35_9B_MODEL",
-                "relative":"qwen3.5/Qwen3.5-9B"
-              }
-            ]
-          },
-          {
-            "id":"nightly-qwen3-vl-mmmu",
-            "runner":"hcu-linux-gfx938-1",
-            "arch":"gfx938",
-            "cards":1,
-            "suite":"model",
-            "pytest_args":["-k","qwen3_vl_8b_mmmu_evalscope_server"],
-            "timeout_minutes":150,
-            "requirements":[
-              {
-                "kind":"model",
-                "env":"VLLM_HCU_QWEN3_VL_8B_MODEL",
-                "relative":"qwen3/Qwen3-VL-8B-Instruct"
-              }
-            ]
-          },
-          {
-            "id":"nightly-qwen3-8b-gsm8k",
-            "runner":"hcu-linux-gfx938-1",
-            "arch":"gfx938",
-            "cards":1,
-            "suite":"model",
-            "pytest_args":["-k","qwen3_8b_gsm8k_evalscope_server"],
-            "timeout_minutes":150,
-            "requirements":[
-              {
-                "kind":"model",
-                "env":"VLLM_HCU_QWEN3_8B_MODEL",
-                "relative":"qwen3/Qwen3-8B"
-              }
-            ]
-          },
-          {
-            "id":"nightly-deepseek-gsm8k",
-            "runner":"hcu-linux-gfx938-8",
-            "arch":"gfx938",
-            "cards":8,
-            "suite":"model",
-            "pytest_args":["-k","deepseek_r1_channel_fp8_gsm8k_evalscope_server"],
-            "timeout_minutes":360,
-            "requirements":[
-              {
-                "kind":"model",
-                "env":"VLLM_HCU_DEEPSEEK_R1_MODEL",
-                "relative":"DeepSeek-R1-Channel-FP8-w8a8"
-              }
-            ]
-          }
-        ]
+      matrix: ${{ needs.prepare.outputs.matrix }}
+      tested_ref: ${{ needs.prepare.outputs.tested_sha }}
+      image: ${{ inputs.image || '' }}
     permissions:
       contents: read
+
+  quarantine-retest:
+    needs: prepare
+    uses: ./.github/workflows/_selected-hcu-tests.yml
+    with:
+      matrix: ${{ needs.prepare.outputs.quarantine_matrix }}
+      tested_ref: ${{ needs.prepare.outputs.tested_sha }}
+      image: ${{ inputs.image || '' }}
+    permissions:
+      contents: read
+
+  notify:
+    if: always()
+    needs:
+      - prepare
+      - hardware
+      - quarantine-retest
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    permissions:
+      contents: read
+      issues: write
+    env:
+      NIGHTLY_OWNER: ${{ vars.HCU_CI_NIGHTLY_OWNER }}
+      PREPARE_RESULT: ${{ needs.prepare.result }}
+      HARDWARE_RESULT: ${{ needs.hardware.result }}
+      QUARANTINE_RESULT: ${{ needs.quarantine-retest.result }}
+      TESTED_SHA: ${{ needs.prepare.outputs.tested_sha }}
+    steps:
+      - name: Update nightly tracking issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '[HCU nightly] current failure';
+            const failed = [
+              process.env.PREPARE_RESULT,
+              process.env.HARDWARE_RESULT,
+              process.env.QUARANTINE_RESULT,
+            ].some(result => !['success', 'skipped'].includes(result));
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `Workflow run: ${runUrl}`,
+              `Tested SHA: ${process.env.TESTED_SHA || 'unavailable'}`,
+              `Prepare: ${process.env.PREPARE_RESULT}`,
+              `Hardware: ${process.env.HARDWARE_RESULT}`,
+              `Quarantine retest: ${process.env.QUARANTINE_RESULT}`,
+              '',
+              'Logs remain on each self-hosted runner under /tmp/vllm-hcu-ci/<run-id>/<attempt>/<job-id>. See each job summary for the exact runner and path.',
+            ].join('\n');
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.find(issue => issue.title === title && !issue.pull_request);
+            if (failed) {
+              const owner = (process.env.NIGHTLY_OWNER || '').trim();
+              if (existing) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existing.number,
+                  body,
+                  ...(owner ? {assignees: [owner]} : {}),
+                });
+              } else {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body,
+                  ...(owner ? {assignees: [owner]} : {}),
+                });
+              }
+            } else if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Recovered in ${runUrl} at ${process.env.TESTED_SHA}.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                state: 'closed',
+              });
+            }

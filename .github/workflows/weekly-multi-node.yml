@@ -3,9 +3,10 @@
 
 name: HCU multi-node
 
-# Enable a schedule after at least one multi-node test and a coordinated
-# hcu-linux-gfx938-8x2 runner have been registered. Until then this is an
-# explicit operator action and fails closed when no tests are collected.
+# Enable a schedule after at least one real multi-node test and a coordinated
+# hcu-linux-gfx938-8x2 runner have been registered. Until then the readiness
+# job keeps the hardware job skipped instead of reserving a runner that cannot
+# execute any registered tests.
 on:
   workflow_dispatch:
 
@@ -13,7 +14,50 @@ permissions:
   contents: read
 
 jobs:
+  readiness:
+    name: Check multi-node registration
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    container:
+      image: ${{ vars.HCU_CI_IMAGE }}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      ready: ${{ steps.registration.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Check for a registered multi-node job
+        id: registration
+        run: |
+          /usr/local/bin/python3.10 --version
+          targets="$RUNNER_TEMP/weekly-multi-node-targets.txt"
+          if /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py \
+              --job weekly-multi-node \
+              --format pytest > "$targets"; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Registered multi-node targets:"
+            cat "$targets"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Multi-node tests are not enabled"
+              echo
+              echo "Add a real test under \`tests/distributed/multi_node/\`,"
+              echo "register the \`weekly-multi-node\` job in both the HCU test"
+              echo "map and registry, then configure an"
+              echo "\`hcu-linux-gfx938-8x2\` runner."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   multi-node:
+    needs: readiness
+    if: needs.readiness.outputs.ready == 'true'
     runs-on:
       - self-hosted
       - hcu-linux-gfx938-8x2
@@ -33,20 +77,24 @@ jobs:
 
       - name: Run multi-node suite
         env:
-          HCU_CI_JOB_ROOT: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-multi-node
+          HCU_CI_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/weekly-multi-node
           HCU_CI_JOB_ID: weekly-multi-node
           HCU_CI_ARCH: gfx938
           HCU_CI_CARDS: "8"
           HCU_CI_SUITE: distributed-multi-node
           HCU_CI_PYTEST_ARGS_JSON: "[]"
           HCU_CI_REQUIREMENTS_JSON: "[]"
-        run: python .github/scripts/hcu_ci/run_hcu_ci_job.py
+        run: python3.10 .github/scripts/hcu_ci/run_hcu_ci_job.py
 
-      - name: Upload multi-node logs
+      - name: Report local multi-node logs
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.run_id }}-gfx938-8x2-multi-node-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-multi-node
-          if-no-files-found: error
-          retention-days: 14
+        env:
+          HCU_CI_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/weekly-multi-node
+        run: |
+          echo "HCU logs retained on runner $RUNNER_NAME at $HCU_CI_JOB_ROOT"
+          {
+            echo "### Local HCU logs"
+            echo
+            echo "- Runner: \`$RUNNER_NAME\`"
+            echo "- Path: \`$HCU_CI_JOB_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"

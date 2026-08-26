@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: HCU full-enabled
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to test
+        required: true
+        default: v0.25.1
+        type: string
+      image:
+        description: Optional immutable HCU CI image override
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-full-enabled
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    container:
+      image: ${{ vars.HCU_CI_IMAGE }}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      tested_sha: ${{ steps.revision.outputs.tested_sha }}
+    steps:
+      - name: Checkout requested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Resolve tested revision
+        id: revision
+        run: echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate patch contracts and Python sources
+        run: |
+          /usr/local/bin/python3.10 --version
+          /usr/local/bin/python3.10 tools/check_patch_test_coverage.py
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-lock-only
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/verify_hcu_registration.py
+          /usr/local/bin/python3.10 -m compileall -q .github/scripts/hcu_ci tools tests vllm_hcu
+
+      - name: Validate quarantine governance
+        run: /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine
+
+      - name: Build full HCU matrix
+        id: matrix
+        run: >-
+          /usr/local/bin/python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py
+          --profile full
+          --github-output "$GITHUB_OUTPUT"
+
+  hardware:
+    needs: prepare
+    uses: ./.github/workflows/_selected-hcu-tests.yml
+    with:
+      matrix: ${{ needs.prepare.outputs.matrix }}
+      tested_ref: ${{ needs.prepare.outputs.tested_sha }}
+      image: ${{ inputs.image }}
+    permissions:
+      contents: read
+
+  full-enabled-gate:
+    if: always()
+    needs:
+      - prepare
+      - hardware
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    env:
+      PREPARE_RESULT: ${{ needs.prepare.result }}
+      HARDWARE_RESULT: ${{ needs.hardware.result }}
+      TESTED_REF: ${{ inputs.ref }}
+      TESTED_SHA: ${{ needs.prepare.outputs.tested_sha }}
+    steps:
+      - name: Enforce full-enabled result
+        run: |
+          echo "ref=$TESTED_REF sha=$TESTED_SHA"
+          echo "prepare=$PREPARE_RESULT hardware=$HARDWARE_RESULT"
+          if [[ "$PREPARE_RESULT" != "success" || "$HARDWARE_RESULT" != "success" ]]; then
+            exit 1
+          fi

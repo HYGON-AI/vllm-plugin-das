@@ -123,6 +123,7 @@ def test_openai_seeded_top_k_top_p_sampling(
         "top_p": 0.8,
         "seed": 2026,
         "max_completion_tokens": 8,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     first = _assert_success(server.post("/v1/chat/completions", request), server)
     second = _assert_success(server.post("/v1/chat/completions", request), server)
@@ -204,6 +205,7 @@ def test_openai_json_mode_and_json_schema(
                 "temperature": 0,
                 "max_completion_tokens": 32,
                 "response_format": {"type": "json_object"},
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         ),
         server,
@@ -235,6 +237,7 @@ def test_openai_json_mode_and_json_schema(
                     "type": "json_schema",
                     "json_schema": schema,
                 },
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         ),
         server,

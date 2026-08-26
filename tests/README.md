@@ -73,6 +73,48 @@ direct test reference.
 - `nightly`: scheduled hardware tests marked `hcu`, `model`, or `nightly`.
 - `full`: all pytest tests under `tests/` with no marker filter.
 
+## Hardware CI operations
+
+The repository keeps the expected Python, Torch, vLLM, AITER, EvalScope,
+pytest, HIP, and DTK versions in
+`.github/workflows/configs/hcu-runner-environment.json`. Every hardware job
+checks this lock before running tests. Update the lock in the same reviewed
+change as an intentional Runner image or package upgrade; an unreviewed Runner
+drift fails before pytest starts.
+
+Available manual workflows:
+
+- `HCU full-enabled` accepts a branch, tag, or SHA and runs every job declared
+  in `hcu-test-map.yaml`.
+- `HCU release wheel` builds the requested checkout, installs the wheel in an
+  isolated virtual environment, verifies the imported package and compiled
+  extension originate from that wheel, then runs an OpenAI server smoke and a
+  TP4/EP4 smoke.
+- `HCU nightly` accepts an optional ref for manual runs and uses `v0.25.1` for
+  scheduled runs. Its matrix is generated from the `nightly_jobs` list in
+  `hcu-test-map.yaml`.
+
+Nightly failures create or update one GitHub tracking issue and close it after
+recovery. Set the repository variable `HCU_CI_NIGHTLY_OWNER` to a GitHub login
+to assign that issue; leaving it unset keeps the issue unassigned. Per-job
+request, environment, JUnit, pytest, server, and EvalScope logs remain on the
+self-hosted Runner under
+`/tmp/vllm-hcu-ci/<run-id>/<attempt>/<job-id>/`; each job summary records the
+exact Runner and path. These files follow the host's `/tmp` cleanup policy and
+are not uploaded to GitHub. Release validation logs use the same local layout;
+only the built Wheel is retained as a GitHub Artifact for 30 days so downstream
+validation jobs can receive it when they run on a different host.
+
+Intentional HCU quarantine is controlled by
+`.github/workflows/configs/hcu-quarantine.json`; do not add an untracked
+`xfail` as a substitute. Each entry must name an existing HCU job and declare
+`id`, `owner`, `reason`, `issue`, `nodeid`, focused `pytest_args`,
+`retest_after`, and `expires`. It may override `timeout_minutes`. Due entries
+are run by nightly with the same zero-test/skip/xfail fail-closed rules as
+normal hardware jobs. An expired entry or an `xfail` without a matching
+quarantine entry fails matrix preparation until it is removed or deliberately
+renewed.
+
 ## HCU model and accuracy tests
 
 Common model test entry points:

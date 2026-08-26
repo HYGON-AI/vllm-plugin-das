@@ -425,7 +425,10 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
     assert adapter.apply_to_module(module)
     builder = FlashMLASparseMetadataBuilder()
     builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        )
     )
     common = SimpleNamespace(num_actual_tokens=8)
 
@@ -630,7 +633,10 @@ def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
     assert adapter.apply_to_module(module)
     builder = builder_cls()
     builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        )
     )
     common = SimpleNamespace(
         num_actual_tokens=4,
@@ -707,7 +713,10 @@ def test_flashmla_sparse_pcp_one_preserves_separate_phase_default(monkeypatch):
     )
     builder = builder_cls()
     builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=1)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        )
     )
 
     metadata = builder.build(
@@ -853,11 +862,16 @@ def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
     monkeypatch.setitem(sys.modules, "lightop", lightop_module)
 
     writer_calls: list[tuple[object, ...]] = []
-    aiter_cache_module = ModuleType("aiter.ops.cache")
-    aiter_cache_module.reshape_and_cache_flash = (
-        lambda *args: writer_calls.append(args)
+    # The cache-writer dispatch itself is covered in
+    # test_flash_attention_and_pp.py. Keep this test portable by verifying
+    # attention_runtime's argument handoff without loading native flash_attn.
+    fa_utils = ModuleType("vllm_hcu.v1.attention.backends.fa_utils")
+    fa_utils.reshape_and_cache_flash = lambda *args: writer_calls.append(args)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        fa_utils,
     )
-    monkeypatch.setitem(sys.modules, "aiter.ops.cache", aiter_cache_module)
 
     q, key, value = runtime.fused_qkv_split_rmsnorm_rope_kv_store_impl(
         torch.zeros(num_tokens, q_size + 2 * kv_size),

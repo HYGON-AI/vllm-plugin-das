@@ -16,7 +16,17 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
-from hcu_ci_preflight import PreflightError, run_preflight
+from hcu_ci_preflight import (
+    DEFAULT_ENVIRONMENT_LOCK,
+    PreflightError,
+    run_preflight,
+)
+from hcu_ci_register import (
+    RegistrationError,
+    parse_registry,
+    partition_registrations,
+    registrations_for_job,
+)
 
 
 def _required_environment(name: str) -> str:
@@ -53,11 +63,30 @@ def _junit_counts(path: Path) -> tuple[int, int, int]:
     return tests, skipped, failures
 
 
+def _tested_git_sha() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPOSITORY,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode or not result.stdout.strip():
+        raise PreflightError(
+            f"cannot resolve tested git SHA: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
 def main() -> int:
     try:
         job_id = _required_environment("HCU_CI_JOB_ID")
         arch = _required_environment("HCU_CI_ARCH")
         suite = _required_environment("HCU_CI_SUITE")
+        registry_job = os.environ.get("HCU_CI_REGISTRY_JOB", job_id)
+        partition_id = int(os.environ.get("HCU_CI_PARTITION_ID", "0"))
+        partition_size = int(os.environ.get("HCU_CI_PARTITION_SIZE", "1"))
         cards = int(_required_environment("HCU_CI_CARDS"))
         job_root = Path(_required_environment("HCU_CI_JOB_ROOT")).resolve()
         pytest_args = _json_list("HCU_CI_PYTEST_ARGS_JSON")
@@ -68,6 +97,25 @@ def main() -> int:
             raise PreflightError(
                 "HCU_CI_REQUIREMENTS_JSON must contain mappings"
             )
+        registered = registrations_for_job(parse_registry(), registry_job)
+        selected_registrations = partition_registrations(
+            registered,
+            partition_id,
+            partition_size,
+        )
+        if not selected_registrations:
+            raise PreflightError(
+                f"registry job {registry_job!r} partition {partition_id}/"
+                f"{partition_size} selected no tests"
+            )
+        registered_targets = [item.target for item in selected_registrations]
+        environment_lock = Path(
+            os.environ.get(
+                "HCU_CI_ENVIRONMENT_LOCK",
+                str(DEFAULT_ENVIRONMENT_LOCK),
+            )
+        ).resolve()
+        tested_git_sha = _tested_git_sha()
         job_root.mkdir(parents=True, exist_ok=True)
         integration_dir = job_root / "integration"
         evalscope_dir = job_root / "evalscope"
@@ -83,7 +131,11 @@ def main() -> int:
             "suite": suite,
             "pytest_args": pytest_args,
             "requirements": requirements,
-            "git_sha": os.environ.get("GITHUB_SHA"),
+            "registry_job": registry_job,
+            "partition_id": partition_id,
+            "partition_size": partition_size,
+            "registered_targets": registered_targets,
+            "git_sha": tested_git_sha,
             "runner_name": os.environ.get("RUNNER_NAME"),
         }
         (job_root / "request.json").write_text(
@@ -95,6 +147,7 @@ def main() -> int:
                 expected_arch=arch,
                 required_cards=cards,
                 requirements=requirements,
+                environment_lock=environment_lock,
             )
         except PreflightError as exc:
             (job_root / "preflight-error.txt").write_text(
@@ -107,7 +160,7 @@ def main() -> int:
                 "job_id": job_id,
                 "suite": suite,
                 "pytest_args": pytest_args,
-                "git_sha": os.environ.get("GITHUB_SHA"),
+                "git_sha": tested_git_sha,
                 "runner_name": os.environ.get("RUNNER_NAME"),
             }
         )
@@ -117,14 +170,24 @@ def main() -> int:
         )
 
         junit_path = job_root / "pytest.xml"
+        pytest_cache = job_root / "pytest-cache"
         command = [
             sys.executable,
             "tools/run_patch_tests.py",
             "--suite",
             suite,
+            *[
+                argument
+                for target in registered_targets
+                for argument in ("--target", target)
+            ],
             "--",
             *pytest_args,
             "-rsxX",
+            "-o",
+            f"cache_dir={pytest_cache}",
+            "--durations=20",
+            "--durations-min=1.0",
             f"--junitxml={junit_path}",
         ]
         command_text = " ".join(command)
@@ -172,7 +235,7 @@ def main() -> int:
             raise PreflightError(
                 f"JUnit reports {failures} failure/error test(s)"
             )
-    except (OSError, ValueError, PreflightError) as exc:
+    except (OSError, ValueError, PreflightError, RegistrationError) as exc:
         print(f"HCU CI job failed closed: {exc}", file=sys.stderr)
         return 2
     return 0

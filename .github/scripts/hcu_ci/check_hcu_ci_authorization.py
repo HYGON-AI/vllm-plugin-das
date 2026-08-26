@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Verify that a trusted maintainer applied the ready-hcu PR label."""
+"""Verify that trusted actors authorized HCU PR hardware execution."""
 
 from __future__ import annotations
 
@@ -117,6 +117,28 @@ def main() -> int:
         pull_request = event.get("pull_request")
         if not isinstance(pull_request, dict):
             raise AuthorizationError("workflow event has no pull_request object")
+        user = pull_request.get("user")
+        if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+            raise AuthorizationError("pull request author is unavailable")
+        author = user["login"]
+        author_permission = _actor_permission(
+            api_url=api_url,
+            repository=repository,
+            actor=author,
+            token=token,
+        )
+        if author_permission in TRUSTED_PERMISSIONS:
+            print(f"HCU execution auto-authorized for {author} ({author_permission})")
+            _write_outputs(
+                {
+                    "ready": "auto",
+                    "authorized": "true",
+                    "actor": author,
+                    "permission": author_permission,
+                }
+            )
+            return 0
+
         labels = pull_request.get("labels", [])
         ready = any(
             isinstance(item, dict) and item.get("name") == "ready-hcu"
@@ -128,8 +150,8 @@ def main() -> int:
                 {
                     "ready": "false",
                     "authorized": "false",
-                    "actor": "",
-                    "permission": "",
+                    "actor": author,
+                    "permission": author_permission,
                 }
             )
             return 0
