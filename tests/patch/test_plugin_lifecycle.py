@@ -283,21 +283,58 @@ def test_platform_probe_failure_is_exposed_on_vllm_second_invocation(monkeypatch
 
 def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
     result = _fresh_python(
-        "import builtins,json,sys; "
-        "heavy=['torch','vllm','vllm_hcu.platforms.hcu',"
-        "'vllm.v1.attention.backends.registry','vllm._aiter_ops','vllm_hcu.ops',"
-        "'vllm_hcu.v1.core.sched.scheduler',"
-        "'vllm_hcu.v1.executor.multiproc_executor']; "
-        "before=set(sys.modules); "
-        "old=builtins.__import__; "
-        "import vllm_hcu; "
-        "path=vllm_hcu.hcu_platform_plugin(); "
-        "print(json.dumps({'path':path,'plugin_file':vllm_hcu.__file__,"
-        "'builtins_same':builtins.__import__ is old,"
-        "'patch_utils':'vllm_hcu.patch_utils' in sys.modules,"
-        "'preloaded':[name for name in heavy if name in before],"
-        "'new_heavy':[name for name in heavy "
-        "if name in sys.modules and name not in before]}))",
+        r'''
+import builtins
+import json
+import sys
+import traceback
+
+heavy = [
+    "torch",
+    "vllm",
+    "vllm_hcu.platforms.hcu",
+    "vllm.v1.attention.backends.registry",
+    "vllm._aiter_ops",
+    "vllm_hcu.ops",
+    "vllm_hcu.v1.core.sched.scheduler",
+    "vllm_hcu.v1.executor.multiproc_executor",
+]
+before = set(sys.modules)
+old_import = builtins.__import__
+first_vllm_import = []
+
+
+def traced_import(name, *args, **kwargs):
+    if not first_vllm_import and (name == "vllm" or name.startswith("vllm.")):
+        first_vllm_import.append(f"requested import: {name}\n")
+        first_vllm_import.extend(traceback.format_stack(limit=16))
+    return old_import(name, *args, **kwargs)
+
+
+builtins.__import__ = traced_import
+try:
+    import vllm_hcu
+
+    path = vllm_hcu.hcu_platform_plugin()
+finally:
+    builtins.__import__ = old_import
+
+print(
+    json.dumps(
+        {
+            "path": path,
+            "plugin_file": vllm_hcu.__file__,
+            "builtins_same": builtins.__import__ is old_import,
+            "patch_utils": "vllm_hcu.patch_utils" in sys.modules,
+            "preloaded": [name for name in heavy if name in before],
+            "new_heavy": [
+                name for name in heavy if name in sys.modules and name not in before
+            ],
+            "first_vllm_import": first_vllm_import,
+        }
+    )
+)
+''',
         assert_target_first=False,
         no_site=True,
     )
@@ -311,6 +348,8 @@ def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
     )
     assert Path(payload.pop("plugin_file")).resolve().is_relative_to(REPO)
     payload.pop("preloaded")
+    first_vllm_import = payload.pop("first_vllm_import")
+    assert payload["new_heavy"] == [], "".join(first_vllm_import)
     assert payload == {
         "path": "vllm_hcu.platforms.hcu.HCUPlatform",
         "builtins_same": True,
