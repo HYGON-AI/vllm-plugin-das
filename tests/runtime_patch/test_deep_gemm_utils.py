@@ -276,7 +276,7 @@ def _load_batched_deep_gemm_apply():
     return namespace
 
 
-def test_w8a8_batched_apply_uses_architecture_aware_deepgemm_masked_api(
+def test_w8a8_batched_apply_uses_low_latency_w6_deepgemm_api(
     monkeypatch,
 ):
     lightop = ModuleType("lightop")
@@ -293,8 +293,18 @@ def test_w8a8_batched_apply_uses_architecture_aware_deepgemm_masked_api(
 
     calls: list[tuple[object, ...]] = []
     deepgemm = ModuleType("deepgemm")
-    deepgemm.m_grouped_i8_gemm_nt_masked = lambda *args: calls.append(args)
+    deepgemm.__path__ = []
+
+    def reject_compatibility_api(*_args):
+        raise AssertionError("deprecated INT8 masked compatibility API invoked")
+
+    deepgemm.m_grouped_i8_gemm_nt_masked = reject_compatibility_api
+    m_group_gemm = ModuleType("deepgemm.m_group_gemm")
+    m_group_gemm.m_grouped_w8a8_gemm_nt_masked_ll = (
+        lambda *args: calls.append(args)
+    )
     monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+    monkeypatch.setitem(sys.modules, "deepgemm.m_group_gemm", m_group_gemm)
     hcu = _load_batched_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
     experts = SimpleNamespace(

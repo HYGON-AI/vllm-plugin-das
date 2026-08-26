@@ -639,15 +639,38 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
     dpsk_w13 = dpsk_w13.reshape(2, 16, 64)
     dpsk_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
     dpsk_w2 = dpsk_w2.reshape(2, 64, 64)
-    from deepgemm import marlin_i8_contiguous_weight
+    import deepgemm
+    from deepgemm import m_group_gemm
 
-    expected_w13 = marlin_i8_contiguous_weight(dpsk_w13.clone())
-    expected_w2 = marlin_i8_contiguous_weight(dpsk_w2.clone())
+    real_pack = m_group_gemm.pack_int8_weight_enk_to_w6_low_latency
+    pack_calls: list[torch.Tensor] = []
+
+    def tracked_w6_pack(weight: torch.Tensor) -> torch.Tensor:
+        pack_calls.append(weight)
+        return real_pack(weight)
+
+    def reject_compatibility_packer(*_args, **_kwargs):
+        raise AssertionError("deprecated architecture compatibility packer invoked")
+
+    monkeypatch.setattr(
+        m_group_gemm,
+        "pack_int8_weight_enk_to_w6_low_latency",
+        tracked_w6_pack,
+    )
+    monkeypatch.setattr(
+        deepgemm,
+        "marlin_i8_contiguous_weight",
+        reject_compatibility_packer,
+    )
+    expected_w13 = real_pack(dpsk_w13.clone())
+    expected_w2 = real_pack(dpsk_w2.clone())
     converted_w13, converted_w2 = target.convert_to_int8_moe_kernel_format(
         backend,
         dpsk_w13,
         dpsk_w2,
     )
+
+    assert pack_calls == [dpsk_w13, dpsk_w2]
 
     torch.testing.assert_close(
         converted_w13,
