@@ -82,7 +82,7 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     require_parameter_names(
         make_quant_config,
-        TARGETS[4],
+        TARGETS[5],
         (
             "int8_backend",
             "w1_scale",

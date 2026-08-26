@@ -671,6 +671,51 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
         target.select_int8_moe_backend(config, "weight", "activation")
 
 
+def test_int8_oracle_reports_quant_config_target_for_abi_drift():
+    from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
+
+    class Int8MoeBackend(enum.Enum):
+        TRITON = "TRITON"
+
+    def backend_to_kernel_cls(backend):
+        del backend
+
+    def map_int8_backend(runner_backend):
+        del runner_backend
+
+    def select_int8_moe_backend(config, weight_key, activation_key):
+        del config, weight_key, activation_key
+
+    def convert_to_int8_moe_kernel_format(
+        int8_backend,
+        w13,
+        w2,
+        layer,
+        w13_scale,
+    ):
+        del int8_backend, w13, w2, layer, w13_scale
+
+    def make_int8_moe_quant_config(incompatible_parameter):
+        del incompatible_parameter
+
+    target = _module(
+        patch_int8_oracle.TARGET_MODULE,
+        Int8MoeBackend=Int8MoeBackend,
+        backend_to_kernel_cls=backend_to_kernel_cls,
+        map_int8_backend=map_int8_backend,
+        select_int8_moe_backend=select_int8_moe_backend,
+        convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
+        make_int8_moe_quant_config=make_int8_moe_quant_config,
+        int8_w8a8_moe_quant_config=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        patch_int8_oracle.apply_to_module(target)
+
+    assert patch_int8_oracle.TARGETS[5] in str(error.value)
+    assert patch_int8_oracle.TARGETS[4] not in str(error.value)
+
+
 def test_worker_registers_int8_aiter_oracle_before_quantized_methods():
     from vllm_hcu.patch import worker
 
