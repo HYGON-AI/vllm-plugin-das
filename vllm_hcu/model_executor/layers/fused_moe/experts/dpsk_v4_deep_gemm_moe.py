@@ -13,11 +13,10 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from deepgemm import (
+    marlin_fp8_contiguous_weight,
+    marlin_fp8_masked_weight,
     m_grouped_fp8_gemm_nt_contiguous,
-)
-from deepgemm.m_group_gemm import (
-    m_grouped_fp8_gemm_nt_masked_ll,
-    pack_int8_weight_enk_to_w6_low_latency,
+    m_grouped_fp8_gemm_nt_masked,
 )
 
 from vllm.logger import init_logger
@@ -62,6 +61,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
     # Match the HCU DeepEP groupgemm path. DeepEP HT
     # dispatch aligns FP8 groupgemm traffic to 256 tokens per expert.
     ALIGNMENT = 256
+    WEIGHT_LAYOUT = "contiguous"
 
     @staticmethod
     def _supports_quant_scheme(
@@ -91,10 +91,27 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         Packed weights replace the original runtime weight parameters so the
         original large weight storage can be released after loading.
         """
-        if getattr(layer, "_dsv4_channel_fp8_deepgemm_repacked", False):
-            self._deepgemm_w13 = layer.w13_weight
-            self._deepgemm_w2 = layer.w2_weight
-            return
+        packed_layout = getattr(
+            layer,
+            "_dsv4_channel_fp8_deepgemm_layout",
+            None,
+        )
+        if packed_layout == self.WEIGHT_LAYOUT:
+            if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
+                self._deepgemm_w13 = layer.w13_weight
+                self._deepgemm_w2 = layer.w2_weight
+                return
+            if not self._can_pack_channel_fp8(layer):
+                raise RuntimeError(
+                    "DeepEP DeepGEMM FP8 layer has invalid reloaded weights: "
+                    f"w13={tuple(layer.w13_weight.shape)} "
+                    f"w2={tuple(layer.w2_weight.shape)}"
+                )
+        elif packed_layout is not None:
+            raise RuntimeError(
+                "DeepEP DeepGEMM FP8 weight layout mismatch: "
+                f"experts require {self.WEIGHT_LAYOUT}, got {packed_layout}."
+            )
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -107,15 +124,25 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             )
 
         with torch.no_grad():
-            w13_packed = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-            w2_packed = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+            w13_packed, w2_packed = self._pack_channel_fp8_weights(w13, w2)
 
         replace_parameter(layer, "w13_weight", w13_packed)
         replace_parameter(layer, "w2_weight", w2_packed)
         self._deepgemm_w13 = layer.w13_weight
         self._deepgemm_w2 = layer.w2_weight
+        layer._dsv4_channel_fp8_deepgemm_layout = self.WEIGHT_LAYOUT
         layer._dsv4_channel_fp8_deepgemm_repacked = True
         del w13, w2
+
+    def _pack_channel_fp8_weights(
+        self,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            marlin_fp8_contiguous_weight(w13).detach(),
+            marlin_fp8_contiguous_weight(w2).detach(),
+        )
 
     def moe_problem_size(
         self,
@@ -263,14 +290,16 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=hidden_states.dtype), (m_aligned, K)
         )
-        input_tensor, input_scale, m_indices, inv_perm = deepgemm_moe_permute(
-            aq=hidden_states,
-            aq_scale=a1q_scale,
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
-            aq_out=a1q_perm,
+        input_tensor, input_scale, m_indices, inv_perm, _align_used = (
+            deepgemm_moe_permute(
+                aq=hidden_states,
+                aq_scale=a1q_scale,
+                topk_ids=topk_ids,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                expert_tokens_meta=expert_tokens_meta,
+                aq_out=a1q_perm,
+            )
         )
 
         gateup_output = _resize_cache(workspace2, (m_aligned, N))
@@ -369,7 +398,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
                 f"w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
             )
 
-        # pack_int8_weight_enk_to_w6_low_latency maps [E, N, K] to
+        # The gfx938 Marlin FP8 packers map [E, N, K] to
         # [E, K / 64, N / 16, 4, 16, 16].
         local_num_experts = w13.size(0)
         n = w13.size(2) * w13.size(4)
@@ -385,6 +414,8 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
 
 class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
     """DeepEP LL backend backed by low-latency masked DeepGEMM."""
+
+    WEIGHT_LAYOUT = "masked"
 
     def __init__(
         self,
@@ -440,6 +471,16 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceDelegate()
+
+    def _pack_channel_fp8_weights(
+        self,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            marlin_fp8_masked_weight(w13).detach(),
+            marlin_fp8_masked_weight(w2).detach(),
+        )
 
     def workspace_shapes(
         self,
@@ -513,7 +554,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         a1q_scale = self._ensure_ll_scale(a1q_scale, local_num_experts, max_tokens)
 
         gateup_output = _resize_cache(workspace2, (local_num_experts, max_tokens, N))
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (hidden_states, a1q_scale),
             (self._deepgemm_w13, self._ensure_ll_weight_scale(self.w1_scale)),
             gateup_output,
@@ -534,7 +575,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         )
 
         out_view = _resize_cache(output, (local_num_experts, max_tokens, K))
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (q_activation, q_activation_scale),
             (self._deepgemm_w2, self._ensure_ll_weight_scale(self.w2_scale)),
             out_view,
@@ -603,9 +644,66 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         return self.ll_experts if self._use_low_latency_snapshot else self.ht_experts
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.ht_experts.process_weights_after_loading(layer)
-        self.ll_experts._deepgemm_w13 = self.ht_experts._deepgemm_w13
-        self.ll_experts._deepgemm_w2 = self.ht_experts._deepgemm_w2
+        packed_layout = getattr(
+            layer,
+            "_dsv4_channel_fp8_deepgemm_layout",
+            None,
+        )
+        if packed_layout == "contiguous+masked":
+            ll_w13 = getattr(
+                layer,
+                "_dsv4_channel_fp8_deepgemm_masked_w13",
+                None,
+            )
+            ll_w2 = getattr(
+                layer,
+                "_dsv4_channel_fp8_deepgemm_masked_w2",
+                None,
+            )
+            if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
+                if ll_w13 is None or ll_w2 is None:
+                    raise RuntimeError(
+                        "DeepEP auto DeepGEMM layer lost its masked weight layout"
+                    )
+                self.ht_experts._deepgemm_w13 = layer.w13_weight
+                self.ht_experts._deepgemm_w2 = layer.w2_weight
+                self.ll_experts._deepgemm_w13 = ll_w13
+                self.ll_experts._deepgemm_w2 = ll_w2
+                return
+            if not self.ht_experts._can_pack_channel_fp8(layer):
+                raise RuntimeError(
+                    "DeepEP auto DeepGEMM layer has invalid reloaded weights: "
+                    f"w13={tuple(layer.w13_weight.shape)} "
+                    f"w2={tuple(layer.w2_weight.shape)}"
+                )
+        if packed_layout is not None:
+            if packed_layout != "contiguous+masked":
+                raise RuntimeError(
+                    "DeepEP auto DeepGEMM requires unpacked channel-FP8 weights, "
+                    f"got {packed_layout} weights."
+                )
+        if not self.ht_experts._can_pack_channel_fp8(layer):
+            raise RuntimeError(
+                "DeepEP auto DeepGEMM requires channel-wise FP8 MoE weights."
+            )
+
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        with torch.no_grad():
+            ht_w13, ht_w2 = self.ht_experts._pack_channel_fp8_weights(w13, w2)
+            ll_w13, ll_w2 = self.ll_experts._pack_channel_fp8_weights(w13, w2)
+
+        replace_parameter(layer, "w13_weight", ht_w13)
+        replace_parameter(layer, "w2_weight", ht_w2)
+        self.ht_experts._deepgemm_w13 = layer.w13_weight
+        self.ht_experts._deepgemm_w2 = layer.w2_weight
+        self.ll_experts._deepgemm_w13 = ll_w13
+        self.ll_experts._deepgemm_w2 = ll_w2
+        layer._dsv4_channel_fp8_deepgemm_masked_w13 = ll_w13
+        layer._dsv4_channel_fp8_deepgemm_masked_w2 = ll_w2
+        layer._dsv4_channel_fp8_deepgemm_layout = "contiguous+masked"
+        layer._dsv4_channel_fp8_deepgemm_repacked = True
+        del w13, w2
 
     @staticmethod
     def _supports_current_device() -> bool:

@@ -2776,16 +2776,14 @@ def _fp8_moe_layer() -> SimpleNamespace:
     )
 
 
-def test_moe_fp8_target_triton_owns_process_and_apply(
+def test_moe_fp8_target_triton_preserves_process_and_apply_behavior(
     monkeypatch: pytest.MonkeyPatch,
 ):
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
-    target_process = method_class.process_weights_after_loading
     target_apply = method_class.apply
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is True
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is False
-    assert method_class.process_weights_after_loading is target_process
     assert method_class.apply is target_apply
     assert not hasattr(method_class, "_get_aiter_moe_runtime_config")
     assert not hasattr(method_class, "_get_aiter_weights_for_solution")
@@ -2838,11 +2836,26 @@ def test_moe_fp8_explicit_aiter_ignores_legacy_environment_half_states(
     assert len(method_class.init_calls) == 1
 
 
-def test_moe_fp8_requires_explicit_aiter_or_triton_and_checks_target_selection():
+def test_moe_fp8_explicit_deepgemm_accepts_hcu_oracle_selection():
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "HCU_DEEPGEMM"
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="deep_gemm"),
+    )
+
+    assert method.fp8_backend.value == "HCU_DEEPGEMM"
+    assert len(method_class.init_calls) == 1
+
+
+def test_moe_fp8_requires_explicit_backend_and_checks_target_selection():
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    with pytest.raises(RuntimeError, match="--moe-backend aiter or triton"):
+    with pytest.raises(RuntimeError, match="--moe-backend aiter, deep_gemm, or triton"):
         method_class(
             *_channel_fp8_moe_args(module),
             SimpleNamespace(moe_backend="auto"),
@@ -3720,26 +3733,82 @@ def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
         )
 
 
-def test_moe_fp8_target_process_has_no_hcu_dpsk_postprocess(
+def test_moe_fp8_hcu_deepgemm_restores_layouts_after_kernel_recreation(
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+
     module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "HCU_DEEPGEMM"
+    created_experts = []
+
+    def make_auto_experts():
+        experts = object.__new__(deepgemm_module.DeepEPAutoDeepGemmExperts)
+        experts.ht_experts = object.__new__(
+            deepgemm_module.DeepEPDeepGemmContiguousExperts
+        )
+        experts.ll_experts = object.__new__(
+            deepgemm_module.DeepEPDeepGemmMaskedExperts
+        )
+        for child in (experts.ht_experts, experts.ll_experts):
+            child._deepgemm_w13 = None
+            child._deepgemm_w2 = None
+        created_experts.append(experts)
+        return experts
+
+    def upstream_process(self, layer):
+        layer.upstream_process_count += 1
+        self.moe_kernel = SimpleNamespace(fused_experts=make_auto_experts())
+
+    method_class.process_weights_after_loading = upstream_process
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    method = module.CompressedTensorsW8A8Fp8MoEMethod(
+    method = method_class(
         *_channel_fp8_moe_args(module),
-        SimpleNamespace(moe_backend="triton"),
+        SimpleNamespace(moe_backend="deep_gemm"),
     )
-    processed: list[object] = []
-    experts = SimpleNamespace(
-        process_weights_after_loading=lambda layer: processed.append(layer)
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 64), dtype=torch.int8),
+        requires_grad=False,
     )
-    method.fp8_backend = SimpleNamespace(value="HCU_DEEPGEMM")
-    method.moe_kernel = SimpleNamespace(
-        fused_experts=SimpleNamespace(experts=experts)
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 64), dtype=torch.int8),
+        requires_grad=False,
     )
-    layer = _fp8_moe_layer()
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones((1, 128)))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones((1, 64)))
+    layer.weight_block_size = None
+    layer.upstream_process_count = 0
+
+    ht_w13 = torch.full((1, 1, 8, 4, 16, 16), 31, dtype=torch.int8)
+    ht_w2 = torch.full((1, 1, 4, 4, 16, 16), 32, dtype=torch.int8)
+    ll_w13 = torch.full((1, 1, 8, 4, 16, 16), 47, dtype=torch.int8)
+    ll_w2 = torch.full((1, 1, 4, 4, 16, 16), 48, dtype=torch.int8)
+    monkeypatch.setattr(
+        deepgemm_module,
+        "marlin_fp8_contiguous_weight",
+        lambda weight: ht_w13.clone() if weight.size(1) == 128 else ht_w2.clone(),
+    )
+    monkeypatch.setattr(
+        deepgemm_module,
+        "marlin_fp8_masked_weight",
+        lambda weight: ll_w13.clone() if weight.size(1) == 128 else ll_w2.clone(),
+    )
+
     method.process_weights_after_loading(layer)
-    assert layer.upstream_processed is True
-    assert processed == []
+    method.process_weights_after_loading(layer)
+
+    assert layer.upstream_process_count == 2
+    assert len(created_experts) == 2
+    replacement = created_experts[-1]
+    assert replacement.ht_experts._deepgemm_w13 is layer.w13_weight
+    assert replacement.ht_experts._deepgemm_w2 is layer.w2_weight
+    assert torch.equal(replacement.ll_experts._deepgemm_w13, ll_w13)
+    assert torch.equal(replacement.ll_experts._deepgemm_w2, ll_w2)
 
 
 def _fake_moe_wna16_module():
