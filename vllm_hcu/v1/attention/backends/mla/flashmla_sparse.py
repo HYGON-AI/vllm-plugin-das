@@ -36,7 +36,7 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
         from vllm import _custom_ops as ops
         from vllm.v1.attention.backends.mla.sparse_utils import (
-            triton_convert_req_index_to_global_index,
+            triton_filter_and_convert_dcp_index,
         )
         from vllm_hcu.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
@@ -52,10 +52,15 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
         topk_indices, topk_length = (
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token,
+            triton_filter_and_convert_dcp_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(
+                    attn_metadata.cp_kv_cache_interleave_size
+                ),
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
@@ -76,6 +81,9 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         )
         if lse is None:
             raise RuntimeError("HCU sparse MLA DCP kernel did not return LSE")
+        empty_rows = topk_length == 0
+        attn_out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
         return attn_out, lse
 
 

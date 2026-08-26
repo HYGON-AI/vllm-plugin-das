@@ -425,7 +425,10 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
     assert adapter.apply_to_module(module)
     builder = FlashMLASparseMetadataBuilder()
     builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        )
     )
     common = SimpleNamespace(num_actual_tokens=8)
 
@@ -630,7 +633,10 @@ def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
     assert adapter.apply_to_module(module)
     builder = builder_cls()
     builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        )
     )
     common = SimpleNamespace(
         num_actual_tokens=4,
@@ -707,7 +713,10 @@ def test_flashmla_sparse_pcp_one_preserves_separate_phase_default(monkeypatch):
     )
     builder = builder_cls()
     builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=1)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        )
     )
 
     metadata = builder.build(
