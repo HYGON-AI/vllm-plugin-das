@@ -23,7 +23,7 @@ _FEATURE_FIELDS = (
     "hcu_flash_attn_mode",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
-_SUPPORTED_MOE_BACKENDS = frozenset({"auto", "dpsk_deep_gemm"})
+_SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "custom", "varlen"}
 )
@@ -33,9 +33,9 @@ _SUPPORTED_FLASH_ATTN_MODES = frozenset(
 class HcuFeatureConfig:
     """Normalized HCU-specific switches.
 
-    ``moe_backend='auto'`` means that no HCU-only MoE backend was selected.
-    The explicit ``dpsk_deep_gemm`` value enables the HCU DPSK path without
-    extending vLLM's own backend ``Literal``.
+    ``moe_backend='auto'`` means that no HCU DeepGEMM implementation was
+    selected.  The explicit ``deep_gemm`` value mirrors vLLM's official
+    backend selection so the HCU worker can install its compatible kernels.
     """
 
     enable_lightly_cp: bool = False

@@ -1458,7 +1458,11 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         return [backend]
 
     def map_fp8_backend(runner_backend):
+        if runner_backend == "deep_gemm":
+            return Fp8MoeBackend.DEEPGEMM
         return "official-map", runner_backend
+
+    official_select_calls: list[tuple[object, object, object, bool]] = []
 
     def select_fp8_moe_backend(
         config,
@@ -1466,7 +1470,9 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         activation_key,
         allow_vllm_cutlass=False,
     ):
-        del config, weight_key, activation_key, allow_vllm_cutlass
+        official_select_calls.append(
+            (config, weight_key, activation_key, allow_vllm_cutlass)
+        )
         return "official-select"
 
     def convert_to_fp8_moe_kernel_format(
@@ -1517,7 +1523,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         ),
     )
     assert patch_fp8_oracle.apply_to_module(module) is True
-    assert module.Fp8MoeBackend.DPSK_DEEPGEMM.value == "DPSK_DEEPGEMM"
+    assert module.Fp8MoeBackend.HCU_DEEPGEMM.value == "HCU_DEEPGEMM"
 
     class SupportedExperts:
         @staticmethod
@@ -1568,17 +1574,45 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         patch_fp8_oracle,
         "_sidecar_config",
         lambda config: SimpleNamespace(
-            deepep_auto=False, moe_backend="dpsk_deep_gemm"
+            deepep_auto=False, moe_backend="deep_gemm"
         ),
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8DynamicTokenSym,
+        kFp8Static128BlockSym,
+        kFp8StaticChannelSym,
+    )
+
     config = SimpleNamespace(
-        moe_backend="auto",
+        moe_backend="deep_gemm",
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
     )
-    backend, experts = module.select_fp8_moe_backend(config, "w", "a")
-    assert backend is module.Fp8MoeBackend.DPSK_DEEPGEMM
+    backend, experts = module.select_fp8_moe_backend(
+        config,
+        kFp8StaticChannelSym,
+        kFp8DynamicTokenSym,
+    )
+    assert backend is module.Fp8MoeBackend.HCU_DEEPGEMM
     assert experts is SupportedExperts
-    assert module.map_fp8_backend("dpsk_deep_gemm") is backend
+    assert module.map_fp8_backend("deep_gemm") is module.Fp8MoeBackend.DEEPGEMM
+
+    assert (
+        module.select_fp8_moe_backend(
+            config,
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+        )
+        == "official-select"
+    )
+    assert official_select_calls == [
+        (
+            config,
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+            False,
+        )
+    ]
 
     tensors = tuple(object() for _ in range(4))
     assert module.convert_to_fp8_moe_kernel_format(
@@ -1617,8 +1651,11 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         "_sidecar_config",
         lambda config: SimpleNamespace(deepep_auto=True, moe_backend="auto"),
     )
+    config.moe_backend = "auto"
     auto_backend, auto_experts = module.select_fp8_moe_backend(
-        config, "w", "a"
+        config,
+        kFp8StaticChannelSym,
+        kFp8DynamicTokenSym,
     )
     assert auto_backend is backend
     assert auto_experts is UnsupportedExperts
@@ -1638,7 +1675,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         "layer",
     ) == "deepep-auto-kernel"
     assert auto_kernel_calls == [("quant", auto_config, "routing")]
-    with pytest.raises(ValueError, match="only the HCU DPSK_DEEPGEMM"):
+    with pytest.raises(ValueError, match="only the HCU_DEEPGEMM"):
         module.make_fp8_moe_kernel(
             "quant",
             auto_config,
@@ -1652,6 +1689,32 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         lambda config: SimpleNamespace(deepep_auto=False, moe_backend="auto"),
     )
     assert module.select_fp8_moe_backend(config, "w", "a") == "official-select"
+
+
+def test_hcu_deep_gemm_fp8_experts_only_advertise_channel_quantization():
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8DynamicTokenSym,
+        kFp8Static128BlockSym,
+        kFp8StaticChannelSym,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmContiguousExperts,
+        DeepEPDeepGemmMaskedExperts,
+    )
+
+    for experts_cls in (
+        DeepEPDeepGemmContiguousExperts,
+        DeepEPDeepGemmMaskedExperts,
+    ):
+        assert experts_cls._supports_quant_scheme(
+            kFp8StaticChannelSym,
+            kFp8DynamicTokenSym,
+        )
+        assert not experts_cls._supports_quant_scheme(
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+        )
 
 
 def test_deepep_ht_quant_and_alignment_contract():

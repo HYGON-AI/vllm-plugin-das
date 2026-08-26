@@ -40,7 +40,8 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_custom_sp",
     "enable_multi_layers_mtp",
 )
-_DPSK_BACKEND = "dpsk_deep_gemm"
+_DEEP_GEMM_BACKEND = "deep_gemm"
+_LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
 _DEEPEP_AUTO_BACKEND = "deepep_auto"
 _DEEPEP_AUTO_UPSTREAM_BACKEND = "deepep_low_latency"
@@ -51,6 +52,14 @@ _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CUSTOM": "custom",
     "FLASH_ATTN_VARLEN": "varlen",
 }
+
+
+def _reject_legacy_moe_backend(value: object, source: str) -> None:
+    if value == _LEGACY_DEEP_GEMM_BACKEND:
+        raise ValueError(
+            f"{_LEGACY_DEEP_GEMM_BACKEND!r} is no longer supported in "
+            f"{source}; use {_DEEP_GEMM_BACKEND!r}"
+        )
 
 
 def _require_engine_args_class(module: ModuleType, name: str) -> type:
@@ -192,39 +201,48 @@ def _normalise_constructor_kwargs(
             f"selects {top_level_all2all!r}"
         )
 
-    requested_dpsk = feature_config.moe_backend == _DPSK_BACKEND
+    requested_deep_gemm = feature_config.moe_backend == _DEEP_GEMM_BACKEND
     top_level_backend = bound.arguments.get("moe_backend")
-    if top_level_backend == _DPSK_BACKEND:
-        if "moe_backend" not in kwargs:
-            raise TypeError(
-                "positional dpsk_deep_gemm is not supported; pass "
-                "moe_backend='dpsk_deep_gemm' so HCU can normalize it before "
-                "upstream validation"
-            )
-        requested_dpsk = True
-        kwargs["moe_backend"] = _UPSTREAM_BACKEND
-    elif requested_dpsk and top_level_backend not in (None, _UPSTREAM_BACKEND):
+    _reject_legacy_moe_backend(top_level_backend, "EngineArgs.moe_backend")
+    if top_level_backend == _DEEP_GEMM_BACKEND:
+        requested_deep_gemm = True
+    elif requested_deep_gemm and top_level_backend in (None, _UPSTREAM_BACKEND):
+        # The sidecar is a mirror of the explicit public backend selection.
+        # Restore that selection when an EngineArgs instance is constructed
+        # from serialized additional_config. argparse supplies ``auto`` even
+        # when the CLI option was omitted, so both forms mean "no overriding
+        # explicit official backend" here.
+        kwargs["moe_backend"] = _DEEP_GEMM_BACKEND
+    elif requested_deep_gemm:
         raise ValueError(
-            "HCU sidecar selects dpsk_deep_gemm but EngineArgs.moe_backend "
+            "HCU sidecar selects deep_gemm but EngineArgs.moe_backend "
             f"selects {top_level_backend!r}"
         )
 
     kernel_config = bound.arguments.get("kernel_config")
-    if isinstance(kernel_config, Mapping):
-        nested_backend = kernel_config.get("moe_backend")
-        if nested_backend == _DPSK_BACKEND:
-            if "kernel_config" not in kwargs:
-                raise TypeError(
-                    "positional KernelConfig with dpsk_deep_gemm is not "
-                    "supported; pass kernel_config by keyword"
+    if isinstance(kernel_config, Mapping) or kernel_config is not None:
+        nested_backend = (
+            kernel_config.get("moe_backend")
+            if isinstance(kernel_config, Mapping)
+            else getattr(kernel_config, "moe_backend", None)
+        )
+        _reject_legacy_moe_backend(
+            nested_backend, "KernelConfig.moe_backend"
+        )
+        if nested_backend == _DEEP_GEMM_BACKEND:
+            if top_level_backend not in (
+                None,
+                _UPSTREAM_BACKEND,
+                _DEEP_GEMM_BACKEND,
+            ):
+                raise ValueError(
+                    "KernelConfig selects deep_gemm but EngineArgs.moe_backend "
+                    f"selects {top_level_backend!r}"
                 )
-            requested_dpsk = True
-            normalized_kernel = dict(kernel_config)
-            normalized_kernel["moe_backend"] = _UPSTREAM_BACKEND
-            kwargs["kernel_config"] = normalized_kernel
-        elif requested_dpsk and nested_backend not in (None, _UPSTREAM_BACKEND):
+            requested_deep_gemm = True
+        elif requested_deep_gemm and nested_backend not in (None, _UPSTREAM_BACKEND):
             raise ValueError(
-                "HCU sidecar selects dpsk_deep_gemm but "
+                "HCU sidecar selects deep_gemm but "
                 f"KernelConfig.moe_backend selects {nested_backend!r}"
             )
 
@@ -259,8 +277,8 @@ def _normalise_constructor_kwargs(
         kwargs["speculative_config"] = normalized_speculative
         updates["enable_multi_layers_mtp"] = nested_multi_mtp
 
-    if requested_dpsk:
-        updates["moe_backend"] = _DPSK_BACKEND
+    if requested_deep_gemm:
+        updates["moe_backend"] = _DEEP_GEMM_BACKEND
     if requested_deepep_auto:
         updates["deepep_auto"] = True
     return feature_config.with_updates(**updates) if updates else feature_config
@@ -301,7 +319,7 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
         feature_config = feature_config.with_updates(
             hcu_flash_attn_mode=direct_mode
         )
-    requested_dpsk = feature_config.moe_backend == _DPSK_BACKEND
+    requested_deep_gemm = feature_config.moe_backend == _DEEP_GEMM_BACKEND
 
     requested_deepep_auto = feature_config.deepep_auto
     all2all_backend = getattr(engine_args, "all2all_backend", None)
@@ -319,28 +337,39 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
         )
 
     backend = getattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)
-    if backend == _DPSK_BACKEND:
-        requested_dpsk = True
-        setattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)
-    elif requested_dpsk and backend != _UPSTREAM_BACKEND:
+    _reject_legacy_moe_backend(backend, "EngineArgs.moe_backend")
+    if backend == _DEEP_GEMM_BACKEND:
+        requested_deep_gemm = True
+    elif requested_deep_gemm and backend == _UPSTREAM_BACKEND:
+        setattr(engine_args, "moe_backend", _DEEP_GEMM_BACKEND)
+    elif requested_deep_gemm:
         raise ValueError(
-            "HCU sidecar selects dpsk_deep_gemm but EngineArgs.moe_backend "
+            "HCU sidecar selects deep_gemm but EngineArgs.moe_backend "
             f"selects {backend!r}"
         )
 
     kernel_config = getattr(engine_args, "kernel_config", None)
-    nested_backend = getattr(kernel_config, "moe_backend", _UPSTREAM_BACKEND)
-    if nested_backend == _DPSK_BACKEND:
-        requested_dpsk = True
-        setattr(kernel_config, "moe_backend", _UPSTREAM_BACKEND)
-    elif requested_dpsk and nested_backend != _UPSTREAM_BACKEND:
+    nested_backend = (
+        kernel_config.get("moe_backend", _UPSTREAM_BACKEND)
+        if isinstance(kernel_config, Mapping)
+        else getattr(kernel_config, "moe_backend", _UPSTREAM_BACKEND)
+    )
+    _reject_legacy_moe_backend(nested_backend, "KernelConfig.moe_backend")
+    if nested_backend == _DEEP_GEMM_BACKEND:
+        if backend not in (_UPSTREAM_BACKEND, _DEEP_GEMM_BACKEND):
+            raise ValueError(
+                "KernelConfig selects deep_gemm but EngineArgs.moe_backend "
+                f"selects {backend!r}"
+            )
+        requested_deep_gemm = True
+    elif requested_deep_gemm and nested_backend != _UPSTREAM_BACKEND:
         raise ValueError(
-            "HCU sidecar selects dpsk_deep_gemm but KernelConfig.moe_backend "
+            "HCU sidecar selects deep_gemm but KernelConfig.moe_backend "
             f"selects {nested_backend!r}"
         )
 
-    if requested_dpsk and feature_config.moe_backend != _DPSK_BACKEND:
-        feature_config = feature_config.with_updates(moe_backend=_DPSK_BACKEND)
+    if requested_deep_gemm and feature_config.moe_backend != _DEEP_GEMM_BACKEND:
+        feature_config = feature_config.with_updates(moe_backend=_DEEP_GEMM_BACKEND)
     if requested_deepep_auto and not feature_config.deepep_auto:
         feature_config = feature_config.with_updates(deepep_auto=True)
 

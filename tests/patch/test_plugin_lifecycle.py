@@ -348,7 +348,7 @@ def test_arg_utils_first_import_applies_sidecar_before_first_construction():
         "from vllm_hcu.patch import patch_report; "
         "from vllm_hcu.patch.config import get_hcu_config; "
         "args=arg_utils.EngineArgs(enable_custom_sp=True,"
-        "enable_multi_layers_mtp=True,moe_backend='dpsk_deep_gemm'); "
+        "enable_multi_layers_mtp=True,moe_backend='deep_gemm'); "
         "feature=get_hcu_config(args); "
         "record=patch_report()['patches']["
         "'platform.core_fix.hcu_config.engine_args']; "
@@ -368,10 +368,10 @@ def test_arg_utils_first_import_applies_sidecar_before_first_construction():
         "marker": True,
         "status": "applied",
         "dataclass_restored": True,
-        "upstream_backend": "auto",
+        "upstream_backend": "deep_gemm",
         "custom_sp": True,
         "multi_mtp": True,
-        "hcu_backend": "dpsk_deep_gemm",
+        "hcu_backend": "deep_gemm",
     }
 
 

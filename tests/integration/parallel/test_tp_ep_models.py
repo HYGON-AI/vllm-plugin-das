@@ -84,10 +84,10 @@ DEEPSEEK_R1_CHANNEL_INT8_TP_EP_MOE_PATHS = (
         id="target-triton",
     ),
     pytest.param(
-        "dpsk-deep-gemm",
-        "dpsk_deep_gemm",
+        "deep-gemm",
+        "deep_gemm",
         {},
-        id="dpsk-deep-gemm",
+        id="deep-gemm",
     ),
 )
 
@@ -289,7 +289,6 @@ def test_glm52_channel_int8_deepep_smoke(
         "tp-ep-smoke",
         model_path,
         timeout_s=5400,
-        extra_env={"VLLM_USE_DEEP_GEMM": "1"},
         log_label=f"glm52-int8-{all2all_backend}",
         extra_args=[
             "--tensor-parallel-size",
@@ -301,7 +300,7 @@ def test_glm52_channel_int8_deepep_smoke(
             "--gpu-memory-utilization",
             "0.9",
             "--moe-backend",
-            "dpsk_deep_gemm",
+            "deep_gemm",
         ],
     )
 
@@ -311,5 +310,5 @@ def test_glm52_channel_int8_deepep_smoke(
         expected_dp=8,
         expected_gpu_memory_utilization=0.9,
         expected_all2all=all2all_backend,
-        expected_moe_backend="dpsk_deep_gemm",
+        expected_moe_backend="deep_gemm",
     )

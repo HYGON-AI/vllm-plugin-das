@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Register the HCU AITER INT8 MoE backend in vLLM's v0.25 oracle."""
+"""Extend vLLM's v0.25 INT8 oracle for HCU AITER and DeepGEMM kernels."""
 
 from __future__ import annotations
 
@@ -97,12 +97,12 @@ def apply_to_module(module: ModuleType) -> bool:
     )
 
     values = {member.name: member.value for member in old_enum}
-    if "AITER" in values or "DPSK_DEEPGEMM" in values:
+    if "AITER" in values or "HCU_DEEPGEMM" in values:
         raise PatchCompatibilityError(
             "HCU INT8 MoE backend is already present outside the HCU adapter"
         )
     values["AITER"] = "AITER"
-    values["DPSK_DEEPGEMM"] = "DPSK_DEEPGEMM"
+    values["HCU_DEEPGEMM"] = "HCU_DEEPGEMM"
     hcu_enum = target.Enum("Int8MoeBackend", values, module=target.__name__)
     target._vllm_hcu_original_int8_moe_backend = old_enum
     target.Int8MoeBackend = hcu_enum
@@ -115,7 +115,7 @@ def apply_to_module(module: ModuleType) -> bool:
             )
 
             return [AiterExperts]
-        if backend == hcu_enum.DPSK_DEEPGEMM:
+        if backend == hcu_enum.HCU_DEEPGEMM:
             from vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
                 BatchedDeepGemmExperts,
             )
@@ -130,18 +130,19 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_map_int8_backend(runner_backend):
         if runner_backend == "aiter":
             return hcu_enum.AITER
-        if runner_backend == "dpsk_deep_gemm":
-            return hcu_enum.DPSK_DEEPGEMM
+        if runner_backend == "deep_gemm":
+            return hcu_enum.HCU_DEEPGEMM
         return map_backend(runner_backend)
 
     @functools.wraps(select_backend)
     def hcu_select_int8_moe_backend(config, weight_key, activation_key):
-        if _sidecar_backend(config) != "dpsk_deep_gemm":
+        if _sidecar_backend(config) != "deep_gemm":
             return select_backend(config, weight_key, activation_key)
-        if getattr(config, "moe_backend", "auto") != "auto":
+        if getattr(config, "moe_backend", "auto") != "deep_gemm":
             raise ValueError(
-                "HCU sidecar selects dpsk_deep_gemm but official FusedMoEConfig "
-                f"selects {config.moe_backend!r}; official backend must remain 'auto'"
+                "HCU sidecar selects deep_gemm but official FusedMoEConfig "
+                f"selects {config.moe_backend!r}; official backend must match "
+                "'deep_gemm'"
             )
         activation_format = (
             target.mk.FusedMoEActivationFormat.BatchedExperts
@@ -149,7 +150,7 @@ def apply_to_module(module: ModuleType) -> bool:
             else target.mk.FusedMoEActivationFormat.Standard
         )
         reasons = []
-        for kernel_cls in hcu_backend_to_kernel_cls(hcu_enum.DPSK_DEEPGEMM):
+        for kernel_cls in hcu_backend_to_kernel_cls(hcu_enum.HCU_DEEPGEMM):
             supported, reason = kernel_cls.is_supported_config(
                 kernel_cls,
                 config,
@@ -158,10 +159,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 activation_format,
             )
             if supported:
-                return hcu_enum.DPSK_DEEPGEMM, kernel_cls
+                return hcu_enum.HCU_DEEPGEMM, kernel_cls
             reasons.append(f"{kernel_cls.__name__}: {reason or 'unsupported'}")
         raise ValueError(
-            "dpsk_deep_gemm is required by HCU sidecar but does not support "
+            "deep_gemm is required by HCU sidecar but does not support "
             "this INT8 MoE configuration: " + "; ".join(reasons)
         )
 
@@ -175,15 +176,26 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         if int8_backend == hcu_enum.AITER:
             return w13, w2
-        if int8_backend == hcu_enum.DPSK_DEEPGEMM:
-            from deepgemm.m_group_gemm import (
-                pack_int8_weight_enk_to_w6_low_latency,
+        if int8_backend == hcu_enum.HCU_DEEPGEMM:
+            if layer is None or not hasattr(layer, "moe_config"):
+                raise ValueError(
+                    "HCU DeepGEMM INT8 weight conversion requires the MoE layer "
+                    "to select its masked or contiguous weight layout"
+                )
+            from deepgemm import (
+                marlin_i8_contiguous_weight,
+                marlin_i8_masked_weight,
             )
 
-            return (
-                pack_int8_weight_enk_to_w6_low_latency(w13),
-                pack_int8_weight_enk_to_w6_low_latency(w2),
+            use_batched = bool(
+                layer.moe_config.moe_parallel_config.use_batched_activation_format
             )
+            pack_weight = (
+                marlin_i8_masked_weight
+                if use_batched
+                else marlin_i8_contiguous_weight
+            )
+            return pack_weight(w13), pack_weight(w2)
         return convert(int8_backend, w13, w2, layer, w13_scale)
 
     @functools.wraps(make_quant_config)
@@ -200,7 +212,7 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         if int8_backend in (
             hcu_enum.AITER,
-            hcu_enum.DPSK_DEEPGEMM,
+            hcu_enum.HCU_DEEPGEMM,
         ) and per_act_token_quant:
             return make_w8a8_quant_config(
                 w1_scale=w1_scale,

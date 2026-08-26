@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Register/select the HCU DPSK DeepGEMM FP8 MoE backend via sidecar config."""
+"""Select HCU FP8 kernels for vLLM's official ``deep_gemm`` backend."""
 
 from __future__ import annotations
 
@@ -53,6 +53,12 @@ def apply_to_module(module: ModuleType) -> bool:
     select_backend = require_callable(target, "select_fp8_moe_backend", TARGETS[3])
     convert = require_callable(target, "convert_to_fp8_moe_kernel_format", TARGETS[4])
     make_kernel = require_callable(target, "make_fp8_moe_kernel", TARGETS[5])
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8DynamicTokenSym,
+        kFp8StaticChannelSym,
+    )
+
+    channel_fp8_scheme = (kFp8StaticChannelSym, kFp8DynamicTokenSym)
     require_parameter_names(backend_to_cls, TARGETS[1], ("backend",))
     require_parameter_names(map_backend, TARGETS[2], ("runner_backend",))
     require_parameter_names(
@@ -87,16 +93,18 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
     )
     values = {member.name: member.value for member in old_enum}
-    if "DPSK_DEEPGEMM" in values:
-        raise PatchCompatibilityError("DPSK backend is already present outside HCU adapter")
-    values["DPSK_DEEPGEMM"] = "DPSK_DEEPGEMM"
+    if "HCU_DEEPGEMM" in values:
+        raise PatchCompatibilityError(
+            "HCU DeepGEMM backend is already present outside the HCU adapter"
+        )
+    values["HCU_DEEPGEMM"] = "HCU_DEEPGEMM"
     hcu_enum = target.Enum("Fp8MoeBackend", values, module=target.__name__)
     target._vllm_hcu_original_fp8_moe_backend = old_enum
     target.Fp8MoeBackend = hcu_enum
 
     @functools.wraps(backend_to_cls)
     def hcu_backend_to_kernel_cls(backend):
-        if backend == hcu_enum.DPSK_DEEPGEMM:
+        if backend == hcu_enum.HCU_DEEPGEMM:
             try:
                 from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                     DeepEPDeepGemmContiguousExperts,
@@ -104,7 +112,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             except (ImportError, AttributeError) as exc:
                 raise RuntimeError(
-                    "dpsk_deep_gemm was selected, but HCU DeepGEMM/LightOP "
+                    "deep_gemm was selected, but HCU DeepGEMM/LightOP "
                     "expert dependencies are unavailable"
                 ) from exc
             return [DeepEPDeepGemmContiguousExperts, DeepEPDeepGemmMaskedExperts]
@@ -112,9 +120,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(map_backend)
     def hcu_map_fp8_backend(runner_backend):
-        if runner_backend == "dpsk_deep_gemm":
-            return hcu_enum.DPSK_DEEPGEMM
-        return map_backend(runner_backend)
+        # Keep the public backend mapped to vLLM's official enum.  The HCU
+        # channel-FP8 specialization needs quantization keys, which are only
+        # available in select_fp8_moe_backend().  Replacing the global mapping
+        # here would also redirect block-FP8 to the channel-only HCU experts.
+        mapped = map_backend(runner_backend)
+        if isinstance(mapped, old_enum):
+            return hcu_enum[mapped.name]
+        return mapped
 
     @functools.wraps(select_backend)
     def hcu_select_fp8_moe_backend(
@@ -124,28 +137,45 @@ def apply_to_module(module: ModuleType) -> bool:
         allow_vllm_cutlass=False,
     ):
         sidecar = _sidecar_config(config)
+        is_channel_fp8 = (weight_key, activation_key) == channel_fp8_scheme
         if sidecar.deepep_auto:
-            if sidecar.moe_backend not in ("auto", "dpsk_deep_gemm"):
+            if sidecar.moe_backend not in ("auto", "deep_gemm"):
                 raise ValueError(
                     "deepep_auto requires moe_backend='auto' or "
-                    "'dpsk_deep_gemm'"
+                    "'deep_gemm'"
                 )
-            if getattr(config, "moe_backend", "auto") != "auto":
+            expected_backend = sidecar.moe_backend
+            if getattr(config, "moe_backend", "auto") != expected_backend:
                 raise ValueError(
                     "deepep_auto requires the official FusedMoEConfig "
-                    "moe_backend to remain 'auto'"
+                    f"moe_backend to match {expected_backend!r}"
+                )
+            if not is_channel_fp8:
+                raise ValueError(
+                    "deepep_auto HCU DeepGEMM supports only channel-wise "
+                    "FP8 weights with dynamic per-token FP8 activations"
                 )
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 DeepEPDeepGemmContiguousExperts,
             )
 
-            return hcu_enum.DPSK_DEEPGEMM, DeepEPDeepGemmContiguousExperts
-        if sidecar.moe_backend != "dpsk_deep_gemm":
+            return hcu_enum.HCU_DEEPGEMM, DeepEPDeepGemmContiguousExperts
+        if sidecar.moe_backend != "deep_gemm":
             return select_backend(config, weight_key, activation_key, allow_vllm_cutlass)
-        if getattr(config, "moe_backend", "auto") != "auto":
+        if getattr(config, "moe_backend", "auto") != "deep_gemm":
             raise ValueError(
-                "HCU sidecar selects dpsk_deep_gemm but official FusedMoEConfig "
-                f"selects {config.moe_backend!r}; official backend must remain 'auto'"
+                "HCU sidecar selects deep_gemm but official FusedMoEConfig "
+                f"selects {config.moe_backend!r}; official backend must match "
+                "'deep_gemm'"
+            )
+        if not is_channel_fp8:
+            # Preserve the official DEEPGEMM/BATCHED_DEEPGEMM selection for
+            # block-FP8 and every other scheme not owned by the HCU adapter.
+            return select_backend(
+                config,
+                weight_key,
+                activation_key,
+                allow_vllm_cutlass,
             )
         activation_format = (
             target.mk.FusedMoEActivationFormat.BatchedExperts
@@ -153,7 +183,7 @@ def apply_to_module(module: ModuleType) -> bool:
             else target.mk.FusedMoEActivationFormat.Standard
         )
         reasons = []
-        for kernel_cls in hcu_backend_to_kernel_cls(hcu_enum.DPSK_DEEPGEMM):
+        for kernel_cls in hcu_backend_to_kernel_cls(hcu_enum.HCU_DEEPGEMM):
             supported, reason = kernel_cls.is_supported_config(
                 kernel_cls,
                 config,
@@ -162,10 +192,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 activation_format,
             )
             if supported:
-                return hcu_enum.DPSK_DEEPGEMM, kernel_cls
+                return hcu_enum.HCU_DEEPGEMM, kernel_cls
             reasons.append(f"{kernel_cls.__name__}: {reason or 'unsupported'}")
         raise ValueError(
-            "dpsk_deep_gemm is required by HCU sidecar but does not support "
+            "deep_gemm is required by HCU sidecar but does not support "
             "this MoE configuration: " + "; ".join(reasons)
         )
 
@@ -180,7 +210,7 @@ def apply_to_module(module: ModuleType) -> bool:
         w13_input_scale,
         w2_input_scale,
     ):
-        if fp8_backend == hcu_enum.DPSK_DEEPGEMM:
+        if fp8_backend == hcu_enum.HCU_DEEPGEMM:
             return w13, w2, w13_scale, w2_scale
         if fp8_backend == hcu_enum.AITER:
             return w13, w2, w13_scale, w2_scale
@@ -213,10 +243,10 @@ def apply_to_module(module: ModuleType) -> bool:
             "use_deepep_auto_kernels",
             False,
         ):
-            if fp8_backend != hcu_enum.DPSK_DEEPGEMM:
+            if fp8_backend != hcu_enum.HCU_DEEPGEMM:
                 raise ValueError(
-                    "deepep_auto currently supports only the HCU "
-                    f"DPSK_DEEPGEMM FP8 backend, got {fp8_backend.value}"
+                    "deepep_auto currently supports only the "
+                    f"HCU_DEEPGEMM FP8 backend, got {fp8_backend.value}"
                 )
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_fp8_moe_kernel,

@@ -25,7 +25,7 @@ def test_defaults_and_round_trip_through_object_sidecar() -> None:
         enable_lightly_cplb=True,
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
     )
 
     assert normalized == HcuFeatureConfig(
@@ -33,7 +33,7 @@ def test_defaults_and_round_trip_through_object_sidecar() -> None:
         enable_lightly_cplb=True,
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
     )
     assert vllm_config.additional_config["unrelated"] == 7
     assert get_hcu_config(vllm_config) == normalized
@@ -76,12 +76,12 @@ def test_pop_legacy_keywords_leaves_upstream_kwargs_untouched() -> None:
         "model": "example",
         "enable_lightly_cp": True,
         "enable_lightly_cplb": True,
-        "moe_backend": "dpsk_deep_gemm",
+        "moe_backend": "deep_gemm",
     }
     config = pop_hcu_feature_kwargs(kwargs)
     assert kwargs == {"model": "example"}
     assert config.enable_lightly_cp and config.enable_lightly_cplb
-    assert config.moe_backend == "dpsk_deep_gemm"
+    assert config.moe_backend == "deep_gemm"
 
 
 @pytest.mark.parametrize(
@@ -89,6 +89,7 @@ def test_pop_legacy_keywords_leaves_upstream_kwargs_untouched() -> None:
     [
         ({"enable_lightly_cp": 1}, TypeError),
         ({"moe_backend": "triton"}, ValueError),
+        ({"moe_backend": "dpsk_deep_gemm"}, ValueError),
         ({"hcu_flash_attn_mode": "future"}, ValueError),
         ({"future_typo": True}, ValueError),
         ({"enable_lightly_cplb": True}, ValueError),

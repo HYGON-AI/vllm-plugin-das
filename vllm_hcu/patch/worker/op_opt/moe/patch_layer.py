@@ -116,7 +116,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 return [weight.view(self.local_num_experts, -1) for weight in weights]
             missing = [name for name, value in zip(names, weights) if value is None]
             raise RuntimeError(
-                "DPSK DeepGEMM repacked layer is missing expert weights: "
+                "HCU DeepGEMM repacked layer is missing expert weights: "
                 + ", ".join(missing)
             )
         return get_weights(self)

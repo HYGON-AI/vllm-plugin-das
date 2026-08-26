@@ -408,7 +408,7 @@ def test_aiter_asm_boltops_fp8_quant_context_rejects_subtle_abi_drift(
     assert asm_module.per_token_quant_hip is incompatible_quant
 
 
-def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
+def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
@@ -602,14 +602,14 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
     assert quant_config.a2_scale is None
 
     config = SimpleNamespace(
-        moe_backend="auto",
+        moe_backend="deep_gemm",
         moe_parallel_config=SimpleNamespace(
             use_batched_activation_format=False,
         ),
         _hcu_vllm_config=SimpleNamespace(
             additional_config={
                 "hcu": {
-                    "moe_backend": "dpsk_deep_gemm",
+                    "moe_backend": "deep_gemm",
                 }
             }
         ),
@@ -617,17 +617,17 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
     backend, experts = target.select_int8_moe_backend(
         config, "weight", "activation"
     )
-    assert backend is target.Int8MoeBackend.DPSK_DEEPGEMM
+    assert backend is target.Int8MoeBackend.HCU_DEEPGEMM
     assert experts is DeepGemmExperts
-    assert target.map_int8_backend("dpsk_deep_gemm") is backend
-    dpsk_quant_config = target.make_int8_moe_quant_config(
+    assert target.map_int8_backend("deep_gemm") is backend
+    deep_gemm_quant_config = target.make_int8_moe_quant_config(
         backend,
         w1_scale,
         w2_scale,
         per_act_token_quant=True,
     )
-    assert getattr(dpsk_quant_config, "use_int8_w8a8", False) is True
-    assert dpsk_quant_config.per_act_token_quant is True
+    assert getattr(deep_gemm_quant_config, "use_int8_w8a8", False) is True
+    assert deep_gemm_quant_config.per_act_token_quant is True
 
     config.moe_parallel_config.use_batched_activation_format = True
     backend, experts = target.select_int8_moe_backend(
@@ -635,51 +635,85 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
     )
     assert experts is BatchedDeepGemmExperts
 
-    dpsk_w13 = torch.arange(2 * 16 * 64, dtype=torch.int32).to(torch.int8)
-    dpsk_w13 = dpsk_w13.reshape(2, 16, 64)
-    dpsk_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
-    dpsk_w2 = dpsk_w2.reshape(2, 64, 64)
+    deep_gemm_w13 = torch.arange(2 * 16 * 64, dtype=torch.int32).to(torch.int8)
+    deep_gemm_w13 = deep_gemm_w13.reshape(2, 16, 64)
+    deep_gemm_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
+    deep_gemm_w2 = deep_gemm_w2.reshape(2, 64, 64)
     import deepgemm
     from deepgemm import m_group_gemm
 
-    real_pack = m_group_gemm.pack_int8_weight_enk_to_w6_low_latency
-    pack_calls: list[torch.Tensor] = []
+    real_contiguous_pack = deepgemm.marlin_i8_contiguous_weight
+    real_masked_pack = deepgemm.marlin_i8_masked_weight
+    contiguous_calls: list[torch.Tensor] = []
+    masked_calls: list[torch.Tensor] = []
 
-    def tracked_w6_pack(weight: torch.Tensor) -> torch.Tensor:
-        pack_calls.append(weight)
-        return real_pack(weight)
+    def tracked_contiguous_pack(weight: torch.Tensor) -> torch.Tensor:
+        contiguous_calls.append(weight)
+        return real_contiguous_pack(weight)
 
-    def reject_compatibility_packer(*_args, **_kwargs):
-        raise AssertionError("deprecated architecture compatibility packer invoked")
+    def tracked_masked_pack(weight: torch.Tensor) -> torch.Tensor:
+        masked_calls.append(weight)
+        return real_masked_pack(weight)
 
-    monkeypatch.setattr(
-        m_group_gemm,
-        "pack_int8_weight_enk_to_w6_low_latency",
-        tracked_w6_pack,
-    )
+    def reject_w6_packer(*_args, **_kwargs):
+        raise AssertionError("W6 low-latency packer invoked")
+
     monkeypatch.setattr(
         deepgemm,
         "marlin_i8_contiguous_weight",
-        reject_compatibility_packer,
+        tracked_contiguous_pack,
     )
-    expected_w13 = real_pack(dpsk_w13.clone())
-    expected_w2 = real_pack(dpsk_w2.clone())
-    converted_w13, converted_w2 = target.convert_to_int8_moe_kernel_format(
+    monkeypatch.setattr(
+        deepgemm,
+        "marlin_i8_masked_weight",
+        tracked_masked_pack,
+    )
+    monkeypatch.setattr(
+        m_group_gemm,
+        "pack_int8_weight_enk_to_w6_low_latency",
+        reject_w6_packer,
+    )
+
+    standard_layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_batched_activation_format=False,
+            )
+        )
+    )
+    expected_standard_w13 = real_contiguous_pack(deep_gemm_w13.clone())
+    expected_standard_w2 = real_contiguous_pack(deep_gemm_w2.clone())
+    standard_w13, standard_w2 = target.convert_to_int8_moe_kernel_format(
         backend,
-        dpsk_w13,
-        dpsk_w2,
+        deep_gemm_w13,
+        deep_gemm_w2,
+        layer=standard_layer,
     )
+    assert contiguous_calls == [deep_gemm_w13, deep_gemm_w2]
+    assert masked_calls == []
+    torch.testing.assert_close(standard_w13, expected_standard_w13)
+    torch.testing.assert_close(standard_w2, expected_standard_w2)
 
-    assert pack_calls == [dpsk_w13, dpsk_w2]
-
-    torch.testing.assert_close(
-        converted_w13,
-        expected_w13,
+    contiguous_calls.clear()
+    batched_layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_batched_activation_format=True,
+            )
+        )
     )
-    torch.testing.assert_close(
-        converted_w2,
-        expected_w2,
+    expected_batched_w13 = real_masked_pack(deep_gemm_w13.clone())
+    expected_batched_w2 = real_masked_pack(deep_gemm_w2.clone())
+    batched_w13, batched_w2 = target.convert_to_int8_moe_kernel_format(
+        backend,
+        deep_gemm_w13,
+        deep_gemm_w2,
+        layer=batched_layer,
     )
+    assert contiguous_calls == []
+    assert masked_calls == [deep_gemm_w13, deep_gemm_w2]
+    torch.testing.assert_close(batched_w13, expected_batched_w13)
+    torch.testing.assert_close(batched_w2, expected_batched_w2)
 
     config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "auto"
     assert target.select_int8_moe_backend(
@@ -688,9 +722,9 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_dpsk_weights(
 
     config._hcu_vllm_config.additional_config["hcu"][
         "moe_backend"
-    ] = "dpsk_deep_gemm"
+    ] = "deep_gemm"
     config.moe_backend = "triton"
-    with pytest.raises(ValueError, match="official backend must remain 'auto'"):
+    with pytest.raises(ValueError, match="official backend must match 'deep_gemm'"):
         target.select_int8_moe_backend(config, "weight", "activation")
 
 
@@ -3689,7 +3723,7 @@ def test_moe_fp8_target_process_has_no_hcu_dpsk_postprocess(
     experts = SimpleNamespace(
         process_weights_after_loading=lambda layer: processed.append(layer)
     )
-    method.fp8_backend = SimpleNamespace(value="DPSK_DEEPGEMM")
+    method.fp8_backend = SimpleNamespace(value="HCU_DEEPGEMM")
     method.moe_kernel = SimpleNamespace(
         fused_experts=SimpleNamespace(experts=experts)
     )

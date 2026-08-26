@@ -154,7 +154,7 @@ def _run_fake_dp_case(monkeypatch, context):
         "data_parallel_size": len(context.exitcodes),
         "gpu_memory_utilization": 0.9,
         "all2all_backend": "deepep_high_throughput",
-        "moe_backend": "dpsk_deep_gemm",
+        "moe_backend": "deep_gemm",
     }
     return cleaned, kwargs
 
@@ -185,7 +185,7 @@ def test_tp_ep_dp_uses_explicit_multiprocess_launcher(monkeypatch):
         data_parallel_size=8,
         gpu_memory_utilization=0.9,
         all2all_backend="deepep_high_throughput",
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
     )
 
     assert result is expected
@@ -195,7 +195,7 @@ def test_tp_ep_dp_uses_explicit_multiprocess_launcher(monkeypatch):
         "data_parallel_size": 8,
         "gpu_memory_utilization": 0.9,
         "all2all_backend": "deepep_high_throughput",
-        "moe_backend": "dpsk_deep_gemm",
+        "moe_backend": "deep_gemm",
     }
 
 
@@ -220,7 +220,7 @@ def test_tp_ep_cli_forwards_data_parallel_and_all2all(monkeypatch, capsys):
             "--all2all-backend",
             "deepep_low_latency",
             "--moe-backend",
-            "dpsk_deep_gemm",
+            "deep_gemm",
         ]
     ) == 0
     assert captured == {
@@ -229,7 +229,7 @@ def test_tp_ep_cli_forwards_data_parallel_and_all2all(monkeypatch, capsys):
         "data_parallel_size": 8,
         "gpu_memory_utilization": 0.6,
         "all2all_backend": "deepep_low_latency",
-        "moe_backend": "dpsk_deep_gemm",
+        "moe_backend": "deep_gemm",
     }
     assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
 
@@ -252,7 +252,7 @@ def test_tp_ep_ll_exercises_model_specific_deepep_token_capacity(monkeypatch):
         data_parallel_size=8,
         gpu_memory_utilization=0.9,
         all2all_backend="deepep_low_latency",
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
     )
 
     assert captured["max_num_batched_tokens"] == 300
@@ -598,7 +598,7 @@ def test_dp_rank_joins_the_shared_owned_process_group(monkeypatch):
         1,
         0.9,
         "deepep_high_throughput",
-        "dpsk_deep_gemm",
+        "deep_gemm",
         result_queue,
         process_group_id,
         _FakeMultiprocessingContext([]),

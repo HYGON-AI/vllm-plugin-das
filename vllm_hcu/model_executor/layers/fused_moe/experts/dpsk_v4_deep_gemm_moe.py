@@ -63,6 +63,16 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
     # dispatch aligns FP8 groupgemm traffic to 256 tokens per expert.
     ALIGNMENT = 256
 
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) == (
+            kFp8StaticChannelSym,
+            kFp8DynamicTokenSym,
+        )
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
