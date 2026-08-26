@@ -25,7 +25,6 @@ TARGETS = (
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
-_DEEPEP_LOW_LATENCY_MAX_BATCHED_TOKENS = 256
 _REQUEST_CAPTURE_SIZES = (
     *range(1, 9),
     *range(10, 33, 2),
@@ -208,34 +207,6 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)
-
-    if (
-        parallel_config is not None
-        and getattr(parallel_config, "all2all_backend", None)
-        == "deepep_low_latency"
-    ):
-        scheduler_config = getattr(vllm_config, "scheduler_config", None)
-        if scheduler_config is None:
-            raise PatchCompatibilityError(
-                "deepep_low_latency requires VllmConfig.scheduler_config"
-            )
-        max_num_batched_tokens = getattr(
-            scheduler_config, "max_num_batched_tokens", None
-        )
-        if not isinstance(max_num_batched_tokens, int):
-            raise PatchCompatibilityError(
-                "deepep_low_latency requires "
-                "SchedulerConfig.max_num_batched_tokens"
-            )
-        if max_num_batched_tokens > _DEEPEP_LOW_LATENCY_MAX_BATCHED_TOKENS:
-            raise ValueError(
-                "deepep_low_latency was configured with "
-                f"max_num_batched_tokens={max_num_batched_tokens}; the maximum "
-                "supported value is "
-                f"{_DEEPEP_LOW_LATENCY_MAX_BATCHED_TOKENS} on HCU. Set "
-                "--max-num-batched-tokens 256 or lower. Long prompts remain "
-                "supported through chunked prefill and are not truncated."
-            )
 
     if parallel_config is not None:
         setattr(

@@ -213,6 +213,16 @@ def _fake_all2all_module() -> ModuleType:
             super().__init__(cpu_group, tcp_store_group)
             self.support_fault_tolerance = False
 
+        def _make_all2all_kwargs(
+            self,
+            max_num_tokens_per_dp_rank,
+            token_hidden_size,
+            num_ep_ranks,
+            num_global_experts,
+            num_local_experts,
+        ):
+            return {"upstream": True}
+
     return _module(
         patch_all2all.TARGET_MODULE,
         DeepEPAll2AllManagerBase=DeepEPAll2AllManagerBase,
@@ -259,16 +269,13 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
 def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    calls = []
+
     class Buffer:
         @staticmethod
         def get_low_latency_rdma_size_hint(**kwargs):
-            assert kwargs == {
-                "num_max_dispatch_tokens_per_rank": 32,
-                "hidden": 7168,
-                "num_ranks": 8,
-                "num_experts": 256,
-            }
-            return 750_000_000
+            calls.append(kwargs)
+            return kwargs["num_max_dispatch_tokens_per_rank"] * 23_437_500
 
     monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
     module = _fake_all2all_module()
@@ -285,6 +292,19 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
     )
     assert manager.is_deepep_auto_manager is True
     assert manager.max_sms_used() == 48
+    assert len(calls) == 32
+    assert calls[0] == {
+        "num_max_dispatch_tokens_per_rank": 1,
+        "hidden": 7168,
+        "num_ranks": 8,
+        "num_experts": 256,
+    }
+    assert calls[-1] == {
+        "num_max_dispatch_tokens_per_rank": 32,
+        "hidden": 7168,
+        "num_ranks": 8,
+        "num_experts": 256,
+    }
     assert kwargs == {
         "group": "group",
         "num_nvl_bytes": 1_000_000_000,
@@ -296,6 +316,132 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         "explicitly_destroy": True,
         "enable_shrink": True,
     }
+    assert manager._make_all2all_kwargs(
+        max_num_tokens_per_dp_rank=32,
+        token_hidden_size=7168,
+        num_ep_ranks=8,
+        num_global_experts=256,
+        num_local_experts=32,
+    ) == kwargs
+    assert len(calls) == 32
+
+
+def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            calls.append(kwargs)
+            tokens = kwargs["num_max_dispatch_tokens_per_rank"]
+            required_bytes = (
+                tokens
+                * kwargs["hidden"]
+                * kwargs["num_ranks"]
+                * kwargs["num_experts"]
+            )
+            glm_test_limit = 3 * 6144 * 8 * 256
+            if required_bytes > glm_test_limit:
+                return sys.maxsize + 1
+            return required_bytes
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+    manager = module.DeepEPLLAll2AllManager("group", "tcp")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"DeepEP low-latency RDMA size hint overflowed at token capacity 4"
+            r".*hidden_size=6144.*num_global_experts=256.*ep_size=8"
+        ),
+    ):
+        manager._make_all2all_kwargs(
+            max_num_tokens_per_dp_rank=512,
+            token_hidden_size=6144,
+            num_ep_ranks=8,
+            num_global_experts=256,
+            num_local_experts=32,
+        )
+
+    assert [
+        call["num_max_dispatch_tokens_per_rank"] for call in calls
+    ] == [1, 2, 3, 4]
+    assert all(call["hidden"] == 6144 for call in calls)
+    assert all(call["num_ranks"] == 8 for call in calls)
+    assert all(call["num_experts"] == 256 for call in calls)
+
+    calls.clear()
+    kwargs = manager._make_all2all_kwargs(
+        max_num_tokens_per_dp_rank=512,
+        token_hidden_size=256,
+        num_ep_ranks=2,
+        num_global_experts=16,
+        num_local_experts=8,
+    )
+    assert kwargs["num_rdma_bytes"] == 512 * 256 * 2 * 16
+    assert len(calls) == 512
+    assert calls[-1] == {
+        "num_max_dispatch_tokens_per_rank": 512,
+        "hidden": 256,
+        "num_ranks": 2,
+        "num_experts": 16,
+    }
+    assert manager._make_all2all_kwargs(
+        max_num_tokens_per_dp_rank=512,
+        token_hidden_size=256,
+        num_ep_ranks=2,
+        num_global_experts=16,
+        num_local_experts=8,
+    ) == kwargs
+    assert len(calls) == 512
+
+
+def test_deep_ep_low_latency_rejects_decreasing_hint_and_wraps_native_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            tokens = kwargs["num_max_dispatch_tokens_per_rank"]
+            if tokens == 3:
+                return 50
+            return tokens * 100
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+    manager = module.DeepEPLLAll2AllManager("group", "tcp")
+
+    with pytest.raises(
+        ValueError,
+        match=r"overflowed at token capacity 3.*previous_hint=200, current_hint=50",
+    ):
+        manager._make_all2all_kwargs(5, 6144, 8, 256, 32)
+
+    class FailingBuffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            if kwargs["num_max_dispatch_tokens_per_rank"] == 2:
+                raise OverflowError("native overflow")
+            return 100
+
+    monkeypatch.setitem(
+        sys.modules, "deep_ep", SimpleNamespace(Buffer=FailingBuffer)
+    )
+    second_manager = module.DeepEPLLAll2AllManager("group", "tcp")
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"RDMA size hint failed at token capacity 2.*hidden_size=6144"
+            r".*num_global_experts=256.*ep_size=8"
+        ),
+    ) as exc_info:
+        second_manager._make_all2all_kwargs(5, 6144, 8, 256, 32)
+    assert isinstance(exc_info.value.__cause__, OverflowError)
 
 
 def _fake_base_communicator_module() -> ModuleType:

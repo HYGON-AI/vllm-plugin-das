@@ -1197,7 +1197,7 @@ def _case_tp_ep_smoke_rank(
     from vllm import LLM
 
     max_num_batched_tokens = (
-        256 if all2all_backend == "deepep_low_latency" else 512
+        300 if all2all_backend == "deepep_low_latency" else 512
     )
     llm = LLM(
         **_llm_kwargs(

@@ -760,21 +760,16 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
     )
 
 
-def test_deepep_low_latency_rejects_unsafe_scheduler_capacity() -> None:
+def test_deepep_low_latency_defers_capacity_check_until_model_is_known() -> None:
     config = _validation_config(
         HcuFeatureConfig(moe_backend="dpsk_deep_gemm")
     )
     config.parallel_config.all2all_backend = "deepep_low_latency"
     config.scheduler_config.max_num_batched_tokens = 512
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"deepep_low_latency.*max_num_batched_tokens=512.*maximum supported "
-            r"value is 256"
-        ),
-    ):
-        patch_vllm_config.validate_and_update_hcu_config(config)
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert config.scheduler_config.max_num_batched_tokens == 512
 
 
 def test_deepep_low_latency_capacity_does_not_truncate_long_prompts() -> None:

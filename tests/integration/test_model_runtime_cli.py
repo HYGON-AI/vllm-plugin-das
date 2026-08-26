@@ -234,7 +234,7 @@ def test_tp_ep_cli_forwards_data_parallel_and_all2all(monkeypatch, capsys):
     assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
 
 
-def test_tp_ep_ll_uses_supported_deepep_token_capacity(monkeypatch):
+def test_tp_ep_ll_exercises_model_specific_deepep_token_capacity(monkeypatch):
     captured = {}
 
     class FakeLLM:
@@ -255,7 +255,7 @@ def test_tp_ep_ll_uses_supported_deepep_token_capacity(monkeypatch):
         moe_backend="dpsk_deep_gemm",
     )
 
-    assert captured["max_num_batched_tokens"] == 256
+    assert captured["max_num_batched_tokens"] == 300
 
 
 def test_tp_ep_dp_cleans_every_rank_group_after_rank_failure(monkeypatch):
