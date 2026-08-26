@@ -27,10 +27,6 @@
       "match": "prefix",
       "version": "0.1."
     },
-    "evalscope": {
-      "match": "exact",
-      "version": "1.9.1"
-    },
     "pytest": {
       "match": "exact",
       "version": "9.1.1"

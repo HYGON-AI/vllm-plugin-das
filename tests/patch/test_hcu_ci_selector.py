@@ -28,7 +28,10 @@ from select_hcu_tests import (  # noqa: E402
     validate_config,
 )
 from hcu_ci_preflight import PreflightError, run_preflight  # noqa: E402
-from hcu_ci_preflight import _check_environment_lock  # noqa: E402
+from hcu_ci_preflight import (  # noqa: E402
+    _check_environment_lock,
+    _check_requirements,
+)
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
 from compile_changed_python import _compile as compile_python_file  # noqa: E402
 from compile_changed_python import main as compile_changed_python_main  # noqa: E402
@@ -352,6 +355,66 @@ def test_environment_lock_allows_compatible_hip_prefix(
             },
             torch_hip="6.4.0",
         )
+
+
+def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
+    config = _config()
+    evalscope_jobs = {
+        "qwen35-gsm8k",
+        "qwen3-vl-mmmu",
+        "qwen3-8b-gsm8k",
+        "deepseek-gsm8k",
+        "glm52-pcp",
+    }
+    expected = {
+        "kind": "distribution",
+        "name": "evalscope",
+        "match": "exact",
+        "version": "1.9.1",
+    }
+    for job_id in evalscope_jobs:
+        assert expected in config["jobs"][job_id]["requirements"]
+    assert expected not in config["jobs"]["qwen35-smoke"]["requirements"]
+
+    environment_lock = json.loads(
+        (
+            REPOSITORY
+            / ".github/workflows/configs/hcu-runner-environment.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert "evalscope" not in environment_lock["distributions"]
+
+
+def test_distribution_requirement_is_checked_on_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = {
+        "kind": "distribution",
+        "name": "evalscope",
+        "match": "exact",
+        "version": "1.9.1",
+    }
+    monkeypatch.setattr(
+        "hcu_ci_preflight._distribution_version",
+        lambda name: None,
+    )
+    with pytest.raises(
+        PreflightError,
+        match="required distribution is missing: evalscope",
+    ):
+        _check_requirements([requirement], None)
+
+    monkeypatch.setattr(
+        "hcu_ci_preflight._distribution_version",
+        lambda name: "1.9.1",
+    )
+    assert _check_requirements([requirement], None) == [
+        {
+            "kind": "distribution",
+            "name": "evalscope",
+            "version": "1.9.1",
+        }
+    ]
 
 
 def test_docs_only_change_does_not_select_hardware() -> None:

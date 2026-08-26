@@ -333,6 +333,12 @@
       "timeout_minutes": 90,
       "requirements": [
         {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
           "kind": "model",
           "env": "VLLM_HCU_QWEN35_9B_MODEL",
           "relative": "qwen3.5/Qwen3.5-9B"
@@ -350,6 +356,12 @@
       ],
       "timeout_minutes": 120,
       "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
         {
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_VL_8B_MODEL",
@@ -369,6 +381,12 @@
       "timeout_minutes": 120,
       "requirements": [
         {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_8B_MODEL",
           "relative": "qwen3/Qwen3-8B"
@@ -387,6 +405,12 @@
       "timeout_minutes": 360,
       "requirements": [
         {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
           "kind": "model",
           "env": "VLLM_HCU_DEEPSEEK_R1_MODEL",
           "relative": "DeepSeek-R1-Channel-FP8-w8a8"
@@ -404,6 +428,12 @@
       ],
       "timeout_minutes": 360,
       "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
         {
           "kind": "model",
           "env": "VLLM_HCU_GLM52_MODEL",

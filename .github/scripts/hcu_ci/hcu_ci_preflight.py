@@ -80,10 +80,45 @@ def _check_requirements(
 ) -> list[dict[str, str]]:
     resolved: list[dict[str, str]] = []
     for item in requirements:
+        kind = item.get("kind")
+        if kind == "distribution":
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                raise PreflightError(
+                    f"invalid distribution requirement name: {item!r}"
+                )
+            specification = _version_specification(
+                {
+                    "match": item.get("match"),
+                    "version": item.get("version"),
+                },
+                name=f"distribution requirement {name!r}",
+            )
+            actual = _distribution_version(name)
+            if actual is None:
+                raise PreflightError(
+                    f"required distribution is missing: {name}"
+                )
+            if not _matches_version(actual, specification):
+                raise PreflightError(
+                    f"required distribution drift for {name}: expected "
+                    f"{specification['match']} {specification['version']}, "
+                    f"got {actual}"
+                )
+            resolved.append(
+                {
+                    "kind": "distribution",
+                    "name": name,
+                    "version": actual,
+                }
+            )
+            continue
+
+        if kind not in {"model", "path"}:
+            raise PreflightError(f"unsupported requirement kind: {kind!r}")
         path = _resolve_requirement(item, model_root)
         if not path.exists():
             raise PreflightError(f"required resource is unavailable: {path}")
-        kind = item.get("kind")
         if kind == "model":
             if not path.is_dir() or not (
                 (path / "config.json").is_file()
@@ -93,8 +128,6 @@ def _check_requirements(
                     f"model resource is not loadable: {path}; expected "
                     "config.json or params.json"
                 )
-        elif kind != "path":
-            raise PreflightError(f"unsupported requirement kind: {kind!r}")
         resolved.append(
             {
                 "env": str(item["env"]),
