@@ -65,6 +65,7 @@ def _fresh_python(
     *,
     plugins: str = "__disabled__",
     assert_target_first: bool = True,
+    no_site: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = plugins
@@ -75,8 +76,12 @@ def _fresh_python(
         if assert_target_first
         else code + _TARGET_SOURCE_ASSERTION
     )
+    command = [sys.executable]
+    if no_site:
+        command.append("-S")
+    command.extend(("-c", child_code))
     return subprocess.run(
-        [sys.executable, "-c", child_code],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -290,6 +295,7 @@ def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
         "'patch_utils':'vllm_hcu.patch_utils' in sys.modules,"
         "'heavy':[name for name in heavy if name in sys.modules]}))",
         assert_target_first=False,
+        no_site=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(
