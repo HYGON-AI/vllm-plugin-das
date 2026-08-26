@@ -284,16 +284,20 @@ def test_platform_probe_failure_is_exposed_on_vllm_second_invocation(monkeypatch
 def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
     result = _fresh_python(
         "import builtins,json,sys; "
-        "old=builtins.__import__; "
-        "import vllm_hcu; "
-        "path=vllm_hcu.hcu_platform_plugin(); "
         "heavy=['torch','vllm','vllm_hcu.platforms.hcu',"
         "'vllm.v1.attention.backends.registry','vllm._aiter_ops','vllm_hcu.ops',"
         "'vllm_hcu.v1.core.sched.scheduler',"
         "'vllm_hcu.v1.executor.multiproc_executor']; "
-        "print(json.dumps({'path':path,'builtins_same':builtins.__import__ is old,"
+        "before=set(sys.modules); "
+        "old=builtins.__import__; "
+        "import vllm_hcu; "
+        "path=vllm_hcu.hcu_platform_plugin(); "
+        "print(json.dumps({'path':path,'plugin_file':vllm_hcu.__file__,"
+        "'builtins_same':builtins.__import__ is old,"
         "'patch_utils':'vllm_hcu.patch_utils' in sys.modules,"
-        "'heavy':[name for name in heavy if name in sys.modules]}))",
+        "'preloaded':[name for name in heavy if name in before],"
+        "'new_heavy':[name for name in heavy "
+        "if name in sys.modules and name not in before]}))",
         assert_target_first=False,
         no_site=True,
     )
@@ -305,11 +309,13 @@ def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
             if line.startswith("{")
         )
     )
+    assert Path(payload.pop("plugin_file")).resolve().is_relative_to(REPO)
+    payload.pop("preloaded")
     assert payload == {
         "path": "vllm_hcu.platforms.hcu.HCUPlatform",
         "builtins_same": True,
         "patch_utils": False,
-        "heavy": [],
+        "new_heavy": [],
     }
 
 
