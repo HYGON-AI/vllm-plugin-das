@@ -159,7 +159,8 @@ done
 docker "${docker_args[@]}" "$image" bash -lc 'while true; do sleep 3600; done'
 docker exec "$container_name" bash -lc '
   set -euo pipefail
-  mkdir -p "$HOME" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
+  ci_home=/tmp/hcu-ci-home
+  mkdir -p "$ci_home" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
   if [[ ! -x /usr/local/bin/python3.10 ]]; then
     python_bin="$(command -v python3.10 || true)"
     if [[ -z "$python_bin" ]]; then
@@ -169,6 +170,6 @@ docker exec "$container_name" bash -lc '
     mkdir -p /usr/local/bin
     ln -sf "$python_bin" /usr/local/bin/python3.10
   fi
-  git config --global --add safe.directory /vllm-plugin-das
+  HOME="$ci_home" git config --global --add safe.directory /vllm-plugin-das
 '
 echo "started HCU CI container $container_name from $image"
