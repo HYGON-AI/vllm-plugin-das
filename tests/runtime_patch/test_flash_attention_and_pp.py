@@ -182,7 +182,7 @@ def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        (None, "cutlass"),
+        (None, "varlen"),
         ("VLLM_HCU_USE_FLASH_ATTN", "classic"),
         ("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "cutlass"),
         ("VLLM_HCU_USE_FLASH_ATTN_VARLEN", "varlen"),

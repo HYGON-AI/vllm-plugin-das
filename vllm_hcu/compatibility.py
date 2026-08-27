@@ -14,8 +14,6 @@ import importlib.metadata as importlib_metadata
 from dataclasses import dataclass
 from pathlib import Path
 
-from packaging.version import InvalidVersion, Version
-
 from vllm_hcu.version import (
     __hcu_version__,
     __version_tuple__,
@@ -97,6 +95,8 @@ def inspect_vllm_compatibility() -> VllmCompatibility:
 
     actual = distribution.version
     location = _distribution_location(distribution)
+    from packaging.version import InvalidVersion, Version
+
     try:
         parsed = Version(actual)
     except (InvalidVersion, TypeError) as exc:
