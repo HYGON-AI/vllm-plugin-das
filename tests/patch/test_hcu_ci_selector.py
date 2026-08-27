@@ -427,6 +427,54 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
     ) in source
 
 
+def test_hcu_control_container_uses_runner_identity() -> None:
+    source = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_run_control_container.sh"
+    ).read_text(encoding="utf-8")
+    assert '--user "$(id -u):$(id -g)"' in source
+    assert "--volume /etc/passwd:/etc/passwd:ro" in source
+    assert "--volume /etc/group:/etc/group:ro" in source
+    assert '--env "LOGNAME=$runner_user"' in source
+    assert '--env "USER=$runner_user"' in source
+
+
+def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
+    for relative in (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/_selected-hcu-tests.yml",
+        ".github/workflows/release-docker-image.yml",
+    ):
+        source = (REPOSITORY / relative).read_text(encoding="utf-8")
+        assert '! -uid "$uid"' in source
+        assert '-type d ! -writable' in source
+        assert '-type f ! -writable' not in source
+
+    for relative in (
+        ".github/workflows/hcu-pr-ci.yml",
+        ".github/workflows/release-docker-image.yml",
+    ):
+        source = (REPOSITORY / relative).read_text(encoding="utf-8")
+        assert "docker image ls --format '{{.ID}}'" in source
+        assert "--user 0:0" in source
+
+    cleanup = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_cleanup_container.sh"
+    ).read_text(encoding="utf-8")
+    assert "docker image ls --format '{{.ID}}'" in cleanup
+    assert "--user 0:0" in cleanup
+
+
+def test_job_container_workflows_remove_root_owned_workspace() -> None:
+    for relative in (
+        ".github/workflows/patch-coverage.yml",
+        ".github/workflows/nightly-hcu.yml",
+        ".github/workflows/full-enabled-hcu.yml",
+        ".github/workflows/weekly-multi-node.yml",
+    ):
+        source = (REPOSITORY / relative).read_text(encoding="utf-8")
+        assert "Remove container-owned workspace files" in source
+
+
 def test_docs_only_change_does_not_select_hardware() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),

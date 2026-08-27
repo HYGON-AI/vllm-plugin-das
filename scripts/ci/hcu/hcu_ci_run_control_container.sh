@@ -22,18 +22,24 @@ image="$("$script_dir/hcu_ci_resolve_image.sh")"
 echo "using HCU CI control image: $image" >&2
 workspace="$(realpath "${GITHUB_WORKSPACE:-$workdir}")"
 workdir="$(realpath "$workdir")"
+runner_user="$(id -un)"
 
 docker_args=(
   run --rm
+  --user "$(id -u):$(id -g)"
   --network host
   --ipc host
   --workdir "$workdir"
   --volume "$workspace:$workspace"
+  --volume /etc/passwd:/etc/passwd:ro
+  --volume /etc/group:/etc/group:ro
   --env CI=1
   --env HOME=/tmp/hcu-ci-home
+  --env "LOGNAME=$runner_user"
   --env PYTHONDONTWRITEBYTECODE=1
   --env PYTHONPATH="$workspace"
   --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
+  --env "USER=$runner_user"
   --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
 )
 

@@ -108,9 +108,10 @@ jobs:
           else
             echo "No sudo or docker fallback available to repair $GITHUB_WORKSPACE" >&2
           fi
-          if [[ -d "$GITHUB_WORKSPACE/.git/objects" && ! -w "$GITHUB_WORKSPACE/.git/objects" ]]; then
-            echo "$GITHUB_WORKSPACE/.git/objects is still not writable by $(id -un)" >&2
-            ls -ld "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.git" "$GITHUB_WORKSPACE/.git/objects" >&2 || true
+          blocked_path="$(find "$GITHUB_WORKSPACE" \( ! -uid "$uid" -o \( -type d ! -writable \) \) -print -quit 2>/dev/null || true)"
+          if [[ -n "$blocked_path" ]]; then
+            echo "$blocked_path still has invalid ownership or directory permissions" >&2
+            ls -ld "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.git" "$blocked_path" >&2 || true
             exit 1
           fi
 

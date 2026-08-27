@@ -19,6 +19,7 @@ concurrency:
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: jenkins/model_test_env
+  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
   BASE_IMAGE: ${{ vars.DTK2604_IMAGE_UBUNTU_PY310 }}
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
@@ -30,6 +31,54 @@ jobs:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
     runs-on: bw18
     steps:
+      - name: Repair self-hosted workspace before checkout
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE"
+          uid="$(id -u)"
+          gid="$(id -g)"
+          blocked_path="$(find "$GITHUB_WORKSPACE" \( ! -uid "$uid" -o \( -type d ! -writable \) \) -print -quit 2>/dev/null || true)"
+          if [[ -z "$blocked_path" ]]; then
+            exit 0
+          fi
+          echo "repairing stale workspace ownership under $GITHUB_WORKSPACE"
+          if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+            sudo chown -R "$uid:$gid" "$GITHUB_WORKSPACE"
+          elif command -v docker >/dev/null 2>&1; then
+            repair_images=()
+            if [[ -n "${HCU_CI_IMAGE:-}" ]]; then
+              repair_id="$(docker image inspect "$HCU_CI_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+              [[ -z "$repair_id" ]] || repair_images+=("$repair_id")
+            fi
+            while IFS= read -r repair_id; do
+              [[ -z "$repair_id" ]] || repair_images+=("$repair_id")
+            done < <(docker image ls --format '{{.ID}}' | awk '!seen[$0]++')
+            repaired=false
+            for repair_image in "${repair_images[@]}"; do
+              if docker run --rm \
+                  --user 0:0 \
+                  --entrypoint /bin/sh \
+                  --volume "$GITHUB_WORKSPACE:/workspace" \
+                  "$repair_image" \
+                  -c 'chown -R "$1:$2" /workspace' -- "$uid" "$gid"; then
+                repaired=true
+                break
+              fi
+            done
+            if [[ "$repaired" != "true" ]]; then
+              echo "No local Docker image could repair: $blocked_path" >&2
+              exit 1
+            fi
+          else
+            echo "Cannot repair non-writable workspace path: $blocked_path" >&2
+            exit 1
+          fi
+          blocked_path="$(find "$GITHUB_WORKSPACE" \( ! -uid "$uid" -o \( -type d ! -writable \) \) -print -quit 2>/dev/null || true)"
+          if [[ -n "$blocked_path" ]]; then
+            echo "Workspace ownership or directory permissions are still invalid: $blocked_path" >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
 

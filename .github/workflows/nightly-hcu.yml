@@ -69,6 +69,10 @@ jobs:
           --profile quarantine
           --github-output "$GITHUB_OUTPUT"
 
+      - name: Remove container-owned workspace files
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
   hardware:
     needs: prepare
     uses: ./.github/workflows/_selected-hcu-tests.yml
