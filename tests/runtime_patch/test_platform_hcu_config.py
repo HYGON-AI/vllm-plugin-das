@@ -205,7 +205,6 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
 @pytest.mark.parametrize(
     ("alias", "mode"),
     [
-        ("FLASH_ATTN", "varlen"),
         ("FLASH_ATTN_CLASSIC", "classic"),
         ("flash_attn_cutlass", "cutlass"),
         ("flash_attn_varlen", "varlen"),
@@ -225,6 +224,45 @@ def test_engine_args_normalizes_hcu_flash_attention_aliases(
     nested = module.EngineArgs(attention_config={"backend": alias})
     assert nested.attention_config["backend"] == "FLASH_ATTN"
     assert get_hcu_config(nested).hcu_flash_attn_mode == mode
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, "varlen"),
+        ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
+        ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
+    ],
+)
+def test_plain_flash_attention_defers_submode_to_legacy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    expected: str,
+) -> None:
+    for name in (
+        "VLLM_HCU_USE_FLASH_ATTN",
+        "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
+        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    top_level = module.EngineArgs(attention_backend="FLASH_ATTN")
+    assert top_level.attention_backend == "FLASH_ATTN"
+    assert get_hcu_config(top_level).hcu_flash_attn_mode is None
+
+    nested = module.EngineArgs(attention_config={"backend": "FLASH_ATTN"})
+    assert nested.attention_config["backend"] == "FLASH_ATTN"
+    assert get_hcu_config(nested).hcu_flash_attn_mode is None
+
+    config = _validation_config(get_hcu_config(top_level.create_engine_config()))
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert feature_config.hcu_flash_attn_mode == expected
 
 
 @pytest.mark.parametrize(

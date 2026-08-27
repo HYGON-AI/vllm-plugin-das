@@ -45,7 +45,6 @@ _UPSTREAM_BACKEND = "auto"
 _DEEPEP_AUTO_BACKEND = "deepep_auto"
 _DEEPEP_AUTO_UPSTREAM_BACKEND = "deepep_low_latency"
 _FLASH_ATTN_BACKEND = "FLASH_ATTN"
-_DEFAULT_HCU_FLASH_ATTN_MODE = "varlen"
 _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CLASSIC": "classic",
     "FLASH_ATTN_CUTLASS": "cutlass",
@@ -60,7 +59,7 @@ def _resolve_requested_flash_mode(
 ) -> str | None:
     normalized = backend.upper()
     if normalized == _FLASH_ATTN_BACKEND:
-        return existing_mode or _DEFAULT_HCU_FLASH_ATTN_MODE
+        return existing_mode
     return _HCU_FLASH_ATTN_ALIASES.get(normalized)
 
 
