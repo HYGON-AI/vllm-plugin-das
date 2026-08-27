@@ -9,6 +9,8 @@ same normalization is used before pickling and in spawned processes.
 
 from __future__ import annotations
 
+import threading
+import warnings
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, MutableMapping
 
@@ -24,9 +26,31 @@ _FEATURE_FIELDS = (
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
+_LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
+_DEEP_GEMM_BACKEND = "deep_gemm"
+_legacy_backend_warning_emitted = False
+_legacy_backend_warning_lock = threading.Lock()
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
     {"classic", "cutlass", "custom", "varlen"}
 )
+
+
+def normalize_hcu_moe_backend(value: Any) -> Any:
+    """Map the public legacy alias to the canonical vLLM backend name."""
+
+    if value != _LEGACY_DEEP_GEMM_BACKEND:
+        return value
+    global _legacy_backend_warning_emitted
+    with _legacy_backend_warning_lock:
+        if not _legacy_backend_warning_emitted:
+            warnings.warn(
+                "moe_backend='dpsk_deep_gemm' is deprecated; use "
+                "moe_backend='deep_gemm' instead",
+                FutureWarning,
+                stacklevel=3,
+            )
+            _legacy_backend_warning_emitted = True
+    return _DEEP_GEMM_BACKEND
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +83,9 @@ class HcuFeatureConfig:
                 "HCU config field 'moe_backend' must be str, "
                 f"got {type(self.moe_backend).__name__}"
             )
+        normalized_backend = normalize_hcu_moe_backend(self.moe_backend)
+        if normalized_backend != self.moe_backend:
+            object.__setattr__(self, "moe_backend", normalized_backend)
         if self.moe_backend not in _SUPPORTED_MOE_BACKENDS:
             supported = ", ".join(sorted(_SUPPORTED_MOE_BACKENDS))
             raise ValueError(
@@ -261,6 +288,7 @@ def pop_hcu_feature_kwargs(
 __all__ = [
     "HcuFeatureConfig",
     "get_hcu_config",
+    "normalize_hcu_moe_backend",
     "pop_hcu_feature_kwargs",
     "set_hcu_config",
     "write_hcu_config",

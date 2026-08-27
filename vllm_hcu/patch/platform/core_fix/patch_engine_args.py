@@ -17,7 +17,12 @@ from dataclasses import dataclass as official_dataclass
 from types import ModuleType
 from typing import Any
 
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
+from vllm_hcu.patch.config import (
+    HcuFeatureConfig,
+    get_hcu_config,
+    normalize_hcu_moe_backend,
+    set_hcu_config,
+)
 from vllm_hcu.patch.runtime_state import PATCH_REGISTRY, PatchRegistry, run_patch
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -52,14 +57,6 @@ _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CUSTOM": "custom",
     "FLASH_ATTN_VARLEN": "varlen",
 }
-
-
-def _reject_legacy_moe_backend(value: object, source: str) -> None:
-    if value == _LEGACY_DEEP_GEMM_BACKEND:
-        raise ValueError(
-            f"{_LEGACY_DEEP_GEMM_BACKEND!r} is no longer supported in "
-            f"{source}; use {_DEEP_GEMM_BACKEND!r}"
-        )
 
 
 def _require_engine_args_class(module: ModuleType, name: str) -> type:
@@ -202,8 +199,15 @@ def _normalise_constructor_kwargs(
         )
 
     requested_deep_gemm = feature_config.moe_backend == _DEEP_GEMM_BACKEND
-    top_level_backend = bound.arguments.get("moe_backend")
-    _reject_legacy_moe_backend(top_level_backend, "EngineArgs.moe_backend")
+    raw_top_level_backend = bound.arguments.get("moe_backend")
+    top_level_backend = normalize_hcu_moe_backend(raw_top_level_backend)
+    if raw_top_level_backend == _LEGACY_DEEP_GEMM_BACKEND:
+        if "moe_backend" not in kwargs:
+            raise TypeError(
+                "positional dpsk_deep_gemm is not supported; pass "
+                "moe_backend='dpsk_deep_gemm' by keyword"
+            )
+        kwargs["moe_backend"] = top_level_backend
     if top_level_backend == _DEEP_GEMM_BACKEND:
         requested_deep_gemm = True
     elif requested_deep_gemm and top_level_backend in (None, _UPSTREAM_BACKEND):
@@ -226,9 +230,20 @@ def _normalise_constructor_kwargs(
             if isinstance(kernel_config, Mapping)
             else getattr(kernel_config, "moe_backend", None)
         )
-        _reject_legacy_moe_backend(
-            nested_backend, "KernelConfig.moe_backend"
-        )
+        raw_nested_backend = nested_backend
+        nested_backend = normalize_hcu_moe_backend(raw_nested_backend)
+        if raw_nested_backend == _LEGACY_DEEP_GEMM_BACKEND:
+            if isinstance(kernel_config, Mapping):
+                if "kernel_config" not in kwargs:
+                    raise TypeError(
+                        "positional KernelConfig with dpsk_deep_gemm is not "
+                        "supported; pass kernel_config by keyword"
+                    )
+                normalized_kernel = dict(kernel_config)
+                normalized_kernel["moe_backend"] = nested_backend
+                kwargs["kernel_config"] = normalized_kernel
+            else:
+                setattr(kernel_config, "moe_backend", nested_backend)
         if nested_backend == _DEEP_GEMM_BACKEND:
             if top_level_backend not in (
                 None,
@@ -336,8 +351,10 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
             f"selects {all2all_backend!r}"
         )
 
-    backend = getattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)
-    _reject_legacy_moe_backend(backend, "EngineArgs.moe_backend")
+    backend = normalize_hcu_moe_backend(
+        getattr(engine_args, "moe_backend", _UPSTREAM_BACKEND)
+    )
+    setattr(engine_args, "moe_backend", backend)
     if backend == _DEEP_GEMM_BACKEND:
         requested_deep_gemm = True
     elif requested_deep_gemm and backend == _UPSTREAM_BACKEND:
@@ -354,7 +371,11 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
         if isinstance(kernel_config, Mapping)
         else getattr(kernel_config, "moe_backend", _UPSTREAM_BACKEND)
     )
-    _reject_legacy_moe_backend(nested_backend, "KernelConfig.moe_backend")
+    nested_backend = normalize_hcu_moe_backend(nested_backend)
+    if isinstance(kernel_config, MutableMapping):
+        kernel_config["moe_backend"] = nested_backend
+    elif kernel_config is not None:
+        setattr(kernel_config, "moe_backend", nested_backend)
     if nested_backend == _DEEP_GEMM_BACKEND:
         if backend not in (_UPSTREAM_BACKEND, _DEEP_GEMM_BACKEND):
             raise ValueError(

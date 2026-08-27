@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import pickle
+import warnings
 from types import SimpleNamespace
 
 import pytest
 
+import vllm_hcu.patch.config as hcu_config_module
 from vllm_hcu.patch.config import (
     HcuFeatureConfig,
     get_hcu_config,
@@ -84,12 +86,36 @@ def test_pop_legacy_keywords_leaves_upstream_kwargs_untouched() -> None:
     assert config.moe_backend == "deep_gemm"
 
 
+def test_legacy_deep_gemm_sidecar_is_normalized_with_one_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hcu_config_module,
+        "_legacy_backend_warning_emitted",
+        False,
+        raising=False,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        first = get_hcu_config({"moe_backend": "dpsk_deep_gemm"})
+        second = get_hcu_config(
+            {"additional_config": {"hcu": {"moe_backend": "dpsk_deep_gemm"}}}
+        )
+        direct = HcuFeatureConfig(moe_backend="dpsk_deep_gemm")
+
+    assert first.moe_backend == "deep_gemm"
+    assert second.moe_backend == "deep_gemm"
+    assert direct.moe_backend == "deep_gemm"
+    assert [warning.category for warning in caught] == [FutureWarning]
+    assert "dpsk_deep_gemm" in str(caught[0].message)
+
+
 @pytest.mark.parametrize(
     ("payload", "error"),
     [
         ({"enable_lightly_cp": 1}, TypeError),
         ({"moe_backend": "triton"}, ValueError),
-        ({"moe_backend": "dpsk_deep_gemm"}, ValueError),
         ({"hcu_flash_attn_mode": "future"}, ValueError),
         ({"future_typo": True}, ValueError),
         ({"enable_lightly_cplb": True}, ValueError),

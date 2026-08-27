@@ -14,6 +14,7 @@ _HCU_BOOLEAN_OPTIONS = {
     "enable_custom_sp": "Enable HCU custom runtime sequence parallelism.",
 }
 _DEEP_GEMM_BACKEND = "deep_gemm"
+_LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 
 
 def _actions_by_dest(parser: object) -> dict[str, argparse.Action]:
@@ -94,6 +95,8 @@ def register_hcu_cli_args(parser: object) -> None:
             "audited vLLM --moe-backend choices do not contain the official "
             "'deep_gemm' backend"
         )
+    if _LEGACY_DEEP_GEMM_BACKEND not in choices:
+        moe_action.choices = tuple(choices) + (_LEGACY_DEEP_GEMM_BACKEND,)
 
 
 def pre_register_and_update(parser: object | None = None) -> None:

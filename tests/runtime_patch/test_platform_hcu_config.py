@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 import torch
 
+import vllm_hcu.patch.config as hcu_config_module
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm_hcu.model_executor.layers.quantization import slimquant_facade
@@ -66,6 +67,14 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 
 def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
+    for name in (
+        "VLLM_DP_RANK",
+        "VLLM_DP_RANK_LOCAL",
+        "VLLM_DP_SIZE",
+        "VLLM_DP_MASTER_IP",
+        "VLLM_DP_MASTER_PORT",
+    ):
+        env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
@@ -265,20 +274,41 @@ def test_engine_args_rejects_conflicting_official_moe_backends() -> None:
         {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
     ],
 )
-def test_engine_args_rejects_legacy_deep_gemm_backend_at_construction(
+def test_engine_args_normalizes_legacy_deep_gemm_backend_at_construction(
     kwargs: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        hcu_config_module,
+        "_legacy_backend_warning_emitted",
+        False,
+        raising=False,
+    )
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
 
-    with pytest.raises(ValueError, match="dpsk_deep_gemm.*no longer supported"):
+    with pytest.warns(FutureWarning, match="dpsk_deep_gemm.*deep_gemm"):
         module.EngineArgs(**kwargs)
+    args = module.EngineArgs(**kwargs)
+    assert (
+        args.moe_backend == "deep_gemm"
+        or args.kernel_config.moe_backend == "deep_gemm"
+    )
+    assert get_hcu_config(args).moe_backend == "deep_gemm"
+    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
 
 @pytest.mark.parametrize("location", ["top_level", "kernel_config"])
-def test_engine_args_rejects_legacy_deep_gemm_backend_on_existing_object(
+def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
     location: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        hcu_config_module,
+        "_legacy_backend_warning_emitted",
+        False,
+        raising=False,
+    )
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     args = module.EngineArgs()
@@ -287,11 +317,17 @@ def test_engine_args_rejects_legacy_deep_gemm_backend_on_existing_object(
     else:
         args.kernel_config.moe_backend = "dpsk_deep_gemm"
 
-    with pytest.raises(ValueError, match="dpsk_deep_gemm.*no longer supported"):
-        args.create_engine_config()
+    with pytest.warns(FutureWarning, match="dpsk_deep_gemm.*deep_gemm"):
+        config = args.create_engine_config()
+    assert (
+        args.moe_backend == "deep_gemm"
+        or args.kernel_config.moe_backend == "deep_gemm"
+    )
+    assert get_hcu_config(args).moe_backend == "deep_gemm"
+    assert config.kernel_config.moe_backend == "deep_gemm"
 
 
-def test_real_v0251_engine_args_rejects_legacy_deep_gemm_backend() -> None:
+def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
     result = _run_fresh_v0251(
         r'''
 from vllm.engine import arg_utils
@@ -303,27 +339,19 @@ for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
     {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
 ):
-    try:
-        arg_utils.EngineArgs(**kwargs)
-    except ValueError as exc:
-        assert "no longer supported" in str(exc), str(exc)
-    else:
-        raise AssertionError(f"legacy backend was accepted: {kwargs}")
+    args = arg_utils.EngineArgs(**kwargs)
+    assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
+    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
 args = arg_utils.EngineArgs()
 args.moe_backend = "dpsk_deep_gemm"
-try:
-    args.create_engine_config()
-except ValueError as exc:
-    assert "no longer supported" in str(exc), str(exc)
-else:
-    raise AssertionError("legacy backend on existing EngineArgs was accepted")
+assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
-print("legacy-backend-rejected")
+print("legacy-backend-normalized")
 '''
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "legacy-backend-rejected" in result.stdout
+    assert "legacy-backend-normalized" in result.stdout
 
 
 def test_nested_speculative_multi_mtp_is_extracted_before_official_config() -> None:
@@ -419,6 +447,20 @@ def test_cli_registration_preserves_official_deep_gemm_backend() -> None:
     assert args.moe_backend == "deep_gemm"
     assert get_hcu_config(args).moe_backend == "deep_gemm"
     assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
+
+
+def test_cli_registration_accepts_legacy_deep_gemm_backend() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--moe-backend",
+        choices=["auto", "triton", "deep_gemm"],
+        default="auto",
+    )
+    patch_hcu_config.register_hcu_cli_args(parser)
+
+    assert parser.parse_args(
+        ["--moe-backend", "dpsk_deep_gemm"]
+    ).moe_backend == "dpsk_deep_gemm"
 
 
 def test_cli_registration_reports_conflicting_destination() -> None:
@@ -907,6 +949,18 @@ def test_deepep_high_throughput_keeps_larger_scheduler_capacity() -> None:
     patch_vllm_config.validate_and_update_hcu_config(config)
 
     assert config.scheduler_config.max_num_batched_tokens == 512
+
+
+def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+
+    with pytest.raises(
+        ValueError,
+        match="deepep_auto.*EPLB.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
 
 
 def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:

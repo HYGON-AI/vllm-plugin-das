@@ -40,10 +40,6 @@ def _sidecar_config(config):
     return get_hcu_config(vllm_config)
 
 
-def _sidecar_backend(config) -> str:
-    return _sidecar_config(config).moe_backend
-
-
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if getattr(target, _MARKER, False):
@@ -136,7 +132,13 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(select_backend)
     def hcu_select_int8_moe_backend(config, weight_key, activation_key):
-        if _sidecar_backend(config) != "deep_gemm":
+        sidecar = _sidecar_config(config)
+        if sidecar.deepep_auto:
+            raise ValueError(
+                "INT8 with deepep_auto is not supported; it requires a "
+                "dedicated Auto INT8 experts factory"
+            )
+        if sidecar.moe_backend != "deep_gemm":
             return select_backend(config, weight_key, activation_key)
         if getattr(config, "moe_backend", "auto") != "deep_gemm":
             raise ValueError(

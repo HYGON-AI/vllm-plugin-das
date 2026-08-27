@@ -224,6 +224,11 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
+        if getattr(parallel_config, "enable_eplb", False):
+            raise ValueError(
+                "deepep_auto with EPLB is not supported because the HT and "
+                "LL expert weight layouts cannot be rebalanced atomically"
+            )
         if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(
                 "deepep_auto requires HCU moe_backend='auto' or "

@@ -635,6 +635,14 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     )
     assert experts is BatchedDeepGemmExperts
 
+    config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = True
+    with pytest.raises(
+        ValueError,
+        match="INT8.*deepep_auto.*not supported",
+    ):
+        target.select_int8_moe_backend(config, "weight", "activation")
+    config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = False
+
     deep_gemm_w13 = torch.arange(2 * 16 * 64, dtype=torch.int32).to(torch.int8)
     deep_gemm_w13 = deep_gemm_w13.reshape(2, 16, 64)
     deep_gemm_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
