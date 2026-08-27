@@ -55,6 +55,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Remove container-owned workspace files
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
   multi-node:
     needs: readiness
     if: needs.readiness.outputs.ready == 'true'

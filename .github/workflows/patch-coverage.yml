@@ -30,3 +30,8 @@ jobs:
           /usr/local/bin/python3.10 tools/check_patch_test_coverage.py
       - name: Compile test and patch tooling
         run: /usr/local/bin/python3.10 -m compileall -q tools tests
+
+      # Job containers run as root on the host-mounted self-hosted workspace.
+      - name: Remove container-owned workspace files
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
