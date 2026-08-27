@@ -2,6 +2,8 @@
 vLLM HCU Plugin
 </h3>
 
+<!-- Quality Gate runner smoke test: 2026-08-27 -->
+
 ---
 
 ## Upstream, License, and Third-Party Notices
