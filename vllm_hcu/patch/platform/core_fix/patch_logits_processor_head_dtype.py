@@ -7,9 +7,6 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
-import torch
-import torch.nn.functional as F
-
 from ._common import (
     PatchCompatibilityError,
     apply_once,
@@ -67,6 +64,9 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[2],
         ("self", "lm_head", "hidden_states", "embedding_bias"),
     )
+
+    import torch
+    import torch.nn.functional as F
 
     from vllm.config import get_current_vllm_config
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
