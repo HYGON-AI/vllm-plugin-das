@@ -8,7 +8,40 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.model_executor.layers.linear import ReplicatedLinear
+try:
+    from boltops.ihc import ihc_head, ihc_post, ihc_pre
+except ImportError:
+    ihc_head = None
+    ihc_post = None
+    ihc_pre = None
+
+
+def _use_boltops_ihc(tensor: torch.Tensor) -> bool:
+    """Use boltops only on its HIP/CUDA execution path."""
+    return (
+        tensor.device.type == "cuda"
+        and ihc_pre is not None
+        and ihc_post is not None
+        and ihc_head is not None
+    )
+
+
+class _IHCProjection(nn.Module):
+    """Small replicated FP32 projection in boltops' [out, in] layout.
+
+    HCU's generic unquantized linear stores weights as [in, out] when
+    VLLM_USE_NN is enabled.  The iHC kernels consume the checkpoint-native
+    [out, in] layout directly, so keep these tiny gate projections canonical.
+    """
+
+    def __init__(self, input_size: int, output_size: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(output_size, input_size, dtype=torch.float32)
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return torch.nn.functional.linear(x, self.weight), None
 
 
 class HYV4HCPreLayer(nn.Module):
@@ -32,11 +65,9 @@ class HYV4HCPreLayer(nn.Module):
         self.magnitude = magnitude
         self.hc_eps = hc_eps
         self.layernorm_epsilon = layernorm_epsilon
-        self.hc_fn = ReplicatedLinear(
+        self.hc_fn = _IHCProjection(
             input_size=hc_mult * hidden_dim,
             output_size=2 * hc_mult,
-            params_dtype=torch.float32,
-            bias=False,
         )
         self.hc_scale = nn.Parameter(torch.empty(2, dtype=torch.float32))
         self.hc_base = nn.Parameter(torch.empty(2 * hc_mult, dtype=torch.float32))
@@ -65,6 +96,18 @@ class HYV4HCPreLayer(nn.Module):
                 )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if _use_boltops_ihc(x):
+            assert ihc_pre is not None
+            return ihc_pre(
+                x,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.layernorm_epsilon,
+                self.hc_eps,
+                self.magnitude,
+            )
+
         shape = x.size()
         x_flat = x.flatten(1).float()
         rsqrt = torch.rsqrt(
@@ -105,6 +148,10 @@ class HYV4HCPostLayer(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
     ) -> torch.Tensor:
+        if _use_boltops_ihc(residual):
+            assert ihc_post is not None
+            return ihc_post(x, residual, post)
+
         dtype = x.dtype
         result = post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
         return (result + residual.float()).to(dtype)
@@ -127,11 +174,9 @@ class HYV4HCHeadLayer(nn.Module):
         self.hidden_size = hidden_size
         self.hc_mult = hc_mult
         self.hc_eps = hc_eps
-        self.hc_head_fn = ReplicatedLinear(
+        self.hc_head_fn = _IHCProjection(
             input_size=hc_mult * hidden_size,
             output_size=hc_mult,
-            params_dtype=torch.float32,
-            bias=False,
         )
         self.hc_head_base = nn.Parameter(
             torch.empty(hc_mult, dtype=torch.float32)
@@ -161,6 +206,17 @@ class HYV4HCHeadLayer(nn.Module):
                 )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _use_boltops_ihc(x):
+            assert ihc_head is not None
+            return ihc_head(
+                x,
+                self.hc_head_fn.weight,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.config.rms_norm_eps,
+                self.hc_eps,
+            )
+
         shape = x.size()
         dtype = x.dtype
         x_flat = x.flatten(1).float()

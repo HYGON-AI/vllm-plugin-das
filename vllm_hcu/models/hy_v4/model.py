@@ -43,6 +43,11 @@ from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_ma
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParameter
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+    dequant_mxfp8_to_bf16,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -120,13 +125,31 @@ def _dequantize_indexer_channel_fp8(
     weight: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    """Dequantize an indexer projection exported with channel-wise FP8."""
+    """Dequantize a channel-wise FP8 or serialized MXFP8 indexer projection."""
+    if weight.ndim != 2:
+        raise ValueError(
+            "HY V4 indexer FP8 weight must be rank 2; "
+            f"got weight={tuple(weight.shape)}."
+        )
+
+    expected_mxfp8_scale_shape = (
+        weight.shape[0],
+        weight.shape[1] // MXFP8_BLOCK_SIZE,
+    )
+    if (
+        weight.shape[1] % MXFP8_BLOCK_SIZE == 0
+        and scale.dtype == torch.uint8
+        and tuple(scale.shape) == expected_mxfp8_scale_shape
+    ):
+        return dequant_mxfp8_to_bf16(weight, scale)
+
     expected_scale_shape = (weight.shape[0], 1)
-    if weight.ndim != 2 or tuple(scale.shape) != expected_scale_shape:
+    if tuple(scale.shape) != expected_scale_shape:
         raise ValueError(
             "HY V4 indexer FP8 scale must be per-output-channel with shape "
-            f"{expected_scale_shape}; got weight={tuple(weight.shape)}, "
-            f"scale={tuple(scale.shape)}."
+            f"{expected_scale_shape}, or MXFP8 uint8 with shape "
+            f"{expected_mxfp8_scale_shape}; got weight={tuple(weight.shape)}, "
+            f"scale={tuple(scale.shape)} dtype={scale.dtype}."
         )
     return (weight.float() * scale.float()).to(torch.bfloat16)
 
@@ -885,12 +908,22 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         )
         self.enable_lm_head_fp32 = getattr(self.config, "enable_lm_head_fp32", False)
         if get_pp_group().is_last_rank:
+            lm_head_prefix = maybe_prefix(prefix, "lm_head")
+            # ModelOpt returns UnquantizedLinearMethod for excluded LM heads.
+            # HCU's NN layout stores that method as [hidden, vocab], while the
+            # vocab loader requires [vocab, hidden]. Let ParallelLMHead select
+            # UnquantizedEmbeddingMethod instead for an excluded head.
+            lm_head_quant_config = quant_config
+            if quant_config is not None and quant_config.is_layer_excluded(
+                lm_head_prefix
+            ):
+                lm_head_quant_config = None
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 params_dtype=torch.float32 if self.enable_lm_head_fp32 else None,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
+                quant_config=lm_head_quant_config,
+                prefix=lm_head_prefix,
             )
             # With tie_word_embeddings, embed_tokens is kept on the last rank
             # (see HYV4Model.__init__) so the weight can be shared here.
@@ -950,7 +983,11 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         loaded_params = loader.load_weights(_filter_weights(weights))
-        required_params = {name for name, _ in self.named_parameters()}
+        required_params = {
+            name
+            for name, param in self.named_parameters()
+            if not isinstance(param, KVCacheScaleParameter)
+        }
         missing_params = required_params - loaded_params
         if missing_params:
             raise RuntimeError(

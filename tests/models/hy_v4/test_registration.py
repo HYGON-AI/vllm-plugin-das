@@ -64,7 +64,7 @@ def test_hy_v4_config_normalizes_sparse_layer_spelling() -> None:
     ]
 
 
-def test_hy_v4_registry_is_backbone_only(monkeypatch) -> None:
+def test_hy_v4_registry_includes_native_mtp(monkeypatch) -> None:
     import vllm_hcu.models as models
 
     calls: list[tuple[str, str]] = []
@@ -81,7 +81,10 @@ def test_hy_v4_registry_is_backbone_only(monkeypatch) -> None:
         "HYV4ForCausalLM",
         "vllm_hcu.models.hy_v4:HYV4ForCausalLM",
     ) in calls
-    assert all(name != "HYV4MTPModel" for name, _ in calls)
+    assert (
+        "HYV4MTPModel",
+        "vllm_hcu.models.hy_v4:HYV4MTP",
+    ) in calls
 
 
 def test_config_registration_does_not_eagerly_import_model() -> None:
@@ -91,5 +94,7 @@ import vllm_hcu.models.hy_v4.config
 assert 'vllm_hcu.models.hy_v4.model' not in sys.modules
 from vllm_hcu.models.hy_v4 import HYV4ForCausalLM
 assert HYV4ForCausalLM.__name__ == 'HYV4ForCausalLM'
+from vllm_hcu.models.hy_v4 import HYV4MTP
+assert HYV4MTP.__name__ == 'HYV4MTP'
 """
     subprocess.run([sys.executable, "-c", code], check=True)

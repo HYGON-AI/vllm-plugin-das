@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParameter
 
 from vllm_hcu.models.hy_v4 import model as hy_v4_model
 from vllm_hcu.models.hy_v4.model import (
+    HYV4ForCausalLM,
     HYV4Model,
     _dequantize_indexer_channel_fp8,
     _normalize_hyv4_config,
@@ -18,6 +20,57 @@ from vllm_hcu.models.hy_v4.model import (
     _try_load_fp8_indexer_projection,
     _try_load_fp8_router_gate,
 )
+
+
+def test_excluded_quant_config_is_not_forwarded_to_lm_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeQuantConfig:
+        packed_modules_mapping = None
+
+        @staticmethod
+        def is_layer_excluded(prefix: str) -> bool:
+            return prefix == "lm_head"
+
+    class FakeInnerModel(torch.nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.make_empty_intermediate_tensors = object()
+
+    class FakeLMHead(torch.nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(hy_v4_model, "HYV4Model", FakeInnerModel)
+    monkeypatch.setattr(hy_v4_model, "ParallelLMHead", FakeLMHead)
+    monkeypatch.setattr(
+        hy_v4_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    config = SimpleNamespace(
+        vocab_size=64,
+        hidden_size=32,
+        enable_lm_head_fp32=True,
+        tie_word_embeddings=False,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config),
+        quant_config=FakeQuantConfig(),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+    )
+
+    HYV4ForCausalLM(vllm_config=vllm_config)
+
+    assert captured["prefix"] == "lm_head"
+    assert captured["params_dtype"] is torch.float32
+    assert captured["quant_config"] is None
 
 
 def test_normalize_hyv4_config_populates_runtime_aliases() -> None:
@@ -134,6 +187,8 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
         torch.full((2, 2), float("nan"))
     )
     quant_projection_weight = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    runtime_scale_name = "model.layers.15.self_attn.mla_attn.q_scale"
+    runtime_scale_parameter = KVCacheScaleParameter()
 
     class CheckpointLinear(torch.nn.Module):
         def __init__(self) -> None:
@@ -198,6 +253,7 @@ def test_outer_load_weights_checks_correction_biases_after_all_prefix_groups(
                     (norm_name, self.model.norm_weight),
                     (linear_name, self.model.hc_fn.weight),
                     (quant_projection_name, self.model.q_proj.weight),
+                    (runtime_scale_name, runtime_scale_parameter),
                 ]
             )
 
@@ -317,6 +373,20 @@ def test_indexer_channel_fp8_dequantizes_each_output_row() -> None:
 
     actual = _dequantize_indexer_channel_fp8(weight, scale)
     expected = weight.float().mul(scale).to(torch.bfloat16)
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
+def test_indexer_mxfp8_dequantizes_each_32_element_block() -> None:
+    weight = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[127, 128], [126, 129]], dtype=torch.uint8)
+
+    actual = _dequantize_indexer_channel_fp8(weight, scale)
+    decoded_scale = torch.exp2(scale.float() - 127.0)
+    expected = (
+        weight.float().view(2, 2, 32) * decoded_scale.unsqueeze(-1)
+    ).view_as(weight).to(torch.bfloat16)
 
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)

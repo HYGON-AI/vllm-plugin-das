@@ -46,6 +46,10 @@ def register_model():
         "HYV4ForCausalLM", "vllm_hcu.models.hy_v4:HYV4ForCausalLM"
     )
 
+    ModelRegistry.register_model(
+        "HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP"
+    )
+
 
 def register_quant_method():
     """to do"""

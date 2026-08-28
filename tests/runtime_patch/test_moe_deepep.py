@@ -1557,7 +1557,9 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
             )
         ),
     )
+    official_enum = module.Fp8MoeBackend
     assert patch_fp8_oracle.apply_to_module(module) is True
+    assert module.Fp8MoeBackend is official_enum
     assert module.Fp8MoeBackend.DPSK_DEEPGEMM.value == "DPSK_DEEPGEMM"
 
     class SupportedExperts:

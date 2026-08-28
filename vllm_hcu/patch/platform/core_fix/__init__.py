@@ -20,11 +20,14 @@ from . import (
     patch_compilation_config,
     patch_engine_args,
     patch_envs,
+    patch_hy_v4_mtp_config,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
     patch_slimquant_registry,
     patch_vllm_config,
+    register_hy_v4_reasoning_parser,
+    register_hy_v4_tool_parser,
 )
 
 
@@ -37,7 +40,10 @@ _ORDERED_ADAPTERS = (
     patch_engine_args,
     patch_compilation_config,
     patch_vllm_config,
+    patch_hy_v4_mtp_config,
     patch_slimquant_registry,
+    register_hy_v4_reasoning_parser,
+    register_hy_v4_tool_parser,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
 )

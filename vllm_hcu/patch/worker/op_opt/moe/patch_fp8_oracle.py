@@ -30,6 +30,22 @@ TARGETS = (
 _MARKER = "_vllm_hcu_fp8_dpsk_oracle_applied"
 
 
+def _extend_enum(enum_cls, name: str, value: str):
+    """Add one member while preserving enum identity for existing importers."""
+    if name in enum_cls.__members__ or value in enum_cls._value2member_map_:
+        raise PatchCompatibilityError(
+            f"{enum_cls.__name__} already defines {name} or value {value}"
+        )
+    member = object.__new__(enum_cls)
+    member._name_ = name
+    member._value_ = value
+    enum_cls._member_names_.append(name)
+    enum_cls._member_map_[name] = member
+    enum_cls._value2member_map_[value] = member
+    type.__setattr__(enum_cls, name, member)
+    return enum_cls
+
+
 def _sidecar_config(config):
     from vllm.config import get_current_vllm_config_or_none
 
@@ -86,13 +102,14 @@ def apply_to_module(module: ModuleType) -> bool:
             "layer",
         ),
     )
-    values = {member.name: member.value for member in old_enum}
-    if "DPSK_DEEPGEMM" in values:
+    if "DPSK_DEEPGEMM" in old_enum.__members__:
         raise PatchCompatibilityError("DPSK backend is already present outside HCU adapter")
-    values["DPSK_DEEPGEMM"] = "DPSK_DEEPGEMM"
-    hcu_enum = target.Enum("Fp8MoeBackend", values, module=target.__name__)
+    # Several vLLM modules import Fp8MoeBackend before platform patches run.
+    # Replacing the Enum class leaves those modules holding members from a
+    # different class, so otherwise-valid backends such as TRITON_MXFP8 fail
+    # equality checks during post-load conversion. Preserve the class object.
+    hcu_enum = _extend_enum(old_enum, "DPSK_DEEPGEMM", "DPSK_DEEPGEMM")
     target._vllm_hcu_original_fp8_moe_backend = old_enum
-    target.Fp8MoeBackend = hcu_enum
 
     @functools.wraps(backend_to_cls)
     def hcu_backend_to_kernel_cls(backend):

@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_hcu.models.hy_v4 import hc as hy_v4_hc
 from vllm_hcu.models.hy_v4.hc import (
     HYV4HCHeadLayer,
     HYV4HCPostLayer,
@@ -24,6 +25,121 @@ class _FixedLinear(nn.Module):
 
     def forward(self, _input: torch.Tensor) -> tuple[torch.Tensor, None]:
         return self.output, None
+
+
+class _WeightOnlyLinear(nn.Module):
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight)
+
+    def forward(self, _input: torch.Tensor):
+        raise AssertionError("the eager linear must not run on the boltops path")
+
+
+def test_hc_projection_weights_keep_boltops_checkpoint_layout() -> None:
+    config = SimpleNamespace(rms_norm_eps=1e-5)
+
+    pre = HYV4HCPreLayer(config, hidden_dim=2, hc_mult=2)
+    head = HYV4HCHeadLayer(config, hidden_size=2, hc_mult=2)
+
+    assert pre.hc_fn.weight.shape == (4, 4)
+    assert pre.hc_fn.weight.dtype == torch.float32
+    assert head.hc_head_fn.weight.shape == (2, 4)
+    assert head.hc_head_fn.weight.dtype == torch.float32
+
+
+def test_hc_pre_dispatches_exact_parameters_to_boltops(monkeypatch) -> None:
+    layer = object.__new__(HYV4HCPreLayer)
+    nn.Module.__init__(layer)
+    layer.hc_fn = _WeightOnlyLinear(torch.arange(16, dtype=torch.float32).view(4, 4))
+    layer.hc_scale = nn.Parameter(torch.tensor([0.25, 0.5], dtype=torch.float32))
+    layer.hc_base = nn.Parameter(torch.arange(4, dtype=torch.float32))
+    layer.layernorm_epsilon = 1e-5
+    layer.hc_eps = 1e-6
+    layer.magnitude = 2.0
+    residual = torch.ones((1, 2, 2), dtype=torch.bfloat16)
+    expected_layer_in = torch.full((1, 2), 3, dtype=torch.bfloat16)
+    expected_post = torch.full((1, 2), 0.75, dtype=torch.float32)
+    captured: tuple[object, ...] | None = None
+
+    def fake_ihc_pre(*args):
+        nonlocal captured
+        captured = args
+        return expected_layer_in, expected_post
+
+    monkeypatch.setattr(hy_v4_hc, "_use_boltops_ihc", lambda tensor: True)
+    monkeypatch.setattr(hy_v4_hc, "ihc_pre", fake_ihc_pre)
+
+    actual_layer_in, actual_post = layer(residual)
+
+    assert captured == (
+        residual,
+        layer.hc_fn.weight,
+        layer.hc_scale,
+        layer.hc_base,
+        1e-5,
+        1e-6,
+        2.0,
+    )
+    assert actual_layer_in is expected_layer_in
+    assert actual_post is expected_post
+
+
+def test_hc_post_dispatches_exact_parameters_to_boltops(monkeypatch) -> None:
+    layer = HYV4HCPostLayer(SimpleNamespace())
+    branch = torch.ones((1, 2), dtype=torch.bfloat16)
+    residual = torch.ones((1, 2, 2), dtype=torch.bfloat16)
+    post = torch.ones((1, 2), dtype=torch.float32)
+    expected = torch.full((1, 2, 2), 7, dtype=torch.bfloat16)
+    captured: tuple[object, ...] | None = None
+
+    def fake_ihc_post(*args):
+        nonlocal captured
+        captured = args
+        return expected
+
+    monkeypatch.setattr(hy_v4_hc, "_use_boltops_ihc", lambda tensor: True)
+    monkeypatch.setattr(hy_v4_hc, "ihc_post", fake_ihc_post)
+
+    actual = layer(branch, residual, post)
+
+    assert captured == (branch, residual, post)
+    assert actual is expected
+
+
+def test_hc_head_dispatches_exact_parameters_to_boltops(monkeypatch) -> None:
+    layer = object.__new__(HYV4HCHeadLayer)
+    nn.Module.__init__(layer)
+    layer.config = SimpleNamespace(rms_norm_eps=1e-5)
+    layer.hc_eps = 1e-6
+    layer.hc_head_fn = _WeightOnlyLinear(
+        torch.arange(8, dtype=torch.float32).view(2, 4)
+    )
+    layer.hc_head_scale = nn.Parameter(torch.tensor([0.5], dtype=torch.float32))
+    layer.hc_head_base = nn.Parameter(torch.arange(2, dtype=torch.float32))
+    residual = torch.ones((1, 2, 2), dtype=torch.bfloat16)
+    expected = torch.full((1, 2), 5, dtype=torch.bfloat16)
+    captured: tuple[object, ...] | None = None
+
+    def fake_ihc_head(*args):
+        nonlocal captured
+        captured = args
+        return expected
+
+    monkeypatch.setattr(hy_v4_hc, "_use_boltops_ihc", lambda tensor: True)
+    monkeypatch.setattr(hy_v4_hc, "ihc_head", fake_ihc_head)
+
+    actual = layer(residual)
+
+    assert captured == (
+        residual,
+        layer.hc_head_fn.weight,
+        layer.hc_head_scale,
+        layer.hc_head_base,
+        1e-5,
+        1e-6,
+    )
+    assert actual is expected
 
 
 def test_hc_post_scatter_matches_fp32_reference() -> None:
