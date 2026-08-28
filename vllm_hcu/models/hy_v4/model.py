@@ -937,7 +937,6 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.model = HYV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.enable_lm_head_fp32 = getattr(self.config, "enable_lm_head_fp32", False)
         if get_pp_group().is_last_rank:
             lm_head_prefix = maybe_prefix(prefix, "lm_head")
             # ModelOpt returns UnquantizedLinearMethod for excluded LM heads.
@@ -952,7 +951,6 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                params_dtype=torch.float32 if self.enable_lm_head_fp32 else None,
                 quant_config=lm_head_quant_config,
                 prefix=lm_head_prefix,
             )
@@ -983,14 +981,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        if self.enable_lm_head_fp32:
-            # Keep the whole projection in fp32 so the head matches training.
-            with torch.autocast(device_type="cuda", enabled=False):
-                logits = self.logits_processor(
-                    self.lm_head, hidden_states.to(torch.float32)
-                )
-        else:
-            logits = self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
 
         if getattr(self.config, "soft_logits_capping", False):
             soft_cap = self.config.soft_logits_capping_logits

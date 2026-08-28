@@ -430,8 +430,6 @@ class HYV4MultiTokenPredictor(nn.Module):
         layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         lm_head = layer.shared_head.head
         projection_input = layer.shared_head(hidden_states)
-        if projection_input.dtype != lm_head.weight.dtype:
-            projection_input = projection_input.to(lm_head.weight.dtype)
         return self.logits_processor(lm_head, projection_input)
 
 

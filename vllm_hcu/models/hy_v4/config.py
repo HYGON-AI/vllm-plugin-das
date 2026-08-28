@@ -106,6 +106,9 @@ class HYV4Config(PreTrainedConfig):
                 for layer_type in self.layer_types
             ]
 
+        if self.enable_lm_head_fp32 and getattr(self, "head_dtype", None) is None:
+            self.head_dtype = "float32"
+
         super().__post_init__(**kwargs)
 
 

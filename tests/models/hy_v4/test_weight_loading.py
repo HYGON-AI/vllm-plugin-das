@@ -69,8 +69,29 @@ def test_excluded_quant_config_is_not_forwarded_to_lm_head(
     HYV4ForCausalLM(vllm_config=vllm_config)
 
     assert captured["prefix"] == "lm_head"
-    assert captured["params_dtype"] is torch.float32
+    assert "params_dtype" not in captured
     assert captured["quant_config"] is None
+
+
+def test_compute_logits_keeps_hidden_state_in_model_dtype() -> None:
+    captured: dict[str, torch.Tensor] = {}
+    model = object.__new__(HYV4ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(soft_logits_capping=False)
+    model.enable_lm_head_fp32 = True
+    model.lm_head = torch.nn.Identity()
+
+    def logits_processor(lm_head, hidden_states):
+        captured["hidden_states"] = hidden_states
+        return hidden_states.float()
+
+    model.logits_processor = logits_processor
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    actual = model.compute_logits(hidden_states)
+
+    assert captured["hidden_states"] is hidden_states
+    assert actual.dtype == torch.float32
 
 
 def test_normalize_hyv4_config_populates_runtime_aliases() -> None:

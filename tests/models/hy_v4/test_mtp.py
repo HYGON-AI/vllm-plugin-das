@@ -95,6 +95,39 @@ def test_predictor_masks_position_zero_embedding_before_mtp_layer() -> None:
     )
 
 
+def test_mtp_compute_logits_keeps_projection_input_dtype() -> None:
+    captured: dict[str, torch.Tensor] = {}
+
+    class SharedHead(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = nn.Linear(4, 8, bias=False, dtype=torch.float32)
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    predictor = object.__new__(hy_v4_mtp.HYV4MultiTokenPredictor)
+    nn.Module.__init__(predictor)
+    predictor.mtp_start_layer_idx = 78
+    predictor.num_mtp_layers = 1
+    predictor.spec_step_idx = 0
+    predictor.layers = nn.ModuleDict(
+        {"78": nn.ModuleDict({"shared_head": SharedHead()})}
+    )
+
+    def logits_processor(lm_head, projection_input):
+        captured["projection_input"] = projection_input
+        return projection_input.float()
+
+    predictor.logits_processor = logits_processor
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    actual = predictor.compute_logits(hidden_states)
+
+    assert captured["projection_input"] is hidden_states
+    assert actual.dtype == torch.float32
+
+
 def test_sparse_mtp_forward_requires_shared_target_topk_buffer() -> None:
     mtp = object.__new__(hy_v4_mtp.HYV4MTP)
     nn.Module.__init__(mtp)

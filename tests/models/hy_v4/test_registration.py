@@ -64,6 +64,24 @@ def test_hy_v4_config_normalizes_sparse_layer_spelling() -> None:
     ]
 
 
+def test_hy_v4_fp32_lm_head_uses_logits_processor_head_dtype() -> None:
+    config = HYV4Config(enable_lm_head_fp32=True)
+
+    assert config.head_dtype == "float32"
+
+
+def test_hy_v4_explicit_head_dtype_is_preserved() -> None:
+    config = HYV4Config(enable_lm_head_fp32=True, head_dtype="model")
+
+    assert config.head_dtype == "model"
+
+
+def test_hy_v4_disabled_fp32_lm_head_does_not_invent_head_dtype() -> None:
+    config = HYV4Config(enable_lm_head_fp32=False)
+
+    assert getattr(config, "head_dtype", None) is None
+
+
 def test_hy_v4_registry_includes_native_mtp(monkeypatch) -> None:
     import vllm_hcu.models as models
 
