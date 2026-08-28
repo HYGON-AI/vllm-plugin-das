@@ -24,14 +24,15 @@
 ### Task 1: HYV4 core runtime classification
 
 **Files:**
-- Create: `vllm_hcu/patch/platform/core_fix/patch_hy_v4_runtime_config.py`
+- Create: `vllm_hcu/patch/platform/core_fix/patch_hy_v4_vllm_config.py`
+- Create: `vllm_hcu/patch/platform/core_fix/patch_hy_v4_model_arch_config.py`
 - Modify: `vllm_hcu/patch/platform/core_fix/__init__.py`
 - Create: `tests/models/hy_v4/test_runtime_config.py`
 - Modify: `tests/patch/test_platform_dispatcher.py`
 
 **Interfaces:**
 - Consumes: `vllm.config.vllm.DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES`, `VllmConfig.__post_init__`, and `ModelArchConfigConvertorBase.is_deepseek_mla`.
-- Produces: `apply_to_vllm_config(module: ModuleType) -> bool` and `apply_to_arch_convertor(module: ModuleType) -> bool`, registered under two exact module callbacks with independent markers.
+- Produces: two standard adapter modules, each exposing `apply_to_module(module: ModuleType) -> bool`, and registered under independent exact module callbacks and markers.
 
 - [ ] **Step 1: Write failing classification tests**
 
