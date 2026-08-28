@@ -9,6 +9,38 @@ argument avoids importing optional communication libraries eagerly.
 
 from __future__ import annotations
 
+import inspect
+
+
+def _has_hcu_low_latency_dispatch_abi(buffer) -> bool:
+    dispatch = getattr(buffer, "low_latency_dispatch", None)
+    if dispatch is None:
+        return False
+    try:
+        parameters = inspect.signature(dispatch).parameters
+    except (TypeError, ValueError):
+        return False
+    names = tuple(parameters)
+    return (
+        names[:5]
+        == (
+            "x",
+            "topk_idx",
+            "topk_weight",
+            "num_max_dispatch_tokens_per_rank",
+            "num_experts",
+        )
+        and {
+            "quant_type",
+            "quant_group_size",
+            "fp8_round_scale",
+            "async_finish",
+            "return_recv_hook",
+        }.issubset(parameters)
+        and "use_fp8" not in parameters
+    )
+
+
 def ht_do_dispatch(
     module,
     self,
@@ -215,6 +247,7 @@ def ll_init(
         local_expert_global_ids,
     )
     self.use_int8_dispatch = bool(use_int8_dispatch)
+    self._hcu_low_latency_dispatch_abi = _has_hcu_low_latency_dispatch_abi(buffer)
 
 
 def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None):
@@ -327,9 +360,18 @@ def ll_prepare_async(
 ):
     from vllm_hcu.platforms import envs as henvs
 
+    hcu_dispatch_abi = getattr(self, "_hcu_low_latency_dispatch_abi", None)
+    if hcu_dispatch_abi is None:
+        hcu_dispatch_abi = _has_hcu_low_latency_dispatch_abi(
+            getattr(self, "buffer", None)
+        )
+        self._hcu_low_latency_dispatch_abi = hcu_dispatch_abi
     use_hcu_api = bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API
+        hcu_dispatch_abi
+        or (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API
+        )
     )
     if not self.use_int8_dispatch and not use_hcu_api:
         return original(

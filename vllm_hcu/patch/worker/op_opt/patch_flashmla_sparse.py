@@ -198,6 +198,13 @@ def apply_to_module(module: ModuleType) -> bool:
             pcp_world_size = int(
                 getattr(common_attn_metadata, "pcp_world_size", 1)
             )
+            cp_kv_cache_interleave_size = int(
+                getattr(
+                    common_attn_metadata,
+                    "cp_kv_cache_interleave_size",
+                    1,
+                )
+            )
         else:
             parallel_config = getattr(vllm_config, "parallel_config", None)
             pcp_world_size = getattr(
@@ -211,6 +218,17 @@ def apply_to_module(module: ModuleType) -> bool:
                     "is missing from sparse MLA metadata builder"
                 )
             pcp_world_size = int(pcp_world_size)
+            cp_kv_cache_interleave_size = getattr(
+                parallel_config,
+                "cp_kv_cache_interleave_size",
+                None,
+            )
+            if cp_kv_cache_interleave_size is None:
+                raise PatchCompatibilityError(
+                    "required vLLM 0.25.1 cp_kv_cache_interleave_size "
+                    "is missing from sparse MLA metadata builder"
+                )
+            cp_kv_cache_interleave_size = int(cp_kv_cache_interleave_size)
         pcp_world_size = effective_pcp_world_size(pcp_world_size)
         if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
             has_fp8_metadata = (
@@ -239,6 +257,7 @@ def apply_to_module(module: ModuleType) -> bool:
             common_attn_metadata.num_actual_tokens,
         )
         result.pcp_world_size = pcp_world_size
+        result.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         if result.pcp_world_size > 1:
             (
                 result.num_decodes,

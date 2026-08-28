@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from threading import local
 
 import torch
 
@@ -24,26 +25,49 @@ _REPLICATED_MTP_BATCH = ContextVar(
     "vllm_hcu_replicated_mtp_batch",
     default=False,
 )
+_REPLICATED_MTP_GRAPH_STATE = local()
 
 
 @contextmanager
 def replicated_mtp_batch_scope() -> Iterator[None]:
-    """Run a restored global MTP batch without reapplying PCP attention."""
+    """Run a restored global MTP batch without reapplying PCP attention.
+
+    The scope and any compiled forward that consumes it must execute
+    synchronously on the same worker thread.  The graph-safe mirror is
+    thread-local and therefore must not cross an ``await`` or thread handoff.
+    ``HcuGPUModelRunnerV2.sample_tokens`` satisfies this contract by entering
+    the scope immediately around its synchronous ``super().sample_tokens``.
+    """
 
     token = _REPLICATED_MTP_BATCH.set(True)
+    previous_graph_depth = getattr(_REPLICATED_MTP_GRAPH_STATE, "depth", 0)
+    _REPLICATED_MTP_GRAPH_STATE.depth = previous_graph_depth + 1
     try:
         yield
     finally:
+        _REPLICATED_MTP_GRAPH_STATE.depth = previous_graph_depth
         _REPLICATED_MTP_BATCH.reset(token)
 
 
 def in_replicated_mtp_batch() -> bool:
+    # Dynamo cannot trace ContextVar.get(). Model-runner sampling scopes and
+    # their compiled forwards execute synchronously on one worker thread, so
+    # mirror only the nesting depth needed while Dynamo captures that graph.
+    # Eager callers retain ContextVar's task-local semantics.
+    if torch.compiler.is_compiling():
+        return bool(getattr(_REPLICATED_MTP_GRAPH_STATE, "depth", 0))
     return bool(_REPLICATED_MTP_BATCH.get())
 
 
 def effective_pcp_world_size(configured_world_size: int) -> int:
     """Return the logical PCP width for the current model invocation."""
 
+    # TP/DCP-only execution is compiled as a full graph.  Avoid consulting the
+    # dynamic MTP scope in that common case because Dynamo cannot trace
+    # ContextVar.get().  A unitary PCP group is already unaffected by replicated
+    # MTP execution, so the lookup cannot change the result.
+    if configured_world_size == 1:
+        return 1
     if in_replicated_mtp_batch():
         return 1
     return configured_world_size

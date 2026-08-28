@@ -13,9 +13,11 @@ import argparse
 import gc
 import json
 import math
+import multiprocessing
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -24,6 +26,12 @@ from typing import Any
 
 import pytest
 
+REPOSITORY = Path(__file__).resolve().parents[2]
+if os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1":
+    repository_text = str(REPOSITORY)
+    if repository_text not in sys.path:
+        sys.path.append(repository_text)
+
 from tests.fixtures.resources import TestResources as HcuTestResources
 
 
@@ -31,6 +39,41 @@ DEFAULT_MODEL_ROOT = Path("/models/llm-models")
 DEFAULT_LOG_DIR = Path("/tmp/vllm-hcu-integration/logs")
 RESULT_PREFIX = "VLLM_HCU_RESULT="
 UNIFIED_ATTENTION_HEAD_DIMS = {128, 192, 256, 512}
+
+
+class _DataParallelTermination(BaseException):
+    pass
+
+
+class _DataParallelTerminationHandler:
+    def __init__(self) -> None:
+        self.defer_termination = False
+        self.deferred_signum: int | None = None
+
+    def __call__(self, signum: int, frame: Any) -> None:
+        if self.defer_termination:
+            self.deferred_signum = signum
+            return
+        _raise_data_parallel_signal(signum, frame)
+
+    def raise_if_deferred(self) -> None:
+        signum = self.deferred_signum
+        self.deferred_signum = None
+        if signum is not None:
+            _raise_data_parallel_signal(signum, None)
+
+
+def _raise_data_parallel_signal(signum: int, frame: Any) -> None:
+    if signum == signal.SIGINT:
+        signal.default_int_handler(signum, frame)
+    _raise_data_parallel_termination(signum, frame)
+
+
+def _raise_data_parallel_termination(signum: int, frame: Any) -> None:
+    del frame
+    raise _DataParallelTermination(
+        f"data-parallel launcher received signal {signum}"
+    )
 
 
 def available_hcu_count() -> int:
@@ -333,60 +376,84 @@ def run_vllm_case(
     if extra_env:
         env.update(extra_env)
     log_path = _case_log_path(log_label or case, model_path)
-    command = [
-        sys.executable,
-        "-m",
-        "tests.integration.model_runtime",
-        case,
-        "--model",
-        str(model_path),
-    ]
+    release_wheel = os.environ.get("VLLM_HCU_RELEASE_WHEEL") == "1"
+    if release_wheel:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            case,
+            "--model",
+            str(model_path),
+        ]
+        child_cwd = Path(
+            os.environ.get("HCU_CI_JOB_ROOT", "/tmp/vllm-hcu-release-wheel")
+        ) / "model-subprocess"
+        child_cwd.mkdir(parents=True, exist_ok=True)
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "tests.integration.model_runtime",
+            case,
+            "--model",
+            str(model_path),
+        ]
+        child_cwd = REPOSITORY
     if extra_args:
         command.extend(extra_args)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log:
-        log.write(_case_log_header(command, env=env, extra_env=extra_env))
-        log.flush()
-        proc = subprocess.Popen(
-            command,
-            cwd=Path(__file__).resolve().parents[2],
-            env=env,
-            text=True,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
-            returncode = proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            _terminate_case_process_group(proc)
-            output = log_path.read_text(encoding="utf-8", errors="replace")
+    proc = None
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write(_case_log_header(command, env=env, extra_env=extra_env))
+            log.flush()
+            proc = subprocess.Popen(
+                command,
+                cwd=child_cwd,
+                env=env,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                returncode = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                _terminate_case_process_group(proc)
+                output = log_path.read_text(encoding="utf-8", errors="replace")
+                raise AssertionError(
+                    f"vLLM integration case {case!r} timed out after "
+                    f"{timeout_s}s\n"
+                    f"command={' '.join(command)}\n"
+                    f"log={log_path}\n"
+                    f"{output}"
+                ) from None
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        if returncode != 0:
             raise AssertionError(
-                f"vLLM integration case {case!r} timed out after {timeout_s}s\n"
+                f"vLLM integration case {case!r} failed with rc={returncode}\n"
                 f"command={' '.join(command)}\n"
                 f"log={log_path}\n"
                 f"{output}"
-            ) from None
-    output = log_path.read_text(encoding="utf-8", errors="replace")
-    if returncode != 0:
+            )
+        for line in reversed(output.splitlines()):
+            if line.startswith(RESULT_PREFIX):
+                payload = line.removeprefix(RESULT_PREFIX)
+                parsed = json.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise AssertionError(
+                        f"invalid result payload for {case!r}: {payload}"
+                    )
+                return parsed
         raise AssertionError(
-            f"vLLM integration case {case!r} failed with rc={returncode}\n"
-            f"command={' '.join(command)}\n"
+            f"vLLM integration case {case!r} did not emit {RESULT_PREFIX!r}\n"
             f"log={log_path}\n"
             f"{output}"
         )
-    for line in reversed(output.splitlines()):
-        if line.startswith(RESULT_PREFIX):
-            payload = line.removeprefix(RESULT_PREFIX)
-            parsed = json.loads(payload)
-            if not isinstance(parsed, dict):
-                raise AssertionError(f"invalid result payload for {case!r}: {payload}")
-            return parsed
-    raise AssertionError(
-        f"vLLM integration case {case!r} did not emit {RESULT_PREFIX!r}\n"
-        f"log={log_path}\n"
-        f"{output}"
-    )
+    except BaseException:
+        if proc is not None:
+            _terminate_case_process_group(proc)
+        raise
 
 
 def _case_log_path(case: str, model_path: Path) -> Path:
@@ -416,18 +483,101 @@ def _case_log_header(
     return header
 
 
-def _terminate_case_process_group(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=30)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_groups(
+    process_group_ids: set[int],
+    timeout_s: float,
+    *,
+    process_leaders: list[Any] | None = None,
+) -> set[int]:
+    remaining = set(process_group_ids)
+    deadline = time.monotonic() + timeout_s
+    while remaining:
+        for process in process_leaders or ():
+            if hasattr(process, "poll"):
+                process.poll()
+            else:
+                process.join(timeout=0)
+        remaining = {
+            process_group_id
+            for process_group_id in remaining
+            if _process_group_exists(process_group_id)
+        }
+        if not remaining or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    return remaining
+
+
+def _signal_process_groups(process_group_ids: set[int], sig: signal.Signals) -> None:
+    for process_group_id in sorted(process_group_ids):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(process_group_id, sig)
         except ProcessLookupError:
-            return
-        proc.wait(timeout=10)
+            pass
+
+
+def _terminate_owned_process_groups(
+    process_group_ids: list[int] | set[int],
+    *,
+    process_leaders: list[Any] | None = None,
+    term_timeout_s: float = 30,
+    kill_timeout_s: float = 10,
+) -> None:
+    owned_groups = {int(process_group_id) for process_group_id in process_group_ids}
+    if not owned_groups:
+        return
+    protected_groups = {os.getpgrp()}
+    try:
+        protected_groups.add(os.getpgid(os.getppid()))
+    except ProcessLookupError:
+        pass
+    if min(owned_groups) <= 1 or owned_groups & protected_groups:
+        raise RuntimeError(
+            f"refusing to signal unvalidated process groups {sorted(owned_groups)}"
+        )
+
+    wait_kwargs = (
+        {"process_leaders": process_leaders}
+        if process_leaders is not None
+        else {}
+    )
+    _signal_process_groups(owned_groups, signal.SIGTERM)
+    remaining = _wait_for_process_groups(
+        owned_groups,
+        term_timeout_s,
+        **wait_kwargs,
+    )
+    if remaining:
+        _signal_process_groups(remaining, signal.SIGKILL)
+        remaining = _wait_for_process_groups(
+            remaining,
+            kill_timeout_s,
+            **wait_kwargs,
+        )
+    if remaining:
+        raise RuntimeError(
+            f"task-owned process groups survived cleanup: {sorted(remaining)}"
+        )
+
+
+def _terminate_case_process_group(proc: subprocess.Popen) -> None:
+    _terminate_owned_process_groups([proc.pid], process_leaders=[proc])
+    try:
+        proc.wait(timeout=0)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"case process {proc.pid} survived process-group cleanup"
+        ) from exc
 
 
 def _llm_kwargs(
@@ -1014,6 +1164,11 @@ def _parallel_config_summary(llm: Any) -> dict[str, Any]:
             "data_parallel_size",
             None,
         ),
+        "all2all_backend": getattr(
+            parallel_config,
+            "all2all_backend",
+            None,
+        ),
         "enable_expert_parallel": getattr(
             parallel_config,
             "enable_expert_parallel",
@@ -1027,20 +1182,62 @@ def _case_tp_ep_smoke(
     model_path: Path,
     *,
     tensor_parallel_size: int,
+    data_parallel_size: int,
     gpu_memory_utilization: float,
+    all2all_backend: str | None,
+    moe_backend: str,
+    enable_expert_parallel: bool = True,
+) -> dict[str, Any]:
+    if data_parallel_size > 1:
+        if not enable_expert_parallel:
+            raise ValueError(
+                "Disabling expert parallel is supported only when "
+                "data_parallel_size=1."
+            )
+        return _case_tp_ep_smoke_data_parallel(
+            model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            all2all_backend=all2all_backend,
+            moe_backend=moe_backend,
+        )
+
+    return _case_tp_ep_smoke_rank(
+        model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        all2all_backend=all2all_backend,
+        moe_backend=moe_backend,
+        enable_expert_parallel=enable_expert_parallel,
+    )
+
+
+def _case_tp_ep_smoke_rank(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    gpu_memory_utilization: float,
+    all2all_backend: str | None,
     moe_backend: str,
     enable_expert_parallel: bool = True,
 ) -> dict[str, Any]:
     from vllm import LLM
 
+    max_num_batched_tokens = (
+        300 if all2all_backend == "deepep_low_latency" else 512
+    )
     llm = LLM(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
             tensor_parallel_size=tensor_parallel_size,
+            all2all_backend=all2all_backend,
             enable_expert_parallel=enable_expert_parallel,
             max_model_len=512,
-            max_num_batched_tokens=512,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=2,
             gpu_memory_utilization=gpu_memory_utilization,
             moe_backend=moe_backend,
@@ -1060,12 +1257,207 @@ def _case_tp_ep_smoke(
         _shutdown_llm(llm)
     return {
         "requested_tensor_parallel_size": tensor_parallel_size,
+        "requested_data_parallel_size": data_parallel_size,
+        "requested_all2all_backend": all2all_backend,
         "requested_enable_expert_parallel": enable_expert_parallel,
         "requested_gpu_memory_utilization": gpu_memory_utilization,
         "requested_moe_backend": moe_backend,
         "parallel_config": parallel_config,
         "output": output,
     }
+
+
+def _tp_ep_data_parallel_rank(
+    local_dp_rank: int,
+    data_parallel_size: int,
+    dp_master_ip: str,
+    dp_master_port: int,
+    model_path: Path,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    all2all_backend: str | None,
+    moe_backend: str,
+    result_queue: Any,
+    process_group_id: Any,
+    process_group_lock: Any,
+    process_group_ready: Any,
+    start_gate: Any,
+) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    with process_group_lock:
+        if process_group_id.value == 0:
+            os.setpgid(0, 0)
+            process_group_id.value = os.getpid()
+        else:
+            os.setpgid(0, process_group_id.value)
+    process_group_ready.set()
+    start_gate.wait()
+    os.environ["VLLM_DP_RANK"] = str(local_dp_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
+    os.environ["VLLM_DP_SIZE"] = str(data_parallel_size)
+    os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
+    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+    result = _case_tp_ep_smoke_rank(
+        model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        all2all_backend=all2all_backend,
+        moe_backend=moe_backend,
+    )
+    result_queue.put((local_dp_rank, result))
+
+
+def _case_tp_ep_smoke_data_parallel(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    gpu_memory_utilization: float,
+    all2all_backend: str | None,
+    moe_backend: str,
+) -> dict[str, Any]:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        dp_master_port = int(listener.getsockname()[1])
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process_group_id = context.Value("q", 0)
+    process_group_lock = context.Lock()
+    process_group_ready = [context.Event() for _ in range(data_parallel_size)]
+    start_gate = context.Event()
+    processes = [
+        context.Process(
+            target=_tp_ep_data_parallel_rank,
+            args=(
+                rank,
+                data_parallel_size,
+                "127.0.0.1",
+                dp_master_port,
+                model_path,
+                tensor_parallel_size,
+                gpu_memory_utilization,
+                all2all_backend,
+                moe_backend,
+                result_queue,
+                process_group_id,
+                process_group_lock,
+                process_group_ready[rank],
+                start_gate,
+            ),
+        )
+        for rank in range(data_parallel_size)
+    ]
+    started_processes = []
+    completed = False
+    termination_handler = _DataParallelTerminationHandler()
+    previous_signal_handlers = {
+        sig: signal.signal(sig, termination_handler)
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        for process in processes:
+            started_processes.append(process)
+            termination_handler.defer_termination = True
+            try:
+                process.start()
+            finally:
+                termination_handler.defer_termination = False
+            termination_handler.raise_if_deferred()
+
+        for process, ready in zip(processes, process_group_ready, strict=True):
+            while not ready.wait(timeout=0.1):
+                if process.exitcode is not None:
+                    raise RuntimeError(
+                        f"data-parallel rank process {process.pid} failed "
+                        f"before process-group setup with exit code "
+                        f"{process.exitcode}"
+                    )
+        start_gate.set()
+
+        pending = set(processes)
+        while pending:
+            for process in tuple(pending):
+                process.join(timeout=0.1)
+                if process.exitcode is None:
+                    continue
+                pending.remove(process)
+                if process.exitcode != 0:
+                    raise RuntimeError(
+                        f"data-parallel rank process {process.pid} failed with "
+                        f"exit code {process.exitcode}"
+                    )
+
+        results = dict(result_queue.get(timeout=10) for _ in processes)
+        if len(results) != data_parallel_size:
+            raise RuntimeError(
+                f"expected {data_parallel_size} data-parallel rank results, "
+                f"got {len(results)}"
+            )
+        completed = True
+        return results[0]
+    finally:
+        try:
+            if not completed:
+                termination_handler.defer_termination = True
+                _terminate_data_parallel_process_groups(
+                    started_processes,
+                    process_group_ready[: len(started_processes)],
+                    process_group_id,
+                )
+        finally:
+            for sig, previous_handler in previous_signal_handlers.items():
+                signal.signal(sig, previous_handler)
+            termination_handler.defer_termination = False
+        termination_handler.raise_if_deferred()
+
+
+def _terminate_data_parallel_process_groups(
+    processes: list[Any],
+    process_group_ready: list[Any],
+    process_group_id: Any,
+) -> None:
+    if len(processes) != len(process_group_ready):
+        raise RuntimeError("rank process/group-ready tracking is inconsistent")
+
+    started_processes = [
+        process for process in processes if process.pid is not None
+    ]
+    unready_processes = [
+        process
+        for process, ready in zip(processes, process_group_ready, strict=True)
+        if process.pid is not None and not ready.is_set()
+    ]
+
+    for process in unready_processes:
+        if process.is_alive():
+            process.terminate()
+
+    owned_group_id = int(process_group_id.value)
+    if owned_group_id > 1:
+        _terminate_owned_process_groups(
+            [owned_group_id],
+            process_leaders=started_processes,
+            term_timeout_s=10,
+            kill_timeout_s=5,
+        )
+
+    for process in started_processes:
+        process.join(timeout=10)
+    survivors = [process for process in started_processes if process.is_alive()]
+    for process in survivors:
+        process.kill()
+    for process in survivors:
+        process.join(timeout=10)
+    survivors = [
+        process.pid for process in started_processes if process.is_alive()
+    ]
+    if survivors:
+        raise RuntimeError(
+            f"data-parallel rank parents survived cleanup: {survivors}"
+        )
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -1094,7 +1486,9 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lora-b", type=Path)
     parser.add_argument("--draft-model", type=Path)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--all2all-backend", default=None)
     parser.add_argument("--moe-backend", default="auto")
     parser.add_argument(
         "--disable-expert-parallel",
@@ -1141,7 +1535,9 @@ def _main(argv: list[str] | None = None) -> int:
         payload = _case_tp_ep_smoke(
             args.model,
             tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=args.data_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            all2all_backend=args.all2all_backend,
             moe_backend=args.moe_backend,
             enable_expert_parallel=not args.disable_expert_parallel,
         )

@@ -11,6 +11,26 @@ SHELL ["/bin/bash", "-c"]
 ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
 
+# CI 环境锁定 Python 3.10; 部分基础镜像的 python3 仍指向系统 Python 3.6.
+# GitHub runner 还可能把 /home/github/.local/bin 放到 PATH 前面, 这里同步修正。
+RUN PYTHON_BIN="$(readlink -f "$(command -v python3.10)")" && \
+    "$PYTHON_BIN" -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version' && \
+    mkdir -p /home/github/.local/bin && \
+    ln -sf "$PYTHON_BIN" /usr/local/bin/python && \
+    ln -sf "$PYTHON_BIN" /usr/local/bin/python3 && \
+    ln -sf "$PYTHON_BIN" /usr/local/bin/python3.10 && \
+    ln -sf "$PYTHON_BIN" /home/github/.local/bin/python && \
+    ln -sf "$PYTHON_BIN" /home/github/.local/bin/python3 && \
+    if [[ "$PYTHON_BIN" != "/home/github/.local/bin/python3.10" ]]; then \
+        ln -sf "$PYTHON_BIN" /home/github/.local/bin/python3.10; \
+    fi && \
+    "$PYTHON_BIN" -m pip --version && \
+    printf '%s\n' '#!/bin/bash' "exec ${PYTHON_BIN} -m pip \"\$@\"" > /usr/local/bin/pip && \
+    printf '%s\n' '#!/bin/bash' "exec ${PYTHON_BIN} -m pip \"\$@\"" > /usr/local/bin/pip3 && \
+    chmod +x /usr/local/bin/pip /usr/local/bin/pip3 && \
+    ln -sf /usr/local/bin/pip /home/github/.local/bin/pip && \
+    ln -sf /usr/local/bin/pip3 /home/github/.local/bin/pip3
+
 # pip 配置 + das-install
 RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     mkdir -p ~/.pip && \
@@ -30,6 +50,8 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     'echo "Installing $pkg==$ver"' \
     'pip install --no-cache-dir --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com "$pkg==$ver"' \
     > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
+
+COPY requirements-test.txt /tmp/requirements-test.txt
 
 # AICC 编译器 (nightly 最新版地址由 CI 通过 build-arg 传入, 在镜像内下载安装)
 # AICC_VERSION 由 CI 从同一 URL 解析传入; ENV 指令不支持 bash 参数展开, 无法在 Dockerfile 内由 URL 自动推导
@@ -51,6 +73,8 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir vllm==${VLLM_VERSION} \
     && pip install --no-cache-dir vllm-hcu==${VLLM_VERSION} \
+    && pip install --no-cache-dir -r /tmp/requirements-test.txt \
+    && pip install --no-cache-dir evalscope==1.9.1 pytest==9.1.1 \
     && pip cache purge
 
 # ---layer--- torch + das 加速库
@@ -69,6 +93,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install causal_conv1d==1.5.4 ${TORCH_TAG} \
     && das-install flash_mla ${TORCH_TAG} \
     && das-install fastsafetensors ${TORCH_TAG} \
+    && das-install flash_kda ${TORCH_TAG} \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip cache purge
     

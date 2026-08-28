@@ -16,10 +16,22 @@ jobs:
   static-patch-gate:
     runs-on:
       - self-hosted
-      - hcu-linux-cpu
+      - hcu-ci-pr
+    container:
+      image: ${{ vars.HCU_CI_IMAGE }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Verify every patch has a contract and test reference
-        run: python tools/check_patch_test_coverage.py
+        run: |
+          /usr/local/bin/python3.10 --version
+          /usr/local/bin/python3.10 tools/check_patch_test_coverage.py
       - name: Compile test and patch tooling
-        run: python -m compileall -q tools tests
+        run: /usr/local/bin/python3.10 -m compileall -q tools tests
+
+      # Job containers run as root on the host-mounted self-hosted workspace.
+      - name: Remove container-owned workspace files
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true

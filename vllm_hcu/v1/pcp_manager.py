@@ -3,20 +3,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU MRV2 virtual-batch prefill context parallelism.
 
-This is a narrow HCU backport of the DualChunkSwap batch-layout algorithm from
-vLLM upstream PR #46570 at commit b6ff8a2f50. Runner wiring is intentionally
-owned by the later integration task.
+This backports the DualChunkSwap batch layout from upstream PR #46570 and its
+GQA FlashAttention plan from upstream PR #49564 to the HCU v0.25.1 sidecar.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
-from vllm.distributed.parallel_state import get_pcp_group
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
@@ -52,6 +52,29 @@ class _BatchSegment:
         return self.num_actual_tokens + self.padding_tokens
 
 
+class PCPContextPlan(NamedTuple):
+    """Cached-context attention inputs for one PCP+DCP step."""
+
+    padded_num_tokens: int
+    restore_idx: torch.Tensor
+    local_idx: torch.Tensor
+    cu_q: torch.Tensor
+    max_q: int
+    ctx_lens: torch.Tensor
+    ctx_cu: torch.Tensor
+    max_ctx: int
+    block_table: torch.Tensor
+
+
+class PCPPlan(NamedTuple):
+    """New-token and cached-context attention plan for one PCP step."""
+
+    new_kv_idx: torch.Tensor
+    new_cu_kv: torch.Tensor
+    new_max_kv: int
+    ctx: PCPContextPlan | None
+
+
 class HcuPCPManager:
     """Build rank-local virtual rows while retaining the global step batch."""
 
@@ -63,6 +86,7 @@ class HcuPCPManager:
         block_tables: object,
         *,
         pcp_group: object | None = None,
+        dcp_group: object | None = None,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.pcp_size = int(parallel_config.prefill_context_parallel_size)
@@ -72,6 +96,18 @@ class HcuPCPManager:
         self.pcp_rank = int(self._pcp_group.rank_in_group)
         assert int(self._pcp_group.world_size) == self.pcp_size
         assert 0 <= self.pcp_rank < self.pcp_size
+        self.dcp_world_size = int(parallel_config.decode_context_parallel_size)
+        self.cp_interleave = int(parallel_config.cp_kv_cache_interleave_size)
+        if self.dcp_world_size > 1:
+            self._dcp_group = (
+                dcp_group if dcp_group is not None else get_dcp_group()
+            )
+            self.dcp_rank = int(self._dcp_group.rank_in_group)
+            assert int(self._dcp_group.world_size) == self.dcp_world_size
+        else:
+            self._dcp_group = dcp_group
+            self.dcp_rank = 0
+        self._use_mla = bool(vllm_config.model_config.use_mla)
 
         self._req_states = req_states
         self._block_tables = block_tables
@@ -80,6 +116,10 @@ class HcuPCPManager:
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._hidden_restore_idx_np: np.ndarray | None = None
+        self._padded_num_tokens = 0
+        self._local_segments: list[_BatchSegment] = []
+        self._global_has_prefill = False
 
         scheduler_config = vllm_config.scheduler_config
         # DualChunkSwap has at most two real rows per request. HCU may need one
@@ -140,6 +180,10 @@ class HcuPCPManager:
             )
             if self._local_block_tables
             else None
+        )
+        self._global_block_tables = tuple(
+            table.new_zeros((int(scheduler_config.max_num_seqs), table.shape[1]))
+            for table in input_block_tables
         )
         num_kv_groups = int(getattr(block_tables, "num_kv_cache_groups", 0))
         self._global_slot_mappings = (
@@ -274,7 +318,8 @@ class HcuPCPManager:
             input_batch.num_scheduled_tokens
         ):
             if (
-                int(query_len_value) == 0
+                not self._use_mla
+                or int(query_len_value) == 0
                 or not bool(input_batch.is_prefilling_np[req_idx])
             ):
                 continue
@@ -364,6 +409,8 @@ class HcuPCPManager:
         self._hidden_restore_idx = torch.from_numpy(hidden_restore_idx).to(
             self.device
         )
+        self._hidden_restore_idx_np = hidden_restore_idx
+        self._padded_num_tokens = padded_num_tokens
         self._padded_gather_idx = torch.from_numpy(padded_gather_idx).to(
             self.device
         )
@@ -383,6 +430,7 @@ class HcuPCPManager:
                 "PCP spec decode requires per-request draft-token counts"
             )
         self._global_batch = input_batch
+        self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(input_batch)
         segments = segments_by_rank[self.pcp_rank]
@@ -396,6 +444,7 @@ class HcuPCPManager:
                     local_slice=slice(0, 0),
                 )
             ]
+        self._local_segments = list(segments)
         num_local_reqs = len(segments)
         num_local_tokens = per_rank_num_tokens[self.pcp_rank]
         num_padded_tokens = max(per_rank_num_tokens, default=0)
@@ -716,7 +765,13 @@ class HcuPCPManager:
         ]
         global_slots.copy_(computed_slots)
         self._global_attn_ready = True
-        return local_tables, self._convert_slot_mappings(global_slots)
+        slot_mappings = (
+            self._convert_slot_mappings(global_slots)
+            if self._global_has_prefill
+            else global_slots
+        )
+        setattr(input_batch, "_vllm_hcu_pcp_plan", self.build_plan())
+        return local_tables, slot_mappings
 
     def prepare_global_attn(
         self,
@@ -775,6 +830,113 @@ class HcuPCPManager:
         gathered = self._pcp_group.all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
+    def build_plan(self) -> PCPPlan | None:
+        """Build the GQA attention plan for a sharded PCP+DCP prefill."""
+
+        global_batch = self._global_batch
+        restore_idx_np = self._hidden_restore_idx_np
+        if (
+            self._use_mla
+            or global_batch is None
+            or restore_idx_np is None
+            or self.dcp_world_size <= 1
+            or not self._global_has_prefill
+        ):
+            return None
+
+        num_reqs = global_batch.num_reqs
+        query_start_loc = global_batch.query_start_loc_np
+        num_computed = global_batch.num_computed_tokens_np[:num_reqs]
+        new_kv_parts: list[np.ndarray] = []
+        new_kv_lens: list[int] = []
+        for segment in self._local_segments:
+            request_start = int(query_start_loc[segment.global_req_idx])
+            row_end = segment.global_slice.stop
+            new_kv_parts.append(restore_idx_np[request_start:row_end])
+            new_kv_lens.append(row_end - request_start)
+        new_kv_idx_np = (
+            np.concatenate(new_kv_parts)
+            if new_kv_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        new_cu_np = np.zeros(len(new_kv_lens) + 1, dtype=np.int32)
+        np.cumsum(np.asarray(new_kv_lens, dtype=np.int32), out=new_cu_np[1:])
+
+        context_lens_np = num_computed.astype(np.int32)
+        has_context = bool(context_lens_np.any())
+        if has_context:
+            local_context_lens_np = (
+                get_dcp_local_seq_lens(
+                    torch.from_numpy(context_lens_np),
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                .numpy()
+                .astype(np.int32)
+            )
+        else:
+            local_context_lens_np = np.zeros(0, dtype=np.int32)
+        context_cu_np = np.zeros(len(local_context_lens_np) + 1, dtype=np.int32)
+        np.cumsum(local_context_lens_np, out=context_cu_np[1:])
+
+        new_kv_idx = torch.from_numpy(new_kv_idx_np).to(self.device)
+        packed_int32 = torch.from_numpy(
+            np.concatenate((new_cu_np, local_context_lens_np, context_cu_np))
+        ).to(self.device)
+        num_new_cu = len(new_cu_np)
+        new_cu_kv = packed_int32[:num_new_cu]
+
+        context_plan = None
+        if has_context:
+            assert self._hidden_restore_idx is not None
+            assert self._padded_gather_idx is not None
+            canonical_tables = getattr(self._block_tables, "block_tables", None)
+            if not isinstance(canonical_tables, list) or not canonical_tables:
+                raise PatchCompatibilityError(
+                    "vLLM 0.25.1 BlockTables canonical block_tables storage is missing"
+                )
+            source = getattr(canonical_tables[0], "gpu", None)
+            if not isinstance(source, torch.Tensor):
+                raise PatchCompatibilityError(
+                    "vLLM 0.25.1 BlockTables canonical block_tables GPU storage "
+                    "is missing"
+                )
+            global_block_table = self._global_block_tables[0][:num_reqs]
+            torch.index_select(
+                source,
+                0,
+                global_batch.idx_mapping[:num_reqs].to(torch.int64),
+                out=global_block_table,
+            )
+            context_lens = packed_int32[
+                num_new_cu : num_new_cu + num_reqs
+            ]
+            context_cu = packed_int32[num_new_cu + num_reqs :]
+            rank_start = self.pcp_rank * self._padded_num_tokens
+            num_local_tokens = sum(
+                segment.num_tokens for segment in self._local_segments
+            )
+            context_plan = PCPContextPlan(
+                padded_num_tokens=self._padded_num_tokens,
+                restore_idx=self._hidden_restore_idx,
+                local_idx=self._padded_gather_idx[
+                    rank_start : rank_start + num_local_tokens
+                ],
+                cu_q=global_batch.query_start_loc[: num_reqs + 1],
+                max_q=int(global_batch.num_scheduled_tokens.max()),
+                ctx_lens=context_lens,
+                ctx_cu=context_cu,
+                max_ctx=int(local_context_lens_np.max()),
+                block_table=global_block_table,
+            )
+        return PCPPlan(
+            new_kv_idx=new_kv_idx,
+            new_cu_kv=new_cu_kv,
+            new_max_kv=max(new_kv_lens, default=0),
+            ctx=context_plan,
+        )
+
     def restore_for_sampling(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, InputBatch]:
@@ -818,6 +980,8 @@ def maybe_restore_pcp_for_sampling(
 
 __all__ = [
     "HcuPCPManager",
+    "PCPContextPlan",
+    "PCPPlan",
     "RankSegment",
     "maybe_build_pcp_manager",
     "maybe_partition_pcp_batch",

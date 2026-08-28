@@ -19,6 +19,11 @@ from tests.integration.model_runtime import (
 
 QWEN35_35B_A3B = "qwen3.5/Qwen3.5-35B-A3B"
 DEEPSEEK_R1_CHANNEL_INT8 = "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8"
+GLM52_CHANNEL_INT8 = "GLM-5.2-Channel-INT8-w8a8"
+GLM52_DEEPEP_MODES = (
+    pytest.param("deepep_high_throughput", id="high-throughput"),
+    pytest.param("deepep_low_latency", id="low-latency"),
+)
 QWEN35_35B_A3B_TP_EP_SIZES = (
     pytest.param(4, id="tp4-ep4"),
     pytest.param(2, id="tp2-ep2"),
@@ -79,10 +84,10 @@ DEEPSEEK_R1_CHANNEL_INT8_TP_EP_MOE_PATHS = (
         id="target-triton",
     ),
     pytest.param(
-        "dpsk-deep-gemm",
-        "dpsk_deep_gemm",
+        "deep-gemm",
+        "deep_gemm",
         {},
-        id="dpsk-deep-gemm",
+        id="deep-gemm",
     ),
 )
 
@@ -125,16 +130,22 @@ def _assert_tp_ep_result(
     result: dict[str, Any],
     *,
     expected_tp: int,
+    expected_dp: int,
     expected_gpu_memory_utilization: float,
+    expected_all2all: str | None,
     expected_moe_backend: str,
 ) -> None:
     assert result["requested_tensor_parallel_size"] == expected_tp
+    assert result["requested_data_parallel_size"] == expected_dp
+    assert result["requested_all2all_backend"] == expected_all2all
     assert result["requested_enable_expert_parallel"] is True
     assert result["requested_gpu_memory_utilization"] == expected_gpu_memory_utilization
     assert result["requested_moe_backend"] == expected_moe_backend
     parallel_config = result["parallel_config"]
     if parallel_config:
         assert parallel_config["tensor_parallel_size"] == expected_tp
+        assert parallel_config["data_parallel_size"] == expected_dp
+        assert parallel_config["all2all_backend"] == expected_all2all
         assert parallel_config["enable_expert_parallel"] is True
         assert parallel_config["world_size"] >= expected_tp
     assert len(result["output"]) == 2
@@ -191,7 +202,9 @@ def test_qwen35_35b_a3b_tp_ep_smoke(
     _assert_tp_ep_result(
         result,
         expected_tp=tp_size,
+        expected_dp=1,
         expected_gpu_memory_utilization=gpu_memory_utilization,
+        expected_all2all=None,
         expected_moe_backend=moe_backend,
     )
 
@@ -245,6 +258,57 @@ def test_deepseek_r1_channel_int8_tp_ep_smoke(
     _assert_tp_ep_result(
         result,
         expected_tp=tp_size,
+        expected_dp=1,
         expected_gpu_memory_utilization=gpu_memory_utilization,
+        expected_all2all=None,
         expected_moe_backend=moe_backend,
+    )
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(8)
+@pytest.mark.slow
+@pytest.mark.nightly
+@pytest.mark.parametrize("all2all_backend", GLM52_DEEPEP_MODES)
+def test_glm52_channel_int8_deepep_smoke(
+    hcu_test_resources: HcuTestResources,
+    all2all_backend: str,
+) -> None:
+    require_gfx_arch("gfx938", "GLM-5.2-Channel-INT8 DeepEP")
+    model_path = require_model_runtime(
+        hcu_test_resources,
+        env_name="VLLM_HCU_GLM52_CHANNEL_INT8_MODEL",
+        relative_path=GLM52_CHANNEL_INT8,
+        label="GLM-5.2-Channel-INT8 DeepEP",
+        hcu_count=8,
+    )
+
+    result = run_vllm_case(
+        "tp-ep-smoke",
+        model_path,
+        timeout_s=5400,
+        log_label=f"glm52-int8-{all2all_backend}",
+        extra_args=[
+            "--tensor-parallel-size",
+            "1",
+            "--data-parallel-size",
+            "8",
+            "--all2all-backend",
+            all2all_backend,
+            "--gpu-memory-utilization",
+            "0.9",
+            "--moe-backend",
+            "deep_gemm",
+        ],
+    )
+
+    _assert_tp_ep_result(
+        result,
+        expected_tp=1,
+        expected_dp=8,
+        expected_gpu_memory_utilization=0.9,
+        expected_all2all=all2all_backend,
+        expected_moe_backend="deep_gemm",
     )

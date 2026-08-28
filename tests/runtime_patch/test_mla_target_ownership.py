@@ -755,7 +755,7 @@ def test_replicated_mtp_scope_uses_target_mla_forward(monkeypatch):
     assert events == ["opaque_forward"]
 
 
-def test_dense_and_sparse_mla_metadata_carry_pcp_world_size(monkeypatch):
+def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
     adapter = _adapter()
     module = _fake_mla_module(adapter, [])
     assert adapter.apply_to_module(module) is True
@@ -828,12 +828,16 @@ def _build_fp8_separate_prefill_decode(self, common_attn_metadata):
     assert sparse_adapter.apply_to_module(sparse_module) is True
     sparse_builder = FlashMLASparseMetadataBuilder()
     sparse_builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=4,
+        )
     )
 
     sparse_metadata = sparse_builder.build(0, common)
 
     assert sparse_metadata.pcp_world_size == 2
+    assert sparse_metadata.cp_kv_cache_interleave_size == 4
 
     from vllm_hcu.model_executor.layers.attention import pcp
 
@@ -902,6 +906,11 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
 
     class UpstreamFlashMLASparseImpl:
         supports_pcp = False
+        can_return_lse_for_decode = False
+
+        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+            del self, q, kv_cache, attn_metadata, layer
+            return "upstream-output", None
 
     class UpstreamFlashMLASparseBackend:
         @staticmethod
@@ -928,7 +937,175 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
     sparse_impl = sparse.HcuFlashMLASparseBackend.get_impl_cls()
     assert sparse_impl is sparse.HcuFlashMLASparseImpl
     assert sparse_impl.supports_pcp is True
+    assert sparse_impl.can_return_lse_for_decode is True
     assert UpstreamFlashMLASparseImpl.supports_pcp is False
+    assert UpstreamFlashMLASparseImpl.can_return_lse_for_decode is False
+
+
+def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
+    monkeypatch,
+):
+    calls: list[tuple[object, ...]] = []
+
+    class UpstreamFlashMLASparseImpl:
+        supports_pcp = False
+        can_return_lse_for_decode = False
+
+        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+            calls.append(("upstream", q, kv_cache, attn_metadata, layer))
+            return "upstream-output", None
+
+    class UpstreamFlashMLASparseBackend:
+        @staticmethod
+        def get_impl_cls():
+            return UpstreamFlashMLASparseImpl
+
+    def concat_mla_q(q_nope, q_pe, output):
+        output.copy_(torch.cat((q_nope, q_pe), dim=-1))
+
+    def convert_indices(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("DCP sparse MLA used the non-DCP index converter")
+
+    def filter_dcp_indices(
+        req_id_per_token,
+        block_table,
+        topk_indices,
+        *,
+        dcp_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
+        BLOCK_SIZE,
+        NUM_TOPK_TOKENS,
+        return_valid_counts,
+    ):
+        torch.testing.assert_close(
+            req_id_per_token,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            block_table,
+            torch.tensor([[7], [11]], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            topk_indices,
+            torch.tensor(
+                [[0, 1, 2, 3], [0, 2, 4, 6]],
+                dtype=torch.int32,
+            ),
+        )
+        calls.append(
+            (
+                "filter_dcp",
+                req_id_per_token,
+                block_table,
+                topk_indices,
+                dcp_size,
+                dcp_rank,
+                cp_kv_cache_interleave_size,
+                BLOCK_SIZE,
+                NUM_TOPK_TOKENS,
+                return_valid_counts,
+            )
+        )
+        # For DCP size=2/rank=1/interleave=1, global positions 1 and 3
+        # become local positions 0 and 1. With physical block 7, those
+        # are slots 112 and 113. The second row has no rank-1 ownership.
+        return (
+            torch.tensor(
+                [[112, 113, -1, -1], [-1, -1, -1, -1]],
+                dtype=torch.int32,
+            ),
+            torch.tensor([2, 0], dtype=torch.int32),
+        )
+
+    kernel_output = torch.arange(24, dtype=torch.float32).view(2, 4, 3)
+    kernel_lse = torch.arange(8, dtype=torch.float32).view(2, 4)
+
+    def sparse_fwd(q, cache, indices, scale, *, topk_length):
+        calls.append(("kernel", q.clone(), cache, indices, scale, topk_length))
+        return kernel_output.clone(), torch.empty(0), kernel_lse.clone()
+
+    _install_stub(
+        monkeypatch,
+        "vllm.v1.attention.backends.mla.flashmla_sparse",
+        FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
+        FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+    )
+    _install_stub(monkeypatch, "vllm._custom_ops", concat_mla_q=concat_mla_q)
+    _install_stub(
+        monkeypatch,
+        "vllm.v1.attention.backends.mla.sparse_utils",
+        triton_convert_req_index_to_global_index=convert_indices,
+        triton_filter_and_convert_dcp_index=filter_dcp_indices,
+    )
+    _install_stub(
+        monkeypatch,
+        "vllm_hcu.v1.attention.ops.flashmla",
+        flash_mla_sparse_fwd=sparse_fwd,
+    )
+
+    module_name = "_vllm_hcu_cpu_test_flashmla_sparse_dcp_backend"
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/v1/attention/backends/mla/flashmla_sparse.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, source)
+    assert spec is not None and spec.loader is not None
+    sparse = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, sparse)
+    spec.loader.exec_module(sparse)
+
+    impl = sparse.HcuFlashMLASparseImpl()
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 1
+    impl.kv_cache_dtype = "auto"
+    impl.softmax_scale = 0.25
+    impl.q_concat_buffer = torch.empty(2, 4, 4)
+    impl.topk_indices_buffer = torch.tensor(
+        [[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.int32
+    )
+    q_nope = torch.ones(2, 4, 3)
+    q_pe = torch.full((2, 4, 1), 2.0)
+    cache = torch.ones(6, 4)
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[7], [11]], dtype=torch.int32),
+        block_size=16,
+        cp_kv_cache_interleave_size=1,
+    )
+    layer = object()
+
+    output, lse = impl.forward_mqa((q_nope, q_pe), cache, metadata, layer)
+
+    torch.testing.assert_close(output[0], kernel_output[0])
+    torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
+    torch.testing.assert_close(lse[0], kernel_lse[0])
+    assert torch.isneginf(lse[1]).all()
+    filter_call = calls[-2]
+    assert filter_call[0] == "filter_dcp"
+    assert filter_call[4:10] == (2, 1, 1, 16, 4, True)
+    kernel_call = calls[-1]
+    assert kernel_call[0] == "kernel"
+    assert kernel_call[1].shape == (2, 4, 4)
+    assert kernel_call[2].shape == (6, 1, 4)
+    torch.testing.assert_close(
+        kernel_call[3],
+        torch.tensor(
+            [[[112, 113, -1, -1]], [[-1, -1, -1, -1]]],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        kernel_call[-1], torch.tensor([2, 0], dtype=torch.int32)
+    )
+
+    impl.dcp_world_size = 1
+    assert impl.forward_mqa(q_nope, cache, metadata, layer) == (
+        "upstream-output",
+        None,
+    )
+    assert calls[-1][0] == "upstream"
 
 
 def test_flashmla_cat_route_consumes_split_query(

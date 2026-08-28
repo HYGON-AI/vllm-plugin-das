@@ -182,7 +182,7 @@ def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        (None, "cutlass"),
+        (None, "varlen"),
         ("VLLM_HCU_USE_FLASH_ATTN", "classic"),
         ("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "cutlass"),
         ("VLLM_HCU_USE_FLASH_ATTN_VARLEN", "varlen"),
@@ -393,6 +393,25 @@ def _bare_flash_attention_builder(flash_attn, *, sliding_window: int = 32):
     return builder
 
 
+def test_gqa_pcp_plan_reaches_flash_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping the per-step plan makes FlashAttention read local-row metadata."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    builder = _bare_flash_attention_builder(flash_attn)
+    plan = object()
+
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=_common_attention_metadata(causal=True),
+        pcp_plan=plan,
+    )
+
+    assert flash_attn.FlashAttentionImpl.supports_pcp is True
+    assert metadata.pcp_plan is plan
+
+
 def _common_attention_metadata(*, causal: bool | torch.Tensor):
     return SimpleNamespace(
         num_reqs=1,
@@ -506,6 +525,45 @@ def test_hcu_flash_attention_encoder_window_is_symmetric(
     )
 
     assert impl.sliding_window == (7, 7)
+
+
+def test_hcu_flash_attention_backend_rejects_pcp_with_dcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attention backend must fail closed if config validation is bypassed."""
+
+    from vllm.distributed import parallel_state
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dcp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+    )
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        flash_attn,
+        "flash_attn_supports_quant_query_input",
+        lambda: False,
+    )
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "classic")
+
+    with pytest.raises(ValueError, match="does not support decode context"):
+        flash_attn.FlashAttentionImpl(
+            num_heads=1,
+            head_size=64,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+        )
 
 
 @pytest.mark.parametrize(
@@ -917,6 +975,56 @@ def test_block_first_kv_update_passes_axis_one_views_to_aiter(
     assert value_cache.stride() == expected_value_cache.stride()
     assert key_cache.storage_offset() == expected_key_cache.storage_offset()
     assert value_cache.storage_offset() == expected_value_cache.storage_offset()
+
+
+def test_pcp_kv_update_does_not_retain_gathered_tokens_without_dcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DCP=1 writes gathered K/V immediately and must not retain it per layer."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    impl.use_pcp = True
+    impl.pcp_world_size = 2
+    impl.dcp_world_size = 1
+    impl._pcp_kv = {}
+
+    class _PCPGroup:
+        @staticmethod
+        def all_gather(tensor, dim):
+            assert dim == 0
+            assert tensor.is_contiguous()
+            return torch.cat((tensor, tensor + 10), dim=0)
+
+    writes: list[tuple[object, ...]] = []
+    monkeypatch.setattr(flash_attn, "get_pcp_group", lambda: _PCPGroup())
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "reshape_and_cache_flash",
+        lambda *args: writes.append(args),
+    )
+    qkv = torch.arange(4, dtype=torch.float32).reshape(2, 2, 1, 1)
+    key = qkv[:, 0]
+    value = (qkv + 100)[:, 1]
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+    cache = torch.empty(4, 2, 1, 1, 1)
+    slots = torch.tensor([0, 1, 2, 3])
+    layer = SimpleNamespace(
+        layer_name="model.layers.0.self_attn",
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+
+    gathered_key, gathered_value = writes[0][0], writes[0][1]
+    assert gathered_key.flatten().tolist() == [0.0, 2.0, 10.0, 12.0]
+    assert gathered_value.flatten().tolist() == [101.0, 103.0, 111.0, 113.0]
+    assert layer.layer_name not in impl._pcp_kv
 
 
 def test_platform_block_copy_and_swap_use_axis_zero():

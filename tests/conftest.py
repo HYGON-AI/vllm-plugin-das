@@ -14,6 +14,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Test modules import vLLM targets during collection.  Keep entry-point plugin
+# activation explicit so collection cannot register replacement modules that a
+# later isolation fixture then removes while leaving vLLM custom-op state live.
+os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
+
 import pytest
 
 from tests.fixtures.artifacts import EnvironmentFingerprint

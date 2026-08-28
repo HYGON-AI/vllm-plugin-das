@@ -548,9 +548,11 @@ def deepgemm_moe_permute(
     H = aq.size(1)
     device = aq.device
 
-    block_m, block_k = get_mk_alignment_for_contiguous_layout()
     if current_platform.is_rocm():
-        block_m = max(block_m, _HCU_TOKEN_ALIGNMENT)
+        block_m = _HCU_TOKEN_ALIGNMENT
+        block_k = 128
+    else:
+        block_m, block_k = get_mk_alignment_for_contiguous_layout()
     # The activation-scale group size may differ from the M/K tile alignment
     # (e.g. MXFP8 uses a 32-element scale group while block_k stays 128).
     if block_size is not None:

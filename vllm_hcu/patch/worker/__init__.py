@@ -48,7 +48,7 @@ FeatureKey = Literal[
     "deepep_high_throughput",
     "deepep_low_latency",
     "deepep_auto",
-    "dpsk_deep_gemm",
+    "deep_gemm",
     "forward_context",
     "lightly_cp",
     "multi_layers_mtp",
@@ -200,7 +200,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_int8_oracle")),
     _CallbackSpec(
         _adapter("op_opt.moe", "patch_fp8_oracle"),
-        feature="dpsk_deep_gemm",
+        feature="deep_gemm",
     ),
 )
 
@@ -687,8 +687,8 @@ def _feature_states(
             backend == "deepep_low_latency" or deepep_auto
         ),
         "deepep_auto": deepep_auto,
-        "dpsk_deep_gemm": (
-            config.moe_backend == "dpsk_deep_gemm" or deepep_auto
+        "deep_gemm": (
+            config.moe_backend == "deep_gemm" or deepep_auto
         ),
         "forward_context": bool(
             config.enable_lightly_cp

@@ -209,7 +209,7 @@ def test_nn_layout_environment_reaches_mamba_path_selector(
 @pytest.mark.parametrize(
     ("values", "expected"),
     [
-        ({}, "cutlass"),
+        ({}, "varlen"),
         ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
         ({"VLLM_HCU_USE_FLASH_ATTN_VARLEN": "1"}, "varlen"),
         (
@@ -254,6 +254,16 @@ def test_flash_attention_environment_priority_routes_expected_backend(
         monkeypatch.setenv(name, value)
 
     assert hcu_envs.resolve_hcu_flash_attn_mode(None) == expected
+
+
+def test_flash_attention_lazy_environment_defaults_select_varlen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_FLASH_ATTN_VARLEN", raising=False)
+
+    assert hcu_envs.VLLM_HCU_USE_FLASH_ATTN_UNIFIED is False
+    assert hcu_envs.VLLM_HCU_USE_FLASH_ATTN_VARLEN is True
 
 
 @pytest.mark.parametrize(

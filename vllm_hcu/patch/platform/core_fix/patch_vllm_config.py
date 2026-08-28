@@ -38,17 +38,17 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         return getattr(owner, name)
     except AttributeError as exc:
         raise PatchCompatibilityError(
-            f"GLM-5.2 PCP requires {owner_name}.{name} in vLLM 0.25.1"
+            f"HCU PCP requires {owner_name}.{name} in vLLM 0.25.1"
         ) from exc
 
 
-def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
+def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
     if not _require_hcu_pcp_attribute(
         vllm_config, "use_v2_model_runner", "VllmConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires Model Runner V2.")
+        raise ValueError("HCU PCP requires Model Runner V2.")
 
     model_config = _require_hcu_pcp_attribute(
         vllm_config, "model_config", "VllmConfig"
@@ -63,37 +63,71 @@ def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
     architectures = _require_hcu_pcp_attribute(
         model_config, "architectures", "ModelConfig"
     )
-    if architectures != ["GlmMoeDsaForCausalLM"]:
+    use_mla = bool(
+        _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
+    )
+    is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
+    if use_mla and not is_glm52:
         raise ValueError(
             "GLM-5.2 PCP only supports architecture "
             "GlmMoeDsaForCausalLM."
         )
-    if not _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig"):
+    if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if not use_mla:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attention_config = _require_hcu_pcp_attribute(
+            vllm_config, "attention_config", "VllmConfig"
+        )
+        attention_backend = _require_hcu_pcp_attribute(
+            attention_config, "backend", "AttentionConfig"
+        )
+        if attention_backend != AttentionBackendEnum.FLASH_ATTN:
+            raise ValueError(
+                "FlashAttention GQA PCP only supports FLASH_ATTN attention backend."
+            )
+    if not use_mla and _require_hcu_pcp_attribute(
+        model_config, "is_hybrid", "ModelConfig"
+    ):
+        raise ValueError(
+            "FlashAttention PCP does not support hybrid KV cache groups."
+        )
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
     ) != 1:
-        raise ValueError("GLM-5.2 PCP does not support pipeline parallelism.")
-    if _require_hcu_pcp_attribute(
-        parallel_config, "decode_context_parallel_size", "ParallelConfig"
-    ) != 1:
+        raise ValueError("HCU PCP does not support pipeline parallelism.")
+    dcp_size = int(
+        _require_hcu_pcp_attribute(
+            parallel_config, "decode_context_parallel_size", "ParallelConfig"
+        )
+    )
+    if use_mla and dcp_size != 1:
+        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+    if not use_mla and dcp_size != 1:
         raise ValueError(
-            "GLM-5.2 PCP does not support decode context parallelism."
+            "FlashAttention PCP does not support decode context parallelism."
         )
     if _require_hcu_pcp_attribute(
         parallel_config, "data_parallel_size", "ParallelConfig"
     ) != 1:
-        raise ValueError("GLM-5.2 PCP does not support data parallelism.")
-    if not _require_hcu_pcp_attribute(
+        raise ValueError("HCU PCP does not support data parallelism.")
+    if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if not _require_hcu_pcp_attribute(model_config, "enforce_eager", "ModelConfig"):
+    if use_mla and not _require_hcu_pcp_attribute(
+        model_config, "enforce_eager", "ModelConfig"
+    ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
     if speculative_config is not None:
+        if not use_mla:
+            raise ValueError(
+                "FlashAttention PCP does not support speculative decoding or MTP."
+            )
         method = _require_hcu_pcp_attribute(
             speculative_config, "method", "SpeculativeConfig"
         )
@@ -109,15 +143,15 @@ def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
                 "GLM-5.2 PCP+MTP requires one or two speculative tokens."
             )
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
-        raise ValueError("GLM-5.2 PCP does not support LoRA.")
+        raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
         model_config, "is_multimodal_model", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP does not support multimodal models.")
+        raise ValueError("HCU PCP does not support multimodal models.")
     if _require_hcu_pcp_attribute(
         cache_config, "kv_offloading_size", "CacheConfig"
     ) is not None:
-        raise ValueError("GLM-5.2 PCP does not support KV offload.")
+        raise ValueError("HCU PCP does not support KV offload.")
 
     kv_transfer_config = _require_hcu_pcp_attribute(
         vllm_config, "kv_transfer_config", "VllmConfig"
@@ -125,13 +159,15 @@ def _require_mrv2_mla_eager_pcp_contract(vllm_config: object) -> None:
     if kv_transfer_config is not None and _require_hcu_pcp_attribute(
         kv_transfer_config, "kv_connector", "KVTransferConfig"
     ) is not None:
-        raise ValueError("GLM-5.2 PCP does not support P/D disaggregation.")
+        raise ValueError("HCU PCP does not support P/D disaggregation.")
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:
-        raise ValueError("GLM-5.2 PCP does not support lightly-CP.")
+        raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:
-        raise ValueError("GLM-5.2 PCP does not support HCU multi-layer MTP.")
+        if use_mla:
+            raise ValueError("GLM-5.2 PCP does not support HCU multi-layer MTP.")
+        raise ValueError("FlashAttention PCP does not support multi-layer MTP.")
 
 
 def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
@@ -146,7 +182,7 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     if pcp_size <= 1:
         return False
 
-    _require_mrv2_mla_eager_pcp_contract(vllm_config)
+    _require_mrv2_pcp_contract(vllm_config)
     return True
 
 
@@ -188,10 +224,15 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
-        if feature_config.moe_backend not in ("auto", "dpsk_deep_gemm"):
+        if getattr(parallel_config, "enable_eplb", False):
+            raise ValueError(
+                "deepep_auto with EPLB is not supported because the HT and "
+                "LL expert weight layouts cannot be rebalanced atomically"
+            )
+        if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(
                 "deepep_auto requires HCU moe_backend='auto' or "
-                "'dpsk_deep_gemm'"
+                "'deep_gemm'"
             )
 
     if feature_config.enable_lightly_cp:
@@ -212,20 +253,17 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "Lightly context parallel and DCP cannot be enabled simultaneously."
             )
 
-    if feature_config.moe_backend == "dpsk_deep_gemm":
+    if feature_config.moe_backend == "deep_gemm":
         if kernel_config is None:
             raise PatchCompatibilityError(
-                "dpsk_deep_gemm requires VllmConfig.kernel_config"
+                "deep_gemm requires VllmConfig.kernel_config"
             )
         upstream_backend = getattr(kernel_config, "moe_backend", None)
-        if upstream_backend == "dpsk_deep_gemm":
-            # Defensive normalization for programmatic objects that bypassed
-            # EngineArgs.  Pydantic's official Literal must never see this.
-            setattr(kernel_config, "moe_backend", "auto")
-        elif upstream_backend != "auto":
+        if upstream_backend != "deep_gemm":
             raise ValueError(
-                "HCU sidecar selects dpsk_deep_gemm but upstream "
-                f"KernelConfig.moe_backend selects {upstream_backend!r}"
+                "HCU sidecar selects deep_gemm but official "
+                "KernelConfig.moe_backend must match 'deep_gemm'; got "
+                f"{upstream_backend!r}"
             )
     return feature_config
 

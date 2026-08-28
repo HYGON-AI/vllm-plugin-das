@@ -30,7 +30,7 @@
   ],
   "jobs": {
     "accuracy-gfx936": {
-      "runner": "hcu-linux-gfx936-1",
+      "runner": "bw18",
       "arch": "gfx936",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -39,7 +39,7 @@
       "requirements": []
     },
     "accuracy-gfx938": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -48,25 +48,38 @@
       "requirements": []
     },
     "contract-hcu-gfx936": {
-      "runner": "hcu-linux-gfx936-1",
+      "runner": "bw18",
       "arch": "gfx936",
       "cards": 1,
       "suite": "contract-hcu",
       "pytest_args": [],
       "timeout_minutes": 45,
-      "requirements": []
+      "requirements": [],
+      "partitions": 2
     },
     "integration-smoke-gfx938": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "integration-smoke",
       "pytest_args": [],
       "timeout_minutes": 45,
-      "requirements": []
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_GRAPH_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN35_9B_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        }
+      ],
+      "partitions": 2
     },
     "qwen35-smoke": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -84,7 +97,7 @@
       ]
     },
     "qwen35-graph": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -102,7 +115,7 @@
       ]
     },
     "engine-features": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -120,7 +133,7 @@
       ]
     },
     "lora": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -148,26 +161,16 @@
       ]
     },
     "spec-decode": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
       "pytest_args": [
         "-k",
-        "llama2_7b_eagle_spec_decode_token_parity or qwen35_4b_mtp_spec_decode_token_parity"
+        "qwen35_4b_mtp_spec_decode_token_parity"
       ],
       "timeout_minutes": 120,
       "requirements": [
-        {
-          "kind": "model",
-          "env": "VLLM_HCU_SPEC_TARGET_MODEL",
-          "relative": "vllm-optest-models/TheBloke/Llama-2-7B-fp16"
-        },
-        {
-          "kind": "model",
-          "env": "VLLM_HCU_SPEC_DRAFT_MODEL",
-          "relative": "vllm-optest-models/yuhuili/EAGLE-llama2-chat-7B"
-        },
         {
           "kind": "model",
           "env": "VLLM_HCU_MTP_MODEL",
@@ -176,7 +179,7 @@
       ]
     },
     "mamba-smoke": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -194,7 +197,7 @@
       ]
     },
     "kv-transfer": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -248,7 +251,7 @@
       ]
     },
     "qwen25-models": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -257,6 +260,7 @@
         "qwen25_15b_openai_server_smoke or qwen25_vl_3b_image_mrope_smoke"
       ],
       "timeout_minutes": 120,
+      "partitions": 2,
       "requirements": [
         {
           "kind": "model",
@@ -271,7 +275,7 @@
       ]
     },
     "qwen3-pooling": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -280,6 +284,7 @@
         "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke or qwen3_embedding_06b_openai_embeddings_server_smoke or qwen3_reranker_score_and_rerank_server_smoke"
       ],
       "timeout_minutes": 90,
+      "partitions": 2,
       "requirements": [
         {
           "kind": "model",
@@ -299,7 +304,7 @@
       ]
     },
     "qwen3-protocol": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -317,7 +322,7 @@
       ]
     },
     "qwen35-gsm8k": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -328,6 +333,12 @@
       "timeout_minutes": 90,
       "requirements": [
         {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
           "kind": "model",
           "env": "VLLM_HCU_QWEN35_9B_MODEL",
           "relative": "qwen3.5/Qwen3.5-9B"
@@ -335,7 +346,7 @@
       ]
     },
     "qwen3-vl-mmmu": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -346,6 +357,12 @@
       "timeout_minutes": 120,
       "requirements": [
         {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_VL_8B_MODEL",
           "relative": "qwen3/Qwen3-VL-8B-Instruct"
@@ -353,7 +370,7 @@
       ]
     },
     "qwen3-8b-gsm8k": {
-      "runner": "hcu-linux-gfx938-1",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -363,6 +380,12 @@
       ],
       "timeout_minutes": 120,
       "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
         {
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_8B_MODEL",
@@ -382,26 +405,101 @@
       "timeout_minutes": 360,
       "requirements": [
         {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
           "kind": "model",
           "env": "VLLM_HCU_DEEPSEEK_R1_MODEL",
           "relative": "DeepSeek-R1-Channel-FP8-w8a8"
         }
       ]
+    },
+    "glm52-pcp": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "glm52_pcp"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_GLM52_MODEL",
+          "relative": "GLM-5___1-Channel-FP8-w8a8"
+        }
+      ]
+    },
+    "single-node-topology": {
+      "runner": "nmz36",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "distributed-single-node",
+      "pytest_args": [],
+      "timeout_minutes": 30,
+      "requirements": []
     }
   },
+  "nightly_jobs": [
+    {"job": "accuracy-gfx936", "timeout_minutes": 45},
+    {"job": "accuracy-gfx938", "timeout_minutes": 45},
+    {"job": "contract-hcu-gfx936", "timeout_minutes": 60},
+    {"job": "integration-smoke-gfx938", "timeout_minutes": 60},
+    {"job": "qwen35-smoke", "timeout_minutes": 90},
+    {"job": "qwen35-graph", "timeout_minutes": 90},
+    {"job": "engine-features", "timeout_minutes": 120},
+    {"job": "lora", "timeout_minutes": 90},
+    {"job": "spec-decode", "timeout_minutes": 180},
+    {"job": "mamba-smoke", "timeout_minutes": 60},
+    {"job": "kv-transfer", "timeout_minutes": 90},
+    {"job": "qwen35-tp-ep", "timeout_minutes": 300},
+    {"job": "deepseek-tp-ep", "timeout_minutes": 360},
+    {"job": "qwen25-models", "timeout_minutes": 150},
+    {"job": "qwen3-pooling", "timeout_minutes": 120},
+    {"job": "qwen3-protocol", "timeout_minutes": 120},
+    {"job": "qwen35-gsm8k", "timeout_minutes": 120},
+    {"job": "qwen3-vl-mmmu", "timeout_minutes": 150},
+    {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
+    {"job": "deepseek-gsm8k", "timeout_minutes": 360},
+    {"job": "glm52-pcp", "timeout_minutes": 360},
+    {"job": "single-node-topology", "timeout_minutes": 30}
+  ],
   "groups": {
     "ci": {
       "patterns": [
         ".github/workflows/**",
         ".github/workflows/configs/**",
         ".github/scripts/hcu_ci/**",
+        "scripts/ci/hcu/**",
         "tools/run_patch_tests.py",
+        "tests/hcu_ci_registry.py",
         "tests/patch/test_hcu_ci_*.py"
       ],
       "jobs": [
         "accuracy-gfx936",
         "contract-hcu-gfx936",
         "integration-smoke-gfx938"
+      ]
+    },
+    "kernel-accuracy-tests": {
+      "patterns": [
+        "tests/accuracy/test_hcu_kernel_accuracy.py",
+        "tests/accuracy/test_aiter_silu_and_mul.py"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "accuracy-gfx938"
       ]
     },
     "platform-runtime": {
@@ -417,6 +515,32 @@
         "contract-hcu-gfx936",
         "integration-smoke-gfx938",
         "qwen35-smoke"
+      ]
+    },
+    "kernel-runtime": {
+      "patterns": [
+        "vllm_hcu/csrc/**",
+        "vllm_hcu/ops/**",
+        "vllm_hcu/model_executor/layers/attention_forward_runtime.py",
+        "vllm_hcu/model_executor/layers/attention_runtime.py",
+        "vllm_hcu/model_executor/layers/linear.py",
+        "vllm_hcu/model_executor/layers/mla_runtime.py",
+        "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "accuracy-gfx938",
+        "integration-smoke-gfx938"
+      ]
+    },
+    "distributed-runtime": {
+      "patterns": [
+        "vllm_hcu/distributed/**",
+        "vllm_hcu/csrc/custom_all_reduce*"
+      ],
+      "jobs": [
+        "contract-hcu-gfx936",
+        "qwen35-tp-ep"
       ]
     },
     "attention-graph": {
@@ -502,20 +626,36 @@
         "deepseek-tp-ep"
       ]
     },
-    "deepseek": {
+    "deepseek-runtime": {
       "patterns": [
         "vllm_hcu/models/deepseek*",
-        "vllm_hcu/**deepseek*",
-        "tests/integration/server/test_evalscope_deepseek*"
+        "vllm_hcu/**deepseek*"
       ],
       "jobs": [
         "deepseek-tp-ep",
         "deepseek-gsm8k"
       ]
     },
-    "model-tests": {
+    "deepseek-evalscope": {
       "patterns": [
-        "tests/integration/models/test_qwen35_9b_smoke.py",
+        "tests/integration/server/test_evalscope_deepseek*"
+      ],
+      "jobs": [
+        "deepseek-gsm8k"
+      ]
+    },
+    "glm52-pcp": {
+      "patterns": [
+        "tests/integration/models/test_glm52_pcp_mrv2.py",
+        "tests/integration/server/test_evalscope_glm52_pcp_humaneval.py",
+        "tests/models/glm52_pcp_humaneval_evalscope.yaml"
+      ],
+      "jobs": [
+        "glm52-pcp"
+      ]
+    },
+    "model-runtime-helper": {
+      "patterns": [
         "tests/integration/model_runtime.py"
       ],
       "jobs": [
@@ -524,6 +664,14 @@
         "qwen3-pooling",
         "mamba-smoke",
         "spec-decode"
+      ]
+    },
+    "qwen35-smoke-tests": {
+      "patterns": [
+        "tests/integration/models/test_qwen35_9b_smoke.py"
+      ],
+      "jobs": [
+        "qwen35-smoke"
       ]
     },
     "qwen25-tests": {
@@ -591,14 +739,30 @@
     },
     "evalscope-runner": {
       "patterns": [
-        "tests/integration/server/evalscope_server.py",
-        "tests/integration/server/test_evalscope_report_threshold.py"
+        "tests/integration/server/evalscope_server.py"
       ],
       "jobs": [
         "qwen35-gsm8k",
         "qwen3-8b-gsm8k",
         "qwen3-vl-mmmu",
         "deepseek-gsm8k"
+      ]
+    },
+    "evalscope-report-tests": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_report_threshold.py"
+      ],
+      "jobs": [
+        "integration-smoke-gfx938"
+      ]
+    },
+    "single-node-topology-tests": {
+      "patterns": [
+        "tests/distributed/single_node/**",
+        "tests/fixtures/distributed.py"
+      ],
+      "jobs": [
+        "single-node-topology"
       ]
     }
   }

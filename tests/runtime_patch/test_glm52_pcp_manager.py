@@ -41,6 +41,12 @@ class _InMemoryPCPGroup:
         return torch.cat(self.gathered, dim=dim)
 
 
+class _InMemoryDCPGroup:
+    def __init__(self, rank: int, world_size: int) -> None:
+        self.rank_in_group = rank
+        self.world_size = world_size
+
+
 class _InMemoryBlockTables:
     """Block/slot table double that performs real tensor indexing on CPU."""
 
@@ -802,6 +808,77 @@ def test_prepare_attn_uses_local_rows_but_global_kv_slot_ownership() -> None:
         assert sorted(written_slots) == list(range(1000, 1008)) + [1116]
     for actual, expected in zip(block_tables.input_block_tables, runner_owned_tables):
         assert torch.equal(actual, expected)
+
+
+def test_gqa_pcp_dcp_plan_describes_new_tokens_and_cached_context() -> None:
+    """Wrong plan permutations silently mix request tokens across PCP ranks."""
+
+    block_tables = _InMemoryBlockTables()
+    manager = HcuPCPManager(
+        _make_config(
+            2,
+            architecture="Qwen3ForCausalLM",
+            use_mla=False,
+            dcp=2,
+            enable_expert_parallel=False,
+        ),
+        torch.device("cpu"),
+        SimpleNamespace(),
+        block_tables,
+        pcp_group=_InMemoryPCPGroup(0, 2),
+        dcp_group=_InMemoryDCPGroup(0, 2),
+    )
+    global_batch = _make_batch(
+        [("extend", list(range(10, 18)), 12, True)]
+    )
+
+    local_batch = manager.partition_batch(global_batch)
+    manager.prepare_attn(local_batch)
+    plan = local_batch._vllm_hcu_pcp_plan
+
+    assert plan is not None
+    assert plan.new_kv_idx.tolist() == [0, 1, 0, 1, 4, 5, 6, 7, 2, 3]
+    assert plan.new_cu_kv.tolist() == [0, 2, 10]
+    assert plan.new_max_kv == 8
+    assert plan.ctx is not None
+    assert plan.ctx.padded_num_tokens == 4
+    assert plan.ctx.restore_idx.tolist() == [0, 1, 4, 5, 6, 7, 2, 3]
+    assert plan.ctx.local_idx.tolist() == [0, 1, 6, 7]
+    assert plan.ctx.cu_q.tolist() == [0, 8]
+    assert plan.ctx.ctx_lens.tolist() == [2]
+    assert plan.ctx.ctx_cu.tolist() == [0, 2]
+    assert plan.ctx.block_table.tolist() == [[40, 41, 42, 43]]
+
+
+def test_gqa_pcp_empty_rank_keeps_a_zero_length_plan_row() -> None:
+    """All PCP ranks must enter collectives with the same request-row count."""
+
+    manager = HcuPCPManager(
+        _make_config(
+            2,
+            architecture="Qwen3ForCausalLM",
+            use_mla=False,
+            dcp=2,
+            enable_expert_parallel=False,
+        ),
+        torch.device("cpu"),
+        SimpleNamespace(),
+        _InMemoryBlockTables(),
+        pcp_group=_InMemoryPCPGroup(1, 2),
+        dcp_group=_InMemoryDCPGroup(1, 2),
+    )
+    local_batch = manager.partition_batch(
+        _make_batch([("tiny", [7], 1, True)])
+    )
+
+    manager.prepare_attn(local_batch)
+    plan = local_batch._vllm_hcu_pcp_plan
+
+    assert local_batch.num_reqs == 1
+    assert local_batch.num_tokens == 0
+    assert plan is not None
+    assert plan.new_cu_kv.tolist() == [0, 0]
+    assert plan.new_max_kv == 0
 
 
 def test_prepare_attn_rejects_missing_canonical_block_storage() -> None:

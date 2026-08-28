@@ -436,10 +436,12 @@ def test_aiter_asm_boltops_fp8_quant_context_rejects_subtle_abi_drift(
     assert asm_module.per_token_quant_hip is incompatible_quant
 
 
-def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
+def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
+
+    import vllm.config as vllm_config_module
 
     class Int8MoeBackend(enum.Enum):
         TRITON = "TRITON"
@@ -456,6 +458,10 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
         if runner_backend == "triton":
             return Int8MoeBackend.TRITON
         raise ValueError(runner_backend)
+
+    def select_int8_moe_backend(config, weight_key, activation_key):
+        del config, weight_key, activation_key
+        return "official-select", "official-experts"
 
     def convert_to_int8_moe_kernel_format(
         int8_backend,
@@ -519,9 +525,16 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
         Int8MoeBackend=Int8MoeBackend,
         backend_to_kernel_cls=backend_to_kernel_cls,
         map_int8_backend=map_int8_backend,
+        select_int8_moe_backend=select_int8_moe_backend,
         convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
         make_int8_moe_quant_config=make_int8_moe_quant_config,
         int8_w8a8_moe_quant_config=int8_w8a8_moe_quant_config,
+        mk=SimpleNamespace(
+            FusedMoEActivationFormat=SimpleNamespace(
+                Standard="standard",
+                BatchedExperts="batched",
+            )
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -530,6 +543,60 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
             "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
             AiterExperts=AiterExperts,
         ),
+    )
+
+    class DeepGemmExperts:
+        @staticmethod
+        def is_supported_config(
+            cls,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        ):
+            del cls, config
+            return (
+                (weight_key, activation_key, activation_format)
+                == ("weight", "activation", "standard"),
+                "requires standard activation format",
+            )
+
+    class BatchedDeepGemmExperts:
+        @staticmethod
+        def is_supported_config(
+            cls,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        ):
+            del cls, config
+            return (
+                (weight_key, activation_key, activation_format)
+                == ("weight", "activation", "batched"),
+                "requires batched activation format",
+            )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+        _module(
+            "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+            DeepGemmExperts=DeepGemmExperts,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
+        _module(
+            "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
+            BatchedDeepGemmExperts=BatchedDeepGemmExperts,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: None,
     )
 
     assert patch_int8_oracle.apply_to_module(target) is True
@@ -562,6 +629,185 @@ def test_int8_aiter_oracle_maps_explicit_backend_and_keeps_canonical_weights(
     assert quant_config.a1_scale is None
     assert quant_config.a2_scale is None
 
+    config = SimpleNamespace(
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            use_batched_activation_format=False,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            additional_config={
+                "hcu": {
+                    "moe_backend": "deep_gemm",
+                }
+            }
+        ),
+    )
+    backend, experts = target.select_int8_moe_backend(
+        config, "weight", "activation"
+    )
+    assert backend is target.Int8MoeBackend.HCU_DEEPGEMM
+    assert experts is DeepGemmExperts
+    assert target.map_int8_backend("deep_gemm") is backend
+    deep_gemm_quant_config = target.make_int8_moe_quant_config(
+        backend,
+        w1_scale,
+        w2_scale,
+        per_act_token_quant=True,
+    )
+    assert getattr(deep_gemm_quant_config, "use_int8_w8a8", False) is True
+    assert deep_gemm_quant_config.per_act_token_quant is True
+
+    config.moe_parallel_config.use_batched_activation_format = True
+    backend, experts = target.select_int8_moe_backend(
+        config, "weight", "activation"
+    )
+    assert experts is BatchedDeepGemmExperts
+
+    config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = True
+    with pytest.raises(
+        ValueError,
+        match="INT8.*deepep_auto.*not supported",
+    ):
+        target.select_int8_moe_backend(config, "weight", "activation")
+    config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = False
+
+    deep_gemm_w13 = torch.arange(2 * 16 * 64, dtype=torch.int32).to(torch.int8)
+    deep_gemm_w13 = deep_gemm_w13.reshape(2, 16, 64)
+    deep_gemm_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
+    deep_gemm_w2 = deep_gemm_w2.reshape(2, 64, 64)
+    import deepgemm
+    from deepgemm import m_group_gemm
+
+    real_contiguous_pack = deepgemm.marlin_i8_contiguous_weight
+    real_masked_pack = deepgemm.marlin_i8_masked_weight
+    contiguous_calls: list[torch.Tensor] = []
+    masked_calls: list[torch.Tensor] = []
+
+    def tracked_contiguous_pack(weight: torch.Tensor) -> torch.Tensor:
+        contiguous_calls.append(weight)
+        return real_contiguous_pack(weight)
+
+    def tracked_masked_pack(weight: torch.Tensor) -> torch.Tensor:
+        masked_calls.append(weight)
+        return real_masked_pack(weight)
+
+    def reject_w6_packer(*_args, **_kwargs):
+        raise AssertionError("W6 low-latency packer invoked")
+
+    monkeypatch.setattr(
+        deepgemm,
+        "marlin_i8_contiguous_weight",
+        tracked_contiguous_pack,
+    )
+    monkeypatch.setattr(
+        deepgemm,
+        "marlin_i8_masked_weight",
+        tracked_masked_pack,
+    )
+    monkeypatch.setattr(
+        m_group_gemm,
+        "pack_int8_weight_enk_to_w6_low_latency",
+        reject_w6_packer,
+    )
+
+    standard_layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_batched_activation_format=False,
+            )
+        )
+    )
+    expected_standard_w13 = real_contiguous_pack(deep_gemm_w13.clone())
+    expected_standard_w2 = real_contiguous_pack(deep_gemm_w2.clone())
+    standard_w13, standard_w2 = target.convert_to_int8_moe_kernel_format(
+        backend,
+        deep_gemm_w13,
+        deep_gemm_w2,
+        layer=standard_layer,
+    )
+    assert contiguous_calls == [deep_gemm_w13, deep_gemm_w2]
+    assert masked_calls == []
+    torch.testing.assert_close(standard_w13, expected_standard_w13)
+    torch.testing.assert_close(standard_w2, expected_standard_w2)
+
+    contiguous_calls.clear()
+    batched_layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_batched_activation_format=True,
+            )
+        )
+    )
+    expected_batched_w13 = real_masked_pack(deep_gemm_w13.clone())
+    expected_batched_w2 = real_masked_pack(deep_gemm_w2.clone())
+    batched_w13, batched_w2 = target.convert_to_int8_moe_kernel_format(
+        backend,
+        deep_gemm_w13,
+        deep_gemm_w2,
+        layer=batched_layer,
+    )
+    assert contiguous_calls == []
+    assert masked_calls == [deep_gemm_w13, deep_gemm_w2]
+    torch.testing.assert_close(batched_w13, expected_batched_w13)
+    torch.testing.assert_close(batched_w2, expected_batched_w2)
+
+    config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "auto"
+    assert target.select_int8_moe_backend(
+        config, "weight", "activation"
+    ) == ("official-select", "official-experts")
+
+    config._hcu_vllm_config.additional_config["hcu"][
+        "moe_backend"
+    ] = "deep_gemm"
+    config.moe_backend = "triton"
+    with pytest.raises(ValueError, match="official backend must match 'deep_gemm'"):
+        target.select_int8_moe_backend(config, "weight", "activation")
+
+
+def test_int8_oracle_reports_quant_config_target_for_abi_drift():
+    from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
+
+    class Int8MoeBackend(enum.Enum):
+        TRITON = "TRITON"
+
+    def backend_to_kernel_cls(backend):
+        del backend
+
+    def map_int8_backend(runner_backend):
+        del runner_backend
+
+    def select_int8_moe_backend(config, weight_key, activation_key):
+        del config, weight_key, activation_key
+
+    def convert_to_int8_moe_kernel_format(
+        int8_backend,
+        w13,
+        w2,
+        layer,
+        w13_scale,
+    ):
+        del int8_backend, w13, w2, layer, w13_scale
+
+    def make_int8_moe_quant_config(incompatible_parameter):
+        del incompatible_parameter
+
+    target = _module(
+        patch_int8_oracle.TARGET_MODULE,
+        Int8MoeBackend=Int8MoeBackend,
+        backend_to_kernel_cls=backend_to_kernel_cls,
+        map_int8_backend=map_int8_backend,
+        select_int8_moe_backend=select_int8_moe_backend,
+        convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
+        make_int8_moe_quant_config=make_int8_moe_quant_config,
+        int8_w8a8_moe_quant_config=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        patch_int8_oracle.apply_to_module(target)
+
+    assert patch_int8_oracle.TARGETS[5] in str(error.value)
+    assert patch_int8_oracle.TARGETS[4] not in str(error.value)
+
 
 def test_worker_registers_int8_aiter_oracle_before_quantized_methods():
     from vllm_hcu.patch import worker
@@ -578,6 +824,36 @@ def test_worker_registers_int8_aiter_oracle_before_quantized_methods():
     )
     assert int8_entry in callbacks
     assert callbacks.index(int8_entry) < callbacks.index(fp8_method_entry)
+
+
+def test_hcu_deep_gemm_experts_accept_rocm_lightop_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.model_executor.layers.fused_moe  # noqa: F401
+
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe,
+        deep_gemm_moe,
+    )
+
+    monkeypatch.setattr(
+        deep_gemm_moe.current_platform,
+        "is_rocm",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        deep_gemm_moe,
+        "is_deep_gemm_supported",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        batched_deep_gemm_moe,
+        "is_deep_gemm_supported",
+        lambda: False,
+    )
+
+    assert deep_gemm_moe.DeepGemmExperts._supports_current_device()
+    assert batched_deep_gemm_moe.BatchedDeepGemmExperts._supports_current_device()
 
 
 def _install_fake_vllm_envs(
@@ -2536,16 +2812,14 @@ def _fp8_moe_layer() -> SimpleNamespace:
     )
 
 
-def test_moe_fp8_target_triton_owns_process_and_apply(
+def test_moe_fp8_target_triton_preserves_process_and_apply_behavior(
     monkeypatch: pytest.MonkeyPatch,
 ):
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
-    target_process = method_class.process_weights_after_loading
     target_apply = method_class.apply
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is True
     assert patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module) is False
-    assert method_class.process_weights_after_loading is target_process
     assert method_class.apply is target_apply
     assert not hasattr(method_class, "_get_aiter_moe_runtime_config")
     assert not hasattr(method_class, "_get_aiter_weights_for_solution")
@@ -2598,11 +2872,26 @@ def test_moe_fp8_explicit_aiter_ignores_legacy_environment_half_states(
     assert len(method_class.init_calls) == 1
 
 
-def test_moe_fp8_requires_explicit_aiter_or_triton_and_checks_target_selection():
+def test_moe_fp8_explicit_deepgemm_accepts_hcu_oracle_selection():
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "HCU_DEEPGEMM"
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="deep_gemm"),
+    )
+
+    assert method.fp8_backend.value == "HCU_DEEPGEMM"
+    assert len(method_class.init_calls) == 1
+
+
+def test_moe_fp8_requires_explicit_backend_and_checks_target_selection():
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    with pytest.raises(RuntimeError, match="--moe-backend aiter or triton"):
+    with pytest.raises(RuntimeError, match="--moe-backend aiter, deep_gemm, or triton"):
         method_class(
             *_channel_fp8_moe_args(module),
             SimpleNamespace(moe_backend="auto"),
@@ -2833,6 +3122,15 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
             MoeQuantType=MoeQuantType,
             get_aiter_moe_config=get_config,
             aiter_moe=aiter_moe,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            per_token_quant_int8=lambda x: (x, None),
+            per_token_quant_hip=_fp8_quant_abi_stub,
         ),
     )
     hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
@@ -4237,26 +4535,82 @@ def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
         )
 
 
-def test_moe_fp8_target_process_has_no_hcu_dpsk_postprocess(
+def test_moe_fp8_hcu_deepgemm_restores_layouts_after_kernel_recreation(
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+
     module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "HCU_DEEPGEMM"
+    created_experts = []
+
+    def make_auto_experts():
+        experts = object.__new__(deepgemm_module.DeepEPAutoDeepGemmExperts)
+        experts.ht_experts = object.__new__(
+            deepgemm_module.DeepEPDeepGemmContiguousExperts
+        )
+        experts.ll_experts = object.__new__(
+            deepgemm_module.DeepEPDeepGemmMaskedExperts
+        )
+        for child in (experts.ht_experts, experts.ll_experts):
+            child._deepgemm_w13 = None
+            child._deepgemm_w2 = None
+        created_experts.append(experts)
+        return experts
+
+    def upstream_process(self, layer):
+        layer.upstream_process_count += 1
+        self.moe_kernel = SimpleNamespace(fused_experts=make_auto_experts())
+
+    method_class.process_weights_after_loading = upstream_process
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    method = module.CompressedTensorsW8A8Fp8MoEMethod(
+    method = method_class(
         *_channel_fp8_moe_args(module),
-        SimpleNamespace(moe_backend="triton"),
+        SimpleNamespace(moe_backend="deep_gemm"),
     )
-    processed: list[object] = []
-    experts = SimpleNamespace(
-        process_weights_after_loading=lambda layer: processed.append(layer)
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 64), dtype=torch.int8),
+        requires_grad=False,
     )
-    method.fp8_backend = SimpleNamespace(value="DPSK_DEEPGEMM")
-    method.moe_kernel = SimpleNamespace(
-        fused_experts=SimpleNamespace(experts=experts)
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 64), dtype=torch.int8),
+        requires_grad=False,
     )
-    layer = _fp8_moe_layer()
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones((1, 128)))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones((1, 64)))
+    layer.weight_block_size = None
+    layer.upstream_process_count = 0
+
+    ht_w13 = torch.full((1, 1, 8, 4, 16, 16), 31, dtype=torch.int8)
+    ht_w2 = torch.full((1, 1, 4, 4, 16, 16), 32, dtype=torch.int8)
+    ll_w13 = torch.full((1, 1, 8, 4, 16, 16), 47, dtype=torch.int8)
+    ll_w2 = torch.full((1, 1, 4, 4, 16, 16), 48, dtype=torch.int8)
+    monkeypatch.setattr(
+        deepgemm_module,
+        "marlin_fp8_contiguous_weight",
+        lambda weight: ht_w13.clone() if weight.size(1) == 128 else ht_w2.clone(),
+    )
+    monkeypatch.setattr(
+        deepgemm_module,
+        "marlin_fp8_masked_weight",
+        lambda weight: ll_w13.clone() if weight.size(1) == 128 else ll_w2.clone(),
+    )
+
     method.process_weights_after_loading(layer)
-    assert layer.upstream_processed is True
-    assert processed == []
+    method.process_weights_after_loading(layer)
+
+    assert layer.upstream_process_count == 2
+    assert len(created_experts) == 2
+    replacement = created_experts[-1]
+    assert replacement.ht_experts._deepgemm_w13 is layer.w13_weight
+    assert replacement.ht_experts._deepgemm_w2 is layer.w2_weight
+    assert torch.equal(replacement.ll_experts._deepgemm_w13, ll_w13)
+    assert torch.equal(replacement.ll_experts._deepgemm_w2, ll_w2)
 
 
 def _fake_moe_wna16_module():
