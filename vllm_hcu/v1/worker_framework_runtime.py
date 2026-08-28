@@ -91,6 +91,11 @@ def share_eagle_topk_buffer(target_model: object, eagle_model: object) -> object
     target_buffer = target_inner.topk_indices_buffer
     if target_buffer is None:
         return eagle_model
+    set_topk_indices_buffer = getattr(
+        eagle_model, "set_topk_indices_buffer", None
+    )
+    if callable(set_topk_indices_buffer):
+        set_topk_indices_buffer(target_buffer)
     for _, child in draft_inner.named_modules():
         if hasattr(child, "topk_indices_buffer"):
             child.topk_indices_buffer = target_buffer

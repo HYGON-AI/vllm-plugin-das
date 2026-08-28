@@ -1188,14 +1188,26 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
     class DraftInner:
         def __init__(self):
             self.child = SimpleNamespace(topk_indices_buffer=None)
+            self.self_attn = SimpleNamespace(
+                mla_attn=SimpleNamespace(
+                    impl=SimpleNamespace(topk_indices_buffer=None)
+                )
+            )
 
         def named_modules(self):
             return [("", self), ("child", self.child)]
 
+    class DraftModel:
+        def __init__(self):
+            self.model = DraftInner()
+
+        def set_topk_indices_buffer(self, buffer):
+            self.model.self_attn.mla_attn.impl.topk_indices_buffer = buffer
+
     models: list[object] = []
 
     def load_eagle_model(target_model, vllm_config):
-        model = SimpleNamespace(model=DraftInner())
+        model = DraftModel()
         models.append(model)
         return model
 
@@ -1206,10 +1218,12 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
     target = SimpleNamespace(model=SimpleNamespace(topk_indices_buffer=target_buffer))
     off_model = module.load_eagle_model(target, _config())
     assert off_model.model.child.topk_indices_buffer is None
+    assert off_model.model.self_attn.mla_attn.impl.topk_indices_buffer is None
     on_model = module.load_eagle_model(
         target, _config(enable_multi_layers_mtp=True)
     )
     assert on_model.model.child.topk_indices_buffer is target_buffer
+    assert on_model.model.self_attn.mla_attn.impl.topk_indices_buffer is target_buffer
 
 
 def test_ubatch_sms_guard_disables_only_missing_compute_control(

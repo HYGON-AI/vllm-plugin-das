@@ -173,6 +173,11 @@ register_hcu_ci(
     est_time=10800,
 )
 register_hcu_ci(
+    job="hy-v4-tp8",
+    target="tests/integration/models/test_hy_v4_smoke.py",
+    est_time=7200,
+)
+register_hcu_ci(
     job="qwen25-models",
     target=(
         "tests/integration/models/test_qwen25_models.py::"

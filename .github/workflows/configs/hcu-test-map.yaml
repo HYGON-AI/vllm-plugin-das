@@ -250,6 +250,24 @@
         }
       ]
     },
+    "hy-v4-tp8": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "hy_v4"
+      ],
+      "timeout_minutes": 240,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_HY_V4_MODEL",
+          "relative": "Hy4-preview-Testing-Channel-FP8-w8a8-v2"
+        }
+      ]
+    },
     "qwen25-models": {
       "runner": "nmz36",
       "arch": "gfx938",
@@ -465,6 +483,7 @@
     {"job": "kv-transfer", "timeout_minutes": 90},
     {"job": "qwen35-tp-ep", "timeout_minutes": 300},
     {"job": "deepseek-tp-ep", "timeout_minutes": 360},
+    {"job": "hy-v4-tp8", "timeout_minutes": 300},
     {"job": "qwen25-models", "timeout_minutes": 150},
     {"job": "qwen3-pooling", "timeout_minutes": 120},
     {"job": "qwen3-protocol", "timeout_minutes": 120},
@@ -634,6 +653,19 @@
       "jobs": [
         "deepseek-tp-ep",
         "deepseek-gsm8k"
+      ]
+    },
+    "hy-v4-runtime": {
+      "patterns": [
+        "vllm_hcu/models/hy_v4/**",
+        "vllm_hcu/reasoning/hy_v4*",
+        "vllm_hcu/tool_parsers/hy_v4*",
+        "tests/hy_v4/**",
+        "tests/models/hy_v4/**",
+        "tests/integration/models/test_hy_v4_smoke.py"
+      ],
+      "jobs": [
+        "hy-v4-tp8"
       ]
     },
     "deepseek-evalscope": {

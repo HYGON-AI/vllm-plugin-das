@@ -784,6 +784,16 @@ def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
             return SimpleNamespace(fp8_use_mixed_batch=False)
 
     class FlashMLASparseImpl:
+        def forward_mqa(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            attn_metadata,
+            layer,
+        ):
+            del kv_c_and_k_pe_cache, attn_metadata, layer
+            return q
+
         def _fp8_flash_mla_kernel(
             self,
             q,

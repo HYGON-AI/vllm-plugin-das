@@ -794,13 +794,33 @@ def _case_spec_decode_parity(
     }
 
 
-def _case_mtp_parity(model_path: Path) -> dict[str, Any]:
-    baseline = _generate(model_path, enforce_eager=True)
+def _case_mtp_parity(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float | None = None,
+    moe_backend: str = "auto",
+    enable_expert_parallel: bool = True,
+    num_speculative_tokens: int = 1,
+) -> dict[str, Any]:
+    common_kwargs = {
+        "tensor_parallel_size": tensor_parallel_size,
+        "moe_backend": moe_backend,
+        "enable_expert_parallel": enable_expert_parallel,
+    }
+    if gpu_memory_utilization is not None:
+        common_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+    baseline = _generate(
+        model_path,
+        enforce_eager=True,
+        **common_kwargs,
+    )
     speculative = _generate(
         model_path,
         enforce_eager=True,
+        **common_kwargs,
         spec_method="mtp",
-        spec_tokens=1,
+        spec_tokens=num_speculative_tokens,
     )
     return {
         "baseline": baseline,
@@ -1487,9 +1507,10 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--draft-model", type=Path)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--data-parallel-size", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--all2all-backend", default=None)
     parser.add_argument("--moe-backend", default="auto")
+    parser.add_argument("--num-speculative-tokens", type=int, default=1)
     parser.add_argument(
         "--disable-expert-parallel",
         action="store_true",
@@ -1514,7 +1535,14 @@ def _main(argv: list[str] | None = None) -> int:
             raise SystemExit("spec-decode-parity requires --draft-model")
         payload = _case_spec_decode_parity(args.model, draft_model=args.draft_model)
     elif args.case == "mtp-parity":
-        payload = _case_mtp_parity(args.model)
+        payload = _case_mtp_parity(
+            args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            moe_backend=args.moe_backend,
+            enable_expert_parallel=not args.disable_expert_parallel,
+            num_speculative_tokens=args.num_speculative_tokens,
+        )
     elif args.case == "kv-transfer-smoke":
         payload = _case_kv_transfer_smoke(args.model)
     elif args.case == "prefix-caching-smoke":
@@ -1536,7 +1564,11 @@ def _main(argv: list[str] | None = None) -> int:
             args.model,
             tensor_parallel_size=args.tensor_parallel_size,
             data_parallel_size=args.data_parallel_size,
-            gpu_memory_utilization=args.gpu_memory_utilization,
+            gpu_memory_utilization=(
+                0.6
+                if args.gpu_memory_utilization is None
+                else args.gpu_memory_utilization
+            ),
             all2all_backend=args.all2all_backend,
             moe_backend=args.moe_backend,
             enable_expert_parallel=not args.disable_expert_parallel,
