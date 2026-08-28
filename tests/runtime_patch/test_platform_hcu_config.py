@@ -391,6 +391,7 @@ def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
+arg_utils.current_platform.device_type = "cpu"
 patch_engine_args.apply_to_module(arg_utils)
 
 for kwargs in (

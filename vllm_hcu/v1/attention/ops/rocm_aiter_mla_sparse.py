@@ -25,8 +25,23 @@ else:
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMetadata
 import vllm_hcu.platforms.envs as henvs 
 from vllm_hcu.platforms.hcu import on_gfx938
-import lightop
-from lightop import op, gemmopt
+try:
+    import lightop
+    from lightop import gemmopt, op
+except (ImportError, RuntimeError, TypeError) as lightop_import_error:
+    class _UnavailableLightop:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def __getattr__(self, name: str):
+            del name
+            raise RuntimeError(
+                "lightop sparse-MLA kernels are unavailable on this host"
+            ) from self.error
+
+    lightop = _UnavailableLightop(lightop_import_error)
+    gemmopt = _UnavailableLightop(lightop_import_error)
+    op = _UnavailableLightop(lightop_import_error)
 
 
 _GLOBAL_LOGITS_BUFFERS = {}

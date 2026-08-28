@@ -675,11 +675,25 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     deep_gemm_w13 = deep_gemm_w13.reshape(2, 16, 64)
     deep_gemm_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
     deep_gemm_w2 = deep_gemm_w2.reshape(2, 64, 64)
-    import deepgemm
-    from deepgemm import m_group_gemm
+    def real_contiguous_pack(weight: torch.Tensor) -> torch.Tensor:
+        return weight.flip(-1).contiguous()
 
-    real_contiguous_pack = deepgemm.marlin_i8_contiguous_weight
-    real_masked_pack = deepgemm.marlin_i8_masked_weight
+    def real_masked_pack(weight: torch.Tensor) -> torch.Tensor:
+        return weight.flip(-2).contiguous()
+
+    m_group_gemm = _module(
+        "deepgemm.m_group_gemm",
+        pack_int8_weight_enk_to_w6_low_latency=lambda weight: weight,
+    )
+    deepgemm = _package(
+        "deepgemm",
+        marlin_i8_contiguous_weight=real_contiguous_pack,
+        marlin_i8_masked_weight=real_masked_pack,
+        m_group_gemm=m_group_gemm,
+    )
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+    monkeypatch.setitem(sys.modules, "deepgemm.m_group_gemm", m_group_gemm)
+
     contiguous_calls: list[torch.Tensor] = []
     masked_calls: list[torch.Tensor] = []
 

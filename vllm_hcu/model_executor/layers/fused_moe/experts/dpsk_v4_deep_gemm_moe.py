@@ -12,12 +12,24 @@ scales.
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from deepgemm import (
-    marlin_fp8_contiguous_weight,
-    marlin_fp8_masked_weight,
-    m_grouped_fp8_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nt_masked,
-)
+try:
+    from deepgemm import (
+        marlin_fp8_contiguous_weight,
+        marlin_fp8_masked_weight,
+        m_grouped_fp8_gemm_nt_contiguous,
+        m_grouped_fp8_gemm_nt_masked,
+    )
+except (ImportError, RuntimeError, TypeError) as deepgemm_import_error:
+    def _deepgemm_unavailable(*args, _error=deepgemm_import_error, **kwargs):
+        del args, kwargs
+        raise RuntimeError(
+            "DeepGEMM MoE kernels are unavailable on this host"
+        ) from _error
+
+    marlin_fp8_contiguous_weight = _deepgemm_unavailable
+    marlin_fp8_masked_weight = _deepgemm_unavailable
+    m_grouped_fp8_gemm_nt_contiguous = _deepgemm_unavailable
+    m_grouped_fp8_gemm_nt_masked = _deepgemm_unavailable
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -46,7 +58,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
-from lightop import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
+try:
+    from lightop import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
+except (ImportError, RuntimeError, TypeError) as lightop_import_error:
+    def _lightop_unavailable(*args, _error=lightop_import_error, **kwargs):
+        del args, kwargs
+        raise RuntimeError(
+            "LightOp MoE kernels are unavailable on this host"
+        ) from _error
+
+    fuse_silu_mul_fp8_quant = _lightop_unavailable
+    fuse_silu_mul_fp8_quant_ep = _lightop_unavailable
 
 logger = init_logger(__name__)
 
