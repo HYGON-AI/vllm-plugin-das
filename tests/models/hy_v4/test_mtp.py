@@ -191,6 +191,73 @@ def test_fused_expert_scale_resolves_to_scale_parameter_not_weight() -> None:
     assert actual == scale_name
 
 
+def test_blockwise_fp8_mtp_expert_scale_normalizes_legacy_name_and_ue8m0_bits(
+) -> None:
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+    )
+    quant_config.is_scale_e8m0 = True
+    raw_scale = torch.tensor([0, 127, 128, 255], dtype=torch.uint8)
+
+    name, actual = hy_v4_mtp._prepare_mtp_fp8_expert_scale(
+        quant_config,
+        "model.layers.78.mtp_block.mlp.experts.gate_up_proj.scale",
+        raw_scale,
+    )
+
+    assert name.endswith("gate_up_proj.weight_scale_inv")
+    assert actual.dtype == torch.float8_e8m0fnu
+    torch.testing.assert_close(actual.view(torch.uint8), raw_scale)
+
+
+def test_modelopt_mtp_expert_scale_keeps_name_and_dtype() -> None:
+    quant_config = SimpleNamespace(
+        weight_block_size=[128, 128],
+        is_scale_e8m0=True,
+    )
+    raw_scale = torch.tensor([0, 127, 128, 255], dtype=torch.uint8)
+    checkpoint_name = (
+        "model.layers.78.mtp_block.mlp.experts.gate_up_proj.scale"
+    )
+
+    name, actual = hy_v4_mtp._prepare_mtp_fp8_expert_scale(
+        quant_config,
+        checkpoint_name,
+        raw_scale,
+    )
+
+    assert name == checkpoint_name
+    assert actual is raw_scale
+
+
+def test_mtp_fp8_quant_config_preserves_static_activation_without_blocks() -> None:
+    config = SimpleNamespace(
+        mtp_quant_algo="FP8",
+        quantization_config={"activation_scheme": "static"},
+    )
+
+    actual = hy_v4_mtp._create_mtp_quant_config(config)
+
+    assert actual.activation_scheme == "static"
+
+
+def test_mtp_blockwise_fp8_quant_config_forces_dynamic_activation() -> None:
+    config = SimpleNamespace(
+        mtp_quant_algo="FP8",
+        quantization_config={
+            "activation_scheme": "static",
+            "weight_block_size": [128, 128],
+        },
+    )
+
+    actual = hy_v4_mtp._create_mtp_quant_config(config)
+
+    assert actual.activation_scheme == "dynamic"
+
+
 def test_fused_expert_scale_loader_targets_scale_parameter() -> None:
     weight_name = "model.layers.78.mtp_block.mlp.experts.routed_experts.w13_weight"
     scale_name = weight_name + "_scale"

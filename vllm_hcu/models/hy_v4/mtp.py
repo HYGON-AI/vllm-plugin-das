@@ -149,18 +149,44 @@ def _create_mtp_quant_config(
 
     hf_quant_config = getattr(hf_config, "quantization_config", None) or {}
     weight_block_size = hf_quant_config.get("weight_block_size")
+    activation_scheme = hf_quant_config.get("activation_scheme", "dynamic")
+    if weight_block_size is not None:
+        activation_scheme = "dynamic"
     ignored_layers = hf_quant_config.get("ignored_layers") or hf_quant_config.get(
         "modules_to_not_convert"
     )
     result = Fp8Config(
         is_checkpoint_fp8_serialized=True,
-        activation_scheme="dynamic",
+        activation_scheme=activation_scheme,
         ignored_layers=ignored_layers or [],
         weight_block_size=weight_block_size,
     )
     if hf_quant_config.get("scale_fmt") == "ue8m0":
         result.is_scale_e8m0 = True
     return result
+
+
+def _prepare_mtp_fp8_expert_scale(
+    quant_config: QuantizationConfig | None,
+    name: str,
+    loaded_weight: torch.Tensor,
+) -> tuple[str, torch.Tensor]:
+    """Normalize legacy block-wise FP8 expert scale names and dtypes."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    if (
+        isinstance(quant_config, Fp8Config)
+        and quant_config.weight_block_size is not None
+        and ".mlp.experts." in name
+        and name.endswith(".scale")
+    ):
+        name = name[: -len(".scale")] + ".weight_scale_inv"
+        if (
+            getattr(quant_config, "is_scale_e8m0", False)
+            and loaded_weight.dtype == torch.uint8
+        ):
+            loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
+    return name, loaded_weight
 
 
 def _rewrite_mtp_weight_name(name: str, mtp_start_layer_idx: int) -> str | None:
@@ -652,6 +678,11 @@ class HYV4MTP(nn.Module):
             name = _rewrite_mtp_weight_name(checkpoint_name, mtp_start)
             if name is None:
                 continue
+            name, loaded_weight = _prepare_mtp_fp8_expert_scale(
+                self.quant_config,
+                name,
+                loaded_weight,
+            )
             if _try_load_fp8_indexer_projection(
                 name,
                 loaded_weight,
