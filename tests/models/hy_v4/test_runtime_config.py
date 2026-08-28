@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 from types import ModuleType, SimpleNamespace
 
+import torch
+from vllm.config.model import ModelConfig
 from vllm.config import vllm as vllm_config
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
@@ -14,6 +16,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 from vllm_hcu.models.hy_v4.config import HYV4Config
 from vllm_hcu.patch.platform.core_fix import (
     patch_hy_v4_model_arch_config,
+    patch_hy_v4_model_head_dtype,
     patch_hy_v4_vllm_config,
 )
 
@@ -42,6 +45,21 @@ def test_hyv4_target_and_mtp_are_classified_as_mla() -> None:
     assert _convertor(target).is_deepseek_mla() is True
     assert _convertor(draft).is_deepseek_mla() is True
     assert _convertor(unrelated).is_deepseek_mla() is False
+
+
+def test_hyv4_generation_model_config_honors_explicit_fp32_head_dtype() -> None:
+    import vllm.config.model as model_module
+
+    patch_hy_v4_model_head_dtype.apply_to_module(model_module)
+    config = object.__new__(ModelConfig)
+    config.hf_config = SimpleNamespace(
+        model_type="hy_v4",
+        head_dtype="float32",
+    )
+    config.dtype = torch.bfloat16
+    config.runner_type = "generate"
+
+    assert config.head_dtype is torch.float32
 
 
 def _fake_vllm_config_module() -> ModuleType:

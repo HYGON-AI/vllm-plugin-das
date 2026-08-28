@@ -7,7 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers import logits_processor as logits_module
 from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParameter
+from vllm.model_executor.layers import vocab_parallel_embedding as vocab_module
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from vllm_hcu.models.hy_v4 import model as hy_v4_model
 from vllm_hcu.models.hy_v4.model import (
@@ -20,6 +25,7 @@ from vllm_hcu.models.hy_v4.model import (
     _try_load_fp8_indexer_projection,
     _try_load_fp8_router_gate,
 )
+from vllm_hcu.patch.platform.core_fix import patch_logits_processor_head_dtype
 
 
 def test_excluded_quant_config_is_not_forwarded_to_lm_head(
@@ -92,6 +98,48 @@ def test_compute_logits_keeps_hidden_state_in_model_dtype() -> None:
 
     assert captured["hidden_states"] is hidden_states
     assert actual.dtype == torch.float32
+
+
+def test_v0251_logits_processor_accumulates_unquantized_hy_v4_head_in_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_logits_processor_head_dtype.apply_to_module(logits_module)
+    monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vocab_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    current = SimpleNamespace(
+        model_config=SimpleNamespace(head_dtype=torch.float32),
+    )
+    with set_current_vllm_config(current):
+        processor = LogitsProcessor(vocab_size=64)
+    processor._gather_logits = lambda logits: logits
+    head = ParallelLMHead(64, 16, params_dtype=torch.bfloat16)
+    with torch.no_grad():
+        head.weight.copy_(
+            torch.arange(head.weight.numel(), dtype=torch.float32)
+            .reshape_as(head.weight)
+            .to(torch.bfloat16)
+            / 128
+        )
+    hidden_states = torch.linspace(
+        -1,
+        1,
+        32,
+        dtype=torch.float32,
+    ).reshape(2, 16).to(torch.bfloat16)
+
+    actual = processor(head, hidden_states)
+
+    assert head.weight.dtype == torch.bfloat16
+    assert actual.dtype == torch.float32
+    expected = torch.nn.functional.linear(
+        hidden_states.float(),
+        head.weight.float(),
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_normalize_hyv4_config_populates_runtime_aliases() -> None:
