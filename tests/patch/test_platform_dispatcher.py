@@ -68,6 +68,14 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ),
         ("platform.core_fix.hcu_config.vllm", "vllm.config.vllm"),
         (
+            "platform.core_fix.hy_v4_vllm_config",
+            "vllm.config.vllm",
+        ),
+        (
+            "platform.core_fix.hy_v4_model_arch_config",
+            "vllm.transformers_utils.model_arch_config_convertor",
+        ),
+        (
             "platform.core_fix.hy_v4_mtp_config",
             "vllm.config.speculative",
         ),
@@ -273,9 +281,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 44,
+        "count": 46,
         "replacements": 11,
-        "callbacks": 33,
+        "callbacks": 35,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
