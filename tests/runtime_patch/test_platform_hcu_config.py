@@ -239,6 +239,64 @@ def test_engine_args_normalizes_hcu_flash_attention_aliases(
     assert get_hcu_config(nested).hcu_flash_attn_mode == mode
 
 
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, "varlen"),
+        ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
+        ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
+    ],
+)
+def test_plain_flash_attention_defers_submode_to_legacy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    expected: str,
+) -> None:
+    for name in (
+        "VLLM_HCU_USE_FLASH_ATTN",
+        "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
+        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    top_level = module.EngineArgs(attention_backend="FLASH_ATTN")
+    assert top_level.attention_backend == "FLASH_ATTN"
+    assert get_hcu_config(top_level).hcu_flash_attn_mode is None
+
+    nested = module.EngineArgs(attention_config={"backend": "FLASH_ATTN"})
+    assert nested.attention_config["backend"] == "FLASH_ATTN"
+    assert get_hcu_config(nested).hcu_flash_attn_mode is None
+
+    config = _validation_config(get_hcu_config(top_level.create_engine_config()))
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert feature_config.hcu_flash_attn_mode == expected
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["TRITON_ATTN", "ROCM_AITER_FA", "TORCH_SDPA"],
+)
+def test_engine_args_preserves_non_hcu_flash_attention_backends(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    top_level = module.EngineArgs(attention_backend=backend)
+    assert top_level.attention_backend == backend
+    assert get_hcu_config(top_level).hcu_flash_attn_mode is None
+
+    nested = module.EngineArgs(attention_config={"backend": backend})
+    assert nested.attention_config["backend"] == backend
+    assert get_hcu_config(nested).hcu_flash_attn_mode is None
+
+
 def test_async_engine_args_and_nested_deep_gemm_use_same_sidecar() -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
@@ -1244,7 +1302,7 @@ def _vllm_hash(additional_config: dict[str, Any]) -> str:
 @pytest.mark.parametrize(
     ("environment", "expected"),
     [
-        ({}, "cutlass"),
+        ({}, "varlen"),
         ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
         ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
         ({"VLLM_HCU_USE_FLASH_ATTN_VARLEN": "1"}, "varlen"),

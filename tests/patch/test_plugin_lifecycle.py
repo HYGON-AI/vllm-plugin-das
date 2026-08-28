@@ -64,6 +64,7 @@ def _fresh_python(
     code: str,
     *,
     plugins: str = "__disabled__",
+    assert_target_source: bool = True,
     assert_target_first: bool = True,
     no_site: bool = False,
 ) -> subprocess.CompletedProcess[str]:
@@ -71,17 +72,15 @@ def _fresh_python(
     env["VLLM_PLUGINS"] = plugins
     env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
-    if no_site:
+    if no_site or not assert_target_source:
         # The dependency-light plugin probe intentionally runs without
         # site-packages; importing vLLM for the source assertion would require
         # torch and invalidate the probe itself.
         child_code = code
+    elif assert_target_first:
+        child_code = _TARGET_SOURCE_ASSERTION + code
     else:
-        child_code = (
-            _TARGET_SOURCE_ASSERTION + code
-            if assert_target_first
-            else code + _TARGET_SOURCE_ASSERTION
-        )
+        child_code = code + _TARGET_SOURCE_ASSERTION
     command = [sys.executable]
     if no_site:
         command.append("-S")
@@ -320,7 +319,7 @@ print(
     )
 )
 ''',
-        assert_target_first=False,
+        assert_target_source=False,
         no_site=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
