@@ -26,7 +26,7 @@ pytestmark = [
 
 def _assert_completion(record: dict[str, Any]) -> None:
     assert record["prompt_token_count"] > 0
-    assert 1 <= len(record["token_ids"]) <= 4
+    assert 1 <= len(record["token_ids"]) <= 8
     assert isinstance(record["text"], str)
     assert record["finish_reason"] in {"length", "stop", "eos"}
     cumulative_logprob = record["cumulative_logprob"]

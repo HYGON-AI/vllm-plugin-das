@@ -1218,7 +1218,10 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
     target = SimpleNamespace(model=SimpleNamespace(topk_indices_buffer=target_buffer))
     off_model = module.load_eagle_model(target, _config())
     assert off_model.model.child.topk_indices_buffer is None
-    assert off_model.model.self_attn.mla_attn.impl.topk_indices_buffer is None
+    assert (
+        off_model.model.self_attn.mla_attn.impl.topk_indices_buffer
+        is target_buffer
+    )
     on_model = module.load_eagle_model(
         target, _config(enable_multi_layers_mtp=True)
     )

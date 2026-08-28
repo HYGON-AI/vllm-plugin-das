@@ -264,7 +264,7 @@
         {
           "kind": "model",
           "env": "VLLM_HCU_HY_V4_MODEL",
-          "relative": "Hy4-preview-Testing-Channel-FP8-w8a8-v2"
+          "relative": "Hy4-preview-FP8-Testing"
         }
       ]
     },

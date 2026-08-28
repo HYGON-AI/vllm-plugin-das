@@ -31,11 +31,19 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_load_eagle_model(target_model, vllm_config):
         eagle_model = original(target_model, vllm_config)
-        if not get_hcu_config(vllm_config).enable_multi_layers_mtp:
+        enable_multi_layers_mtp = get_hcu_config(vllm_config).enable_multi_layers_mtp
+        has_explicit_setter = callable(
+            getattr(eagle_model, "set_topk_indices_buffer", None)
+        )
+        if not enable_multi_layers_mtp and not has_explicit_setter:
             return eagle_model
         from vllm_hcu.v1.worker_framework_runtime import share_eagle_topk_buffer
 
-        return share_eagle_topk_buffer(target_model, eagle_model)
+        return share_eagle_topk_buffer(
+            target_model,
+            eagle_model,
+            traverse_modules=enable_multi_layers_mtp,
+        )
 
     setattr(hcu_load_eagle_model, _WRAPPER, True)
     setattr(eagle, "_vllm_hcu_original_load_eagle_model", original)
