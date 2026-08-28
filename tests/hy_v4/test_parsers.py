@@ -171,10 +171,11 @@ def test_tool_parser_streams_multiple_calls_without_losing_arguments() -> None:
             current,
             chunk,
             [],
-            [],
-            [],
-            tools,
-        )
+                [],
+                [],
+                tools,
+                guided=True,
+            )
         if delta is not None:
             for tool_call in delta["tool_calls"]:
                 index = tool_call["index"]
@@ -201,8 +202,10 @@ def test_tool_parser_streaming_is_chunk_invariant_for_complete_delta() -> None:
         + "after"
     )
 
+    start_id = extractor.tool_calls_start_token_id
+    assert start_id is not None
     delta = extractor.extract_tool_calls_streaming(
-        "", output, output, [], [], [], None
+        "", output, output, [], [start_id], [start_id], None
     )
 
     assert delta is not None
@@ -211,6 +214,79 @@ def test_tool_parser_streaming_is_chunk_invariant_for_complete_delta() -> None:
     assert [tool["arguments"] for tool in delta["tool_calls"]] == [
         '{"city": "武汉"}',
         "{}",
+    ]
+
+
+def test_tool_parser_streams_ordinary_less_than_on_atomic_token_path() -> None:
+    extractor = HYV4ToolExtractor(_tool_vocabulary(), SUFFIX, strict=True)
+
+    prefix = extractor.extract_tool_calls_streaming(
+        "", "plain ", "plain ", [], [100], [100], None
+    )
+    less_than = extractor.extract_tool_calls_streaming(
+        "plain ", "plain <", "<", [100], [100, 101], [101], None
+    )
+
+    assert prefix == {"content": "plain ", "tool_calls": []}
+    assert less_than == {"content": "<", "tool_calls": []}
+
+
+def test_tool_parser_atomic_path_does_not_repeat_content_before_tool_block() -> None:
+    extractor = HYV4ToolExtractor(_tool_vocabulary(), SUFFIX, strict=True)
+    start_id = extractor.tool_calls_start_token_id
+    assert start_id is not None
+
+    prefix = extractor.extract_tool_calls_streaming(
+        "", "before", "before", [], [100], [100], None
+    )
+    output = "before" + _block(_call("date"))
+    tool = extractor.extract_tool_calls_streaming(
+        "before",
+        output,
+        output[len("before") :],
+        [100],
+        [100, start_id],
+        [start_id],
+        None,
+    )
+
+    assert prefix == {"content": "before", "tool_calls": []}
+    assert tool is not None
+    assert tool["content"] is None
+    assert [call["name"] for call in tool["tool_calls"]] == ["date"]
+
+
+def test_tool_parser_guided_stream_accepts_split_structural_marker() -> None:
+    extractor = HYV4ToolExtractor(_tool_vocabulary(), SUFFIX, strict=True)
+    start = f"<tool_calls{SUFFIX}>"
+    split = len(start) // 2
+
+    first = extractor.extract_tool_calls_streaming(
+        "",
+        start[:split],
+        start[:split],
+        [],
+        [100],
+        [100],
+        None,
+        guided=True,
+    )
+    output = start + _call("date") + f"</tool_calls{SUFFIX}>"
+    second = extractor.extract_tool_calls_streaming(
+        start[:split],
+        output,
+        output[split:],
+        [100],
+        [100, 101],
+        [101],
+        None,
+        guided=True,
+    )
+
+    assert first is None or first == {"content": None, "tool_calls": []}
+    assert second is not None
+    assert second["tool_calls"] == [
+        {"index": 0, "new": True, "name": "date", "arguments": "{}"}
     ]
 
 
@@ -223,7 +299,14 @@ def test_tool_parser_streams_content_after_tool_block() -> None:
     for chunk in output:
         current = previous + chunk
         delta = extractor.extract_tool_calls_streaming(
-            previous, current, chunk, [], [], [], None
+            previous,
+            current,
+            chunk,
+            [],
+            [],
+            [],
+            None,
+            guided=True,
         )
         if delta is not None:
             content += delta["content"] or ""
@@ -308,6 +391,29 @@ def test_required_tool_choice_preserves_hyv4_native_output_format() -> None:
     )
     assert _is_grammar_accept_string(grammar, valid)
     assert not _is_grammar_accept_string(grammar, malformed)
+
+
+def test_auto_tool_choice_skips_hyv4_structural_tag() -> None:
+    parser = HYV4ToolParser(FakeTokenizer(_tool_vocabulary()))
+    request = ChatCompletionRequest(
+        model="hy4",
+        messages=[{"role": "user", "content": "北京天气如何？"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    assert parser.get_structural_tag(request) is None
 
 
 def test_required_tool_choice_falls_back_to_vllm_json_guidance() -> None:

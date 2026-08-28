@@ -586,7 +586,12 @@ class HYV4ToolExtractor:
         current_token_ids,
         delta_token_ids,
         tools: list[ToolSchema] | None,
+        *,
+        guided: bool = False,
     ) -> StreamDelta | None:
+        if not guided and self.tool_calls_start_token_id not in current_token_ids:
+            self._stream_prefix_emitted_len = len(current_text)
+            return StreamDelta(content=delta_text, tool_calls=[])
         if not delta_text and current_text == previous_text:
             return None
         del previous_text, delta_text, previous_token_ids, current_token_ids
@@ -1124,6 +1129,14 @@ class HYV4ToolParser(ToolParser):
         if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING:
             return None
 
+        tool_choice = request.tool_choice
+        if (
+            tool_choice is None
+            or tool_choice == "auto"
+            or getattr(tool_choice, "mode", None) == "auto"
+        ):
+            return None
+
         try:
             return _build_hyv4_structural_tag(
                 request.tools,
@@ -1175,6 +1188,14 @@ class HYV4ToolParser(ToolParser):
             return self._plain_tools
         return _tools_to_plain(getattr(request, "tools", None))
 
+    @staticmethod
+    def _is_guided(request: ChatCompletionRequest) -> bool:
+        structured_outputs = getattr(request, "structured_outputs", None)
+        return (
+            structured_outputs is not None
+            and structured_outputs.structural_tag is not None
+        )
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -1215,6 +1236,7 @@ class HYV4ToolParser(ToolParser):
             current_token_ids,
             delta_token_ids,
             self._tools(request),
+            guided=self._is_guided(request),
         )
         self._mirror_state()
         if delta is None:
