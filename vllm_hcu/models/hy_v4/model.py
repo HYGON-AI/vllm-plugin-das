@@ -48,6 +48,10 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     dequant_mxfp8_to_bf16,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    scaled_dequantize,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -143,15 +147,42 @@ def _dequantize_indexer_channel_fp8(
     ):
         return dequant_mxfp8_to_bf16(weight, scale)
 
-    expected_scale_shape = (weight.shape[0], 1)
-    if tuple(scale.shape) != expected_scale_shape:
+    if scale.ndim == 1:
+        if scale.shape[0] != weight.shape[0]:
+            raise ValueError(
+                "HY V4 indexer rank-one FP8 scale must contain one value per "
+                f"output row; got weight={tuple(weight.shape)}, "
+                f"scale={tuple(scale.shape)}."
+            )
+        scale = scale.unsqueeze(-1)
+    if scale.ndim != 2 or any(dimension <= 0 for dimension in scale.shape):
         raise ValueError(
-            "HY V4 indexer FP8 scale must be per-output-channel with shape "
-            f"{expected_scale_shape}, or MXFP8 uint8 with shape "
-            f"{expected_mxfp8_scale_shape}; got weight={tuple(weight.shape)}, "
+            "HY V4 indexer FP8 scale must be rank one or two; "
+            f"got weight={tuple(weight.shape)}, scale={tuple(scale.shape)} "
+            f"dtype={scale.dtype}."
+        )
+    if (
+        weight.shape[0] % scale.shape[0] != 0
+        or weight.shape[1] % scale.shape[1] != 0
+    ):
+        raise ValueError(
+            "HY V4 indexer FP8 scale dimensions must divide the weight "
+            f"dimensions exactly; got weight={tuple(weight.shape)}, "
             f"scale={tuple(scale.shape)} dtype={scale.dtype}."
         )
-    return (weight.float() * scale.float()).to(torch.bfloat16)
+
+    if scale.dtype in (torch.uint8, torch.float8_e8m0fnu):
+        scale = scale.view(torch.float8_e8m0fnu).to(torch.float32)
+    group_shape = GroupShape(
+        weight.shape[0] // scale.shape[0],
+        weight.shape[1] // scale.shape[1],
+    )
+    return scaled_dequantize(
+        weight,
+        scale,
+        group_shape=group_shape,
+        out_dtype=torch.bfloat16,
+    )
 
 
 def _try_load_fp8_indexer_projection(

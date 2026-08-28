@@ -378,6 +378,58 @@ def test_indexer_channel_fp8_dequantizes_each_output_row() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_indexer_rank_one_fp8_scale_dequantizes_each_output_row() -> None:
+    weight = torch.ones(2, 3, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([0.5, 2.0], dtype=torch.float32)
+
+    actual = _dequantize_indexer_channel_fp8(weight, scale)
+
+    expected = torch.tensor(
+        [[0.5, 0.5, 0.5], [2.0, 2.0, 2.0]],
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_indexer_fp8_dequantizes_128_by_128_scale_blocks() -> None:
+    weight = torch.ones(256, 256, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]], dtype=torch.float32)
+
+    actual = _dequantize_indexer_channel_fp8(weight, scale)
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        actual[:128, :128],
+        torch.ones(128, 128, dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        actual[:128, 128:],
+        torch.full((128, 128), 2.0, dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        actual[128:, :128],
+        torch.full((128, 128), 4.0, dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        actual[128:, 128:],
+        torch.full((128, 128), 8.0, dtype=torch.bfloat16),
+    )
+
+
+def test_indexer_fp8_reinterprets_ue8m0_128_by_128_scale_blocks() -> None:
+    weight = torch.ones(256, 256, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[127, 128], [126, 129]], dtype=torch.uint8)
+
+    actual = _dequantize_indexer_channel_fp8(weight, scale)
+
+    expected = torch.empty(256, 256, dtype=torch.bfloat16)
+    expected[:128, :128] = 1.0
+    expected[:128, 128:] = 2.0
+    expected[128:, :128] = 0.5
+    expected[128:, 128:] = 4.0
+    torch.testing.assert_close(actual, expected)
+
+
 def test_indexer_mxfp8_dequantizes_each_32_element_block() -> None:
     weight = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
     scale = torch.tensor([[127, 128], [126, 129]], dtype=torch.uint8)
@@ -392,10 +444,10 @@ def test_indexer_mxfp8_dequantizes_each_32_element_block() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_indexer_channel_fp8_rejects_non_channel_scale() -> None:
+def test_indexer_fp8_rejects_non_divisible_block_scale() -> None:
     weight = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
-    with pytest.raises(ValueError, match="per-output-channel"):
-        _dequantize_indexer_channel_fp8(weight, torch.ones(1, 4))
+    with pytest.raises(ValueError, match="divide"):
+        _dequantize_indexer_channel_fp8(weight, torch.ones(1, 3))
 
 
 @pytest.mark.parametrize(
