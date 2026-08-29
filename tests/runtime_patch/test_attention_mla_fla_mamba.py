@@ -60,6 +60,7 @@ def _gdn_causal_conv1d_update(
     block_idx_last_scheduled_token=None,
     initial_state_idx=None,
     validate_data=False,
+    out=None,
 ):
     return weight
 
@@ -618,6 +619,7 @@ def test_gdn_feature_off_delegates_official_state_dtype(monkeypatch):
         block_idx_last_scheduled_token,
         initial_state_idx,
         validate_data,
+        out,
     ):
         return "official-update"
 

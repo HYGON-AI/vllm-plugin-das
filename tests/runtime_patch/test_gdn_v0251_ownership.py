@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""vLLM v0.25.1 ownership and HCU-delta contracts for Qwen GDN."""
+"""vLLM v0.28 ownership and HCU-delta contracts for Qwen GDN."""
 
 from __future__ import annotations
 
@@ -126,6 +126,7 @@ def _causal_update_contract(
     block_idx_last_scheduled_token=None,
     initial_state_idx=None,
     validate_data=False,
+    out=None,
 ):
     del (
         x,
@@ -140,6 +141,7 @@ def _causal_update_contract(
         block_idx_last_scheduled_token,
         initial_state_idx,
         validate_data,
+        out,
     )
     return weight
 
@@ -360,10 +362,12 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
         conv_states=conv_state,
         query_start_loc=torch.tensor([0, 2]),
     )
+    out = torch.empty_like(x_update)
     update_result = module.causal_conv1d_update(
         x_update,
         conv_state,
         weight,
+        out=out,
     )
     aiter_result = _call_aiter(module, conv_state, weight)
     for result in (fn_result, update_result, aiter_result):
@@ -372,6 +376,7 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
     for name in ("causal", "update", "aiter"):
         record = calls[name]
         torch.testing.assert_close(record["arguments"]["weight"], expected)
+    assert calls["update"]["arguments"]["out"] is out
     if not use_nn:
         # Feature-off preserves the original keyword invocation exactly.
         assert calls["causal"]["raw_args"] == ()
@@ -445,7 +450,7 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
 
     monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
     assert adapter.apply_to_module(module) is True
-    with pytest.raises(PatchCompatibilityError, match="audited vLLM v0.25.1"):
+    with pytest.raises(PatchCompatibilityError, match="audited vLLM v0.28"):
         module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
             x=torch.empty(1),
             unexpected=torch.empty(1),
@@ -508,7 +513,7 @@ prepare_worker_patches()
 qwen = importlib.import_module(qwen_name)
 canonical = importlib.import_module(canonical_name)
 base = importlib.import_module(base_name)
-fla = importlib.import_module("vllm.model_executor.layers.fla.ops")
+fla = importlib.import_module("vllm.third_party.flash_linear_attention.ops")
 
 assert Path(qwen.__file__).resolve() == (
     source_root

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""NN-layout adapter for vLLM v0.25.1's native Qwen GDN AITER path."""
+"""NN-layout adapter for vLLM v0.28's native Qwen GDN AITER path."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ TARGETS = (
 _MARKER = "_vllm_hcu_qwen_gdn_aiter_layout_applied"
 _WRAPPER = "_vllm_hcu_qwen_gdn_aiter_layout_wrapper"
 
-# This is the audited vLLM v0.25.1 AITER launcher contract.  Binding by name is
+# This is the audited vLLM v0.28 AITER launcher contract.  Binding by name is
 # intentional: the old HCU adapter rewrote args[10], which could silently
 # transpose the wrong object if AITER inserted or reordered a parameter.
 _AITER_UPDATE_PARAMETERS = (
@@ -94,7 +94,7 @@ def apply_to_module(module: ModuleType) -> bool:
         except TypeError as exc:
             raise PatchCompatibilityError(
                 f"required HCU call for {TARGETS[0]} does not match the "
-                f"audited vLLM v0.25.1 AITER contract {aiter_signature}"
+                f"audited vLLM v0.28 AITER contract {aiter_signature}"
             ) from exc
         conv_state = bound.arguments.get("conv_state")
         if conv_state is None or "weight" not in bound.arguments:
