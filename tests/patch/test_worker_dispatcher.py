@@ -60,6 +60,7 @@ def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[
 def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     replacements = worker_dispatcher.worker_module_exchange_names()
     callbacks = worker_dispatcher.worker_callback_names()
+    pending_callbacks = worker_dispatcher.worker_pending_callback_names()
 
     assert replacements == (
         (
@@ -85,6 +86,16 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     )
     assert callbacks
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
+    assert pending_callbacks == (
+        (
+            "worker.op_opt.compressed_tensors.moe_wna16",
+            "vllm.model_executor.layers.quantization.compressed_tensors."
+            "compressed_tensors_moe.compressed_tensors_moe_wna16",
+        ),
+    )
+    assert {patch_id for patch_id, _ in callbacks}.isdisjoint(
+        patch_id for patch_id, _ in pending_callbacks
+    )
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
     assert positions["worker.op_opt.moe.config"] < positions[
@@ -124,7 +135,10 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
             *worker_dispatcher._OP_REPLACEMENTS,
         )
     }
-    inventoried_adapters = callback_specs | replacement_specs
+    pending_specs = {
+        spec.adapter for spec in worker_dispatcher._PENDING_CALLBACKS
+    }
+    inventoried_adapters = callback_specs | replacement_specs | pending_specs
     adapter_files = {
         ".".join(path.with_suffix("").parts)
         for root in (

@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""HCU AITER W4A16 zero-point adapter for compressed-tensors MoE."""
+"""Pending v0.25 HCU AITER W4A16 adapter retained for migration audit.
+
+It is not registered in the v0.28 selected callback surface because the
+target removed int4_w4a16_moe_quant_config.
+"""
 
 from __future__ import annotations
 

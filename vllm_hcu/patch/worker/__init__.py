@@ -248,6 +248,16 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
+    # v0.25 WNA16/AITER adapter retained as pending source evidence only;
+    # v0.28 removed its int4_w4a16_moe_quant_config dependency.
+)
+
+
+# Source-audited adapters that are deliberately outside the selected runtime
+# surface. Keeping them explicit prevents an unregistered file from becoming
+# invisible to inventory checks while ensuring prepare_worker_patches() cannot
+# arm an unverified v0.25 contract on v0.28.
+_PENDING_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_wna16")),
 )
 
@@ -817,6 +827,16 @@ def worker_callback_names() -> tuple[tuple[str, str], ...]:
     return tuple(values)
 
 
+def worker_pending_callback_names() -> tuple[tuple[str, str], ...]:
+    """Return source-audited callbacks intentionally excluded from selection."""
+
+    values: list[tuple[str, str]] = []
+    for spec in _PENDING_CALLBACKS:
+        adapter = _load_adapter(spec.adapter)
+        values.append((spec.patch_id or adapter.PATCH_ID, adapter.TARGET_MODULE))
+    return tuple(values)
+
+
 def worker_module_exchange_names() -> tuple[tuple[str, str, str], ...]:
     """Return worker replacement ids in their safety-critical order."""
 
@@ -832,4 +852,5 @@ __all__ = [
     "validate_worker_patches",
     "worker_callback_names",
     "worker_module_exchange_names",
+    "worker_pending_callback_names",
 ]

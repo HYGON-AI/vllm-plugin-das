@@ -3887,6 +3887,21 @@ def _wna16_method(module, *, gated: bool, num_bits: int = 4):
     return method
 
 
+def test_v028_wna16_adapter_is_pending_not_selected():
+    from vllm_hcu.patch.worker import (
+        worker_callback_names,
+        worker_pending_callback_names,
+    )
+
+    assert patch_compressed_tensors_moe_wna16.PATCH_ID not in dict(
+        worker_callback_names()
+    )
+    assert dict(worker_pending_callback_names()) == {
+        patch_compressed_tensors_moe_wna16.PATCH_ID:
+            patch_compressed_tensors_moe_wna16.TARGET_MODULE,
+    }
+
+
 def test_moe_wna16_feature_off_delegates_exactly(
     monkeypatch: pytest.MonkeyPatch,
 ):
