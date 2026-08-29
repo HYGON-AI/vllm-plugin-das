@@ -561,9 +561,9 @@ def apply_aiter_w8a8_fp8_moe(
 
 
 def process_dpsk_deepgemm_weights(method: object, layer: object) -> None:
-    """Run the HCU-owned expert post-load step for the DPSK backend."""
+    """Run the HCU-owned expert post-load step for ``deep_gemm``."""
 
-    if _enum_token(getattr(method, "fp8_backend", None)) != "DPSK_DEEPGEMM":
+    if _enum_token(getattr(method, "fp8_backend", None)) != "HCU_DEEPGEMM":
         return
     moe_kernel = getattr(method, "moe_kernel", None)
     fused_experts = getattr(moe_kernel, "fused_experts", None)
@@ -571,7 +571,7 @@ def process_dpsk_deepgemm_weights(method: object, layer: object) -> None:
     process = getattr(experts, "process_weights_after_loading", None)
     if not callable(process):
         raise HcuCompressedTensorsMoeError(
-            "DPSK_DEEPGEMM was selected, but the HCU expert post-load hook "
+            "HCU_DEEPGEMM was selected, but the HCU expert post-load hook "
             "is unavailable"
         )
     process(layer)

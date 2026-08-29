@@ -13,7 +13,8 @@ _HCU_BOOLEAN_OPTIONS = {
     "enable_lightly_cplb": "Enable HCU lightly-CP load balancing.",
     "enable_custom_sp": "Enable HCU custom runtime sequence parallelism.",
 }
-_DPSK_BACKEND = "dpsk_deep_gemm"
+_DEEP_GEMM_BACKEND = "deep_gemm"
+_LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 
 
 def _actions_by_dest(parser: object) -> dict[str, argparse.Action]:
@@ -30,7 +31,7 @@ def _actions_by_dest(parser: object) -> dict[str, argparse.Action]:
 
 
 def register_hcu_cli_args(parser: object) -> None:
-    """Add legacy CLI switches once and extend the existing MoE choice."""
+    """Add HCU CLI switches and verify the audited official MoE choices."""
 
     by_dest = _actions_by_dest(parser)
     add_group = getattr(parser, "add_argument_group", None)
@@ -89,11 +90,13 @@ def register_hcu_cli_args(parser: object) -> None:
             help=help_text,
         )
 
-    # EngineArgs.add_cli_args owns this action.  The platform hook executes
-    # afterwards, so it may extend choices without changing KernelConfig's
-    # upstream Literal/Pydantic schema.
-    if _DPSK_BACKEND not in choices:
-        moe_action.choices = [*choices, _DPSK_BACKEND]
+    if _DEEP_GEMM_BACKEND not in choices:
+        raise PatchCompatibilityError(
+            "audited vLLM --moe-backend choices do not contain the official "
+            "'deep_gemm' backend"
+        )
+    if _LEGACY_DEEP_GEMM_BACKEND not in choices:
+        moe_action.choices = tuple(choices) + (_LEGACY_DEEP_GEMM_BACKEND,)
 
 
 def pre_register_and_update(parser: object | None = None) -> None:

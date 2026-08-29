@@ -73,10 +73,15 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
-        if feature_config.moe_backend not in ("auto", "dpsk_deep_gemm"):
+        if getattr(parallel_config, "enable_eplb", False):
+            raise ValueError(
+                "deepep_auto with EPLB is not supported because the HT and "
+                "LL expert weight layouts cannot be rebalanced atomically"
+            )
+        if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(
                 "deepep_auto requires HCU moe_backend='auto' or "
-                "'dpsk_deep_gemm'"
+                "'deep_gemm'"
             )
 
     if feature_config.enable_lightly_cp:
@@ -97,20 +102,17 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "Lightly context parallel and DCP cannot be enabled simultaneously."
             )
 
-    if feature_config.moe_backend == "dpsk_deep_gemm":
+    if feature_config.moe_backend == "deep_gemm":
         if kernel_config is None:
             raise PatchCompatibilityError(
-                "dpsk_deep_gemm requires VllmConfig.kernel_config"
+                "deep_gemm requires VllmConfig.kernel_config"
             )
         upstream_backend = getattr(kernel_config, "moe_backend", None)
-        if upstream_backend == "dpsk_deep_gemm":
-            # Defensive normalization for programmatic objects that bypassed
-            # EngineArgs.  Pydantic's official Literal must never see this.
-            setattr(kernel_config, "moe_backend", "auto")
-        elif upstream_backend != "auto":
+        if upstream_backend != "deep_gemm":
             raise ValueError(
-                "HCU sidecar selects dpsk_deep_gemm but upstream "
-                f"KernelConfig.moe_backend selects {upstream_backend!r}"
+                "HCU sidecar selects deep_gemm but official "
+                "KernelConfig.moe_backend must match 'deep_gemm'; got "
+                f"{upstream_backend!r}"
             )
     return feature_config
 

@@ -23,11 +23,13 @@ TARGET_MODULE = (
 PATCH_ID = "worker.op_opt.compressed_tensors.moe_w8a8_fp8"
 TARGETS = (
     f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod.__init__",
+    f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod.process_weights_after_loading",
 )
 _CLASS_MARKER = "_vllm_hcu_moe_w8a8_fp8_applied"
 _WRAPPER_MARKER = "_vllm_hcu_moe_w8a8_fp8_wrapper"
 _EXPLICIT_BACKENDS = {
     "aiter": "AITER",
+    "deep_gemm": "HCU_DEEPGEMM",
     "triton": "TRITON",
 }
 
@@ -57,7 +59,8 @@ def _required_selected_backend(moe) -> str:
     selected_backend = _EXPLICIT_BACKENDS.get(requested_backend)
     if selected_backend is None:
         raise RuntimeError(
-            "Channel-FP8 MoE requires explicit --moe-backend aiter or triton"
+            "Channel-FP8 MoE requires explicit --moe-backend "
+            "aiter, deep_gemm, or triton"
         )
     return selected_backend
 
@@ -69,16 +72,35 @@ def apply_to_module(module: ModuleType) -> bool:
         "CompressedTensorsW8A8Fp8MoEMethod",
         f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8MoEMethod",
     )
-    wrapped = ((method_class, "__init__", TARGETS[0], _WRAPPER_MARKER),)
+    wrapped = (
+        (method_class, "__init__", TARGETS[0], _WRAPPER_MARKER),
+        (
+            method_class,
+            "process_weights_after_loading",
+            TARGETS[1],
+            _WRAPPER_MARKER,
+        ),
+    )
     if already_applied(method_class, _CLASS_MARKER, wrapped):
         return False
 
     original_init = require_callable(method_class, "__init__", TARGETS[0])
+    original_process = require_callable(
+        method_class,
+        "process_weights_after_loading",
+        TARGETS[1],
+    )
     require_exact_signature(
         original_init,
         TARGETS[0],
         positional=("self", "weight_quant", "input_quant", "moe", "layer_name"),
         defaults={"layer_name": None},
+    )
+    require_exact_signature(
+        original_process,
+        TARGETS[1],
+        positional=("self", "layer"),
+        defaults={},
     )
 
     @functools.wraps(original_init)
@@ -99,9 +121,36 @@ def apply_to_module(module: ModuleType) -> bool:
                     f"(expected={expected_backend!r}, selected={selected_backend!r})"
                 )
 
+    @functools.wraps(original_process)
+    def hcu_process_weights_after_loading(self, layer):
+        original_process(self, layer)
+        if _selected_backend_name(self) != "HCU_DEEPGEMM":
+            return
+        moe_kernel = getattr(self, "moe_kernel", None)
+        fused_experts = getattr(moe_kernel, "fused_experts", None)
+        experts = getattr(fused_experts, "experts", fused_experts)
+        process = getattr(experts, "process_weights_after_loading", None)
+        if not callable(process):
+            raise RuntimeError(
+                "HCU_DEEPGEMM FP8 backend did not construct modular experts "
+                "before weight postprocessing"
+            )
+        process(layer)
+
     setattr(hcu_init, _WRAPPER_MARKER, True)
+    setattr(hcu_process_weights_after_loading, _WRAPPER_MARKER, True)
     setattr(method_class, "_vllm_hcu_original_init", original_init)
+    setattr(
+        method_class,
+        "_vllm_hcu_original_process_weights_after_loading",
+        original_process,
+    )
     setattr(method_class, "__init__", hcu_init)
+    setattr(
+        method_class,
+        "process_weights_after_loading",
+        hcu_process_weights_after_loading,
+    )
     setattr(method_class, _CLASS_MARKER, True)
     setattr(method_class, "_vllm_hcu_fp8_moe_owner", "target-explicit")
     return True

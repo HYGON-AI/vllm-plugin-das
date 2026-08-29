@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 import torch
 
+import vllm_hcu.patch.config as hcu_config_module
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm_hcu.model_executor.layers.quantization import slimquant_facade
@@ -66,6 +67,14 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 
 def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
+    for name in (
+        "VLLM_DP_RANK",
+        "VLLM_DP_RANK_LOCAL",
+        "VLLM_DP_SIZE",
+        "VLLM_DP_MASTER_IP",
+        "VLLM_DP_MASTER_PORT",
+    ):
+        env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
@@ -109,9 +118,12 @@ def _make_arg_utils_module() -> ModuleType:
             headless: bool = False,
         ) -> object:
             del usage_context, headless
+            kernel_config = copy.deepcopy(self.kernel_config)
+            if self.moe_backend != "auto":
+                kernel_config.moe_backend = self.moe_backend
             return SimpleNamespace(
                 additional_config=copy.deepcopy(self.additional_config),
-                kernel_config=copy.deepcopy(self.kernel_config),
+                kernel_config=kernel_config,
                 parallel_config=SimpleNamespace(
                     all2all_backend=self.all2all_backend
                 ),
@@ -160,16 +172,16 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
         enable_lightly_cplb=True,
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
     )
-    assert args.moe_backend == "auto"
+    assert args.moe_backend == "deep_gemm"
     assert args.kernel_config.moe_backend == "auto"
     assert get_hcu_config(args) == HcuFeatureConfig(
         enable_lightly_cp=True,
         enable_lightly_cplb=True,
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
     )
     assert inspect.signature(module.EngineArgs.__init__) == original_signature
     assert {item.name for item in fields(module.EngineArgs)} == {
@@ -183,6 +195,7 @@ def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
     }
 
     config = args.create_engine_config()
+    assert config.kernel_config.moe_backend == "deep_gemm"
     assert get_hcu_config(config) == get_hcu_config(args)
 
 
@@ -284,16 +297,120 @@ def test_engine_args_preserves_non_hcu_flash_attention_backends(
     assert get_hcu_config(nested).hcu_flash_attn_mode is None
 
 
-def test_async_engine_args_and_nested_dpsk_config_use_same_sidecar() -> None:
+def test_async_engine_args_and_nested_deep_gemm_use_same_sidecar() -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     args = module.AsyncEngineArgs(
-        kernel_config={"moe_backend": "dpsk_deep_gemm"},
+        kernel_config={"moe_backend": "deep_gemm"},
         enable_custom_sp=True,
     )
-    assert args.kernel_config.moe_backend == "auto"
-    assert get_hcu_config(args).moe_backend == "dpsk_deep_gemm"
+    assert args.kernel_config.moe_backend == "deep_gemm"
+    assert get_hcu_config(args).moe_backend == "deep_gemm"
     assert get_hcu_config(args).enable_custom_sp is True
+
+
+def test_engine_args_rejects_conflicting_official_moe_backends() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.raises(ValueError, match="KernelConfig selects deep_gemm"):
+        module.EngineArgs(
+            moe_backend="triton",
+            kernel_config={"moe_backend": "deep_gemm"},
+        )
+    with pytest.raises(ValueError, match="KernelConfig.moe_backend"):
+        module.EngineArgs(
+            moe_backend="deep_gemm",
+            kernel_config={"moe_backend": "triton"},
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"moe_backend": "dpsk_deep_gemm"},
+        {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
+    ],
+)
+def test_engine_args_normalizes_legacy_deep_gemm_backend_at_construction(
+    kwargs: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hcu_config_module,
+        "_legacy_backend_warning_emitted",
+        False,
+        raising=False,
+    )
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    with pytest.warns(FutureWarning, match="dpsk_deep_gemm.*deep_gemm"):
+        module.EngineArgs(**kwargs)
+    args = module.EngineArgs(**kwargs)
+    assert (
+        args.moe_backend == "deep_gemm"
+        or args.kernel_config.moe_backend == "deep_gemm"
+    )
+    assert get_hcu_config(args).moe_backend == "deep_gemm"
+    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
+
+
+@pytest.mark.parametrize("location", ["top_level", "kernel_config"])
+def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
+    location: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hcu_config_module,
+        "_legacy_backend_warning_emitted",
+        False,
+        raising=False,
+    )
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    args = module.EngineArgs()
+    if location == "top_level":
+        args.moe_backend = "dpsk_deep_gemm"
+    else:
+        args.kernel_config.moe_backend = "dpsk_deep_gemm"
+
+    with pytest.warns(FutureWarning, match="dpsk_deep_gemm.*deep_gemm"):
+        config = args.create_engine_config()
+    assert (
+        args.moe_backend == "deep_gemm"
+        or args.kernel_config.moe_backend == "deep_gemm"
+    )
+    assert get_hcu_config(args).moe_backend == "deep_gemm"
+    assert config.kernel_config.moe_backend == "deep_gemm"
+
+
+def test_real_v0280_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
+    result = _run_fresh_v0251(
+        r'''
+from vllm.engine import arg_utils
+from vllm_hcu.patch.platform.core_fix import patch_engine_args
+
+patch_engine_args.apply_to_module(arg_utils)
+
+for kwargs in (
+    {"moe_backend": "dpsk_deep_gemm"},
+    {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
+):
+    args = arg_utils.EngineArgs(**kwargs)
+    assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
+
+args = arg_utils.EngineArgs()
+args.moe_backend = "dpsk_deep_gemm"
+feature = patch_engine_args._normalise_existing_engine_args(args)
+assert args.moe_backend == "deep_gemm"
+assert feature.moe_backend == "deep_gemm"
+
+print("legacy-backend-normalized")
+'''
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "legacy-backend-normalized" in result.stdout
 
 
 def test_nested_speculative_multi_mtp_is_extracted_before_official_config() -> None:
@@ -360,9 +477,13 @@ def test_engine_args_rejects_incompatible_target_signature() -> None:
         patch_engine_args.apply_to_module(module)
 
 
-def test_cli_registration_is_idempotent_and_dpsk_never_reaches_schema() -> None:
+def test_cli_registration_preserves_official_deep_gemm_backend() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--moe-backend", choices=["auto", "triton"], default="auto")
+    parser.add_argument(
+        "--moe-backend",
+        choices=["auto", "triton", "deep_gemm"],
+        default="auto",
+    )
     patch_hcu_config.register_hcu_cli_args(parser)
     patch_hcu_config.register_hcu_cli_args(parser)
 
@@ -373,7 +494,7 @@ def test_cli_registration_is_idempotent_and_dpsk_never_reaches_schema() -> None:
                 "--enable-lightly-cplb",
                 "--enable-custom-sp",
                 "--moe-backend",
-                "dpsk_deep_gemm",
+                "deep_gemm",
             ]
         )
     )
@@ -382,8 +503,23 @@ def test_cli_registration_is_idempotent_and_dpsk_never_reaches_schema() -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     args = module.EngineArgs.from_cli_args(argparse.Namespace(**parsed))
-    assert args.moe_backend == "auto"
-    assert get_hcu_config(args).moe_backend == "dpsk_deep_gemm"
+    assert args.moe_backend == "deep_gemm"
+    assert get_hcu_config(args).moe_backend == "deep_gemm"
+    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
+
+
+def test_cli_registration_accepts_legacy_deep_gemm_backend() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--moe-backend",
+        choices=["auto", "triton", "deep_gemm"],
+        default="auto",
+    )
+    patch_hcu_config.register_hcu_cli_args(parser)
+
+    assert parser.parse_args(
+        ["--moe-backend", "dpsk_deep_gemm"]
+    ).moe_backend == "dpsk_deep_gemm"
 
 
 def test_cli_registration_reports_conflicting_destination() -> None:
@@ -394,9 +530,18 @@ def test_cli_registration_reports_conflicting_destination() -> None:
         patch_hcu_config.register_hcu_cli_args(parser)
 
 
+def test_cli_registration_requires_official_deep_gemm_choice() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--moe-backend", choices=["auto", "triton"])
+    with pytest.raises(PatchCompatibilityError, match="official 'deep_gemm'"):
+        patch_hcu_config.register_hcu_cli_args(parser)
+
+
 def test_cli_omission_preserves_sidecar_and_explicit_flag_overrides() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--moe-backend", choices=["auto"], default="auto")
+    parser.add_argument(
+        "--moe-backend", choices=["auto", "deep_gemm"], default="auto"
+    )
     parser.add_argument("--additional-config", type=json.loads, default={})
     patch_hcu_config.register_hcu_cli_args(parser)
     module = _make_arg_utils_module()
@@ -409,6 +554,15 @@ def test_cli_omission_preserves_sidecar_and_explicit_flag_overrides() -> None:
         parser.parse_args(["--additional-config", sidecar_true])
     )
     assert get_hcu_config(omitted).enable_custom_sp is True
+
+    deep_gemm_sidecar = json.dumps(
+        {"hcu": HcuFeatureConfig(moe_backend="deep_gemm").to_dict()}
+    )
+    restored = module.EngineArgs.from_cli_args(
+        parser.parse_args(["--additional-config", deep_gemm_sidecar])
+    )
+    assert restored.moe_backend == "deep_gemm"
+    assert restored.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
     sidecar_false = json.dumps({"hcu": HcuFeatureConfig().to_dict()})
     explicit = module.EngineArgs.from_cli_args(
@@ -793,11 +947,69 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
     return SimpleNamespace(
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
-        model_config=SimpleNamespace(enforce_eager=True, use_mla=False),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        kernel_config=SimpleNamespace(moe_backend="auto"),
+        model_config=SimpleNamespace(
+            enforce_eager=True,
+            use_mla=False,
+            max_model_len=4096,
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
+        kernel_config=SimpleNamespace(moe_backend=feature_config.moe_backend),
         kv_transfer_config=None,
     )
+
+
+def test_deepep_low_latency_defers_capacity_check_until_model_is_known() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(moe_backend="deep_gemm")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.scheduler_config.max_num_batched_tokens = 512
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert config.scheduler_config.max_num_batched_tokens == 512
+
+
+def test_deepep_low_latency_capacity_does_not_truncate_long_prompts() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(moe_backend="deep_gemm")
+    )
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    # max_num_batched_tokens limits each chunked-prefill scheduler iteration;
+    # it must not reduce the accepted model/prompt length.
+    assert config.scheduler_config.max_num_batched_tokens == 256
+    assert config.model_config.max_model_len == 4096
+
+
+def test_deepep_high_throughput_keeps_larger_scheduler_capacity() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(moe_backend="deep_gemm")
+    )
+    config.parallel_config.all2all_backend = "deepep_high_throughput"
+    config.scheduler_config.max_num_batched_tokens = 512
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert config.scheduler_config.max_num_batched_tokens == 512
+
+
+def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+
+    with pytest.raises(
+        ValueError,
+        match="deepep_auto.*EPLB.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
 
 
 def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
@@ -806,7 +1018,7 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
         enable_lightly_cplb=True,
         enable_custom_sp=True,
         enable_multi_layers_mtp=True,
-        moe_backend="dpsk_deep_gemm",
+        moe_backend="deep_gemm",
         hcu_flash_attn_mode="cutlass",
     )
     config = _validation_config(feature_config)
@@ -814,7 +1026,7 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
     # CompilationConfig has no duplicate serialized sidecar; the process-local
     # binding is derived again from authoritative additional_config after IPC.
     assert "_vllm_hcu_feature_config" not in vars(config.compilation_config)
-    assert config.kernel_config.moe_backend == "auto"
+    assert config.kernel_config.moe_backend == "deep_gemm"
     assert not hasattr(config.parallel_config, "enable_lightly_cp")
 
     config.model_config.enforce_eager = False

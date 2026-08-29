@@ -1255,7 +1255,11 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         return [backend]
 
     def map_fp8_backend(runner_backend):
+        if runner_backend == "deep_gemm":
+            return Fp8MoeBackend.DEEPGEMM
         return "official-map", runner_backend
+
+    official_select_calls: list[tuple[object, object, object, bool]] = []
 
     def select_fp8_moe_backend(
         config,
@@ -1263,7 +1267,9 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         activation_key,
         allow_vllm_cutlass=False,
     ):
-        del config, weight_key, activation_key, allow_vllm_cutlass
+        official_select_calls.append(
+            (config, weight_key, activation_key, allow_vllm_cutlass)
+        )
         return "official-select"
 
     def convert_to_fp8_moe_kernel_format(
@@ -1312,7 +1318,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         ),
     )
     assert patch_fp8_oracle.apply_to_module(module) is True
-    assert module.Fp8MoeBackend.DPSK_DEEPGEMM.value == "DPSK_DEEPGEMM"
+    assert module.Fp8MoeBackend.HCU_DEEPGEMM.value == "HCU_DEEPGEMM"
 
     class SupportedExperts:
         @staticmethod
@@ -1363,17 +1369,45 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         patch_fp8_oracle,
         "_sidecar_config",
         lambda config: SimpleNamespace(
-            deepep_auto=False, moe_backend="dpsk_deep_gemm"
+            deepep_auto=False, moe_backend="deep_gemm"
         ),
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8DynamicTokenSym,
+        kFp8Static128BlockSym,
+        kFp8StaticChannelSym,
+    )
+
     config = SimpleNamespace(
-        moe_backend="auto",
+        moe_backend="deep_gemm",
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
     )
-    backend, experts = module.select_fp8_moe_backend(config, "w", "a")
-    assert backend is module.Fp8MoeBackend.DPSK_DEEPGEMM
+    backend, experts = module.select_fp8_moe_backend(
+        config,
+        kFp8StaticChannelSym,
+        kFp8DynamicTokenSym,
+    )
+    assert backend is module.Fp8MoeBackend.HCU_DEEPGEMM
     assert experts is SupportedExperts
-    assert module.map_fp8_backend("dpsk_deep_gemm") is backend
+    assert module.map_fp8_backend("deep_gemm") is module.Fp8MoeBackend.DEEPGEMM
+
+    assert (
+        module.select_fp8_moe_backend(
+            config,
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+        )
+        == "official-select"
+    )
+    assert official_select_calls == [
+        (
+            config,
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+            False,
+        )
+    ]
 
     tensors = tuple(object() for _ in range(4))
     assert module.convert_to_fp8_moe_kernel_format(
@@ -1404,8 +1438,11 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         "_sidecar_config",
         lambda config: SimpleNamespace(deepep_auto=True, moe_backend="auto"),
     )
+    config.moe_backend = "auto"
     auto_backend, auto_experts = module.select_fp8_moe_backend(
-        config, "w", "a"
+        config,
+        kFp8StaticChannelSym,
+        kFp8DynamicTokenSym,
     )
     assert auto_backend is backend
     assert auto_experts is UnsupportedExperts
@@ -1424,7 +1461,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         "routing",
     ) == "deepep-auto-kernel"
     assert auto_kernel_calls == [("quant", auto_config, "routing")]
-    with pytest.raises(ValueError, match="only the HCU DPSK_DEEPGEMM"):
+    with pytest.raises(ValueError, match="only the HCU_DEEPGEMM"):
         module.make_fp8_moe_kernel(
             "quant",
             auto_config,
@@ -1438,6 +1475,363 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         lambda config: SimpleNamespace(deepep_auto=False, moe_backend="auto"),
     )
     assert module.select_fp8_moe_backend(config, "w", "a") == "official-select"
+
+
+def test_hcu_deep_gemm_fp8_experts_only_advertise_channel_quantization():
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8DynamicTokenSym,
+        kFp8Static128BlockSym,
+        kFp8StaticChannelSym,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmContiguousExperts,
+        DeepEPDeepGemmMaskedExperts,
+    )
+
+    for experts_cls in (
+        DeepEPDeepGemmContiguousExperts,
+        DeepEPDeepGemmMaskedExperts,
+    ):
+        assert experts_cls._supports_quant_scheme(
+            kFp8StaticChannelSym,
+            kFp8DynamicTokenSym,
+        )
+        assert not experts_cls._supports_quant_scheme(
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+        )
+
+
+@pytest.mark.parametrize(
+    ("experts_name", "packer_name", "layout", "sentinel"),
+    (
+        (
+            "DeepEPDeepGemmContiguousExperts",
+            "marlin_fp8_contiguous_weight",
+            "contiguous",
+            11,
+        ),
+        (
+            "DeepEPDeepGemmMaskedExperts",
+            "marlin_fp8_masked_weight",
+            "masked",
+            23,
+        ),
+    ),
+)
+def test_channel_fp8_experts_repack_reloaded_weights_in_declared_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    experts_name: str,
+    packer_name: str,
+    layout: str,
+    sentinel: int,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts_cls = getattr(module, experts_name)
+    experts = object.__new__(experts_cls)
+    experts._deepgemm_w13 = None
+    experts._deepgemm_w2 = None
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 32, 64), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 16), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 32)),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 64)),
+        requires_grad=False,
+    )
+    layer.weight_block_size = None
+
+    packed = torch.full((1, 1, 1, 1, 1, 1), sentinel, dtype=torch.int8)
+
+    def expected_packer(weight: torch.Tensor) -> torch.Tensor:
+        del weight
+        return packed.clone()
+
+    monkeypatch.setattr(module, packer_name, expected_packer, raising=False)
+
+    experts.process_weights_after_loading(layer)
+
+    assert torch.equal(layer.w13_weight, packed)
+    assert torch.equal(layer.w2_weight, packed)
+    assert layer._dsv4_channel_fp8_deepgemm_layout == layout
+
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 32, 64), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 16), dtype=torch.int8),
+        requires_grad=False,
+    )
+    replacement = object.__new__(experts_cls)
+    replacement._deepgemm_w13 = None
+    replacement._deepgemm_w2 = None
+
+    replacement.process_weights_after_loading(layer)
+
+    assert torch.equal(layer.w13_weight, packed)
+    assert torch.equal(layer.w2_weight, packed)
+    assert replacement._deepgemm_w13 is layer.w13_weight
+    assert replacement._deepgemm_w2 is layer.w2_weight
+
+
+def test_channel_fp8_masked_experts_execute_public_deepgemm_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    experts._deepgemm_w13 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts._deepgemm_w2 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((2, 8)),
+        w2_scale=torch.ones((2, 4)),
+    )
+    experts.moe_problem_size = lambda *_args: (2, 3, 8, 4, 1)
+
+    call_number = 0
+
+    def public_masked_kernel(
+        _a,
+        _b,
+        destination: torch.Tensor,
+        _masked_m,
+        _expected_m_per_group,
+    ) -> torch.Tensor:
+        nonlocal call_number
+        call_number += 1
+        destination.fill_(call_number)
+        return destination
+
+    monkeypatch.setattr(
+        module,
+        "m_grouped_fp8_gemm_nt_masked",
+        public_masked_kernel,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "fuse_silu_mul_fp8_quant_ep",
+        lambda output, **_kwargs: (
+            output[..., :4].to(torch.int8),
+            torch.ones(output.shape[:2]),
+        ),
+    )
+
+    output = torch.empty((2, 3, 4))
+    experts.apply(
+        output=output,
+        hidden_states=torch.ones((2, 3, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((3, 1)),
+        topk_ids=torch.zeros((3, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=2,
+        expert_map=None,
+        a1q_scale=torch.ones((2, 3)),
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty((2, 3, 8)),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=torch.tensor([2, 1], dtype=torch.int32)
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.equal(output, torch.full_like(output, 2))
+
+
+def test_channel_fp8_contiguous_experts_accept_v0251_permute_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts._deepgemm_w13 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts._deepgemm_w2 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((1, 8)),
+        w2_scale=torch.ones((1, 4)),
+    )
+    experts.moe_problem_size = lambda *_args: (1, 3, 8, 4, 1)
+
+    monkeypatch.setattr(module, "compute_aligned_M", lambda **_kwargs: 3)
+    monkeypatch.setattr(
+        module,
+        "deepgemm_moe_permute",
+        lambda **kwargs: (
+            kwargs["aq"],
+            kwargs["aq_scale"],
+            torch.zeros(3, dtype=torch.int32),
+            torch.zeros_like(kwargs["topk_ids"], dtype=torch.int32),
+            256,
+        ),
+    )
+    call_number = 0
+
+    def public_contiguous_kernel(
+        _a,
+        _b,
+        destination: torch.Tensor,
+        _m_indices,
+    ) -> torch.Tensor:
+        nonlocal call_number
+        call_number += 1
+        destination.fill_(call_number)
+        return destination
+
+    monkeypatch.setattr(
+        module,
+        "m_grouped_fp8_gemm_nt_contiguous",
+        public_contiguous_kernel,
+    )
+    monkeypatch.setattr(
+        module,
+        "fuse_silu_mul_fp8_quant",
+        lambda output, **_kwargs: (
+            output[..., :4].to(torch.int8),
+            torch.ones((output.shape[0], 1)),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "deepgemm_unpermute_and_reduce",
+        lambda a, output, **_kwargs: output.copy_(a),
+    )
+
+    output = torch.empty((3, 4))
+    experts.apply(
+        output=output,
+        hidden_states=torch.ones((3, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((3, 1)),
+        topk_ids=torch.zeros((3, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((3, 1)),
+        a2_scale=None,
+        workspace13=torch.empty(12, dtype=torch.int8),
+        workspace2=torch.empty(24),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=torch.tensor([3], dtype=torch.int32),
+            expert_num_tokens_cpu=torch.tensor([3], dtype=torch.int32),
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.equal(output, torch.full_like(output, 2))
+
+
+def test_channel_fp8_auto_experts_restore_layouts_after_kernel_recreation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    for child in (experts.ht_experts, experts.ll_experts):
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 32, 64), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 16), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones((1, 32)))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones((1, 64)))
+    layer.weight_block_size = None
+
+    contiguous = torch.full((1, 1, 1, 1, 1, 1), 31, dtype=torch.int8)
+    masked = torch.full((1, 1, 1, 1, 1, 1), 47, dtype=torch.int8)
+    monkeypatch.setattr(
+        module,
+        "marlin_fp8_contiguous_weight",
+        lambda _weight: contiguous.clone(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "marlin_fp8_masked_weight",
+        lambda _weight: masked.clone(),
+        raising=False,
+    )
+
+    experts.process_weights_after_loading(layer)
+
+    assert torch.equal(experts.ht_experts._deepgemm_w13, contiguous)
+    assert torch.equal(experts.ht_experts._deepgemm_w2, contiguous)
+    assert torch.equal(experts.ll_experts._deepgemm_w13, masked)
+    assert torch.equal(experts.ll_experts._deepgemm_w2, masked)
+    assert layer._dsv4_channel_fp8_deepgemm_layout == "contiguous+masked"
+
+    replacement = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    replacement.ht_experts = object.__new__(
+        module.DeepEPDeepGemmContiguousExperts
+    )
+    replacement.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    for child in (replacement.ht_experts, replacement.ll_experts):
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    replacement.process_weights_after_loading(layer)
+
+    assert replacement.ht_experts._deepgemm_w13 is layer.w13_weight
+    assert replacement.ht_experts._deepgemm_w2 is layer.w2_weight
+    assert torch.equal(replacement.ll_experts._deepgemm_w13, masked)
+    assert torch.equal(replacement.ll_experts._deepgemm_w2, masked)
+
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 32, 64), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 16), dtype=torch.int8),
+        requires_grad=False,
+    )
+    reloaded = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    reloaded.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    reloaded.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    for child in (reloaded.ht_experts, reloaded.ll_experts):
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    reloaded.process_weights_after_loading(layer)
+
+    assert torch.equal(reloaded.ht_experts._deepgemm_w13, contiguous)
+    assert torch.equal(reloaded.ht_experts._deepgemm_w2, contiguous)
+    assert torch.equal(reloaded.ll_experts._deepgemm_w13, masked)
+    assert torch.equal(reloaded.ll_experts._deepgemm_w2, masked)
 
 
 def test_deepep_ht_quant_and_alignment_contract():
@@ -1720,6 +2114,157 @@ def test_deepep_ll_feature_off_delegates_and_expanded_signatures(monkeypatch: py
     inspect = importlib.import_module("inspect")
     assert "use_int8_dispatch" in inspect.signature(cls.__init__).parameters
     assert "expert_num_tokens" in inspect.signature(cls._do_quant).parameters
+
+
+class _LegacyLowLatencyBuffer:
+    def low_latency_dispatch(self, x, topk_idx, use_fp8=False):
+        del x, topk_idx, use_fp8
+
+
+class _PartialHcuLowLatencyBuffer:
+    def low_latency_dispatch(
+        self,
+        x,
+        topk_idx,
+        topk_weight,
+        quant_type=1,
+        fp8_round_scale=False,
+    ):
+        del x, topk_idx, topk_weight, quant_type, fp8_round_scale
+
+
+@pytest.mark.parametrize(
+    "buffer_cls",
+    [_LegacyLowLatencyBuffer, _PartialHcuLowLatencyBuffer],
+)
+def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    buffer_cls: type,
+):
+    module = _fake_deepep_ll_module()
+    assert patch_deepep_ll.apply_to_module(module) is True
+    instance = object.__new__(module.DeepEPLLPrepareAndFinalize)
+    instance.buffer = buffer_cls()
+    instance.use_int8_dispatch = False
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API",
+        False,
+    )
+
+    assert (
+        instance.prepare_async(None, None, None, 1, None, False, None)
+        == "official-feature-off"
+    )
+
+
+def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_deepep_ll_module()
+    module.torch = torch
+    module.dbo_current_ubatch_id = lambda: 0
+    module.DEEPEP_QUANT_BLOCK_SIZE = 128
+    module.envs = SimpleNamespace(VLLM_DEEPEPLL_NVFP4_DISPATCH=False)
+    assert patch_deepep_ll.apply_to_module(module) is True
+    cls = module.DeepEPLLPrepareAndFinalize
+    cls.SUPPORTED_HIDDEN_SIZES = [2048]
+    cls._map_global_to_physical_ids = lambda self, ids: ids
+
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    signature_calls = 0
+    original_signature = deepep_runtime.inspect.signature
+
+    def counted_signature(callable_object):
+        nonlocal signature_calls
+        signature_calls += 1
+        return original_signature(callable_object)
+
+    monkeypatch.setattr(deepep_runtime.inspect, "signature", counted_signature)
+
+    calls: dict[str, object] = {}
+
+    class Buffer:
+        def low_latency_dispatch(
+            self,
+            x,
+            topk_idx,
+            topk_weight,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            quant_type=1,
+            quant_group_size=0,
+            fp8_round_scale=False,
+            async_finish=False,
+            return_recv_hook=False,
+        ):
+            calls.update(
+                x=x,
+                topk_idx=topk_idx,
+                topk_weight=topk_weight,
+                num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+                num_experts=num_experts,
+                quant_type=quant_type,
+                quant_group_size=quant_group_size,
+                fp8_round_scale=fp8_round_scale,
+                async_finish=async_finish,
+                return_recv_hook=return_recv_hook,
+            )
+            expert_x = (
+                torch.ones((1, 1, 2048), dtype=torch.float8_e4m3fn),
+                torch.ones((1, 1, 1)),
+            )
+            return expert_x, torch.ones(1, dtype=torch.int32), "handle", None, lambda: None
+
+    instance = cls(Buffer(), 8, 1, use_fp8_dispatch=True)
+    instance.handles = [None]
+    instance.use_int8_dispatch = False
+    instance.use_ue8m0_dispatch = False
+    quant_config = SimpleNamespace(
+        quant_dtype=torch.float8_e4m3fn,
+        block_shape=None,
+        per_act_token_quant=True,
+        a1_scale=None,
+        a2_scale=None,
+        a1_gscale=None,
+    )
+    topk_weights = torch.ones((1, 1))
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API",
+        False,
+    )
+    hook, _receiver = instance.prepare_async(
+        torch.ones((1, 2048), dtype=torch.bfloat16),
+        topk_weights,
+        torch.zeros((1, 1), dtype=torch.int64),
+        1,
+        None,
+        False,
+        quant_config,
+    )
+    instance.prepare_async(
+        torch.ones((1, 2048), dtype=torch.bfloat16),
+        topk_weights,
+        torch.zeros((1, 1), dtype=torch.int64),
+        1,
+        None,
+        False,
+        quant_config,
+    )
+
+    assert callable(hook)
+    assert signature_calls == 1
+    assert calls["topk_weight"] is topk_weights
+    assert calls["quant_type"] == 2
+    assert calls["quant_group_size"] == 0
 
 
 def test_deepep_ll_hcu_int8_dispatch_contract(

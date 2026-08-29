@@ -262,7 +262,7 @@ def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
         "config=SimpleNamespace(additional_config={'hcu':{"
         "'enable_lightly_cp':True,'enable_lightly_cplb':True,"
         "'enable_custom_sp':True,'enable_multi_layers_mtp':True,"
-        "'moe_backend':'dpsk_deep_gemm'}},"
+        "'moe_backend':'deep_gemm'}},"
         "compilation_config=CompilationConfig(),parallel_config=SimpleNamespace("
         "all2all_backend='deepep_low_latency')); "
         "config=pickle.loads(pickle.dumps(config)); "
