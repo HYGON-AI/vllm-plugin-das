@@ -33,12 +33,12 @@ DSPARK_CONFIG = {
     "draft_sample_method": "probabilistic",
 }
 PREFILL_EVIDENCE = """\
-Mooncake TTFT_EVENT event=p_send_kv_done ts=1.0
+Finished sending KV transfer for request request-1
 DeepEP auto selected contiguous high-throughput experts for this forward.
 Using DeepEPDeepGemmContiguousExperts with DeepGEMM HT path.
 """
 DECODE_EVIDENCE = """\
-Mooncake TTFT_EVENT event=d_kv_ready ts=2.0
+Finished recving KV transfer for request request-1
 DeepEP auto selected masked low-latency experts for this forward.
 Using DeepEPDeepGemmMaskedExperts with DeepGEMM LL path.
 """
@@ -195,10 +195,10 @@ def test_deepseek_v4_dspark_mooncake_pd_runtime_evidence(
         (
             PREFILL_EVIDENCE,
             DECODE_EVIDENCE.replace(
-                "Mooncake TTFT_EVENT event=d_kv_ready ts=2.0\n", ""
+                "Finished recving KV transfer for request request-1\n", ""
             ),
             DSPARK_METRICS,
-            "d_kv_ready",
+            "Finished recving KV transfer",
         ),
         (
             PREFILL_EVIDENCE + "Sending to 127.0.0.1 failed (ret=-1)\n",

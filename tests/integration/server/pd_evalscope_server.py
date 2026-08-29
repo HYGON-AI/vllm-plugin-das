@@ -35,12 +35,12 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 _REQUIRED_PREFILL_EVIDENCE = (
-    "Mooncake TTFT_EVENT event=p_send_kv_done",
+    "Finished sending KV transfer for request",
     "DeepEP auto selected contiguous high-throughput experts for this forward.",
     "Using DeepEPDeepGemmContiguousExperts with DeepGEMM HT path.",
 )
 _REQUIRED_DECODE_EVIDENCE = (
-    "Mooncake TTFT_EVENT event=d_kv_ready",
+    "Finished recving KV transfer for request",
     "DeepEP auto selected masked low-latency experts for this forward.",
     "Using DeepEPDeepGemmMaskedExperts with DeepGEMM LL path.",
 )

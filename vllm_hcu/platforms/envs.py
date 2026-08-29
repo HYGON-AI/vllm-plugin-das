@@ -336,7 +336,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MOE_CONFIG", "True").lower() in
                     ("true", "1")),
 
-    # Emit Mooncake TTFT_EVENT lines with wall-clock ts for PD TTFT analysis.
+    # Emit Mooncake TTFT_EVENT DEBUG lines with wall-clock ts for PD TTFT analysis.
     "VLLM_HCU_MOONCAKE_TTFT_TRACE":
         lambda: (os.environ.get("VLLM_HCU_MOONCAKE_TTFT_TRACE", "False").lower() in
                     ("true", "1")),

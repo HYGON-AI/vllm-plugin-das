@@ -52,7 +52,6 @@ export HIP_VISIBLE_DEVICES=0,1,2,3
 export VLLM_MOONCAKE_BOOTSTRAP_PORT=18998
 export VLLM_DP_MASTER_IP=127.0.0.1
 export VLLM_DP_MASTER_PORT=29561
-export VLLM_HCU_MOONCAKE_TTFT_TRACE=1
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1
 
@@ -84,7 +83,6 @@ export HIP_VISIBLE_DEVICES=4,5,6,7
 export VLLM_MOONCAKE_BOOTSTRAP_PORT=18999
 export VLLM_DP_MASTER_IP=127.0.0.1
 export VLLM_DP_MASTER_PORT=29562
-export VLLM_HCU_MOONCAKE_TTFT_TRACE=1
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1
 
@@ -161,8 +159,9 @@ pytest -q -s \
 ```
 
 The acceptance gate requires exactly 32 predictions and reviews, normalized
-HumanEval accuracy and pass@1 of 32/32, successful Mooncake send/receive TTFT
-events, both contiguous HT and masked LL DeepEP/DeepGEMM markers, no known
+HumanEval accuracy and pass@1 of 32/32, successful official Mooncake KV
+send/receive completion events, both contiguous HT and masked LL
+DeepEP/DeepGEMM markers, no known
 Mooncake transfer failure, and positive DSpark draft and accepted token totals.
 `VLLM_V0251_SOURCE_ROOT` locates only the official proxy script. Do not add that
 source tree to `PYTHONPATH`: doing so hides the compiled extensions in the

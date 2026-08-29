@@ -36,7 +36,6 @@ pd:
     - --speculative-config
     - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
   environment:
-    VLLM_HCU_MOONCAKE_TTFT_TRACE: "1"
     VLLM_LOGGING_LEVEL: DEBUG
   prefill:
     port: 10141

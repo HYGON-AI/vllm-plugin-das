@@ -105,7 +105,7 @@ def log_ttft_event(
     tid = transfer_id if transfer_id and transfer_id != "-" else None
     if tid is None:
         tid = transfer_id_from_req(req_id, kv_params)
-    logger.info(
+    logger.debug(
         "Mooncake TTFT_EVENT event=%s ts=%.6f transfer_id=%s req_id=%s",
         event,
         time.time(),
