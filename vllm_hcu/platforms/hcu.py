@@ -1,19 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import importlib
-import os
-from datetime import timedelta
-from functools import cache, lru_cache
+from functools import cache
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-import regex as re
 import torch
-import vllm.envs as envs
-from torch.distributed import PrefixStore, ProcessGroup
-from torch.distributed.distributed_c10d import is_nccl_available
 from vllm.logger import init_logger
-from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.platforms.interface import DeviceCapability, PlatformEnum
+from vllm.platforms.rocm import RocmPlatform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 from vllm_hcu import _ensure_platform_plugin_ready
@@ -63,42 +58,6 @@ try:
 except ImportError as e:
     logger.warning("Failed to import from vllm._C with %r", e)
 
-
-@lru_cache(maxsize=8)
-def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int:
-    """Get number of ROCm devices, caching based on the value of CUDA_VISIBLE_DEVICES
-    at the time of call.
-
-    This should be used instead of torch.accelerator.device_count() unless
-    CUDA_VISIBLE_DEVICES has already been set to the desired value.
-
-    # This can be removed and simply replaced with torch.cuda.get_device_count
-    # after https://github.com/pytorch/pytorch/pull/122815 is released."""
-    # Note: cuda_visible_devices is not used, but we keep it as an argument for
-    # LRU Cache purposes.
-
-    # Code below is based on
-    # https://github.com/pytorch/pytorch/blob/
-    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
-    # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.cuda
-
-    if not torch.cuda._is_compiled():
-        return 0
-    # This requires a sufficiently modern version of Torch 2.4.0
-    try:
-        raw_count = (
-            torch.cuda._device_count_amdsmi()
-            if hasattr(torch.cuda, "_device_count_amdsmi")
-            else -1
-        )
-        return (
-            torch._C._cuda_getDeviceCount()
-            if raw_count < 0
-            else raw_count
-        )
-    except Exception:
-        raise RuntimeError("HCU device discovery failed.") from None
 
 @cache
 def flash_attn_triton_available() -> bool:
@@ -185,7 +144,7 @@ def register_attention_backends() -> None:
     )
 
 
-class HCUPlatform(Platform):
+class HCUPlatform(RocmPlatform):
     #这个地方会管理custom_ops
     _enum = PlatformEnum.ROCM
     device_name: str = "hip"
@@ -229,17 +188,6 @@ class HCUPlatform(Platform):
     ]
     
     @classmethod
-    def import_kernels(cls) -> None:
-        """Import ROCm-specific kernels."""
-        super().import_kernels()
-
-        import contextlib
-
-        # Import ROCm-specific extension
-        with contextlib.suppress(ImportError):
-            import vllm._rocm_C  # noqa: F401
-
-    @classmethod
     def get_valid_backends(
         cls,
         device_capability: DeviceCapability,
@@ -273,93 +221,6 @@ class HCUPlatform(Platform):
                 valid_backends_priorities.append((backend, priority))
 
         return valid_backends_priorities, invalid_reasons
-
-    @classmethod
-    def get_attn_backend_cls(
-        cls,
-        selected_backend: "AttentionBackendEnum",
-        attn_selector_config: "AttentionSelectorConfig",
-        num_heads: int | None = None,
-    ) -> str:
-        device_capability = cls.get_device_capability()
-        assert device_capability is not None
-
-        attn_selector_config = attn_selector_config._replace(block_size=None)
-
-        # First try checking just the selected backend, if there is one.
-        if selected_backend is not None:
-            try:
-                backend_class = selected_backend.get_class()
-                invalid_reasons = backend_class.validate_configuration(
-                    device_capability=device_capability,
-                    **attn_selector_config._asdict(),
-                )
-            except ImportError:
-                invalid_reasons = ["ImportError"]
-            if invalid_reasons:
-                raise ValueError(
-                    f"Selected backend {selected_backend} is not valid for "
-                    f"this configuration. Reason: {invalid_reasons}"
-                )
-            else:
-                logger.info("Using %s backend.", selected_backend)
-                return selected_backend.get_path()
-
-        # No selected backend or the selected backend is invalid,
-        # so we try finding a valid backend.
-        valid_backends_priorities, invalid_reasons = cls.get_valid_backends(
-            device_capability=device_capability,
-            attn_selector_config=attn_selector_config,
-            num_heads=num_heads,
-        )
-        reasons_str = (
-            "{"
-            + ", ".join(
-                f"{backend.name}: [{', '.join(reasons)}]"
-                for backend, reasons in invalid_reasons.items()
-            )
-            + "}"
-        )
-        config_str = attn_selector_config.__repr__()
-        logger.debug_once(
-            f"Some attention backends are not valid for {cls.device_name} with "
-            f"{config_str}. Reasons: {reasons_str}."
-        )
-        if len(valid_backends_priorities) == 0:
-            raise ValueError(
-                f"No valid attention backend found for {cls.device_name} "
-                f"with {config_str}. Reasons: {reasons_str}."
-            )
-
-        # We have found some valid backends. Select the one with the
-        # highest priority.
-        sorted_indices = sorted(
-            range(len(valid_backends_priorities)),
-            key=lambda i: valid_backends_priorities[i][1],
-        )
-        selected_index = sorted_indices[0]
-        selected_backend = valid_backends_priorities[selected_index][0]
-        valid_str = (
-            "[" + ", ".join(f"'{b[0].name}'" for b in valid_backends_priorities) + "]"
-        )
-        if invalid_reasons:
-            rejected_str = ", ".join(b.name for b in invalid_reasons)
-            logger.info(
-                "Found incompatible backend(s) [%s] with %s. "
-                "Overriding with %s out of potential backends: %s.",
-                rejected_str,
-                attn_selector_config.attn_type,
-                selected_backend.name,
-                valid_str,
-            )
-        else:
-            logger.info_once(
-                "Using %s backend out of potential backends: %s.",
-                selected_backend.name,
-                valid_str,
-            )
-
-        return selected_backend.get_path()
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
@@ -401,14 +262,6 @@ class HCUPlatform(Platform):
         # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
         return True
     
-    @classmethod
-    def device_count(cls) -> int:
-        return _rocm_device_count_stateless(envs.CUDA_VISIBLE_DEVICES)
-    
-    @classmethod
-    def manual_seed_all(cls, seed: int) -> None:
-        torch.cuda.manual_seed_all(seed)
-
     @classmethod
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         """Check whether all selected devices have a direct high-speed link."""
@@ -452,29 +305,6 @@ class HCUPlatform(Platform):
 
 
     @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        return torch.cuda.get_device_name(device_id)
-    
-    @classmethod
-    def set_device(cls, device: torch.device) -> None:
-        """
-        Set the device for the current platform.
-        """
-        torch.cuda.set_device(device)
-
-    @classmethod
-    @lru_cache(maxsize=8)
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        major, minor = torch.cuda.get_device_capability(device_id)
-        return DeviceCapability(major=major, minor=minor)
-
-
-    @classmethod
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        device_props = torch.cuda.get_device_properties(device_id)
-        return device_props.total_memory
-
-    @classmethod
     def pre_register_and_update(cls, parser=None) -> None:
         """Register HCU config adapters through vLLM's public platform hook."""
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
@@ -487,57 +317,23 @@ class HCUPlatform(Platform):
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
-        # ``vllm._aiter_ops`` performs import-time custom-op registration.
-        # Arm its exact HCU replacement before either implementation can load.
+        """Arm HCU operators, then retain target ROCm platform defaults."""
+
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
         from vllm_hcu.patch.worker import prepare_worker_patches
 
         IMPORT_COORDINATOR.drain_ready_callbacks()
         prepare_worker_patches()
-        from vllm._aiter_ops import rocm_aiter_ops
-
-        compilation_config = vllm_config.compilation_config
-        use_aiter_fused_moe = rocm_aiter_ops.is_fused_moe_enabled()
-        use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
-        use_aiter_fused_se = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-
-        if use_aiter_fp8_linear and "-quant_fp8" not in compilation_config.custom_ops:
-            compilation_config.custom_ops.append("+quant_fp8")
-
-        if use_aiter_fused_se and "-grouped_topk" in compilation_config.custom_ops:
-            logger.warning_once(
-                "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled, which "
-                "requires the 'grouped_topk' custom op. Overriding the "
-                "user-provided '-grouped_topk'."
-            )
-            compilation_config.custom_ops.remove("-grouped_topk")
-        # Ensure grouped_topk is always enabled when using AITER if
-        # its not disabled by user
-        if (
-            use_aiter_fused_moe
-            and "+grouped_topk" not in compilation_config.custom_ops
-            and "-grouped_topk" not in compilation_config.custom_ops
-        ):
-            compilation_config.custom_ops.append("+grouped_topk")
-
-        # Default dispatch to rocm's sparse_attn_indexer implementation
-        compilation_config.custom_ops.append("+sparse_attn_indexer")
-        
+        super().apply_config_platform_defaults(vllm_config)
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        from vllm.config.compilation import CUDAGraphMode
+        """Apply target v0.28 policy before narrow HCU selectors."""
+
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
         from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
             validate_and_update_hcu_config,
         )
-
-        IMPORT_COORDINATOR.drain_ready_callbacks()
-        feature_config = validate_and_update_hcu_config(vllm_config)
-
-        # Use vLLM's public qualified-class configuration hooks.  Both
-        # selectors only assign strings and therefore keep the official and
-        # HCU Scheduler/Executor implementations lazy until engine startup.
         from vllm_hcu.patch.platform.framework_opt.patch_multiproc_executor import (
             select_hcu_multiproc_executor,
         )
@@ -545,202 +341,22 @@ class HCUPlatform(Platform):
             select_hcu_scheduler,
         )
 
+        IMPORT_COORDINATOR.drain_ready_callbacks()
+        validate_and_update_hcu_config(vllm_config)
+        super().check_and_update_config(vllm_config)
         select_hcu_scheduler(vllm_config)
         select_hcu_multiproc_executor(vllm_config)
 
-        cache_config = vllm_config.cache_config
-        compilation_config = vllm_config.compilation_config
+        # RocmPlatform resolves "auto" to the target Worker. Replace only that
+        # exact selected implementation; preserve every explicit user choice.
         parallel_config = vllm_config.parallel_config
-        # if cache_config and cache_config.block_size is None:
-        #     cache_config.block_size = 64
-        if compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # decode context parallel does not support full cudagraphs
-            if parallel_config.decode_context_parallel_size > 1:
-                logger.warning_once(
-                    "Decode context parallel (DCP) is enabled, which is "
-                    "incompatible with full CUDA graphs. "
-                    "Overriding cudagraph_mode to PIECEWISE."
-                )
-                compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-            # prefill context parallel do not support full cudagraphs
-            elif parallel_config.prefill_context_parallel_size > 1:
-                logger.warning_once(
-                    "Prefill context parallel (PCP) is enabled, which is "
-                    "incompatible with full CUDA graphs. "
-                    "Overriding cudagraph_mode to PIECEWISE."
-                )
-                compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-
-        if cache_config and not cache_config.user_specified_block_size:
-            backend = vllm_config.attention_config.backend
-            if (
-                envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION and envs.VLLM_ROCM_USE_AITER
-                # NOTE: This block has been deprecated
-                # or get_env_variable_attn_backend()
-                # == AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN
-                # TODO: monitor https://github.com/vllm-project/vllm/pull/30396
-                # to see how we can transition to the new way of selecting
-                # attention backends
-            ):
-                cache_config.block_size = 64
-                logger.warning(
-                    "[ROCM_AITER_UNIFIED_ATTN]: Setting kv cache block size to 64."
-                )
-            elif (
-                henvs.VLLM_HCU_USE_FLASHMLA
-                or backend == AttentionBackendEnum.FLASHMLA
-            ):
-                cache_config.block_size = 64
-                logger.warning(
-                    "[HCU FLASHMLA]: Setting kv cache block size to 64."
-                )
-            elif backend == AttentionBackendEnum.TRITON_ATTN:
-                cache_config.block_size = 16
-            elif backend == AttentionBackendEnum.FLASH_ATTN or (
-                backend is None and flash_attn_triton_available()
-            ):
-                mode = henvs.resolve_hcu_flash_attn_mode(
-                    feature_config.hcu_flash_attn_mode
-                )
-                if mode == "custom":
-                    cache_config.block_size = 64
-                    logger.warning(
-                        "[HCU FLASH_ATTN:custom]: Setting kv cache block size to 64."
-                    )
-                elif (
-                    henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE is not None
-                    and henvs.VLLM_HCU_USE_CUSTOM_OPS
-                ):
-                    block_size = henvs.VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE
-                    if block_size <= 0 or block_size % 16 != 0:
-                        raise ValueError(
-                            "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE must be "
-                            f"a positive multiple of 16, got {block_size}."
-                        )
-                    cache_config.block_size = block_size
-                    logger.warning(
-                        "[HCU FLASH_ATTN:%s]: Setting kv cache block size to %d "
-                        "(VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE).",
-                        mode,
-                        cache_config.block_size,
-                    )
-                elif mode == "cutlass":
-                    cache_config.block_size = 64
-                    logger.warning(
-                        "[HCU FLASH_ATTN:cutlass]: Setting kv cache block size to 64."
-                    )
-                else:
-                    cache_config.block_size = 128
-                    logger.warning(
-                        "[HCU FLASH_ATTN:classic]: Setting kv cache block size to 128."
-                    )
-            else:
-                cache_config.block_size = 16
-
-        if parallel_config.worker_cls == "auto":
-            # parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+        if parallel_config.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
             parallel_config.worker_cls = "vllm_hcu.v1.worker.HcuGPUWorker"
-            
 
-    @classmethod
-    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        # TODO: ROCm still sets block_size in check_and_update_config.
-        # Move that logic here so block_size is chosen by the backend.
-        pass
-
-
-    @classmethod
-    def get_current_memory_usage(
-        cls, device: torch.types.Device | None = None
-    ) -> float:
-        torch.cuda.reset_peak_memory_stats(device)
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
-        return total_mem - free_mem
 
     @classmethod
     def supports_fp8(cls) -> bool:
         return on_gfx938()
-
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return (
-            "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
-        )
-
-    @classmethod
-    def get_punica_wrapper(cls) -> str:
-        return "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
-
-    @classmethod
-    def opaque_attention_op(cls) -> bool:
-        return True
-
-
-    @classmethod
-    def get_static_graph_wrapper_cls(cls) -> str:
-        return "vllm.compilation.cuda_graph.CUDAGraphWrapper"
-
-    @classmethod
-    def check_if_supports_dtype(cls, dtype: torch.dtype):
-        if dtype == torch.bfloat16:  # noqa: SIM102
-            if not cls.has_device_capability(80):
-                capability = cls.get_device_capability()
-                gpu_name = cls.get_device_name()
-
-                if capability is None:
-                    compute_str = "does not have a compute capability"
-                else:
-                    version_str = capability.as_version_str()
-                    compute_str = f"has compute capability {version_str}"
-
-                raise ValueError(
-                    "Bfloat16 is only supported on GPUs "
-                    "with compute capability of at least 8.0. "
-                    f"Your {gpu_name} GPU {compute_str}. "
-                    "You can use float16 instead by explicitly setting the "
-                    "`dtype` flag in CLI, for example: --dtype=half."
-                )
-
-    @classmethod
-    def insert_blocks_to_device(
-        cls,
-        src_cache: torch.Tensor,
-        dst_cache: torch.Tensor,
-        src_block_indices: torch.Tensor,
-        dst_block_indices: torch.Tensor,
-    ) -> None:
-        """Copy blocks from src_cache to dst_cache on GPU."""
-        _src_cache = src_cache[src_block_indices]
-        dst_cache[dst_block_indices] = _src_cache.to(dst_cache.device)
-
-    @classmethod
-    def swap_out_blocks_to_host(
-        cls,
-        src_cache: torch.Tensor,
-        dst_cache: torch.Tensor,
-        src_block_indices: torch.Tensor,
-        dst_block_indices: torch.Tensor,
-    ) -> None:
-        """Copy blocks from GPU to host (CPU)."""
-        _src_cache = src_cache[src_block_indices]
-        dst_cache[dst_block_indices] = _src_cache.cpu()
-
-    @classmethod
-    def support_hybrid_kv_cache(cls) -> bool:
-        return True
-
-    @classmethod
-    def support_static_graph_mode(cls) -> bool:
-        return True
-
-    @classmethod
-    def num_compute_units(cls, device_id: int = 0) -> int:
-        return torch.cuda.get_device_properties(device_id).multi_processor_count
-
-    @classmethod
-    def use_custom_op_collectives(cls) -> bool:
-        return True
-
 
 # The registry stores lazy class paths, so this does not import HCU kernels.
 # It does make explicit backend selection resolve to HCU before validation.

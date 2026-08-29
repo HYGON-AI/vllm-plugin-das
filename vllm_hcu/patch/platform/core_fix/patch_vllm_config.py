@@ -44,6 +44,11 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
     if updates:
         feature_config = feature_config.with_updates(**updates)
+    if feature_config.hcu_flash_attn_mode == "custom":
+        raise ValueError(
+            "HCU custom FlashAttention is not supported by the v0.28 product "
+            "path; use native varlen or the explicit CUTLASS compatibility mode."
+        )
     # Persist the resolved mode so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
 
