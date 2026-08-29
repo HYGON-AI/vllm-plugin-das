@@ -71,13 +71,39 @@ def test_hcu_modular_experts_preserve_target_expert_map_contract():
             "-c",
             textwrap.dedent(
                 """
+                import inspect
+                from types import SimpleNamespace
+
+                import torch
                 import vllm
                 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+                from vllm.model_executor.layers.fused_moe.activation import (
+                    ApplyMoEActivationConfig,
+                    MoEActivation,
+                )
                 from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
                     TritonExperts,
                 )
+
+                signature = inspect.signature(
+                    mk.FusedMoEExpertsModular.activation
+                )
+                assert "topk_ids" in signature.parameters
+                assert "expert_map" in signature.parameters
+                assert "clamp_limit" not in signature.parameters
+
+                x = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 10
+                out = torch.empty_like(x)
+                expert = SimpleNamespace(
+                    activation_config=ApplyMoEActivationConfig()
+                )
+                mk.FusedMoEExpertsModular.activation(
+                    expert, MoEActivation.SILU_NO_MUL, out, x
+                )
+                torch.testing.assert_close(out, torch.nn.functional.silu(x))
                 print(f"BASE={mk.FusedMoEExperts.consumes_expert_mask}")
                 print(f"TRITON={TritonExperts.consumes_expert_mask}")
+                print("ACTIVATION=PASSED")
                 """
             ),
         ],
@@ -89,6 +115,7 @@ def test_hcu_modular_experts_preserve_target_expert_map_contract():
     )
     assert "BASE=False" in result.stdout
     assert "TRITON=False" in result.stdout
+    assert "ACTIVATION=PASSED" in result.stdout
 
 
 def _module(name: str, **attributes: object) -> ModuleType:
