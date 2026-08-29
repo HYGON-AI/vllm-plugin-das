@@ -72,6 +72,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "global_ranks",
             "global_world_size",
             "tcp_store_group",
+            "use_all2all",
         ),
         defaults={
             "device": None,
@@ -80,6 +81,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "global_ranks": None,
             "global_world_size": None,
             "tcp_store_group": None,
+            "use_all2all": False,
         },
     )
     if "all_to_all_single" in vars(communicator):
@@ -98,6 +100,7 @@ def apply_to_module(module: ModuleType) -> bool:
         global_ranks=None,
         global_world_size=None,
         tcp_store_group=None,
+        use_all2all=False,
     ):
         init(
             self,
@@ -108,6 +111,7 @@ def apply_to_module(module: ModuleType) -> bool:
             global_ranks,
             global_world_size,
             tcp_store_group,
+            use_all2all,
         )
         from vllm.config import get_current_vllm_config_or_none
 

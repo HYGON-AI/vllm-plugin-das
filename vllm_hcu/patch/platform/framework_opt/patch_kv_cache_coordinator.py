@@ -26,7 +26,7 @@ _PARAMETERS = (
     "self",
     "kv_cache_config",
     "max_model_len",
-    "max_num_batched_tokens",
+    "max_in_flight_tokens",
     "use_eagle",
     "enable_caching",
     "enable_kv_cache_events",
@@ -35,6 +35,7 @@ _PARAMETERS = (
     "scheduler_block_size",
     "hash_block_size",
     "metrics_collector",
+    "num_prefill_lookahead",
 )
 
 
@@ -81,13 +82,18 @@ def apply_to_module(module: ModuleType) -> bool:
             f"required HCU patch target {TARGETS[0]} has incompatible "
             f"signature {signature}"
         )
+    if signature.parameters["num_prefill_lookahead"].default != 0:
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} has incompatible "
+            f"signature {signature}"
+        )
 
     @functools.wraps(original)
     def hcu_init(
         self,
         kv_cache_config,
         max_model_len,
-        max_num_batched_tokens,
+        max_in_flight_tokens,
         use_eagle,
         enable_caching,
         enable_kv_cache_events,
@@ -96,6 +102,7 @@ def apply_to_module(module: ModuleType) -> bool:
         scheduler_block_size,
         hash_block_size,
         metrics_collector=None,
+        num_prefill_lookahead=0,
     ):
         # vLLM's all-group fallback is correct for generic unmarked EAGLE
         # models.  Combined GLM/DeepSeek MTP+indexer groups are the exception:
@@ -108,7 +115,7 @@ def apply_to_module(module: ModuleType) -> bool:
             self,
             kv_cache_config,
             max_model_len,
-            max_num_batched_tokens,
+            max_in_flight_tokens,
             effective_use_eagle,
             enable_caching,
             enable_kv_cache_events,
@@ -117,6 +124,7 @@ def apply_to_module(module: ModuleType) -> bool:
             scheduler_block_size,
             hash_block_size,
             metrics_collector,
+            num_prefill_lookahead,
         )
 
     setattr(hcu_init, _WRAPPER, True)

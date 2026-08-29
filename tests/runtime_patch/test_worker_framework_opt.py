@@ -308,10 +308,11 @@ def _fake_base_communicator_module() -> ModuleType:
             unique_name="",
             global_ranks=None,
             global_world_size=None,
+            use_all2all=False,
         ):
             self.device_group = device_group
             self.is_ep_communicator = unique_name.split(":")[0] == "ep"
-            self.use_all2all = False
+            self.use_all2all = self.is_ep_communicator and use_all2all
 
         def reduce_scatter(self, input_, dim=-1):
             return input_
@@ -347,6 +348,16 @@ def test_base_communicator_reads_custom_sp_sidecar_and_uses_torch_collective(
     assert communicator.all_to_all_single(output, input_) is output
     assert calls == [(output, input_, "device-group")]
 
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config_or_none",
+        lambda: _config(enable_custom_sp=False),
+    )
+    upstream_all2all = module.DeviceCommunicatorBase(
+        object(), unique_name="ep:1", use_all2all=True
+    )
+    assert upstream_all2all.use_all2all is True
+
 
 def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obsolete():
     class CudaCommunicator:
@@ -359,8 +370,9 @@ def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obso
             global_ranks=None,
             global_world_size=None,
             tcp_store_group=None,
+            use_all2all=False,
         ):
-            pass
+            del use_all2all
 
     module = _module(
         patch_cuda_communicator.TARGET_MODULE, CudaCommunicator=CudaCommunicator
@@ -406,10 +418,11 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
             global_ranks=None,
             global_world_size=None,
             tcp_store_group=None,
+            use_all2all=False,
         ):
             del device, device_group, unique_name, global_ranks, global_world_size
             self.cpu_group = cpu_group
-            self.use_all2all = True
+            self.use_all2all = use_all2all
             self.all2all_manager = "normalized-low-latency"
 
     module = _module(
@@ -417,7 +430,9 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
         CudaCommunicator=CudaCommunicator,
     )
     assert patch_cuda_communicator.apply_to_module(module)
-    communicator = module.CudaCommunicator("cpu-group", tcp_store_group="tcp")
+    communicator = module.CudaCommunicator(
+        "cpu-group", tcp_store_group="tcp", use_all2all=True
+    )
     assert isinstance(communicator.all2all_manager, DeepEPAutoAll2AllManager)
     assert created == [("cpu-group", "tcp")]
 
