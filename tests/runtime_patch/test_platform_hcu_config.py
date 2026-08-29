@@ -1076,15 +1076,38 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 
-def test_dspark_rejects_pd_disaggregation_before_model_loading() -> None:
+def _dspark_pd_config(
+    connector: str,
+    architecture: str = "DeepseekV4ForCausalLM",
+) -> object:
     config = _validation_config(HcuFeatureConfig())
+    config.model_config.architectures = [architecture]
     config.speculative_config = SimpleNamespace(method="dspark")
-    config.kv_transfer_config = SimpleNamespace(
-        kv_connector="MooncakeConnector"
+    config.kv_transfer_config = SimpleNamespace(kv_connector=connector)
+    return config
+
+
+def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
+    patch_vllm_config.validate_and_update_hcu_config(
+        _dspark_pd_config("MooncakeConnector")
     )
 
-    with pytest.raises(ValueError, match="DSpark.*P/D disaggregation"):
-        patch_vllm_config.validate_and_update_hcu_config(config)
+
+@pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])
+def test_deepseek_v4_dspark_rejects_unvalidated_pd_connectors(
+    connector: str,
+) -> None:
+    with pytest.raises(ValueError, match=f"DSpark.*{connector}"):
+        patch_vllm_config.validate_and_update_hcu_config(
+            _dspark_pd_config(connector)
+        )
+
+
+def test_non_deepseek_dspark_does_not_gain_mooncake_pd_support() -> None:
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        patch_vllm_config.validate_and_update_hcu_config(
+            _dspark_pd_config("MooncakeConnector", "Qwen3ForCausalLM")
+        )
 
 
 def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:

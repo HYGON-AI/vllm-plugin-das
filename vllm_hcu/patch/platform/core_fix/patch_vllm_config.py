@@ -186,10 +186,9 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     return True
 
 
-def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
-    """Validate cross-config invariants and bind the compilation adapter."""
+def _validate_dspark_pd_scope(vllm_config: object) -> None:
+    """Allow only the validated DeepSeek-V4 Mooncake DSpark P/D path."""
 
-    _validate_hcu_pcp_scope(vllm_config)
     speculative_config = getattr(vllm_config, "speculative_config", None)
     use_dspark = getattr(speculative_config, "use_dspark", None)
     dspark_enabled = (
@@ -197,10 +196,33 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         if callable(use_dspark)
         else getattr(speculative_config, "method", None) == "dspark"
     )
-    if dspark_enabled and getattr(vllm_config, "kv_transfer_config", None) is not None:
-        raise ValueError(
-            "DeepSeek-V4 DSpark with P/D disaggregation is not supported on HCU."
-        )
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    connector = getattr(kv_transfer_config, "kv_connector", None)
+    if not dspark_enabled or connector is None:
+        return
+
+    architectures = getattr(
+        getattr(vllm_config, "model_config", None),
+        "architectures",
+        (),
+    )
+    if (
+        connector == "MooncakeConnector"
+        and "DeepseekV4ForCausalLM" in architectures
+    ):
+        return
+    raise ValueError(
+        "DeepSeek-V4 DSpark P/D disaggregation on HCU supports only "
+        f"MooncakeConnector; got connector={connector!r}, "
+        f"architectures={architectures!r}."
+    )
+
+
+def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
+    """Validate cross-config invariants and bind the compilation adapter."""
+
+    _validate_hcu_pcp_scope(vllm_config)
+    _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
     updates: dict[str, str] = {}
     if feature_config.hcu_flash_attn_mode is None:
