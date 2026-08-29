@@ -1858,26 +1858,27 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         "_sidecar_config",
         lambda config: SimpleNamespace(deepep_auto=False, moe_backend="auto"),
     )
-    explicit_aiter_config = SimpleNamespace(
-        moe_backend="aiter",
-        moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
-    )
-    assert module.select_fp8_moe_backend(
-        explicit_aiter_config,
-        kFp8StaticChannelSym,
-        kFp8DynamicTokenSym,
-    ) == "official-select"
+    for explicit_backend in ("triton", "aiter"):
+        explicit_config = SimpleNamespace(
+            moe_backend=explicit_backend,
+            moe_parallel_config=SimpleNamespace(
+                use_batched_activation_format=False
+            ),
+        )
+        assert module.select_fp8_moe_backend(
+            explicit_config,
+            kFp8StaticChannelSym,
+            kFp8DynamicTokenSym,
+        ) == "official-select"
     auto_config = SimpleNamespace(
         moe_backend="auto",
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
     )
-    auto_channel_backend, auto_channel_experts = module.select_fp8_moe_backend(
+    assert module.select_fp8_moe_backend(
         auto_config,
         kFp8StaticChannelSym,
         kFp8DynamicTokenSym,
-    )
-    assert auto_channel_backend is module.Fp8MoeBackend.HCU_DEEPGEMM
-    assert auto_channel_experts is SupportedExperts
+    ) == "official-select"
     assert module.select_fp8_moe_backend(config, "w", "a") == "official-select"
 
 

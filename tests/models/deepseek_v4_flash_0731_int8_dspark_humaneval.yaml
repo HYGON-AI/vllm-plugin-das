@@ -61,10 +61,42 @@ profiles:
         - "0.9"
         - --tensor-parallel-size
         - "8"
+        - --moe-backend
+        - triton
         - --speculative-config
         - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/deepseek_v4_flash_0731_int8_dspark_tp8
+
+  tp8_aiter:
+    server:
+      port: 10141
+      args:
+        - --trust-remote-code
+        - --kv-cache-dtype
+        - fp8
+        - --block-size
+        - "256"
+        - --tokenizer-mode
+        - deepseek_v4
+        - --distributed-executor-backend
+        - mp
+        - --max-model-len
+        - "4096"
+        - --max-num-batched-tokens
+        - "512"
+        - --max-num-seqs
+        - "8"
+        - --gpu-memory-utilization
+        - "0.9"
+        - --tensor-parallel-size
+        - "8"
+        - --moe-backend
+        - aiter
+        - --speculative-config
+        - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/deepseek_v4_flash_0731_int8_dspark_tp8_aiter
 
   dp8_ep8:
     server:

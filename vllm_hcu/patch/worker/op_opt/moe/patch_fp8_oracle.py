@@ -182,26 +182,18 @@ def apply_to_module(module: ModuleType) -> bool:
             )
 
             return hcu_enum.HCU_DEEPGEMM, DeepEPDeepGemmContiguousExperts
-        if sidecar.moe_backend == "auto":
-            if (
-                getattr(config, "moe_backend", "auto") != "auto"
-                or not is_channel_fp8
-            ):
-                # Preserve vLLM's complete priority list for explicit public
-                # requests and every quantization scheme not owned here.
-                return select_backend(
-                    config,
-                    weight_key,
-                    activation_key,
-                    allow_vllm_cutlass,
-                )
-            # vLLM's ordinary auto oracle can select its DeepGEMM experts for
-            # Channel-FP8, but those experts reject per-output-channel scales.
-            # Select the HCU-compatible implementation without requiring the
-            # user to add a non-official MoE compute flag.
-        elif sidecar.moe_backend != "deep_gemm":
-            return select_backend(config, weight_key, activation_key, allow_vllm_cutlass)
-        elif getattr(config, "moe_backend", "auto") != sidecar.moe_backend:
+        if sidecar.moe_backend != "deep_gemm":
+            # Keep non-DeepEP auto and explicit public backends on vLLM's
+            # official selector. In particular, pure TP deployments must be
+            # free to select Triton or AITER without inheriting the DeepEP
+            # Channel-FP8 specialization.
+            return select_backend(
+                config,
+                weight_key,
+                activation_key,
+                allow_vllm_cutlass,
+            )
+        if getattr(config, "moe_backend", "auto") != sidecar.moe_backend:
             raise ValueError(
                 "HCU sidecar and official FusedMoEConfig select different "
                 f"MoE backends ({sidecar.moe_backend!r} != "

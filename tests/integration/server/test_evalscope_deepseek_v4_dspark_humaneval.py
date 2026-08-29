@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.integration.server.evalscope_server import (
+    _server_environment,
     evalscope_command,
     load_profiled_config,
     run_evalscope_server_test,
@@ -31,6 +32,7 @@ DSPARK_CONFIG = {
     "num_speculative_tokens": 7,
     "draft_sample_method": "probabilistic",
 }
+TP8_PROFILES = ("tp8", "tp8_aiter")
 
 
 def _option_value(command: list[str], option: str) -> str:
@@ -53,7 +55,7 @@ def _load_int8(profile: str) -> dict:
     )
 
 
-@pytest.mark.parametrize("profile", ["tp8", "dp8_ep8"])
+@pytest.mark.parametrize("profile", [*TP8_PROFILES, "dp8_ep8"])
 def test_deepseek_v4_int8_dspark_humaneval_server_contract(
     monkeypatch: pytest.MonkeyPatch,
     profile: str,
@@ -76,7 +78,6 @@ def test_deepseek_v4_int8_dspark_humaneval_server_contract(
     assert config["evalscope"]["pass_criteria"]["mean_acc"] == 1.0
     assert config["evalscope"]["pass_criteria"]["mean_acc_pass@1"] == 1.0
     assert "--enforce-eager" not in command
-    assert "--moe-backend" not in command
     assert not any(
         fragment in item
         for item in command
@@ -87,19 +88,23 @@ def test_deepseek_v4_int8_dspark_humaneval_server_contract(
             "deepep_low_latency",
         )
     )
-    if profile == "tp8":
+    if profile in TP8_PROFILES:
         assert _option_value(command, "--tensor-parallel-size") == "8"
+        assert _option_value(command, "--moe-backend") == (
+            "aiter" if profile == "tp8_aiter" else "triton"
+        )
         assert "--data-parallel-size" not in command
         assert "--enable-expert-parallel" not in command
         assert "--all2all-backend" not in command
     else:
+        assert "--moe-backend" not in command
         assert _option_value(command, "--tensor-parallel-size") == "1"
         assert _option_value(command, "--data-parallel-size") == "8"
         assert "--enable-expert-parallel" in command
         assert _option_value(command, "--all2all-backend") == "deepep_auto"
 
 
-@pytest.mark.parametrize("profile", ["tp8", "dp8_ep8"])
+@pytest.mark.parametrize("profile", [*TP8_PROFILES, "dp8_ep8"])
 def test_deepseek_v4_dspark_humaneval_common_server_contract(
     monkeypatch: pytest.MonkeyPatch,
     profile: str,
@@ -128,7 +133,12 @@ def test_deepseek_v4_dspark_humaneval_common_server_contract(
     assert not any(
         fragment in item for item in command for fragment in forbidden_fragments
     )
-    assert "--moe-backend" not in command
+    if profile in TP8_PROFILES:
+        assert _option_value(command, "--moe-backend") == (
+            "aiter" if profile == "tp8_aiter" else "triton"
+        )
+    else:
+        assert "--moe-backend" not in command
 
 
 def test_deepseek_v4_dspark_tp8_humaneval_command_contract() -> None:
@@ -140,6 +150,38 @@ def test_deepseek_v4_dspark_tp8_humaneval_command_contract() -> None:
     assert "--all2all-backend" not in command
 
 
+@pytest.mark.parametrize(
+    ("loader", "model_env"),
+    ((_load, MODEL_ENV), (_load_int8, INT8_MODEL_ENV)),
+    ids=("fp8", "int8"),
+)
+@pytest.mark.parametrize(
+    ("profile", "backend"),
+    (("tp8", "triton"), ("tp8_aiter", "aiter")),
+)
+def test_deepseek_v4_dspark_tp8_selects_public_moe_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    loader,
+    model_env: str,
+    profile: str,
+    backend: str,
+) -> None:
+    monkeypatch.delenv("VLLM_ROCM_USE_AITER", raising=False)
+    monkeypatch.delenv("VLLM_ROCM_USE_AITER_MOE", raising=False)
+    config = loader(profile)
+    command, _, _ = server_command(config, model_env=model_env)
+    environment = _server_environment(config)
+
+    assert _option_value(command, "--tensor-parallel-size") == "8"
+    assert _option_value(command, "--moe-backend") == backend
+    assert "--enable-expert-parallel" not in command
+    # Explicit --moe-backend must not enable unrelated AITER attention or
+    # communication paths. The HCU compatibility layer performs the explicit
+    # MoE capability check independently of these legacy global gates.
+    assert environment.get("VLLM_ROCM_USE_AITER") != "1"
+    assert environment.get("VLLM_ROCM_USE_AITER_MOE") != "1"
+
+
 def test_deepseek_v4_dspark_dp8_humaneval_is_single_service_auto_deepep() -> None:
     command, _, _ = server_command(_load("dp8_ep8"), model_env=MODEL_ENV)
 
@@ -149,7 +191,7 @@ def test_deepseek_v4_dspark_dp8_humaneval_is_single_service_auto_deepep() -> Non
     assert _option_value(command, "--all2all-backend") == "deepep_auto"
 
 
-@pytest.mark.parametrize("profile", ["tp8", "dp8_ep8"])
+@pytest.mark.parametrize("profile", [*TP8_PROFILES, "dp8_ep8"])
 def test_deepseek_v4_dspark_humaneval_requires_exact_32_of_32(
     profile: str,
 ) -> None:
@@ -167,7 +209,7 @@ def test_deepseek_v4_dspark_humaneval_requires_exact_32_of_32(
     }
 
 
-@pytest.mark.parametrize("profile", ["tp8", "dp8_ep8"])
+@pytest.mark.parametrize("profile", [*TP8_PROFILES, "dp8_ep8"])
 def test_deepseek_v4_dspark_humaneval_request_is_deterministic(
     tmp_path: Path,
     profile: str,
@@ -217,6 +259,23 @@ def test_deepseek_v4_dspark_humaneval_tp8() -> None:
 @pytest.mark.slow
 @pytest.mark.nightly
 @pytest.mark.external_service("evalscope")
+def test_deepseek_v4_dspark_humaneval_tp8_aiter() -> None:
+    config = _load("tp8_aiter")
+    run_evalscope_server_test(
+        config,
+        model_env=MODEL_ENV,
+        model_label="DeepSeek-V4-Flash-0731 TP8+AITER+DSpark",
+        required_hcu_count=8,
+    )
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(8)
+@pytest.mark.slow
+@pytest.mark.nightly
+@pytest.mark.external_service("evalscope")
 def test_deepseek_v4_dspark_humaneval_dp8_ep8() -> None:
     config = _load("dp8_ep8")
     run_evalscope_server_test(
@@ -240,6 +299,23 @@ def test_deepseek_v4_int8_dspark_humaneval_tp8() -> None:
         config,
         model_env=INT8_MODEL_ENV,
         model_label="DeepSeek-V4-Flash-0731 INT8 TP8+DSpark",
+        required_hcu_count=8,
+    )
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(8)
+@pytest.mark.slow
+@pytest.mark.nightly
+@pytest.mark.external_service("evalscope")
+def test_deepseek_v4_int8_dspark_humaneval_tp8_aiter() -> None:
+    config = _load_int8("tp8_aiter")
+    run_evalscope_server_test(
+        config,
+        model_env=INT8_MODEL_ENV,
+        model_label="DeepSeek-V4-Flash-0731 INT8 TP8+AITER+DSpark",
         required_hcu_count=8,
     )
 
