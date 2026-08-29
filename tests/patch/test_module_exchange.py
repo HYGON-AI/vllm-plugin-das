@@ -254,6 +254,32 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
     )
 
 
+def test_linear_replacement_preserves_v028_dcp_group_contract():
+    repo = Path(__file__).resolve().parents[2]
+    replacement = repo / "vllm_hcu/model_executor/layers/linear.py"
+    tree = ast.parse(replacement.read_text(encoding="utf-8"))
+    classes = {
+        node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
+    }
+
+    assert "DCPGroupColumnParallelLinear" in classes
+    for class_name in ("LinearBase", "ColumnParallelLinear"):
+        init = next(
+            node
+            for node in classes[class_name].body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        keyword_only = {argument.arg for argument in init.args.kwonlyargs}
+        assert {"tp_rank", "tp_size"} <= keyword_only
+
+    dcp_methods = {
+        node.name
+        for node in classes["DCPGroupColumnParallelLinear"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    assert {"__init__", "_local_view"} <= dcp_methods
+
+
 def test_linear_replacement_preserves_v0251_stacked_weight_loaders():
     repo = Path(__file__).resolve().parents[2]
     replacement = repo / "vllm_hcu/model_executor/layers/linear.py"
