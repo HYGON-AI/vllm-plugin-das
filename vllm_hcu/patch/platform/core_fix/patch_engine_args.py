@@ -49,7 +49,18 @@ _HCU_FLASH_ATTN_ALIASES = {
     "FLASH_ATTN_CLASSIC": "classic",
     "FLASH_ATTN_CUTLASS": "cutlass",
     "FLASH_ATTN_CUSTOM": "custom",
+    "FLASH_ATTN_VARLEN": "varlen",
 }
+
+
+def _resolve_requested_flash_mode(
+    backend: str,
+    existing_mode: str | None,
+) -> str | None:
+    normalized = backend.upper()
+    if normalized == _FLASH_ATTN_BACKEND:
+        return existing_mode
+    return _HCU_FLASH_ATTN_ALIASES.get(normalized)
 
 
 def _require_engine_args_class(module: ModuleType, name: str) -> type:
@@ -129,8 +140,9 @@ def _normalise_constructor_kwargs(
     requested_flash_mode: str | None = None
     top_level_attention_backend = bound.arguments.get("attention_backend")
     if isinstance(top_level_attention_backend, str):
-        requested_flash_mode = _HCU_FLASH_ATTN_ALIASES.get(
-            top_level_attention_backend.upper()
+        requested_flash_mode = _resolve_requested_flash_mode(
+            top_level_attention_backend,
+            feature_config.hcu_flash_attn_mode,
         )
         if requested_flash_mode is not None:
             if "attention_backend" not in kwargs:
@@ -144,7 +156,10 @@ def _normalise_constructor_kwargs(
     if isinstance(attention_config, Mapping):
         nested_backend = attention_config.get("backend")
         if isinstance(nested_backend, str):
-            nested_mode = _HCU_FLASH_ATTN_ALIASES.get(nested_backend.upper())
+            nested_mode = _resolve_requested_flash_mode(
+                nested_backend,
+                feature_config.hcu_flash_attn_mode,
+            )
             if nested_mode is not None:
                 if "attention_config" not in kwargs:
                     raise TypeError(
@@ -270,8 +285,9 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
 
     attention_backend = getattr(engine_args, "attention_backend", None)
     if isinstance(attention_backend, str):
-        requested_flash_mode = _HCU_FLASH_ATTN_ALIASES.get(
-            attention_backend.upper()
+        requested_flash_mode = _resolve_requested_flash_mode(
+            attention_backend,
+            feature_config.hcu_flash_attn_mode,
         )
         if requested_flash_mode is not None:
             if (

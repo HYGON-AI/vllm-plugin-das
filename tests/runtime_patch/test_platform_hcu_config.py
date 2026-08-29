@@ -207,6 +207,7 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     [
         ("FLASH_ATTN_CLASSIC", "classic"),
         ("flash_attn_cutlass", "cutlass"),
+        ("flash_attn_varlen", "varlen"),
     ],
 )
 def test_engine_args_normalizes_hcu_flash_attention_aliases(
@@ -223,6 +224,64 @@ def test_engine_args_normalizes_hcu_flash_attention_aliases(
     nested = module.EngineArgs(attention_config={"backend": alias})
     assert nested.attention_config["backend"] == "FLASH_ATTN"
     assert get_hcu_config(nested).hcu_flash_attn_mode == mode
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, "varlen"),
+        ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
+        ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
+    ],
+)
+def test_plain_flash_attention_defers_submode_to_legacy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    expected: str,
+) -> None:
+    for name in (
+        "VLLM_HCU_USE_FLASH_ATTN",
+        "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
+        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    top_level = module.EngineArgs(attention_backend="FLASH_ATTN")
+    assert top_level.attention_backend == "FLASH_ATTN"
+    assert get_hcu_config(top_level).hcu_flash_attn_mode is None
+
+    nested = module.EngineArgs(attention_config={"backend": "FLASH_ATTN"})
+    assert nested.attention_config["backend"] == "FLASH_ATTN"
+    assert get_hcu_config(nested).hcu_flash_attn_mode is None
+
+    config = _validation_config(get_hcu_config(top_level.create_engine_config()))
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert feature_config.hcu_flash_attn_mode == expected
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["TRITON_ATTN", "ROCM_AITER_FA", "TORCH_SDPA"],
+)
+def test_engine_args_preserves_non_hcu_flash_attention_backends(
+    backend: str,
+) -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    top_level = module.EngineArgs(attention_backend=backend)
+    assert top_level.attention_backend == backend
+    assert get_hcu_config(top_level).hcu_flash_attn_mode is None
+
+    nested = module.EngineArgs(attention_config={"backend": backend})
+    assert nested.attention_config["backend"] == backend
+    assert get_hcu_config(nested).hcu_flash_attn_mode is None
 
 
 def test_async_engine_args_and_nested_dpsk_config_use_same_sidecar() -> None:
@@ -767,10 +826,13 @@ def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 
-def test_compilation_binding_is_recreated_after_pickle() -> None:
+@pytest.mark.parametrize("flash_attn_mode", ["cutlass", "varlen"])
+def test_compilation_binding_is_recreated_after_pickle(
+    flash_attn_mode: str,
+) -> None:
     feature_config = HcuFeatureConfig(
         enable_custom_sp=True,
-        hcu_flash_attn_mode="cutlass",
+        hcu_flash_attn_mode=flash_attn_mode,
     )
     config = _validation_config(feature_config)
     patch_vllm_config.validate_and_update_hcu_config(config)
@@ -1019,9 +1081,10 @@ def _vllm_hash(additional_config: dict[str, Any]) -> str:
 @pytest.mark.parametrize(
     ("environment", "expected"),
     [
-        ({}, "cutlass"),
+        ({}, "varlen"),
         ({"VLLM_HCU_USE_FLASH_ATTN": "1"}, "classic"),
         ({"VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1"}, "cutlass"),
+        ({"VLLM_HCU_USE_FLASH_ATTN_VARLEN": "1"}, "varlen"),
     ],
 )
 def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
@@ -1032,6 +1095,7 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
     for name in (
         "VLLM_HCU_USE_FLASH_ATTN",
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
         "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -1043,6 +1107,65 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
 
     assert feature_config.hcu_flash_attn_mode == expected
     assert get_hcu_config(config) == feature_config
+
+
+def test_varlen_flash_attention_uses_64_token_cache_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class _NoFullGraphs:
+        @staticmethod
+        def has_full_cudagraphs() -> bool:
+            return False
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_PD_SPLIT", False)
+    monkeypatch.setattr(
+        hcu_envs,
+        "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE",
+        128,
+    )
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    config = _validation_config(
+        HcuFeatureConfig(hcu_flash_attn_mode="varlen")
+    )
+    config.compilation_config.cudagraph_mode = _NoFullGraphs()
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.distributed_executor_backend = "uni"
+    config.parallel_config.worker_cls = "auto"
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=False,
+        block_size=None,
+    )
+    config.attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASH_ATTN
+    )
+
+    HCUPlatform.check_and_update_config(config)
+    assert config.cache_config.block_size is None
+
+    class NativeVarlenBackend:
+        @classmethod
+        def get_preferred_block_size(cls, default_block_size: int) -> int:
+            del default_block_size
+            return 64
+
+        @classmethod
+        def get_name(cls) -> str:
+            return "HCU_NATIVE_VARLEN"
+
+    config.model_config = SimpleNamespace(is_hybrid=False)
+    config.cache_config.kv_cache_dtype_skip_layers = None
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: NativeVarlenBackend),
+    )
+    HCUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 64
 
 
 def test_cutlass_block_first_mooncake_defers_to_worker_capability_gates() -> None:

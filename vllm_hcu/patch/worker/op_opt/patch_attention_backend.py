@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""HCU metadata and MLA cache-update adapters for the official backend API."""
+"""HCU metadata adapter for the official v0.28 attention backend API.
+
+``SparseMLAAttentionImpl`` was removed from this module before v0.28.  Its old
+cache-update wrapper therefore cannot be carried forward as a backend-wide
+requirement.  Sparse MLA remains a separate, fail-closed upgrade contract;
+this callback only owns the common metadata fields used by HCU backends.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +26,6 @@ from ._common import (
 TARGET_MODULE = "vllm.v1.attention.backend"
 PATCH_ID = "worker.op_opt.attention.backend_hcu_metadata"
 TARGETS = (
-    f"{TARGET_MODULE}.SparseMLAAttentionImpl.do_kv_cache_update",
     f"{TARGET_MODULE}.CpCommonAttentionMetadata",
     f"{TARGET_MODULE}.CommonAttentionMetadata.__init__",
     f"{TARGET_MODULE}.CommonAttentionMetadata.unpadded",
@@ -37,56 +42,29 @@ _HCU_FIELDS = (
 def apply_to_module(module: ModuleType) -> bool:
     backend = load_exact_module(TARGET_MODULE, module)
     common = require_class(backend, "CommonAttentionMetadata", f"{TARGET_MODULE}.CommonAttentionMetadata")
-    sparse = require_class(backend, "SparseMLAAttentionImpl", f"{TARGET_MODULE}.SparseMLAAttentionImpl")
     wrapped = (
-        (sparse, "do_kv_cache_update", TARGETS[0], _WRAPPER),
-        (common, "__init__", TARGETS[2], _WRAPPER),
-        (common, "unpadded", TARGETS[3], _WRAPPER),
-        (common, "replace", TARGETS[4], _WRAPPER),
+        (common, "__init__", TARGETS[1], _WRAPPER),
+        (common, "unpadded", TARGETS[2], _WRAPPER),
+        (common, "replace", TARGETS[3], _WRAPPER),
     )
     if already_applied(backend, _MARKER, wrapped):
         return False
     if "CpCommonAttentionMetadata" in vars(backend):
-        raise PatchCompatibilityError(f"required HCU-owned type {TARGETS[1]} already exists")
-    cache_update = require_callable(sparse, "do_kv_cache_update", TARGETS[0])
-    require_exact_signature(
-        cache_update, TARGETS[0],
-        positional=("self", "kv_c_normed", "k_pe", "kv_cache", "slot_mapping", "kv_cache_dtype", "k_scale"),
-    )
-    original_init = require_callable(common, "__init__", TARGETS[2])
+        raise PatchCompatibilityError(f"required HCU-owned type {TARGETS[0]} already exists")
+    original_init = require_callable(common, "__init__", TARGETS[1])
     try:
         init_names = tuple(inspect.signature(original_init).parameters)
     except (TypeError, ValueError) as exc:
-        raise PatchCompatibilityError(f"cannot inspect {TARGETS[2]}") from exc
+        raise PatchCompatibilityError(f"cannot inspect {TARGETS[1]}") from exc
     required = {"self", "query_start_loc", "seq_lens", "num_actual_tokens", "slot_mapping"}
     if not required.issubset(init_names):
-        raise PatchCompatibilityError(f"required HCU target {TARGETS[2]} has incompatible fields")
-    unpadded = require_callable(common, "unpadded", TARGETS[3])
-    require_exact_signature(unpadded, TARGETS[3], positional=("self", "num_actual_tokens", "num_actual_reqs"))
-    replace = require_callable(common, "replace", TARGETS[4])
-    require_exact_signature(replace, TARGETS[4], positional=("self",), var_keyword="kwargs")
+        raise PatchCompatibilityError(f"required HCU target {TARGETS[1]} has incompatible fields")
+    unpadded = require_callable(common, "unpadded", TARGETS[2])
+    require_exact_signature(unpadded, TARGETS[2], positional=("self", "num_actual_tokens", "num_actual_reqs"))
+    replace = require_callable(common, "replace", TARGETS[3])
+    require_exact_signature(replace, TARGETS[3], positional=("self",), var_keyword="kwargs")
 
     from vllm_hcu.v1.attention.metadata import CpCommonAttentionMetadata
-
-    @functools.wraps(cache_update)
-    def hcu_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping,
-                         kv_cache_dtype, k_scale):
-        if kv_cache.numel() == 0:
-            return None
-        from vllm.platforms import current_platform
-
-        if not current_platform.is_rocm():
-            return cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping,
-                                kv_cache_dtype, k_scale)
-        try:
-            from vllm_hcu.v1.attention.backends.fa_utils import hcu_ops  # noqa: F401
-
-            op = backend.torch.ops.hcu_ops.concat_and_cache_mla
-        except (ImportError, AttributeError) as exc:
-            raise RuntimeError("HCU MLA concat-and-cache operator is required but unavailable") from exc
-        op(kv_c_normed, k_pe.squeeze(1), kv_cache, slot_mapping.flatten(),
-           kv_cache_dtype, k_scale)
-        return None
 
     @functools.wraps(original_init)
     def hcu_common_init(self, *args, **kwargs):
@@ -113,13 +91,11 @@ def apply_to_module(module: ModuleType) -> bool:
             setattr(result, name, value)
         return result
 
-    for function in (hcu_cache_update, hcu_common_init, hcu_unpadded, hcu_replace):
+    for function in (hcu_common_init, hcu_unpadded, hcu_replace):
         setattr(function, _WRAPPER, True)
-    setattr(sparse, "_vllm_hcu_original_do_kv_cache_update", cache_update)
     setattr(common, "_vllm_hcu_original_init", original_init)
     setattr(common, "_vllm_hcu_original_unpadded", unpadded)
     setattr(common, "_vllm_hcu_original_replace", replace)
-    setattr(sparse, "do_kv_cache_update", hcu_cache_update)
     setattr(common, "__init__", hcu_common_init)
     setattr(common, "unpadded", hcu_unpadded)
     setattr(common, "replace", hcu_replace)

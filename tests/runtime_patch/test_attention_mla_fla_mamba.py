@@ -344,6 +344,8 @@ def test_fused_attention_rejects_incompatible_stacked_kv_axis(
 def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    if importlib.util.find_spec("vllm_hcu.hcu_ops") is None:
+        pytest.skip("source-only test environment has no HCU native extension")
     try:
         runtime = importlib.import_module(
             "vllm_hcu.model_executor.layers.attention_runtime"
@@ -1004,16 +1006,9 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
             values.update(kwargs)
             return CommonAttentionMetadata(**values)
 
-    class SparseMLAAttentionImpl:
-        def do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping,
-                               kv_cache_dtype, k_scale):
-            return "official"
-
     module = _module(
         adapter.TARGET_MODULE,
         CommonAttentionMetadata=CommonAttentionMetadata,
-        SparseMLAAttentionImpl=SparseMLAAttentionImpl,
-        torch=torch,
     )
     adapter.apply_to_module(module)
     tensor = torch.arange(4)
@@ -1121,8 +1116,14 @@ def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch)
             quant_config=None,
             prefix="",
             skip_topk=False,
+            non_causal_multi_token_decode=False,
+            allow_short_prefill_indexer_scoring_skip=False,
         ):
             self.skip_topk = skip_topk
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
+            self.allow_short_prefill_indexer_scoring_skip = (
+                allow_short_prefill_indexer_scoring_skip
+            )
 
         def forward(self, positions, hidden_states, llama_4_scaling=None):
             return (
@@ -1144,9 +1145,22 @@ def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch)
     )
     assert adapter.apply_to_module(module) is True
     instance = MultiHeadLatentAttentionWrapper(
-        16, 2, 0.5, 4, 4, 8, 4, 4, object(), skip_topk=True
+        16,
+        2,
+        0.5,
+        4,
+        4,
+        8,
+        4,
+        4,
+        object(),
+        skip_topk=True,
+        non_causal_multi_token_decode=True,
+        allow_short_prefill_indexer_scoring_skip=True,
     )
     assert instance.skip_topk is True
+    assert instance.non_causal_multi_token_decode is True
+    assert instance.allow_short_prefill_indexer_scoring_skip is True
     assert instance.forward("positions", "hidden") == (
         "official",
         True,
@@ -1154,6 +1168,150 @@ def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch)
         "hidden",
         None,
     )
+
+
+def test_mla_attention_v028_dcp_contract_forwards_or_fails_closed(monkeypatch):
+    adapter = _adapter("patch_mla_attention")
+    calls = []
+
+    class MLAAttention:
+        def __init__(
+            self,
+            num_heads,
+            scale,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            q_lora_rank,
+            kv_lora_rank,
+            kv_b_proj,
+            dcp_q_replicate=False,
+            cache_config=None,
+            quant_config=None,
+            prefix="",
+            attn_backend=None,
+            use_sparse=False,
+            indexer=None,
+            topk_indices_buffer=None,
+            non_causal_multi_token_decode=False,
+            sliding_window=None,
+            prefill_backend_cls=None,
+            **extra_impl_args,
+        ):
+            del (
+                num_heads,
+                scale,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                v_head_dim,
+                q_lora_rank,
+                kv_lora_rank,
+                kv_b_proj,
+                dcp_q_replicate,
+                cache_config,
+                quant_config,
+                prefix,
+                attn_backend,
+                use_sparse,
+                indexer,
+                topk_indices_buffer,
+                non_causal_multi_token_decode,
+                sliding_window,
+                prefill_backend_cls,
+                extra_impl_args,
+            )
+
+        def forward_impl(
+            self,
+            q,
+            k_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale=None,
+            output_block_scale=None,
+            quant_group_size=None,
+            quant_scale_ue8m0=None,
+            quant_col_major=None,
+            quant_tma_aligned=None,
+            q_dcp_replicated=None,
+        ):
+            del self
+            calls.append(
+                (
+                    q,
+                    k_c_normed,
+                    k_pe,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    output_scale,
+                    output_block_scale,
+                    quant_group_size,
+                    quant_scale_ue8m0,
+                    quant_col_major,
+                    quant_tma_aligned,
+                    q_dcp_replicated,
+                )
+            )
+            return "official"
+
+        def process_weights_after_loading(self, act_dtype):
+            return act_dtype
+
+    class MLACommonMetadata:
+        def __init__(self, num_actual_tokens):
+            self.num_actual_tokens = num_actual_tokens
+
+    class MLACommonMetadataBuilder:
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            del self, common_prefix_len, fast_build
+            return MLACommonMetadata(common_attn_metadata.num_actual_tokens)
+
+    def split_decodes_and_prefills(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        return (
+            common_attn_metadata,
+            decode_threshold,
+            require_uniform,
+            treat_short_extends_as_decodes,
+        )
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        MLAAttention=MLAAttention,
+        MLACommonMetadata=MLACommonMetadata,
+        MLACommonMetadataBuilder=MLACommonMetadataBuilder,
+        split_decodes_and_prefills=split_decodes_and_prefills,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.config",
+        get_current_vllm_config_or_none=lambda: None,
+    )
+    feature_config = SimpleNamespace(enable_lightly_cp=False)
+    monkeypatch.setattr(adapter, "get_hcu_config", lambda _: feature_config)
+
+    assert adapter.apply_to_module(module) is True
+    instance = MLAAttention(1, 1.0, 1, 1, 1, None, 1, object())
+    q_dcp_replicated = object()
+    assert instance.forward_impl(
+        "q", "k", "pe", "cache", "metadata", "output",
+        q_dcp_replicated=q_dcp_replicated,
+    ) == "official"
+    assert calls[-1][-1] is q_dcp_replicated
+
+    feature_config.enable_lightly_cp = True
+    with pytest.raises(NotImplementedError, match="DCP query replication"):
+        instance.forward_impl(
+            "q", "k", "pe", "cache", "metadata", "output",
+            q_dcp_replicated=q_dcp_replicated,
+        )
 
 
 def test_wrong_exact_module_name_fails_before_mutation():
