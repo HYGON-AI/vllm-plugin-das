@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Guard target-owned compressed-tensors Channel-FP8 MoE routing."""
+"""Validate explicit target-owned Channel-FP8 MoE backend routing."""
 
 from __future__ import annotations
 
@@ -26,23 +26,10 @@ TARGETS = (
 )
 _CLASS_MARKER = "_vllm_hcu_moe_w8a8_fp8_applied"
 _WRAPPER_MARKER = "_vllm_hcu_moe_w8a8_fp8_wrapper"
-_REQUIRED_BACKEND = "triton"
-_REQUIRED_SELECTED_BACKEND = "TRITON"
-
-
-def _aiter_moe_state() -> tuple[bool, bool]:
-    try:
-        import vllm.envs as target_envs
-        from vllm_hcu.platforms import envs as henvs
-
-        return (
-            bool(target_envs.VLLM_ROCM_USE_AITER_MOE),
-            bool(henvs.VLLM_HCU_USE_AITER_W8A8_FP8_MOE),
-        )
-    except (AttributeError, ImportError) as exc:
-        raise PatchCompatibilityError(
-            "required target/HCU FP8-MoE routing flags are unavailable"
-        ) from exc
+_EXPLICIT_BACKENDS = {
+    "aiter": "AITER",
+    "triton": "TRITON",
+}
 
 
 def _selected_backend_name(method) -> str | None:
@@ -65,20 +52,14 @@ def _is_channel_token_route(fp8_moe_module, weight_quant, input_quant) -> bool:
         ) from exc
 
 
-def _require_target_triton_policy(moe) -> None:
-    target_aiter, hcu_aiter = _aiter_moe_state()
-    if target_aiter or hcu_aiter:
-        raise RuntimeError(
-            "Channel-FP8 MoE requires VLLM_ROCM_USE_AITER_MOE=0 and "
-            "VLLM_HCU_USE_AITER_W8A8_FP8_MOE=0 before model construction"
-        )
-
+def _required_selected_backend(moe) -> str:
     requested_backend = getattr(moe, "moe_backend", None)
-    if requested_backend != _REQUIRED_BACKEND:
+    selected_backend = _EXPLICIT_BACKENDS.get(requested_backend)
+    if selected_backend is None:
         raise RuntimeError(
-            "Channel-FP8 MoE requires the explicit vLLM v0.25.1 target route "
-            "--moe-backend triton"
+            "Channel-FP8 MoE requires explicit --moe-backend aiter or triton"
         )
+    return selected_backend
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -105,22 +86,24 @@ def apply_to_module(module: ModuleType) -> bool:
         channel_token = _is_channel_token_route(
             fp8_moe_module, weight_quant, input_quant
         )
+        expected_backend = None
         if channel_token:
-            _require_target_triton_policy(moe)
+            expected_backend = _required_selected_backend(moe)
         original_init(self, weight_quant, input_quant, moe, layer_name)
         if channel_token:
             selected_backend = _selected_backend_name(self)
-            if selected_backend != _REQUIRED_SELECTED_BACKEND:
+            if selected_backend != expected_backend:
                 raise RuntimeError(
-                    "vLLM v0.25.1 did not select the required target TRITON "
-                    f"Channel-FP8 MoE backend (selected={selected_backend!r})"
+                    "vLLM v0.28 selected a Channel-FP8 MoE backend "
+                    "different from the explicit request "
+                    f"(expected={expected_backend!r}, selected={selected_backend!r})"
                 )
 
     setattr(hcu_init, _WRAPPER_MARKER, True)
     setattr(method_class, "_vllm_hcu_original_init", original_init)
     setattr(method_class, "__init__", hcu_init)
     setattr(method_class, _CLASS_MARKER, True)
-    setattr(method_class, "_vllm_hcu_fp8_moe_owner", "target-triton")
+    setattr(method_class, "_vllm_hcu_fp8_moe_owner", "target-explicit")
     return True
 
 

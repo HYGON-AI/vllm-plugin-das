@@ -28,6 +28,7 @@ TARGETS = (
     f"{TARGET_MODULE}.AiterExperts._supports_activation",
     f"{TARGET_MODULE}.AiterExperts._supports_current_device",
     f"{TARGET_MODULE}.AiterExperts.is_supported_config",
+    f"{TARGET_MODULE}.AiterExperts._supports_quant_scheme",
 )
 _MARKER = "_vllm_hcu_aiter_gelu_tanh_applied"
 _EXPLICIT_CAPABILITY_CHECK: ContextVar[bool] = ContextVar(
@@ -134,6 +135,9 @@ def apply_to_module(module: ModuleType) -> bool:
     is_supported_config = require_callable(
         experts_class, "is_supported_config", TARGETS[4]
     )
+    supports_quant_scheme = require_callable(
+        experts_class, "_supports_quant_scheme", TARGETS[5]
+    )
     require_parameter_names(
         fused_experts,
         TARGETS[1],
@@ -150,6 +154,11 @@ def apply_to_module(module: ModuleType) -> bool:
         is_supported_config,
         TARGETS[4],
         ("cls", "moe_config", "weight_key", "activation_key", "activation_format"),
+    )
+    require_parameter_names(
+        supports_quant_scheme,
+        TARGETS[5],
+        ("weight_key", "activation_key"),
     )
     values = {member.name: member.value for member in activation_method}
     if values != {"SILU": 0, "GELU": 1}:
@@ -184,20 +193,59 @@ def apply_to_module(module: ModuleType) -> bool:
         fused_experts,
         special_globals,
     )
+    fused_experts_signature = inspect.signature(fused_experts)
+
+    int8_weight_key = getattr(target, "kInt8StaticChannelSym", None)
+    int8_activation_key = getattr(target, "kInt8DynamicTokenSym", None)
+    if int8_weight_key is None or int8_activation_key is None:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kInt8DynamicTokenSym,
+            kInt8StaticChannelSym,
+        )
+
+        int8_weight_key = kInt8StaticChannelSym
+        int8_activation_key = kInt8DynamicTokenSym
 
     @functools.wraps(fused_experts)
     def hcu_fused_experts(*args, **kwargs):
-        activation = kwargs.get("activation")
-        if activation is None and len(args) > 6:
-            activation = args[6]
-        moe_config = kwargs.get("moe_config")
-        if moe_config is None and len(args) > 5:
-            moe_config = args[5]
+        bound = fused_experts_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        activation = arguments.get("activation")
+        moe_config = arguments.get("moe_config")
+        quant_config = arguments.get("quant_config")
         from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
             aiter_moe_request_context,
         )
 
         with aiter_moe_request_context(moe_config):
+            if bool(getattr(quant_config, "use_fp8_w8a8", False)) or bool(
+                getattr(quant_config, "use_int8_w8a8", False)
+            ):
+                from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                    apply_aiter_quantized_moe,
+                )
+
+                return apply_aiter_quantized_moe(
+                    hidden_states=arguments["hidden_states"],
+                    w1=arguments["w1"],
+                    w2=arguments["w2"],
+                    topk_weights=arguments["topk_weights"],
+                    topk_ids=arguments["topk_ids"],
+                    vllm_moe_config=moe_config,
+                    activation=activation,
+                    apply_router_weight_on_input=arguments[
+                        "apply_router_weight_on_input"
+                    ],
+                    expert_map=arguments.get("expert_mask"),
+                    quant_config=quant_config,
+                    a1q_scale=arguments.get("a1q_scale"),
+                    num_local_tokens=arguments["num_local_tokens"],
+                    output_dtype=arguments.get("output_dtype"),
+                    moe_sorting_dispatch_policy=arguments[
+                        "moe_sorting_dispatch_policy"
+                    ],
+                )
             if activation == gelu_tanh:
                 return special_impl(*args, **kwargs)
             return normal_impl(*args, **kwargs)
@@ -207,6 +255,15 @@ def apply_to_module(module: ModuleType) -> bool:
         if activation == moe_activation.SWIGLUOAI_UNINTERLEAVE:
             return False
         return activation == gelu_tanh or supports(activation)
+
+    @functools.wraps(supports_quant_scheme)
+    def hcu_supports_quant_scheme(weight_key, activation_key):
+        if (
+            weight_key == int8_weight_key
+            and activation_key == int8_activation_key
+        ):
+            return True
+        return supports_quant_scheme(weight_key, activation_key)
 
     @functools.wraps(supports_device)
     def hcu_supports_current_device():
@@ -247,6 +304,8 @@ def apply_to_module(module: ModuleType) -> bool:
     experts_class._supports_current_device = staticmethod(hcu_supports_current_device)
     experts_class._vllm_hcu_original_is_supported_config = is_supported_config
     experts_class.is_supported_config = staticmethod(hcu_is_supported_config)
+    experts_class._vllm_hcu_original_supports_quant_scheme = supports_quant_scheme
+    experts_class._supports_quant_scheme = staticmethod(hcu_supports_quant_scheme)
     setattr(target, _MARKER, True)
     return True
 

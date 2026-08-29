@@ -517,18 +517,27 @@ def test_aiter_and_triton_expert_capability_contract(
             return False
 
         @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+        @staticmethod
         def is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
         ):
             del cls, moe_config, weight_key, activation_key, activation_format
             return AiterExperts._supports_current_device(), None
 
+    int8_weight_key = object()
+    int8_activation_key = object()
     aiter_module = _module(
         patch_rocm_aiter_moe.TARGET_MODULE,
         IntEnum=IntEnum,
         ActivationMethod=ActivationMethod,
         MoEActivation=MoEActivation,
         kMxfp4Static=object(),
+        kInt8StaticChannelSym=int8_weight_key,
+        kInt8DynamicTokenSym=int8_activation_key,
         rocm_aiter_fused_experts=namespace["rocm_aiter_fused_experts"],
         AiterExperts=AiterExperts,
     )
@@ -551,6 +560,10 @@ def test_aiter_and_triton_expert_capability_contract(
     )
     assert activation == aiter_module.ActivationMethod.GELU_TANH
     assert AiterExperts._supports_activation(MoEActivation.GELU_TANH) is True
+    assert AiterExperts._supports_quant_scheme(
+        int8_weight_key, int8_activation_key
+    ) is True
+    assert AiterExperts._supports_quant_scheme(object(), object()) is False
     assert (
         AiterExperts._supports_activation(
             MoEActivation.SWIGLUOAI_UNINTERLEAVE
@@ -1236,6 +1249,7 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         DEEPGEMM = "DEEPGEMM"
         BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
         TRITON = "TRITON"
+        AITER = "AITER"
 
     def backend_to_kernel_cls(backend):
         return [backend]
