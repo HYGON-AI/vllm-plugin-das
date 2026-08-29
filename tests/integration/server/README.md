@@ -34,6 +34,11 @@ Current coverage:
   disaggregation, a public MoE backend, and separate HT/LL switches are
   excluded. Acceptance requires 32 predictions, 32 reviews, and exact `1.0`
   scores for both HumanEval metrics.
+- `test_evalscope_deepseek_v4_dspark_mooncake_pd.py` adds the isolated
+  4-prefill-card + 4-decode-card Mooncake topology for the same FP8 and INT8
+  checkpoints. It starts and stops only its own P, D, and proxy process trees,
+  runs HumanEval-32 through the proxy, and requires positive Mooncake transfer,
+  DeepEP/DeepGEMM HT+LL, and DSpark metrics evidence.
 
 The Qwen3-8B smoke test needs one local HCU device, the checkpoint at
 `/models/llm-models/qwen3/Qwen3-8B`, `vllm`, and `evalscope`. Select it with
@@ -75,3 +80,10 @@ The Channel-INT8 acceptance profile defaults to
 `/models/DeepSeek-V4-Flash-0731-Channel-INT8-w8a8`; override it with
 `VLLM_HCU_DEEPSEEK_V4_FLASH_0731_INT8_MODEL`. Override its profiled YAML with
 `VLLM_HCU_DEEPSEEK_V4_INT8_DSPARK_HUMANEVAL_CONFIG`.
+
+The P/D profiles use those same model override variables. Override their
+shared YAML with `VLLM_HCU_DEEPSEEK_V4_DSPARK_MOONCAKE_PD_CONFIG` and point
+`VLLM_V0251_SOURCE_ROOT` at the vLLM source tree that contains the official
+Mooncake proxy. See
+`docs/deepseek_v4_flash_0731_dspark_mooncake_pd_validation.md` for the exact P,
+D, proxy, curl, and pytest commands.

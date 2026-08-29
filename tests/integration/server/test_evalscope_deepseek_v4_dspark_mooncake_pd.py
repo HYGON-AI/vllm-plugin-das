@@ -25,6 +25,8 @@ DEFAULT_CONFIG = (
 )
 CONFIG_ENV = "VLLM_HCU_DEEPSEEK_V4_DSPARK_MOONCAKE_PD_CONFIG"
 MODEL_ENV = "VLLM_HCU_DEEPSEEK_V4_DSPARK_MOONCAKE_PD_MODEL"
+FP8_MODEL_ENV = "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_MODEL"
+INT8_MODEL_ENV = "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_INT8_MODEL"
 DSPARK_CONFIG = {
     "method": "dspark",
     "num_speculative_tokens": 7,
@@ -322,3 +324,37 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
         "stop:decode",
         "stop:prefill",
     ]
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(8)
+@pytest.mark.slow
+@pytest.mark.nightly
+@pytest.mark.external_service("evalscope")
+@pytest.mark.external_service("mooncake")
+def test_deepseek_v4_dspark_humaneval_fp8_mooncake_pd() -> None:
+    run_evalscope_pd_server_test(
+        _load("fp8"),
+        model_env=FP8_MODEL_ENV,
+        model_label="DeepSeek-V4-Flash-0731 FP8 4P+4D Mooncake",
+        required_hcu_count=8,
+    )
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.multi_hcu
+@pytest.mark.hcu_count(8)
+@pytest.mark.slow
+@pytest.mark.nightly
+@pytest.mark.external_service("evalscope")
+@pytest.mark.external_service("mooncake")
+def test_deepseek_v4_dspark_humaneval_int8_mooncake_pd() -> None:
+    run_evalscope_pd_server_test(
+        _load("int8"),
+        model_env=INT8_MODEL_ENV,
+        model_label="DeepSeek-V4-Flash-0731 INT8 4P+4D Mooncake",
+        required_hcu_count=8,
+    )
