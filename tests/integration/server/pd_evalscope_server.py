@@ -171,6 +171,8 @@ def _fetch_text(url: str, timeout: int) -> str:
 def _reset_pd_logs(log_dir: Path) -> None:
     """Remove only the owned P/D acceptance evidence files."""
 
+    if log_dir.is_symlink():
+        raise ValueError(f"P/D log directory must not be a symlink: {log_dir}")
     log_dir.mkdir(parents=True, exist_ok=True)
     for name in (
         "prefill.log",
@@ -253,6 +255,7 @@ def pd_commands(config: dict[str, Any], *, model_env: str) -> PDCommands:
     )
     if not proxy_script.is_file():
         raise FileNotFoundError(f"Mooncake connector proxy is absent: {proxy_script}")
+    base_env.pop("VLLM_V0251_SOURCE_ROOT", None)
 
     proxy_port = int(pd["proxy_port"])
     prefill_port = int(prefill["port"])

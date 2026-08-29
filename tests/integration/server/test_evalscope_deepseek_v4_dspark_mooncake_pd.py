@@ -89,6 +89,9 @@ def test_deepseek_v4_dspark_mooncake_pd_command_contract(
     assert commands.decode_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "18999"
     assert commands.prefill_env["VLLM_DP_MASTER_PORT"] == "29561"
     assert commands.decode_env["VLLM_DP_MASTER_PORT"] == "29562"
+    assert "VLLM_V0251_SOURCE_ROOT" not in commands.prefill_env
+    assert "VLLM_V0251_SOURCE_ROOT" not in commands.decode_env
+    assert "VLLM_V0251_SOURCE_ROOT" not in commands.proxy_env
     assert _option_value(commands.prefill, "--max-num-batched-tokens") == "512"
     assert _option_value(commands.decode, "--max-num-batched-tokens") == "64"
 
@@ -169,6 +172,22 @@ def test_deepseek_v4_dspark_mooncake_pd_runtime_evidence(
     decode_log.write_text(DECODE_EVIDENCE, encoding="utf-8")
 
     assert_pd_runtime_evidence(prefill_log, decode_log, DSPARK_METRICS)
+
+
+def test_deepseek_v4_dspark_mooncake_pd_rejects_symlinked_log_dir(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "external-logs"
+    target.mkdir()
+    evidence = target / "prefill.log"
+    evidence.write_text("keep\n", encoding="utf-8")
+    log_dir = tmp_path / "logs"
+    log_dir.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        pd_runner._reset_pd_logs(log_dir)
+
+    assert evidence.read_text(encoding="utf-8") == "keep\n"
 
 
 @pytest.mark.parametrize(
