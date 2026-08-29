@@ -52,6 +52,18 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any):
+        try:
+            bound = signature.bind_partial(*args, **kwargs)
+        except TypeError as exc:
+            raise RuntimeError(
+                f"HCU flash_attn.{name} call does not match its audited ABI"
+            ) from exc
+        requested_out = bound.arguments.get("out")
+        if requested_out is not None and not isinstance(requested_out, Tensor):
+            raise TypeError(
+                f"HCU flash_attn.{name} requires out to be a Tensor or None"
+            )
+
         layout = _flash_attn_layout()
         if layout_position is not None and len(args) > layout_position:
             positional = list(args)
@@ -60,7 +72,24 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
             kwargs.pop("layout", None)
         else:
             kwargs["layout"] = layout
-        return function(*args, **kwargs)
+        result = function(*args, **kwargs)
+
+        # The HCU FlashAttention wheel exposes vLLM's ``out`` argument but
+        # some kernels return a distinct output tensor instead of writing the
+        # supplied buffer. Runner V2 and CUDAGraph own the caller's output
+        # storage, so repair that native ABI difference at the kernel boundary.
+        if requested_out is None:
+            return result
+        result_out = result[0] if isinstance(result, tuple) else result
+        if not isinstance(result_out, Tensor):
+            raise RuntimeError(
+                f"HCU flash_attn.{name} did not return an output Tensor"
+            )
+        if result_out.data_ptr() != requested_out.data_ptr():
+            requested_out.copy_(result_out)
+        if isinstance(result, tuple):
+            return (requested_out, *result[1:])
+        return requested_out
 
     return wrapped
 

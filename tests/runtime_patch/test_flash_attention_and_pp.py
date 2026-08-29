@@ -149,6 +149,62 @@ def test_hcu_fa_entrypoints_map_kv_cache_layout_to_kernel_layout(
     assert calls[entrypoint_name] == [{"layout": expected_fa_layout}]
 
 
+@pytest.mark.parametrize("returns_lse", [False, True])
+def test_hcu_fa_boundary_repairs_native_out_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+    returns_lse: bool,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    calls: list[str] = []
+
+    def native(
+        q,
+        k,
+        v,
+        *,
+        out=None,
+        layout="unrouted",
+    ):
+        del k, v, out
+        calls.append(layout)
+        distinct = q + 1
+        if returns_lse:
+            return distinct, torch.full((1,), 7.0)
+        return distinct
+
+    wrapped = fa_utils._with_kv_cache_layout(native, "native")
+    q = torch.arange(8, dtype=torch.float32).view(2, 4)
+    out = torch.full_like(q, -1)
+    result = wrapped(q, q, q, out=out)
+
+    result_out = result[0] if isinstance(result, tuple) else result
+    assert result_out.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, q + 1)
+    assert calls == ["bshd"]
+    if returns_lse:
+        torch.testing.assert_close(result[1], torch.full((1,), 7.0))
+
+
+def test_hcu_fa_boundary_rejects_non_tensor_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+
+    def native(q=None, k=None, v=None, *, out=None, layout="bshd"):
+        del k, v, out, layout
+        return q
+
+    wrapped = fa_utils._with_kv_cache_layout(native, "native")
+    with pytest.raises(TypeError, match="out to be a Tensor or None"):
+        wrapped(q=torch.ones(1), out="not-a-tensor")
+
+
 def test_hcu_fa_boundary_rejects_interface_without_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
