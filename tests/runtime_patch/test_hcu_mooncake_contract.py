@@ -827,3 +827,29 @@ def test_ttft_transfer_identity(mooncake):
     assert mooncake.transfer_id_from_req(req_id, {"transfer_id": "explicit"}) == (
         "explicit"
     )
+
+
+def test_enabled_ttft_event_uses_visible_info_log(mooncake, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mooncake, "ttft_trace_enabled", lambda: True)
+    monkeypatch.setattr(
+        mooncake.logger,
+        "info",
+        lambda *args: calls.append(args),
+    )
+
+    mooncake.log_ttft_event(
+        "p_send_kv_done",
+        transfer_id="xfer-1",
+        req_id="request-1",
+    )
+
+    assert len(calls) == 1
+    template, event, timestamp, transfer_id, request_id = calls[0]
+    assert template == (
+        "Mooncake TTFT_EVENT event=%s ts=%.6f transfer_id=%s req_id=%s"
+    )
+    assert event == "p_send_kv_done"
+    assert isinstance(timestamp, float)
+    assert transfer_id == "xfer-1"
+    assert request_id == "request-1"

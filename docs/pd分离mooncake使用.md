@@ -54,8 +54,10 @@ Prefill 与 Decode **均需**设置（与 `--disable-log-stats` 无关）。该�
 
 ```bash
 export VLLM_HCU_MOONCAKE_TTFT_TRACE=1
-export VLLM_LOGGING_LEVEL=DEBUG   # TTFT_EVENT 以 DEBUG 级别输出，需同步开启
 ```
+
+TTFT_EVENT 仅在上述开关启用时以 INFO 级别输出，无需额外调整
+`VLLM_LOGGING_LEVEL`。
 
 #### 日志格式
 

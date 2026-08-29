@@ -214,6 +214,77 @@ def test_terminate_process_group_stops_owned_orphan_after_parent_exit(
                 child.kill()
 
 
+def test_terminate_process_group_signals_detached_children_concurrently(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    child_ready_path = tmp_path / "child.ready"
+    child_term_path = tmp_path / "child.term"
+    parent_ready_path = tmp_path / "parent.ready"
+    parent_term_path = tmp_path / "parent.term"
+    owner_token = f"evalscope-test-{os.getpid()}-{time.monotonic_ns()}"
+    child_code = (
+        "import pathlib,signal,sys,time;"
+        "signal.signal(signal.SIGTERM,lambda *_:"
+        "pathlib.Path(sys.argv[1]).write_text(str(time.monotonic())));"
+        "pathlib.Path(sys.argv[2]).write_text('ready');"
+        "time.sleep(300)"
+    )
+    parent_code = (
+        "import pathlib,signal,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[1],"
+        "sys.argv[2],sys.argv[3]],start_new_session=True);"
+        "child_ready=pathlib.Path(sys.argv[3]);"
+        "exec('while not child_ready.exists():\\n time.sleep(0.01)');"
+        "pathlib.Path(sys.argv[4]).write_text(str(child.pid));"
+        "signal.signal(signal.SIGTERM,lambda *_:"
+        "pathlib.Path(sys.argv[5]).write_text(str(time.monotonic())));"
+        "pathlib.Path(sys.argv[6]).write_text('ready');"
+        "time.sleep(300)"
+    )
+    env = os.environ.copy()
+    env["VLLM_HCU_EVAL_PROCESS_OWNER"] = owner_token
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            parent_code,
+            child_code,
+            str(child_term_path),
+            str(child_ready_path),
+            str(child_pid_path),
+            str(parent_term_path),
+            str(parent_ready_path),
+        ],
+        env=env,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not parent_ready_path.exists():
+            time.sleep(0.05)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+        evalscope_server._terminate_process_group(
+            parent,
+            timeout_s=1,
+            owner_token=owner_token,
+        )
+
+        parent_term = float(parent_term_path.read_text(encoding="utf-8"))
+        child_term = float(child_term_path.read_text(encoding="utf-8"))
+        assert abs(parent_term - child_term) < 0.5
+    finally:
+        if parent.poll() is None:
+            os.killpg(parent.pid, signal.SIGKILL)
+            parent.wait(timeout=5)
+        if child_pid is not None and psutil.pid_exists(child_pid):
+            child = psutil.Process(child_pid)
+            if child.status() != psutil.STATUS_ZOMBIE:
+                child.kill()
+
+
 def _config(score: float) -> dict:
     return {
         "model": "/models/Qwen3-8B",

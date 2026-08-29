@@ -257,6 +257,7 @@ def _terminate_process_group(
     *,
     owner_token: str | None = None,
 ) -> None:
+    deadline = time.monotonic() + timeout_s
     descendants: list[psutil.Process] = []
     if proc.poll() is None:
         try:
@@ -266,7 +267,7 @@ def _terminate_process_group(
     if owner_token is not None:
         known_pids = {child.pid for child in descendants}
         for child in psutil.process_iter():
-            if child.pid == os.getpid() or child.pid in known_pids:
+            if child.pid in (os.getpid(), proc.pid) or child.pid in known_pids:
                 continue
             try:
                 if child.environ().get(EVALSCOPE_PROCESS_OWNER_ENV) == owner_token:
@@ -274,22 +275,16 @@ def _terminate_process_group(
                     known_pids.add(child.pid)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
-    try:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=timeout_s)
-    except ProcessLookupError:
-        pass
-    except subprocess.TimeoutExpired:
+    root_running = proc.poll() is None
+    if root_running:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass
-        proc.wait(timeout=10)
+            root_running = False
 
-    # DP engine cores may create workers in their own sessions. Capture the
-    # complete tree before stopping the API server, then explicitly reap any
-    # descendants that were outside the server's process group.
+    # DP engine cores may create workers in their own sessions. Signal the
+    # complete captured/owned tree at the same time as the API server so all
+    # processes share one graceful-shutdown budget.
     alive: list[psutil.Process] = []
     for child in descendants:
         try:
@@ -298,7 +293,21 @@ def _terminate_process_group(
                 alive.append(child)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    _, alive = psutil.wait_procs(alive, timeout=timeout_s)
+
+    if root_running:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=10)
+
+    _, alive = psutil.wait_procs(
+        alive,
+        timeout=max(0.0, deadline - time.monotonic()),
+    )
     for child in alive:
         try:
             child.kill()
