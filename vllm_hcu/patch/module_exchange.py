@@ -73,13 +73,13 @@ _ATTENTION: tuple[_Entry, ...] = (
     ),
 )
 
+# Sparse indexer/SWA adapters remain source-audited references only. They are
+# deliberately excluded from the default selected surface until their v0.28
+# public API and gfx936 kernel behavior are validated. The target modules stay
+# selected in the first release scope; no global hardware prohibition is added.
 _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
     _MODULAR_KERNEL,
     _BASE_LINEAR,
-    # DeepSeek attention imports the sparse indexer through its canonical
-    # alias, so the indexer's AITER-bearing replacement must be armed first.
-    _ATTENTION,
-    _DEEPSEEK_V4,
     _DEEP_GEMM,
 )
 
@@ -159,22 +159,10 @@ def register_base_linear_exchanges(
     return _register_entries(_BASE_LINEAR, coordinator)
 
 
-def register_deepseek_v4_exchanges(
-    coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
-) -> tuple[ImportRegistration, ...]:
-    return _register_entries(_DEEPSEEK_V4, coordinator)
-
-
 def register_deep_gemm_exchanges(
     coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
 ) -> tuple[ImportRegistration, ...]:
     return _register_entries(_DEEP_GEMM, coordinator)
-
-
-def register_attention_exchanges(
-    coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
-) -> tuple[ImportRegistration, ...]:
-    return _register_entries(_ATTENTION, coordinator)
 
 
 def register_all_module_exchanges(
@@ -208,9 +196,7 @@ def module_exchange_names() -> tuple[tuple[str, str], ...]:
 __all__ = [
     "module_exchange_names",
     "register_all_module_exchanges",
-    "register_attention_exchanges",
     "register_base_linear_exchanges",
     "register_deep_gemm_exchanges",
-    "register_deepseek_v4_exchanges",
     "register_modular_kernel_exchange",
 ]

@@ -56,8 +56,8 @@ def test_all_exchange_registration_is_exact_lazy_and_idempotent(
     first = register_all_module_exchanges(coordinator)
     second = register_all_module_exchanges(coordinator)
 
-    assert len(first) == len(second) == 7
-    assert len(coordinator.registrations()) == 7
+    assert len(first) == len(second) == 5
+    assert len(coordinator.registrations()) == 5
     assert all(item.status == PatchStatus.ARMED.value for item in first)
     assert builtins.__import__ is original_import
     assert replacements_before == set()
@@ -436,9 +436,10 @@ def test_v0251_native_mhc_contract_is_not_replaced():
     } <= exports
 
 
-def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
+def test_v028_native_deepseek_v4_contracts_remain_target_owned():
     exchanges = dict(module_exchange_names())
-    assert "vllm.v1.attention.backends.mla.sparse_swa" in exchanges
+    assert "vllm.v1.attention.backends.mla.sparse_swa" not in exchanges
+    assert "vllm.model_executor.layers.sparse_attn_indexer" not in exchanges
     assert {
         "vllm.model_executor.layers.deepseek_compressor",
         "vllm.model_executor.layers.deepseek_v4_attention",
@@ -602,85 +603,15 @@ def test_sparse_indexer_replacement_keeps_v0251_q_rope_quant_contract():
     ]
 
 
-@pytest.mark.parametrize(
-    ("target_relative", "replacement_relative"),
-    (
-        (
-            "vllm/model_executor/layers/sparse_attn_indexer.py",
-            "vllm_hcu/model_executor/layers/sparse_attn_indexer.py",
-        ),
-        (
-            "vllm/v1/attention/backends/mla/sparse_swa.py",
-            "vllm_hcu/v1/attention/backends/mla/sparse_swa.py",
-        ),
-    ),
-)
-def test_sparse_replacements_preserve_v0251_definition_surface_and_signatures(
-    target_relative: str,
-    replacement_relative: str,
-):
-    """Whole-module replacements must carry the complete target definition API."""
-
-    target_tree = ast.parse(
-        (TARGET_VLLM_ROOT / target_relative).read_text(encoding="utf-8")
-    )
-    replacement_tree = ast.parse(
-        (REPO_ROOT / replacement_relative).read_text(encoding="utf-8")
-    )
-
-    def definitions(tree: ast.Module) -> dict[str, ast.AST]:
-        return {
-            node.name: node
-            for node in tree.body
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-
-    target_definitions = definitions(target_tree)
-    replacement_definitions = definitions(replacement_tree)
-    assert target_definitions.keys() <= replacement_definitions.keys()
-    hcu_owned_definitions = set(replacement_definitions).difference(
-        target_definitions
-    )
-    if replacement_relative.endswith("sparse_attn_indexer.py"):
-        assert hcu_owned_definitions == {"V32SparseAttnIndexer"}
-    else:
-        assert hcu_owned_definitions == set()
-
-    for name, target_node in target_definitions.items():
-        replacement_node = replacement_definitions[name]
-        assert type(replacement_node) is type(target_node), name
-        if isinstance(target_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            assert isinstance(
-                replacement_node, (ast.FunctionDef, ast.AsyncFunctionDef)
-            )
-            assert ast.dump(
-                replacement_node.args, include_attributes=False
-            ) == ast.dump(target_node.args, include_attributes=False), name
-            continue
-
-        assert isinstance(target_node, ast.ClassDef)
-        assert isinstance(replacement_node, ast.ClassDef)
-        target_methods = {
-            node.name: node
-            for node in target_node.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        replacement_methods = {
-            node.name: node
-            for node in replacement_node.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        assert replacement_methods.keys() == target_methods.keys(), name
-        for method_name, target_method in target_methods.items():
-            replacement_method = replacement_methods[method_name]
-            assert ast.dump(
-                replacement_method.args, include_attributes=False
-            ) == ast.dump(target_method.args, include_attributes=False), (
-                f"{name}.{method_name}"
-            )
+def test_unvalidated_sparse_adapters_are_not_selected_by_default():
+    exchanges = dict(module_exchange_names())
+    assert {
+        "vllm.model_executor.layers.sparse_attn_indexer",
+        "vllm.v1.attention.backends.mla.sparse_swa",
+    }.isdisjoint(exchanges)
 
 
-def test_sparse_replacements_keep_reviewed_hcu_deltas():
+def test_pending_sparse_adapters_keep_reviewed_hcu_deltas():
     indexer_source = (
         REPO_ROOT / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
     ).read_text(encoding="utf-8")
