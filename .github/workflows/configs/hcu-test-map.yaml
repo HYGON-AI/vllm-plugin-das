@@ -26,7 +26,8 @@
     "qwen35-gsm8k",
     "qwen3-8b-gsm8k",
     "qwen3-vl-mmmu",
-    "deepseek-gsm8k"
+    "deepseek-gsm8k",
+    "deepseek-v4-dspark-humaneval"
   ],
   "jobs": {
     "accuracy-gfx936": {
@@ -441,6 +442,58 @@
         }
       ]
     },
+    "deepseek-v4-dspark-runtime": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "deepseek_v4_flash_dspark"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_MODEL",
+          "relative": "DeepSeek-V4-Flash-0731-Channel-FP8-w8a8"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_INT8_MODEL",
+          "relative": "DeepSeek-V4-Flash-0731-Channel-INT8-w8a8"
+        }
+      ]
+    },
+    "deepseek-v4-dspark-humaneval": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "deepseek_v4_dspark_humaneval"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_MODEL",
+          "relative": "DeepSeek-V4-Flash-0731-Channel-FP8-w8a8"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_INT8_MODEL",
+          "relative": "DeepSeek-V4-Flash-0731-Channel-INT8-w8a8"
+        }
+      ]
+    },
     "single-node-topology": {
       "runner": "nmz36",
       "arch": "gfx938",
@@ -473,6 +526,8 @@
     {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
     {"job": "deepseek-gsm8k", "timeout_minutes": 360},
     {"job": "glm52-pcp", "timeout_minutes": 360},
+    {"job": "deepseek-v4-dspark-runtime", "timeout_minutes": 360},
+    {"job": "deepseek-v4-dspark-humaneval", "timeout_minutes": 360},
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
@@ -579,7 +634,7 @@
       "patterns": [
         "vllm_hcu/**spec_decode*",
         "vllm_hcu/v1/spec_decode/**",
-        "tests/integration/spec_decode/**"
+        "tests/integration/spec_decode/test_llama2_7b_eagle_parity.py"
       ],
       "jobs": [
         "spec-decode"
@@ -633,15 +688,44 @@
       ],
       "jobs": [
         "deepseek-tp-ep",
-        "deepseek-gsm8k"
+        "deepseek-gsm8k",
+        "deepseek-v4-dspark-runtime",
+        "deepseek-v4-dspark-humaneval"
       ]
     },
     "deepseek-evalscope": {
       "patterns": [
-        "tests/integration/server/test_evalscope_deepseek*"
+        "tests/integration/server/test_evalscope_deepseek_r1_gsm8k.py",
+        "tests/models/deepseek_r1_gsm8k_evalscope.yaml"
       ],
       "jobs": [
         "deepseek-gsm8k"
+      ]
+    },
+    "deepseek-v4-dspark-ops": {
+      "patterns": [
+        "tests/accuracy/test_deepseek_v4_dspark_ops.py"
+      ],
+      "jobs": [
+        "accuracy-gfx938"
+      ]
+    },
+    "deepseek-v4-dspark-runtime-tests": {
+      "patterns": [
+        "tests/integration/spec_decode/test_deepseek_v4_flash_dspark.py"
+      ],
+      "jobs": [
+        "deepseek-v4-dspark-runtime"
+      ]
+    },
+    "deepseek-v4-dspark-eval": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_deepseek_v4_dspark_humaneval.py",
+        "tests/models/deepseek_v4_flash_0731_dspark_humaneval.yaml",
+        "tests/models/deepseek_v4_flash_0731_int8_dspark_humaneval.yaml"
+      ],
+      "jobs": [
+        "deepseek-v4-dspark-humaneval"
       ]
     },
     "glm52-pcp": {
@@ -663,7 +747,8 @@
         "qwen25-models",
         "qwen3-pooling",
         "mamba-smoke",
-        "spec-decode"
+        "spec-decode",
+        "deepseek-v4-dspark-runtime"
       ]
     },
     "qwen35-smoke-tests": {
@@ -745,7 +830,8 @@
         "qwen35-gsm8k",
         "qwen3-8b-gsm8k",
         "qwen3-vl-mmmu",
-        "deepseek-gsm8k"
+        "deepseek-gsm8k",
+        "deepseek-v4-dspark-humaneval"
       ]
     },
     "evalscope-report-tests": {

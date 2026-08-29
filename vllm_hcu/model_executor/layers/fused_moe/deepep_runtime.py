@@ -41,6 +41,21 @@ def _has_hcu_low_latency_dispatch_abi(buffer) -> bool:
     )
 
 
+def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
+    """Whether HCU DeepGEMM quantizes Channel-FP8 after routing."""
+
+    return bool(
+        getattr(
+            quant_config,
+            "_vllm_hcu_channel_fp8_deepgemm",
+            False,
+        )
+        and quant_config.use_fp8_w8a8
+        and quant_config.is_per_act_token
+        and not quant_config.is_block_quantized
+    )
+
+
 def ht_do_dispatch(
     module,
     self,
@@ -70,14 +85,21 @@ def ht_do_dispatch(
         allocate_on_comm_stream=False,
     )
     token_data = (tokens, token_scales) if has_scales else tokens
+    post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
+        quant_config
+    )
     expert_alignment = (
-        256
-        if (
-            (quant_config.use_int8_w8a8 or quant_config.use_fp8_w8a8)
-            and quant_config.is_per_act_token
-            and not quant_config.is_block_quantized
+        1
+        if post_dispatch_channel_fp8
+        else (
+            256
+            if (
+                (quant_config.use_int8_w8a8 or quant_config.use_fp8_w8a8)
+                and quant_config.is_per_act_token
+                and not quant_config.is_block_quantized
+            )
+            else 1
         )
-        else 1
     )
     (
         token_data,
@@ -95,6 +117,9 @@ def ht_do_dispatch(
         num_tokens_per_expert=dispatch_expert_num_tokens,
         topk_idx=rank_topk_ids,
         topk_weights=rank_topk_weights,
+        # Channel-FP8 DeepGEMM performs its own expert permutation below.
+        # Preserve the aligned tuple-dispatch contract for Channel-INT8 and
+        # every other per-token quantization path.
         expert_alignment=expert_alignment,
         config=self._get_dispatch_config(),
         previous_event=previous_event,
@@ -148,10 +173,16 @@ def ht_receiver(
         expert_num_tokens_per_expert_list,
         device=expert_x.device,
     )
+    post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
+        quant_config
+    )
     if (
-        not quant_config.is_block_quantized
-        and not quant_config.is_per_act_token
-        and not defer_input_quant
+        not defer_input_quant
+        and not quant_config.is_block_quantized
+        and (
+            not quant_config.is_per_act_token
+            or post_dispatch_channel_fp8
+        )
     ):
         expert_x_scale = None
         if expert_x.numel() != 0:
@@ -159,7 +190,7 @@ def ht_receiver(
                 expert_x,
                 a1_scale,
                 quant_dtype=quant_config.quant_dtype,
-                per_act_token_quant=False,
+                per_act_token_quant=quant_config.per_act_token_quant,
                 block_shape=quant_config.block_shape,
                 is_scale_swizzled=quant_config.is_scale_swizzled,
             )
@@ -188,8 +219,17 @@ def ht_prepare_async(
         if topk_ids.size(1) != 1:
             raise ValueError("DeepEP HT apply_router_weight_on_input requires topk=1")
         a1 = a1 * topk_weights.to(a1.dtype)
+    post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
+        quant_config
+    )
     if (
-        (quant_config.is_block_quantized or quant_config.is_per_act_token)
+        (
+            quant_config.is_block_quantized
+            or (
+                quant_config.is_per_act_token
+                and not post_dispatch_channel_fp8
+            )
+        )
         and not defer_input_quant
     ):
         a1q, a1q_scale = module.moe_kernel_quantize_input(

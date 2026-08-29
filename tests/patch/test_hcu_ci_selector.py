@@ -35,6 +35,7 @@ from hcu_ci_preflight import (  # noqa: E402
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
 from compile_changed_python import _compile as compile_python_file  # noqa: E402
 from compile_changed_python import main as compile_changed_python_main  # noqa: E402
+from run_hcu_ci_job import _prepare_evalscope_work_dir  # noqa: E402
 from hcu_ci_register import (  # noqa: E402
     HCURegistry,
     RegistrationError,
@@ -64,6 +65,21 @@ def _contains_pytest_hcu_marker(path: Path) -> bool:
         and node.value.value.id == "pytest"
         for node in ast.walk(tree)
     )
+
+
+def test_ci_job_claims_its_evalscope_artifact_directory(tmp_path: Path) -> None:
+    from tests.integration.server.evalscope_server import (
+        EVALSCOPE_OWNER_MARKER,
+        EVALSCOPE_OWNER_SIGNATURE,
+        _reset_evalscope_artifacts,
+    )
+
+    evalscope_dir = _prepare_evalscope_work_dir(tmp_path / "evalscope")
+
+    assert (evalscope_dir / EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == EVALSCOPE_OWNER_SIGNATURE
+    _reset_evalscope_artifacts(evalscope_dir)
 
 
 def test_selector_configuration_is_valid() -> None:
@@ -554,6 +570,48 @@ def test_deepseek_eval_change_does_not_select_tp_ep() -> None:
     )
     assert {job["registry_job"] for job in jobs} == {"deepseek-gsm8k"}
     assert groups == ["deepseek-evalscope"]
+    assert fallback is False
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_job", "expected_group"),
+    [
+        (
+            "tests/accuracy/test_deepseek_v4_dspark_ops.py",
+            "accuracy-gfx938",
+            "deepseek-v4-dspark-ops",
+        ),
+        (
+            "tests/integration/spec_decode/test_deepseek_v4_flash_dspark.py",
+            "deepseek-v4-dspark-runtime",
+            "deepseek-v4-dspark-runtime-tests",
+        ),
+        (
+            "tests/integration/server/"
+            "test_evalscope_deepseek_v4_dspark_humaneval.py",
+            "deepseek-v4-dspark-humaneval",
+            "deepseek-v4-dspark-eval",
+        ),
+        (
+            "tests/models/deepseek_v4_flash_0731_dspark_humaneval.yaml",
+            "deepseek-v4-dspark-humaneval",
+            "deepseek-v4-dspark-eval",
+        ),
+        (
+            "tests/models/deepseek_v4_flash_0731_int8_dspark_humaneval.yaml",
+            "deepseek-v4-dspark-humaneval",
+            "deepseek-v4-dspark-eval",
+        ),
+    ],
+)
+def test_deepseek_v4_dspark_tests_select_only_their_own_job(
+    path: str,
+    expected_job: str,
+    expected_group: str,
+) -> None:
+    jobs, groups, fallback = select_jobs(_config(), [path])
+    assert {job["registry_job"] for job in jobs} == {expected_job}
+    assert groups == [expected_group]
     assert fallback is False
 
 

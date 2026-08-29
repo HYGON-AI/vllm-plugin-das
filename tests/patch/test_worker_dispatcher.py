@@ -10,7 +10,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -363,14 +363,14 @@ def test_apply_orders_platform_role_sidecar_prepare_and_feature_binding(
 
     def get_config(value: object):
         events.append("sidecar")
-        return worker_dispatcher.HcuFeatureConfig()
+        return worker_dispatcher.HcuFeatureConfig(deepep_auto=True)
 
     monkeypatch.setattr(worker_dispatcher, "get_hcu_config", get_config)
     monkeypatch.setattr(
         worker_dispatcher,
         "_bind_deserialized_hcu_config",
         lambda value: events.append("sidecar-bind")
-        or worker_dispatcher.HcuFeatureConfig(),
+        or worker_dispatcher.HcuFeatureConfig(deepep_auto=True),
     )
     monkeypatch.setattr(
         worker_dispatcher,
@@ -390,7 +390,9 @@ def test_apply_orders_platform_role_sidecar_prepare_and_feature_binding(
     )
     monkeypatch.setattr(worker_dispatcher, "IMPORT_COORDINATOR", FakeCoordinator())
 
-    worker_dispatcher.apply_worker_patches(object())
+    config = SimpleNamespace(parallel_config=SimpleNamespace())
+    worker_dispatcher.apply_worker_patches(config)
+    assert config.parallel_config._vllm_hcu_deepep_auto is True
     assert events == [
         "platform",
         "role:Worker",

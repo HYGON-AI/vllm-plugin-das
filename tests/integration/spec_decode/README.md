@@ -33,3 +33,19 @@ Run only this coverage with:
 ```bash
 python tools/run_patch_tests.py --suite model -k llama2_7b_eagle
 ```
+
+DeepSeek-V4-Flash-0731 Channel-FP8 has three eight-card-node gates: pure
+TP8+DSpark and DP8+EP8+DSpark. The DP profile exposes only
+the standard `--all2all-backend deepep_auto` setting; the plugin selects the
+contiguous high-throughput or masked low-latency DeepEP/DeepGEMM path for each
+forward. PCP+DSpark and prefill/decode disaggregation are intentionally not
+part of these tests.
+
+The default checkpoint is
+`/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8`; override it with
+`VLLM_HCU_DEEPSEEK_V4_FLASH_0731_MODEL`. Run the gates in order:
+
+```bash
+python tools/run_patch_tests.py --suite model -- -k deepseek_v4_flash_dspark_tp8
+python tools/run_patch_tests.py --suite model -- -k deepseek_v4_flash_dspark_dp8_ep8
+```

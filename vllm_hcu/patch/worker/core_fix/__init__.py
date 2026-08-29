@@ -9,7 +9,13 @@ explicit ``apply(module=None)`` convenience entry point.
 
 from . import (
     patch_deepseek_v32_config,
+    patch_deepseek_v4_attention,
+    patch_deepseek_v4_dspark_target,
+    patch_deepseek_v4_load_weights,
+    patch_deepseek_v4_rocm_dspark_metadata,
+    patch_deepseek_v4_rocm_wo_a_layout,
     patch_gpt_oss_mlp_block,
+    patch_mhc_backend,
     patch_qwen3_5_mamba_state_dtype,
     patch_qwen3_vl,
     patch_qwen3_vl_moe,
@@ -17,7 +23,13 @@ from . import (
 
 __all__ = [
     "patch_deepseek_v32_config",
+    "patch_deepseek_v4_attention",
+    "patch_deepseek_v4_dspark_target",
+    "patch_deepseek_v4_load_weights",
+    "patch_deepseek_v4_rocm_dspark_metadata",
+    "patch_deepseek_v4_rocm_wo_a_layout",
     "patch_gpt_oss_mlp_block",
+    "patch_mhc_backend",
     "patch_qwen3_5_mamba_state_dtype",
     "patch_qwen3_vl",
     "patch_qwen3_vl_moe",

@@ -28,6 +28,24 @@ from hcu_ci_register import (
     registrations_for_job,
 )
 
+EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
+EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
+
+
+def _prepare_evalscope_work_dir(path: Path) -> Path:
+    if path.is_symlink():
+        raise PreflightError(
+            f"EvalScope artifact directory must not be a symlink: {path}"
+        )
+    path.mkdir(parents=True, exist_ok=True)
+    marker = path / EVALSCOPE_OWNER_MARKER
+    if marker.is_symlink():
+        raise PreflightError(
+            f"EvalScope ownership marker must not be a symlink: {marker}"
+        )
+    marker.write_text(EVALSCOPE_OWNER_SIGNATURE, encoding="utf-8")
+    return path
+
 
 def _required_environment(name: str) -> str:
     value = os.environ.get(name)
@@ -118,9 +136,8 @@ def main() -> int:
         tested_git_sha = _tested_git_sha()
         job_root.mkdir(parents=True, exist_ok=True)
         integration_dir = job_root / "integration"
-        evalscope_dir = job_root / "evalscope"
+        evalscope_dir = _prepare_evalscope_work_dir(job_root / "evalscope")
         integration_dir.mkdir(parents=True, exist_ok=True)
-        evalscope_dir.mkdir(parents=True, exist_ok=True)
         os.environ["VLLM_HCU_INTEGRATION_LOG_DIR"] = str(integration_dir)
         os.environ["VLLM_HCU_EVAL_WORK_DIR"] = str(evalscope_dir)
 

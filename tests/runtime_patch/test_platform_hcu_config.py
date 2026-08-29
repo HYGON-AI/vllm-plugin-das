@@ -215,6 +215,43 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     assert parsed.all2all_backend == "deepep_auto"
 
 
+def test_dspark_deepep_auto_uses_standard_engine_args_path() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    speculative_config = {
+        "method": "dspark",
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "probabilistic",
+    }
+
+    args = module.EngineArgs(
+        all2all_backend="deepep_auto",
+        speculative_config=speculative_config,
+    )
+
+    assert args.all2all_backend == "deepep_low_latency"
+    assert args.speculative_config == speculative_config
+    assert get_hcu_config(args).deepep_auto is True
+    config = args.create_engine_config()
+    assert config.parallel_config.all2all_backend == "deepep_low_latency"
+    assert get_hcu_config(config).deepep_auto is True
+
+
+def test_omitted_all2all_backend_keeps_official_default_for_dspark() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        speculative_config={
+            "method": "dspark",
+            "num_speculative_tokens": 7,
+        }
+    )
+
+    assert args.all2all_backend == "allgather_reducescatter"
+    assert get_hcu_config(args).deepep_auto is False
+
+
 @pytest.mark.parametrize(
     ("alias", "mode"),
     [
@@ -392,6 +429,7 @@ from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
 patch_engine_args.apply_to_module(arg_utils)
+arg_utils.current_platform.device_type = "cpu"
 
 for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
@@ -613,6 +651,7 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls += 1
             return all2all_backend, data_parallel_size
 
+    module.CUDAGraphMode = SimpleNamespace(NONE=_CUDAGraphMode(piecewise=False))
     module.CompilationConfig = CompilationConfig
     return module
 
@@ -654,6 +693,21 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
 
     config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
+
+
+def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
 
 
 def test_compilation_adapter_defers_to_inductor_unsafe_tags() -> None:
@@ -966,6 +1020,7 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
             decode_context_parallel_size=1,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
+        speculative_config=None,
         kernel_config=SimpleNamespace(moe_backend=feature_config.moe_backend),
         kv_transfer_config=None,
     )
@@ -1018,6 +1073,17 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         ValueError,
         match="deepep_auto.*EPLB.*not supported",
     ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_dspark_rejects_pd_disaggregation_before_model_loading() -> None:
+    config = _validation_config(HcuFeatureConfig())
+    config.speculative_config = SimpleNamespace(method="dspark")
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MooncakeConnector"
+    )
+
+    with pytest.raises(ValueError, match="DSpark.*P/D disaggregation"):
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 

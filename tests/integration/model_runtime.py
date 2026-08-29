@@ -39,6 +39,15 @@ DEFAULT_MODEL_ROOT = Path("/models/llm-models")
 DEFAULT_LOG_DIR = Path("/tmp/vllm-hcu-integration/logs")
 RESULT_PREFIX = "VLLM_HCU_RESULT="
 UNIFIED_ATTENTION_HEAD_DIMS = {128, 192, 256, 512}
+DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG = {
+    "method": "dspark",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "probabilistic",
+}
+DEEPSEEK_V4_DSPARK_TOPOLOGIES = {
+    "tp8": (8, 1),
+    "dp8_ep8": (1, 8),
+}
 
 
 class _DataParallelTermination(BaseException):
@@ -444,6 +453,7 @@ def run_vllm_case(
                     raise AssertionError(
                         f"invalid result payload for {case!r}: {payload}"
                     )
+                parsed["_log_path"] = str(log_path)
                 return parsed
         raise AssertionError(
             f"vLLM integration case {case!r} did not emit {RESULT_PREFIX!r}\n"
@@ -1159,6 +1169,11 @@ def _parallel_config_summary(llm: Any) -> dict[str, Any]:
             "pipeline_parallel_size",
             None,
         ),
+        "prefill_context_parallel_size": getattr(
+            parallel_config,
+            "prefill_context_parallel_size",
+            None,
+        ),
         "data_parallel_size": getattr(
             parallel_config,
             "data_parallel_size",
@@ -1175,6 +1190,103 @@ def _parallel_config_summary(llm: Any) -> dict[str, Any]:
             None,
         ),
         "world_size": getattr(parallel_config, "world_size", None),
+    }
+
+
+def _case_deepseek_v4_dspark(
+    model_path: Path,
+    *,
+    topology: str,
+    gpu_memory_utilization: float,
+) -> dict[str, Any]:
+    try:
+        tensor_parallel_size, data_parallel_size = (
+            DEEPSEEK_V4_DSPARK_TOPOLOGIES[topology]
+        )
+    except KeyError:
+        supported = ", ".join(sorted(DEEPSEEK_V4_DSPARK_TOPOLOGIES))
+        raise ValueError(
+            f"unsupported DeepSeek V4 DSpark topology {topology!r}; "
+            f"expected one of: {supported}"
+        ) from None
+
+    if data_parallel_size > 1:
+        return _case_tp_ep_smoke_data_parallel(
+            model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            all2all_backend="deepep_auto",
+            moe_backend="auto",
+            rank_case="deepseek_v4_dspark",
+        )
+    return _case_deepseek_v4_dspark_rank(
+        model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
+
+
+def _case_deepseek_v4_dspark_rank(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    gpu_memory_utilization: float,
+) -> dict[str, Any]:
+    from vllm import LLM
+
+    parallel_kwargs: dict[str, Any] = {
+        "tensor_parallel_size": tensor_parallel_size,
+        "enable_expert_parallel": data_parallel_size > 1,
+    }
+    if data_parallel_size > 1:
+        parallel_kwargs["all2all_backend"] = "deepep_auto"
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=False,
+            tokenizer_mode="deepseek_v4",
+            kv_cache_dtype="fp8",
+            block_size=256,
+            speculative_config=dict(DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG),
+            max_model_len=4096,
+            max_num_batched_tokens=512,
+            max_num_seqs=8,
+            gpu_memory_utilization=gpu_memory_utilization,
+            **parallel_kwargs,
+        )
+    )
+    try:
+        output = _generate_with_llm(
+            llm,
+            prompts=[
+                "Write one concise sentence explaining why deterministic "
+                "parallel inference is useful."
+            ],
+            max_tokens=16,
+        )
+        parallel_config = _parallel_config_summary(llm)
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "requested_tensor_parallel_size": tensor_parallel_size,
+        "requested_data_parallel_size": data_parallel_size,
+        "requested_all2all_backend": (
+            "deepep_auto" if data_parallel_size > 1 else None
+        ),
+        "requested_enable_expert_parallel": data_parallel_size > 1,
+        "speculative_method": DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG["method"],
+        "draft_token_count": DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG[
+            "num_speculative_tokens"
+        ],
+        "pcp_world_size": parallel_config.get(
+            "prefill_context_parallel_size",
+            1,
+        ),
+        "parallel_config": parallel_config,
+        "output": output,
     }
 
 
@@ -1274,6 +1386,7 @@ def _tp_ep_data_parallel_rank(
     process_group_lock: Any,
     process_group_ready: Any,
     start_gate: Any,
+    rank_case: str = "tp_ep",
 ) -> None:
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -1290,14 +1403,22 @@ def _tp_ep_data_parallel_rank(
     os.environ["VLLM_DP_SIZE"] = str(data_parallel_size)
     os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
     os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
-    result = _case_tp_ep_smoke_rank(
-        model_path,
-        tensor_parallel_size=tensor_parallel_size,
-        data_parallel_size=data_parallel_size,
-        gpu_memory_utilization=gpu_memory_utilization,
-        all2all_backend=all2all_backend,
-        moe_backend=moe_backend,
-    )
+    if rank_case == "deepseek_v4_dspark":
+        result = _case_deepseek_v4_dspark_rank(
+            model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+    else:
+        result = _case_tp_ep_smoke_rank(
+            model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            all2all_backend=all2all_backend,
+            moe_backend=moe_backend,
+        )
     result_queue.put((local_dp_rank, result))
 
 
@@ -1309,6 +1430,7 @@ def _case_tp_ep_smoke_data_parallel(
     gpu_memory_utilization: float,
     all2all_backend: str | None,
     moe_backend: str,
+    rank_case: str = "tp_ep",
 ) -> dict[str, Any]:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -1338,6 +1460,7 @@ def _case_tp_ep_smoke_data_parallel(
                 process_group_lock,
                 process_group_ready[rank],
                 start_gate,
+                rank_case,
             ),
         )
         for rank in range(data_parallel_size)
@@ -1471,6 +1594,7 @@ def _main(argv: list[str] | None = None) -> int:
             "reranker-smoke",
             "vl-image-smoke",
             "tp-ep-smoke",
+            "deepseek-v4-dspark-smoke",
         ),
     )
     parser.add_argument("--model", required=True, type=Path)
@@ -1482,6 +1606,11 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--all2all-backend", default=None)
     parser.add_argument("--moe-backend", default="auto")
+    parser.add_argument(
+        "--topology",
+        choices=("tp8", "dp8_ep8"),
+        default="tp8",
+    )
     args = parser.parse_args(argv)
 
     if args.case == "smoke":
@@ -1518,7 +1647,7 @@ def _main(argv: list[str] | None = None) -> int:
         payload = _case_reranker_smoke(args.model)
     elif args.case == "vl-image-smoke":
         payload = _case_vl_image_smoke(args.model)
-    else:
+    elif args.case == "tp-ep-smoke":
         payload = _case_tp_ep_smoke(
             args.model,
             tensor_parallel_size=args.tensor_parallel_size,
@@ -1526,6 +1655,12 @@ def _main(argv: list[str] | None = None) -> int:
             gpu_memory_utilization=args.gpu_memory_utilization,
             all2all_backend=args.all2all_backend,
             moe_backend=args.moe_backend,
+        )
+    else:
+        payload = _case_deepseek_v4_dspark(
+            args.model,
+            topology=args.topology,
+            gpu_memory_utilization=args.gpu_memory_utilization,
         )
     print(RESULT_PREFIX + json.dumps(payload, sort_keys=True))
     return 0

@@ -114,8 +114,11 @@ def apply_to_module(module: ModuleType) -> bool:
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is None or not get_hcu_config(vllm_config).deepep_auto:
             return
+        # CudaCommunicator is constructed for DP/TP/PP as well as EP groups.
+        # ``deepep_auto`` owns only the official EP all-to-all communicator;
+        # the other groups must retain their normal collective managers.
         if not getattr(self, "use_all2all", False):
-            raise RuntimeError("deepep_auto requires an active all-to-all group")
+            return
         from vllm.distributed.device_communicators.all2all import (
             DeepEPAutoAll2AllManager,
         )

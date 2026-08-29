@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
-from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
 
 from ._common import (
     PatchCompatibilityError,
@@ -36,6 +36,28 @@ def _sidecar_config(config):
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         vllm_config = getattr(config, "_hcu_vllm_config", None)
+    if vllm_config is None:
+        parallel_config = getattr(config, "moe_parallel_config", None)
+        deepep_auto = bool(
+            getattr(parallel_config, "all2all_backend", None)
+            == "deepep_auto"
+            or getattr(parallel_config, "use_deepep_auto_kernels", False)
+        )
+        official_backend = getattr(config, "moe_backend", "auto")
+        # The HCU sidecar owns only auto/deep_gemm. Official-only choices
+        # such as triton and aiter must remain on FusedMoEConfig so the
+        # selector below can delegate them without validating them as HCU
+        # configuration. Keep the deprecated HCU alias here so its existing
+        # normalization and warning remain intact.
+        hcu_backend = (
+            official_backend
+            if official_backend in ("auto", "deep_gemm", "dpsk_deep_gemm")
+            else "auto"
+        )
+        return HcuFeatureConfig(
+            deepep_auto=deepep_auto,
+            moe_backend=hcu_backend,
+        )
     return get_hcu_config(vllm_config)
 
 
@@ -160,13 +182,30 @@ def apply_to_module(module: ModuleType) -> bool:
             )
 
             return hcu_enum.HCU_DEEPGEMM, DeepEPDeepGemmContiguousExperts
-        if sidecar.moe_backend != "deep_gemm":
+        if sidecar.moe_backend == "auto":
+            if (
+                getattr(config, "moe_backend", "auto") != "auto"
+                or not is_channel_fp8
+            ):
+                # Preserve vLLM's complete priority list for explicit public
+                # requests and every quantization scheme not owned here.
+                return select_backend(
+                    config,
+                    weight_key,
+                    activation_key,
+                    allow_vllm_cutlass,
+                )
+            # vLLM's ordinary auto oracle can select its DeepGEMM experts for
+            # Channel-FP8, but those experts reject per-output-channel scales.
+            # Select the HCU-compatible implementation without requiring the
+            # user to add a non-official MoE compute flag.
+        elif sidecar.moe_backend != "deep_gemm":
             return select_backend(config, weight_key, activation_key, allow_vllm_cutlass)
-        if getattr(config, "moe_backend", "auto") != "deep_gemm":
+        elif getattr(config, "moe_backend", "auto") != sidecar.moe_backend:
             raise ValueError(
-                "HCU sidecar selects deep_gemm but official FusedMoEConfig "
-                f"selects {config.moe_backend!r}; official backend must match "
-                "'deep_gemm'"
+                "HCU sidecar and official FusedMoEConfig select different "
+                f"MoE backends ({sidecar.moe_backend!r} != "
+                f"{config.moe_backend!r})"
             )
         if not is_channel_fp8:
             # Preserve the official DEEPGEMM/BATCHED_DEEPGEMM selection for
@@ -195,7 +234,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 return hcu_enum.HCU_DEEPGEMM, kernel_cls
             reasons.append(f"{kernel_cls.__name__}: {reason or 'unsupported'}")
         raise ValueError(
-            "deep_gemm is required by HCU sidecar but does not support "
+            f"{sidecar.moe_backend} HCU Channel-FP8 selection does not support "
             "this MoE configuration: " + "; ".join(reasons)
         )
 
@@ -238,11 +277,25 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
         layer=None,
     ):
+        if fp8_backend == hcu_enum.HCU_DEEPGEMM:
+            # Scope the post-dispatch quantization ABI to the selected HCU
+            # Channel-FP8 backend. Channel-INT8 and official FP8 kernels keep
+            # their existing DeepEP dispatch behavior.
+            setattr(
+                moe_quant_config,
+                "_vllm_hcu_channel_fp8_deepgemm",
+                True,
+            )
         if getattr(
             moe_config.moe_parallel_config,
             "use_deepep_auto_kernels",
             False,
         ):
+            logger = getattr(target, "logger", None)
+            if logger is not None:
+                logger.info_once(
+                    "HCU FP8 oracle is constructing the unified DeepEP auto kernel."
+                )
             if fp8_backend != hcu_enum.HCU_DEEPGEMM:
                 raise ValueError(
                     "deepep_auto currently supports only the "

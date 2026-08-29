@@ -28,6 +28,11 @@ register_hcu_ci(
     target="tests/accuracy/test_aiter_silu_and_mul.py",
     est_time=300,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_deepseek_v4_dspark_ops.py",
+    est_time=60,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -244,6 +249,19 @@ register_hcu_ci(
     job="glm52-pcp",
     target="tests/integration/server/test_evalscope_glm52_pcp_humaneval.py",
     est_time=14400,
+)
+register_hcu_ci(
+    job="deepseek-v4-dspark-runtime",
+    target="tests/integration/spec_decode/test_deepseek_v4_flash_dspark.py",
+    est_time=21600,
+)
+register_hcu_ci(
+    job="deepseek-v4-dspark-humaneval",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_deepseek_v4_dspark_humaneval.py"
+    ),
+    est_time=21600,
 )
 register_hcu_ci(
     job="single-node-topology",
