@@ -99,7 +99,7 @@ def test_setup_version_query_keeps_provenance_without_rewriting_source(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"0.25.1+das.{sha}.dtk2604" in result.stdout
+    assert f"0.28.0+das.{sha}.dtk2604" in result.stdout
     assert hashlib.sha256(version_file.read_bytes()).hexdigest() == before
 
 

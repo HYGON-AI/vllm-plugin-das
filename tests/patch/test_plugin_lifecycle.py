@@ -434,44 +434,13 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     )
 
 
-@pytest.mark.parametrize(
-    ("use_v2", "expected_module", "expected_class"),
-    [
-        (True, "vllm_hcu.v1.hcu_model_runner_v2", "HcuGPUModelRunnerV2"),
-        (False, "vllm_hcu.v1.hcu_model_runner", "GPUModelRunner"),
-    ],
-)
-def test_worker_selects_plugin_owned_model_runner(
-    monkeypatch,
+def test_worker_delegates_model_runner_selection_to_target(
     cpu_safe_hcu_worker_module,
-    use_v2,
-    expected_module,
-    expected_class,
 ):
-    events: list[tuple[object, object]] = []
-    runner_module = ModuleType(expected_module)
+    worker = cpu_safe_hcu_worker_module.HcuGPUWorker
 
-    class Runner:
-        def __init__(self, config, device):
-            events.append((config, device))
-
-    setattr(runner_module, expected_class, Runner)
-    installed: list[object] = []
-    if use_v2:
-        runner_module.install_fixed_width_pp_sample_broadcast = installed.append
-    monkeypatch.setitem(sys.modules, expected_module, runner_module)
-    config = object()
-    device = object()
-
-    result = cpu_safe_hcu_worker_module._create_model_runner(
-        config,
-        device,
-        use_v2_model_runner=use_v2,
-    )
-
-    assert isinstance(result, Runner)
-    assert events == [(config, device)]
-    assert installed == ([result] if use_v2 else [])
+    assert not hasattr(cpu_safe_hcu_worker_module, "_create_model_runner")
+    assert "compile_or_warm_up_model" not in worker.__dict__
 
 
 def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
@@ -616,19 +585,11 @@ def test_hcu_topology_direct_links_preserve_success(monkeypatch):
     assert events == ["init", ("zero", "two"), "cleanup"]
 
 
-def test_hcu_device_discovery_hides_backend_error(monkeypatch):
-    import vllm_hcu.platforms.hcu as hcu_module
+def test_hcu_device_discovery_is_target_rocm_owned():
+    from vllm.platforms.rocm import RocmPlatform
+    from vllm_hcu.platforms.hcu import HCUPlatform
 
-    monkeypatch.setattr(hcu_module.torch.cuda, "_is_compiled", lambda: True)
-    monkeypatch.setattr(
-        hcu_module.torch.cuda,
-        "_device_count_amdsmi",
-        lambda: (_ for _ in ()).throw(RuntimeError("private backend detail")),
-    )
-    hcu_module._rocm_device_count_stateless.cache_clear()
-
-    with pytest.raises(RuntimeError, match="^HCU device discovery failed\\.$"):
-        hcu_module._rocm_device_count_stateless(None)
+    assert HCUPlatform.device_count.__func__ is RocmPlatform.device_count.__func__
 
 
 def test_platform_defaults_prearm_worker_before_aiter_import(monkeypatch):
