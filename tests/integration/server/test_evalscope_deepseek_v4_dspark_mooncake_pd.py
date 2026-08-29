@@ -89,6 +89,8 @@ def test_deepseek_v4_dspark_mooncake_pd_command_contract(
     assert commands.decode_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "18999"
     assert commands.prefill_env["VLLM_DP_MASTER_PORT"] == "29561"
     assert commands.decode_env["VLLM_DP_MASTER_PORT"] == "29562"
+    assert _option_value(commands.prefill, "--max-num-batched-tokens") == "512"
+    assert _option_value(commands.decode, "--max-num-batched-tokens") == "64"
 
     for command in (commands.prefill, commands.decode):
         assert _option_value(command, "--served-model-name") == served_model_name

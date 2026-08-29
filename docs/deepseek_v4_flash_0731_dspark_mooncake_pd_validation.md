@@ -95,7 +95,7 @@ vllm serve "$MODEL" \
   --tokenizer-mode deepseek_v4 \
   --distributed-executor-backend mp \
   --max-model-len 4096 \
-  --max-num-batched-tokens 512 \
+  --max-num-batched-tokens 64 \
   --max-num-seqs 8 \
   --gpu-memory-utilization 0.9 \
   --tensor-parallel-size 1 \
@@ -108,6 +108,11 @@ vllm serve "$MODEL" \
   --port 10142 \
   --data-parallel-rpc-port 29552
 ```
+
+The decode pool uses 64 batched tokens because DeepEP LL capacity is
+`max_num_seqs * (1 + num_speculative_tokens)` (8 * 8). This also keeps the
+vLLM startup profiling forward inside the same validated LL dispatch capacity;
+it is a standard vLLM scheduler option, not a public HT/LL backend switch.
 
 ## Official Mooncake proxy
 
