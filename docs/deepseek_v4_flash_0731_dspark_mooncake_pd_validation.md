@@ -176,12 +176,11 @@ removes only those fences and re-executes every completion.
 
 | Checkpoint | Raw accuracy | Normalized | Avg TTFT | Throughput | DSpark draft / accepted |
 |---|---:|---:|---:|---:|---:|
-| Channel-FP8 W8A8 | 30/32 (0.9375) | 32/32 (1.0000) | 984.2 ms | 32.28 tok/s | 4165 / 3185 |
+| Channel-FP8 W8A8 | 30/32 (0.9375) | 32/32 (1.0000) | 1002.6 ms | 32.23 tok/s | 4165 / 3185 |
 | Channel-INT8 W8A8 | 30/32 (0.9375) | 32/32 (1.0000) | 956 ms | 32.86 tok/s | 4088 / 3169 |
 
 Both runs recorded 32 producer send completions and 32 consumer receive
 completions, the producer-only contiguous HT markers, the consumer-only masked
-LL markers, and no known Mooncake or DP collective failures. The INT8 complete
-acceptance test exited with `1 passed in 583.06s`; the FP8 artifacts were
-independently rechecked against the same final runtime-evidence and accuracy
-gates after the evidence matcher was aligned to the official scheduler logs.
+LL markers, and no known Mooncake or DP collective failures. The complete FP8
+and INT8 acceptance tests exited with `1 passed in 611.94s` and
+`1 passed in 583.06s`, respectively.
