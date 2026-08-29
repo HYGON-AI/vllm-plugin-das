@@ -2,53 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
-import os
-import gc
+"""Narrow HCU Worker adapter around the official vLLM v0.28 Worker."""
+
 import torch
-import math
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
-from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
-from vllm.utils.torch_utils import set_random_seed
-from vllm.utils.mem_utils import MemorySnapshot, format_gib
-from vllm.config import VllmConfig, CacheConfig
-from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
-from vllm.v1.worker.workspace import init_workspace_manager
-from vllm.v1.worker.utils import request_memory
-
-logger = init_logger(__name__)
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-
-def _create_model_runner(
-    vllm_config: VllmConfig,
-    device: torch.device,
-    *,
-    use_v2_model_runner: bool,
-):
-    if use_v2_model_runner:
-        from vllm_hcu.v1.hcu_model_runner_v2 import (
-            HcuGPUModelRunnerV2,
-            install_fixed_width_pp_sample_broadcast,
-        )
-
-        runner = HcuGPUModelRunnerV2(vllm_config, device)
-        install_fixed_width_pp_sample_broadcast(runner)
-        return runner
-
-    from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
-
-    return GPUModelRunner(vllm_config, device)
+from vllm.config import VllmConfig
+from vllm.v1.worker.gpu_worker import Worker
 
 
 class HcuGPUWorker(Worker):
-    """A worker class that executes (a partition of) the model on a HCU.
-    Each worker is associated with a single HCU. In case of
-    distributed inference, each worker is assigned a partition of the model.
-    """
+    """Arm HCU callbacks while retaining the target Worker lifecycle."""
 
     def __init__(
         self,
@@ -58,7 +20,7 @@ class HcuGPUWorker(Worker):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        # Worker callbacks must be armed against the deserialised config before
+        # Worker callbacks must be armed against the deserialized config before
         # the parent constructor imports model runners or custom operators.
         from vllm_hcu.patch.runtime_state import set_process_role
         from vllm_hcu.patch.worker import apply_worker_patches
@@ -74,118 +36,25 @@ class HcuGPUWorker(Worker):
         )
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        """Load the model, then require every enabled patch chain to be live."""
+        """Load via target Worker, then prove every enabled patch is live."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
 
         validate_worker_patches(require_applied=True)
 
-    def compile_or_warm_up_model(self):
-        if (
-            self.use_v2_model_runner
-            and self.parallel_config.pipeline_parallel_size > 1
-            and self.vllm_config.speculative_config is not None
-        ):
-            from vllm_hcu.v1.worker_framework_runtime import (
-                suppress_pp_v2_warmup_sample_broadcast,
-            )
-
-            with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
-                return super().compile_or_warm_up_model()
-        return super().compile_or_warm_up_model()
-
     def init_device(self):
-        if self.device_config.device_type == "cuda":
-            # This env var set by Ray causes exceptions with graph building.
-            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-            parallel_config = self.parallel_config
-            if (
-                parallel_config.distributed_executor_backend
-                not in ("ray", "external_launcher")
-                and parallel_config.data_parallel_backend != "ray"
-                and parallel_config.nnodes_within_dp == 1
-            ):
-                # Use local DP rank if available, otherwise use global DP rank.
-                dp_local_rank = self.parallel_config.data_parallel_rank_local
-                if dp_local_rank is None:
-                    dp_local_rank = self.parallel_config.data_parallel_index
+        """Install the HCU split-group shim, then delegate to target v0.28."""
 
-                tp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size
-                    * self.parallel_config.tensor_parallel_size
-                )
+        from vllm import envs
 
-                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
-                self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.accelerator.device_count(), (
-                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
-                )
-                visible_device_count = (
-                    torch.accelerator.device_count() if torch.cuda.is_available() else 0
-                )
-                assert self.parallel_config.local_world_size <= visible_device_count, (
-                    f"local_world_size ({self.parallel_config.local_world_size}) must "
-                    f"be less than or equal to the number of visible devices "
-                    f"({visible_device_count})."
-                )
-
-            self.device = torch.device(f"cuda:{self.local_rank}")
-            torch.accelerator.set_device_index(self.device)
-
-            current_platform.check_if_supports_dtype(self.model_config.dtype)
-
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
-            from vllm import envs
-
-            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
-                from vllm_hcu.v1.worker_framework_runtime import (
-                    install_split_group_backend_compat,
-                )
-
-                install_split_group_backend_compat(torch.distributed)
-            init_worker_distributed_environment(
-                self.vllm_config,
-                self.rank,
-                self.distributed_init_method,
-                self.local_rank,
-                current_platform.dist_backend,
+        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+            from vllm_hcu.v1.worker_framework_runtime import (
+                install_split_group_backend_compat,
             )
 
-            if self.use_v2_model_runner:
-                logger.info_once("Using V2 Model Runner", scope="local")
+            install_split_group_backend_compat(torch.distributed)
+        return super().init_device()
 
-            # Set random seed.
-            set_random_seed(self.model_config.seed)
 
-            # Now take memory snapshot after NCCL is initialized
-            gc.collect()
-            torch.accelerator.empty_cache()
-
-            # take current memory snapshot
-            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
-            logger.debug("worker init memory snapshot: %r", self.init_snapshot)
-            logger.debug(
-                "worker requested memory: %sGiB", format_gib(self.requested_memory)
-            )
-        else:
-            raise RuntimeError(f"Not support device type: {self.device_config.device}")
-
-        # Initialize workspace manager
-        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
-
-        # Construct the model runner
-        self.model_runner: GPUModelRunner = _create_model_runner(  # type: ignore
-            self.vllm_config,
-            self.device,
-            use_v2_model_runner=self.use_v2_model_runner,
-        )
-
-        if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
-            report_usage_stats(self.vllm_config)
+__all__ = ["HcuGPUWorker"]
