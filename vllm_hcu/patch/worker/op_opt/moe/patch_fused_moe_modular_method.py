@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Pass HCU kernel dimensions and pre-quantized inputs through modular MoE."""
+"""Pass HCU pre-quantized inputs through target-owned v0.28 modular MoE."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from ._common import load_exact_module, require_callable, require_class, require
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.fused_moe_modular_method"
 PATCH_ID = "worker.op_opt.moe.fused_moe_modular_method"
 TARGETS = (
-    f"{TARGET_MODULE}.FusedMoEModularMethod.make",
     f"{TARGET_MODULE}.FusedMoEModularMethod.apply",
 )
 _MARKER = "_vllm_hcu_modular_method_applied"
@@ -23,35 +22,15 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(target, _MARKER, False):
         return False
     cls = require_class(target, "FusedMoEModularMethod", TARGETS[0].rsplit(".", 1)[0])
-    make = require_callable(cls, "make", TARGETS[0])
-    method_apply = require_callable(cls, "apply", TARGETS[1])
-    require_parameter_names(
-        make,
-        TARGETS[0],
-        (
-            "routed_experts",
-            "old_quant_method",
-            "prepare_finalize",
-        ),
-    )
+    method_apply = require_callable(cls, "apply", TARGETS[0])
     require_parameter_names(
         method_apply,
-        TARGETS[1],
+        TARGETS[0],
         (
             "self", "layer", "x", "topk_weights", "topk_ids",
             "shared_experts", "shared_experts_input",
         ),
     )
-
-    @functools.wraps(make)
-    def hcu_make(routed_experts, old_quant_method, prepare_finalize):
-        kernel = target.FusedMoEKernel(
-            prepare_finalize,
-            old_quant_method.select_gemm_impl(prepare_finalize, routed_experts),
-            N=getattr(old_quant_method, "N", -1),
-            K=getattr(old_quant_method, "K", -1),
-        )
-        return cls(old_quant_method, kernel)
 
     @functools.wraps(method_apply)
     def hcu_apply(
@@ -90,8 +69,6 @@ def apply_to_module(module: ModuleType) -> bool:
 
     del hcu_apply.__wrapped__
 
-    cls._vllm_hcu_original_make = make
-    cls.make = staticmethod(hcu_make)
     cls._vllm_hcu_original_apply = method_apply
     cls.apply = hcu_apply
     setattr(target, _MARKER, True)

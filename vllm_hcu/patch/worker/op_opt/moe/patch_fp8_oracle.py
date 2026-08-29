@@ -83,7 +83,6 @@ def apply_to_module(module: ModuleType) -> bool:
             "experts_cls",
             "fp8_backend",
             "routing_tables",
-            "layer",
         ),
     )
     values = {member.name: member.value for member in old_enum}
@@ -204,7 +203,6 @@ def apply_to_module(module: ModuleType) -> bool:
         experts_cls,
         fp8_backend,
         routing_tables=None,
-        layer=None,
     ):
         if getattr(
             moe_config.moe_parallel_config,
@@ -231,7 +229,6 @@ def apply_to_module(module: ModuleType) -> bool:
             experts_cls,
             fp8_backend,
             routing_tables,
-            layer,
         )
 
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls

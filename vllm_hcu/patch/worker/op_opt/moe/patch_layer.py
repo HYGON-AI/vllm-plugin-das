@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Wire HCU-owned MoE capabilities into the v0.25.1 factory pipeline."""
+"""Wire HCU-owned MoE capabilities into the v0.28 factory pipeline."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from ._common import load_exact_module, require_callable, require_class, require
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.layer"
 PATCH_ID = "worker.op_opt.moe.layer"
 TARGETS = (
-    f"{TARGET_MODULE}.FusedMoE",
+    f"{TARGET_MODULE}.FusedMoEFactory",
     f"{TARGET_MODULE}.RoutedExperts.get_expert_weights",
 )
 _MARKER = "_vllm_hcu_moe_layer_applied"
@@ -22,7 +22,7 @@ def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if getattr(target, _MARKER, False):
         return False
-    factory = require_callable(target, "FusedMoE", TARGETS[0])
+    factory = require_callable(target, "FusedMoEFactory", TARGETS[0])
     routed_experts_cls = require_class(
         target, "RoutedExperts", f"{TARGET_MODULE}.RoutedExperts"
     )
@@ -38,10 +38,12 @@ def apply_to_module(module: ModuleType) -> bool:
             "num_expert_group", "topk_group", "quant_config", "tp_size", "dp_size",
             "pcp_size", "prefix", "custom_routing_function", "router",
             "scoring_func", "routed_scaling_factor", "swiglu_limit",
-            "swiglu_alpha", "swiglu_beta", "e_score_correction_bias",
+            "swiglu_alpha", "swiglu_beta", "activation_situ_beta",
+            "activation_situ_linear_beta", "e_score_correction_bias",
             "apply_router_weight_on_input", "activation", "enable_eplb",
             "num_redundant_experts", "has_bias", "is_sequence_parallel",
-            "reduce_results", "ckpt_names", "n_shared_experts", "router_logits_dtype",
+            "reduce_results", "ckpt_names", "is_fused_checkpoint_transposed",
+            "n_shared_experts", "router_logits_dtype",
             "gate", "shared_experts", "shared_expert_gate", "routed_input_transform",
             "routed_output_transform", "apply_routed_scale_to_output",
             "zero_expert_type", "hash_indices_table", "runner_cls", "runner_args",
@@ -87,7 +89,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return get_weights(self)
 
     target._vllm_hcu_original_fused_moe_factory = factory
-    target.FusedMoE = hcu_factory
+    target.FusedMoEFactory = hcu_factory
     routed_experts_cls._vllm_hcu_original_get_expert_weights = get_weights
     routed_experts_cls.get_expert_weights = hcu_get_expert_weights
     setattr(target, _MARKER, True)

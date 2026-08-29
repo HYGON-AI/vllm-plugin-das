@@ -487,12 +487,12 @@ def test_aiter_and_triton_expert_capability_contract(
             """
             def rocm_aiter_fused_experts(
                 hidden_states, w1, w2, topk_weights, topk_ids, moe_config,
-                activation, apply_router_weight_on_input, expert_map,
+                activation, apply_router_weight_on_input, expert_mask,
                 quant_config, a1q_scale, num_local_tokens, output_dtype,
                 moe_sorting_dispatch_policy=0,
             ):
                 del hidden_states, w1, w2, topk_weights, topk_ids, moe_config
-                del apply_router_weight_on_input, expert_map, quant_config
+                del apply_router_weight_on_input, expert_mask, quant_config
                 del a1q_scale, num_local_tokens, output_dtype
                 del moe_sorting_dispatch_policy
                 if activation == MoEActivation.SILU:
@@ -782,7 +782,7 @@ def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
     assert calls["moe"]["use_weight_shuffle"] is False
 
 
-def test_modular_method_dimensions_and_prequant_contract():
+def test_modular_method_v028_target_factory_and_prequant_contract():
     class FusedMoEKernel:
         last = None
 
@@ -816,15 +816,6 @@ def test_modular_method_dimensions_and_prequant_contract():
             self.moe_kernel = moe_kernel
             self.disable_expert_map = False
 
-        @staticmethod
-        def make(
-            routed_experts,
-            old_quant_method,
-            prepare_finalize,
-        ):
-            del routed_experts, old_quant_method, prepare_finalize
-            return None
-
         def apply(
             self,
             layer,
@@ -839,19 +830,14 @@ def test_modular_method_dimensions_and_prequant_contract():
 
     module = _module(
         patch_fused_moe_modular_method.TARGET_MODULE,
-        FusedMoEKernel=FusedMoEKernel,
         FusedMoEModularMethod=FusedMoEModularMethod,
     )
     assert patch_fused_moe_modular_method.apply_to_module(module) is True
-    old_method = SimpleNamespace(
-        N=32,
-        K=64,
-        select_gemm_impl=lambda prepare, layer: (prepare, layer),
-    )
-    method = FusedMoEModularMethod.make("layer", old_method, "prepare")
-    assert FusedMoEKernel.last.arguments == (
-        "prepare", ("prepare", "layer"), None, False, 32, 64,
-    )
+    old_method = SimpleNamespace()
+    kernel = FusedMoEKernel("prepare", "experts")
+    method = FusedMoEModularMethod(old_method, kernel)
+    assert FusedMoEKernel.last is kernel
+    assert not hasattr(FusedMoEModularMethod, "make")
     layer = SimpleNamespace(
         w13_weight="w1",
         w2_weight="w2",
@@ -988,9 +974,11 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "num_expert_group", "topk_group", "quant_config", "tp_size", "dp_size",
         "pcp_size", "prefix", "custom_routing_function", "router", "scoring_func",
         "routed_scaling_factor", "swiglu_limit", "swiglu_alpha", "swiglu_beta",
+        "activation_situ_beta", "activation_situ_linear_beta",
         "e_score_correction_bias", "apply_router_weight_on_input", "activation",
         "enable_eplb", "num_redundant_experts", "has_bias",
-        "is_sequence_parallel", "reduce_results", "ckpt_names", "n_shared_experts",
+        "is_sequence_parallel", "reduce_results", "ckpt_names",
+        "is_fused_checkpoint_transposed", "n_shared_experts",
         "router_logits_dtype", "gate", "shared_experts", "shared_expert_gate",
         "routed_input_transform", "routed_output_transform",
         "apply_routed_scale_to_output", "zero_expert_type", "hash_indices_table",
@@ -1029,7 +1017,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         Runner=Runner,
     )
     source = (
-        "def FusedMoE("
+        "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
         + "):\n    return Runner()\n"
     )
@@ -1051,7 +1039,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     monkeypatch.setitem(sys.modules, hcu_module_name, hcu_module)
 
     assert patch_layer.apply_to_module(module) is True
-    runner = module.FusedMoE()
+    runner = module.FusedMoEFactory()
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
@@ -1283,7 +1271,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         experts_cls,
         fp8_backend,
         routing_tables=None,
-        layer=None,
     ):
         del (
             moe_quant_config,
@@ -1291,7 +1278,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
             experts_cls,
             fp8_backend,
             routing_tables,
-            layer,
         )
         return "official-kernel"
 
@@ -1397,7 +1383,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         SupportedExperts,
         backend,
         "routing",
-        "layer",
     ) == "official-kernel"
 
     monkeypatch.setattr(
@@ -1423,7 +1408,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         auto_experts,
         auto_backend,
         "routing",
-        "layer",
     ) == "deepep-auto-kernel"
     assert auto_kernel_calls == [("quant", auto_config, "routing")]
     with pytest.raises(ValueError, match="only the HCU DPSK_DEEPGEMM"):
