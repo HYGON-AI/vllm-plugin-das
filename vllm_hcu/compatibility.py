@@ -127,14 +127,35 @@ def inspect_vllm_compatibility() -> VllmCompatibility:
     )
 
 
-def ensure_vllm_compatible() -> VllmCompatibility:
-    """Return compatibility details or fail before runtime patch mutation."""
+def ensure_vllm_compatible(
+    *,
+    check_target_api: bool = True,
+) -> VllmCompatibility:
+    """Fail before mutation unless release and target API contracts match.
+
+    check_target_api=False is reserved for metadata-only diagnostics and unit
+    tests that intentionally provide a synthetic distribution.
+    """
 
     result = inspect_vllm_compatibility()
     if not result.compatible:
         raise VllmCompatibilityError(
             f"vLLM compatibility check failed: {result.detail()}"
         )
+    if check_target_api:
+        if result.vllm_location is None:
+            raise VllmCompatibilityError(
+                "vLLM target API fingerprint failed: distribution location "
+                "is unavailable"
+            )
+        from vllm_hcu.target_api import inspect_target_api
+
+        mismatches = inspect_target_api(result.vllm_location)
+        if mismatches:
+            details = "\n- ".join(mismatches)
+            raise VllmCompatibilityError(
+                "vLLM target API fingerprint failed:\n- " + details
+            )
     return result
 
 
