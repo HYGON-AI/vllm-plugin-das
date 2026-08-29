@@ -161,8 +161,8 @@ pytest -q -s \
 The acceptance gate requires exactly 32 predictions and reviews, normalized
 HumanEval accuracy and pass@1 of 32/32, successful official Mooncake KV
 send/receive completion events, both contiguous HT and masked LL
-DeepEP/DeepGEMM markers, no known
-Mooncake transfer failure, and positive DSpark draft and accepted token totals.
+DeepEP/DeepGEMM markers, no known Mooncake transfer failure, and positive
+DSpark draft and accepted token totals.
 `VLLM_V0251_SOURCE_ROOT` locates only the official proxy script. Do not add that
 source tree to `PYTHONPATH`: doing so hides the compiled extensions in the
 installed vLLM 0.25.1 wheel.
