@@ -21,6 +21,7 @@ from tests.integration.server.evalscope_server import (
     _assert_pass_criteria,
     _direct_urlopen,
     _open_log,
+    _owned_process_environment,
     _require_runtime,
     _reset_evalscope_artifacts,
     _server_environment,
@@ -333,6 +334,9 @@ def run_evalscope_pd_server_test(
     prefill_proc: subprocess.Popen | None = None
     decode_proc: subprocess.Popen | None = None
     proxy_proc: subprocess.Popen | None = None
+    prefill_owner: str | None = None
+    decode_owner: str | None = None
+    proxy_owner: str | None = None
     prefill_log = _open_log(prefill_log_path)
     decode_log = None
     proxy_log = None
@@ -341,10 +345,13 @@ def run_evalscope_pd_server_test(
             ("prefill command: " + " ".join(commands.prefill) + "\n").encode()
         )
         prefill_log.flush()
+        prefill_env, prefill_owner = _owned_process_environment(
+            commands.prefill_env
+        )
         prefill_proc = subprocess.Popen(
             commands.prefill,
             cwd=ROOT,
-            env=commands.prefill_env,
+            env=prefill_env,
             stdout=prefill_log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -360,10 +367,11 @@ def run_evalscope_pd_server_test(
             ("decode command: " + " ".join(commands.decode) + "\n").encode()
         )
         decode_log.flush()
+        decode_env, decode_owner = _owned_process_environment(commands.decode_env)
         decode_proc = subprocess.Popen(
             commands.decode,
             cwd=ROOT,
-            env=commands.decode_env,
+            env=decode_env,
             stdout=decode_log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -379,10 +387,11 @@ def run_evalscope_pd_server_test(
             ("proxy command: " + " ".join(commands.proxy) + "\n").encode()
         )
         proxy_log.flush()
+        proxy_env, proxy_owner = _owned_process_environment(commands.proxy_env)
         proxy_proc = subprocess.Popen(
             commands.proxy,
             cwd=ROOT,
-            env=commands.proxy_env,
+            env=proxy_env,
             stdout=proxy_log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -443,9 +452,17 @@ def run_evalscope_pd_server_test(
             decode_metrics,
         )
     finally:
-        for proc in (proxy_proc, decode_proc, prefill_proc):
+        for proc, owner_token in (
+            (proxy_proc, proxy_owner),
+            (decode_proc, decode_owner),
+            (prefill_proc, prefill_owner),
+        ):
             if proc is not None:
-                _terminate_process_group(proc, commands.shutdown_timeout_s)
+                _terminate_process_group(
+                    proc,
+                    commands.shutdown_timeout_s,
+                    owner_token=owner_token,
+                )
         if proxy_log is not None:
             proxy_log.close()
         if decode_log is not None:

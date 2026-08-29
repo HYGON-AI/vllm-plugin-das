@@ -289,7 +289,13 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
         events.append("metrics:decode")
         return DSPARK_METRICS
 
-    def fake_stop(proc: FakeProcess, _timeout_s: int) -> None:
+    def fake_stop(
+        proc: FakeProcess,
+        _timeout_s: int,
+        *,
+        owner_token: str | None = None,
+    ) -> None:
+        assert owner_token
         events.append(f"stop:{proc.label}")
 
     def fake_evidence(

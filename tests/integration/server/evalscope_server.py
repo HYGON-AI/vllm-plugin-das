@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[3]
 EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
 EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
 EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
+EVALSCOPE_PROCESS_OWNER_ENV = "VLLM_HCU_EVAL_PROCESS_OWNER"
 _DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
@@ -240,13 +242,38 @@ def _wait_for_server(proc: subprocess.Popen, url: str, timeout_s: int) -> None:
     raise TimeoutError(f"vLLM server did not become ready at {url}: {last_error}")
 
 
-def _terminate_process_group(proc: subprocess.Popen, timeout_s: int) -> None:
+def _owned_process_environment(
+    env: dict[str, str],
+) -> tuple[dict[str, str], str]:
+    owner_token = uuid.uuid4().hex
+    owned_env = env.copy()
+    owned_env[EVALSCOPE_PROCESS_OWNER_ENV] = owner_token
+    return owned_env, owner_token
+
+
+def _terminate_process_group(
+    proc: subprocess.Popen,
+    timeout_s: int,
+    *,
+    owner_token: str | None = None,
+) -> None:
     descendants: list[psutil.Process] = []
     if proc.poll() is None:
         try:
             descendants = psutil.Process(proc.pid).children(recursive=True)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    if owner_token is not None:
+        known_pids = {child.pid for child in descendants}
+        for child in psutil.process_iter():
+            if child.pid == os.getpid() or child.pid in known_pids:
+                continue
+            try:
+                if child.environ().get(EVALSCOPE_PROCESS_OWNER_ENV) == owner_token:
+                    descendants.append(child)
+                    known_pids.add(child.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
     try:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGTERM)
@@ -727,7 +754,7 @@ def run_evalscope_server_test(
     server_log_path = log_dir / "vllm_server.log"
     eval_log_path = log_dir / "evalscope.log"
 
-    env = _server_environment(config)
+    env, owner_token = _owned_process_environment(_server_environment(config))
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())
@@ -778,4 +805,8 @@ def run_evalscope_server_test(
             ):
                 print(f"keeping vLLM server alive for debugging: pid={proc.pid}")
             else:
-                _terminate_process_group(proc, shutdown_timeout)
+                _terminate_process_group(
+                    proc,
+                    shutdown_timeout,
+                    owner_token=owner_token,
+                )

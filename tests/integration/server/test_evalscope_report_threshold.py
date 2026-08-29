@@ -169,6 +169,51 @@ def test_terminate_process_group_also_stops_new_session_descendants(
                 child.kill()
 
 
+def test_terminate_process_group_stops_owned_orphan_after_parent_exit(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "orphan.pid"
+    owner_token = f"evalscope-test-{os.getpid()}-{time.monotonic_ns()}"
+    parent_code = (
+        "import pathlib,subprocess,sys;"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import time; time.sleep(300)'],start_new_session=True);"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))"
+    )
+    env = os.environ.copy()
+    env["VLLM_HCU_EVAL_PROCESS_OWNER"] = owner_token
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code, str(child_pid_path)],
+        env=env,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        parent.wait(timeout=10)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert psutil.pid_exists(child_pid)
+
+        evalscope_server._terminate_process_group(
+            parent,
+            timeout_s=2,
+            owner_token=owner_token,
+        )
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and psutil.pid_exists(child_pid):
+            if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                break
+            time.sleep(0.05)
+        assert not psutil.pid_exists(child_pid) or (
+            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        )
+    finally:
+        if child_pid is not None and psutil.pid_exists(child_pid):
+            child = psutil.Process(child_pid)
+            if child.status() != psutil.STATUS_ZOMBIE:
+                child.kill()
+
+
 def _config(score: float) -> dict:
     return {
         "model": "/models/Qwen3-8B",
