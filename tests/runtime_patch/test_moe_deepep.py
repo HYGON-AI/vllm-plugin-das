@@ -309,6 +309,92 @@ def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
     ]
 
 
+@pytest.mark.parametrize(
+    ("kv_role", "expected"),
+    [("kv_producer", False), ("kv_consumer", True)],
+)
+def test_dspark_mooncake_pd_role_selects_one_deepep_layout(
+    kv_role: str,
+    expected: bool,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto as auto_module,
+    )
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role=kv_role,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+            )
+        ),
+    )
+
+    assert auto_module.dspark_mooncake_pd_use_low_latency(config) is expected
+    config.kv_transfer_config.kv_connector = "NixlConnector"
+    assert auto_module.dspark_mooncake_pd_use_low_latency(config) is None
+
+
+@pytest.mark.parametrize(
+    ("fixed_use_low_latency", "selected"),
+    [(False, "ht"), (True, "ll")],
+)
+def test_deepep_auto_prepare_pins_mooncake_pd_role(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_use_low_latency: bool,
+    selected: str,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto as auto_module,
+    )
+
+    class Delegate:
+        def __init__(self, name: str):
+            self.name = name
+            self.calls: list[str] = []
+
+        def post_init_setup(self, _experts):
+            self.calls.append("post_init_setup")
+
+        def prepare(self, *_args):
+            self.calls.append("prepare")
+            return self.name
+
+    ht = Delegate("ht")
+    ll = Delegate("ll")
+    prepare_finalize = auto_module.DeepEPAutoPrepareAndFinalize(
+        ht,
+        ll,
+        fixed_use_low_latency=fixed_use_low_latency,
+    )
+    monkeypatch.setattr(
+        auto_module,
+        "_forward_uses_low_latency",
+        lambda: not fixed_use_low_latency,
+    )
+
+    class Experts:
+        ht_experts = "ht-experts"
+        ll_experts = "ll-experts"
+
+        def set_deepep_auto_use_low_latency(self, value):
+            self.low_latency = value
+
+    experts = Experts()
+    prepare_finalize.post_init_setup(experts)
+
+    assert prepare_finalize.prepare(
+        "a1", "weights", "ids", 8, None, False, "quant"
+    ) == selected
+    assert experts.low_latency is fixed_use_low_latency
+    assert ht.calls == (["post_init_setup", "prepare"] if selected == "ht" else [])
+    assert ll.calls == (["post_init_setup", "prepare"] if selected == "ll" else [])
+
+
 class _GroupShape:
     PER_TENSOR = object()
     PER_TOKEN = object()
@@ -2304,6 +2390,125 @@ def test_channel_fp8_auto_experts_isolate_in_place_marlin_layouts(
     assert ht_w13.untyped_storage().data_ptr() != ll_w13.untyped_storage().data_ptr()
 
 
+@pytest.mark.parametrize(
+    ("fixed_use_low_latency", "layout", "selected_packer", "rejected_packer"),
+    [
+        (
+            False,
+            "contiguous",
+            "marlin_fp8_contiguous_weight",
+            "marlin_fp8_masked_weight",
+        ),
+        (
+            True,
+            "masked",
+            "marlin_fp8_masked_weight",
+            "marlin_fp8_contiguous_weight",
+        ),
+    ],
+)
+def test_channel_fp8_auto_experts_pack_only_mooncake_pd_role_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_use_low_latency: bool,
+    layout: str,
+    selected_packer: str,
+    rejected_packer: str,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts._fixed_use_low_latency = fixed_use_low_latency
+    experts._use_low_latency_snapshot = False
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    for child in (experts.ht_experts, experts.ll_experts):
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 32, 64), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 16), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones((1, 32)))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones((1, 64)))
+    layer.weight_block_size = None
+    packed = torch.full((1, 1, 1, 1, 1, 1), 31, dtype=torch.int8)
+
+    monkeypatch.setattr(
+        module,
+        selected_packer,
+        lambda _weight: packed.clone(),
+    )
+    monkeypatch.setattr(
+        module,
+        rejected_packer,
+        lambda _weight: pytest.fail("unused Mooncake P/D layout was packed"),
+    )
+
+    experts.process_weights_after_loading(layer)
+
+    assert layer._dsv4_channel_deepgemm_layout == layout
+    current = experts.ll_experts if fixed_use_low_latency else experts.ht_experts
+    unused = experts.ht_experts if fixed_use_low_latency else experts.ll_experts
+    assert torch.equal(current._deepgemm_w13, packed)
+    assert torch.equal(current._deepgemm_w2, packed)
+    assert unused._deepgemm_w13 is None
+    assert unused._deepgemm_w2 is None
+
+
+@pytest.mark.parametrize(
+    ("fixed_use_low_latency", "selected"),
+    [(False, "contiguous"), (True, "masked")],
+)
+def test_channel_auto_experts_construct_only_mooncake_pd_role_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_use_low_latency: bool,
+    selected: str,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    constructed: list[str] = []
+
+    class ContiguousExperts:
+        def __init__(self, **_kwargs):
+            constructed.append("contiguous")
+
+    class MaskedExperts:
+        def __init__(self, **_kwargs):
+            constructed.append("masked")
+
+    monkeypatch.setattr(
+        module,
+        "DeepEPDeepGemmContiguousExperts",
+        ContiguousExperts,
+    )
+    monkeypatch.setattr(
+        module,
+        "DeepEPDeepGemmMaskedExperts",
+        MaskedExperts,
+    )
+
+    experts = module.DeepEPAutoDeepGemmExperts(
+        moe_config=SimpleNamespace(),
+        quant_config=SimpleNamespace(),
+        max_num_tokens=64,
+        num_dispatchers=4,
+        fixed_use_low_latency=fixed_use_low_latency,
+    )
+
+    assert constructed == [selected]
+    assert experts.ht_experts is experts.ll_experts
+
+
 def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2355,6 +2560,7 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
         "quant_config": quant_config,
         "max_num_tokens": 64,
         "num_dispatchers": 8,
+        "fixed_use_low_latency": None,
     }
 
 

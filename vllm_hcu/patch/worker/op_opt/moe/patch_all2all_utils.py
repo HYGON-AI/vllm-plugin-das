@@ -120,13 +120,16 @@ def apply_to_module(module: ModuleType) -> bool:
                 physical_to_global=physical_to_global,
                 local_expert_global_ids=local_expert_global_ids,
             )
-            from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
-                DeepEPAutoPrepareAndFinalize,
+            from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+                deepep_auto,
             )
 
-            return DeepEPAutoPrepareAndFinalize(
+            return deepep_auto.DeepEPAutoPrepareAndFinalize(
                 ht_prepare_finalize,
                 ll_prepare_finalize,
+                fixed_use_low_latency=(
+                    deepep_auto.dspark_mooncake_pd_use_low_latency(vllm_config)
+                ),
             )
 
         prepare_finalize = original(

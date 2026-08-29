@@ -234,6 +234,17 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
+    work_dir = tmp_path / "eval"
+    stale_log_dir = work_dir / "logs"
+    stale_log_dir.mkdir(parents=True)
+    for name in (
+        "prefill.log",
+        "decode.log",
+        "proxy.log",
+        "evalscope.log",
+        "decode_metrics.prom",
+    ):
+        (stale_log_dir / name).write_text("stale evidence\n", encoding="utf-8")
 
     class FakeProcess:
         def __init__(self, label: str) -> None:
@@ -279,8 +290,17 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
     def fake_stop(proc: FakeProcess, _timeout_s: int) -> None:
         events.append(f"stop:{proc.label}")
 
+    def fake_evidence(
+        prefill_log: Path,
+        decode_log: Path,
+        _metrics: str,
+    ) -> None:
+        assert "stale evidence" not in prefill_log.read_text(encoding="utf-8")
+        assert "stale evidence" not in decode_log.read_text(encoding="utf-8")
+        events.append("evidence")
+
     monkeypatch.setenv("VLLM_V0251_SOURCE_ROOT", "/models/zb/vllm_025/vllm")
-    monkeypatch.setenv("VLLM_HCU_EVAL_WORK_DIR", str(tmp_path / "eval"))
+    monkeypatch.setenv("VLLM_HCU_EVAL_WORK_DIR", str(work_dir))
     monkeypatch.setattr(pd_runner, "_require_runtime", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         pd_runner, "_reset_evalscope_artifacts", lambda _work_dir: None
@@ -298,7 +318,7 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
     monkeypatch.setattr(
         pd_runner,
         "assert_pd_runtime_evidence",
-        lambda *args, **kwargs: events.append("evidence"),
+        fake_evidence,
     )
     monkeypatch.setattr(pd_runner, "_terminate_process_group", fake_stop)
 
@@ -309,6 +329,9 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
         required_hcu_count=8,
     )
 
+    assert (stale_log_dir / "decode_metrics.prom").read_text(
+        encoding="utf-8"
+    ) == DSPARK_METRICS
     assert events == [
         "start:prefill",
         "wait:prefill",

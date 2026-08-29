@@ -707,7 +707,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
 
 class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
-    """Switch DeepGEMM expert layout with the per-forward DeepEP mode."""
+    """Select a per-forward or role-fixed DeepGEMM expert layout."""
 
     def __init__(
         self,
@@ -715,33 +715,53 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
         max_num_tokens: int,
         num_dispatchers: int,
+        fixed_use_low_latency: bool | None = None,
     ):
         # The expert base validates one fixed activation format, while this
-        # adapter intentionally owns both.  Initialize its public state using
-        # the same v0.25.1 fields and let each concrete child validate itself.
+        # adapter can own both. Initialize its public state using the same
+        # v0.25.1 fields and let each constructed child validate itself.
         self.moe_config = moe_config
         self.quant_config = quant_config
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
+        self._fixed_use_low_latency = fixed_use_low_latency
         self._use_low_latency_snapshot = False
-        self.ht_experts = DeepEPDeepGemmContiguousExperts(
-            moe_config=moe_config,
-            quant_config=quant_config,
-        )
-        self.ll_experts = DeepEPDeepGemmMaskedExperts(
-            moe_config=moe_config,
-            quant_config=quant_config,
-            max_num_tokens=max_num_tokens,
-            num_dispatchers=num_dispatchers,
-        )
+        if fixed_use_low_latency is not True:
+            self.ht_experts = DeepEPDeepGemmContiguousExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+            )
+        if fixed_use_low_latency is not False:
+            self.ll_experts = DeepEPDeepGemmMaskedExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+                max_num_tokens=max_num_tokens,
+                num_dispatchers=num_dispatchers,
+            )
+        if fixed_use_low_latency is True:
+            self.ht_experts = self.ll_experts
+        elif fixed_use_low_latency is False:
+            self.ll_experts = self.ht_experts
 
     def set_deepep_auto_use_low_latency(self, use_low_latency: bool) -> None:
-        self._use_low_latency_snapshot = bool(use_low_latency)
+        if self._fixed_use_low_latency is None:
+            self._use_low_latency_snapshot = bool(use_low_latency)
+        else:
+            self._use_low_latency_snapshot = self._fixed_use_low_latency
 
     def _current(self) -> mk.FusedMoEExperts:
+        if self._fixed_use_low_latency is not None:
+            return (
+                self.ll_experts
+                if self._fixed_use_low_latency
+                else self.ht_experts
+            )
         return self.ll_experts if self._use_low_latency_snapshot else self.ht_experts
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(self, "_fixed_use_low_latency", None) is not None:
+            self._current().process_weights_after_loading(layer)
+            return
         packed_layout = getattr(
             layer,
             "_dsv4_channel_deepgemm_layout",
@@ -949,13 +969,27 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     max_num_tokens = prepare_finalize.ll_prepare_finalize.max_num_tokens_per_rank()
     if max_num_tokens is None:
         raise RuntimeError("DeepEP auto LL token capacity is unavailable")
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
+        dspark_mooncake_pd_use_low_latency,
+    )
+
+    fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(
+        get_current_vllm_config_or_none()
+    )
     experts = DeepEPAutoDeepGemmExperts(
         moe_config=moe_config,
         quant_config=moe_quant_config,
         max_num_tokens=max_num_tokens,
         num_dispatchers=prepare_finalize.num_dispatchers(),
+        fixed_use_low_latency=fixed_use_low_latency,
     )
-    logger.info_once("Using DeepEP auto MoE kernel with HT/LL experts.")
+    if fixed_use_low_latency is None:
+        logger.info_once("Using DeepEP auto MoE kernel with HT/LL experts.")
+    elif fixed_use_low_latency:
+        logger.info_once("Using role-fixed DeepEP auto MoE kernel with LL experts.")
+    else:
+        logger.info_once("Using role-fixed DeepEP auto MoE kernel with HT experts.")
     return mk.FusedMoEKernel(prepare_finalize, experts)
 
 

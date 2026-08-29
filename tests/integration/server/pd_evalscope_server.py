@@ -167,6 +167,23 @@ def _fetch_text(url: str, timeout: int) -> str:
         return response.read().decode("utf-8", errors="replace")
 
 
+def _reset_pd_logs(log_dir: Path) -> None:
+    """Remove only the owned P/D acceptance evidence files."""
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "prefill.log",
+        "decode.log",
+        "proxy.log",
+        "evalscope.log",
+        "decode_metrics.prom",
+    ):
+        path = log_dir / name
+        if path.is_dir() and not path.is_symlink():
+            raise ValueError(f"P/D log path must not be a directory: {path}")
+        path.unlink(missing_ok=True)
+
+
 def _role_command(
     *,
     model: str,
@@ -306,10 +323,12 @@ def run_evalscope_pd_server_test(
     )
     _reset_evalscope_artifacts(work_dir)
     log_dir = work_dir / "logs"
+    _reset_pd_logs(log_dir)
     prefill_log_path = log_dir / "prefill.log"
     decode_log_path = log_dir / "decode.log"
     proxy_log_path = log_dir / "proxy.log"
     eval_log_path = log_dir / "evalscope.log"
+    decode_metrics_path = log_dir / "decode_metrics.prom"
 
     prefill_proc: subprocess.Popen | None = None
     decode_proc: subprocess.Popen | None = None
@@ -408,6 +427,7 @@ def run_evalscope_pd_server_test(
             f"http://{commands.host}:{commands.decode_port}/metrics",
             30,
         )
+        decode_metrics_path.write_text(decode_metrics, encoding="utf-8")
         _assert_pass_criteria(
             eval_config,
             model_env=model_env,

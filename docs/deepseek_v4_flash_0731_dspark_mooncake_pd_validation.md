@@ -18,8 +18,12 @@ connectors remain rejected.
 The public MoE selection remains one `--all2all-backend deepep_auto` argument.
 There are no public high-throughput, low-latency, or `--moe-backend` switches.
 The HCU runtime selects contiguous DeepEP/DeepGEMM for high-throughput forwards
-and masked DeepEP/DeepGEMM for low-latency forwards. Both services use
-`--kv-cache-dtype fp8`, including the Channel-INT8 checkpoint.
+and masked DeepEP/DeepGEMM for low-latency forwards. In Mooncake P/D mode the
+role fixes that internal choice: the producer retains only the contiguous
+Marlin layout and the consumer retains only the masked layout. This makes DP4
+fit without adding a role-specific public MoE option; ordinary single-service
+`deepep_auto` still retains both layouts and selects per forward. Both services
+use `--kv-cache-dtype fp8`, including the Channel-INT8 checkpoint.
 
 ## Choose the model
 
@@ -137,7 +141,7 @@ FP8:
 
 ```bash
 VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm \
-PYTHONPATH=/models/zb/vllm_025/vllm:. \
+PYTHONPATH=. \
 pytest -q -s \
   tests/integration/server/test_evalscope_deepseek_v4_dspark_mooncake_pd.py::test_deepseek_v4_dspark_humaneval_fp8_mooncake_pd
 ```
@@ -146,7 +150,7 @@ INT8:
 
 ```bash
 VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm \
-PYTHONPATH=/models/zb/vllm_025/vllm:. \
+PYTHONPATH=. \
 pytest -q -s \
   tests/integration/server/test_evalscope_deepseek_v4_dspark_mooncake_pd.py::test_deepseek_v4_dspark_humaneval_int8_mooncake_pd
 ```
@@ -155,6 +159,9 @@ The acceptance gate requires exactly 32 predictions and reviews, normalized
 HumanEval accuracy and pass@1 of 32/32, successful Mooncake send/receive TTFT
 events, both contiguous HT and masked LL DeepEP/DeepGEMM markers, no known
 Mooncake transfer failure, and positive DSpark draft and accepted token totals.
+`VLLM_V0251_SOURCE_ROOT` locates only the official proxy script. Do not add that
+source tree to `PYTHONPATH`: doing so hides the compiled extensions in the
+installed vLLM 0.25.1 wheel.
 
 ## Observed results
 

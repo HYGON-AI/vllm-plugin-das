@@ -19,6 +19,32 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 logger = init_logger("vllm.hcu.deepseek_v4_deepep_auto")
 
 
+def dspark_mooncake_pd_use_low_latency(vllm_config: object) -> bool | None:
+    """Return the fixed DeepEP layout for a supported Mooncake P/D role."""
+
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if getattr(speculative_config, "method", None) != "dspark":
+        return None
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if getattr(kv_transfer_config, "kv_connector", None) != "MooncakeConnector":
+        return None
+
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", ())
+    if "DeepseekV4ForCausalLM" not in (architectures or ()):
+        return None
+
+    role = getattr(kv_transfer_config, "kv_role", None)
+    if role == "kv_producer":
+        return False
+    if role == "kv_consumer":
+        return True
+    return None
+
+
 def _forward_uses_low_latency() -> bool:
     from vllm.forward_context import get_forward_context
 
@@ -36,15 +62,20 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self,
         ht_prepare_finalize: FusedMoEPrepareAndFinalize,
         ll_prepare_finalize: FusedMoEPrepareAndFinalize,
+        fixed_use_low_latency: bool | None = None,
     ):
         super().__init__()
         self.ht_prepare_finalize = ht_prepare_finalize
         self.ll_prepare_finalize = ll_prepare_finalize
+        self._fixed_use_low_latency = fixed_use_low_latency
         self._use_low_latency_snapshot = False
         self._auto_experts: mk.FusedMoEExperts | None = None
 
     def _snapshot_forward_mode(self) -> None:
-        self._use_low_latency_snapshot = _forward_uses_low_latency()
+        if self._fixed_use_low_latency is None:
+            self._use_low_latency_snapshot = _forward_uses_low_latency()
+        else:
+            self._use_low_latency_snapshot = self._fixed_use_low_latency
         if self._use_low_latency_snapshot:
             logger.info_once(
                 "DeepEP auto selected masked low-latency experts for this forward."
@@ -68,6 +99,16 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
         self._auto_experts = fused_experts
+        if self._fixed_use_low_latency is not None:
+            self._use_low_latency_snapshot = self._fixed_use_low_latency
+            self._current().post_init_setup(
+                getattr(
+                    fused_experts,
+                    "ll_experts" if self._fixed_use_low_latency else "ht_experts",
+                    fused_experts,
+                )
+            )
+            return
         self.ht_prepare_finalize.post_init_setup(
             getattr(fused_experts, "ht_experts", fused_experts)
         )
@@ -92,6 +133,8 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         return self._current().topk_indices_dtype()
 
     def supports_async(self) -> bool:
+        if self._fixed_use_low_latency is not None:
+            return self._current().supports_async()
         return (
             self.ht_prepare_finalize.supports_async()
             and self.ll_prepare_finalize.supports_async()
@@ -180,4 +223,7 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
 
-__all__ = ["DeepEPAutoPrepareAndFinalize"]
+__all__ = [
+    "DeepEPAutoPrepareAndFinalize",
+    "dspark_mooncake_pd_use_low_latency",
+]
