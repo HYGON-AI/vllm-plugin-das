@@ -556,9 +556,9 @@ def _validate_phase1_kv_cache_config(
             "HCU Mooncake phase-1 does not support Mamba/GDN hybrid cache "
             "groups."
         )
-    if len(kv_cache_config.kv_cache_groups) != 1:
-        raise NotImplementedError(
-            "HCU Mooncake phase-1 supports exactly one KV cache group."
+    if not kv_cache_config.kv_cache_groups:
+        raise ValueError(
+            "HCU Mooncake requires at least one KV cache group."
         )
 
 

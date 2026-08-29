@@ -251,15 +251,22 @@ def test_phase1_feature_gates(mooncake):
     valid = SimpleNamespace(has_mamba_layers=False, kv_cache_groups=[object()])
     mooncake._validate_phase1_kv_cache_config(valid, 1)
     mooncake._validate_phase1_kv_cache_config(valid, 2)
+    mooncake._validate_phase1_kv_cache_config(
+        SimpleNamespace(
+            has_mamba_layers=False,
+            kv_cache_groups=[object(), object()],
+        ),
+        1,
+    )
     with pytest.raises(ValueError, match="positive number"):
         mooncake._validate_phase1_kv_cache_config(valid, 0)
     with pytest.raises(NotImplementedError, match="Mamba/GDN"):
         mooncake._validate_phase1_kv_cache_config(
             SimpleNamespace(has_mamba_layers=True, kv_cache_groups=[object()]), 1
         )
-    with pytest.raises(NotImplementedError, match="exactly one"):
+    with pytest.raises(ValueError, match="at least one"):
         mooncake._validate_phase1_kv_cache_config(
-            SimpleNamespace(has_mamba_layers=False, kv_cache_groups=[1, 2]), 1
+            SimpleNamespace(has_mamba_layers=False, kv_cache_groups=[]), 1
         )
 
 
@@ -341,10 +348,10 @@ def test_phase1_gate_runs_before_transfer_engine_creation(mooncake, monkeypatch)
     )
     unsupported = SimpleNamespace(
         has_mamba_layers=False,
-        kv_cache_groups=[object(), object()],
+        kv_cache_groups=[],
     )
 
-    with pytest.raises(NotImplementedError, match="exactly one"):
+    with pytest.raises(ValueError, match="at least one"):
         mooncake.MooncakeConnectorWorker(config, "engine", unsupported)
 
     assert engine_creations == []
