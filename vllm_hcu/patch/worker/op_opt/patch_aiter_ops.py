@@ -60,6 +60,8 @@ _FUSED_POSITIONAL = (
     "bias2",
     "moe_sorting_dispatch_policy",
     "swiglu_limit",
+    "beta",
+    "linear_beta",
 )
 _FUSED_DEFAULTS = {
     "expert_mask": None,
@@ -79,6 +81,8 @@ _FUSED_DEFAULTS = {
     "bias2": None,
     "moe_sorting_dispatch_policy": 0,
     "swiglu_limit": 0.0,
+    "beta": None,
+    "linear_beta": None,
 }
 _TOPK_POSITIONAL = (
     "topk_weights",

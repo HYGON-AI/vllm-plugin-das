@@ -786,6 +786,8 @@ def fused_moe_impl(
     bias2: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
     swiglu_limit: float = 0.0,
+    beta: float | None = None,
+    linear_beta: float | None = None,
 ) -> torch.Tensor:
     """Select HCU's W16A16 ASM path, otherwise preserve upstream exactly."""
 
@@ -824,6 +826,8 @@ def fused_moe_impl(
                 bias2,
                 moe_sorting_dispatch_policy,
                 swiglu_limit,
+                beta,
+                linear_beta,
             )
         # ActivationType in older HCU AITER builds has no numeric GELU-tanh
         # member, while fused_moe accepts its stable string spelling.
@@ -844,6 +848,8 @@ def fused_moe_impl(
             "bias2": (bias2, None),
             "moe_sorting_dispatch_policy": (moe_sorting_dispatch_policy, 0),
             "swiglu_limit": (swiglu_limit, 0.0),
+            "beta": (beta, None),
+            "linear_beta": (linear_beta, None),
         }
         for name, (value, default) in unsupported_arguments.items():
             if value != default:
@@ -882,6 +888,8 @@ def fused_moe_impl(
         "intermediate_pad": (intermediate_pad, 0),
         "bias1": (bias1, None),
         "bias2": (bias2, None),
+        "beta": (beta, None),
+        "linear_beta": (linear_beta, None),
     }
     for name, (value, default) in unsupported.items():
         if value != default:
