@@ -475,6 +475,13 @@ class FusedMoEPrepareAndFinalizeMonolithic(FusedMoEPrepareAndFinalize):
 
 # TODO: add supported activations method (return string)
 class FusedMoEExperts(ABC):
+    # target contract: RoutedExperts.expert_map asks the selected experts
+    # implementation whether it consumes AITER's 0/1 expert mask. HCU
+    # replaces the canonical modular_kernel module, so every target-owned
+    # experts class also inherits this HCU base at runtime.
+    # Only AITER implementations override the default to True.
+    consumes_expert_mask: bool = False
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,

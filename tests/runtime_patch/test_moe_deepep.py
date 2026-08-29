@@ -59,6 +59,38 @@ ADAPTERS = (
 )
 
 
+def test_hcu_modular_experts_preserve_target_expert_map_contract():
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(repo_root), env.get("PYTHONPATH")))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import vllm
+                import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+                from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+                    TritonExperts,
+                )
+                print(f"BASE={mk.FusedMoEExperts.consumes_expert_mask}")
+                print(f"TRITON={TritonExperts.consumes_expert_mask}")
+                """
+            ),
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "BASE=False" in result.stdout
+    assert "TRITON=False" in result.stdout
+
+
 def _module(name: str, **attributes: object) -> ModuleType:
     module = ModuleType(name)
     for key, value in attributes.items():
