@@ -43,6 +43,13 @@ def choose_deepep_auto_low_latency(
 
     if not get_hcu_config(vllm_config).deepep_auto:
         return False
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
+        dspark_mooncake_pd_use_low_latency,
+    )
+
+    fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
+    if fixed_use_low_latency is not None:
+        return fixed_use_low_latency
     local_decode = bool(
         batch_descriptor is not None
         and getattr(batch_descriptor, "uniform", False)

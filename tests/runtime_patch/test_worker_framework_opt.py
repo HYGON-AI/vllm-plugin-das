@@ -979,6 +979,49 @@ def test_dspark_deepep_auto_uses_dp_global_phase_on_empty_ranks(
     assert local_evidence == [(True, False), (False, False)]
 
 
+@pytest.mark.parametrize(
+    ("kv_role", "expected"),
+    [("kv_producer", False), ("kv_consumer", True)],
+)
+def test_dspark_mooncake_pd_role_skips_dynamic_phase_collective(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_role: str,
+    expected: bool,
+):
+    import vllm_hcu.forward_context_runtime as runtime
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=4)
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+    )
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MooncakeConnector",
+        kv_role=kv_role,
+    )
+    config.model_config = SimpleNamespace(
+        architectures=["DeepseekV4ForCausalLM"]
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_synchronize_deepep_auto_phase",
+        lambda *args, **kwargs: pytest.fail(
+            "role-fixed Mooncake P/D must not add a DP collective"
+        ),
+    )
+
+    assert (
+        runtime.choose_deepep_auto_low_latency(
+            config,
+            8,
+            torch.tensor([8, 0, 0, 0]),
+            SimpleNamespace(uniform=expected),
+        )
+        is expected
+    )
+
+
 def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     calls: list[tuple[object, ...]] = []
 
