@@ -5,19 +5,15 @@
 """DeepEP DeepGEMM MoE expert implementations.
 
 These backends are used for DeepEP high-throughput and low-latency DeepGEMM
-paths. They expect channel-wise FP8 expert weights and per-token activation
-scales.
+paths. They accept channel-wise FP8 or INT8 expert weights and per-token
+activation scales.
 """
+
+import functools
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from deepgemm import (
-    marlin_fp8_contiguous_weight,
-    marlin_fp8_masked_weight,
-    m_grouped_fp8_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nt_masked,
-)
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -38,17 +34,93 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
-    count_expert_num_tokens,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8DynamicTokenSym,
     kFp8StaticChannelSym,
+    kInt8DynamicTokenSym,
+    kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
-from lightop import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
 
-logger = init_logger(__name__)
+# Use vLLM's configured logger hierarchy so worker-side backend evidence is
+# present in the normal engine log (``vllm_hcu.*`` has no configured handler).
+logger = init_logger("vllm.hcu.deepseek_v4_deepep_experts")
+
+
+@functools.lru_cache(maxsize=None)
+def _deepgemm_op(name: str):
+    """Resolve DeepGEMM only when an HCU worker first needs an operator."""
+
+    import deepgemm
+
+    return getattr(deepgemm, name)
+
+
+def marlin_fp8_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
+    return _deepgemm_op("marlin_fp8_contiguous_weight")(weight)
+
+
+def marlin_fp8_masked_weight(weight: torch.Tensor) -> torch.Tensor:
+    return _deepgemm_op("marlin_fp8_masked_weight")(weight)
+
+
+def marlin_i8_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
+    return _deepgemm_op("marlin_i8_contiguous_weight")(weight)
+
+
+def marlin_i8_masked_weight(weight: torch.Tensor) -> torch.Tensor:
+    return _deepgemm_op("marlin_i8_masked_weight")(weight)
+
+
+def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
+    return _deepgemm_op("m_grouped_fp8_gemm_nt_contiguous")(*args, **kwargs)
+
+
+def m_grouped_fp8_gemm_nt_masked(*args, **kwargs):
+    return _deepgemm_op("m_grouped_fp8_gemm_nt_masked")(*args, **kwargs)
+
+
+def m_grouped_i8_gemm_nt_contiguous(*args, **kwargs):
+    return _deepgemm_op("m_grouped_i8_gemm_nt_contiguous")(*args, **kwargs)
+
+
+def m_grouped_i8_gemm_nt_masked(*args, **kwargs):
+    return _deepgemm_op("m_grouped_i8_gemm_nt_masked")(*args, **kwargs)
+
+
+@functools.lru_cache(maxsize=None)
+def _lightop_op(name: str):
+    """Resolve LightOp only when an HCU worker first needs an operator."""
+
+    import lightop
+
+    return getattr(lightop, name)
+
+
+def fuse_silu_mul_fp8_quant(*args, **kwargs):
+    return _lightop_op("fuse_silu_mul_fp8_quant")(*args, **kwargs)
+
+
+def fuse_silu_mul_fp8_quant_ep(*args, **kwargs):
+    return _lightop_op("fuse_silu_mul_fp8_quant_ep")(*args, **kwargs)
+
+
+def fuse_silu_mul_quant(*args, **kwargs):
+    return _lightop_op("fuse_silu_mul_quant")(*args, **kwargs)
+
+
+def fuse_silu_mul_quant_ep(*args, **kwargs):
+    return _lightop_op("fuse_silu_mul_quant_ep")(*args, **kwargs)
+
+
+def fuse_silu_mul_clamp_quant(*args, **kwargs):
+    return _lightop_op("fuse_silu_mul_clamp_quant")(*args, **kwargs)
+
+
+def fuse_silu_mul_clamp_quant_ep(*args, **kwargs):
+    return _lightop_op("fuse_silu_mul_clamp_quant_ep")(*args, **kwargs)
 
 
 class DeepEPDeepGemmContiguousExperts(TritonExperts):
@@ -58,8 +130,8 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
     grouped GEMM flow.
     """
 
-    # Match the HCU DeepEP groupgemm path. DeepEP HT
-    # dispatch aligns FP8 groupgemm traffic to 256 tokens per expert.
+    # Match the HCU DeepEP groupgemm path. DeepEP HT dispatch aligns
+    # quantized groupgemm traffic to 256 tokens per expert.
     ALIGNMENT = 256
     WEIGHT_LAYOUT = "contiguous"
 
@@ -68,9 +140,9 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return (weight_key, activation_key) == (
-            kFp8StaticChannelSym,
-            kFp8DynamicTokenSym,
+        return (weight_key, activation_key) in (
+            (kFp8StaticChannelSym, kFp8DynamicTokenSym),
+            (kInt8StaticChannelSym, kInt8DynamicTokenSym),
         )
 
     def __init__(
@@ -86,14 +158,14 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Prepare channel-wise FP8 weights for the DeepGEMM HT path.
+        """Prepare channel-wise FP8 or INT8 weights for the DeepGEMM HT path.
 
         Packed weights replace the original runtime weight parameters so the
         original large weight storage can be released after loading.
         """
         packed_layout = getattr(
             layer,
-            "_dsv4_channel_fp8_deepgemm_layout",
+            "_dsv4_channel_deepgemm_layout",
             None,
         )
         if packed_layout == self.WEIGHT_LAYOUT:
@@ -101,44 +173,50 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
                 self._deepgemm_w13 = layer.w13_weight
                 self._deepgemm_w2 = layer.w2_weight
                 return
-            if not self._can_pack_channel_fp8(layer):
+            if not self._can_pack_channel_weights(layer):
                 raise RuntimeError(
-                    "DeepEP DeepGEMM FP8 layer has invalid reloaded weights: "
+                    "DeepEP DeepGEMM layer has invalid reloaded weights: "
                     f"w13={tuple(layer.w13_weight.shape)} "
                     f"w2={tuple(layer.w2_weight.shape)}"
                 )
         elif packed_layout is not None:
             raise RuntimeError(
-                "DeepEP DeepGEMM FP8 weight layout mismatch: "
+                "DeepEP DeepGEMM weight layout mismatch: "
                 f"experts require {self.WEIGHT_LAYOUT}, got {packed_layout}."
             )
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
-        if not self._can_pack_channel_fp8(layer):
+        if not self._can_pack_channel_weights(layer):
             raise RuntimeError(
-                "DeepEP DeepGEMM HT requires channel-wise FP8 MoE weights, "
+                "DeepEP DeepGEMM HT requires channel-wise FP8 or INT8 MoE "
+                "weights, "
                 f"got w13={tuple(w13.shape)} w2={tuple(w2.shape)} "
                 f"w13_scale={tuple(layer.w13_weight_scale.shape)} "
                 f"w2_scale={tuple(layer.w2_weight_scale.shape)}"
             )
 
         with torch.no_grad():
-            w13_packed, w2_packed = self._pack_channel_fp8_weights(w13, w2)
+            w13_packed, w2_packed = self._pack_channel_weights(w13, w2)
 
         replace_parameter(layer, "w13_weight", w13_packed)
         replace_parameter(layer, "w2_weight", w2_packed)
         self._deepgemm_w13 = layer.w13_weight
         self._deepgemm_w2 = layer.w2_weight
-        layer._dsv4_channel_fp8_deepgemm_layout = self.WEIGHT_LAYOUT
-        layer._dsv4_channel_fp8_deepgemm_repacked = True
+        layer._dsv4_channel_deepgemm_layout = self.WEIGHT_LAYOUT
+        layer._dsv4_channel_deepgemm_repacked = True
         del w13, w2
 
-    def _pack_channel_fp8_weights(
+    def _pack_channel_weights(
         self,
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if getattr(getattr(self, "quant_config", None), "use_int8_w8a8", False):
+            return (
+                marlin_i8_contiguous_weight(w13).detach(),
+                marlin_i8_contiguous_weight(w2).detach(),
+            )
         return (
             marlin_fp8_contiguous_weight(w13).detach(),
             marlin_fp8_contiguous_weight(w2).detach(),
@@ -256,16 +334,11 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         if a1q_scale is None:
             raise RuntimeError("DeepEP DeepGEMM HT requires per-token activation scales")
         if self.w1_scale is None or self.w2_scale is None:
-            raise RuntimeError("DeepEP DeepGEMM HT requires FP8 weight scales")
+            raise RuntimeError("DeepEP DeepGEMM HT requires weight scales")
+        use_int8 = bool(self.quant_config.use_int8_w8a8)
 
         local_num_experts, _, _, _, _ = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
-        )
-        expert_tokens_meta = self._ensure_expert_tokens_meta(
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
         )
         if self._deepgemm_w13 is None or self._deepgemm_w2 is None:
             raise RuntimeError(
@@ -303,7 +376,12 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         )
 
         gateup_output = _resize_cache(workspace2, (m_aligned, N))
-        m_grouped_fp8_gemm_nt_contiguous(
+        grouped_gemm = (
+            m_grouped_i8_gemm_nt_contiguous
+            if use_int8
+            else m_grouped_fp8_gemm_nt_contiguous
+        )
+        grouped_gemm(
             (input_tensor, input_scale),
             (w13_deepgemm, self.w1_scale),
             gateup_output,
@@ -312,13 +390,29 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         del input_tensor
         del a2_scale
 
-        q_activation, q_activation_scale = fuse_silu_mul_fp8_quant(
-            gateup_output, fp8type=0, expert_ids=m_indices
-        )
+        if use_int8:
+            clamp_limit = self.quant_config.gemm1_clamp_limit
+            if clamp_limit is not None and clamp_limit > 0:
+                q_activation, q_activation_scale = fuse_silu_mul_clamp_quant(
+                    gateup_output,
+                    limit=clamp_limit,
+                )
+            else:
+                q_activation, q_activation_scale = fuse_silu_mul_quant(
+                    gateup_output,
+                    expert_ids=m_indices,
+                )
+        else:
+            q_activation, q_activation_scale = fuse_silu_mul_fp8_quant(
+                gateup_output,
+                fp8type=0,
+                expert_ids=m_indices,
+                limit=self.quant_config.gemm1_clamp_limit,
+            )
         del gateup_output
 
         down_output = _resize_cache(workspace2, (m_aligned, K))
-        m_grouped_fp8_gemm_nt_contiguous(
+        grouped_gemm(
             (q_activation, q_activation_scale),
             (w2_deepgemm, self.w2_scale),
             down_output,
@@ -341,30 +435,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         return scale
 
     @staticmethod
-    def _ensure_expert_tokens_meta(
-        topk_ids: torch.Tensor,
-        local_num_experts: int,
-        expert_map: torch.Tensor | None,
-        expert_tokens_meta: mk.ExpertTokensMetadata | None,
-    ) -> mk.ExpertTokensMetadata:
-        if (
-            expert_tokens_meta is not None
-            and expert_tokens_meta.expert_num_tokens_cpu is not None
-        ):
-            return expert_tokens_meta
-
-        expert_num_tokens = (
-            expert_tokens_meta.expert_num_tokens
-            if expert_tokens_meta is not None
-            else count_expert_num_tokens(topk_ids, local_num_experts, expert_map)
-        )
-        return mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens,
-            expert_num_tokens_cpu=expert_num_tokens.cpu(),
-        )
-
-    @staticmethod
-    def _can_pack_channel_fp8(layer: torch.nn.Module) -> bool:
+    def _can_pack_channel_weights(layer: torch.nn.Module) -> bool:
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
@@ -398,7 +469,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
                 f"w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
             )
 
-        # The gfx938 Marlin FP8 packers map [E, N, K] to
+        # The gfx938 Marlin FP8/INT8 packers map [E, N, K] to
         # [E, K / 64, N / 16, 4, 16, 16].
         local_num_experts = w13.size(0)
         n = w13.size(2) * w13.size(4)
@@ -446,9 +517,9 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return (weight_key, activation_key) == (
-            kFp8StaticChannelSym,
-            kFp8DynamicTokenSym,
+        return (weight_key, activation_key) in (
+            (kFp8StaticChannelSym, kFp8DynamicTokenSym),
+            (kInt8StaticChannelSym, kInt8DynamicTokenSym),
         )
 
     @staticmethod
@@ -472,11 +543,16 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceDelegate()
 
-    def _pack_channel_fp8_weights(
+    def _pack_channel_weights(
         self,
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if getattr(getattr(self, "quant_config", None), "use_int8_w8a8", False):
+            return (
+                marlin_i8_masked_weight(w13).detach(),
+                marlin_i8_masked_weight(w2).detach(),
+            )
         return (
             marlin_fp8_masked_weight(w13).detach(),
             marlin_fp8_masked_weight(w2).detach(),
@@ -534,7 +610,8 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         if a1q_scale is None:
             raise RuntimeError("DeepEP DeepGEMM LL requires activation scales")
         if self.w1_scale is None or self.w2_scale is None:
-            raise RuntimeError("DeepEP DeepGEMM LL requires FP8 weight scales")
+            raise RuntimeError("DeepEP DeepGEMM LL requires weight scales")
+        use_int8 = bool(self.quant_config.use_int8_w8a8)
         if self._deepgemm_w13 is None or self._deepgemm_w2 is None:
             raise RuntimeError(
                 "DeepEP DeepGEMM LL weights were not packed. "
@@ -554,7 +631,12 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         a1q_scale = self._ensure_ll_scale(a1q_scale, local_num_experts, max_tokens)
 
         gateup_output = _resize_cache(workspace2, (local_num_experts, max_tokens, N))
-        m_grouped_fp8_gemm_nt_masked(
+        grouped_gemm = (
+            m_grouped_i8_gemm_nt_masked
+            if use_int8
+            else m_grouped_fp8_gemm_nt_masked
+        )
+        grouped_gemm(
             (hidden_states, a1q_scale),
             (self._deepgemm_w13, self._ensure_ll_weight_scale(self.w1_scale)),
             gateup_output,
@@ -562,11 +644,27 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             max_tokens,
         )
 
-        q_activation, q_activation_scale = fuse_silu_mul_fp8_quant_ep(
-            gateup_output,
-            fp8type=0,
-            tokens_per_expert=expert_num_tokens,
-        )
+        if use_int8:
+            clamp_limit = self.quant_config.gemm1_clamp_limit
+            if clamp_limit is not None and clamp_limit > 0:
+                q_activation, q_activation_scale = fuse_silu_mul_clamp_quant_ep(
+                    gateup_output,
+                    limit=clamp_limit,
+                    mask_m=expert_num_tokens,
+                    expect_m=max_tokens,
+                )
+            else:
+                q_activation, q_activation_scale = fuse_silu_mul_quant_ep(
+                    gateup_output,
+                    tokens_per_expert=expert_num_tokens,
+                )
+        else:
+            q_activation, q_activation_scale = fuse_silu_mul_fp8_quant_ep(
+                gateup_output,
+                fp8type=0,
+                tokens_per_expert=expert_num_tokens,
+                limit=self.quant_config.gemm1_clamp_limit,
+            )
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         q_activation = q_activation.view(local_num_experts, max_tokens,
                                          activation_out_dim)
@@ -575,7 +673,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         )
 
         out_view = _resize_cache(output, (local_num_experts, max_tokens, K))
-        m_grouped_fp8_gemm_nt_masked(
+        grouped_gemm(
             (q_activation, q_activation_scale),
             (self._deepgemm_w2, self._ensure_ll_weight_scale(self.w2_scale)),
             out_view,
@@ -646,18 +744,18 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         packed_layout = getattr(
             layer,
-            "_dsv4_channel_fp8_deepgemm_layout",
+            "_dsv4_channel_deepgemm_layout",
             None,
         )
         if packed_layout == "contiguous+masked":
             ll_w13 = getattr(
                 layer,
-                "_dsv4_channel_fp8_deepgemm_masked_w13",
+                "_dsv4_channel_deepgemm_masked_w13",
                 None,
             )
             ll_w2 = getattr(
                 layer,
-                "_dsv4_channel_fp8_deepgemm_masked_w2",
+                "_dsv4_channel_deepgemm_masked_w2",
                 None,
             )
             if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
@@ -670,7 +768,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                 self.ll_experts._deepgemm_w13 = ll_w13
                 self.ll_experts._deepgemm_w2 = ll_w2
                 return
-            if not self.ht_experts._can_pack_channel_fp8(layer):
+            if not self.ht_experts._can_pack_channel_weights(layer):
                 raise RuntimeError(
                     "DeepEP auto DeepGEMM layer has invalid reloaded weights: "
                     f"w13={tuple(layer.w13_weight.shape)} "
@@ -679,19 +777,28 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         if packed_layout is not None:
             if packed_layout != "contiguous+masked":
                 raise RuntimeError(
-                    "DeepEP auto DeepGEMM requires unpacked channel-FP8 weights, "
+                    "DeepEP auto DeepGEMM requires unpacked channel-wise "
+                    "FP8 or INT8 weights, "
                     f"got {packed_layout} weights."
                 )
-        if not self.ht_experts._can_pack_channel_fp8(layer):
+        if not self.ht_experts._can_pack_channel_weights(layer):
             raise RuntimeError(
-                "DeepEP auto DeepGEMM requires channel-wise FP8 MoE weights."
+                "DeepEP auto DeepGEMM requires channel-wise FP8 or INT8 MoE "
+                "weights."
             )
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         with torch.no_grad():
-            ht_w13, ht_w2 = self.ht_experts._pack_channel_fp8_weights(w13, w2)
-            ll_w13, ll_w2 = self.ll_experts._pack_channel_fp8_weights(w13, w2)
+            # Both HCU Marlin packers rearrange their input storage in place
+            # and return a view of that same storage.  Preserve independent
+            # layouts: contiguous owns clones while masked reuses the original
+            # parameter storage that is about to be replaced on the layer.
+            ht_w13, ht_w2 = self.ht_experts._pack_channel_weights(
+                w13.clone(),
+                w2.clone(),
+            )
+            ll_w13, ll_w2 = self.ll_experts._pack_channel_weights(w13, w2)
 
         replace_parameter(layer, "w13_weight", ht_w13)
         replace_parameter(layer, "w2_weight", ht_w2)
@@ -699,10 +806,10 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         self.ht_experts._deepgemm_w2 = layer.w2_weight
         self.ll_experts._deepgemm_w13 = ll_w13
         self.ll_experts._deepgemm_w2 = ll_w2
-        layer._dsv4_channel_fp8_deepgemm_masked_w13 = ll_w13
-        layer._dsv4_channel_fp8_deepgemm_masked_w2 = ll_w2
-        layer._dsv4_channel_fp8_deepgemm_layout = "contiguous+masked"
-        layer._dsv4_channel_fp8_deepgemm_repacked = True
+        layer._dsv4_channel_deepgemm_masked_w13 = ll_w13
+        layer._dsv4_channel_deepgemm_masked_w2 = ll_w2
+        layer._dsv4_channel_deepgemm_layout = "contiguous+masked"
+        layer._dsv4_channel_deepgemm_repacked = True
         del w13, w2
 
     @staticmethod
@@ -821,7 +928,7 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
 
 
-def make_deepep_auto_deepgemm_fp8_moe_kernel(
+def _make_deepep_auto_deepgemm_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -850,3 +957,33 @@ def make_deepep_auto_deepgemm_fp8_moe_kernel(
     )
     logger.info_once("Using DeepEP auto MoE kernel with HT/LL experts.")
     return mk.FusedMoEKernel(prepare_finalize, experts)
+
+
+def make_deepep_auto_deepgemm_fp8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Build the unified DeepEP HT/LL kernel for Channel-FP8 W8A8."""
+
+    return _make_deepep_auto_deepgemm_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=moe_config,
+        routing_tables=routing_tables,
+    )
+
+
+def make_deepep_auto_deepgemm_int8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Build the unified DeepEP HT/LL kernel for Channel-INT8 W8A8."""
+
+    if not moe_quant_config.use_int8_w8a8:
+        raise ValueError("Channel-INT8 auto factory requires INT8 W8A8 quantization")
+    return _make_deepep_auto_deepgemm_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=moe_config,
+        routing_tables=routing_tables,
+    )

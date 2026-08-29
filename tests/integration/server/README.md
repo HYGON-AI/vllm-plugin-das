@@ -27,6 +27,13 @@ Current coverage:
   GLM-5.2 model-runner-v2 TP=4, PCP=2, EP, eager, Triton-MoE launch contract,
   then runs 32 deterministic HumanEval samples through the OpenAI API and
   requires `mean_acc >= 0.90`.
+- `test_evalscope_deepseek_v4_dspark_humaneval.py` defines TP8+DSpark and
+  DP8+EP8+DSpark profiles for both Channel-FP8 and Channel-INT8 checkpoints on
+  the first 32 ModelScope HumanEval samples. The DP profile exposes only
+  `--all2all-backend deepep_auto`; PCP, P/D
+  disaggregation, a public MoE backend, and separate HT/LL switches are
+  excluded. Acceptance requires 32 predictions, 32 reviews, and exact `1.0`
+  scores for both HumanEval metrics.
 
 The Qwen3-8B smoke test needs one local HCU device, the checkpoint at
 `/models/llm-models/qwen3/Qwen3-8B`, `vllm`, and `evalscope`. Select it with
@@ -58,3 +65,13 @@ The GLM-5.2 acceptance server defaults to
 with `VLLM_HCU_GLM52_HUMANEVAL_CONFIG`. It requires eight HCU devices and
 EvalScope, and intentionally uses model-runner v2 with `TP=4`, `PCP=2`, EP,
 eager execution, and the Triton MoE backend.
+
+The DeepSeek-V4 acceptance server defaults to
+`/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8`; override it with
+`VLLM_HCU_DEEPSEEK_V4_FLASH_0731_MODEL`. Override the profiled YAML with
+`VLLM_HCU_DEEPSEEK_V4_DSPARK_HUMANEVAL_CONFIG`.
+
+The Channel-INT8 acceptance profile defaults to
+`/models/DeepSeek-V4-Flash-0731-Channel-INT8-w8a8`; override it with
+`VLLM_HCU_DEEPSEEK_V4_FLASH_0731_INT8_MODEL`. Override its profiled YAML with
+`VLLM_HCU_DEEPSEEK_V4_INT8_DSPARK_HUMANEVAL_CONFIG`.

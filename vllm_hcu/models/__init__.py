@@ -5,8 +5,8 @@
 
 from vllm import ModelRegistry
 
+
 def register_model():
-    
     ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
@@ -37,6 +37,11 @@ def register_model():
     
     ModelRegistry.register_model(
         "HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP"
+    )
+
+    ModelRegistry.register_model(
+        "DSparkDraftModel",
+        "vllm_hcu.models.deepseek_v4_dspark:DSparkDeepseekV4ForCausalLM",
     )
 
 

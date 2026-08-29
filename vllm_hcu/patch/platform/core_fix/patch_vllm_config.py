@@ -190,6 +190,17 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
     _validate_hcu_pcp_scope(vllm_config)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    use_dspark = getattr(speculative_config, "use_dspark", None)
+    dspark_enabled = (
+        bool(use_dspark())
+        if callable(use_dspark)
+        else getattr(speculative_config, "method", None) == "dspark"
+    )
+    if dspark_enabled and getattr(vllm_config, "kv_transfer_config", None) is not None:
+        raise ValueError(
+            "DeepSeek-V4 DSpark with P/D disaggregation is not supported on HCU."
+        )
     feature_config = get_hcu_config(vllm_config)
     updates: dict[str, str] = {}
     if feature_config.hcu_flash_attn_mode is None:

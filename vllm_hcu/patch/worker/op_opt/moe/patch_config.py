@@ -7,6 +7,8 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+from vllm_hcu.patch.config import get_hcu_config
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -170,8 +172,29 @@ def apply_to_module(module: ModuleType) -> bool:
             sp_size_,
             vllm_parallel_config,
         )
-        if getattr(vllm_parallel_config, "_vllm_hcu_deepep_auto", False):
+        deepep_auto = getattr(
+            vllm_parallel_config, "_vllm_hcu_deepep_auto", False
+        )
+        if not deepep_auto:
+            # Engine-core serialization does not preserve private attributes
+            # on ParallelConfig. The official current-config context does
+            # preserve additional_config, so recover only this internal MoE
+            # dispatch marker from that canonical source.
+            from vllm.config import get_current_vllm_config_or_none
+
+            vllm_config = get_current_vllm_config_or_none()
+            deepep_auto = bool(
+                get_hcu_config(vllm_config).deepep_auto
+                if vllm_config is not None
+                else False
+            )
+        if deepep_auto:
             result.all2all_backend = "deepep_auto"
+            logger = getattr(target, "logger", None)
+            if logger is not None:
+                logger.info_once(
+                    "HCU internal MoE dispatch selected deepep_auto for DP+EP."
+                )
         return result
 
     target._vllm_hcu_original_quant_flags_to_group_shape = flags

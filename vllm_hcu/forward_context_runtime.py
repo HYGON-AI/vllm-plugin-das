@@ -35,6 +35,7 @@ def choose_deepep_auto_low_latency(
     num_tokens: int | None,
     num_tokens_across_dp: object | None,
     batch_descriptor: object | None,
+    attn_metadata: object | None = None,
 ) -> bool:
     """Choose LL for uniform decode and HT for prefill/mixed batches."""
 
@@ -42,28 +43,102 @@ def choose_deepep_auto_low_latency(
 
     if not get_hcu_config(vllm_config).deepep_auto:
         return False
-    if batch_descriptor is not None:
-        return bool(getattr(batch_descriptor, "uniform", False))
+    local_decode = bool(
+        batch_descriptor is not None
+        and getattr(batch_descriptor, "uniform", False)
+    ) or _attention_metadata_is_pure_spec_decode(vllm_config, attn_metadata)
 
-    # Draft/profiling forwards do not always carry BatchDescriptor. Preserve
-    # the bounded-token fallback at this boundary, using the target scheduler
-    # and speculative configuration rather than runner globals.
-    if num_tokens_across_dp is None:
-        max_num_tokens = int(num_tokens or 0)
-    else:
-        maximum = getattr(num_tokens_across_dp, "max", None)
-        if not callable(maximum):
-            raise TypeError("num_tokens_across_dp must expose max()")
-        value = maximum()
-        item = getattr(value, "item", None)
-        max_num_tokens = int(item() if callable(item) else value)
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0))
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    data_parallel_size = int(
+        getattr(parallel_config, "data_parallel_size", 1)
+    )
+    if data_parallel_size > 1:
+        # Token counts cannot distinguish a short prefill from a short decode.
+        # Synchronize phase evidence so every EP participant enters the same
+        # DeepEP collective; ranks with no local tokens are neutral.
+        return _synchronize_deepep_auto_phase(
+            vllm_config,
+            local_active=int(num_tokens or 0) > 0,
+            local_decode=local_decode,
+        )
+
+    # Missing descriptor/metadata is not proof of decode. HT is safe for draft
+    # and profiling forwards, while a token-count guess can send short prefills
+    # through the masked LL path.
+    return local_decode
+
+
+def _synchronize_deepep_auto_phase(
+    vllm_config: object,
+    *,
+    local_active: bool,
+    local_decode: bool,
+) -> bool:
+    """Return true only when every active DP rank reports pure decode."""
+
+    import torch
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_dp_group
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    dp_group = get_dp_group()
+    device = dp_group.device
+    process_group = dp_group.device_group
+    if bool(
+        getattr(parallel_config, "disable_nccl_for_dp_synchronization", False)
+    ):
+        device = "cpu"
+        process_group = dp_group.cpu_group
+
+    evidence = torch.tensor(
+        [int(local_active), int(local_active and local_decode)],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(evidence, group=process_group)
+    active_ranks, decode_ranks = (int(value) for value in evidence.cpu().tolist())
+    return active_ranks > 0 and decode_ranks == active_ranks
+
+
+def _attention_metadata_is_pure_spec_decode(
+    vllm_config: object,
+    attn_metadata: object | None,
+) -> bool:
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    num_speculative_tokens = int(
+    max_decode_query = 1 + int(
         getattr(speculative_config, "num_speculative_tokens", 0) or 0
     )
-    return max_num_tokens <= max_num_seqs * (1 + num_speculative_tokens)
+    if max_decode_query <= 1 or attn_metadata is None:
+        return False
+
+    pending = [attn_metadata]
+    seen: set[int] = set()
+    found_attention_metadata = False
+    while pending:
+        metadata = pending.pop()
+        identity = id(metadata)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(metadata, dict):
+            pending.extend(metadata.values())
+            continue
+        if isinstance(metadata, (list, tuple)):
+            pending.extend(metadata)
+            continue
+        max_query_len = getattr(metadata, "max_query_len", None)
+        max_seq_len = getattr(metadata, "max_seq_len", None)
+        if max_query_len is None or max_seq_len is None:
+            continue
+        found_attention_metadata = True
+        max_query_len = int(max_query_len)
+        max_seq_len = int(max_seq_len)
+        if not (
+            0 < max_query_len <= max_decode_query
+            and max_seq_len > max_query_len
+        ):
+            return False
+    return found_attention_metadata
 
 
 @contextmanager

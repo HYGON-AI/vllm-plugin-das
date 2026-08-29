@@ -9,10 +9,14 @@ from collections.abc import Callable
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
+
+# Keep per-forward HT/LL selection visible in the normal vLLM worker log.
+logger = init_logger("vllm.hcu.deepseek_v4_deepep_auto")
 
 
 def _forward_uses_low_latency() -> bool:
@@ -41,6 +45,15 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def _snapshot_forward_mode(self) -> None:
         self._use_low_latency_snapshot = _forward_uses_low_latency()
+        if self._use_low_latency_snapshot:
+            logger.info_once(
+                "DeepEP auto selected masked low-latency experts for this forward."
+            )
+        else:
+            logger.info_once(
+                "DeepEP auto selected contiguous high-throughput experts for this "
+                "forward."
+            )
         if self._auto_experts is not None:
             self._auto_experts.set_deepep_auto_use_low_latency(
                 self._use_low_latency_snapshot

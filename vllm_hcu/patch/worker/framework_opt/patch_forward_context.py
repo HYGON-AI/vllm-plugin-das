@@ -213,6 +213,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     num_tokens,
                     num_tokens_across_dp,
                     batch_descriptor,
+                    attn_metadata,
                 )
             ),
         )
