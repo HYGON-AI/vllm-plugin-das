@@ -309,18 +309,18 @@ def test_weight_installer_is_direct_idempotent_and_keeps_bindings_coherent(
 
 
 @pytest.mark.hcu
-def test_clean_v0251_model_loader_import_order_has_no_weight_debug_cycle():
+def test_clean_target_model_loader_import_order_has_no_weight_debug_cycle():
     repo = Path(__file__).resolve().parents[2]
     target_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
+        os.environ.get("VLLM_TARGET_SOURCE_ROOT", repo.parent / "vllm_target")
     ).resolve()
     if not (target_vllm / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
+            f"VLLM_TARGET_SOURCE_ROOT does not contain vllm: {target_vllm}"
         )
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    env["VLLM_TARGET_SOURCE_ROOT"] = str(target_vllm)
     env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(repo)))
     code = r'''
 import importlib.abc
@@ -331,7 +331,7 @@ from pathlib import Path
 
 import vllm
 
-target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+target_root = Path(os.environ["VLLM_TARGET_SOURCE_ROOT"]).resolve()
 target_file = Path(vllm.__file__).resolve()
 assert target_file.is_relative_to(target_root), (
     f"vllm resolved outside target root: {target_file} not under {target_root}"

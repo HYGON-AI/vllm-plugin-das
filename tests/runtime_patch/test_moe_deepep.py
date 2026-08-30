@@ -1718,7 +1718,7 @@ def test_channel_fp8_masked_experts_execute_public_deepgemm_kernel(
     assert torch.equal(output, torch.full_like(output, 2))
 
 
-def test_channel_fp8_contiguous_experts_accept_v0251_permute_contract(
+def test_channel_fp8_contiguous_experts_accept_target_permute_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -2434,11 +2434,11 @@ def test_custom_op_runner_rejects_post_import_callback():
 def test_moe_runner_and_shared_experts_cold_replacement_contract():
     repository = Path(__file__).resolve().parents[2]
     target_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repository.parent / "vllm_0251")
+        os.environ.get("VLLM_TARGET_SOURCE_ROOT", repository.parent / "vllm_target")
     ).resolve()
     if not (target_vllm / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
+            f"VLLM_TARGET_SOURCE_ROOT does not contain vllm: {target_vllm}"
         )
     python_path = [str(target_vllm), str(repository)]
     existing = os.environ.get("PYTHONPATH")
@@ -2456,7 +2456,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         import torch
         import vllm
 
-        target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+        target_root = Path(os.environ["VLLM_TARGET_SOURCE_ROOT"]).resolve()
         target_file = Path(vllm.__file__).resolve()
         assert target_file.is_relative_to(target_root), (
             f"vllm resolved outside target root: {target_file} not under {target_root}"
@@ -2600,7 +2600,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
     )
     environment = os.environ.copy()
     environment["VLLM_PLUGINS"] = "__disabled__"
-    environment["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    environment["VLLM_TARGET_SOURCE_ROOT"] = str(target_vllm)
     environment["PYTHONPATH"] = os.pathsep.join(python_path)
     result = subprocess.run(
         [sys.executable, "-c", script],

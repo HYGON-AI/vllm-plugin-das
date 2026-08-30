@@ -409,17 +409,17 @@ def test_runtime_compat_zero_arg_api_uses_exact_child_and_fails_closed(
                 sys.modules[name] = original_module
 
 
-def test_clean_v0251_lora_callback_uses_completed_exact_module_without_gpu() -> None:
+def test_clean_target_lora_callback_uses_completed_exact_module_without_gpu() -> None:
     target_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", ROOT.parent / "vllm_0251")
+        os.environ.get("VLLM_TARGET_SOURCE_ROOT", ROOT.parent / "vllm_target")
     ).resolve()
     if not (target_vllm / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
+            f"VLLM_TARGET_SOURCE_ROOT does not contain vllm: {target_vllm}"
         )
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    env["VLLM_TARGET_SOURCE_ROOT"] = str(target_vllm)
     env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(ROOT)))
     code = r'''
 import importlib
@@ -429,7 +429,7 @@ from pathlib import Path
 
 import vllm
 
-target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+target_root = Path(os.environ["VLLM_TARGET_SOURCE_ROOT"]).resolve()
 target_file = Path(vllm.__file__).resolve()
 assert target_file.is_relative_to(target_root), (
     f"vllm resolved outside target root: {target_file} not under {target_root}"

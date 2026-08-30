@@ -68,7 +68,7 @@ def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
         assert not any(fragment in source for fragment in forbidden)
 
 
-def test_hcu_runner_uses_v0251_routed_experts_contract():
+def test_hcu_runner_uses_target_routed_experts_contract():
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
         encoding="utf-8-sig"
     )
@@ -81,7 +81,7 @@ def test_hcu_runner_uses_v0251_routed_experts_contract():
         "routed_experts_dict=",
     )
     assert not any(name in source for name in removed_legacy_api)
-    required_v0251_api = (
+    required_target_api = (
         "RoutedExpertsCapturer",
         "RoutedExpertsLists",
         "RoutedExpertsTensors",
@@ -89,10 +89,10 @@ def test_hcu_runner_uses_v0251_routed_experts_contract():
         "self.routed_experts_slot_mapping_device",
         "routed_experts=routed_experts_snapshot",
     )
-    assert all(name in source for name in required_v0251_api)
+    assert all(name in source for name in required_target_api)
 
 
-def test_hcu_runner_uses_v0251_kv_block_zeroer_constructor_contract():
+def test_hcu_runner_uses_target_kv_block_zeroer_constructor_contract():
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
         encoding="utf-8-sig"
     )
@@ -139,7 +139,7 @@ def test_hcu_runner_uses_v0251_kv_block_zeroer_constructor_contract():
         ),
     ),
 )
-def test_hcu_attention_backend_uses_v0251_combination_signature(path, class_name):
+def test_hcu_attention_backend_uses_target_combination_signature(path, class_name):
     tree = ast.parse(Path(path).read_text(encoding="utf-8-sig"))
     backend = next(
         node
@@ -166,7 +166,7 @@ def test_hcu_attention_backend_uses_v0251_combination_signature(path, class_name
     ]
 
 
-def test_hcu_runner_uses_v0251_input_batch_constructor_contract():
+def test_hcu_runner_uses_target_input_batch_constructor_contract():
     import ast
 
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
@@ -185,7 +185,7 @@ def test_hcu_runner_uses_v0251_input_batch_constructor_contract():
         assert "pin_memory" not in {keyword.arg for keyword in call.keywords}
 
 
-def test_hcu_runner_uses_v0251_uniform_kv_cache_contract():
+def test_hcu_runner_uses_target_uniform_kv_cache_contract():
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
         encoding="utf-8-sig"
     )
@@ -1473,7 +1473,7 @@ def test_clean_vllm_modules_import_apply_and_second_apply_is_idempotent():
 import os
 from pathlib import Path
 import vllm
-target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+target_root = Path(os.environ["VLLM_TARGET_SOURCE_ROOT"]).resolve()
 target_file = Path(vllm.__file__).resolve()
 assert target_file.is_relative_to(target_root), (
     f"vllm resolved outside target root: {target_file} not under {target_root}"
@@ -1511,13 +1511,13 @@ print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
     env["VLLM_PLUGINS"] = "__disabled__"
     repository = Path(__file__).resolve().parents[2]
     target_vllm = Path(
-        env.get("VLLM_V0251_SOURCE_ROOT", repository.parent / "vllm_0251")
+        env.get("VLLM_TARGET_SOURCE_ROOT", repository.parent / "vllm_target")
     ).resolve()
     if not (target_vllm / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
+            f"VLLM_TARGET_SOURCE_ROOT does not contain vllm: {target_vllm}"
         )
-    env["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    env["VLLM_TARGET_SOURCE_ROOT"] = str(target_vllm)
     env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(repository)))
     result = subprocess.run(
         [sys.executable, "-c", script],

@@ -36,6 +36,13 @@ class _NoStructuredOutput:
         return False
 
 
+class _DefaultEncoderCacheManagerConfig:
+    """Match the v0.28 default: let Scheduler choose its built-in manager."""
+
+    def get_encoder_cache_manager_obj(self):
+        return None
+
+
 def _make_scheduler(*, enable_prefix_caching: bool = False) -> HcuScheduler:
     scheduler_config = SimpleNamespace(
         max_num_seqs=4,
@@ -58,6 +65,7 @@ def _make_scheduler(*, enable_prefix_caching: bool = False) -> HcuScheduler:
         max_model_len=64,
         is_diffusion=False,
         enable_return_routed_experts=False,
+        return_sampling_mask=False,
     )
     parallel_config = SimpleNamespace(
         data_parallel_index=0,
@@ -78,10 +86,15 @@ def _make_scheduler(*, enable_prefix_caching: bool = False) -> HcuScheduler:
         parallel_config=parallel_config,
         observability_config=observability_config,
         model_config=model_config,
+        is_encoder_only=False,
         kv_transfer_config=None,
         ec_transfer_config=None,
         speculative_config=None,
+        ec_manager_config=_DefaultEncoderCacheManagerConfig(),
         num_speculative_tokens=0,
+        num_lookahead_tokens=0,
+        max_in_flight_tokens=64,
+        max_concurrent_batches=1,
         use_v2_model_runner=False,
     )
     kv_cache_config = KVCacheConfig(
@@ -244,7 +257,7 @@ def test_async_external_load_owns_blocks_and_inflight_state(
     assert allocate_kwargs["has_scheduled_reqs"] is False
 
 
-def test_dynamic_spec_and_deferred_free_fence_are_v0251_owned(split_pd_enabled):
+def test_dynamic_spec_and_deferred_free_fence_are_target_owned(split_pd_enabled):
     scheduler = _make_scheduler()
     scheduler.dynamic_sd_lookup = [0, 3, 2, 1, 1]
     scheduler.defer_block_free = True

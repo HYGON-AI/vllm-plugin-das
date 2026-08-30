@@ -522,7 +522,7 @@ def test_output_processor_logs_first_decoder_token_once(monkeypatch):
     assert trace_calls[0][0] == ("d_first_token",)
 
 
-def test_hcu_multiproc_executor_sizes_message_queue_from_v0251_config(monkeypatch):
+def test_hcu_multiproc_executor_sizes_message_queue_from_target_config(monkeypatch):
     from vllm_hcu.v1.executor import multiproc_executor as hcu_executor
 
     records = []
@@ -689,10 +689,10 @@ def test_outputs_keep_model_runner_ipc_stable_and_use_draft_channel():
     assert patch_outputs.apply_to_module(module) is False
 
 
-def test_clean_v0251_model_runner_output_and_hcu_draft_method_contract():
+def test_clean_target_model_runner_output_and_hcu_draft_method_contract():
     repo = Path(__file__).resolve().parents[2]
     clean_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
+        os.environ.get("VLLM_TARGET_SOURCE_ROOT", repo.parent / "vllm_target")
     )
     script = r'''
 import ast
@@ -784,7 +784,7 @@ print("CLEAN_OUTPUT_DRAFT_CHANNEL_OK", vllm.__file__)
 def _run_clean_vllm_real_factory_and_runtime_contract_smoke():
     repo = Path(__file__).resolve().parents[2]
     clean_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
+        os.environ.get("VLLM_TARGET_SOURCE_ROOT", repo.parent / "vllm_target")
     )
     script = """
 from vllm_hcu.patch.platform.framework_opt import (

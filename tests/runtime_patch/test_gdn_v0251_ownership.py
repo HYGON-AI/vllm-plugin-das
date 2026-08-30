@@ -20,14 +20,16 @@ from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
-).resolve()
-# Do not resolve this symlink: resolving it would lose the venv package view.
+_target_source_root = os.environ.get("VLLM_TARGET_SOURCE_ROOT")
+if _target_source_root is None:
+    _target_source_root = str(
+        Path(importlib.import_module("vllm").__file__).resolve().parents[1]
+    )
+TARGET_VLLM_ROOT = Path(_target_source_root).resolve()
 TARGET_PYTHON = Path(
     os.environ.get(
-        "VLLM_V0251_PYTHON",
-        TARGET_VLLM_ROOT / ".venv/bin/python",
+        "VLLM_TARGET_PYTHON",
+        sys.executable,
     )
 )
 QWEN_MODULE = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
@@ -37,7 +39,7 @@ def _adapter(name: str):
     return importlib.import_module(f"vllm_hcu.patch.worker.op_opt.{name}")
 
 
-def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     assert (TARGET_VLLM_ROOT / "vllm/__init__.py").is_file()
     assert TARGET_PYTHON.is_file()
     env = dict(os.environ)
@@ -46,7 +48,7 @@ def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
             "VLLM_PLUGINS": "__disabled__",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "VLLM_V0251_SOURCE_ROOT": str(TARGET_VLLM_ROOT),
+            "VLLM_TARGET_SOURCE_ROOT": str(TARGET_VLLM_ROOT),
             "VLLM_HCU_SOURCE_ROOT": str(REPO_ROOT),
             "VLLM_USE_NN": "1",
             "VLLM_HCU_USE_CUSTOM_OPS": "0",
@@ -241,12 +243,17 @@ def _fake_qwen(*, aiter_available: bool = True):
         del args, kwargs
         return "target-sigmoid"
 
+    def mamba_loader(shard_spec, tp_size, tp_rank):
+        calls["mamba_loader"] = (shard_spec, tp_size, tp_rank)
+        return "target-mamba-loader"
+
     values = {
         "GDN_AITER_TRITON_AVAILABLE": aiter_available,
         "causal_conv1d_fn": causal,
         "causal_conv1d_update": update,
         "fused_recurrent_gated_delta_rule_packed_decode": recurrent,
         "fused_sigmoid_gating_delta_rule_update": sigmoid,
+        "mamba_v2_sharded_weight_loader": mamba_loader,
         "QwenGatedDeltaNetAttention": QwenGatedDeltaNetAttention,
     }
     if aiter_available:
@@ -468,8 +475,8 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
         adapter.apply_to_module(bad_module)
 
 
-def test_real_v0251_cold_import_scopes_gdn_deltas_to_qwen():
-    result = _run_fresh_v0251(
+def test_real_v028_cold_import_scopes_gdn_deltas_to_qwen():
+    result = _run_fresh_target(
         r'''\
 import importlib
 import json
@@ -482,7 +489,7 @@ import vllm_hcu
 import vllm.platforms as platforms
 from vllm.platforms.interface import UnspecifiedPlatform
 
-source_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+source_root = Path(os.environ["VLLM_TARGET_SOURCE_ROOT"]).resolve()
 hcu_root = Path(os.environ["VLLM_HCU_SOURCE_ROOT"]).resolve()
 assert Path(vllm.__file__).resolve() == source_root / "vllm/__init__.py"
 assert Path(vllm_hcu.__file__).resolve() == hcu_root / "vllm_hcu/__init__.py"
@@ -569,12 +576,12 @@ report = patch_report()["patches"]
 statuses = {patch_id: report[patch_id]["status"] for patch_id in ids}
 assert set(statuses.values()) == {"applied"}
 print(json.dumps({
-    "sentinel": "GDN_V0251_OWNERSHIP_OK",
+    "sentinel": "GDN_V028_OWNERSHIP_OK",
     "statuses": statuses,
 }, sort_keys=True))
 '''
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["sentinel"] == "GDN_V0251_OWNERSHIP_OK"
+    assert payload["sentinel"] == "GDN_V028_OWNERSHIP_OK"
     assert set(payload["statuses"].values()) == {"applied"}
