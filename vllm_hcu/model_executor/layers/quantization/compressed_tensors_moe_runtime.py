@@ -23,6 +23,92 @@ class HcuCompressedTensorsMoeError(RuntimeError):
     """An explicitly selected HCU compressed-tensors MoE path is invalid."""
 
 
+def _reject_channel_fp8_w8a16_reload(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+    raise HcuCompressedTensorsMoeError(
+        "Channel-FP8 W8A16 requantization does not support online weight reload"
+    )
+
+
+@torch.no_grad()
+def requantize_channel_fp8_moe_weights(
+    layer: object,
+    replace_parameter: Callable[[object, str, torch.Tensor], None],
+    expert_chunk_size: int = 8,
+) -> None:
+    """Requantize TP-local Channel-FP8 experts to INT8 per output channel."""
+
+    if getattr(layer, "_hcu_channel_fp8_w8a16_requantized", False):
+        if _required_tensor(layer, "w13_weight").dtype is not torch.int8 or (
+            _required_tensor(layer, "w2_weight").dtype is not torch.int8
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "Channel-FP8 W8A16 marker does not match the expert weight dtype"
+            )
+        return
+    if not isinstance(expert_chunk_size, int) or expert_chunk_size <= 0:
+        raise HcuCompressedTensorsMoeError(
+            "Channel-FP8 W8A16 expert_chunk_size must be a positive integer"
+        )
+
+    fp8_dtypes = {torch.float8_e4m3fn}
+    fp8_fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    if fp8_fnuz is not None:
+        fp8_dtypes.add(fp8_fnuz)
+
+    def convert(name: str, scale_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = _required_tensor(layer, name)
+        old_scale = _required_tensor(layer, scale_name)
+        if weight.ndim != 3 or weight.dtype not in fp8_dtypes:
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 W8A16 requires rank-3 FP8 {name}"
+            )
+        expected_scale_shape = (*weight.shape[:-1], 1)
+        if tuple(old_scale.shape) != expected_scale_shape:
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 W8A16 {scale_name} shape must be "
+                f"{expected_scale_shape}, got {tuple(old_scale.shape)}"
+            )
+
+        quantized = torch.empty_like(weight, dtype=torch.int8)
+        new_scale = torch.empty_like(old_scale, dtype=torch.float32)
+        for start in range(0, weight.shape[0], expert_chunk_size):
+            stop = min(start + expert_chunk_size, weight.shape[0])
+            dequantized = weight[start:stop].float() * old_scale[start:stop].float()
+            absmax = dequantized.abs().amax(dim=-1, keepdim=True)
+            chunk_scale = torch.where(absmax > 0, absmax / 127.0, 1.0)
+            quantized[start:stop].copy_(
+                torch.round(dequantized / chunk_scale)
+                .clamp_(-127, 127)
+                .to(torch.int8)
+            )
+            new_scale[start:stop].copy_(chunk_scale)
+        if not bool(torch.isfinite(new_scale).all().item()):
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 W8A16 found non-finite values in {name}"
+            )
+        return quantized, new_scale
+
+    w13, w13_scale = convert("w13_weight", "w13_weight_scale")
+    w2, w2_scale = convert("w2_weight", "w2_weight_scale")
+    replace_parameter(layer, "w13_weight", w13)
+    replace_parameter(layer, "w2_weight", w2)
+    replace_parameter(layer, "w13_weight_scale", w13_scale)
+    replace_parameter(layer, "w2_weight_scale", w2_scale)
+    for name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
+        setattr(
+            _required_tensor(layer, name),
+            "weight_loader",
+            _reject_channel_fp8_w8a16_reload,
+        )
+    setattr(layer, "_hcu_channel_fp8_w8a16_requantized", True)
+
+
 class _AiterInplaceShuffleState:
     """Lifecycle state for a destructively shuffled expert-weight pair."""
 
@@ -679,7 +765,7 @@ def _apply_aiter_quantized_moe_with_lease(
     output_dtype: torch.dtype | None = None,
     moe_sorting_dispatch_policy: int = 0,
 ) -> torch.Tensor:
-    """Run v0.25 FP8/INT8 W8A8 experts through the public HCU AITER API."""
+    """Run v0.25 quantized experts through the public HCU AITER/BoltOps API."""
 
     if (
         topk_weights.ndim != 2
@@ -705,7 +791,82 @@ def _apply_aiter_quantized_moe_with_lease(
         )
     if getattr(quant_config, "block_shape", None) is not None:
         raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE supports only channel/token W8A8 in this path"
+            "AITER quantized MoE supports only non-block FP8/INT8 configs in this path"
+        )
+
+    use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
+    use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
+    use_int8_w8a16 = bool(getattr(quant_config, "use_int8_w8a16", False))
+    if sum((use_fp8, use_int8, use_int8_w8a16)) != 1:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE requires exactly one FP8-W8A8, INT8-W8A8, "
+            "or INT8-W8A16 config"
+        )
+    w1_scale = _required_tensor(quant_config, "w1_scale")
+    w2_scale = _required_tensor(quant_config, "w2_scale")
+    activation_value = getattr(activation, "value", activation)
+    if activation_value is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE requires an activation"
+        )
+    activation_name = str(activation_value)
+
+    if use_int8_w8a16:
+        if w1.dtype is not torch.int8 or w2.dtype is not torch.int8:
+            raise HcuCompressedTensorsMoeError(
+                "AITER INT8-W8A16 requires INT8 expert weights"
+            )
+        if expert_map is not None:
+            raise HcuCompressedTensorsMoeError(
+                "AITER INT8-W8A16 fallback is currently limited to TP/non-EP"
+            )
+        if a1q_scale is not None or any(
+            getattr(quant_config, name, None) is not None
+            for name in ("a1_scale", "a2_scale", "w1_zp", "w2_zp")
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "AITER INT8-W8A16 requires unquantized activations and "
+                "symmetric weights"
+            )
+        try:
+            from boltops.fused_moe.triton.fused_moe import fused_experts_impl
+        except Exception as exc:
+            raise HcuCompressedTensorsMoeError(
+                "AITER INT8-W8A16 fallback requires BoltOps Triton fused MoE"
+            ) from exc
+        gemm1_alpha = getattr(quant_config, "gemm1_alpha", None)
+        if gemm1_alpha is None:
+            gemm1_alpha = getattr(vllm_moe_config, "swiglu_alpha", None)
+        gemm1_limit = getattr(quant_config, "gemm1_clamp_limit", None)
+        if gemm1_limit is None:
+            gemm1_limit = getattr(vllm_moe_config, "swiglu_limit", None)
+        return fused_experts_impl(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights.to(torch.float32),
+            topk_ids=topk_ids.to(torch.int32),
+            output_dtype=output_dtype,
+            inplace=False,
+            activation=activation_name,
+            is_gated=getattr(vllm_moe_config, "is_act_and_mul", None),
+            apply_router_weight_on_input=False,
+            use_int8_w8a16=True,
+            per_channel_quant=True,
+            global_num_experts=getattr(
+                vllm_moe_config, "num_experts", w1.shape[0]
+            ),
+            expert_map=None,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=None,
+            w2_zp=None,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=None,
+            routed_scaling_factor=1.0,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_limit=gemm1_limit,
         )
 
     try:
@@ -722,27 +883,12 @@ def _apply_aiter_quantized_moe_with_lease(
 
     _install_aiter_dynamo_metrics_logging_patch()
 
-    use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
-    use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
-    if use_fp8 == use_int8:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE requires exactly one FP8-W8A8 or INT8-W8A8 config"
-        )
     quant_member = "FP8_W8A8" if use_fp8 else "W8A8"
     quant_type = getattr(MoeQuantType, quant_member, None)
     if quant_type is None:
         raise HcuCompressedTensorsMoeError(
             f"AITER does not expose required MoeQuantType.{quant_member}"
         )
-
-    w1_scale = _required_tensor(quant_config, "w1_scale")
-    w2_scale = _required_tensor(quant_config, "w2_scale")
-    activation_value = getattr(activation, "value", activation)
-    if activation_value is None:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE requires an activation"
-        )
-    activation_name = str(activation_value)
     aiter_config = _get_aiter_quantized_runtime_config(
         hidden_states,
         w1,
@@ -1239,4 +1385,5 @@ __all__ = [
     "get_aiter_w8a8_runtime_config",
     "get_aiter_weights_for_solution",
     "process_dpsk_deepgemm_weights",
+    "requantize_channel_fp8_moe_weights",
 ]

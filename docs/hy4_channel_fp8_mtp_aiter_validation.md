@@ -81,6 +81,56 @@ python -m evalscope.cli.cli eval \
 
 Each run produced exactly 164 prediction rows and 164 review rows.
 
+## Opt-in Channel-FP8 to INT8-W8A16 path (2026-08-31)
+
+The HCU plugin can optionally requantize each already TP-local Channel-FP8
+expert matrix to symmetric INT8 per output channel and execute it with BF16
+activations through the AITER-owned BoltOps W8A16 path. This avoids the eager
+AITER FP8 weight shuffle, keeps the standard expert layout, and leaves the
+existing FP8 route unchanged unless explicitly enabled.
+
+Add this environment variable to the server command above:
+
+```bash
+export VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE=1
+MOE_BACKEND=aiter
+```
+
+The installed BoltOps build has no tuned JSON for the production TP8 shape
+`E=256,N=256,arch=gfx938,dtype=int8_w8a16`; the runtime therefore uses the
+BoltOps default Triton configuration. Both MTP-off and MTP3 services loaded,
+captured FULL and PIECEWISE graphs for batch sizes 1 and 16, and returned a
+normal HTTP 200 chat completion. Online weight reload is rejected explicitly
+after requantization because replaying the original FP8 loaders into INT8
+parameters would silently corrupt weights.
+
+The following is a 16-task diagnostic sample, not a formal full HumanEval run.
+All runs used TP8, graph mode, batch 16, `temperature=0`, seed 42, and
+`reasoning_effort=no_think`.
+
+| Expert execution | MTP | Correct | pass@1 | Avg latency | Avg throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original Channel-FP8 AITER | off | 15/16 | 93.75% | 34.764 s | 4.75 tok/s |
+| Original Channel-FP8 AITER | 3 | 14/16 | 87.5% | 31.347 s | 6.47 tok/s |
+| Requantized INT8-W8A16 BoltOps | off | 14/16 | 87.5% | 47.016 s | 3.66 tok/s |
+| Requantized INT8-W8A16 BoltOps | 3 | 14/16 | 87.5% | 23.374 s | 8.63 tok/s |
+
+The W8A16 runs both failed `HumanEval/1` and `HumanEval/10`. The original FP8
+MTP-off run failed only `/10`, while its MTP3 run failed `/1` and `/10`.
+Therefore W8A16 introduced one pass-to-fail flip without MTP in this small
+sample; enabling MTP did not introduce another pass/fail change on top of
+W8A16. Output lengths differ, and the W8A16 kernels use an untuned default
+configuration, so the throughput numbers are directional only.
+
+Numerical diagnostics provide a less noisy view of the expert math. For a real
+TP8 production-shaped layer (`E=256`, top-k 8), the BoltOps kernel differed from
+an explicit INT8 reference by 0.657% relative L2 at batch 16 and from the
+original Channel-FP8 weight reference by 1.655%. Against the downloaded layer
+40 BF16 reference, explicit INT8-W8A16 measured 4.805% relative L2 versus
+6.272% for the existing Channel-FP8 W8A8 route. A separate live HCU synthetic
+kernel check measured 0.379% relative L2 and 0.999993 cosine versus explicit
+BF16 expert math.
+
 ## Full HumanEval results
 
 | MoE backend | MTP draft tokens | Correct | pass@1 | Avg latency | Avg throughput | Avg output | Wall time |
