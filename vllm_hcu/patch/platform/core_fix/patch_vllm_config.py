@@ -5,11 +5,15 @@
 from __future__ import annotations
 
 import functools
+import importlib.metadata as importlib_metadata
 import inspect
+from collections.abc import Mapping, MutableMapping
+from enum import Enum
 from types import ModuleType
 from typing import Any
 
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
+from vllm_hcu.version import get_hcu_version
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
@@ -23,12 +27,98 @@ TARGETS = (
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
+_RUNTIME_ABI_KEY = "hcu_runtime_abi"
+_RUNTIME_ABI_SCHEMA = 1
+_RUNTIME_PACKAGE_CANDIDATES = {
+    "vllm_hcu": ("vllm-hcu", "vllm_hcu"),
+    "torch": ("torch",),
+    "triton": ("triton",),
+    "conch_triton_kernels": ("conch-triton-kernels",),
+    "flash_attn": ("flash-attn", "flash_attn"),
+    "aiter": ("aiter",),
+    "lightop": ("lightop",),
+    "boltops": ("boltops",),
+    "tilelang": ("tilelang",),
+}
 _REQUEST_CAPTURE_SIZES = (
     *range(1, 9),
     *range(10, 33, 2),
     *range(40, 65, 4),
     *range(72, 257, 8),
 )
+
+
+def _json_stable_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return _json_stable_value(value.value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_stable_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_stable_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(_json_stable_value(item) for item in value)
+    return str(value)
+
+
+def _distribution_version(candidates: tuple[str, ...]) -> str:
+    for name in candidates:
+        try:
+            return importlib_metadata.version(name)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    return "not-installed"
+
+
+def _runtime_package_versions() -> dict[str, str]:
+    versions = {
+        name: _distribution_version(candidates)
+        for name, candidates in _RUNTIME_PACKAGE_CANDIDATES.items()
+    }
+    if versions["vllm_hcu"] == "not-installed":
+        versions["vllm_hcu"] = get_hcu_version()
+    return versions
+
+
+def _hcu_environment_snapshot() -> dict[str, Any]:
+    from vllm_hcu.platforms.envs import hcu_vllm_environment_variables
+
+    return {
+        name: _json_stable_value(loader())
+        for name, loader in sorted(hcu_vllm_environment_variables.items())
+    }
+
+
+def build_hcu_runtime_abi_identity() -> dict[str, Any]:
+    """Describe HCU-only inputs omitted from official v0.28 config fields."""
+
+    return {
+        "schema": _RUNTIME_ABI_SCHEMA,
+        "kv_layout": "block_first[B,2,N,H,D]",
+        "packages": _runtime_package_versions(),
+        "environment": _hcu_environment_snapshot(),
+    }
+
+
+def persist_hcu_runtime_abi_identity(vllm_config: object) -> dict[str, Any]:
+    """Put the HCU ABI payload on v0.28's authoritative hash surface."""
+
+    if isinstance(vllm_config, MutableMapping):
+        additional_config = vllm_config.get("additional_config")
+    else:
+        additional_config = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional_config, MutableMapping):
+        raise PatchCompatibilityError(
+            "VllmConfig.additional_config must be mutable before HCU ABI "
+            "identity is finalized"
+        )
+    identity = build_hcu_runtime_abi_identity()
+    additional_config[_RUNTIME_ABI_KEY] = identity
+    return identity
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
@@ -51,6 +141,7 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         )
     # Persist the resolved mode so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
+    persist_hcu_runtime_abi_identity(vllm_config)
 
     feature_config = bind_hcu_config(vllm_config)
     parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -333,5 +424,7 @@ __all__ = [
     "TARGETS",
     "apply",
     "apply_to_module",
+    "build_hcu_runtime_abi_identity",
+    "persist_hcu_runtime_abi_identity",
     "validate_and_update_hcu_config",
 ]

@@ -26,7 +26,6 @@ from typing import Any
 
 import pytest
 import torch
-
 import vllm_hcu.patch.config as hcu_config_module
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -41,14 +40,17 @@ from vllm_hcu.patch.platform.core_fix import (
 )
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 
-
 REPO = Path(__file__).resolve().parents[2]
+TARGET_SOURCE_ENV = "VLLM_TARGET_SOURCE_ROOT"
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
+    os.environ.get(
+        TARGET_SOURCE_ENV,
+        os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_target"),
+    )
 ).resolve()
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"{TARGET_SOURCE_ENV} does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
 _TARGET_SOURCE_ASSERTION = r'''
@@ -56,7 +58,7 @@ import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_TARGET_SOURCE_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
@@ -65,7 +67,7 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 '''
 
 
-def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
         "VLLM_DP_RANK",
@@ -76,7 +78,7 @@ def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     ):
         env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env[TARGET_SOURCE_ENV] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
@@ -386,7 +388,7 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
 
 
 def test_real_v0280_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
-    result = _run_fresh_v0251(
+    result = _run_fresh_target(
         r'''
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
@@ -869,8 +871,8 @@ def test_request_cudagraph_buckets_and_feature_off_equivalence(
     assert explicit.compilation_config.post_init_calls == 1
 
 
-def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
-    result = _run_fresh_v0251(
+def test_real_v028_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
+    result = _run_fresh_target(
         "import json; from types import SimpleNamespace; "
         "import vllm.config.compilation as compilation_module; "
         "import vllm.config.vllm as vllm_module; "
@@ -1107,7 +1109,7 @@ def test_slimquant_registry_rejects_provider_conflict() -> None:
         patch_slimquant_registry.apply_to_module(module)
 
 
-def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> None:
+def test_slimquant_marlin_inherits_v028_compressed_tensors_constructor() -> None:
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
@@ -1131,7 +1133,7 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
     assert config.ignore == []
     assert config.quant_format == "int-quantized"
 
-    # v0.25.1's FusedMoE public symbol is a factory and may be wrapped by HCU;
+    # v0.28's FusedMoE public symbol is a factory and may be wrapped by HCU;
     # quantization dispatch must use the target-owned RoutedExperts type.
     source = Path(
         "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
@@ -1390,6 +1392,76 @@ def test_cutlass_block_first_mooncake_defers_to_worker_capability_gates() -> Non
     assert patch_vllm_config.validate_and_update_hcu_config(config) == (
         HcuFeatureConfig(hcu_flash_attn_mode="cutlass")
     )
+
+
+def test_hcu_runtime_abi_is_persisted_on_v028_hash_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "_runtime_package_versions",
+        lambda: {"vllm_hcu": "0.28.0+test", "torch": "2.11.0+test"},
+    )
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "_hcu_environment_snapshot",
+        lambda: {"VLLM_HCU_USE_CUSTOM_OPS": True},
+    )
+    config = _validation_config(HcuFeatureConfig())
+    config.additional_config["unrelated"] = {"keep": True}
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    identity = config.additional_config["hcu_runtime_abi"]
+    assert identity == {
+        "schema": 1,
+        "kv_layout": "block_first[B,2,N,H,D]",
+        "packages": {
+            "vllm_hcu": "0.28.0+test",
+            "torch": "2.11.0+test",
+        },
+        "environment": {"VLLM_HCU_USE_CUSTOM_OPS": True},
+    }
+    assert config.additional_config["unrelated"] == {"keep": True}
+    assert json.loads(json.dumps(identity, sort_keys=True)) == identity
+
+
+@pytest.mark.parametrize("changed_input", ["package", "environment"])
+def test_hcu_runtime_abi_changes_official_v028_config_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_input: str,
+) -> None:
+    package_version = "0.28.0+first"
+    custom_ops = True
+
+    def packages() -> dict[str, str]:
+        return {"vllm_hcu": package_version, "torch": "2.11.0"}
+
+    def environment() -> dict[str, bool]:
+        return {"VLLM_HCU_USE_CUSTOM_OPS": custom_ops}
+
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "_runtime_package_versions",
+        packages,
+    )
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "_hcu_environment_snapshot",
+        environment,
+    )
+    first = _validation_config(HcuFeatureConfig())
+    patch_vllm_config.validate_and_update_hcu_config(first)
+    first_hash = _vllm_hash(first.additional_config)
+
+    if changed_input == "package":
+        package_version = "0.28.0+second"
+    else:
+        custom_ops = False
+    second = _validation_config(HcuFeatureConfig())
+    patch_vllm_config.validate_and_update_hcu_config(second)
+
+    assert _vllm_hash(second.additional_config) != first_hash
 
 
 def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() -> None:
