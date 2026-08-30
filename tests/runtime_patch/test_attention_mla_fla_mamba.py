@@ -746,6 +746,9 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     qwen_module = _module(
         qwen_adapter.TARGET_MODULE,
         GDN_AITER_TRITON_AVAILABLE=True,
+        mamba_v2_sharded_weight_loader=lambda shard_spec, tp_size, tp_rank: (
+            lambda param, loaded_weight: None
+        ),
         gdn_aiter_fused_reshape_causal_conv1d_update_single_token=aiter_update,
         fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
         fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
@@ -834,6 +837,9 @@ def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
     module = _module(
         adapter.TARGET_MODULE,
         GDN_AITER_TRITON_AVAILABLE=False,
+        mamba_v2_sharded_weight_loader=lambda shard_spec, tp_size, tp_rank: (
+            lambda param, loaded_weight: None
+        ),
         fused_recurrent_gated_delta_rule_packed_decode=recurrent,
         fused_sigmoid_gating_delta_rule_update=sigmoid,
     )
@@ -845,6 +851,38 @@ def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
     assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
     assert module.fused_recurrent_gated_delta_rule_packed_decode() == "official-recurrent"
     assert module.fused_sigmoid_gating_delta_rule_update() == "official-sigmoid"
+
+
+def test_gdn_qwen_local_mamba_loader_uses_nn_output_last_layout(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    original_calls = []
+
+    def original_loader(shard_spec, tp_size, tp_rank):
+        original_calls.append((shard_spec, tp_size, tp_rank))
+        return lambda param, loaded_weight: None
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        GDN_AITER_TRITON_AVAILABLE=False,
+        mamba_v2_sharded_weight_loader=original_loader,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    param = torch.zeros(3, 1, 4)
+    loaded = torch.arange(24, dtype=torch.float32).reshape(8, 1, 3)
+    module.mamba_v2_sharded_weight_loader([(8, 0, False)], 2, 0)(
+        param, loaded
+    )
+    torch.testing.assert_close(param, loaded[:4].permute(2, 1, 0))
+    assert original_calls == []
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    module.mamba_v2_sharded_weight_loader([(8, 0, False)], 2, 1)(
+        param, loaded
+    )
+    assert original_calls == [([(8, 0, False)], 2, 1)]
 
 
 def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):

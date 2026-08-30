@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""NN-layout adapter for vLLM v0.28's native Qwen GDN AITER path."""
+"""NN-layout adapters for vLLM v0.28's native Qwen GDN path."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ TARGET_MODULE = (
 PATCH_ID = "worker.op_opt.mamba.gdn.qwen_kernel_bindings"
 TARGETS = (
     f"{TARGET_MODULE}.gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
+    f"{TARGET_MODULE}.mamba_v2_sharded_weight_loader",
 )
 _MARKER = "_vllm_hcu_qwen_gdn_aiter_layout_applied"
 _WRAPPER = "_vllm_hcu_qwen_gdn_aiter_layout_wrapper"
@@ -63,13 +64,41 @@ _AITER_UPDATE_PARAMETERS = (
 def apply_to_module(module: ModuleType) -> bool:
     qwen = load_exact_module(TARGET_MODULE, module)
     aiter_available = bool(getattr(qwen, "GDN_AITER_TRITON_AVAILABLE", False))
-    wrapped = (
-        (qwen, TARGETS[0].rsplit(".", 1)[-1], TARGETS[0], _WRAPPER),
-    ) if aiter_available else ()
+    wrapped = [
+        (qwen, "mamba_v2_sharded_weight_loader", TARGETS[1], _WRAPPER),
+    ]
+    if aiter_available:
+        wrapped.append(
+            (qwen, TARGETS[0].rsplit(".", 1)[-1], TARGETS[0], _WRAPPER),
+        )
     if already_applied(qwen, _MARKER, wrapped):
         return False
 
+    loader_factory = require_callable(
+        qwen,
+        "mamba_v2_sharded_weight_loader",
+        TARGETS[1],
+    )
+    require_parameter_names(
+        loader_factory,
+        TARGETS[1],
+        ("shard_spec", "tp_size", "tp_rank"),
+    )
+
+    @functools.wraps(loader_factory)
+    def hcu_loader_factory(shard_spec, tp_size, tp_rank):
+        if not use_nn_layout():
+            return loader_factory(shard_spec, tp_size, tp_rank)
+        from vllm_hcu.model_executor.layers.mamba_runtime import (
+            mamba_v2_nn_sharded_weight_loader,
+        )
+
+        return mamba_v2_nn_sharded_weight_loader(shard_spec, tp_size, tp_rank)
+
     if not aiter_available:
+        setattr(hcu_loader_factory, _WRAPPER, True)
+        setattr(qwen, "_vllm_hcu_original_mamba_v2_loader", loader_factory)
+        setattr(qwen, "mamba_v2_sharded_weight_loader", hcu_loader_factory)
         setattr(qwen, _MARKER, True)
         return True
 
@@ -108,7 +137,10 @@ def apply_to_module(module: ModuleType) -> bool:
         return aiter_update(*bound.args, **bound.kwargs)
 
     setattr(hcu_aiter_update, _WRAPPER, True)
+    setattr(hcu_loader_factory, _WRAPPER, True)
     setattr(qwen, "_vllm_hcu_original_gdn_aiter_update", aiter_update)
+    setattr(qwen, "_vllm_hcu_original_mamba_v2_loader", loader_factory)
+    setattr(qwen, "mamba_v2_sharded_weight_loader", hcu_loader_factory)
     setattr(
         qwen,
         "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
