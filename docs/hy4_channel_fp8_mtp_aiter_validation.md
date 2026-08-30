@@ -154,6 +154,49 @@ layout, scales, and public API calls are correct, and the installed MOE_C
 kernel agrees with its reference algorithm. The AITER/Triton difference comes
 from different dynamic FP8 quantization, accumulation, and reduction paths.
 
+### Max-token-capped failure rerun
+
+Fourteen of the 29 AITER/MTP-off failures consumed exactly the configured
+1,024 output tokens and ended with incomplete Python. They were rerun as one
+14-request batch with the same server, prompt, graph mode, sampling parameters,
+and `reasoning_effort=no_think`; only `max_tokens` changed from 1,024 to 3,072.
+
+- Recovered and passed: `HumanEval/91`, `/97`, `/103`, `/109`, `/119`
+- Still reached 3,072 tokens: `HumanEval/32`, `/73`, `/76`, `/77`, `/127`,
+  `/129`, `/130`, `/132`, `/134`
+- The five recovered requests stopped normally at 727, 292, 901, 1,086 and
+  1,264 tokens respectively.
+- The remaining nine predictions repeatedly reasoned inside Python comments
+  and never completed the function before the larger limit. There were no API,
+  kernel, NaN, or text-decoding errors.
+
+Substituting the five recovered results into the original run gives a paired
+diagnostic score of 140/164 (85.4%). This is not a new formal full-dataset
+pass@1 run because the failed subset was generated again with a different
+batch composition. It demonstrates that five of the original failures were
+caused by the 1,024-token evaluation limit, while nine are persistent
+long-output degeneration rather than ordinary short code failures.
+
+### Upstream PR 54160 audit
+
+The merged upstream implementation in
+[vllm-project/vllm#54160](https://github.com/vllm-project/vllm/pull/54160)
+was compared at head `184421e`. Its accuracy-relevant changes are aligned in
+this plugin: FP32 lm-head accumulation, FP32 router logits and weights, generic
+indexer FP8 scale shapes, routed scaling 2.827, normalized sigmoid top-k,
+routed-expert SwiGLU limit 10, iHC formulas, sparse top-k buffer ownership, and
+the HY V4 MTP hidden-width rule.
+
+Upstream PR 54160 implements NVIDIA MXFP8/TRTLLM experts; it does not contain a
+channel-wise AITER expert path. Consequently it is a framework/model reference,
+but not an AITER channel-FP8 operator oracle. A direct comparison of BoltOps
+`ihc_pre`, `ihc_post`, and `ihc_head` against the upstream PyTorch formulas at
+the real `hc=4`, `d=6144` shape found zero p99 BF16 error for T=1 and T=16. At
+T=16, the maximum errors were 0.0009766 for pre/head and 0.0039063 for post.
+Together with the AITER golden comparison above, this does not support a
+framework wiring or iHC/MOE_C correctness defect as the cause of the low
+HumanEval score.
+
 ## Review decision
 
 No production source change is justified by this investigation:
@@ -165,6 +208,10 @@ No production source change is justified by this investigation:
 - AITER-off scores one task above Triton-off on the full dataset; therefore the
   earlier 15/16 versus 16/16 result was a small-sample effect, not evidence of
   a general AITER regression.
+- Raising only the output limit recovers 5/14 capped AITER failures. Nine hard
+  cases continue generating repetitive reasoning comments through 3,072
+  tokens, so evaluation length and model output behavior materially depress
+  the formal 1,024-token score.
 - MTP3 improves throughput substantially but has a measurable pass@1 tradeoff
   in both backends. Accuracy-sensitive deployments should leave MTP disabled;
   throughput-sensitive deployments should validate on their own workload.
