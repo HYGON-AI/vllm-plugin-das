@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
-"""HCU Scheduler for the v0.25.1 split-P/D scheduling policy.
+"""HCU Scheduler adapter for the target v0.28 split-P/D scheduling policy.
 
 The class is selected through vLLM's public ``scheduler_cls`` configuration.
 It never replaces the official ``Scheduler`` class. Feature-off execution
@@ -11,6 +11,7 @@ delegates directly to the official scheduler.
 
 from __future__ import annotations
 
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.sched import scheduler as _upstream
 from vllm_hcu.platforms import envs as henvs
 
@@ -29,7 +30,6 @@ Request = _upstream.Request
 KVCacheBlocks = _upstream.KVCacheBlocks
 create_request_queue = _upstream.create_request_queue
 RequestStatus = _upstream.RequestStatus
-HybridKVCacheCoordinator = _upstream.HybridKVCacheCoordinator
 EngineCoreEventType = _upstream.EngineCoreEventType
 record_function_or_nullcontext = _upstream.record_function_or_nullcontext
 SchedulingPolicy = _upstream.SchedulingPolicy
