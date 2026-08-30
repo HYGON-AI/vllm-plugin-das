@@ -1640,6 +1640,9 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
     cache_module = _module(
         "aiter.ops.cache",
         reshape_and_cache=cache,
+    )
+    fa_utils_module = _module(
+        "vllm_hcu.v1.attention.backends.fa_utils",
         reshape_and_cache_flash=cache_flash,
     )
     rope_module = _module(
@@ -1651,6 +1654,11 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
     monkeypatch.setitem(sys.modules, "aiter.ops.triton", triton)
     monkeypatch.setitem(sys.modules, "aiter.ops.cache", cache_module)
     monkeypatch.setitem(sys.modules, "aiter.ops.triton.rope", rope_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        fa_utils_module,
+    )
 
     query = torch.zeros(2, 8)
     key = torch.zeros(2, 4)
