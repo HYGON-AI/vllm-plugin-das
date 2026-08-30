@@ -56,6 +56,22 @@ def _load(profile: str) -> dict:
     return load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
 
 
+@pytest.fixture
+def mooncake_proxy_source_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    source_root = tmp_path / "vllm-source"
+    proxy_script = (
+        source_root
+        / "examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py"
+    )
+    proxy_script.parent.mkdir(parents=True)
+    proxy_script.write_text("# test Mooncake proxy\n", encoding="utf-8")
+    monkeypatch.setenv("VLLM_V0251_SOURCE_ROOT", str(source_root))
+    return source_root
+
+
 @pytest.mark.parametrize(
     ("profile", "model_path", "served_model_name"),
     [
@@ -73,6 +89,7 @@ def _load(profile: str) -> dict:
 )
 def test_deepseek_v4_dspark_mooncake_pd_command_contract(
     monkeypatch: pytest.MonkeyPatch,
+    mooncake_proxy_source_root: Path,
     profile: str,
     model_path: str,
     served_model_name: str,
@@ -92,6 +109,10 @@ def test_deepseek_v4_dspark_mooncake_pd_command_contract(
     assert "VLLM_V0251_SOURCE_ROOT" not in commands.prefill_env
     assert "VLLM_V0251_SOURCE_ROOT" not in commands.decode_env
     assert "VLLM_V0251_SOURCE_ROOT" not in commands.proxy_env
+    assert commands.proxy[1] == str(
+        mooncake_proxy_source_root
+        / "examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py"
+    )
     assert _option_value(commands.prefill, "--max-num-batched-tokens") == "512"
     assert _option_value(commands.decode, "--max-num-batched-tokens") == "64"
 
@@ -253,6 +274,7 @@ def test_deepseek_v4_dspark_mooncake_pd_rejects_missing_runtime_evidence(
 def test_deepseek_v4_dspark_mooncake_pd_process_order(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    mooncake_proxy_source_root: Path,
 ) -> None:
     events: list[str] = []
     work_dir = tmp_path / "eval"
@@ -326,7 +348,6 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
         assert "stale evidence" not in decode_log.read_text(encoding="utf-8")
         events.append("evidence")
 
-    monkeypatch.setenv("VLLM_V0251_SOURCE_ROOT", "/models/zb/vllm_025/vllm")
     monkeypatch.setenv("VLLM_HCU_EVAL_WORK_DIR", str(work_dir))
     monkeypatch.setattr(pd_runner, "_require_runtime", lambda *args, **kwargs: None)
     monkeypatch.setattr(
