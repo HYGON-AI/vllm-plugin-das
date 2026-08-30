@@ -32,6 +32,25 @@ def test_shared_head_uses_backbone_lm_head_quant_prefix(monkeypatch) -> None:
     assert captured["prefix"] == "lm_head"
 
 
+def test_shared_head_accepts_quant_config_without_modelopt_exclusion_api(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeHead(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(hy_v4_mtp, "ParallelLMHead", FakeHead)
+    quant_config = SimpleNamespace()
+    config = SimpleNamespace(vocab_size=64, hidden_size=16)
+
+    hy_v4_mtp.HYV4SharedHead(config, quant_config)
+
+    assert captured["quant_config"] is quant_config
+
+
 def test_shared_head_drops_excluded_quant_config_for_vocab_layout(
     monkeypatch,
 ) -> None:
@@ -192,6 +211,32 @@ def test_modelopt_mtp_exclusions_are_copied_remapped_and_keep_wildcards() -> Non
         "model.mtp_layers.0.self_attn.linear_gate*",
         "model.layers.78.eh_proj",
         "model.layers.78.self_attn.linear_gate*",
+    ]
+
+
+def test_compressed_tensors_mtp_ignore_is_copied_and_remapped() -> None:
+    quant_config = SimpleNamespace(
+        ignore=[
+            "lm_head",
+            "model.mtp_layers.0.self_attn.linear_gate",
+        ]
+    )
+
+    actual = hy_v4_mtp._remap_mtp_quant_exclusions(
+        quant_config,
+        mtp_start_layer_idx=78,
+        num_mtp_layers=1,
+    )
+
+    assert actual is not quant_config
+    assert quant_config.ignore == [
+        "lm_head",
+        "model.mtp_layers.0.self_attn.linear_gate",
+    ]
+    assert actual.ignore == [
+        "lm_head",
+        "model.mtp_layers.0.self_attn.linear_gate",
+        "model.layers.78.self_attn.linear_gate",
     ]
 
 

@@ -43,6 +43,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from .model import (
     HYV4DecoderLayer,
+    _is_modelopt_layer_excluded,
     _normalize_hyv4_config,
     _slice_sink_for_tp,
     _try_load_fp8_indexer_projection,
@@ -52,7 +53,7 @@ from .model import (
 logger = init_logger(__name__)
 
 
-_MTP_QUANT_EXCLUSION_ATTRS = ("ignored_layers", "exclude_modules")
+_MTP_QUANT_EXCLUSION_ATTRS = ("ignore", "ignored_layers", "exclude_modules")
 _MTP_WRAPPER_WEIGHTS = ("enorm", "hnorm", "eh_proj", "final_layernorm")
 
 
@@ -251,7 +252,7 @@ class HYV4SharedHead(nn.Module):
         # embedding layout [vocab, hidden]. Match the target HYV4 head and
         # let ParallelLMHead choose its unquantized embedding method.
         head_quant_config = quant_config
-        if quant_config is not None and quant_config.is_layer_excluded("lm_head"):
+        if _is_modelopt_layer_excluded(quant_config, "lm_head"):
             head_quant_config = None
         self.head = ParallelLMHead(
             config.vocab_size,

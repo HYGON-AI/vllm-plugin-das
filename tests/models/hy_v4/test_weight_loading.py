@@ -79,6 +79,48 @@ def test_excluded_quant_config_is_not_forwarded_to_lm_head(
     assert captured["quant_config"] is None
 
 
+def test_non_modelopt_quant_config_is_forwarded_to_lm_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeInnerModel(torch.nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.make_empty_intermediate_tensors = object()
+
+    class FakeLMHead(torch.nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(hy_v4_model, "HYV4Model", FakeInnerModel)
+    monkeypatch.setattr(hy_v4_model, "ParallelLMHead", FakeLMHead)
+    monkeypatch.setattr(
+        hy_v4_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    quant_config = SimpleNamespace()
+    config = SimpleNamespace(
+        vocab_size=64,
+        hidden_size=32,
+        tie_word_embeddings=False,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config),
+        quant_config=quant_config,
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+    )
+
+    HYV4ForCausalLM(vllm_config=vllm_config)
+
+    assert captured["quant_config"] is quant_config
+
+
 def test_compute_logits_keeps_hidden_state_in_model_dtype() -> None:
     captured: dict[str, torch.Tensor] = {}
     model = object.__new__(HYV4ForCausalLM)

@@ -89,6 +89,15 @@ HYV4_PACKED_MODULES_MAPPING = {
 }
 
 
+def _is_modelopt_layer_excluded(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> bool:
+    """Return ModelOpt's explicit exclusion without assuming its config API."""
+    is_layer_excluded = getattr(quant_config, "is_layer_excluded", None)
+    return bool(is_layer_excluded(prefix)) if callable(is_layer_excluded) else False
+
+
 def _rewrite_hyv4_weight_name(name: str) -> str:
     """Map HY V4 checkpoint-only names to runtime parameter names."""
     name = name.replace("gate.e_score_correction_bias", "expert_bias")
@@ -944,9 +953,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             # vocab loader requires [vocab, hidden]. Let ParallelLMHead select
             # UnquantizedEmbeddingMethod instead for an excluded head.
             lm_head_quant_config = quant_config
-            if quant_config is not None and quant_config.is_layer_excluded(
-                lm_head_prefix
-            ):
+            if _is_modelopt_layer_excluded(quant_config, lm_head_prefix):
                 lm_head_quant_config = None
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
