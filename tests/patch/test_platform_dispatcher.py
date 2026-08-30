@@ -61,6 +61,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
         ("platform.core_fix.envs", "vllm.envs"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
+        (
+            "platform.core_fix.nixl.package_name",
+            "vllm.distributed.nixl_utils",
+        ),
         ("platform.core_fix.hcu_config.engine_args", "vllm.engine.arg_utils"),
         (
             "platform.core_fix.hcu_config.compilation_cudagraph",
