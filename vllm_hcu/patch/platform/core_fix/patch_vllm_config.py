@@ -9,6 +9,7 @@ import inspect
 from types import ModuleType
 from typing import Any
 
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -189,28 +190,16 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
 def _validate_dspark_pd_scope(vllm_config: object) -> None:
     """Allow only the validated DeepSeek-V4 Mooncake DSpark P/D path."""
 
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    use_dspark = getattr(speculative_config, "use_dspark", None)
-    dspark_enabled = (
-        bool(use_dspark())
-        if callable(use_dspark)
-        else getattr(speculative_config, "method", None) == "dspark"
-    )
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     connector = getattr(kv_transfer_config, "kv_connector", None)
-    if not dspark_enabled or connector is None:
+    if not is_dspark_enabled(vllm_config) or connector is None:
         return
 
-    architectures = getattr(
-        getattr(vllm_config, "model_config", None),
-        "architectures",
-        (),
-    )
-    if (
-        connector == "MooncakeConnector"
-        and "DeepseekV4ForCausalLM" in architectures
-    ):
+    if connector == "MooncakeConnector" and is_deepseek_v4(vllm_config):
         return
+    architectures = getattr(
+        getattr(vllm_config, "model_config", None), "architectures", ()
+    )
     raise ValueError(
         "DeepSeek-V4 DSpark P/D disaggregation on HCU supports only "
         f"MooncakeConnector; got connector={connector!r}, "
@@ -261,6 +250,12 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             raise ValueError(
                 "deepep_auto with EPLB is not supported because the HT and "
                 "LL expert weight layouts cannot be rebalanced atomically"
+            )
+        if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
+            raise ValueError("HCU deepep_auto requires data_parallel_size > 1.")
+        if not getattr(parallel_config, "enable_expert_parallel", False):
+            raise ValueError(
+                "HCU deepep_auto requires enable_expert_parallel=True."
             )
         if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(

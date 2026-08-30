@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 
 # Keep per-forward HT/LL selection visible in the normal vLLM worker log.
 logger = init_logger("vllm.hcu.deepseek_v4_deepep_auto")
@@ -22,19 +23,13 @@ logger = init_logger("vllm.hcu.deepseek_v4_deepep_auto")
 def dspark_mooncake_pd_use_low_latency(vllm_config: object) -> bool | None:
     """Return the fixed DeepEP layout for a supported Mooncake P/D role."""
 
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if getattr(speculative_config, "method", None) != "dspark":
+    if not is_dspark_enabled(vllm_config):
         return None
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if getattr(kv_transfer_config, "kv_connector", None) != "MooncakeConnector":
         return None
 
-    model_config = getattr(vllm_config, "model_config", None)
-    architectures = getattr(model_config, "architectures", None)
-    if architectures is None:
-        hf_config = getattr(model_config, "hf_config", None)
-        architectures = getattr(hf_config, "architectures", ())
-    if "DeepseekV4ForCausalLM" not in (architectures or ()):
+    if not is_deepseek_v4(vllm_config):
         return None
 
     role = getattr(kv_transfer_config, "kv_role", None)

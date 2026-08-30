@@ -234,6 +234,14 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         10, torch.float16, moe.moe_parallel_config
     ) == 13
 
+    moe.num_experts = 7
+    with pytest.raises(ValueError, match="divisible by the EP world size"):
+        module.maybe_make_prepare_finalize(
+            moe,
+            SimpleNamespace(quant_dtype=torch.float8_e4m3fn),
+            routing_tables,
+        )
+
 
 def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
     monkeypatch: pytest.MonkeyPatch,
@@ -337,6 +345,32 @@ def test_dspark_mooncake_pd_role_selects_one_deepep_layout(
     assert auto_module.dspark_mooncake_pd_use_low_latency(config) is expected
     config.kv_transfer_config.kv_connector = "NixlConnector"
     assert auto_module.dspark_mooncake_pd_use_low_latency(config) is None
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "expected"),
+    [("kv_producer", False), ("kv_consumer", True)],
+)
+def test_callable_dspark_mooncake_pd_role_selects_one_deepep_layout(
+    kv_role: str,
+    expected: bool,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto as auto_module,
+    )
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_dspark=lambda: True),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role=kv_role,
+        ),
+        model_config=SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+        ),
+    )
+
+    assert auto_module.dspark_mooncake_pd_use_low_latency(config) is expected
 
 
 @pytest.mark.parametrize(
@@ -1753,6 +1787,11 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
     config = SimpleNamespace(
         moe_backend="deep_gemm",
         moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+            ),
+        ),
     )
     backend, experts = module.select_fp8_moe_backend(
         config,
@@ -1845,6 +1884,18 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
     ) == "deepep-auto-kernel"
     assert auto_quant._vllm_hcu_channel_fp8_deepgemm is True
     assert auto_kernel_calls == [(auto_quant, auto_config, "routing")]
+    config._hcu_vllm_config.model_config.architectures = [
+        "Qwen3MoeForCausalLM"
+    ]
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        module.select_fp8_moe_backend(
+            config,
+            kFp8StaticChannelSym,
+            kFp8DynamicTokenSym,
+        )
+    config._hcu_vllm_config.model_config.architectures = [
+        "DeepseekV4ForCausalLM"
+    ]
     with pytest.raises(ValueError, match="only the HCU_DEEPGEMM"):
         module.make_fp8_moe_kernel(
             "quant",

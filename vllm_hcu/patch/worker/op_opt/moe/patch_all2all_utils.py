@@ -72,6 +72,11 @@ def apply_to_module(module: ModuleType) -> bool:
                     "DeepEP auto requires DeepEPAutoAll2AllManager"
                 )
             assert moe.dp_size == all2all_manager.dp_world_size
+            if moe.num_experts % all2all_manager.world_size != 0:
+                raise ValueError(
+                    "deepep_auto requires num_experts to be divisible by the "
+                    "EP world size"
+                )
             global_to_physical = None
             physical_to_global = None
             local_expert_global_ids = None

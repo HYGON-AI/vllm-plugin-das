@@ -1018,6 +1018,8 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         speculative_config=None,
@@ -1073,6 +1075,28 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         ValueError,
         match="deepep_auto.*EPLB.*not supported",
     ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+@pytest.mark.parametrize(
+    ("data_parallel_size", "enable_expert_parallel", "message"),
+    [
+        (1, True, "data_parallel_size > 1"),
+        (8, False, "enable_expert_parallel=True"),
+    ],
+)
+def test_deepep_auto_rejects_non_dp_ep_topology_before_model_loading(
+    data_parallel_size: int,
+    enable_expert_parallel: bool,
+    message: str,
+) -> None:
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = False
+    config.parallel_config.data_parallel_size = data_parallel_size
+    config.parallel_config.enable_expert_parallel = enable_expert_parallel
+
+    with pytest.raises(ValueError, match=message):
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 

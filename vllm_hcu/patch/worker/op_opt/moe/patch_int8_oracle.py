@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+from vllm_hcu.deepseek_v4_runtime import model_architectures
 from vllm_hcu.patch.config import get_hcu_config
 
 from ._common import (
@@ -47,12 +48,7 @@ def _model_architectures(config) -> tuple[str, ...]:
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         vllm_config = getattr(config, "_hcu_vllm_config", None)
-    model_config = getattr(vllm_config, "model_config", None)
-    architectures = getattr(model_config, "architectures", None)
-    if architectures is None:
-        hf_config = getattr(model_config, "hf_config", None)
-        architectures = getattr(hf_config, "architectures", ())
-    return tuple(architectures or ())
+    return model_architectures(vllm_config)
 
 
 def apply_to_module(module: ModuleType) -> bool:
