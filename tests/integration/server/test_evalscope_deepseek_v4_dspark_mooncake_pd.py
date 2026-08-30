@@ -397,7 +397,6 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
     ]
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)
@@ -414,7 +413,6 @@ def test_deepseek_v4_dspark_humaneval_fp8_mooncake_pd() -> None:
     )
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)

@@ -116,7 +116,7 @@ The live gfx938 operator suite passed all ten FP8/INT8 cases:
 
 ```bash
 HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=__disabled__ \
-python -m pytest -q tests/accuracy/test_deepseek_v4_dspark_ops.py -m hcu -s
+python -m pytest -q tests/accuracy/test_deepseek_v4_dspark_ops.py -s
 ```
 
 Observed result: `10 passed`. FP8 coverage includes:

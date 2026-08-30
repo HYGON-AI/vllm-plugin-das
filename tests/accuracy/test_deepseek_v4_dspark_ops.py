@@ -11,9 +11,6 @@ import torch
 import torch.nn.functional as functional
 
 
-pytestmark = pytest.mark.hcu
-
-
 def _hcu_device() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("a live HCU/ROCm device is required")

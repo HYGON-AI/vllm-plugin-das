@@ -235,7 +235,6 @@ def test_deepseek_v4_dspark_humaneval_request_is_deterministic(
     assert _option_value(command, "--datasets") == "humaneval"
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)
@@ -252,7 +251,6 @@ def test_deepseek_v4_dspark_humaneval_tp8() -> None:
     )
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)
@@ -269,7 +267,6 @@ def test_deepseek_v4_dspark_humaneval_tp8_aiter() -> None:
     )
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)
@@ -286,7 +283,6 @@ def test_deepseek_v4_dspark_humaneval_dp8_ep8() -> None:
     )
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)
@@ -303,7 +299,6 @@ def test_deepseek_v4_int8_dspark_humaneval_tp8() -> None:
     )
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)
@@ -320,7 +315,6 @@ def test_deepseek_v4_int8_dspark_humaneval_tp8_aiter() -> None:
     )
 
 
-@pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
 @pytest.mark.hcu_count(8)

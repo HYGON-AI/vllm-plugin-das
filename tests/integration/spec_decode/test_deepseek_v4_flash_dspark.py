@@ -21,7 +21,6 @@ INT8_MODEL_PATH = "DeepSeek-V4-Flash-0731-Channel-INT8-w8a8"
 INT8_MODEL_ENV = "VLLM_HCU_DEEPSEEK_V4_FLASH_0731_INT8_MODEL"
 
 pytestmark = [
-    pytest.mark.hcu,
     pytest.mark.model,
     pytest.mark.multi_hcu,
     pytest.mark.slow,
