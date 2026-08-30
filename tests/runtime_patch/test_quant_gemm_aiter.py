@@ -673,7 +673,10 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
                 "hcu": {
                     "moe_backend": "deep_gemm",
                 }
-            }
+            },
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+            ),
         ),
     )
     backend, experts = target.select_int8_moe_backend(
@@ -722,6 +725,19 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     ) is auto_kernel
     assert auto_kernel_calls == [(auto_quant_config, config, "routing")]
     assert auto_processed_layers == [auto_layer]
+
+    config._hcu_vllm_config.model_config.architectures = [
+        "GlmMoeDsaForCausalLM"
+    ]
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        target.select_int8_moe_backend(
+            config,
+            kInt8StaticChannelSym,
+            kInt8DynamicTokenSym,
+        )
+    config._hcu_vllm_config.model_config.architectures = [
+        "DeepseekV4ForCausalLM"
+    ]
     config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = False
     config.moe_parallel_config.use_deepep_auto_kernels = False
     config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "deep_gemm"

@@ -41,6 +41,20 @@ def _sidecar_config(config):
     return get_hcu_config(vllm_config)
 
 
+def _model_architectures(config) -> tuple[str, ...]:
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        vllm_config = getattr(config, "_hcu_vllm_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", ())
+    return tuple(architectures or ())
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     if getattr(target, _MARKER, False):
@@ -154,6 +168,14 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_select_int8_moe_backend(config, weight_key, activation_key):
         sidecar = _sidecar_config(config)
         if sidecar.deepep_auto:
+            architectures = _model_architectures(config)
+            if "DeepseekV4ForCausalLM" not in architectures:
+                raise ValueError(
+                    "HCU Channel-INT8 deepep_auto is validated only for "
+                    "DeepSeek-V4; use an explicit DeepEP high-throughput or "
+                    "low-latency backend for other models. "
+                    f"Got architectures={architectures!r}."
+                )
             if sidecar.moe_backend not in ("auto", "deep_gemm"):
                 raise ValueError(
                     "deepep_auto requires moe_backend='auto' or 'deep_gemm'"
