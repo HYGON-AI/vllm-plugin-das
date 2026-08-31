@@ -138,6 +138,10 @@ def _attention_metadata_is_pure_spec_decode(
         if max_query_len is None or max_seq_len is None:
             continue
         found_attention_metadata = True
+        if not _is_explicitly_non_prefilling(
+            getattr(metadata, "is_prefilling", None)
+        ):
+            return False
         max_query_len = int(max_query_len)
         max_seq_len = int(max_seq_len)
         if not (
@@ -146,6 +150,24 @@ def _attention_metadata_is_pure_spec_decode(
         ):
             return False
     return found_attention_metadata
+
+
+def _is_explicitly_non_prefilling(value: object | None) -> bool:
+    """Return true only for non-empty phase evidence containing only false."""
+
+    if value is None:
+        return False
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            value = tolist()
+        except (TypeError, ValueError):
+            return False
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(
+            _is_explicitly_non_prefilling(item) for item in value
+        )
+    return isinstance(value, bool) and not value
 
 
 @contextmanager
