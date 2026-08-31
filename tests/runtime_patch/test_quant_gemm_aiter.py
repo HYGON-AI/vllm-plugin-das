@@ -3856,6 +3856,55 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_tp_aiter_keeps_raw_canonical_owner(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The DP auto ownership exception must not mutate pure-TP AITER weights."""
+
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(moe_backend="aiter"),
+    )
+    w13 = torch.nn.Parameter(
+        torch.arange(16, dtype=torch.int8).reshape(1, 8, 2),
+        requires_grad=False,
+    )
+    w2 = torch.nn.Parameter(
+        torch.arange(8, dtype=torch.int8).reshape(1, 4, 2),
+        requires_grad=False,
+    )
+    layer = SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones((1, 8, 1), dtype=torch.float32), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((1, 4, 1), dtype=torch.float32), requires_grad=False
+        ),
+    )
+    expected_w13 = w13.detach().clone()
+    expected_w2 = w2.detach().clone()
+    prewarm_calls: list[object] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda _method, owner: prewarm_calls.append(owner),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert prewarm_calls == [layer]
+    assert layer.w13_weight is w13
+    assert layer.w2_weight is w2
+    torch.testing.assert_close(layer.w13_weight, expected_w13)
+    torch.testing.assert_close(layer.w2_weight, expected_w2)
+    assert not hasattr(layer, "_slimquant_w4a8_deepep_auto_layout")
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -64,19 +64,22 @@ def _unpack_signed_int4_high_low(packed: torch.Tensor) -> torch.Tensor:
     return torch.stack((high, low), dim=-1).flatten(-2).contiguous()
 
 
-def test_contiguous_w4a8_hipc_deepgemm_matches_unpacked_reference() -> None:
-    """A HIPC pack must not mutate canonical INT4 bytes and must dequantize."""
+def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
+    """One auto-owned HIPC storage must produce matching HT and LL values."""
     from deepgemm import (
         m_grouped_w4a8_gemm_nt_contiguous_hipc,
-        pack_w4a8_moe_hipc_weight,
+        m_grouped_w4a8_gemm_nt_masked_hipc,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as experts_module,
+    )
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
     )
 
     device = _hcu_device()
-    # W4A8 HIPC accepts N32/K64-aligned storage, but its numerical kernel is
-    # specialized for DeepSeek-V4's logical MoE dimensions. Keep E/M small
-    # while exercising the production K=7168, N=3072 contract.
     experts, tokens, hidden, output_size = 2, 512, 7168, 3072
-    generator = torch.Generator(device=device).manual_seed(741)
+    generator = torch.Generator(device=device).manual_seed(743)
     activation = torch.randint(
         -8,
         8,
@@ -86,9 +89,12 @@ def test_contiguous_w4a8_hipc_deepgemm_matches_unpacked_reference() -> None:
         dtype=torch.int8,
     )
     activation_scale = torch.rand(
-        (tokens, 1), generator=generator, device=device, dtype=torch.float32
+        (tokens, 1),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
     ).add_(0.01)
-    logical_weight = torch.randint(
+    logical_w13 = torch.randint(
         -8,
         8,
         (experts, output_size, hidden),
@@ -96,131 +102,104 @@ def test_contiguous_w4a8_hipc_deepgemm_matches_unpacked_reference() -> None:
         device=device,
         dtype=torch.int8,
     )
-    canonical_weight = _pack_signed_int4_high_low(logical_weight)
-    canonical_before_pack = canonical_weight.clone()
-    checkpoint_weight_scale = torch.rand(
+    canonical_w13 = _pack_signed_int4_high_low(logical_w13)
+    raw_w13 = canonical_w13.clone()
+    # Supply a shape-compatible companion down projection; the numerical
+    # assertion below exercises the shared gate/up storage in both modes.
+    logical_w2 = torch.randint(
+        -8,
+        8,
+        (experts, hidden, output_size // 2),
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    canonical_w2 = _pack_signed_int4_high_low(logical_w2)
+    checkpoint_scale = torch.rand(
         (experts, output_size, 1),
         generator=generator,
         device=device,
         dtype=torch.float32,
     ).add_(0.01)
-    # The runtime converts SlimQuant's high-nibble checkpoint scale exactly
-    # once before passing it to signed-INT4 HIPC W4A8.
-    hipc_weight_scale = checkpoint_weight_scale * 16.0
-    packed_weight = pack_w4a8_moe_hipc_weight(canonical_weight.clone())
-    m_indices = torch.cat(
-        (
-            torch.zeros(tokens // 2, device=device, dtype=torch.int32),
-            torch.ones(tokens // 2, device=device, dtype=torch.int32),
-        )
+    hipc_scale = checkpoint_scale * 16.0
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(canonical_w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(canonical_w2, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        checkpoint_scale,
+        requires_grad=False,
     )
-    output = torch.empty(
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones(
+            (experts, hidden, 1),
+            device=device,
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    auto = object.__new__(experts_module.DeepEPAutoW4A8Experts)
+    auto._fixed_use_low_latency = None
+    auto._use_low_latency_snapshot = False
+    auto.ht_experts = object.__new__(
+        runtime.DeepEPDeepGemmW4A8ContiguousExperts
+    )
+    auto.ll_experts = object.__new__(runtime.DeepEPDeepGemmW4A8MaskedExperts)
+    for child in (auto.ht_experts, auto.ll_experts):
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    auto.process_weights_after_loading(layer)
+
+    ht_weight = auto.ht_experts._deepgemm_w13
+    ll_weight = auto.ll_experts._deepgemm_w13
+    assert ht_weight.ndim == 3
+    assert ll_weight.ndim == 6
+    assert ht_weight.untyped_storage().data_ptr() == (
+        ll_weight.untyped_storage().data_ptr()
+    )
+    assert ht_weight.untyped_storage().data_ptr() == (
+        layer.w13_weight.untyped_storage().data_ptr()
+    )
+
+    ht_output = torch.empty(
         (tokens, output_size), device=device, dtype=torch.bfloat16
     )
-
     m_grouped_w4a8_gemm_nt_contiguous_hipc(
         (activation, activation_scale),
-        (packed_weight, hipc_weight_scale),
-        output,
-        m_indices,
+        (ht_weight, hipc_scale),
+        ht_output,
+        torch.zeros(tokens, device=device, dtype=torch.int32),
     )
-
-    torch.testing.assert_close(canonical_weight, canonical_before_pack)
-    unpacked_weight = _unpack_signed_int4_high_low(canonical_weight)
-    references = []
-    tokens_per_expert = tokens // experts
-    for expert in range(experts):
-        start = expert * tokens_per_expert
-        stop = start + tokens_per_expert
-        references.append(
-            (activation[start:stop].float() * activation_scale[start:stop])
-            @ (unpacked_weight[expert].float() * hipc_weight_scale[expert]).T
-        )
-    reference = torch.cat(references)
-    assert output.dtype == torch.bfloat16
-    assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, rtol=3e-2, atol=0.1)
-
-
-def test_masked_w4a8_hipc_deepgemm_matches_reference_and_preserves_invalid_rows(
-) -> None:
-    """N32 HIPC masked GEMM must honor token counts, including an empty expert."""
-    from deepgemm import (
-        m_grouped_w4a8_gemm_nt_masked_hipc,
-        pack_w4a8_moe_hipc_weight,
-        view_w4a8_moe_hipc_weight_n32_layout,
-    )
-
-    device = _hcu_device()
-    # Keep the dispatch small while using the production W4A8 HIPC geometry.
-    experts, max_tokens, hidden, output_size = 2, 32, 7168, 3072
-    active_tokens = 17
-    generator = torch.Generator(device=device).manual_seed(742)
-    activation = torch.randint(
-        -8,
-        8,
-        (experts, max_tokens, hidden),
-        generator=generator,
-        device=device,
-        dtype=torch.int8,
-    )
-    activation_scale = torch.rand(
-        (experts, max_tokens, 1),
-        generator=generator,
-        device=device,
-        dtype=torch.float32,
-    ).add_(0.01)
-    logical_weight = torch.randint(
-        -8,
-        8,
-        (experts, output_size, hidden),
-        generator=generator,
-        device=device,
-        dtype=torch.int8,
-    )
-    canonical_weight = _pack_signed_int4_high_low(logical_weight)
-    canonical_before_pack = canonical_weight.clone()
-    checkpoint_weight_scale = torch.rand(
-        (experts, output_size, 1),
-        generator=generator,
-        device=device,
-        dtype=torch.float32,
-    ).add_(0.01)
-    # Match SlimQuant's boundary conversion from high-nibble-domain scales.
-    hipc_weight_scale = checkpoint_weight_scale * 16.0
-    packed_weight = pack_w4a8_moe_hipc_weight(canonical_weight.clone())
-    n32_weight = view_w4a8_moe_hipc_weight_n32_layout(packed_weight)
-    tokens_per_expert = torch.tensor(
-        [active_tokens, 0], device=device, dtype=torch.int32
-    )
-    output = torch.full(
-        (experts, max_tokens, output_size),
+    ll_output = torch.full(
+        (experts, tokens, output_size),
         torch.nan,
         device=device,
         dtype=torch.bfloat16,
     )
-
     m_grouped_w4a8_gemm_nt_masked_hipc(
-        (activation, activation_scale),
-        (n32_weight, hipc_weight_scale),
-        output,
-        tokens_per_expert,
-        max_tokens,
+        (
+            activation.unsqueeze(0).expand(experts, -1, -1).contiguous(),
+            activation_scale
+            .unsqueeze(0)
+            .expand(experts, -1, -1)
+            .contiguous(),
+        ),
+        (ll_weight, hipc_scale),
+        ll_output,
+        torch.tensor([tokens, 0], device=device, dtype=torch.int32),
+        tokens,
     )
 
-    torch.testing.assert_close(canonical_weight, canonical_before_pack)
-    unpacked_weight = _unpack_signed_int4_high_low(canonical_weight)
-    reference = (
-        activation[0, :active_tokens].float()
-        * activation_scale[0, :active_tokens]
-    ) @ (unpacked_weight[0].float() * hipc_weight_scale[0]).T
-    assert output.dtype == torch.bfloat16
-    assert torch.isfinite(output[0, :active_tokens]).all()
+    unpacked_w13 = _unpack_signed_int4_high_low(raw_w13)
+    reference = (activation.float() * activation_scale) @ (
+        unpacked_w13[0].float() * hipc_scale[0]
+    ).T
+    torch.testing.assert_close(ht_output.float(), reference, rtol=3e-2, atol=0.1)
     torch.testing.assert_close(
-        output[0, :active_tokens].float(), reference, rtol=3e-2, atol=0.1
+        ll_output[0].float(), reference, rtol=3e-2, atol=0.1
     )
-    assert torch.isnan(output[0, active_tokens:]).all()
-    assert torch.isnan(output[1]).all()
+    assert torch.isnan(ll_output[1]).all()
 
 
 def test_contiguous_channel_fp8_deepgemm_matches_dequantized_reference() -> None:

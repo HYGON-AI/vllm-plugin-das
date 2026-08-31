@@ -2880,6 +2880,262 @@ def test_channel_auto_experts_construct_only_mooncake_pd_role_layout(
     assert experts.ht_experts is experts.ll_experts
 
 
+def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    experts = object.__new__(module.DeepEPAutoW4A8Experts)
+    experts._fixed_use_low_latency = fixed_use_low_latency
+    experts._use_low_latency_snapshot = False
+    if fixed_use_low_latency is True:
+        child = object.__new__(runtime.DeepEPDeepGemmW4A8MaskedExperts)
+        experts.ht_experts = child
+        experts.ll_experts = child
+    elif fixed_use_low_latency is False:
+        child = object.__new__(runtime.DeepEPDeepGemmW4A8ContiguousExperts)
+        experts.ht_experts = child
+        experts.ll_experts = child
+    else:
+        experts.ht_experts = object.__new__(
+            runtime.DeepEPDeepGemmW4A8ContiguousExperts
+        )
+        experts.ll_experts = object.__new__(
+            runtime.DeepEPDeepGemmW4A8MaskedExperts
+        )
+    for child in {experts.ht_experts, experts.ll_experts}:
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+    return experts
+
+
+def _slimquant_w4a8_auto_layer() -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 32), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 64, 32), dtype=torch.int8),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 128, 1), dtype=torch.float32),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((1, 64, 1), dtype=torch.float32),
+        requires_grad=False,
+    )
+    return layer
+
+
+def _install_in_place_w4a8_packers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    pack_calls: list[torch.Tensor] = []
+    view_calls: list[torch.Tensor] = []
+
+    def pack(weight: torch.Tensor) -> torch.Tensor:
+        pack_calls.append(weight)
+        weight.fill_(40 + len(pack_calls))
+        return weight
+
+    def n32_view(weight: torch.Tensor) -> torch.Tensor:
+        view_calls.append(weight)
+        experts, n, k_half = weight.shape
+        return weight.view(experts, k_half // 32, n // 32, 4, 32, 8)
+
+    monkeypatch.setattr(runtime, "pack_w4a8_moe_hipc_weight", pack)
+    monkeypatch.setattr(
+        runtime,
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        n32_view,
+    )
+    return pack_calls, view_calls
+
+
+@pytest.mark.parametrize(
+    ("fixed_use_low_latency", "layout", "expected_view_calls"),
+    [
+        (None, "shared_hipc_auto", 2),
+        (False, "shared_hipc_contiguous", 0),
+        (True, "shared_hipc_n32", 2),
+    ],
+)
+def test_slimquant_w4a8_auto_packs_original_storage_once_for_role(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_use_low_latency: bool | None,
+    layout: str,
+    expected_view_calls: int,
+):
+    """The strict auto owner must not retain a full cloned weight layout."""
+
+    pack_calls, view_calls = _install_in_place_w4a8_packers(monkeypatch)
+    experts = _slimquant_w4a8_auto_experts(fixed_use_low_latency)
+    layer = _slimquant_w4a8_auto_layer()
+    original_w13 = layer.w13_weight
+    original_w2 = layer.w2_weight
+
+    experts.process_weights_after_loading(layer)
+
+    assert len(pack_calls) == 2
+    assert [weight.untyped_storage().data_ptr() for weight in pack_calls] == [
+        original_w13.untyped_storage().data_ptr(),
+        original_w2.untyped_storage().data_ptr(),
+    ]
+    assert layer.w13_weight is original_w13
+    assert layer.w2_weight is original_w2
+    assert len(view_calls) == expected_view_calls
+    assert layer._slimquant_w4a8_deepep_auto_layout == layout
+    current = experts._current()
+    expected_rank = 6 if fixed_use_low_latency is True else 3
+    assert current._deepgemm_w13.ndim == expected_rank
+    assert current._deepgemm_w2.ndim == expected_rank
+    assert current._deepgemm_w13.untyped_storage().data_ptr() == (
+        layer.w13_weight.untyped_storage().data_ptr()
+    )
+    assert current._deepgemm_w2.untyped_storage().data_ptr() == (
+        layer.w2_weight.untyped_storage().data_ptr()
+    )
+    if fixed_use_low_latency is None:
+        assert experts.ht_experts._deepgemm_w13.ndim == 3
+        assert experts.ht_experts._deepgemm_w2.ndim == 3
+        assert experts.ll_experts._deepgemm_w13.ndim == 6
+        assert experts.ll_experts._deepgemm_w2.ndim == 6
+        assert experts.ht_experts._deepgemm_w13.untyped_storage().data_ptr() == (
+            experts.ll_experts._deepgemm_w13.untyped_storage().data_ptr()
+        )
+        assert experts.ht_experts._deepgemm_w2.untyped_storage().data_ptr() == (
+            experts.ll_experts._deepgemm_w2.untyped_storage().data_ptr()
+        )
+
+
+def test_slimquant_w4a8_auto_is_idempotent_across_state_dict_and_sleep_restore(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Restoring the packed owner in place must only rebuild aliasing views."""
+
+    pack_calls, _ = _install_in_place_w4a8_packers(monkeypatch)
+    layer = _slimquant_w4a8_auto_layer()
+    experts = _slimquant_w4a8_auto_experts(None)
+    experts.process_weights_after_loading(layer)
+    owner_ptrs = (
+        layer.w13_weight.untyped_storage().data_ptr(),
+        layer.w2_weight.untyped_storage().data_ptr(),
+    )
+    packed_state = {name: value.clone() for name, value in layer.state_dict().items()}
+
+    # CuMem level-1 sleep/wake restores the tagged weight allocation at the
+    # same virtual address.  Exercise the equivalent in-place byte restore.
+    layer.w13_weight.zero_()
+    layer.w2_weight.zero_()
+    layer.load_state_dict(packed_state)
+    replacement = _slimquant_w4a8_auto_experts(None)
+    replacement.process_weights_after_loading(layer)
+
+    assert len(pack_calls) == 2
+    assert owner_ptrs == (
+        layer.w13_weight.untyped_storage().data_ptr(),
+        layer.w2_weight.untyped_storage().data_ptr(),
+    )
+    torch.testing.assert_close(layer.w13_weight, packed_state["w13_weight"])
+    torch.testing.assert_close(layer.w2_weight, packed_state["w2_weight"])
+    assert replacement.ht_experts._deepgemm_w13.untyped_storage().data_ptr() == (
+        replacement.ll_experts._deepgemm_w13.untyped_storage().data_ptr()
+    )
+    assert not any("deepep_auto" in name for name in packed_state)
+
+
+def test_slimquant_w4a8_auto_reloads_raw_weights_into_existing_owner(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Checkpoint reload may use temporary Parameters but must retain one owner."""
+
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _copy_and_restore_kernel_tensors,
+    )
+
+    pack_calls, _ = _install_in_place_w4a8_packers(monkeypatch)
+    layer = _slimquant_w4a8_auto_layer()
+    experts = _slimquant_w4a8_auto_experts(None)
+    experts.process_weights_after_loading(layer)
+    kernel_parameters = dict(layer.named_parameters(recurse=False))
+    owner_w13 = layer.w13_weight
+    owner_w2 = layer.w2_weight
+    owner_ptrs = (
+        owner_w13.untyped_storage().data_ptr(),
+        owner_w2.untyped_storage().data_ptr(),
+    )
+
+    reloaded_w13 = torch.nn.Parameter(
+        torch.full_like(owner_w13, 3), requires_grad=False
+    )
+    reloaded_w2 = torch.nn.Parameter(
+        torch.full_like(owner_w2, 5), requires_grad=False
+    )
+    layer.w13_weight = reloaded_w13
+    layer.w2_weight = reloaded_w2
+    replacement = _slimquant_w4a8_auto_experts(None)
+    replacement.process_weights_after_loading(layer)
+    _copy_and_restore_kernel_tensors(
+        layer,
+        SimpleNamespace(kernel_tensors=(kernel_parameters, {})),
+    )
+
+    assert len(pack_calls) == 4
+    assert [weight.untyped_storage().data_ptr() for weight in pack_calls] == [
+        owner_w13.untyped_storage().data_ptr(),
+        owner_w2.untyped_storage().data_ptr(),
+        reloaded_w13.untyped_storage().data_ptr(),
+        reloaded_w2.untyped_storage().data_ptr(),
+    ]
+    assert layer.w13_weight is owner_w13
+    assert layer.w2_weight is owner_w2
+    assert layer.w13_weight.untyped_storage().data_ptr() == owner_ptrs[0]
+    assert layer.w2_weight.untyped_storage().data_ptr() == owner_ptrs[1]
+    assert torch.count_nonzero(layer.w13_weight != 43) == 0
+    assert torch.count_nonzero(layer.w2_weight != 44) == 0
+    assert replacement.ht_experts._deepgemm_w13.untyped_storage().data_ptr() == (
+        replacement.ll_experts._deepgemm_w13.untyped_storage().data_ptr()
+    )
+
+
+def test_slimquant_w4a8_auto_rejects_incompatible_marker_before_repacking(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A partial/unknown packed marker must not repack transformed bytes."""
+
+    pack_calls, _ = _install_in_place_w4a8_packers(monkeypatch)
+    layer = _slimquant_w4a8_auto_layer()
+    layer._slimquant_w4a8_deepep_auto_layout = "unknown_transformed_layout"
+    experts = _slimquant_w4a8_auto_experts(None)
+
+    with pytest.raises(RuntimeError, match="invalid.*deepep_auto.*marker"):
+        experts.process_weights_after_loading(layer)
+
+    assert pack_calls == []
+
+    valid_layer = _slimquant_w4a8_auto_layer()
+    valid_experts = _slimquant_w4a8_auto_experts(None)
+    valid_experts.process_weights_after_loading(valid_layer)
+    valid_layer._slimquant_w4a8_deepep_auto_packed_w13 = (
+        valid_layer._slimquant_w4a8_deepep_auto_packed_w13.flatten()
+    )
+
+    with pytest.raises(RuntimeError, match="invalid.*deepep_auto.*marker"):
+        valid_experts.process_weights_after_loading(valid_layer)
+
+    assert len(pack_calls) == 2
+
+
 def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -80,12 +80,26 @@ deepep_auto forward snapshot
     `-- low latency     -> masked N32 HIPC W4A8 DeepGEMM
 ```
 
-The implementation must preserve raw checkpoint parameters as canonical
-owners and cache any packed/view layout separately when required by the base
-branch's expert lifecycle. Scale conversion remains exactly once at the
-quantization boundary. Expert maps, empty-rank behavior, shared experts, and
-prepare/expert/finalize selection must follow the existing `deepep_auto`
-snapshot contract.
+Raw checkpoint parameters remain the canonical owners for pure-TP AITER,
+which can select a different dynamic solution after load. The strict
+`dp_size > 1` plus EP plus `deepep_auto` route is the only ownership exception:
+after checkpoint load it packs each local W4A8 parameter once in place, keeps
+the registered rank-3 tensor as the single HIPC owner, and gives masked LL an
+N32 rank-6 view of that same storage. Fixed Mooncake P/D roles build only their
+selected rank-3 or N32 handle. No raw HCU copy or second packed weight owner is
+retained. Scale conversion remains exactly once at the quantization boundary.
+Expert maps, empty-rank behavior, shared experts, and prepare/expert/finalize
+selection must follow the existing `deepep_auto` snapshot contract.
+
+The auto-route layout marker is idempotent and fail-closed: an unchanged
+post-load owner is rebound without repacking; checkpoint reload packs the new
+raw parameter once and copies it into the existing kernel storage used by
+v0.25.1 layerwise reload; an unknown marker, missing owner, or incompatible
+shape is rejected before transformed bytes can be packed again. Level-1
+sleep/wake restores the allocator's `weights` storage at the same address, so
+the rank-3/N32 alias remains valid. A post-load state dict contains the packed
+registered owners, not extra N32 tensors; such a dict is kernel-format state,
+not raw checkpoint-format input.
 
 Unsupported topologies or quantization metadata fail with an explicit error;
 they must not silently enter AITER, LightOp, or an incompatible W8A8 kernel.
@@ -112,8 +126,10 @@ The supported speculative configuration is:
   workflow, or script changes.
 - Existing latest-base SlimQuant W4A8 and unified AITER suites remain green.
 - New tests cover `deepep_auto` expert selection, contiguous and masked W4A8
-  layouts, scale propagation, empty dispatch, expert-map behavior, and
-  fail-closed unsupported metadata.
+  layouts, one in-place pack per local weight, HT/LL storage aliasing, fixed
+  roles, reload/sleep/state-dict idempotence, scale propagation, empty
+  dispatch, expert-map behavior, and fail-closed unsupported metadata or
+  marker state.
 - Existing DSpark target/draft and DeepEP-auto synchronization tests remain
   green.
 
@@ -158,8 +174,8 @@ claimed.
   SlimQuant W4A8 DP+EP delta plus its tests and documentation.
 - Pure TP uses the base branch's unified AITER dispatcher without a competing
   LightOp/AITER routing implementation.
-- DP8+EP8 uses one `deepep_auto` public configuration and correct HT/LL W4A8
-  DeepGEMM layouts.
+- DP8+EP8 uses one `deepep_auto` public configuration and one in-place W4A8
+  HIPC owner per local weight; HT rank-3 and LL N32 layouts share its storage.
 - TP8+AITER+DSpark and DP8+EP8+DSpark have reproducible live evidence, or the
   exact blocking root cause is documented without claiming support.
 - The final test suite passes and independent review has no unresolved

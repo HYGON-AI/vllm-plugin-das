@@ -953,7 +953,11 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
 
 
 class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
-    """Select the W4A8 HIPC layout captured by ``deepep_auto``."""
+    """Own one in-place W4A8 HIPC layout for strict ``deepep_auto``."""
+
+    _LAYOUT_MARKER = "_slimquant_w4a8_deepep_auto_layout"
+    _PACKED_W13 = "_slimquant_w4a8_deepep_auto_packed_w13"
+    _PACKED_W2 = "_slimquant_w4a8_deepep_auto_packed_w2"
 
     def __init__(
         self,
@@ -987,11 +991,98 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
             self.ll_experts = self.ht_experts
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self._fixed_use_low_latency is not None:
-            self._current().process_weights_after_loading(layer)
+        from vllm_hcu.model_executor.layers.quantization import (
+            slimquant_w4a8_deepgemm_runtime as runtime,
+        )
+
+        expected_layout = {
+            None: "shared_hipc_auto",
+            False: "shared_hipc_contiguous",
+            True: "shared_hipc_n32",
+        }[self._fixed_use_low_latency]
+        marker = getattr(layer, self._LAYOUT_MARKER, None)
+        owners = (
+            getattr(layer, self._PACKED_W13, None),
+            getattr(layer, self._PACKED_W2, None),
+        )
+        if marker is None and any(owner is not None for owner in owners):
+            self._invalid_marker()
+        if marker is not None and marker != expected_layout:
+            self._invalid_marker()
+        runtime._validate_w4a8_channel_weights(layer)
+        weights = (layer.w13_weight, layer.w2_weight)
+        if marker is not None:
+            if any(
+                not isinstance(owner, torch.Tensor)
+                or owner.dtype != torch.int8
+                or owner.ndim != 3
+                or tuple(owner.shape) != tuple(weight.shape)
+                for owner, weight in zip(owners, weights)
+            ):
+                self._invalid_marker()
+            if all(self._same_storage(a, b) for a, b in zip(owners, weights)):
+                self._bind_packed_owners(runtime, *owners)
+                return
+
+            # v0.25.1 layerwise reload processes temporary raw Parameters and
+            # then restores the original kernel storage. Reuse that storage so
+            # the temporary allocation cannot become a second resident owner.
+            reloaded = self._pack_in_place(runtime, weights)
+            with torch.no_grad():
+                for owner, weight in zip(owners, reloaded):
+                    owner.copy_(weight)
+            replace_parameter(layer, "w13_weight", owners[0])
+            replace_parameter(layer, "w2_weight", owners[1])
+            self._bind_packed_owners(runtime, *owners)
             return
-        self.ht_experts.process_weights_after_loading(layer)
-        self.ll_experts.process_weights_after_loading(layer)
+
+        self._pack_in_place(runtime, weights)
+        owners = tuple(weight.detach() for weight in weights)
+        setattr(layer, self._PACKED_W13, owners[0])
+        setattr(layer, self._PACKED_W2, owners[1])
+        setattr(layer, self._LAYOUT_MARKER, expected_layout)
+        self._bind_packed_owners(runtime, *owners)
+
+    @staticmethod
+    def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+        return (
+            left.untyped_storage().data_ptr()
+            == right.untyped_storage().data_ptr()
+        )
+
+    def _pack_in_place(self, runtime, weights):
+        with torch.no_grad():
+            packed = tuple(
+                runtime.pack_w4a8_moe_hipc_weight(weight).detach()
+                for weight in weights
+            )
+        if any(
+            weight.ndim != 3 or not self._same_storage(weight, source)
+            for weight, source in zip(packed, weights)
+        ):
+            raise RuntimeError(
+                "SlimQuant W4A8 deepep_auto packer must reuse rank-3 "
+                "weight storage"
+            )
+        return packed
+
+    @staticmethod
+    def _invalid_marker() -> None:
+        raise RuntimeError(
+            "invalid SlimQuant W4A8 deepep_auto marker or owner shape state"
+        )
+
+    def _bind_packed_owners(self, runtime, w13, w2) -> None:
+        if self._fixed_use_low_latency is not True:
+            self.ht_experts._deepgemm_w13 = w13
+            self.ht_experts._deepgemm_w2 = w2
+        if self._fixed_use_low_latency is not False:
+            self.ll_experts._deepgemm_w13 = (
+                runtime.view_w4a8_moe_hipc_weight_n32_layout(w13).detach()
+            )
+            self.ll_experts._deepgemm_w2 = (
+                runtime.view_w4a8_moe_hipc_weight_n32_layout(w2).detach()
+            )
 
     @staticmethod
     def _supports_quant_scheme(
