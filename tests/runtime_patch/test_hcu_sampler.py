@@ -179,9 +179,14 @@ def test_hcu_topk_topp_custom_path_receives_softmax_probs_and_filters(
     assert deterministic is True
 
 
+@pytest.mark.parametrize(
+    "logprobs_mode",
+    ["raw_logprobs", "processed_logits", "processed_logprobs"],
+)
 def test_dummy_profile_uses_safe_greedy_then_native_random_warmup(
     runner_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
+    logprobs_mode: str,
 ) -> None:
     """Dummy profiling must avoid full-vocabulary top-k and warm native RNG."""
 
@@ -202,8 +207,8 @@ def test_dummy_profile_uses_safe_greedy_then_native_random_warmup(
     )
     runner.speculative_config = None
 
-    sampler = HcuSampler()
-    sampler.topk_topp_sampler = HcuTopKTopPSampler()
+    sampler = HcuSampler(logprobs_mode=logprobs_mode)
+    sampler.topk_topp_sampler = HcuTopKTopPSampler(logprobs_mode=logprobs_mode)
     runner.sampler = sampler
 
     metadata_calls: list[SamplingMetadata] = []
