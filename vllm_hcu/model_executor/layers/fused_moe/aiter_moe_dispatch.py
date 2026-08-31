@@ -34,7 +34,7 @@ class AiterMoeProblem:
     block_size: int
     dtype: torch.dtype
     device: torch.device
-    quant_type: str
+    quant_type: object
     activation: str = "silu"
     use_shuffle: bool = True
 

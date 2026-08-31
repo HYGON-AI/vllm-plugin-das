@@ -357,3 +357,32 @@ base passed with:
 ```text
 138 passed, 18 warnings in 36.45s
 ```
+
+### Unified AITER MoE operator validation
+
+The unified dispatcher was validated on one `gfx938` HCU with synthetic
+weights only. No model checkpoint was loaded and no inference server was
+started.
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm \
+python -m pytest \
+  tests/accuracy/test_unified_aiter_moe_operator.py -vv -s -rs
+```
+
+All nine cases passed against vLLM's native Triton fused-MoE reference:
+
+- W16A16: `E=8`, `K=128`, `N=64`, `M=1/16/64`; AITER selected `TRITON`;
+  `rtol=atol=0.02`.
+- INT8 W8A8 channel quantization: `E=256`, `K=2048`, `N=128`,
+  `M=1/16/64`; AITER selected `MOE_C`; `rtol=atol=0.08`.
+- FP8 W8A8 channel quantization: `E=256`, `K=2048`, `N=128`,
+  `M=1/16/64`; AITER selected `MOE_C`; `rtol=atol=0.05`.
+
+The quantized shape uses the smallest hidden size supported by the installed
+AITER channel-quantized `MOE_C` bottom GEMM. The result was:
+
+```text
+9 passed, 14 warnings in 22.78s
+```
