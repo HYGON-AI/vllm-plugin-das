@@ -1171,9 +1171,12 @@ def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
     w1_scale = torch.ones((1, 4, 1))
     w2_scale = torch.ones((1, 2, 1))
+    native_expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
     result = module.fused_experts_impl(
         hidden, w1, w2, topk_weights, topk_ids, "silu", False, False,
-        False, False, True, None, False, 1, None, w1_scale, w2_scale,
+        False, False, True, None, False, 4, expert_mask, w1_scale, w2_scale,
         None, None, None, None, [128, 128], None, None,
     )
 
@@ -1186,6 +1189,10 @@ def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
     torch.testing.assert_close(calls["moe"]["w1_scale"], w1_scale + 1)
     torch.testing.assert_close(calls["moe"]["w2_scale"], w2_scale + 2)
     assert calls["moe"]["use_weight_shuffle"] is False
+    expected_expert_map = (
+        expert_mask if solution_type == "asm" else native_expert_map
+    )
+    assert calls["moe"]["expert_map"] is expected_expert_map
 
 
 def test_fused_moe_w4a16_fallback_is_only_explicit_no_solution(
@@ -1204,7 +1211,7 @@ def test_fused_moe_w4a16_fallback_is_only_explicit_no_solution(
         "def fused_experts_impl("
         + ", ".join(parameter_names)
         + "):\n"
-        + "    original_calls.append((w1, w2, w1_scale, w2_scale))\n"
+        + "    original_calls.append((w1, w2, w1_scale, w2_scale, expert_map))\n"
         + "    return 'official'\n",
         namespace,
     )
@@ -1238,15 +1245,27 @@ def test_fused_moe_w4a16_fallback_is_only_explicit_no_solution(
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
     w1_scale = torch.ones((1, 4, 1))
     w2_scale = torch.ones((1, 2, 1))
+    native_expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
     arguments = (
         hidden, w1, w2, topk_weights, topk_ids, "silu", False, False,
-        False, False, True, None, False, 1, None, w1_scale, w2_scale,
+        False, False, True, None, False, 4, expert_mask, w1_scale, w2_scale,
         None, None, None, None, [128, 128], None, None,
     )
 
     assert module.fused_experts_impl(*arguments) == "official"
     original_calls = namespace["original_calls"]
-    assert original_calls == [(w1, w2, w1_scale, w2_scale)]
+    assert len(original_calls) == 1
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            original_calls[0][:4],
+            (w1, w2, w1_scale, w2_scale),
+            strict=True,
+        )
+    )
+    assert original_calls[0][4] is native_expert_map
 
     def config_fault(**kwargs: object):
         raise RuntimeError("aiter config fault")
@@ -1256,7 +1275,7 @@ def test_fused_moe_w4a16_fallback_is_only_explicit_no_solution(
     fault_arguments[1] = w1.clone()
     with pytest.raises(RuntimeError, match="aiter config fault"):
         module.fused_experts_impl(*fault_arguments)
-    assert original_calls == [(w1, w2, w1_scale, w2_scale)]
+    assert len(original_calls) == 1
 
 
 def test_modular_method_dimensions_and_prequant_contract():
@@ -1487,6 +1506,12 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.layer_name = "model.layers.0.mlp"
             self.expert_mapping = []
             self.official_loads = []
+            self._expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+            self.expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+
+        @property
+        def expert_map(self):
+            return self.expert_mask
 
         def _replace_quant_method(self, method):
             self.quant_method = method
@@ -1561,6 +1586,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+    assert experts.expert_map is experts.expert_mask
+    assert (
+        experts.expert_mask._vllm_hcu_native_expert_map is experts._expert_map
+    )
 
     experts._dsv4_channel_deepgemm_repacked = True
     experts.w13_weight = torch.arange(24).reshape(2, 3, 4)

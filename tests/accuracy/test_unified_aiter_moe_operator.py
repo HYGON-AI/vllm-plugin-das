@@ -21,8 +21,6 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
     aiter_asm_boltops_int8_quant_context,
 )
 
-pytestmark = pytest.mark.hcu
-
 TOLERANCES = {
     "w16a16": {"rtol": 2e-2, "atol": 2e-2},
     "int8_w8a8": {"rtol": 8e-2, "atol": 8e-2},

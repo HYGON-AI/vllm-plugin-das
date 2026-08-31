@@ -23,6 +23,7 @@ TARGETS = (
     f"{TARGET_MODULE}.FusedMoE",
     f"{TARGET_MODULE}.RoutedExperts.get_expert_weights",
     f"{TARGET_MODULE}.RoutedExperts.load_weights",
+    f"{TARGET_MODULE}.RoutedExperts.expert_map",
 )
 _MARKER = "_vllm_hcu_moe_layer_applied"
 
@@ -59,6 +60,13 @@ def apply_to_module(module: ModuleType) -> bool:
             f"{TARGET_MODULE}.RoutedExperts does not reference the required "
             f"v0.25.1 {LAYER_MODULE}.RoutedExperts class"
         )
+    expert_map_property = vars(routed_experts_cls).get("expert_map")
+    if not isinstance(expert_map_property, property) or not callable(
+        expert_map_property.fget
+    ):
+        raise PatchCompatibilityError(
+            f"{TARGETS[3]} must remain a property"
+        )
     get_weights = require_callable(
         routed_experts_cls, "get_expert_weights", TARGETS[1]
     )
@@ -84,6 +92,26 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     require_parameter_names(get_weights, TARGETS[1], ("self",))
     require_parameter_names(load_weights, TARGETS[2], ("self", "weights"))
+
+    @functools.wraps(expert_map_property.fget)
+    def hcu_expert_map(self):
+        value = expert_map_property.fget(self)
+        native_map = getattr(self, "_expert_map", None)
+        expert_mask = getattr(self, "expert_mask", None)
+        if (
+            value is expert_mask
+            and expert_mask is not None
+            and native_map is not None
+        ):
+            expert_mask._vllm_hcu_native_expert_map = native_map
+        return value
+
+    routed_experts_cls.expert_map = property(
+        hcu_expert_map,
+        expert_map_property.fset,
+        expert_map_property.fdel,
+        expert_map_property.__doc__,
+    )
 
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):

@@ -5,16 +5,26 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
+from threading import Lock
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
-_CACHE_LIMIT = 8
+logger = init_logger(__name__)
+
+_SELECTION_CACHE_LIMIT = 128
+_DERIVED_CACHE_LIMIT = 8
+_ROUTE_LOG_CACHE_LIMIT = 1024
 _SELECTION_CACHE_ATTR = "_hcu_aiter_moe_selection_cache"
 _WEIGHT_CACHE_ATTR = "_hcu_aiter_moe_weight_cache"
 _SCALE_CACHE_ATTR = "_hcu_aiter_moe_scale_cache"
+_NATIVE_EXPERT_MAP_ATTR = "_vllm_hcu_native_expert_map"
+_M1_CAPABILITY_ATTR = "_hcu_aiter_moe_m1_supported"
+_ROUTE_LOG_CACHE: OrderedDict["AiterMoeProblem", None] = OrderedDict()
+_ROUTE_LOG_LOCK = Lock()
 
 
 class HcuAiterMoeDispatchError(RuntimeError):
@@ -62,11 +72,31 @@ def _owner_cache(owner: object, name: str) -> OrderedDict[Any, Any]:
     return cache
 
 
-def _cache_put(cache: OrderedDict[Any, Any], key: Any, value: Any) -> None:
+def _cache_put(
+    cache: OrderedDict[Any, Any],
+    key: Any,
+    value: Any,
+    *,
+    limit: int,
+) -> None:
     cache[key] = value
     cache.move_to_end(key)
-    while len(cache) > _CACHE_LIMIT:
+    while len(cache) > limit:
         cache.popitem(last=False)
+
+
+def _mark_route_logged(problem: "AiterMoeProblem") -> bool:
+    with _ROUTE_LOG_LOCK:
+        if problem in _ROUTE_LOG_CACHE:
+            _ROUTE_LOG_CACHE.move_to_end(problem)
+            return False
+        _cache_put(
+            _ROUTE_LOG_CACHE,
+            problem,
+            None,
+            limit=_ROUTE_LOG_CACHE_LIMIT,
+        )
+    return True
 
 
 def _freeze(value: Any) -> Any:
@@ -90,13 +120,26 @@ def _solution_token(config: object) -> str:
     return str(solution).rsplit(".", 1)[-1].upper()
 
 
-def _config_generation(config: object) -> tuple[Any, ...]:
+def _weight_layout_generation(config: object) -> tuple[Any, ...]:
+    config_values = getattr(config, "config", None)
+    padded_k = (
+        config_values.get("PADDED_K")
+        if isinstance(config_values, dict)
+        else None
+    )
     return (
         _freeze(getattr(config, "quant_type", None)),
         _solution_token(config),
         bool(getattr(config, "need_shuffle", False)),
+        _freeze(padded_k),
+    )
+
+
+def _scale_layout_generation(config: object) -> tuple[Any, ...]:
+    return (
+        _freeze(getattr(config, "quant_type", None)),
+        _solution_token(config),
         bool(getattr(config, "need_shuffle_scale", False)),
-        _freeze(getattr(config, "config", None)),
     )
 
 
@@ -133,7 +176,34 @@ def _validate_derived_tensor(
             f"AITER returned a non-tensor {label}; "
             f"solution={_solution_token(config)}"
         )
-    if derived.shape != original.shape:
+    compatible_shape = derived.shape == original.shape
+    config_values = getattr(config, "config", None)
+    if not compatible_shape and isinstance(config_values, dict):
+        padded_k = config_values.get("PADDED_K")
+        original_k = config_values.get("ORIGINAL_K")
+        try:
+            padded_k = int(padded_k)
+            original_k = int(original_k)
+        except (TypeError, ValueError):
+            padded_k = original_k = -1
+        mismatched_dims = (
+            [
+                index
+                for index, (actual, expected) in enumerate(
+                    zip(derived.shape, original.shape, strict=True)
+                )
+                if actual != expected
+            ]
+            if derived.ndim == original.ndim
+            else []
+        )
+        compatible_shape = (
+            len(mismatched_dims) == 1
+            and derived.shape[mismatched_dims[0]] == padded_k
+            and original.shape[mismatched_dims[0]] == original_k
+            and padded_k >= original_k > 0
+        )
+    if not compatible_shape:
         raise HcuAiterMoeDispatchError(
             f"AITER returned incompatible {label} shape {tuple(derived.shape)} "
             f"for {tuple(original.shape)}; solution={_solution_token(config)}"
@@ -146,6 +216,9 @@ def select_aiter_moe_config(
     cache_owner: object,
 ) -> object | None:
     """Ask AITER to route the problem, preserving explicit no-solution status."""
+
+    if getattr(cache_owner, _M1_CAPABILITY_ATTR, None) is False:
+        return None
 
     cache = _owner_cache(cache_owner, _SELECTION_CACHE_ATTR)
     if problem in cache:
@@ -179,8 +252,19 @@ def select_aiter_moe_config(
             + problem.describe()
         )
     status, config = result
-    if not status:
-        _cache_put(cache, problem, None)
+    if type(status) is not bool:
+        raise HcuAiterMoeDispatchError(
+            "get_aiter_moe_config must return a boolean status; "
+            + problem.describe()
+        )
+    if status is False:
+        if _mark_route_logged(problem):
+            logger.warning(
+                "AITER MoE has no supported solution; falling back to vLLM "
+                "Triton MoE for %s",
+                problem.describe(),
+            )
+        _cache_put(cache, problem, None, limit=_SELECTION_CACHE_LIMIT)
         return None
     if config is None:
         raise HcuAiterMoeDispatchError(
@@ -188,7 +272,31 @@ def select_aiter_moe_config(
             + problem.describe()
         )
 
-    _cache_put(cache, problem, config)
+    solution = _solution_token(config)
+    if _mark_route_logged(problem):
+        logger.debug(
+            "AITER MoE selected %s for %s",
+            solution,
+            problem.describe(),
+        )
+    _cache_put(cache, problem, config, limit=_SELECTION_CACHE_LIMIT)
+    return config
+
+
+def prewarm_aiter_moe_config(
+    problem: AiterMoeProblem,
+    cache_owner: object,
+) -> object | None:
+    """Probe M=1 at model load and cache static AITER capability."""
+
+    m1_problem = replace(problem, M=1)
+    config = select_aiter_moe_config(m1_problem, cache_owner=cache_owner)
+    try:
+        setattr(cache_owner, _M1_CAPABILITY_ATTR, config is not None)
+    except (AttributeError, TypeError) as exc:
+        raise HcuAiterMoeDispatchError(
+            "AITER M=1 capability cannot be attached to the weight owner"
+        ) from exc
     return config
 
 
@@ -208,7 +316,7 @@ def prepare_aiter_moe_weights(
     cache_key = (
         _tensor_generation(w1),
         _tensor_generation(w2),
-        _config_generation(config),
+        _weight_layout_generation(config),
         _freeze(block_shape),
     )
     if cache_key in cache:
@@ -246,7 +354,7 @@ def prepare_aiter_moe_weights(
     )
     assert validated_w1 is not None and validated_w2 is not None
     result = (validated_w1, validated_w2)
-    _cache_put(cache, cache_key, result)
+    _cache_put(cache, cache_key, result, limit=_DERIVED_CACHE_LIMIT)
     return result
 
 
@@ -265,7 +373,7 @@ def prepare_aiter_moe_scales(
     cache_key = (
         _tensor_generation(scale1),
         _tensor_generation(scale2),
-        _config_generation(config),
+        _scale_layout_generation(config),
     )
     if cache_key in cache:
         cache.move_to_end(cache_key)
@@ -294,29 +402,85 @@ def prepare_aiter_moe_scales(
             config=config,
         ),
     )
-    _cache_put(cache, cache_key, result)
+    _cache_put(cache, cache_key, result, limit=_DERIVED_CACHE_LIMIT)
     return result
+
+
+def _validate_expert_mapping_tensor(
+    value: torch.Tensor,
+    *,
+    label: str,
+) -> None:
+    if value.ndim != 1 or value.dtype not in (torch.int32, torch.int64):
+        raise HcuAiterMoeDispatchError(
+            f"AITER requires a rank-1 integer {label}"
+        )
+
+
+def resolve_aiter_expert_maps(
+    expert_map: torch.Tensor | None,
+    global_num_experts: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Recover vLLM's native map and AITER's sentinel mask as a pair."""
+
+    if expert_map is None:
+        return None, None
+    _validate_expert_mapping_tensor(expert_map, label="expert map or mask")
+    native_map = getattr(expert_map, _NATIVE_EXPERT_MAP_ATTR, None)
+    if native_map is not None:
+        if not isinstance(native_map, torch.Tensor):
+            raise HcuAiterMoeDispatchError(
+                "AITER expert mask carries a non-tensor native expert map"
+            )
+        _validate_expert_mapping_tensor(native_map, label="native expert map")
+        if (
+            global_num_experts > 0
+            and expert_map.numel() < global_num_experts + 1
+        ):
+            raise HcuAiterMoeDispatchError(
+                "AITER expert mask has no trailing sentinel: "
+                f"{expert_map.numel()} < {global_num_experts + 1}"
+            )
+        return native_map, expert_map
+
+    if global_num_experts > 0 and expert_map.numel() != global_num_experts:
+        raise HcuAiterMoeDispatchError(
+            "AITER received an unpaired expert mask; the original vLLM "
+            "global-to-local map is required for non-ASM routing and fallback"
+        )
+    sentinel = torch.zeros((1,), dtype=torch.int32, device=expert_map.device)
+    expert_mask = torch.cat(((expert_map >= 0).to(torch.int32), sentinel))
+    return expert_map, expert_mask
 
 
 def aiter_expert_map_for_solution(
     expert_map: torch.Tensor | None,
     config: object,
     global_num_experts: int,
+    *,
+    expert_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Convert vLLM's expert map only for AITER ASM's mask ABI."""
+    """Choose vLLM's native map or AITER's sentinel mask after selection."""
 
-    if expert_map is None or _solution_token(config) != "ASM":
-        return expert_map
-    if expert_map.ndim != 1 or expert_map.dtype not in (torch.int32, torch.int64):
-        raise HcuAiterMoeDispatchError(
-            "AITER ASM requires a rank-1 integer expert_map"
+    if expert_mask is None:
+        native_map, expert_mask = resolve_aiter_expert_maps(
+            expert_map,
+            global_num_experts,
         )
-    if global_num_experts > 0 and expert_map.numel() != global_num_experts:
-        raise HcuAiterMoeDispatchError(
-            "AITER ASM expert_map does not match global_num_experts: "
-            f"{expert_map.numel()} != {global_num_experts}"
-        )
-    return (expert_map >= 0).to(torch.int32)
+    else:
+        native_map = expert_map
+        if native_map is not None:
+            _validate_expert_mapping_tensor(native_map, label="native expert map")
+        _validate_expert_mapping_tensor(expert_mask, label="expert mask")
+        if (
+            global_num_experts > 0
+            and expert_mask.numel() < global_num_experts + 1
+        ):
+            raise HcuAiterMoeDispatchError(
+                "AITER expert mask has no trailing sentinel: "
+                f"{expert_mask.numel()} < {global_num_experts + 1}"
+            )
+    return expert_mask if _solution_token(config) == "ASM" else native_map
 
 
 def execute_aiter_moe(

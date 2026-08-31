@@ -153,7 +153,6 @@ _OP_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
         targets=(
             "vllm._aiter_ops",
             "vllm._aiter_ops.is_aiter_found_and_supported",
-            "vllm._aiter_ops._get_aiter_w16a16_moe_solution_id",
             "vllm._aiter_ops._rocm_aiter_fused_moe_impl",
             "vllm._aiter_ops._rocm_aiter_topk_softmax_impl",
             "vllm._aiter_ops.rocm_aiter_ops.get_aiter_activation_type",

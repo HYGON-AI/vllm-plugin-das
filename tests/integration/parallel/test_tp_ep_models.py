@@ -134,7 +134,8 @@ def _assert_tp_ep_result(
     if parallel_config:
         assert parallel_config["tensor_parallel_size"] == expected_tp
         assert parallel_config["data_parallel_size"] == expected_dp
-        assert parallel_config["all2all_backend"] == expected_all2all
+        if expected_all2all is not None:
+            assert parallel_config["all2all_backend"] == expected_all2all
         assert parallel_config["enable_expert_parallel"] is True
         assert parallel_config["world_size"] >= expected_tp
     assert len(result["output"]) == 2

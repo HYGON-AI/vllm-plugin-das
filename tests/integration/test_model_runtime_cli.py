@@ -350,6 +350,32 @@ def test_tp_ep_ll_exercises_model_specific_deepep_token_capacity(monkeypatch):
     assert captured["max_num_batched_tokens"] == 300
 
 
+def test_tp_ep_default_does_not_override_vllm_all2all_backend_with_none(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.llm_engine = SimpleNamespace(vllm_config=None)
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FakeLLM))
+    monkeypatch.setattr(model_runtime, "_generate_with_llm", lambda *args, **kwargs: [])
+    monkeypatch.setattr(model_runtime, "_shutdown_llm", lambda llm: None)
+
+    model_runtime._case_tp_ep_smoke_rank(
+        Path("/models/fake"),
+        tensor_parallel_size=4,
+        data_parallel_size=1,
+        gpu_memory_utilization=0.4,
+        all2all_backend=None,
+        moe_backend="aiter",
+    )
+
+    assert "all2all_backend" not in captured
+
+
 def test_tp_ep_dp_cleans_every_rank_group_after_rank_failure(monkeypatch):
     context = _FakeMultiprocessingContext([1, None])
     cleaned, kwargs = _run_fake_dp_case(monkeypatch, context)

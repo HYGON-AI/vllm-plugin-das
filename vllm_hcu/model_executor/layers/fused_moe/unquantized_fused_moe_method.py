@@ -20,6 +20,11 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod as _Original,
 )
+from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+    AiterMoeProblem,
+    prewarm_aiter_moe_config,
+)
+from vllm_hcu.platforms import envs as henvs
 
 
 def _is_hcu_aiter_moe_requested(method: object | None = None) -> bool:
@@ -67,5 +72,23 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             backend=self.unquantized_backend,
             experts_cls=self.experts_cls,
             routing_tables=_expert_routing_tables(layer),
+        )
+        activation = getattr(self.moe.activation, "value", self.moe.activation)
+        prewarm_aiter_moe_config(
+            AiterMoeProblem(
+                M=1,
+                E=int(self.moe.num_experts),
+                N1=int(layer.w13_weight.shape[1]),
+                N2=int(layer.w2_weight.shape[1]),
+                K=int(layer.w13_weight.shape[2]),
+                top_k=int(self.moe.experts_per_token),
+                block_size=0,
+                dtype=self.moe.in_dtype,
+                device=layer.w13_weight.device,
+                quant_type="w16a16",
+                activation=str(activation),
+                use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+            ),
+            cache_owner=layer.w13_weight,
         )
         layer._hcu_aiter_moe_initialized = True

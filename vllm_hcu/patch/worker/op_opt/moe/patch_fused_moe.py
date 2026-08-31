@@ -84,6 +84,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 execute_aiter_moe,
                 prepare_aiter_moe_scales,
                 prepare_aiter_moe_weights,
+                resolve_aiter_expert_maps,
                 select_aiter_moe_config,
             )
 
@@ -104,6 +105,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
             )
             moe_config = select_aiter_moe_config(problem, cache_owner=w1)
+            native_expert_map, expert_mask = resolve_aiter_expert_maps(
+                expert_map,
+                int(global_num_experts),
+            )
             if moe_config is not None:
                 prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
                     w1,
@@ -119,9 +124,10 @@ def apply_to_module(module: ModuleType) -> bool:
                     cache_owner=w1_scale if w1_scale is not None else w1,
                 )
                 aiter_expert_map = aiter_expert_map_for_solution(
-                    expert_map,
+                    native_expert_map,
                     moe_config,
                     int(global_num_experts),
+                    expert_mask=expert_mask,
                 )
                 return execute_aiter_moe(
                     moe_config,
@@ -146,6 +152,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     ),
                     output_dtype=hidden_states.dtype,
                 )
+            expert_map = native_expert_map
         return original(
             hidden_states, w1, w2, topk_weights, topk_ids, activation,
             apply_router_weight_on_input, use_fp8_w8a8, use_int8_w8a8,

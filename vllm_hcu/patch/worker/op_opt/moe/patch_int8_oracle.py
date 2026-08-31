@@ -301,6 +301,20 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
         layer=None,
     ):
+        if int8_backend == hcu_enum.AITER:
+            if layer is None:
+                raise RuntimeError(
+                    "AITER INT8 MoE model-load prewarm requires the MoE layer"
+                )
+            from vllm_hcu.model_executor.layers.quantization import (
+                compressed_tensors_moe_runtime as hcu_runtime,
+            )
+
+            hcu_runtime.prewarm_aiter_quantized_moe(
+                layer,
+                moe_config,
+                moe_quant_config,
+            )
         if getattr(
             moe_config.moe_parallel_config,
             "use_deepep_auto_kernels",

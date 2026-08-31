@@ -508,6 +508,15 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 )
 
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                prewarm_aiter_quantized_moe,
+            )
+
+            prewarm_aiter_quantized_moe(
+                layer,
+                self.moe,
+                self.moe_quant_config,
+            )
             return
         # Default Marlin weight interleave path
         #if not self.use_deepep:

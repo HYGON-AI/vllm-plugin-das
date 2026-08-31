@@ -23,6 +23,7 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
     execute_aiter_moe,
     prepare_aiter_moe_weights,
+    resolve_aiter_expert_maps,
     select_aiter_moe_config,
 )
 
@@ -619,7 +620,7 @@ def _activation_name(activation_method: int) -> str:
         return {
             0: "silu",
             1: "gelu",
-            2: "swiglu",
+            2: "swigluoai",
             3: "gelu_tanh",
         }[activation_method]
     except KeyError as exc:
@@ -686,25 +687,6 @@ def _aiter_asm_expert_mask_contract(
             f"local_num_experts={local_num_experts}"
         )
     return global_num_experts, expert_mask
-
-
-def _aiter_mask_to_vllm_expert_map(
-    expert_mask: torch.Tensor | None,
-    global_num_experts: int,
-) -> torch.Tensor | None:
-    if expert_mask is None:
-        return None
-    routed_mask = expert_mask[:global_num_experts].to(torch.bool)
-    local_ids = torch.cumsum(
-        routed_mask.to(torch.int32),
-        dim=0,
-        dtype=torch.int32,
-    ) - 1
-    return torch.where(
-        routed_mask,
-        local_ids,
-        torch.full_like(local_ids, -1),
-    )
 
 
 def fused_moe_impl(
@@ -846,8 +828,8 @@ def fused_moe_impl(
             f"{moe_sorting_dispatch_policy}"
         )
 
-    # HCU AITER uses w1=[E, 2N, K] and w2=[E, K, N]. Its N2
-    # configuration argument is GEMM2's output dimension, i.e. w2.shape[1].
+    # HCU AITER consumes vLLM's canonical w1=[E, N1, K] and
+    # w2=[E, N2, K2]. N2 is GEMM2's hidden/output dimension at w2.shape[1].
     if (
         w1.dim() != 3
         or w2.dim() != 3
@@ -875,11 +857,11 @@ def fused_moe_impl(
         use_shuffle=use_shuffle,
     )
     aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
-    native_expert_map = _aiter_mask_to_vllm_expert_map(
-        expert_mask,
-        global_num_experts,
-    )
     if aiter_config is None:
+        native_expert_map, _ = resolve_aiter_expert_maps(
+            expert_mask,
+            global_num_experts,
+        )
         if swiglu_limit:
             raise HcuAiterRuntimeError(
                 "vLLM Triton W16A16 fallback does not support swiglu_limit"
@@ -916,11 +898,13 @@ def fused_moe_impl(
     )
     solution = getattr(aiter_config, "solution_type", None)
     solution = getattr(solution, "value", solution)
-    aiter_expert_map = (
-        expert_mask
-        if str(solution).rsplit(".", 1)[-1].upper() == "ASM"
-        else native_expert_map
-    )
+    if str(solution).rsplit(".", 1)[-1].upper() == "ASM":
+        aiter_expert_map = expert_mask
+    else:
+        aiter_expert_map, _ = resolve_aiter_expert_maps(
+            expert_mask,
+            global_num_experts,
+        )
     return execute_aiter_moe(
         aiter_config,
         hidden_states=hidden_states,

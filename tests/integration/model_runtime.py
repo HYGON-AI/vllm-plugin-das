@@ -1333,18 +1333,23 @@ def _case_tp_ep_smoke_rank(
     max_num_batched_tokens = (
         300 if all2all_backend == "deepep_low_latency" else 512
     )
+    all2all_kwargs = (
+        {"all2all_backend": all2all_backend}
+        if all2all_backend is not None
+        else {}
+    )
     llm = LLM(
         **_llm_kwargs(
             model_path,
             enforce_eager=True,
             tensor_parallel_size=tensor_parallel_size,
-            all2all_backend=all2all_backend,
             enable_expert_parallel=True,
             max_model_len=512,
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=2,
             gpu_memory_utilization=gpu_memory_utilization,
             moe_backend=moe_backend,
+            **all2all_kwargs,
         )
     )
     try:

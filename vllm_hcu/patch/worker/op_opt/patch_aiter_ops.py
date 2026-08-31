@@ -22,7 +22,6 @@ PATCH_ID = "worker.op_opt.aiter_ops.hcu_runtime"
 TARGETS = (
     TARGET_MODULE,
     f"{TARGET_MODULE}.is_aiter_found_and_supported",
-    f"{TARGET_MODULE}._get_aiter_w16a16_moe_solution_id",
     f"{TARGET_MODULE}._rocm_aiter_fused_moe_impl",
     f"{TARGET_MODULE}._rocm_aiter_topk_softmax_impl",
     f"{TARGET_MODULE}.rocm_aiter_ops.get_aiter_activation_type",
@@ -93,17 +92,6 @@ _TOPK_DEFAULTS = {
     "num_shared_experts": 0,
     "shared_expert_scoring_func": "",
 }
-_SOLUTION_POSITIONAL = (
-    "M",
-    "E",
-    "N1",
-    "N2",
-    "K",
-    "top_k",
-    "dtype",
-    "activation",
-    "use_shuffle",
-)
 _RMSNORM_POSITIONAL = (
     "x",
     "weight",
@@ -155,59 +143,53 @@ def _validate(module: ModuleType) -> None:
         module, "is_aiter_found_and_supported", TARGETS[1]
     )
     fused = _require_hcu_wrapper(
-        module, "_rocm_aiter_fused_moe_impl", TARGETS[3]
+        module, "_rocm_aiter_fused_moe_impl", TARGETS[2]
     )
     topk = _require_hcu_wrapper(
-        module, "_rocm_aiter_topk_softmax_impl", TARGETS[4]
+        module, "_rocm_aiter_topk_softmax_impl", TARGETS[3]
     )
     activation = _require_hcu_wrapper(
-        aiter_class, "get_aiter_activation_type", TARGETS[5]
-    )
-    solution = require_callable(
-        module, "_get_aiter_w16a16_moe_solution_id", TARGETS[2]
+        aiter_class, "get_aiter_activation_type", TARGETS[4]
     )
     require_exact_signature(supported, TARGETS[1])
     require_exact_signature(
         fused,
-        TARGETS[3],
+        TARGETS[2],
         positional=_FUSED_POSITIONAL,
         defaults=_FUSED_DEFAULTS,
     )
     require_exact_signature(
         topk,
-        TARGETS[4],
+        TARGETS[3],
         positional=_TOPK_POSITIONAL,
         defaults=_TOPK_DEFAULTS,
     )
     require_exact_signature(
-        activation, TARGETS[5], positional=("activation_str",)
-    )
-    require_exact_signature(
-        solution, TARGETS[2], positional=_SOLUTION_POSITIONAL
+        activation, TARGETS[4], positional=("activation_str",)
     )
     rmsnorm = _require_hcu_wrapper(
         module,
         "_rocm_aiter_rmsnorm_fused_dynamic_quant_impl",
-        TARGETS[9],
+        TARGETS[8],
     )
     rmsnorm_add = _require_hcu_wrapper(
         module,
         "_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl",
-        TARGETS[10],
+        TARGETS[9],
     )
     require_exact_signature(
         rmsnorm,
-        TARGETS[9],
+        TARGETS[8],
         positional=_RMSNORM_POSITIONAL,
     )
     require_exact_signature(
         rmsnorm_add,
-        TARGETS[10],
+        TARGETS[9],
         positional=_RMSNORM_ADD_POSITIONAL,
     )
     for index, name in (
-        (6, "is_shuffled_per_token_w8a8_gemm_tuned"),
-        (7, "is_per_token_w8a8_gemm_tuned"),
+        (5, "is_shuffled_per_token_w8a8_gemm_tuned"),
+        (6, "is_per_token_w8a8_gemm_tuned"),
     ):
         tuning_probe = require_callable(aiter_class, name, TARGETS[index])
         require_exact_signature(
@@ -220,20 +202,20 @@ def _validate(module: ModuleType) -> None:
                 f"required HCU target {TARGETS[index]} must remain a staticmethod"
             )
     fp8_bmm_probe = require_callable(
-        aiter_class, "is_fp8bmm_enabled", TARGETS[8]
+        aiter_class, "is_fp8bmm_enabled", TARGETS[7]
     )
-    require_exact_signature(fp8_bmm_probe, TARGETS[8], positional=())
+    require_exact_signature(fp8_bmm_probe, TARGETS[7], positional=())
     if not isinstance(
         vars(aiter_class).get("is_fp8bmm_enabled"), classmethod
     ):
         raise PatchCompatibilityError(
-            f"required HCU target {TARGETS[8]} must remain a classmethod"
+            f"required HCU target {TARGETS[7]} must remain a classmethod"
         )
     if not isinstance(
         vars(aiter_class).get("get_aiter_activation_type"), staticmethod
     ):
         raise PatchCompatibilityError(
-            f"required HCU target {TARGETS[5]} must remain a staticmethod"
+            f"required HCU target {TARGETS[4]} must remain a staticmethod"
         )
 
 

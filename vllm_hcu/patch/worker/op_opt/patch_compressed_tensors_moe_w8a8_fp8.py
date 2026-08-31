@@ -133,7 +133,24 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer):
         original_process(self, layer)
-        if _selected_backend_name(self) != "HCU_DEEPGEMM":
+        selected_backend = _selected_backend_name(self)
+        if selected_backend == "AITER":
+            from vllm_hcu.model_executor.layers.quantization import (
+                compressed_tensors_moe_runtime as hcu_runtime,
+            )
+
+            quant_config = getattr(self, "moe_quant_config", None)
+            if quant_config is None:
+                raise RuntimeError(
+                    "AITER FP8 MoE did not initialize its quantization config"
+                )
+            hcu_runtime.prewarm_aiter_quantized_moe(
+                layer,
+                self.moe,
+                quant_config,
+            )
+            return
+        if selected_backend != "HCU_DEEPGEMM":
             return
         moe_kernel = getattr(self, "moe_kernel", None)
         fused_experts = getattr(moe_kernel, "fused_experts", None)

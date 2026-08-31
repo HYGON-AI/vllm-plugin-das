@@ -3180,7 +3180,6 @@ for _hcu_wrapper in (
     setattr(_hcu_wrapper, "_vllm_hcu_aiter_ops_wrapper", True)
 
 
-_get_aiter_w16a16_moe_solution_id = _hcu_runtime.get_w16a16_moe_solution_id
 rocm_aiter_ops.get_aiter_activation_type = staticmethod(
     _hcu_get_aiter_activation_type
 )

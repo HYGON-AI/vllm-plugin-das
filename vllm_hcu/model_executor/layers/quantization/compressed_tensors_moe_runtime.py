@@ -18,8 +18,10 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
     aiter_expert_map_for_solution,
     execute_aiter_moe,
+    prewarm_aiter_moe_config,
     prepare_aiter_moe_scales,
     prepare_aiter_moe_weights,
+    resolve_aiter_expert_maps,
     select_aiter_moe_config,
 )
 from vllm_hcu.platforms import envs as henvs
@@ -53,6 +55,126 @@ def _enum_token(value: object) -> str:
         if token:
             return token
     return ""
+
+
+def prewarm_aiter_quantized_moe(
+    layer: object,
+    vllm_moe_config: object,
+    quant_config: object,
+) -> object | None:
+    """Probe M=1 while canonical quantized MoE weights are being loaded."""
+
+    w1 = _required_tensor(layer, "w13_weight")
+    w2 = _required_tensor(layer, "w2_weight")
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE prewarm expects compatible rank-3 weights"
+        )
+    use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
+    use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
+    if use_fp8 == use_int8:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE prewarm requires one W8A8 quantization mode"
+        )
+    from aiter.moe import MoeQuantType
+
+    quant_member = "FP8_W8A8" if use_fp8 else "W8A8"
+    quant_type = getattr(MoeQuantType, quant_member, None)
+    if quant_type is None:
+        raise HcuCompressedTensorsMoeError(
+            f"AITER does not expose required MoeQuantType.{quant_member}"
+        )
+    top_k = getattr(vllm_moe_config, "experts_per_token", None)
+    dtype = getattr(vllm_moe_config, "in_dtype", None)
+    if not isinstance(top_k, int) or top_k <= 0 or not isinstance(dtype, torch.dtype):
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE prewarm requires valid top-k and input dtype"
+        )
+    activation = getattr(getattr(layer, "activation", None), "value", None)
+    if activation is None:
+        activation = getattr(getattr(vllm_moe_config, "activation", None), "value", None)
+    if activation is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE prewarm requires an activation"
+        )
+    block_shape = getattr(quant_config, "block_shape", None)
+    block_size = int(block_shape[1]) if block_shape else 0
+    problem = AiterMoeProblem(
+        M=1,
+        E=int(w1.shape[0]),
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=int(w1.shape[2]),
+        top_k=top_k,
+        block_size=block_size,
+        dtype=dtype,
+        device=w1.device,
+        quant_type=quant_type,
+        activation=str(activation),
+        use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+    )
+    return prewarm_aiter_moe_config(problem, cache_owner=w1)
+
+
+def prewarm_aiter_w4a16_moe(
+    method: object,
+    layer: object,
+    quant_config: object,
+) -> object | None:
+    """Probe the M=1 W4A16 route after packed weights are loaded."""
+
+    w1 = _required_tensor(layer, "w13_weight_packed")
+    w2 = _required_tensor(layer, "w2_weight_packed")
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
+        raise HcuCompressedTensorsMoeError(
+            "AITER W4A16 prewarm expects compatible rank-3 packed weights"
+        )
+    moe = getattr(method, "moe", None)
+    top_k = getattr(moe, "experts_per_token", None)
+    hidden_dim = getattr(moe, "hidden_dim", None)
+    dtype = getattr(moe, "in_dtype", None)
+    if (
+        not isinstance(top_k, int)
+        or top_k <= 0
+        or not isinstance(hidden_dim, int)
+        or hidden_dim <= 0
+        or not isinstance(dtype, torch.dtype)
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "AITER W4A16 prewarm requires valid MoE dimensions and dtype"
+        )
+    activation = getattr(getattr(moe, "activation", None), "value", None)
+    if activation is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER W4A16 prewarm requires an activation"
+        )
+    block_shape = getattr(quant_config, "block_shape", None)
+    if not block_shape or len(block_shape) < 2:
+        raise HcuCompressedTensorsMoeError(
+            "AITER W4A16 prewarm requires a two-dimensional block shape"
+        )
+    from aiter.moe import MoeQuantType
+
+    quant_type = getattr(MoeQuantType, "W4A16", None)
+    if quant_type is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER does not expose required MoeQuantType.W4A16"
+        )
+    problem = AiterMoeProblem(
+        M=1,
+        E=int(w1.shape[0]),
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=hidden_dim,
+        top_k=top_k,
+        block_size=int(block_shape[1]),
+        dtype=dtype,
+        device=w1.device,
+        quant_type=quant_type,
+        activation=str(activation),
+        use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+    )
+    return prewarm_aiter_moe_config(problem, cache_owner=w1)
 
 
 def apply_aiter_quantized_moe(
@@ -139,6 +261,10 @@ def apply_aiter_quantized_moe(
     )
     aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
     global_num_experts = getattr(vllm_moe_config, "num_experts", w1.shape[0])
+    native_expert_map, expert_mask = resolve_aiter_expert_maps(
+        expert_map,
+        int(global_num_experts),
+    )
     if aiter_config is None:
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_experts_impl,
@@ -158,7 +284,7 @@ def apply_aiter_quantized_moe(
             use_int4_w4a16=False,
             per_channel_quant=True,
             global_num_experts=global_num_experts,
-            expert_map=expert_map,
+            expert_map=native_expert_map,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w1_zp=getattr(quant_config, "w1_zp", None),
@@ -196,9 +322,10 @@ def apply_aiter_quantized_moe(
     align_int8_quant = bool(use_int8 and is_asm_solution)
     align_fp8_quant = bool(use_fp8 and is_asm_solution)
     aiter_expert_map = aiter_expert_map_for_solution(
-        expert_map,
+        native_expert_map,
         aiter_config,
         int(global_num_experts),
+        expert_mask=expert_mask,
     )
     with (
         aiter_asm_boltops_int8_quant_context(enabled=align_int8_quant),
@@ -317,7 +444,8 @@ def apply_aiter_w8a8_fp8_moe(
     w1_scale = _required_tensor(layer, "w13_weight_scale")
     w2_scale = _required_tensor(layer, "w2_weight_scale")
     global_num_experts = getattr(layer, "global_num_experts", -1)
-    expert_map = getattr(layer, "expert_map", None)
+    expert_map = getattr(layer, "_expert_map", None)
+    expert_mask = getattr(layer, "expert_mask", None)
     if moe_config is None:
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_experts_impl,
@@ -361,6 +489,7 @@ def apply_aiter_w8a8_fp8_moe(
         expert_map,
         moe_config,
         int(global_num_experts),
+        expert_mask=expert_mask,
     )
     from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
         aiter_asm_boltops_fp8_quant_context,
@@ -517,13 +646,15 @@ def build_aiter_w4a16_quant_config(
         raise HcuCompressedTensorsMoeError(
             "AITER W4A16 MoE requires a positive integer group_size"
         )
-    return config_builder(
+    config = config_builder(
         w1_scale=_required_tensor(layer, "w13_weight_scale"),
         w2_scale=_required_tensor(layer, "w2_weight_scale"),
         w1_zp=_required_tensor(layer, "w13_qzeros"),
         w2_zp=_required_tensor(layer, "w2_qzeros"),
         block_shape=[0, group_size],
     )
+    prewarm_aiter_w4a16_moe(method, layer, config)
+    return config
 
 
 __all__ = [
