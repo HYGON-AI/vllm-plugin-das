@@ -3011,6 +3011,163 @@ def test_moe_fp8_explicit_aiter_opt_in_builds_standard_layout_w8a16(
     assert method.moe_quant_config.w2_scale is layer.w2_weight_scale
 
 
+def test_moe_fp8_bf16_diagnostic_keeps_channel_fp8_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "1")
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="aiter"),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = layer.w13_weight.to(torch.float8_e4m3fn)
+    layer.w2_weight = layer.w2_weight.to(torch.float8_e4m3fn)
+    original_w1 = layer.w13_weight
+    original_w2 = layer.w2_weight
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.backend_during_process.value == "TRITON"
+    assert layer.backend_for_kernel.value == "AITER"
+    assert method.fp8_backend.value == "AITER"
+    assert layer.w13_weight is original_w1
+    assert layer.w2_weight is original_w2
+    assert method.moe_quant_config.use_fp8_w8a16 is True
+    assert method.moe_quant_config.per_out_ch_quant is True
+    assert method.moe_quant_config.w1_scale is layer.w13_weight_scale
+    assert method.moe_quant_config.w2_scale is layer.w2_weight_scale
+
+
+def test_moe_fp8_bf16_diagnostic_preserves_upstream_replaced_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+
+    def upstream_process(self, layer):
+        layer.backend_during_process = self.fp8_backend
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            module.replace_parameter(layer, name, getattr(layer, name))
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        layer.backend_for_kernel = self.fp8_backend
+
+    method_class.process_weights_after_loading = upstream_process
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "1")
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="aiter"),
+    )
+    layer = torch.nn.Module()
+    for name, value in (
+        (
+            "w13_weight",
+            torch.ones((3, 8, 4), dtype=torch.float8_e4m3fn),
+        ),
+        ("w2_weight", torch.ones((3, 4, 4), dtype=torch.float8_e4m3fn)),
+        ("w13_weight_scale", torch.ones((3, 8, 1), dtype=torch.float32)),
+        ("w2_weight_scale", torch.ones((3, 4, 1), dtype=torch.float32)),
+    ):
+        layer.register_parameter(
+            name, torch.nn.Parameter(value, requires_grad=False)
+        )
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    original_parameters = {
+        name: getattr(layer, name)
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        )
+    }
+
+    method.process_weights_after_loading(layer)
+
+    for name, parameter in original_parameters.items():
+        assert getattr(layer, name) is parameter
+    assert layer.backend_during_process.value == "TRITON"
+    assert layer.backend_for_kernel.value == "AITER"
+
+
+def test_moe_fp8_bf16_diagnostic_rejects_requantization_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE", "1")
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+
+    with pytest.raises(RuntimeError, match="mutually exclusive"):
+        method_class(
+            *_channel_fp8_moe_args(module),
+            SimpleNamespace(moe_backend="aiter"),
+        )
+
+
+def test_moe_fp8_bf16_diagnostic_rejects_nonfinite_scale(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "1")
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="aiter"),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = layer.w13_weight.to(torch.float8_e4m3fn)
+    layer.w2_weight = layer.w2_weight.to(torch.float8_e4m3fn)
+    layer.w13_weight_scale[0, 0, 0] = torch.inf
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="non-finite w1_scale",
+    ):
+        method.process_weights_after_loading(layer)
+
+
+@pytest.mark.parametrize("invalid_scale", [0.0, -0.25])
+def test_moe_fp8_bf16_diagnostic_rejects_nonpositive_scale(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_scale: float,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "1")
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="aiter"),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = layer.w13_weight.to(torch.float8_e4m3fn)
+    layer.w2_weight = layer.w2_weight.to(torch.float8_e4m3fn)
+    layer.w13_weight_scale[0, 0, 0] = invalid_scale
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="non-positive w1_scale",
+    ):
+        method.process_weights_after_loading(layer)
+
+
 def test_moe_fp8_w8a16_opt_in_does_not_change_non_aiter_route(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3211,6 +3368,11 @@ def test_moe_fp8_hcu_aiter_flag_defaults_off(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE", "1")
     assert henvs.VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE is True
 
+    monkeypatch.delenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", raising=False)
+    assert henvs.VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE is False
+    monkeypatch.setenv("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "1")
+    assert henvs.VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE is True
+
 
 def test_moe_fp8_aiter_path_accepts_v0251_shared_expert_contract(
     monkeypatch: pytest.MonkeyPatch,
@@ -3347,7 +3509,6 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
         a2_scale=None,
         block_shape=None,
     )
-
     output = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
         hidden_states=hidden_states,
         w1=w1,
@@ -3454,6 +3615,172 @@ def test_quantized_aiter_runtime_uses_boltops_w8a16_default_fallback(
     assert call["is_gated"] is True
     assert call["gemm1_alpha"] == 1.702
     assert call["gemm1_limit"] == 7.0
+
+
+def test_quantized_aiter_runtime_dequantizes_channel_fp8_to_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    kernel_calls: list[dict[str, object]] = []
+    expected_output = torch.full((2, 2), 3.0, dtype=torch.bfloat16)
+
+    def fused_experts_impl(**kwargs):
+        kernel_calls.append(kwargs)
+        return expected_output
+
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.fused_moe",
+        _module(
+            "boltops.fused_moe.triton.fused_moe",
+            fused_experts_impl=fused_experts_impl,
+        ),
+    )
+    hidden_states = torch.ones((2, 2), dtype=torch.bfloat16)
+    w1 = torch.tensor(
+        [[[2.0, -1.0], [0.5, 4.0], [-2.0, 1.0], [1.0, 0.0]]],
+        dtype=torch.float8_e4m3fn,
+    )
+    w2 = torch.tensor(
+        [[[4.0, -2.0], [0.5, 1.0]]],
+        dtype=torch.float8_e4m3fn,
+    )
+    w1_scale = torch.tensor([[[0.5], [2.0], [0.25], [3.0]]])
+    w2_scale = torch.tensor([[[0.25], [4.0]]])
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_fp8_w8a16=True,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+    quant_config._hcu_channel_fp8_bf16_standard_layout = (
+        (w1, w1._version),
+        (w2, w2._version),
+        (w1_scale, w1_scale._version),
+        (w2_scale, w2_scale._version),
+    )
+
+    output = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=torch.ones((2, 1), dtype=torch.bfloat16),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+        vllm_moe_config=SimpleNamespace(
+            num_experts=1,
+            is_act_and_mul=True,
+            swiglu_alpha=1.702,
+            swiglu_limit=7.0,
+        ),
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=None,
+        quant_config=quant_config,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert output is expected_output
+    assert len(kernel_calls) == 1
+    call = kernel_calls[0]
+    assert call["hidden_states"] is hidden_states
+    assert call["w1"].dtype is torch.bfloat16
+    assert call["w2"].dtype is torch.bfloat16
+    torch.testing.assert_close(
+        call["w1"],
+        torch.tensor(
+            [[[1.0, -0.5], [1.0, 8.0], [-0.5, 0.25], [3.0, 0.0]]],
+            dtype=torch.bfloat16,
+        ),
+    )
+    torch.testing.assert_close(
+        call["w2"],
+        torch.tensor([[[1.0, -0.5], [2.0, 4.0]]], dtype=torch.bfloat16),
+    )
+    assert call["use_fp8_w8a8"] is False
+    assert call["use_int8_w8a8"] is False
+    assert call["use_int8_w8a16"] is False
+    assert call["per_channel_quant"] is False
+    assert call["w1_scale"] is None and call["w2_scale"] is None
+    assert call["gemm1_alpha"] == 1.702
+    assert call["gemm1_limit"] == 7.0
+
+
+@pytest.mark.parametrize(
+    "invalid_case", ["missing_marker", "non_fp32_scale", "mutated_weight"]
+)
+def test_quantized_aiter_runtime_rejects_noncanonical_bf16_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_case: str,
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fused_moe.triton.fused_moe",
+        _module(
+            "boltops.fused_moe.triton.fused_moe",
+            fused_experts_impl=lambda **kwargs: kwargs["hidden_states"],
+        ),
+    )
+    hidden_states = torch.ones((2, 2), dtype=torch.bfloat16)
+    w1 = torch.ones((1, 4, 2), dtype=torch.float8_e4m3fn)
+    w2 = torch.ones((1, 2, 2), dtype=torch.float8_e4m3fn)
+    scale_dtype = (
+        torch.float16 if invalid_case == "non_fp32_scale" else torch.float32
+    )
+    w1_scale = torch.ones((1, 4, 1), dtype=scale_dtype)
+    w2_scale = torch.ones((1, 2, 1), dtype=scale_dtype)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_fp8_w8a16=True,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+    if invalid_case != "missing_marker":
+        quant_config._hcu_channel_fp8_bf16_standard_layout = (
+            (w1, w1._version),
+            (w2, w2._version),
+            (w1_scale, w1_scale._version),
+            (w2_scale, w2_scale._version),
+        )
+    if invalid_case == "mutated_weight":
+        w1.copy_(w1.clone())
+
+    expected = {
+        "missing_marker": "standard-layout marker",
+        "non_fp32_scale": "FP32",
+        "mutated_weight": "no longer matches",
+    }[invalid_case]
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match=expected,
+    ):
+        compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=torch.ones((2, 1), dtype=torch.bfloat16),
+            topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+            vllm_moe_config=SimpleNamespace(
+                num_experts=1, is_act_and_mul=True
+            ),
+            activation=SimpleNamespace(value="silu"),
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            quant_config=quant_config,
+            output_dtype=torch.bfloat16,
+        )
 
 
 @pytest.mark.parametrize(
@@ -4727,7 +5054,10 @@ def test_quantized_aiter_runtime_synchronizes_every_weight_use_stream():
         ("topk_shape", "matching rank-2 top-k"),
         ("router_weight", "apply_router_weight_on_input=True"),
         ("block_quant", "non-block FP8/INT8"),
-        ("ambiguous_quant", "exactly one FP8-W8A8, INT8-W8A8, or INT8-W8A16"),
+        (
+            "ambiguous_quant",
+            "exactly one FP8-W8A8, INT8-W8A8, INT8-W8A16, or FP8-W8A16",
+        ),
         ("no_solution", "found no backend config"),
     ],
 )

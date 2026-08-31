@@ -23,11 +23,131 @@ class HcuCompressedTensorsMoeError(RuntimeError):
     """An explicitly selected HCU compressed-tensors MoE path is invalid."""
 
 
+_CHANNEL_FP8_BF16_LAYOUT_MARKER = (
+    "_hcu_channel_fp8_bf16_standard_layout"
+)
+
+
 def _reject_channel_fp8_w8a16_reload(*args: object, **kwargs: object) -> None:
     del args, kwargs
     raise HcuCompressedTensorsMoeError(
         "Channel-FP8 W8A16 requantization does not support online weight reload"
     )
+
+
+def _validate_channel_fp8_bf16_tensor(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    name: str,
+) -> None:
+    """Validate one canonical Channel-FP8 expert tensor and its scale."""
+
+    fp8_dtypes = {torch.float8_e4m3fn}
+    fp8_fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    if fp8_fnuz is not None:
+        fp8_dtypes.add(fp8_fnuz)
+    if weight.ndim != 3 or weight.dtype not in fp8_dtypes:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires rank-3 FP8 {name}"
+        )
+    if not weight.is_contiguous() or weight.stride(-1) != 1:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires canonical contiguous {name}"
+        )
+    expected_scale_shape = (*weight.shape[:-1], 1)
+    if tuple(scale.shape) != expected_scale_shape:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic {name}_scale shape must be "
+            f"{expected_scale_shape}, got {tuple(scale.shape)}"
+        )
+    if scale.dtype is not torch.float32:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires FP32 {name}_scale"
+        )
+    if scale.device != weight.device:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires {name} and {name}_scale "
+            "on the same device"
+        )
+    if not scale.is_contiguous():
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires contiguous {name}_scale"
+        )
+
+
+@torch.no_grad()
+def mark_channel_fp8_bf16_moe_standard_layout(
+    layer: object,
+    quant_config: object,
+) -> None:
+    """Validate and mark canonical Channel-FP8 parameters after loading."""
+
+    tensors = (
+        _required_tensor(layer, "w13_weight"),
+        _required_tensor(layer, "w2_weight"),
+        _required_tensor(layer, "w13_weight_scale"),
+        _required_tensor(layer, "w2_weight_scale"),
+    )
+    _validate_channel_fp8_bf16_tensor(tensors[0], tensors[2], "w1")
+    _validate_channel_fp8_bf16_tensor(tensors[1], tensors[3], "w2")
+    if tensors[0].shape[0] != tensors[1].shape[0]:
+        raise HcuCompressedTensorsMoeError(
+            "Channel-FP8 BF16 diagnostic requires matching expert counts"
+        )
+    for name, scale in (("w1", tensors[2]), ("w2", tensors[3])):
+        if not bool(torch.isfinite(scale).all().item()):
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 BF16 diagnostic found non-finite {name}_scale"
+            )
+        if not bool((scale > 0).all().item()):
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 BF16 diagnostic found non-positive {name}_scale"
+            )
+    setattr(
+        quant_config,
+        _CHANNEL_FP8_BF16_LAYOUT_MARKER,
+        tuple((tensor, tensor._version) for tensor in tensors),
+    )
+
+
+def _require_channel_fp8_bf16_moe_standard_layout(
+    quant_config: object,
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    marker = getattr(quant_config, _CHANNEL_FP8_BF16_LAYOUT_MARKER, None)
+    if not isinstance(marker, tuple) or len(marker) != len(tensors):
+        raise HcuCompressedTensorsMoeError(
+            "Channel-FP8 BF16 diagnostic requires a standard-layout marker"
+        )
+    for entry, tensor in zip(marker, tensors):
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) != 2
+            or entry[0] is not tensor
+            or entry[1] != tensor._version
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "Channel-FP8 BF16 diagnostic standard-layout marker no longer "
+                "matches the loaded parameters"
+            )
+
+
+@torch.no_grad()
+def _dequantize_channel_fp8_moe_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    """Materialize one canonical Channel-FP8 expert tensor as BF16."""
+
+    _validate_channel_fp8_bf16_tensor(weight, scale, name)
+
+    # Every FP8 value is exactly representable in BF16. Casting first and then
+    # multiplying in place therefore matches a FP32 multiply rounded to BF16,
+    # without allocating a full-size FP32 intermediate for these large experts.
+    dequantized = weight.to(torch.bfloat16)
+    dequantized.mul_(scale)
+    return dequantized
 
 
 @torch.no_grad()
@@ -797,10 +917,11 @@ def _apply_aiter_quantized_moe_with_lease(
     use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
     use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
     use_int8_w8a16 = bool(getattr(quant_config, "use_int8_w8a16", False))
-    if sum((use_fp8, use_int8, use_int8_w8a16)) != 1:
+    use_fp8_w8a16 = bool(getattr(quant_config, "use_fp8_w8a16", False))
+    if sum((use_fp8, use_int8, use_int8_w8a16, use_fp8_w8a16)) != 1:
         raise HcuCompressedTensorsMoeError(
             "AITER quantized MoE requires exactly one FP8-W8A8, INT8-W8A8, "
-            "or INT8-W8A16 config"
+            "INT8-W8A16, or FP8-W8A16 config"
         )
     w1_scale = _required_tensor(quant_config, "w1_scale")
     w2_scale = _required_tensor(quant_config, "w2_scale")
@@ -811,28 +932,38 @@ def _apply_aiter_quantized_moe_with_lease(
         )
     activation_name = str(activation_value)
 
-    if use_int8_w8a16:
-        if w1.dtype is not torch.int8 or w2.dtype is not torch.int8:
+    if use_int8_w8a16 or use_fp8_w8a16:
+        diagnostic_name = "FP8-W8A16" if use_fp8_w8a16 else "INT8-W8A16"
+        if use_int8_w8a16 and (
+            w1.dtype is not torch.int8 or w2.dtype is not torch.int8
+        ):
             raise HcuCompressedTensorsMoeError(
                 "AITER INT8-W8A16 requires INT8 expert weights"
             )
         if expert_map is not None:
             raise HcuCompressedTensorsMoeError(
-                "AITER INT8-W8A16 fallback is currently limited to TP/non-EP"
+                f"AITER {diagnostic_name} fallback is currently limited to TP/non-EP"
             )
         if a1q_scale is not None or any(
             getattr(quant_config, name, None) is not None
             for name in ("a1_scale", "a2_scale", "w1_zp", "w2_zp")
         ):
             raise HcuCompressedTensorsMoeError(
-                "AITER INT8-W8A16 requires unquantized activations and "
-                "symmetric weights"
+                f"AITER {diagnostic_name} requires unquantized activations "
+                "and symmetric weights"
+            )
+        if use_fp8_w8a16 and (
+            hidden_states.dtype is not torch.bfloat16
+            or output_dtype not in (None, torch.bfloat16)
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "AITER FP8-W8A16 diagnostic requires BF16 activations and output"
             )
         try:
             from boltops.fused_moe.triton.fused_moe import fused_experts_impl
         except Exception as exc:
             raise HcuCompressedTensorsMoeError(
-                "AITER INT8-W8A16 fallback requires BoltOps Triton fused MoE"
+                f"AITER {diagnostic_name} fallback requires BoltOps Triton fused MoE"
             ) from exc
         gemm1_alpha = getattr(quant_config, "gemm1_alpha", None)
         if gemm1_alpha is None:
@@ -840,10 +971,28 @@ def _apply_aiter_quantized_moe_with_lease(
         gemm1_limit = getattr(quant_config, "gemm1_clamp_limit", None)
         if gemm1_limit is None:
             gemm1_limit = getattr(vllm_moe_config, "swiglu_limit", None)
+        if use_fp8_w8a16:
+            _require_channel_fp8_bf16_moe_standard_layout(
+                quant_config,
+                (w1, w2, w1_scale, w2_scale),
+            )
+            kernel_w1 = _dequantize_channel_fp8_moe_weight(
+                w1, w1_scale, "w1"
+            )
+            kernel_w2 = _dequantize_channel_fp8_moe_weight(
+                w2, w2_scale, "w2"
+            )
+            kernel_w1_scale = None
+            kernel_w2_scale = None
+        else:
+            kernel_w1 = w1
+            kernel_w2 = w2
+            kernel_w1_scale = w1_scale
+            kernel_w2_scale = w2_scale
         return fused_experts_impl(
             hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
+            w1=kernel_w1,
+            w2=kernel_w2,
             topk_weights=topk_weights.to(torch.float32),
             topk_ids=topk_ids.to(torch.int32),
             output_dtype=output_dtype,
@@ -851,14 +1000,16 @@ def _apply_aiter_quantized_moe_with_lease(
             activation=activation_name,
             is_gated=getattr(vllm_moe_config, "is_act_and_mul", None),
             apply_router_weight_on_input=False,
-            use_int8_w8a16=True,
-            per_channel_quant=True,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=use_int8_w8a16,
+            per_channel_quant=use_int8_w8a16,
             global_num_experts=getattr(
                 vllm_moe_config, "num_experts", w1.shape[0]
             ),
             expert_map=None,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
+            w1_scale=kernel_w1_scale,
+            w2_scale=kernel_w2_scale,
             w1_zp=None,
             w2_zp=None,
             a1_scale=None,

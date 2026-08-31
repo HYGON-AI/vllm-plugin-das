@@ -223,6 +223,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 bool(getattr(quant_config, "use_fp8_w8a8", False))
                 or bool(getattr(quant_config, "use_int8_w8a8", False))
                 or bool(getattr(quant_config, "use_int8_w8a16", False))
+                or bool(getattr(quant_config, "use_fp8_w8a16", False))
             ):
                 from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
                     apply_aiter_quantized_moe,

@@ -131,6 +131,88 @@ original Channel-FP8 weight reference by 1.655%. Against the downloaded layer
 kernel check measured 0.379% relative L2 and 0.999993 cosine versus explicit
 BF16 expert math.
 
+## Opt-in Channel-FP8 weight-only BF16 diagnostic (2026-08-31)
+
+`VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE=1` isolates the original Channel-FP8
+checkpoint weights from both dynamic activation quantization and the FP8 MoE
+kernel. The weights and FP32 channel scales remain resident in their canonical
+checkpoint layout. For each current MoE layer, the diagnostic materializes
+temporary BF16 weights and invokes the unquantized BoltOps Triton fused MoE.
+The temporary storage is released for allocator/graph-pool reuse after that
+layer. This path is intentionally accuracy-only and is not a production
+performance backend. It is mutually exclusive with
+`VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE`.
+
+```bash
+export PLUGIN_ROOT=/models/zb/hy4/.worktrees/hy-v4-mtp-blockwise-v0251-merge
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONPATH="${PLUGIN_ROOT}"
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KV_CACHE_LAYOUT=NHD
+export VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE=1
+unset VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE
+
+vllm serve /models/Hy4-preview-Channel-FP8-w8a8-v2 \
+  --served-model-name hy4-channel \
+  --tensor-parallel-size 8 \
+  --no-enable-expert-parallel \
+  --moe-backend aiter \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 4096 \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}' \
+  --reasoning-parser hy_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hy_v4 \
+  --compilation-config '{"cudagraph_capture_sizes":[1,16]}' \
+  --port 8000
+```
+
+The TP8 service captured both PIECEWISE and FULL graphs for sizes 1 and 16;
+graph capture consumed 2.51 GiB per rank, confirming that BF16 layer
+temporaries were reused rather than retained for all 77 layers. A short chat
+completion returned HTTP 200. On a live BW1100, a synthetic BF16 diagnostic
+call was bitwise identical to the same BoltOps call with explicitly
+dequantized weights (`max_abs=0`, relative L2 `0`).
+
+The first 16 HumanEval tasks were then run with MTP disabled, batch 16,
+`temperature=0`, seed 42, and `max_tokens=1024`. The diagnostic is slow (about
+0.49 token/s for a single long request), so the API timeout must exceed the
+original 1800 seconds:
+
+```bash
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u http_proxy -u https_proxy \
+python -m evalscope.cli.cli eval \
+  --model hy4-channel \
+  --model-id Hy4-preview-Channel-FP8-w8a8-v2-bf16-mtpoff-no_think \
+  --api-url http://127.0.0.1:8000/v1 \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets humaneval \
+  --dataset-hub modelscope \
+  --limit 16 \
+  --eval-batch-size 16 \
+  --generation-config '{"batch_size":16,"max_tokens":1024,"temperature":0.0,"top_p":1.0,"seed":42,"timeout":3600.0,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \
+  --seed 42 \
+  --work-dir /models/evalscope_hy4_channel_bf16_mtpoff_humaneval16_20260831 \
+  --no-timestamp
+```
+
+| Expert execution | MTP | Correct | pass@1 | Failed tasks |
+| --- | ---: | ---: | ---: | --- |
+| Original Channel-FP8 AITER W8A8 | off | 15/16 | 93.75% | `/10` |
+| Requantized INT8-W8A16 BoltOps | off | 14/16 | 87.5% | `/1`, `/10` |
+| Channel-FP8 weight-only BF16 diagnostic | off | 15/16 | 93.75% | `/10` |
+
+The weight-only diagnostic recovered `HumanEval/1`, which the extra INT8
+requantization had changed from pass to fail. It did not recover `/10`; the
+BF16 and original AITER outputs both contain the same palindrome-suffix index
+error. In this 16-task isolation, the extra loss is therefore attributable to
+Channel-FP8-to-INT8 weight requantization, not dynamic activation quantization,
+FlashMLA, or the original AITER FP8 MoE route.
+
 ## Full HumanEval results
 
 | MoE backend | MTP draft tokens | Correct | pass@1 | Avg latency | Avg throughput | Avg output | Wall time |

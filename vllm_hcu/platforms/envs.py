@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_DEEPSEEK_V4_CACHE_WINDOW: bool = False
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE: bool = False
+    VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
@@ -274,6 +275,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # execute them as W8A16 through the HCU AITER/BoltOps path.
     "VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE":
         lambda: (os.environ.get("VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE", "False").lower() in
+                    ("true", "1")),
+    # Accuracy diagnostic: keep Channel-FP8 MoE weights resident and
+    # dequantize only the current layer to BF16 for each expert invocation.
+    "VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE":
+        lambda: (os.environ.get("VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "False").lower() in
                     ("true", "1")),
     "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "True").lower() in
