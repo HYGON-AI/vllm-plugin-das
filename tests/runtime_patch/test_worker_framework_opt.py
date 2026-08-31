@@ -7,6 +7,7 @@ import ast
 import contextlib
 import dataclasses
 import enum
+import importlib
 import os
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_cuda_communicator,
     patch_dp_utils,
     patch_eagle_utils,
+    patch_eplb_communicator,
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
@@ -46,6 +48,103 @@ def _module(name: str, **attributes: object) -> ModuleType:
 def _config(**updates: object) -> SimpleNamespace:
     values = HcuFeatureConfig(**updates).to_dict()
     return SimpleNamespace(additional_config={"hcu": values})
+
+
+def _fake_eplb_communicator_module() -> ModuleType:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    class PyNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    return _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistNcclEplbCommunicator=TorchDistNcclEplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+        PyNcclEplbCommunicator=PyNcclEplbCommunicator,
+    )
+
+
+def test_gloo_eplb_skips_device_collective_profile_reservation_on_hcu() -> None:
+    module = _fake_eplb_communicator_module()
+    gloo = module.TorchDistGlooStagedEplbCommunicator
+
+    assert patch_eplb_communicator.apply_to_module(module) is True
+    assert gloo().needs_profile_buffer_reservation is False
+    assert (
+        module.TorchDistNcclEplbCommunicator(
+        ).needs_profile_buffer_reservation
+        is True
+    )
+    assert module.PyNcclEplbCommunicator().needs_profile_buffer_reservation is True
+    assert patch_eplb_communicator.apply_to_module(module) is False
+
+
+def test_gloo_eplb_patch_fails_closed_when_upstream_owns_profile_policy() -> None:
+    module = _fake_eplb_communicator_module()
+    gloo = module.TorchDistGlooStagedEplbCommunicator
+    setattr(gloo, "needs_profile_buffer_reservation", property(lambda self: True))
+
+    with pytest.raises(
+        patch_eplb_communicator.PatchCompatibilityError,
+        match="already defines needs_profile_buffer_reservation",
+    ):
+        patch_eplb_communicator.apply_to_module(module)
+
+
+def test_kernel_warmup_skips_cuda_only_minimax_import_on_hcu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        patch_kernel_warmup = importlib.import_module(
+            "vllm_hcu.patch.worker.op_opt.patch_kernel_warmup"
+        )
+    except ModuleNotFoundError:
+        pytest.fail("the HCU kernel-warmup adapter is missing")
+
+    minimax_module_name = (
+        "vllm.model_executor.warmup.minimax_m3_msa_warmup"
+    )
+    cuda_only_module = ModuleType(minimax_module_name)
+
+    def cuda_only_warmup(worker):
+        del worker
+        raise AssertionError("NVIDIA-only MiniMax warmup must not run on HCU")
+
+    cuda_only_module.minimax_m3_msa_warmup = cuda_only_warmup
+    monkeypatch.setitem(sys.modules, minimax_module_name, cuda_only_module)
+    calls = []
+
+    def official_kernel_warmup(worker):
+        from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+            minimax_m3_msa_warmup,
+        )
+
+        calls.append(worker)
+        minimax_m3_msa_warmup(worker)
+
+    module = _module(
+        patch_kernel_warmup.TARGET_MODULE,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        kernel_warmup=official_kernel_warmup,
+    )
+    assert patch_kernel_warmup.apply_to_module(module) is True
+
+    module.kernel_warmup("worker")
+
+    assert calls == ["worker"]
+    assert sys.modules[minimax_module_name] is cuda_only_module
 
 
 def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
@@ -1460,14 +1559,26 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
     class DraftInner:
         def __init__(self):
             self.child = SimpleNamespace(topk_indices_buffer=None)
+            self.self_attn = SimpleNamespace(
+                mla_attn=SimpleNamespace(
+                    impl=SimpleNamespace(topk_indices_buffer=None)
+                )
+            )
 
         def named_modules(self):
             return [("", self), ("child", self.child)]
 
+    class DraftModel:
+        def __init__(self):
+            self.model = DraftInner()
+
+        def set_topk_indices_buffer(self, buffer):
+            self.model.self_attn.mla_attn.impl.topk_indices_buffer = buffer
+
     models: list[object] = []
 
     def load_eagle_model(target_model, vllm_config):
-        model = SimpleNamespace(model=DraftInner())
+        model = DraftModel()
         models.append(model)
         return model
 
@@ -1478,10 +1589,15 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
     target = SimpleNamespace(model=SimpleNamespace(topk_indices_buffer=target_buffer))
     off_model = module.load_eagle_model(target, _config())
     assert off_model.model.child.topk_indices_buffer is None
+    assert (
+        off_model.model.self_attn.mla_attn.impl.topk_indices_buffer
+        is target_buffer
+    )
     on_model = module.load_eagle_model(
         target, _config(enable_multi_layers_mtp=True)
     )
     assert on_model.model.child.topk_indices_buffer is target_buffer
+    assert on_model.model.self_attn.mla_attn.impl.topk_indices_buffer is target_buffer
 
 
 def test_ubatch_sms_guard_disables_only_missing_compute_control(
@@ -1783,13 +1899,15 @@ assert target_file.is_relative_to(target_root), (
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
-    patch_dp_utils, patch_eagle_utils, patch_forward_context,
+    patch_dp_utils, patch_eagle_utils, patch_eplb_communicator,
+    patch_forward_context,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
     patch_llm_base_proposer, patch_dp_utils, patch_eagle_utils,
+    patch_eplb_communicator,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
 for adapter in adapters:

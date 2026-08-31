@@ -248,6 +248,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
+    _CallbackSpec(_adapter("op_opt", "patch_kernel_warmup")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm")),
     _CallbackSpec(_adapter("op_opt", "patch_scaled_mm_linear_kernel")),
     _CallbackSpec(_adapter("op_opt", "patch_input_quant_fp8")),
@@ -302,6 +303,9 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_eplb_communicator"),
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),

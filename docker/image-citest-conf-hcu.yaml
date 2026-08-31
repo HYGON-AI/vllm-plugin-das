@@ -11,7 +11,7 @@ Qwen3.5-35B-A3B-W8A8:
     limit: 50
     dataset_args:
       swe_bench_lite_agentic:
-        limit: 5 
+        limit: 5
       mcp_atlas:
         limit: 5
   model: Qwen3.5-35B-A3B-W8A8
@@ -44,7 +44,7 @@ Qwen3.6-35B-A3B:
     limit: 50
     dataset_args:
       swe_bench_lite_agentic:
-        limit: 5 
+        limit: 5
       mcp_atlas:
         limit: 5
   model: Qwen3.6-35B-A3B

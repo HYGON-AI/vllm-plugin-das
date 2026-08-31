@@ -53,10 +53,17 @@ _AITER_ASM_BOLTOPS_INT8_QUANT: ContextVar[bool] = ContextVar(
 _AITER_ASM_BOLTOPS_FP8_QUANT: ContextVar[bool] = ContextVar(
     "vllm_hcu_aiter_asm_boltops_fp8_quant", default=False
 )
+_AITER_MOE_C_SWIGLU_LIMIT: ContextVar[tuple[float | None, float] | None] = (
+    ContextVar("vllm_hcu_aiter_moe_c_swiglu_limit", default=None)
+)
 _AITER_ASM_INT8_QUANT_WRAPPER_MARKER = (
     "_vllm_hcu_aiter_asm_int8_quant_wrapper"
 )
 _AITER_ASM_FP8_QUANT_WRAPPER_MARKER = "_vllm_hcu_aiter_asm_fp8_quant_wrapper"
+_AITER_MOE_C_SWIGLU_WRAPPER_MARKER = "_vllm_hcu_aiter_moe_c_swiglu_wrapper"
+_AITER_DYNAMO_METRICS_WRAPPER_MARKER = (
+    "_vllm_hcu_aiter_dynamo_metrics_wrapper"
+)
 _AITER_ASM_FP8_QUANT_PARAMETERS = (
     "x",
     "scale",
@@ -197,6 +204,74 @@ def _install_aiter_asm_fp8_quant_wrapper() -> None:
     module.per_token_quant_hip = wrapped_quant
 
 
+def _install_aiter_moe_c_swiglu_wrapper() -> None:
+    module = import_module("aiter.fused_moe_c")
+    current = getattr(module, "moe_c_silu_and_mul", None)
+    if not callable(current):
+        raise HcuAiterRuntimeError(
+            "AITER MoE-C exposes no callable moe_c_silu_and_mul"
+        )
+    if bool(getattr(current, _AITER_MOE_C_SWIGLU_WRAPPER_MARKER, False)):
+        return
+    apply_activation = getattr(module, "_apply_activation", None)
+    if not callable(apply_activation):
+        raise HcuAiterRuntimeError(
+            "AITER MoE-C exposes no callable _apply_activation"
+        )
+
+    original = current
+
+    @functools.wraps(original)
+    def wrapped_activation(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        clamp = _AITER_MOE_C_SWIGLU_LIMIT.get()
+        if clamp is None:
+            return original(output, input, *args, **kwargs)
+        alpha, limit = clamp
+        return apply_activation(
+            activation="silu",
+            is_gated=True,
+            activated_out=output,
+            ffn1_out_2d=input,
+            gemm1_alpha=alpha,
+            gemm1_limit=limit,
+        )
+
+    setattr(wrapped_activation, _AITER_MOE_C_SWIGLU_WRAPPER_MARKER, True)
+    module.moe_c_silu_and_mul = wrapped_activation
+
+
+def _install_aiter_dynamo_metrics_logging_patch() -> None:
+    """Keep AITER logger callables out of Torch's JSON metrics snapshot."""
+
+    module = import_module("torch._dynamo.utils")
+    current = getattr(module, "_get_dynamo_config_for_logging", None)
+    if not callable(current):
+        raise HcuAiterRuntimeError(
+            "Torch exposes no callable _get_dynamo_config_for_logging"
+        )
+    if bool(getattr(current, _AITER_DYNAMO_METRICS_WRAPPER_MARKER, False)):
+        return
+
+    original = current
+
+    @functools.wraps(original)
+    def wrapped_config() -> str | None:
+        try:
+            return original()
+        except TypeError as exc:
+            if "not JSON serializable" not in str(exc):
+                raise
+            return "Dynamo Config is not JSON serializable"
+
+    setattr(wrapped_config, _AITER_DYNAMO_METRICS_WRAPPER_MARKER, True)
+    module._get_dynamo_config_for_logging = wrapped_config
+
+
 @contextmanager
 def aiter_asm_boltops_int8_quant_context(enabled: bool):
     """Align AITER ASM's dynamic INT8 quantization with BoltOps Triton."""
@@ -223,6 +298,32 @@ def aiter_asm_boltops_fp8_quant_context(enabled: bool):
         yield
     finally:
         _AITER_ASM_BOLTOPS_FP8_QUANT.reset(token)
+
+
+@contextmanager
+def aiter_moe_c_swiglu_limit_context(
+    enabled: bool,
+    *,
+    alpha: float | None,
+    limit: float | None,
+):
+    """Preserve vLLM's clamped SwiGLU contract in AITER MoE-C."""
+
+    if not enabled:
+        yield
+        return
+    if limit is None or float(limit) <= 0:
+        raise HcuAiterRuntimeError(
+            "AITER MoE-C clamped SwiGLU requires a positive limit"
+        )
+    _install_aiter_moe_c_swiglu_wrapper()
+    token = _AITER_MOE_C_SWIGLU_LIMIT.set(
+        (None if alpha is None else float(alpha), float(limit))
+    )
+    try:
+        yield
+    finally:
+        _AITER_MOE_C_SWIGLU_LIMIT.reset(token)
 
 
 def is_aiter_moe_requested(moe_config: object | None = None) -> bool:

@@ -322,8 +322,82 @@ def test_tp_ep_cli_forwards_data_parallel_and_all2all(monkeypatch, capsys):
         "gpu_memory_utilization": 0.6,
         "all2all_backend": "deepep_low_latency",
         "moe_backend": "deep_gemm",
+        "enable_expert_parallel": True,
     }
     assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
+
+
+def test_mtp_parity_forwards_hyv4_tp8_blockwise_contract(monkeypatch):
+    calls = []
+
+    def fake_generate(model_path, *, enforce_eager, **kwargs):
+        calls.append((model_path, enforce_eager, kwargs))
+        return [{"token_ids": [1, 2, 3]}]
+
+    monkeypatch.setattr(model_runtime, "_generate", fake_generate)
+
+    result = model_runtime._case_mtp_parity(
+        Path("/models/Hy4-preview-FP8-Testing"),
+        tensor_parallel_size=8,
+        gpu_memory_utilization=0.95,
+        moe_backend="triton",
+        enable_expert_parallel=False,
+        num_speculative_tokens=3,
+    )
+
+    common = {
+        "tensor_parallel_size": 8,
+        "gpu_memory_utilization": 0.95,
+        "moe_backend": "triton",
+        "enable_expert_parallel": False,
+    }
+    assert calls == [
+        (Path("/models/Hy4-preview-FP8-Testing"), True, common),
+        (
+            Path("/models/Hy4-preview-FP8-Testing"),
+            True,
+            {**common, "spec_method": "mtp", "spec_tokens": 3},
+        ),
+    ]
+    assert result["baseline"] == result["speculative"]
+
+
+def test_tp_ep_cli_forwards_disable_expert_parallel(monkeypatch, capsys):
+    captured = {}
+
+    def fake_case(model_path, **kwargs):
+        captured["model_path"] = model_path
+        captured.update(kwargs)
+        return {"output": []}
+
+    monkeypatch.setattr(model_runtime, "_case_tp_ep_smoke", fake_case)
+    assert model_runtime._main(
+        [
+            "tp-ep-smoke",
+            "--model",
+            "/models/fake",
+            "--tensor-parallel-size",
+            "8",
+            "--disable-expert-parallel",
+            "--moe-backend",
+            "triton",
+        ]
+    ) == 0
+    assert captured["enable_expert_parallel"] is False
+    assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
+
+
+def test_tp_ep_rejects_disabled_expert_parallel_with_data_parallel():
+    with pytest.raises(ValueError, match="data_parallel_size=1"):
+        model_runtime._case_tp_ep_smoke(
+            Path("/models/fake"),
+            tensor_parallel_size=1,
+            data_parallel_size=2,
+            gpu_memory_utilization=0.9,
+            all2all_backend="deepep_high_throughput",
+            moe_backend="deep_gemm",
+            enable_expert_parallel=False,
+        )
 
 
 def test_tp_ep_ll_exercises_model_specific_deepep_token_capacity(monkeypatch):

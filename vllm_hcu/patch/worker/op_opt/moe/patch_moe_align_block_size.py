@@ -11,7 +11,10 @@ from ._common import load_exact_module, require_callable, require_parameter_name
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.moe_align_block_size"
 PATCH_ID = "worker.op_opt.moe.align_block_size"
-TARGETS = (f"{TARGET_MODULE}.moe_align_block_size",)
+TARGETS = (
+    f"{TARGET_MODULE}.moe_align_block_size",
+    "vllm._custom_ops.moe_align_block_size",
+)
 _MARKER = "_vllm_hcu_moe_align_applied"
 
 
@@ -35,6 +38,7 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(target, _MARKER, False):
         return False
     original = require_callable(target, "moe_align_block_size", TARGETS[0])
+    original_op = require_callable(target.ops, "moe_align_block_size", TARGETS[1])
     require_parameter_names(
         original,
         TARGETS[0],
@@ -47,6 +51,59 @@ def apply_to_module(module: ModuleType) -> bool:
             "ignore_invalid_experts",
         ),
     )
+
+    @functools.wraps(original_op)
+    def hcu_moe_align_op(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map=None,
+    ):
+        from vllm_hcu.platforms import envs as henvs
+
+        enabled = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_LIGHTOP_MOE_ALIGN
+        )
+        if not enabled:
+            return original_op(
+                topk_ids,
+                num_experts,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                expert_map,
+            )
+        try:
+            from lightop import op as lightop
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN is enabled, but "
+                "lightop.op is unavailable"
+            ) from exc
+        # Stale high-level vLLM bindings allocate these out-parameters with
+        # ``torch.empty`` before resolving ``ops.moe_align_block_size`` at
+        # call time.  LightOP does not fill padding slots when Is_fuse_fill
+        # is false, and upstream remaps the entire expert buffer under EP.
+        sorted_ids.fill_(topk_ids.numel())
+        expert_ids.zero_()
+        lightop.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map,
+            None,  # expert_mask
+            None,  # num_local_tokens
+            False,  # Is_EP
+            False,  # Is_fuse_fill; the wrapper initialized outputs above
+        )
 
     @functools.wraps(original)
     def hcu_moe_align_block_size(
@@ -157,6 +214,8 @@ def apply_to_module(module: ModuleType) -> bool:
         return sorted_ids, expert_ids, num_tokens_post_pad
 
     target._vllm_hcu_original_moe_align_block_size = original
+    target.ops._vllm_hcu_original_moe_align_block_size = original_op
+    target.ops.moe_align_block_size = hcu_moe_align_op
     target.moe_align_block_size = hcu_moe_align_block_size
     setattr(target, _MARKER, True)
     return True

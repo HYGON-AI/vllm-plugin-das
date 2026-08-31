@@ -369,9 +369,9 @@ def test_input_fp8_environment_selects_custom_or_official_wrapper(
         assert native_result[0] == "custom"
         assert calls == ["custom", "custom"]
     else:
-        assert cuda_result == "official-cuda"
+        assert cuda_result == "official-native"
         assert native_result == "official-native"
-        assert calls == ["official-cuda", "official-native"]
+        assert calls == ["official-native", "official-native"]
 
 
 @pytest.mark.parametrize(

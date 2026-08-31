@@ -103,6 +103,21 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+def test_hy4_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
+    """Removing the Hy4 whitelist entry must reject its valid PCP topology."""
+
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        use_mla=True,
+        pcp=2,
+        tp=4,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config) -> None:
     """GQA PCP must not remain trapped behind the former MLA-only gate."""
 
@@ -199,6 +214,23 @@ def test_glm52_pcp_allows_validated_builtin_mtp_depths(
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_hy4_pcp_allows_validated_builtin_mtp_depths(
+    make_pcp_config, num_speculative_tokens: int
+) -> None:
+    """Hy4 uses the existing replicated built-in MTP PCP contract."""
+
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        pcp=2,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=num_speculative_tokens,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 def test_gqa_pcp_rejects_speculative_decoding(make_pcp_config) -> None:
     """FlashAttention PCP has no replicated speculative-decode contract."""
 
@@ -235,7 +267,10 @@ def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
     ("override", "message"),
     [
         ({"use_v2": False}, "Model Runner V2"),
-        ({"architecture": "DeepseekV2ForCausalLM"}, "GLM-5.2"),
+        (
+            {"architecture": "DeepseekV2ForCausalLM"},
+            "HCU MLA PCP only supports",
+        ),
         ({"use_mla": False}, "MLA"),
         ({"pp": 2}, "pipeline parallel"),
         ({"dcp": 2}, "decode context parallel"),
@@ -266,6 +301,39 @@ def test_glm52_pcp_scope_rejects_unsupported_combinations(
     with pytest.raises(ValueError, match=message):
         patch_vllm_config._validate_hcu_pcp_scope(
             make_pcp_config(pcp=2, **override)
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"enable_expert_parallel": False}, "expert parallel"),
+        ({"enforce_eager": False}, "eager"),
+        ({"pp": 2}, "pipeline parallel"),
+        ({"dcp": 2}, "decode context parallel"),
+        ({"dp": 2}, "data parallel"),
+        (
+            {"speculative": True, "speculative_method": "eagle"},
+            "built-in MTP",
+        ),
+        (
+            {"speculative": True, "num_speculative_tokens": 3},
+            "one or two",
+        ),
+    ],
+)
+def test_hy4_pcp_rejects_unsupported_combinations(
+    make_pcp_config, override, message
+) -> None:
+    """Hy4 must not bypass the shared sparse-MLA PCP restrictions."""
+
+    with pytest.raises(ValueError, match=message):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="HYV4ForCausalLM",
+                pcp=2,
+                **override,
+            )
         )
 
 
@@ -322,6 +390,22 @@ def test_valid_glm52_pcp_removes_only_the_upstream_pcp_rejection(
     module = _make_vllm_module()
     assert patch_vllm_config.apply_to_module(module) is True
     config = _as_fake_vllm_config(module, make_pcp_config(pcp=2))
+
+    assert config._get_v2_model_runner_unsupported_features() == []
+    config._validate_v2_model_runner()
+
+
+def test_valid_hy4_pcp_removes_only_the_upstream_pcp_rejection(
+    make_pcp_config,
+) -> None:
+    """Hy4 PCP removes no unrelated Model Runner V2 rejection."""
+
+    module = _make_vllm_module()
+    assert patch_vllm_config.apply_to_module(module) is True
+    config = _as_fake_vllm_config(
+        module,
+        make_pcp_config(architecture="HYV4ForCausalLM", pcp=2),
+    )
 
     assert config._get_v2_model_runner_unsupported_features() == []
     config._validate_v2_model_runner()

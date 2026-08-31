@@ -74,7 +74,12 @@ def suppress_pp_v2_warmup_sample_broadcast(model_runner: object):
             setattr(model_runner, suppress_attr, previous_suppress)
 
 
-def share_eagle_topk_buffer(target_model: object, eagle_model: object) -> object:
+def share_eagle_topk_buffer(
+    target_model: object,
+    eagle_model: object,
+    *,
+    traverse_modules: bool = True,
+) -> object:
     target_language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
@@ -82,18 +87,20 @@ def share_eagle_topk_buffer(target_model: object, eagle_model: object) -> object
     )
     target_inner = getattr(target_language_model, "model", None)
     draft_inner = getattr(eagle_model, "model", None)
-    if (
-        target_inner is None
-        or draft_inner is None
-        or not hasattr(target_inner, "topk_indices_buffer")
-    ):
+    if target_inner is None or not hasattr(target_inner, "topk_indices_buffer"):
         return eagle_model
     target_buffer = target_inner.topk_indices_buffer
     if target_buffer is None:
         return eagle_model
-    for _, child in draft_inner.named_modules():
-        if hasattr(child, "topk_indices_buffer"):
-            child.topk_indices_buffer = target_buffer
+    set_topk_indices_buffer = getattr(
+        eagle_model, "set_topk_indices_buffer", None
+    )
+    if callable(set_topk_indices_buffer):
+        set_topk_indices_buffer(target_buffer)
+    if traverse_modules and draft_inner is not None:
+        for _, child in draft_inner.named_modules():
+            if hasattr(child, "topk_indices_buffer"):
+                child.topk_indices_buffer = target_buffer
     return eagle_model
 
 

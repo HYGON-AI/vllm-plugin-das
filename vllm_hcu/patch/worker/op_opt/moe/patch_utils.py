@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Expert-aware INT8 quantization adapter for batched DeepEP activations."""
+"""HCU-safe FP8 and expert-aware INT8 MoE quantization adapters."""
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ from ._common import load_exact_module, require_callable, require_parameter_name
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.utils"
 PATCH_ID = "worker.op_opt.moe.utils.int8_expert_quant"
-TARGETS = (f"{TARGET_MODULE}._int8_quantize",)
+TARGETS = (
+    f"{TARGET_MODULE}._int8_quantize",
+    f"{TARGET_MODULE}._fp8_quantize",
+)
 _MARKER = "_vllm_hcu_int8_expert_quant_applied"
 
 
@@ -21,6 +24,12 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     original = require_callable(target, "_int8_quantize", TARGETS[0])
     require_parameter_names(original, TARGETS[0], ("A", "A_scale", "per_act_token", "block_shape"))
+    original_fp8 = require_callable(target, "_fp8_quantize", TARGETS[1])
+    require_parameter_names(
+        original_fp8,
+        TARGETS[1],
+        ("A", "A_scale", "per_act_token", "block_shape"),
+    )
 
     @functools.wraps(original)
     def hcu_int8_quantize(
@@ -47,8 +56,21 @@ def apply_to_module(module: ModuleType) -> bool:
 
     # The wrapper intentionally extends the public internal signature.
     del hcu_int8_quantize.__wrapped__
+
+    @functools.wraps(original_fp8)
+    def hcu_fp8_quantize(A, A_scale, per_act_token, block_shape=None):
+        if A_scale is None and per_act_token and block_shape is None:
+            from vllm_hcu.model_executor.layers.quantization.native_fp8_runtime import (
+                dynamic_per_token_quant_fp8,
+            )
+
+            return dynamic_per_token_quant_fp8(A)
+        return original_fp8(A, A_scale, per_act_token, block_shape)
+
     target._vllm_hcu_original_int8_quantize = original
+    target._vllm_hcu_original_fp8_quantize = original_fp8
     target._int8_quantize = hcu_int8_quantize
+    target._fp8_quantize = hcu_fp8_quantize
     setattr(target, _MARKER, True)
     return True
 

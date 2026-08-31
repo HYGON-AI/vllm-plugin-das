@@ -5,8 +5,12 @@
 
 from vllm import ModelRegistry
 
+from vllm_hcu.models.hy_v4.config import register_hy_v4_config
+
 
 def register_model():
+    register_hy_v4_config()
+
     ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
@@ -37,6 +41,14 @@ def register_model():
     
     ModelRegistry.register_model(
         "HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP"
+    )
+
+    ModelRegistry.register_model(
+        "HYV4ForCausalLM", "vllm_hcu.models.hy_v4:HYV4ForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP"
     )
 
     ModelRegistry.register_model(

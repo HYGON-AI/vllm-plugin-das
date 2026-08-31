@@ -409,6 +409,31 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     assert scale_calls == [(mla, False)]
 
 
+def test_mla_channel_fp8_weight_is_dequantized_without_linear_forward():
+    weight = torch.tensor(
+        [[1.0, 2.0, -3.0], [4.0, -5.0, 6.0]],
+        dtype=torch.float8_e4m3fn,
+    )
+    weight.input_dim = 0
+    weight.output_dim = 1
+    scale = torch.tensor([[0.25], [0.5], [0.125]], dtype=torch.float32)
+    layer = SimpleNamespace(weight=weight, weight_scale=scale)
+    upstream = SimpleNamespace(
+        get_and_maybe_dequant_weights=lambda *args, **kwargs: pytest.fail(
+            "channel FP8 dequantization must not execute the quantized linear"
+        )
+    )
+
+    actual = mla_runtime._get_mla_kv_b_proj_weight(
+        upstream,
+        layer,
+        torch.bfloat16,
+    )
+
+    expected = (weight.float() * scale.T).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     adapter = _adapter()
     target_calls = []
@@ -759,6 +784,16 @@ def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
             return SimpleNamespace(fp8_use_mixed_batch=False)
 
     class FlashMLASparseImpl:
+        def forward_mqa(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            attn_metadata,
+            layer,
+        ):
+            del kv_c_and_k_pe_cache, attn_metadata, layer
+            return q
+
         def _fp8_flash_mla_kernel(
             self,
             q,

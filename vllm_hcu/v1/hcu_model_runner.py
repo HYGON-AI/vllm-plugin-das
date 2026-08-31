@@ -5289,23 +5289,36 @@ class GPUModelRunner(
 
         # begin loading weights
         logger.info_once("Reloading weights inplace...")
-        if is_checkpoint_format:
-            # load weights from checkpoint/ original model format
-            initialize_layerwise_reload(model)
-            loaded_weights = model.load_weights(weights_iterator)
-            finalize_layerwise_reload(model, self.model_config)
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            abort_aiter_weight_reload,
+            begin_aiter_weight_reload,
+            commit_aiter_weight_reload,
+        )
 
+        aiter_reload = begin_aiter_weight_reload(model)
+        try:
+            if is_checkpoint_format:
+                # load weights from checkpoint/ original model format
+                initialize_layerwise_reload(model)
+                loaded_weights = model.load_weights(weights_iterator)
+                finalize_layerwise_reload(model, self.model_config)
+
+            else:
+                # load weights from kernel format
+                logger.warning_once(
+                    "Reloading with `is_checkpoint_format=True` requires that "
+                    "weights be in kernel format and already sharded",
+                )
+                loaded_weights = set()
+                for name, loaded_weight in weights_iterator:
+                    param = model.get_parameter(name)  # TODO: buffers?
+                    param.copy_(loaded_weight)
+                    loaded_weights.add(name)
+        except BaseException:
+            abort_aiter_weight_reload(aiter_reload)
+            raise
         else:
-            # load weights from kernel format
-            logger.warning_once(
-                "Reloading with `is_checkpoint_format=True` requires that "
-                "weights be in kernel format and already sharded",
-            )
-            loaded_weights = set()
-            for name, loaded_weight in weights_iterator:
-                param = model.get_parameter(name)  # TODO: buffers?
-                param.copy_(loaded_weight)
-                loaded_weights.add(name)
+            commit_aiter_weight_reload(aiter_reload)
 
         # logging and validation
         counter_after_reloading = time.perf_counter()

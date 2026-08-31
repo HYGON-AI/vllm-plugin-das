@@ -67,14 +67,20 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     use_mla = bool(
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
-    is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    mla_pcp_models = {
+        "GlmMoeDsaForCausalLM": "GLM-5.2",
+        "HYV4ForCausalLM": "Hy4",
+    }
+    architecture = architectures[0] if len(architectures) == 1 else None
+    mla_model_name = mla_pcp_models.get(architecture)
+    if use_mla and mla_model_name is None:
+        supported = ", ".join(sorted(mla_pcp_models))
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "HCU MLA PCP only supports architectures "
+            f"{supported}; got {architectures!r}."
         )
-    if is_glm52 and not use_mla:
-        raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if mla_model_name is not None and not use_mla:
+        raise ValueError(f"{mla_model_name} PCP requires MLA or sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -104,7 +110,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     )
     if use_mla and dcp_size != 1:
-        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+        raise ValueError(
+            f"{mla_model_name} PCP does not support decode context parallelism."
+        )
     if not use_mla and dcp_size != 1:
         raise ValueError(
             "FlashAttention PCP does not support decode context parallelism."
@@ -116,11 +124,13 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires expert parallelism.")
+        raise ValueError(f"{mla_model_name} PCP requires expert parallelism.")
     if use_mla and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        raise ValueError(
+            f"{mla_model_name} PCP requires eager execution without graphs."
+        )
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
@@ -133,7 +143,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             speculative_config, "method", "SpeculativeConfig"
         )
         if method != "mtp":
-            raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
+            raise ValueError(f"{mla_model_name} PCP only supports built-in MTP.")
         num_speculative_tokens = _require_hcu_pcp_attribute(
             speculative_config,
             "num_speculative_tokens",
@@ -141,7 +151,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
         if num_speculative_tokens not in (1, 2):
             raise ValueError(
-                "GLM-5.2 PCP+MTP requires one or two speculative tokens."
+                f"{mla_model_name} PCP+MTP requires one or two speculative tokens."
             )
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
@@ -167,7 +177,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:
         if use_mla:
-            raise ValueError("GLM-5.2 PCP does not support HCU multi-layer MTP.")
+            raise ValueError(
+                f"{mla_model_name} PCP does not support HCU multi-layer MTP."
+            )
         raise ValueError("FlashAttention PCP does not support multi-layer MTP.")
 
 

@@ -83,6 +83,10 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             events.append("super.prepare_dummy_attn")
             return ("global-dummy-blocks", input_batch), "global-dummy-slots"
 
+        def execute_model(self, *args, **kwargs):
+            events.append("super.execute_model")
+            return args, kwargs
+
         def sample_tokens(self, grammar_output):
             events.append("super.sample_tokens")
             assert grammar_output == "grammar"
@@ -141,8 +145,8 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     """Moving partition or restore across its upstream boundary is a bug."""
 
     runner_module, events = pcp_runner_module
-    global_batch = object()
-    local_batch = object()
+    global_batch = SimpleNamespace(is_prefilling_np=np.array([True]))
+    local_batch = SimpleNamespace(is_prefilling_np=np.array([True]))
     global_hidden = object()
     local_hidden = object()
     synchronized_batches: list[object] = []
@@ -424,7 +428,7 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     """PCP=1 must not call a manager helper or bypass an upstream method."""
 
     runner_module, events = pcp_runner_module
-    global_batch = object()
+    global_batch = SimpleNamespace(is_prefilling_np=np.array([True]))
     hidden_states = object()
 
     def unexpected_builder(*args):

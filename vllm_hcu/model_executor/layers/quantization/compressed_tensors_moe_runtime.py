@@ -9,7 +9,11 @@ that no vLLM source file needs to be rewritten.
 
 from __future__ import annotations
 
+import functools
+import os
+import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -17,6 +21,246 @@ import torch
 
 class HcuCompressedTensorsMoeError(RuntimeError):
     """An explicitly selected HCU compressed-tensors MoE path is invalid."""
+
+
+_CHANNEL_FP8_BF16_LAYOUT_MARKER = (
+    "_hcu_channel_fp8_bf16_standard_layout"
+)
+
+
+def _reject_channel_fp8_w8a16_reload(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+    raise HcuCompressedTensorsMoeError(
+        "Channel-FP8 W8A16 requantization does not support online weight reload"
+    )
+
+
+def _validate_channel_fp8_bf16_tensor(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    name: str,
+) -> None:
+    """Validate one canonical Channel-FP8 expert tensor and its scale."""
+
+    fp8_dtypes = {torch.float8_e4m3fn}
+    fp8_fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    if fp8_fnuz is not None:
+        fp8_dtypes.add(fp8_fnuz)
+    if weight.ndim != 3 or weight.dtype not in fp8_dtypes:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires rank-3 FP8 {name}"
+        )
+    if not weight.is_contiguous() or weight.stride(-1) != 1:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires canonical contiguous {name}"
+        )
+    expected_scale_shape = (*weight.shape[:-1], 1)
+    if tuple(scale.shape) != expected_scale_shape:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic {name}_scale shape must be "
+            f"{expected_scale_shape}, got {tuple(scale.shape)}"
+        )
+    if scale.dtype is not torch.float32:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires FP32 {name}_scale"
+        )
+    if scale.device != weight.device:
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires {name} and {name}_scale "
+            "on the same device"
+        )
+    if not scale.is_contiguous():
+        raise HcuCompressedTensorsMoeError(
+            f"Channel-FP8 BF16 diagnostic requires contiguous {name}_scale"
+        )
+
+
+@torch.no_grad()
+def mark_channel_fp8_bf16_moe_standard_layout(
+    layer: object,
+    quant_config: object,
+) -> None:
+    """Validate and mark canonical Channel-FP8 parameters after loading."""
+
+    tensors = (
+        _required_tensor(layer, "w13_weight"),
+        _required_tensor(layer, "w2_weight"),
+        _required_tensor(layer, "w13_weight_scale"),
+        _required_tensor(layer, "w2_weight_scale"),
+    )
+    _validate_channel_fp8_bf16_tensor(tensors[0], tensors[2], "w1")
+    _validate_channel_fp8_bf16_tensor(tensors[1], tensors[3], "w2")
+    if tensors[0].shape[0] != tensors[1].shape[0]:
+        raise HcuCompressedTensorsMoeError(
+            "Channel-FP8 BF16 diagnostic requires matching expert counts"
+        )
+    for name, scale in (("w1", tensors[2]), ("w2", tensors[3])):
+        if not bool(torch.isfinite(scale).all().item()):
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 BF16 diagnostic found non-finite {name}_scale"
+            )
+        if not bool((scale > 0).all().item()):
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 BF16 diagnostic found non-positive {name}_scale"
+            )
+    setattr(
+        quant_config,
+        _CHANNEL_FP8_BF16_LAYOUT_MARKER,
+        tuple((tensor, tensor._version) for tensor in tensors),
+    )
+
+
+def _require_channel_fp8_bf16_moe_standard_layout(
+    quant_config: object,
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    marker = getattr(quant_config, _CHANNEL_FP8_BF16_LAYOUT_MARKER, None)
+    if not isinstance(marker, tuple) or len(marker) != len(tensors):
+        raise HcuCompressedTensorsMoeError(
+            "Channel-FP8 BF16 diagnostic requires a standard-layout marker"
+        )
+    for entry, tensor in zip(marker, tensors):
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) != 2
+            or entry[0] is not tensor
+            or entry[1] != tensor._version
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "Channel-FP8 BF16 diagnostic standard-layout marker no longer "
+                "matches the loaded parameters"
+            )
+
+
+@torch.no_grad()
+def _dequantize_channel_fp8_moe_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    """Materialize one canonical Channel-FP8 expert tensor as BF16."""
+
+    _validate_channel_fp8_bf16_tensor(weight, scale, name)
+
+    # Every FP8 value is exactly representable in BF16. Casting first and then
+    # multiplying in place therefore matches a FP32 multiply rounded to BF16,
+    # without allocating a full-size FP32 intermediate for these large experts.
+    dequantized = weight.to(torch.bfloat16)
+    dequantized.mul_(scale)
+    return dequantized
+
+
+@torch.no_grad()
+def requantize_channel_fp8_moe_weights(
+    layer: object,
+    replace_parameter: Callable[[object, str, torch.Tensor], None],
+    expert_chunk_size: int = 8,
+) -> None:
+    """Requantize TP-local Channel-FP8 experts to INT8 per output channel."""
+
+    if getattr(layer, "_hcu_channel_fp8_w8a16_requantized", False):
+        if _required_tensor(layer, "w13_weight").dtype is not torch.int8 or (
+            _required_tensor(layer, "w2_weight").dtype is not torch.int8
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "Channel-FP8 W8A16 marker does not match the expert weight dtype"
+            )
+        return
+    if not isinstance(expert_chunk_size, int) or expert_chunk_size <= 0:
+        raise HcuCompressedTensorsMoeError(
+            "Channel-FP8 W8A16 expert_chunk_size must be a positive integer"
+        )
+
+    fp8_dtypes = {torch.float8_e4m3fn}
+    fp8_fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    if fp8_fnuz is not None:
+        fp8_dtypes.add(fp8_fnuz)
+
+    def convert(name: str, scale_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = _required_tensor(layer, name)
+        old_scale = _required_tensor(layer, scale_name)
+        if weight.ndim != 3 or weight.dtype not in fp8_dtypes:
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 W8A16 requires rank-3 FP8 {name}"
+            )
+        expected_scale_shape = (*weight.shape[:-1], 1)
+        if tuple(old_scale.shape) != expected_scale_shape:
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 W8A16 {scale_name} shape must be "
+                f"{expected_scale_shape}, got {tuple(old_scale.shape)}"
+            )
+
+        quantized = torch.empty_like(weight, dtype=torch.int8)
+        new_scale = torch.empty_like(old_scale, dtype=torch.float32)
+        for start in range(0, weight.shape[0], expert_chunk_size):
+            stop = min(start + expert_chunk_size, weight.shape[0])
+            dequantized = weight[start:stop].float() * old_scale[start:stop].float()
+            absmax = dequantized.abs().amax(dim=-1, keepdim=True)
+            chunk_scale = torch.where(absmax > 0, absmax / 127.0, 1.0)
+            quantized[start:stop].copy_(
+                torch.round(dequantized / chunk_scale)
+                .clamp_(-127, 127)
+                .to(torch.int8)
+            )
+            new_scale[start:stop].copy_(chunk_scale)
+        if not bool(torch.isfinite(new_scale).all().item()):
+            raise HcuCompressedTensorsMoeError(
+                f"Channel-FP8 W8A16 found non-finite values in {name}"
+            )
+        return quantized, new_scale
+
+    w13, w13_scale = convert("w13_weight", "w13_weight_scale")
+    w2, w2_scale = convert("w2_weight", "w2_weight_scale")
+    replace_parameter(layer, "w13_weight", w13)
+    replace_parameter(layer, "w2_weight", w2)
+    replace_parameter(layer, "w13_weight_scale", w13_scale)
+    replace_parameter(layer, "w2_weight_scale", w2_scale)
+    for name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
+        setattr(
+            _required_tensor(layer, name),
+            "weight_loader",
+            _reject_channel_fp8_w8a16_reload,
+        )
+    setattr(layer, "_hcu_channel_fp8_w8a16_requantized", True)
+
+
+class _AiterInplaceShuffleState:
+    """Lifecycle state for a destructively shuffled expert-weight pair."""
+
+    def __init__(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
+        self.lock = threading.RLock()
+        self.weight_ids = (id(w1), id(w2))
+        self.status = "canonical"
+        self.config_key: tuple[str, str] | None = None
+        self.generations: (
+            tuple[tuple[object, ...], tuple[object, ...]] | None
+        ) = None
+        self.error: BaseException | None = None
+        self.loaded_weight_ids: set[int] = set()
+        self.use_events: dict[int, object] = {}
+
+
+class _AiterWeightReloadTransaction:
+    def __init__(
+        self,
+        model: object,
+        pairs: list[
+            tuple[_AiterInplaceShuffleState, tuple[str, str]]
+        ],
+    ) -> None:
+        self.model = model
+        self.pairs = pairs
+        self.active = True
+
+
+_AITER_INPLACE_STATE_ATTR = "_hcu_aiter_quantized_inplace_shuffle_state"
+_AITER_WEIGHT_LOADER_MARKER = "_vllm_hcu_aiter_shuffle_reload_guard"
+_AITER_INPLACE_STATE_CREATION_LOCK = threading.Lock()
 
 
 def _required_tensor(owner: object, name: str) -> torch.Tensor:
@@ -72,7 +316,252 @@ def _tensor_cache(
     return cache
 
 
-def _get_aiter_quantized_runtime_config(
+def _existing_inplace_shuffle_state(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+) -> _AiterInplaceShuffleState | None:
+    state1 = getattr(w1, _AITER_INPLACE_STATE_ATTR, None)
+    state2 = getattr(w2, _AITER_INPLACE_STATE_ATTR, None)
+    if state1 is None and state2 is None:
+        return None
+    if (
+        not isinstance(state1, _AiterInplaceShuffleState)
+        or state1 is not state2
+        or state1.weight_ids != (id(w1), id(w2))
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "AITER in-place MoE shuffle state does not match its weight pair"
+        )
+    return state1
+
+
+def _get_or_create_inplace_shuffle_state(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+) -> _AiterInplaceShuffleState:
+    with _AITER_INPLACE_STATE_CREATION_LOCK:
+        state = _existing_inplace_shuffle_state(w1, w2)
+        if state is None:
+            state = _AiterInplaceShuffleState(w1, w2)
+            setattr(w1, _AITER_INPLACE_STATE_ATTR, state)
+            setattr(w2, _AITER_INPLACE_STATE_ATTR, state)
+        return state
+
+
+def _reset_inplace_shuffle_state_after_load(param: torch.Tensor) -> None:
+    state = getattr(param, _AITER_INPLACE_STATE_ATTR, None)
+    if not isinstance(state, _AiterInplaceShuffleState):
+        return
+    with state.lock:
+        state.status = "canonical"
+        state.config_key = None
+        state.generations = None
+        state.error = None
+        state.loaded_weight_ids.clear()
+
+
+def _synchronize_weight_use_events(state: _AiterInplaceShuffleState) -> None:
+    for event in state.use_events.values():
+        synchronize = getattr(event, "synchronize", None)
+        if not callable(synchronize):
+            raise HcuCompressedTensorsMoeError(
+                "AITER MoE weight-use event cannot be synchronized"
+            )
+        synchronize()
+    state.use_events.clear()
+
+
+def _install_weight_loader_reload_guard(param: torch.Tensor) -> None:
+    current = getattr(param, "weight_loader", None)
+    if not callable(current) or bool(
+        getattr(current, _AITER_WEIGHT_LOADER_MARKER, False)
+    ):
+        return
+    original = current
+
+    @functools.wraps(original)
+    def guarded_loader(loaded_param, *args, **kwargs):
+        state = getattr(loaded_param, _AITER_INPLACE_STATE_ATTR, None)
+        if isinstance(state, _AiterInplaceShuffleState):
+            with state.lock:
+                _synchronize_weight_use_events(state)
+                state.status = "loading"
+                state.config_key = None
+                state.generations = None
+                state.error = None
+                try:
+                    result = original(loaded_param, *args, **kwargs)
+                except BaseException as exc:
+                    state.status = "failed"
+                    state.error = exc
+                    raise
+                state.loaded_weight_ids.add(id(loaded_param))
+                if state.loaded_weight_ids == set(state.weight_ids):
+                    _reset_inplace_shuffle_state_after_load(loaded_param)
+                return result
+        return original(loaded_param, *args, **kwargs)
+
+    setattr(guarded_loader, _AITER_WEIGHT_LOADER_MARKER, True)
+    param.weight_loader = guarded_loader
+
+
+def begin_aiter_weight_reload(model: object) -> _AiterWeightReloadTransaction:
+    """Lock every prepared AITER pair for one complete vLLM reload."""
+
+    named_parameters = getattr(model, "named_parameters", None)
+    if not callable(named_parameters):
+        raise HcuCompressedTensorsMoeError(
+            "AITER weight reload transaction requires named_parameters()"
+        )
+    names_by_id = {id(param): name for name, param in named_parameters()}
+    states: dict[int, _AiterInplaceShuffleState] = {}
+    for _, param in named_parameters():
+        state = getattr(param, _AITER_INPLACE_STATE_ATTR, None)
+        if isinstance(state, _AiterInplaceShuffleState):
+            states[id(state)] = state
+
+    pairs: list[tuple[_AiterInplaceShuffleState, tuple[str, str]]] = []
+    for state in sorted(states.values(), key=id):
+        try:
+            names = (
+                names_by_id[state.weight_ids[0]],
+                names_by_id[state.weight_ids[1]],
+            )
+        except KeyError as exc:
+            raise HcuCompressedTensorsMoeError(
+                "AITER reload could not resolve a shuffled weight pair"
+            ) from exc
+        pairs.append((state, names))
+
+    acquired: list[_AiterInplaceShuffleState] = []
+    try:
+        for state, _ in pairs:
+            state.lock.acquire()
+            acquired.append(state)
+            _synchronize_weight_use_events(state)
+            state.status = "loading"
+            state.config_key = None
+            state.generations = None
+            state.error = None
+            state.loaded_weight_ids.clear()
+    except BaseException:
+        for state in reversed(acquired):
+            state.lock.release()
+        raise
+    return _AiterWeightReloadTransaction(model, pairs)
+
+
+def _finish_aiter_weight_reload(
+    transaction: _AiterWeightReloadTransaction,
+    *,
+    failed: bool,
+) -> None:
+    if not isinstance(transaction, _AiterWeightReloadTransaction):
+        raise HcuCompressedTensorsMoeError(
+            "invalid AITER weight reload transaction"
+        )
+    if not transaction.active:
+        raise HcuCompressedTensorsMoeError(
+            "AITER weight reload transaction is already complete"
+        )
+    transaction.active = False
+    try:
+        get_parameter = getattr(transaction.model, "get_parameter", None)
+        if not callable(get_parameter):
+            raise HcuCompressedTensorsMoeError(
+                "AITER weight reload transaction requires get_parameter()"
+            )
+        for state, names in transaction.pairs:
+            current_w1 = get_parameter(names[0])
+            current_w2 = get_parameter(names[1])
+            if not isinstance(current_w1, torch.Tensor) or not isinstance(
+                current_w2, torch.Tensor
+            ):
+                raise HcuCompressedTensorsMoeError(
+                    "AITER reload replaced expert weights with non-tensors"
+                )
+            state.weight_ids = (id(current_w1), id(current_w2))
+            setattr(current_w1, _AITER_INPLACE_STATE_ATTR, state)
+            setattr(current_w2, _AITER_INPLACE_STATE_ATTR, state)
+            for tensor in (current_w1, current_w2):
+                for cache_name in (
+                    "_hcu_aiter_quantized_config_cache",
+                    "_hcu_aiter_quantized_weight_cache",
+                ):
+                    cache = getattr(tensor, cache_name, None)
+                    if isinstance(cache, dict):
+                        cache.clear()
+            state.status = "failed" if failed else "canonical"
+            state.config_key = None
+            state.generations = None
+            state.error = (
+                HcuCompressedTensorsMoeError(
+                    "vLLM weight reload did not complete"
+                )
+                if failed
+                else None
+            )
+            state.loaded_weight_ids.clear()
+    except BaseException as exc:
+        for state, _ in transaction.pairs:
+            state.status = "failed"
+            state.error = exc
+        raise
+    finally:
+        for state, _ in reversed(transaction.pairs):
+            state.lock.release()
+
+
+def commit_aiter_weight_reload(
+    transaction: _AiterWeightReloadTransaction,
+) -> None:
+    _finish_aiter_weight_reload(transaction, failed=False)
+
+
+def abort_aiter_weight_reload(
+    transaction: _AiterWeightReloadTransaction,
+) -> None:
+    _finish_aiter_weight_reload(transaction, failed=True)
+
+
+@contextmanager
+def aiter_quantized_weight_lease(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+):
+    """Protect one AITER kernel submission from concurrent weight reload."""
+
+    state = _get_or_create_inplace_shuffle_state(w1, w2)
+    with state.lock:
+        if state.status == "loading":
+            raise HcuCompressedTensorsMoeError(
+                "AITER MoE weights are still being reloaded"
+            )
+        if state.status == "failed":
+            raise HcuCompressedTensorsMoeError(
+                "AITER MoE weights require a successful reload before reuse"
+            )
+        try:
+            yield
+        finally:
+            if w1.device.type == "cuda":
+                stream = torch.cuda.current_stream(w1.device)
+                stream_id = getattr(stream, "cuda_stream", None)
+                if not isinstance(stream_id, int):
+                    stream_id = id(stream)
+                event = state.use_events.get(stream_id)
+                if event is None:
+                    event = torch.cuda.Event()
+                    state.use_events[stream_id] = event
+                record = getattr(event, "record", None)
+                if not callable(record):
+                    raise HcuCompressedTensorsMoeError(
+                        "AITER MoE weight-use event cannot be recorded"
+                    )
+                record(stream)
+
+
+def _get_aiter_quantized_runtime_config_unlocked(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -105,7 +594,10 @@ def _get_aiter_quantized_runtime_config(
     if cached is not None:
         return cached
 
-    status, aiter_config = get_aiter_moe_config(
+    pinned_solution = getattr(
+        w1, "_hcu_aiter_quantized_pinned_solution", None
+    )
+    config_kwargs = dict(
         M=hidden_states.shape[0],
         E=w1.shape[0],
         N1=w1.shape[1],
@@ -117,6 +609,9 @@ def _get_aiter_quantized_runtime_config(
         quant_type=quant_type,
         activation=activation,
     )
+    if pinned_solution is not None:
+        config_kwargs["spec_sol_type"] = pinned_solution
+    status, aiter_config = get_aiter_moe_config(**config_kwargs)
     if not status or aiter_config is None:
         raise HcuCompressedTensorsMoeError(
             "AITER quantized MoE found no backend config for "
@@ -124,10 +619,86 @@ def _get_aiter_quantized_runtime_config(
             f"top_k={topk_ids.shape[1]}, dtype={hidden_states.dtype}, "
             f"quant_type={quant_type}"
         )
+    shuffle_mode = os.environ.get(
+        "VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "auto"
+    ).strip().lower()
+    solution_type = getattr(aiter_config, "solution_type", None)
+    destructive_solution = bool(
+        getattr(aiter_config, "need_shuffle", False)
+        and (
+            shuffle_mode == "1"
+            or (
+                shuffle_mode == "auto"
+                and _enum_token(getattr(aiter_config, "quant_type", None))
+                == "FP8_W8A8"
+                and _enum_token(solution_type) == "MOE_C"
+            )
+        )
+    )
+    if destructive_solution:
+        if pinned_solution is not None and _enum_token(
+            pinned_solution
+        ) != _enum_token(solution_type):
+            raise HcuCompressedTensorsMoeError(
+                "AITER returned a solution different from the pinned in-place "
+                "MoE weight layout"
+            )
+        if pinned_solution is None:
+            setattr(
+                w1,
+                "_hcu_aiter_quantized_pinned_solution",
+                solution_type,
+            )
+            cache.clear()
     if len(cache) >= 128:
         cache.clear()
     cache[cache_key] = aiter_config
     return aiter_config
+
+
+def _get_aiter_quantized_runtime_config(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type: object,
+    activation: str,
+) -> object:
+    shuffle_mode = os.environ.get(
+        "VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE", "auto"
+    ).strip().lower()
+    tracks_destructive_layout = shuffle_mode == "1" or (
+        shuffle_mode == "auto" and _enum_token(quant_type) == "FP8_W8A8"
+    )
+    state = _existing_inplace_shuffle_state(w1, w2)
+    if state is None and tracks_destructive_layout:
+        state = _get_or_create_inplace_shuffle_state(w1, w2)
+    if state is None:
+        return _get_aiter_quantized_runtime_config_unlocked(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            quant_type,
+            activation,
+        )
+    with state.lock:
+        if state.status == "loading":
+            raise HcuCompressedTensorsMoeError(
+                "AITER MoE weights are still being reloaded"
+            )
+        if state.status == "failed":
+            raise HcuCompressedTensorsMoeError(
+                "AITER MoE weights require a successful reload before reuse"
+            )
+        return _get_aiter_quantized_runtime_config_unlocked(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            quant_type,
+            activation,
+        )
 
 
 def _get_aiter_quantized_weights(
@@ -135,8 +706,127 @@ def _get_aiter_quantized_weights(
     w2: torch.Tensor,
     aiter_config: object,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    existing_state = _existing_inplace_shuffle_state(w1, w2)
     if not bool(getattr(aiter_config, "need_shuffle", False)):
+        if existing_state is not None:
+            with existing_state.lock:
+                if existing_state.status != "canonical":
+                    detail = (
+                        "partially shuffled weights require a successful reload"
+                        if existing_state.status == "failed"
+                        else "an AITER MoE weight layout transition is not safe"
+                    )
+                    raise HcuCompressedTensorsMoeError(detail)
         return w1, w2
+
+    shuffle_mode = os.environ.get(
+        "VLLM_HCU_AITER_MOE_INPLACE_CHUNKED_SHUFFLE",
+        "auto",
+    ).strip().lower()
+    auto_chunked_shuffle = (
+        _enum_token(getattr(aiter_config, "quant_type", None)) == "FP8_W8A8"
+        and _enum_token(getattr(aiter_config, "solution_type", None)) == "MOE_C"
+    )
+    use_chunked_shuffle = shuffle_mode == "1" or (
+        shuffle_mode == "auto" and auto_chunked_shuffle
+    )
+
+    if use_chunked_shuffle:
+        config_key = (
+            _enum_token(getattr(aiter_config, "quant_type", None)),
+            _enum_token(getattr(aiter_config, "solution_type", None)),
+        )
+        state = _get_or_create_inplace_shuffle_state(w1, w2)
+        _install_weight_loader_reload_guard(w1)
+        _install_weight_loader_reload_guard(w2)
+        with state.lock:
+            if state.status == "loading":
+                raise HcuCompressedTensorsMoeError(
+                    "AITER MoE weights are still being reloaded"
+                )
+            if state.status == "failed":
+                raise HcuCompressedTensorsMoeError(
+                    "AITER MoE weights are partially shuffled; a successful "
+                    "weight reload is required before reuse"
+                )
+            if state.status == "ready":
+                if state.config_key != config_key:
+                    raise HcuCompressedTensorsMoeError(
+                        "an AITER MoE weight layout transition is not safe "
+                        "after in-place shuffle"
+                    )
+                generations = (
+                    _tensor_generation(w1),
+                    _tensor_generation(w2),
+                )
+                if state.generations != generations:
+                    state.status = "failed"
+                    raise HcuCompressedTensorsMoeError(
+                        "AITER in-place shuffled weights were modified outside "
+                        "their guarded weight loaders; reload is required"
+                    )
+                return w1, w2
+            if state.status == "preparing":
+                raise HcuCompressedTensorsMoeError(
+                    "recursive AITER in-place MoE weight preparation is invalid"
+                )
+
+            state.status = "preparing"
+            state.config_key = config_key
+            try:
+                from aiter.moe import aiter_moe_shfl_weight
+
+                chunk_experts = max(
+                    1,
+                    int(
+                        os.environ.get(
+                            "VLLM_HCU_AITER_MOE_SHUFFLE_CHUNK_EXPERTS", "1"
+                        )
+                    ),
+                )
+                with torch.no_grad():
+                    for start in range(0, w1.shape[0], chunk_experts):
+                        end = min(start + chunk_experts, w1.shape[0])
+                        w1_chunk = w1[start:end]
+                        w2_chunk = w2[start:end]
+                        shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(
+                            w1_chunk,
+                            w2_chunk,
+                            aiter_config,
+                        )
+                        if (
+                            not isinstance(shuffled_w1, torch.Tensor)
+                            or not isinstance(shuffled_w2, torch.Tensor)
+                            or shuffled_w1.shape != w1_chunk.shape
+                            or shuffled_w2.shape != w2_chunk.shape
+                        ):
+                            raise HcuCompressedTensorsMoeError(
+                                "AITER returned incompatible chunked shuffled "
+                                "weights"
+                            )
+                        w1_chunk.copy_(shuffled_w1)
+                        w2_chunk.copy_(shuffled_w2)
+            except BaseException as exc:
+                state.status = "failed"
+                state.error = exc
+                raise
+            state.status = "ready"
+            state.generations = (
+                _tensor_generation(w1),
+                _tensor_generation(w2),
+            )
+            state.error = None
+            return w1, w2
+
+    if existing_state is not None:
+        with existing_state.lock:
+            if existing_state.status != "canonical":
+                detail = (
+                    "partially shuffled weights require a successful reload"
+                    if existing_state.status == "failed"
+                    else "an AITER MoE weight layout transition is not safe"
+                )
+                raise HcuCompressedTensorsMoeError(detail)
 
     cache = _tensor_cache(w1, "_hcu_aiter_quantized_weight_cache")
     cache_key = (
@@ -179,7 +869,7 @@ def _get_aiter_quantized_weights(
     return shuffled_w1, shuffled_w2
 
 
-def apply_aiter_quantized_moe(
+def _apply_aiter_quantized_moe_with_lease(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -195,7 +885,7 @@ def apply_aiter_quantized_moe(
     output_dtype: torch.dtype | None = None,
     moe_sorting_dispatch_policy: int = 0,
 ) -> torch.Tensor:
-    """Run v0.25 FP8/INT8 W8A8 experts through the public HCU AITER API."""
+    """Run v0.25 quantized experts through the public HCU AITER/BoltOps API."""
 
     if (
         topk_weights.ndim != 2
@@ -221,7 +911,113 @@ def apply_aiter_quantized_moe(
         )
     if getattr(quant_config, "block_shape", None) is not None:
         raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE supports only channel/token W8A8 in this path"
+            "AITER quantized MoE supports only non-block FP8/INT8 configs in this path"
+        )
+
+    use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
+    use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
+    use_int8_w8a16 = bool(getattr(quant_config, "use_int8_w8a16", False))
+    use_fp8_w8a16 = bool(getattr(quant_config, "use_fp8_w8a16", False))
+    if sum((use_fp8, use_int8, use_int8_w8a16, use_fp8_w8a16)) != 1:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE requires exactly one FP8-W8A8, INT8-W8A8, "
+            "INT8-W8A16, or FP8-W8A16 config"
+        )
+    w1_scale = _required_tensor(quant_config, "w1_scale")
+    w2_scale = _required_tensor(quant_config, "w2_scale")
+    activation_value = getattr(activation, "value", activation)
+    if activation_value is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE requires an activation"
+        )
+    activation_name = str(activation_value)
+
+    if use_int8_w8a16 or use_fp8_w8a16:
+        diagnostic_name = "FP8-W8A16" if use_fp8_w8a16 else "INT8-W8A16"
+        if use_int8_w8a16 and (
+            w1.dtype is not torch.int8 or w2.dtype is not torch.int8
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "AITER INT8-W8A16 requires INT8 expert weights"
+            )
+        if expert_map is not None:
+            raise HcuCompressedTensorsMoeError(
+                f"AITER {diagnostic_name} fallback is currently limited to TP/non-EP"
+            )
+        if a1q_scale is not None or any(
+            getattr(quant_config, name, None) is not None
+            for name in ("a1_scale", "a2_scale", "w1_zp", "w2_zp")
+        ):
+            raise HcuCompressedTensorsMoeError(
+                f"AITER {diagnostic_name} requires unquantized activations "
+                "and symmetric weights"
+            )
+        if use_fp8_w8a16 and (
+            hidden_states.dtype is not torch.bfloat16
+            or output_dtype not in (None, torch.bfloat16)
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "AITER FP8-W8A16 diagnostic requires BF16 activations and output"
+            )
+        try:
+            from boltops.fused_moe.triton.fused_moe import fused_experts_impl
+        except Exception as exc:
+            raise HcuCompressedTensorsMoeError(
+                f"AITER {diagnostic_name} fallback requires BoltOps Triton fused MoE"
+            ) from exc
+        gemm1_alpha = getattr(quant_config, "gemm1_alpha", None)
+        if gemm1_alpha is None:
+            gemm1_alpha = getattr(vllm_moe_config, "swiglu_alpha", None)
+        gemm1_limit = getattr(quant_config, "gemm1_clamp_limit", None)
+        if gemm1_limit is None:
+            gemm1_limit = getattr(vllm_moe_config, "swiglu_limit", None)
+        if use_fp8_w8a16:
+            _require_channel_fp8_bf16_moe_standard_layout(
+                quant_config,
+                (w1, w2, w1_scale, w2_scale),
+            )
+            kernel_w1 = _dequantize_channel_fp8_moe_weight(
+                w1, w1_scale, "w1"
+            )
+            kernel_w2 = _dequantize_channel_fp8_moe_weight(
+                w2, w2_scale, "w2"
+            )
+            kernel_w1_scale = None
+            kernel_w2_scale = None
+        else:
+            kernel_w1 = w1
+            kernel_w2 = w2
+            kernel_w1_scale = w1_scale
+            kernel_w2_scale = w2_scale
+        return fused_experts_impl(
+            hidden_states=hidden_states,
+            w1=kernel_w1,
+            w2=kernel_w2,
+            topk_weights=topk_weights.to(torch.float32),
+            topk_ids=topk_ids.to(torch.int32),
+            output_dtype=output_dtype,
+            inplace=False,
+            activation=activation_name,
+            is_gated=getattr(vllm_moe_config, "is_act_and_mul", None),
+            apply_router_weight_on_input=False,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=use_int8_w8a16,
+            per_channel_quant=use_int8_w8a16,
+            global_num_experts=getattr(
+                vllm_moe_config, "num_experts", w1.shape[0]
+            ),
+            expert_map=None,
+            w1_scale=kernel_w1_scale,
+            w2_scale=kernel_w2_scale,
+            w1_zp=None,
+            w2_zp=None,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=None,
+            routed_scaling_factor=1.0,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_limit=gemm1_limit,
         )
 
     try:
@@ -232,27 +1028,18 @@ def apply_aiter_quantized_moe(
             "is unavailable"
         ) from exc
 
-    use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
-    use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
-    if use_fp8 == use_int8:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE requires exactly one FP8-W8A8 or INT8-W8A8 config"
-        )
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+        _install_aiter_dynamo_metrics_logging_patch,
+    )
+
+    _install_aiter_dynamo_metrics_logging_patch()
+
     quant_member = "FP8_W8A8" if use_fp8 else "W8A8"
     quant_type = getattr(MoeQuantType, quant_member, None)
     if quant_type is None:
         raise HcuCompressedTensorsMoeError(
             f"AITER does not expose required MoeQuantType.{quant_member}"
         )
-
-    w1_scale = _required_tensor(quant_config, "w1_scale")
-    w2_scale = _required_tensor(quant_config, "w2_scale")
-    activation_value = getattr(activation, "value", activation)
-    if activation_value is None:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE requires an activation"
-        )
-    activation_name = str(activation_value)
     aiter_config = _get_aiter_quantized_runtime_config(
         hidden_states,
         w1,
@@ -270,13 +1057,21 @@ def apply_aiter_quantized_moe(
     from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
         aiter_asm_boltops_fp8_quant_context,
         aiter_asm_boltops_int8_quant_context,
+        aiter_moe_c_swiglu_limit_context,
     )
 
-    is_asm_solution = (
-        _enum_token(getattr(aiter_config, "solution_type", None)) == "ASM"
-    )
+    solution_type = _enum_token(getattr(aiter_config, "solution_type", None))
+    is_asm_solution = solution_type == "ASM"
     align_int8_quant = bool(use_int8 and is_asm_solution)
     align_fp8_quant = bool(use_fp8 and is_asm_solution)
+    swiglu_alpha = getattr(vllm_moe_config, "swiglu_alpha", None)
+    swiglu_limit = getattr(vllm_moe_config, "swiglu_limit", None)
+    align_moe_c_swiglu = bool(
+        solution_type == "MOE_C"
+        and activation_name == "silu"
+        and swiglu_limit is not None
+        and float(swiglu_limit) > 0
+    )
     aiter_expert_map = expert_map
     if is_asm_solution and expert_map is not None:
         global_num_experts = getattr(vllm_moe_config, "num_experts", None)
@@ -297,6 +1092,11 @@ def apply_aiter_quantized_moe(
     with (
         aiter_asm_boltops_int8_quant_context(enabled=align_int8_quant),
         aiter_asm_boltops_fp8_quant_context(enabled=align_fp8_quant),
+        aiter_moe_c_swiglu_limit_context(
+            enabled=align_moe_c_swiglu,
+            alpha=swiglu_alpha,
+            limit=swiglu_limit,
+        ),
     ):
         return aiter_moe(
             hidden_states=hidden_states,
@@ -327,6 +1127,43 @@ def apply_aiter_quantized_moe(
                 getattr(aiter_config, "need_shuffle", False)
             ),
             output_dtype=output_dtype,
+            gemm1_alpha=swiglu_alpha,
+            gemm1_limit=swiglu_limit,
+        )
+
+
+def apply_aiter_quantized_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    vllm_moe_config: object,
+    activation: object,
+    apply_router_weight_on_input: bool,
+    expert_map: torch.Tensor | None,
+    quant_config: object,
+    a1q_scale: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+) -> torch.Tensor:
+    with aiter_quantized_weight_lease(w1, w2):
+        return _apply_aiter_quantized_moe_with_lease(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            vllm_moe_config=vllm_moe_config,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            expert_map=expert_map,
+            quant_config=quant_config,
+            a1q_scale=a1q_scale,
+            num_local_tokens=num_local_tokens,
+            output_dtype=output_dtype,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
         )
 
 
@@ -689,11 +1526,15 @@ def build_aiter_w4a16_quant_config(
 
 __all__ = [
     "HcuCompressedTensorsMoeError",
+    "abort_aiter_weight_reload",
     "apply_aiter_quantized_moe",
     "apply_aiter_w8a8_fp8_moe",
+    "begin_aiter_weight_reload",
     "build_aiter_w4a16_quant_config",
+    "commit_aiter_weight_reload",
     "create_aiter_w4a16_qzeros",
     "get_aiter_w8a8_runtime_config",
     "get_aiter_weights_for_solution",
     "process_dpsk_deepgemm_weights",
+    "requantize_channel_fp8_moe_weights",
 ]
