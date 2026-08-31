@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import sys
 from types import ModuleType
 
 from ._common import (
@@ -54,7 +55,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_is_available)
     def hcu_is_nixl_available() -> bool:
         pkg = "nixl"
-        return importlib.util.find_spec(pkg) is not None
+        return pkg in sys.modules or importlib.util.find_spec(pkg) is not None
 
     setattr(nixl_utils, "_vllm_hcu_original_get_nixl_module_name", original_module_name)
     setattr(nixl_utils, "_vllm_hcu_original_is_nixl_available", original_is_available)

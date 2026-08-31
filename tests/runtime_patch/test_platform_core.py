@@ -207,6 +207,28 @@ def test_nixl_utils_uses_nixl_for_hcu(
     assert probes == ["nixl"]
 
 
+def test_nixl_utils_accepts_preloaded_nixl_without_spec(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    probes: list[str] = []
+
+    def find_spec(package_name):
+        probes.append(package_name)
+        return None
+
+    monkeypatch.setattr("importlib.util.find_spec", find_spec)
+    monkeypatch.setitem(sys.modules, "nixl", ModuleType("nixl"))
+    module = _module(
+        patch_nixl_utils.TARGET_MODULE,
+        _get_nixl_module_name=lambda name: "rixl._api",
+        is_nixl_available=lambda: False,
+    )
+
+    assert patch_nixl_utils.apply(module) is True
+    assert module.is_nixl_available() is True
+    assert probes == []
+
+
 def test_nixl_utils_rejects_signature_drift():
     module = _module(
         patch_nixl_utils.TARGET_MODULE,
