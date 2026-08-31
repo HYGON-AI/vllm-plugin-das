@@ -6,7 +6,35 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
+
+
+_DEEPEP_AUTO_REQUEST_PHASE: ContextVar[list[object | None] | None] = ContextVar(
+    "vllm_hcu_deepep_auto_request_phase", default=None
+)
+
+
+@contextmanager
+def deepep_auto_request_phase_scope():
+    """Keep Model Runner V2 phase evidence local to one invocation."""
+
+    token = _DEEPEP_AUTO_REQUEST_PHASE.set([None])
+    try:
+        yield
+    finally:
+        _DEEPEP_AUTO_REQUEST_PHASE.reset(token)
+
+
+def set_deepep_auto_request_phase(is_prefilling: object) -> None:
+    phase_holder = _DEEPEP_AUTO_REQUEST_PHASE.get()
+    if phase_holder is not None:
+        phase_holder[0] = is_prefilling
+
+
+def get_deepep_auto_request_phase() -> object | None:
+    phase_holder = _DEEPEP_AUTO_REQUEST_PHASE.get()
+    return None if phase_holder is None else phase_holder[0]
 
 
 def attach_hcu_context_fields(
@@ -54,6 +82,8 @@ def choose_deepep_auto_low_latency(
     # Backend-specific attention metadata does not consistently retain
     # CommonAttentionMetadata.is_prefilling.  Require the runner's explicit
     # per-request phase vector instead of inferring phase from query lengths.
+    if is_prefilling is None:
+        is_prefilling = get_deepep_auto_request_phase()
     explicit_decode = _is_explicitly_non_prefilling(is_prefilling)
     local_decode = explicit_decode and (
         bool(

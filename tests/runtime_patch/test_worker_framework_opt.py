@@ -864,6 +864,20 @@ def test_deepep_auto_forward_mode_requires_decode_phase_evidence():
     assert not choose_deepep_auto_low_latency(
         config, 512, None, SimpleNamespace(uniform=True)
     )
+    from vllm_hcu.forward_context_runtime import (
+        deepep_auto_request_phase_scope,
+        set_deepep_auto_request_phase,
+    )
+
+    with deepep_auto_request_phase_scope():
+        set_deepep_auto_request_phase(torch.tensor([False]))
+        assert choose_deepep_auto_low_latency(
+            config,
+            1,
+            None,
+            SimpleNamespace(uniform=True),
+            SimpleNamespace(max_query_len=1, max_seq_len=100),
+        )
     assert choose_deepep_auto_low_latency(
         config,
         1,

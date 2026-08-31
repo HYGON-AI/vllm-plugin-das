@@ -542,7 +542,9 @@ def test_worker_selects_plugin_owned_model_runner(
     assert installed == ([result] if use_v2 else [])
 
 
-def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
+def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
+    monkeypatch,
+):
     upstream_name = "vllm.v1.worker.gpu.model_runner"
     adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
     upstream_module = ModuleType(upstream_name)
@@ -551,8 +553,16 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
         def __init__(self, vllm_config, device):
             self.upstream_init = (vllm_config, device)
 
+        def prepare_inputs(self, scheduler_output, batch_desc):
+            return SimpleNamespace(is_prefilling_np=[False, False])
+
         def execute_model(self):
-            return "upstream"
+            self.prepare_inputs(None, None)
+            from vllm_hcu.forward_context_runtime import (
+                get_deepep_auto_request_phase,
+            )
+
+            return get_deepep_auto_request_phase()
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
@@ -567,8 +577,11 @@ def test_hcu_model_runner_v2_is_thin_upstream_adapter(monkeypatch):
     assert issubclass(adapter, UpstreamGPUModelRunner)
     assert runner.upstream_init == (config, device)
     assert runner.pcp_manager is None
-    assert runner.execute_model() == "upstream"
-    assert "execute_model" not in adapter.__dict__
+    assert runner.execute_model() == [False, False]
+    from vllm_hcu.forward_context_runtime import get_deepep_auto_request_phase
+
+    assert get_deepep_auto_request_phase() is None
+    assert "execute_model" in adapter.__dict__
 
 
 def test_worker_does_not_terminal_validate_after_failed_parent_load(
