@@ -514,7 +514,8 @@
     "kernel-accuracy-tests": {
       "patterns": [
         "tests/accuracy/test_hcu_kernel_accuracy.py",
-        "tests/accuracy/test_aiter_silu_and_mul.py"
+        "tests/accuracy/test_aiter_silu_and_mul.py",
+        "tests/accuracy/test_deepseek_v4_dspark_ops.py"
       ],
       "jobs": [
         "accuracy-gfx936",

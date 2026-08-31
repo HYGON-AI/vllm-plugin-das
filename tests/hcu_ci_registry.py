@@ -28,6 +28,11 @@ register_hcu_ci(
     target="tests/accuracy/test_aiter_silu_and_mul.py",
     est_time=300,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_deepseek_v4_dspark_ops.py",
+    est_time=300,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
