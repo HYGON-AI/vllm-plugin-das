@@ -2935,6 +2935,61 @@ def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     }
 
 
+def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    class PrepareFinalize:
+        ll_prepare_finalize = SimpleNamespace(
+            max_num_tokens_per_rank=lambda: 64,
+        )
+
+        @staticmethod
+        def num_dispatchers():
+            return 8
+
+    prepare_finalize = PrepareFinalize()
+    monkeypatch.setattr(
+        all2all_utils,
+        "maybe_make_prepare_finalize",
+        lambda **_kwargs: prepare_finalize,
+    )
+    constructed: dict[str, object] = {}
+
+    class AutoW4A8Experts:
+        def __init__(self, **kwargs):
+            constructed.update(kwargs)
+
+    monkeypatch.setattr(module, "DeepEPAutoW4A8Experts", AutoW4A8Experts)
+    monkeypatch.setattr(
+        module.mk,
+        "FusedMoEKernel",
+        lambda prepare, experts: (prepare, experts),
+    )
+    quant_config = SimpleNamespace(weight_quant_dtype="int4")
+    moe_config = SimpleNamespace()
+
+    kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+        moe_quant_config=quant_config,
+        moe_config=moe_config,
+        routing_tables="routing",
+    )
+
+    assert kernel[0] is prepare_finalize
+    assert isinstance(kernel[1], AutoW4A8Experts)
+    assert constructed == {
+        "moe_config": moe_config,
+        "quant_config": quant_config,
+        "max_num_tokens": 64,
+        "num_dispatchers": 8,
+        "fixed_use_low_latency": None,
+    }
+
+
 @pytest.mark.parametrize("use_fp8", [True, False])
 def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class DeepEPHTPrepareAndFinalize:

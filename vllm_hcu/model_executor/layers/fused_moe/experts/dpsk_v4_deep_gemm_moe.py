@@ -1007,6 +1007,7 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    experts_cls: type[DeepEPAutoDeepGemmExperts] | None = None,
 ) -> mk.FusedMoEKernel:
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
@@ -1032,7 +1033,9 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(
         get_current_vllm_config_or_none()
     )
-    experts = DeepEPAutoDeepGemmExperts(
+    if experts_cls is None:
+        experts_cls = DeepEPAutoDeepGemmExperts
+    experts = experts_cls(
         moe_config=moe_config,
         quant_config=moe_quant_config,
         max_num_tokens=max_num_tokens,
@@ -1075,4 +1078,21 @@ def make_deepep_auto_deepgemm_int8_moe_kernel(
         moe_quant_config=moe_quant_config,
         moe_config=moe_config,
         routing_tables=routing_tables,
+    )
+
+
+def make_deepep_auto_deepgemm_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
+
+    if moe_quant_config.weight_quant_dtype != "int4":
+        raise ValueError("SlimQuant auto factory requires INT4 W4A8 quantization")
+    return _make_deepep_auto_deepgemm_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=moe_config,
+        routing_tables=routing_tables,
+        experts_cls=DeepEPAutoW4A8Experts,
     )

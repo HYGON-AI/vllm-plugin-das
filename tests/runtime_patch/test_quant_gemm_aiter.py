@@ -3610,6 +3610,119 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
 
 @pytest.mark.hcu
+@pytest.mark.parametrize(
+    (
+        "dp_size",
+        "use_ep",
+        "all2all_backend",
+        "auto_kernels",
+        "moe_backend",
+        "match",
+    ),
+    [
+        (
+            2,
+            True,
+            "deepep_high_throughput",
+            False,
+            "auto",
+            "requires all2all_backend='deepep_auto'",
+        ),
+        (
+            2,
+            True,
+            "deepep_low_latency",
+            False,
+            "auto",
+            "requires all2all_backend='deepep_auto'",
+        ),
+        (
+            1,
+            False,
+            "deepep_auto",
+            True,
+            "auto",
+            "requires dp_size > 1 and expert parallelism",
+        ),
+        (
+            2,
+            False,
+            "deepep_auto",
+            True,
+            "auto",
+            "requires dp_size > 1 and expert parallelism",
+        ),
+        (
+            2,
+            True,
+            "deepep_auto",
+            False,
+            "auto",
+            "incompatible use_deepep_auto_kernels metadata",
+        ),
+        (
+            2,
+            True,
+            "deepep_auto",
+            True,
+            "aiter",
+            "requires moe_backend='auto' or 'deep_gemm'",
+        ),
+    ],
+)
+def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
+    use_ep: bool,
+    all2all_backend: str,
+    auto_kernels: bool,
+    moe_backend: str,
+    match: str,
+):
+    """Invalid DeepEP metadata must never fall through to TP AITER/Triton."""
+
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda *_args: pytest.fail("invalid DeepEP metadata entered TP AITER"),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        object(),
+        SimpleNamespace(
+            moe_backend=moe_backend,
+            moe_parallel_config=SimpleNamespace(
+                dp_size=dp_size,
+                use_ep=use_ep,
+                all2all_backend=all2all_backend,
+                use_deepep_auto_kernels=auto_kernels,
+            ),
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros((2, 8, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros((2, 4, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 8, 1)), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 4, 1)), requires_grad=False
+        ),
+        w13_input_scale=None,
+        w2_input_scale=None,
+    )
+    method.get_fused_moe_quant_config(layer)
+
+    with pytest.raises(ValueError, match=match):
+        method.process_weights_after_loading(layer)
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
     monkeypatch: pytest.MonkeyPatch,
 ):
