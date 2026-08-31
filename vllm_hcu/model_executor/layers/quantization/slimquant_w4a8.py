@@ -222,6 +222,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         )
 
         if slimquant_w4a8_uses_deepep_auto(getattr(self, "moe", None)):
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             if self.moe_quant_config is None:
                 raise RuntimeError(
                     "SlimQuant W4A8 deepep_auto requires its MoE quantization "
@@ -234,7 +235,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
-                routing_tables=None,
+                routing_tables=layer._expert_routing_tables(),
             )
             fused_experts = getattr(self.moe_kernel, "fused_experts", None)
             experts = getattr(fused_experts, "experts", fused_experts)

@@ -2943,9 +2943,12 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         dpsk_v4_deep_gemm_moe as module,
     )
 
+    routing_tables = (object(), object(), object())
+
     class PrepareFinalize:
         ll_prepare_finalize = SimpleNamespace(
             max_num_tokens_per_rank=lambda: 64,
+            routing_tables=None,
         )
 
         @staticmethod
@@ -2953,10 +2956,17 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
             return 8
 
     prepare_finalize = PrepareFinalize()
+
+    def maybe_make_prepare_finalize(**kwargs):
+        prepare_finalize.ll_prepare_finalize.routing_tables = kwargs[
+            "routing_tables"
+        ]
+        return prepare_finalize
+
     monkeypatch.setattr(
         all2all_utils,
         "maybe_make_prepare_finalize",
-        lambda **_kwargs: prepare_finalize,
+        maybe_make_prepare_finalize,
     )
     constructed: dict[str, object] = {}
 
@@ -2976,10 +2986,11 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_quant_config=quant_config,
         moe_config=moe_config,
-        routing_tables="routing",
+        routing_tables=routing_tables,
     )
 
     assert kernel[0] is prepare_finalize
+    assert kernel[0].ll_prepare_finalize.routing_tables is routing_tables
     assert isinstance(kernel[1], AutoW4A8Experts)
     assert constructed == {
         "moe_config": moe_config,

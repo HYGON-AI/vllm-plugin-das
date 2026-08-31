@@ -3570,6 +3570,7 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         ),
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(object(), moe)
+    routing_tables = (object(), object(), object())
     layer = SimpleNamespace(
         w13_weight=torch.nn.Parameter(
             torch.zeros((2, 8, 2), dtype=torch.int8), requires_grad=False
@@ -3585,14 +3586,17 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         ),
         w13_input_scale=None,
         w2_input_scale=None,
+        _expert_routing_tables=lambda: routing_tables,
     )
 
-    quant_config = method.get_fused_moe_quant_config(layer)
-    assert quant_config.weight_quant_dtype == "int4"
+    assert method.moe_quant_config is None
 
     method.process_weights_after_loading(layer)
 
-    assert factory_calls == [(quant_config, moe, None)]
+    quant_config = method.moe_quant_config
+    assert quant_config is not None
+    assert quant_config.weight_quant_dtype == "int4"
+    assert factory_calls == [(quant_config, moe, routing_tables)]
     assert processed_layers == [layer]
     assert method.moe_kernel is not None
     x = torch.zeros((2, 4), dtype=torch.bfloat16)
