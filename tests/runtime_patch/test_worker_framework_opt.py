@@ -831,8 +831,19 @@ def test_deepep_auto_forward_mode_requires_decode_phase_evidence():
     config.scheduler_config = SimpleNamespace(max_num_seqs=8)
     config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
 
-    assert choose_deepep_auto_low_latency(
+    assert not choose_deepep_auto_low_latency(
         config, 512, None, SimpleNamespace(uniform=True)
+    )
+    assert choose_deepep_auto_low_latency(
+        config,
+        1,
+        None,
+        SimpleNamespace(uniform=True),
+        SimpleNamespace(
+            max_query_len=1,
+            max_seq_len=100,
+            is_prefilling=torch.tensor([False]),
+        ),
     )
     assert not choose_deepep_auto_low_latency(
         config, 1, None, SimpleNamespace(uniform=False)
@@ -863,11 +874,22 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
         None,
         SimpleNamespace(uniform=False),
     )
-    assert choose_deepep_auto_low_latency(
+    assert not choose_deepep_auto_low_latency(
         config,
         8,
         None,
         SimpleNamespace(uniform=True),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        2,
+        None,
+        SimpleNamespace(uniform=True),
+        SimpleNamespace(
+            max_query_len=2,
+            max_seq_len=100,
+            is_prefilling=torch.tensor([True]),
+        ),
     )
     assert not choose_deepep_auto_low_latency(config, 64, None, None)
     assert not choose_deepep_auto_low_latency(config, 65, None, None)
