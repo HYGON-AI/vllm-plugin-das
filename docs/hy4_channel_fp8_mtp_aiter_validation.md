@@ -352,3 +352,173 @@ Changing plugin kernels to force Triton-like outputs would be an alignment
 policy or fallback mode, not a correctness fix. It should not be introduced
 without an explicit product requirement and a wider accuracy/performance
 evaluation.
+
+## TP4 + PCP2 validation (2026-08-31)
+
+Hy4 sparse MLA now accepts prefill context parallelism with a fail-closed
+contract. The validated topology is `TP4 * PCP2 = 8` worker ranks. Expert
+parallelism is enabled, so
+each rank owns 32 of the 256 experts. Eager mode is required for this initial
+PCP support; MTP values 1 and 2 are accepted, while MTP3 is rejected during
+configuration validation.
+
+The following command starts the validated Triton service. Omit `SPEC_ARGS`
+for target-only generation, or select one of the two MTP variants shown below.
+
+```bash
+export PLUGIN_ROOT=/models/zb/hy4/.worktrees/hy-v4-mtp-blockwise-v0251-merge
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KV_CACHE_LAYOUT=NHD
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=300
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=300
+export PYTHONPATH="${PLUGIN_ROOT}"
+unset VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE
+unset VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE
+
+SPEC_ARGS=()
+# MTP1:
+# SPEC_ARGS=(--speculative-config '{"method":"mtp","num_speculative_tokens":1}')
+# MTP2:
+# SPEC_ARGS=(--speculative-config '{"method":"mtp","num_speculative_tokens":2}')
+
+vllm serve /models/Hy4-preview-Channel-FP8-w8a8-v2 \
+  --served-model-name hy4-channel-pcp \
+  --tensor-parallel-size 4 \
+  --prefill-context-parallel-size 2 \
+  --enable-expert-parallel \
+  --enforce-eager \
+  --moe-backend triton \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 4096 \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}' \
+  --reasoning-parser hy_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hy_v4 \
+  "${SPEC_ARGS[@]}" \
+  --port 8000
+```
+
+All three variants created ranks `PCP0/1_TP0..3_EP0..7`, selected the
+`FLASH_ATTN MLA prefill backend` and native vLLM `TRITON Fp8 MoE` backend,
+completed model loading, and returned HTTP 200 with assistant content `OK`:
+
+```bash
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u http_proxy -u https_proxy \
+curl --fail-with-body --max-time 600 -sS \
+  http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"hy4-channel-pcp","messages":[{"role":"user","content":"Reply with exactly: OK"}],"temperature":0,"max_tokens":16,"chat_template_kwargs":{"reasoning_effort":"no_think"}}'
+```
+
+The target-only service also passed this long-prefill smoke, which exercises
+PCP with a meaningful context rather than only a short prompt:
+
+```bash
+python - <<'PY' | \
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u http_proxy -u https_proxy \
+curl --fail-with-body --max-time 600 -sS \
+  http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @-
+import json
+
+content = (
+    "Read the following filler context, then reply with exactly: OK\n\n"
+    + ("alpha " * 3000)
+    + "\n\nEnd of filler context. Reply with exactly: OK"
+)
+print(json.dumps({
+    "model": "hy4-channel-pcp",
+    "messages": [{"role": "user", "content": content}],
+    "temperature": 0,
+    "max_tokens": 16,
+    "chat_template_kwargs": {"reasoning_effort": "no_think"},
+}))
+PY
+```
+
+The response was HTTP 200 with assistant content `OK`, 3,049 prompt tokens,
+and two completion tokens. The service log showed the PCP indexer-cache gather
+kernel executing and no request or kernel error. The service then shut down
+without an orphan worker.
+
+The first 16 HumanEval tasks were run at request batch size 16:
+
+```bash
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u http_proxy -u https_proxy \
+python -m evalscope.cli.cli eval \
+  --model hy4-channel-pcp \
+  --model-id Hy4-preview-Channel-FP8-w8a8-v2-triton-pcp2-mtpoff-no_think \
+  --api-url http://127.0.0.1:8000/v1 \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets humaneval \
+  --dataset-hub modelscope \
+  --limit 16 \
+  --eval-batch-size 16 \
+  --generation-config '{"batch_size":16,"max_tokens":1024,"temperature":0.0,"top_p":1.0,"seed":42,"timeout":1800.0,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \
+  --seed 42 \
+  --work-dir /models/evalscope_hy4_channel_pcp2_triton_mtpoff_humaneval16_20260831 \
+  --no-timestamp
+```
+
+Change `mtpoff` in the model ID and work directory to `mtp1` or `mtp2` as
+appropriate when running the speculative variants.
+
+The three reports are retained under:
+
+```text
+/models/evalscope_hy4_channel_pcp2_triton_mtpoff_humaneval16_20260831
+/models/evalscope_hy4_channel_pcp2_triton_mtp1_humaneval16_20260831
+/models/evalscope_hy4_channel_pcp2_triton_mtp2_humaneval16_20260831
+```
+
+| MoE backend | PCP | MTP | Correct | pass@1 | Failed tasks | Avg latency | Avg throughput | Avg output |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| Triton | 2 | off | 15/16 | 93.8% | `/10` | 75.078 s | 2.60 tok/s | 196 |
+| Triton | 2 | 1 | 14/16 | 87.5% | `/1`, `/10` | 49.911 s | 4.67 tok/s | 233 |
+| Triton | 2 | 2 | 15/16 | 93.8% | `/10` | 38.955 s | 4.70 tok/s | 183 |
+
+Target-only and MTP2 have the same 15/16 score and the same `/10` failure,
+whose generated code contains the same palindrome-suffix index error. MTP2
+therefore had no pass/fail flips and did not reduce pass@1 in this sample.
+MTP1 introduced one pass-to-fail flip, `/1`, and no fail-to-pass flips; that
+output followed a longer, different generation trajectory. No API or runtime
+error was logged, but this small sample alone does not isolate whether the
+trajectory change comes from speculation, PCP-sensitive numerics, or ordinary
+generation variance. Each service was stopped after its run; no vLLM worker
+remained and all eight cards returned to zero utilization.
+
+### AITER PCP limitation
+
+The same TP4+PCP2+EP topology was also attempted with `--moe-backend aiter`.
+The attempted target-only command is the service command above with
+`--moe-backend triton` changed to `--moe-backend aiter`; MTP1 and MTP2 add the
+corresponding `SPEC_ARGS` value. It fails during the startup profile before an
+API request can be served.
+It intentionally remains fail-closed in this plugin because the installed
+AITER package has no valid Channel-FP8 expert-parallel solution for the local
+shape `M=8192,E=32,top_k=8,dtype=bf16,quant_type=fp8_w8a8`:
+
+```text
+HcuCompressedTensorsMoeError: AITER quantized MoE found no backend config for
+M=8192, E=32, top_k=8, dtype=torch.bfloat16, quant_type=fp8_w8a8
+```
+
+AITER's MOE_C table contains a configuration for the global `E=256` shape,
+but its kernel performs another lookup using the local EP shape and returns an
+incomplete default without `MODE`. Forcing that global configuration would
+also bypass part of the expert-map contract. The public AITER Triton fallback
+was tested separately and caused an HCU VM fault for this production EP shape;
+it is not the native vLLM modular Triton backend validated above. No unsafe
+fallback was retained. This is an installed AITER/BoltOps capability gap, not
+a PCP configuration or Hy4 model-registration failure.
+
+The fail-closed configuration and sparse-backend capability changes are in
+commits `5682574` and `d1a47b6`, respectively.
