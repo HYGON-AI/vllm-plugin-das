@@ -5928,10 +5928,10 @@ class GPUModelRunner(
 
         dummy_metadata = SamplingMetadata(
             temperature=dummy_tensors(0.5),
-            all_greedy=False,
+            all_greedy=True,
             all_random=False,
             top_p=dummy_tensors(0.9),
-            top_k=dummy_tensors(logits.size(1) - 1),
+            top_k=dummy_tensors(0),
             generators={},
             max_num_logprobs=None,
             logprob_token_ids=None,
@@ -5965,6 +5965,9 @@ class GPUModelRunner(
                     logits=logits,
                     sampling_metadata=replace(
                         dummy_metadata,
+                        all_greedy=False,
+                        all_random=True,
+                        top_k=dummy_tensors(logits.size(1)),
                         generators={
                             0: torch.Generator(device=self.device).manual_seed(0)
                         },
