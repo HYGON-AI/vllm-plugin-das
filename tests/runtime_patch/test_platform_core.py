@@ -17,6 +17,7 @@ from vllm_hcu.patch.platform.core_fix import (
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
+    patch_nixl_utils,
 )
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.runtime_state import (
@@ -175,6 +176,68 @@ def test_apply_to_module_runs_inside_coordinator_without_reentrant_registry(
     assert record is not None and record.status is PatchStatus.APPLIED
     assert record.targets == patch_import_utils.TARGETS
     assert PATCH_REGISTRY.get(patch_import_utils.PATCH_ID) is None
+
+
+def test_nixl_utils_uses_nixl_for_hcu(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    probes: list[str] = []
+
+    def find_spec(package_name):
+        probes.append(package_name)
+        return object()
+
+    monkeypatch.setattr("importlib.util.find_spec", find_spec)
+    module = _module(
+        patch_nixl_utils.TARGET_MODULE,
+        _get_nixl_module_name=lambda name: (
+            "rixl._bindings" if name == "nixlXferTelemetry" else "rixl._api"
+        ),
+        is_nixl_available=lambda: False,
+    )
+
+    assert patch_nixl_utils.apply(module) is True
+    assert patch_nixl_utils.apply(module) is False
+    assert module._get_nixl_module_name("NixlWrapper") == "nixl._api"
+    assert (
+        module._get_nixl_module_name("nixlXferTelemetry")
+        == "nixl._bindings"
+    )
+    assert module.is_nixl_available() is True
+    assert probes == ["nixl"]
+
+
+def test_nixl_utils_accepts_preloaded_nixl_without_spec(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    probes: list[str] = []
+
+    def find_spec(package_name):
+        probes.append(package_name)
+        return None
+
+    monkeypatch.setattr("importlib.util.find_spec", find_spec)
+    monkeypatch.setitem(sys.modules, "nixl", ModuleType("nixl"))
+    module = _module(
+        patch_nixl_utils.TARGET_MODULE,
+        _get_nixl_module_name=lambda name: "rixl._api",
+        is_nixl_available=lambda: False,
+    )
+
+    assert patch_nixl_utils.apply(module) is True
+    assert module.is_nixl_available() is True
+    assert probes == []
+
+
+def test_nixl_utils_rejects_signature_drift():
+    module = _module(
+        patch_nixl_utils.TARGET_MODULE,
+        _get_nixl_module_name=lambda: "rixl._api",
+        is_nixl_available=lambda: False,
+    )
+
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_nixl_utils.apply(module)
 
 
 class _Tokenizer:

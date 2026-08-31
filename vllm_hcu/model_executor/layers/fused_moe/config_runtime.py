@@ -108,8 +108,9 @@ def int8_w8a8_moe_quant_config(
     w2_bias=None,
     per_act_token_quant: bool = False,
     block_shape: list[int] | None = None,
+    gemm1_clamp_limit: float | None = None,
 ):
-    if block_shape is None:
+    if block_shape is None and gemm1_clamp_limit is None:
         return original(
             w1_scale,
             w2_scale,
@@ -130,6 +131,7 @@ def int8_w8a8_moe_quant_config(
         per_act_token_quant=per_act_token_quant,
         per_out_ch_quant=False,
         block_shape=block_shape,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 

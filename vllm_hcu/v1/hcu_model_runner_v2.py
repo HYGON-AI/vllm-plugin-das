@@ -14,6 +14,10 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_hcu.model_executor.layers.attention.pcp import (
     replicated_mtp_batch_scope,
 )
+from vllm_hcu.forward_context_runtime import (
+    deepep_auto_request_phase_scope,
+    set_deepep_auto_request_phase,
+)
 from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
 
 
@@ -139,9 +143,15 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def prepare_inputs(self, scheduler_output, batch_desc):
         input_batch = super().prepare_inputs(scheduler_output, batch_desc)
-        if self.pcp_manager is None:
-            return input_batch
-        return self.pcp_manager.partition_batch(input_batch)
+        if self.pcp_manager is not None:
+            input_batch = self.pcp_manager.partition_batch(input_batch)
+        set_deepep_auto_request_phase(input_batch.is_prefilling_np)
+        return input_batch
+
+    @functools.wraps(GPUModelRunner.execute_model)
+    def execute_model(self, *args, **kwargs):
+        with deepep_auto_request_phase_scope():
+            return super().execute_model(*args, **kwargs)
 
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:

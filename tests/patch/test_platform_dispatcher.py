@@ -61,6 +61,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
         ("platform.core_fix.envs", "vllm.envs"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
+        (
+            "platform.core_fix.nixl.package_name",
+            "vllm.distributed.nixl_utils",
+        ),
         ("platform.core_fix.hcu_config.engine_args", "vllm.engine.arg_utils"),
         (
             "platform.core_fix.hcu_config.compilation_cudagraph",
@@ -289,9 +293,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 48,
+        "count": 49,
         "replacements": 11,
-        "callbacks": 37,
+        "callbacks": 38,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

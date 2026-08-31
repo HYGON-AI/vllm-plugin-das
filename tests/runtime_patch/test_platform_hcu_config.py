@@ -215,6 +215,43 @@ def test_engine_args_normalizes_deepep_auto_and_extends_cli_choice() -> None:
     assert parsed.all2all_backend == "deepep_auto"
 
 
+def test_dspark_deepep_auto_uses_standard_engine_args_path() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    speculative_config = {
+        "method": "dspark",
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "probabilistic",
+    }
+
+    args = module.EngineArgs(
+        all2all_backend="deepep_auto",
+        speculative_config=speculative_config,
+    )
+
+    assert args.all2all_backend == "deepep_low_latency"
+    assert args.speculative_config == speculative_config
+    assert get_hcu_config(args).deepep_auto is True
+    config = args.create_engine_config()
+    assert config.parallel_config.all2all_backend == "deepep_low_latency"
+    assert get_hcu_config(config).deepep_auto is True
+
+
+def test_omitted_all2all_backend_keeps_official_default_for_dspark() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        speculative_config={
+            "method": "dspark",
+            "num_speculative_tokens": 7,
+        }
+    )
+
+    assert args.all2all_backend == "allgather_reducescatter"
+    assert get_hcu_config(args).deepep_auto is False
+
+
 @pytest.mark.parametrize(
     ("alias", "mode"),
     [
@@ -393,6 +430,7 @@ from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
 arg_utils.current_platform.device_type = "cpu"
 patch_engine_args.apply_to_module(arg_utils)
+arg_utils.current_platform.device_type = "cpu"
 
 for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
@@ -614,6 +652,7 @@ def _make_compilation_module() -> ModuleType:
             self.splitting_calls += 1
             return all2all_backend, data_parallel_size
 
+    module.CUDAGraphMode = SimpleNamespace(NONE=_CUDAGraphMode(piecewise=False))
     module.CompilationConfig = CompilationConfig
     return module
 
@@ -655,6 +694,21 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
 
     config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
+
+
+def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    vllm_config = SimpleNamespace(
+        additional_config={"hcu": HcuFeatureConfig(deepep_auto=True).to_dict()},
+        compilation_config=config,
+    )
+    patch_compilation_config.bind_hcu_config(vllm_config)
+
+    config.set_splitting_ops_for_v1("deepep_low_latency", 8)
+
+    assert config.cudagraph_mode is module.CUDAGraphMode.NONE
 
 
 def test_compilation_adapter_defers_to_inductor_unsafe_tags() -> None:
@@ -965,8 +1019,11 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
+        speculative_config=None,
         kernel_config=SimpleNamespace(moe_backend=feature_config.moe_backend),
         kv_transfer_config=None,
     )
@@ -1020,6 +1077,76 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
         match="deepep_auto.*EPLB.*not supported",
     ):
         patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+@pytest.mark.parametrize(
+    ("data_parallel_size", "enable_expert_parallel", "message"),
+    [
+        (1, True, "data_parallel_size > 1"),
+        (8, False, "enable_expert_parallel=True"),
+    ],
+)
+def test_deepep_auto_rejects_non_dp_ep_topology_before_model_loading(
+    data_parallel_size: int,
+    enable_expert_parallel: bool,
+    message: str,
+) -> None:
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = False
+    config.parallel_config.data_parallel_size = data_parallel_size
+    config.parallel_config.enable_expert_parallel = enable_expert_parallel
+
+    with pytest.raises(ValueError, match=message):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_deepep_auto_rejects_ubatching_before_model_loading() -> None:
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+    config.parallel_config.use_ubatching = True
+
+    with pytest.raises(
+        ValueError,
+        match="deepep_auto.*ubatching.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def _dspark_pd_config(
+    connector: str,
+    architecture: str = "DeepseekV4ForCausalLM",
+) -> object:
+    config = _validation_config(HcuFeatureConfig())
+    config.model_config.architectures = [architecture]
+    config.speculative_config = SimpleNamespace(method="dspark")
+    config.kv_transfer_config = SimpleNamespace(kv_connector=connector)
+    return config
+
+
+def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
+    patch_vllm_config.validate_and_update_hcu_config(
+        _dspark_pd_config("MooncakeConnector")
+    )
+
+
+@pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])
+def test_deepseek_v4_dspark_rejects_unvalidated_pd_connectors(
+    connector: str,
+) -> None:
+    with pytest.raises(ValueError, match=f"DSpark.*{connector}"):
+        patch_vllm_config.validate_and_update_hcu_config(
+            _dspark_pd_config(connector)
+        )
+
+
+def test_non_deepseek_dspark_does_not_gain_mooncake_pd_support() -> None:
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        patch_vllm_config.validate_and_update_hcu_config(
+            _dspark_pd_config("MooncakeConnector", "Qwen3ForCausalLM")
+        )
 
 
 def test_hcu_config_validation_binds_sidecar_without_upstream_fields() -> None:

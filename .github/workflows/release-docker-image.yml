@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   schedule:
     # 北京时间每天 0 点 (UTC 16:00)
-    - cron: '0 16 * * *'
+    - cron: '0 14 * * *'
 
 permissions:
   contents: read

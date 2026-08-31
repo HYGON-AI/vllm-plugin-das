@@ -12,6 +12,98 @@ import pytest
 from tests.integration import model_runtime
 
 
+DEEPSEEK_V4_MODEL = Path("/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8")
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "data_parallel_size", "expected_backend"),
+    [(8, 1, None), (1, 8, "deepep_auto")],
+)
+def test_deepseek_v4_dspark_rank_uses_standard_engine_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    expected_backend: str | None,
+) -> None:
+    captured = {}
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        data_parallel_size=data_parallel_size,
+        all2all_backend=expected_backend or "allgather_reducescatter",
+        enable_expert_parallel=data_parallel_size > 1,
+        world_size=tensor_parallel_size,
+    )
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(parallel_config=parallel_config)
+            )
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FakeLLM))
+    monkeypatch.setattr(
+        model_runtime,
+        "_generate_with_llm",
+        lambda *args, **kwargs: [{"token_ids": [1], "text": "ok"}],
+    )
+    monkeypatch.setattr(model_runtime, "_shutdown_llm", lambda llm: None)
+
+    result = model_runtime._case_deepseek_v4_dspark_rank(
+        DEEPSEEK_V4_MODEL,
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        gpu_memory_utilization=0.9,
+    )
+
+    assert captured["tokenizer_mode"] == "deepseek_v4"
+    assert captured["kv_cache_dtype"] == "fp8"
+    assert captured["speculative_config"] == (
+        model_runtime.DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG
+    )
+    assert captured["tensor_parallel_size"] == tensor_parallel_size
+    assert captured["enable_expert_parallel"] is (data_parallel_size > 1)
+    assert captured.get("all2all_backend") == expected_backend
+    assert "prefill_context_parallel_size" not in captured
+    assert "kv_transfer_config" not in captured
+    assert "moe_backend" not in captured
+    assert result["speculative_method"] == "dspark"
+    assert result["draft_token_count"] == 7
+    assert result["pcp_world_size"] == 1
+    assert result["output"]
+
+
+def test_deepseek_v4_dspark_cli_forwards_only_topology(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_case(model_path, **kwargs):
+        captured["model_path"] = model_path
+        captured.update(kwargs)
+        return {"output": []}
+
+    monkeypatch.setattr(model_runtime, "_case_deepseek_v4_dspark", fake_case)
+
+    assert model_runtime._main(
+        [
+            "deepseek-v4-dspark-smoke",
+            "--model",
+            str(DEEPSEEK_V4_MODEL),
+            "--topology",
+            "dp8_ep8",
+            "--gpu-memory-utilization",
+            "0.9",
+        ]
+    ) == 0
+    assert captured == {
+        "model_path": DEEPSEEK_V4_MODEL,
+        "topology": "dp8_ep8",
+        "gpu_memory_utilization": 0.9,
+    }
+    assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
+
+
 class _FakeEvent:
     def __init__(self):
         self._is_set = False

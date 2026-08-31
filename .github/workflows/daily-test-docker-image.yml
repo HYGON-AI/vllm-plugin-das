@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: test-docker-image-daily
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 北京时间每天 0 点 (UTC 16:00)
+    - cron: '0 16 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYPI_URL: ${{ vars.PYPI_URL }}
+  VLLM_VERSION: "0.25.1"
+
+jobs:
+  citest:
+    runs-on: nmz36
+    container:
+      image: ${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:0.25.1-latest
+      options: --privileged --cap-add=SYS_PTRACE --network=host --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
+      volumes:
+        - /public/opendas/DL_DATA/llm-models:/models/public:ro
+        - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
+        - /opt/hyhal:/opt/hyhal:ro
+        - /var/run/docker.sock:/var/run/docker.sock:ro
+        - /usr/bin/docker.orig:/usr/local/bin/docker:ro
+        - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 CItest
+        run: |
+          PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
+          pip install citest[evalscope] cinotificate \
+            -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
+            --trusted-host "${PYPI_HOST}"
+
+      - name: 运行 CItest
+        run: |
+          CItest --test_tool evalscope \
+                 --case_conf docker/image-citest-conf-hcu.yaml \
+                 --models_path /models \
+                 --output_dir "${GITHUB_WORKSPACE}/citest-output"
+
+      - name: 飞书通知
+        run: |
+          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --json_key docker_image_name \
+                       --json_value "${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:${{ env.VLLM_VERSION }}-latest"
+          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --json_key jenkins_url \
+                       --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          CInotificate --notificate_conf "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --notificate_type PrecisionTest \
+                       --group_name "框架发版对接 高性能推理加速部"
+
+      - name: 归档测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: citest-output-${{ github.run_id }}
+          path: citest-output/**
+
+      # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true

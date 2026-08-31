@@ -7,6 +7,7 @@ from vllm import ModelRegistry
 
 from vllm_hcu.models.hy_v4.config import register_hy_v4_config
 
+
 def register_model():
     register_hy_v4_config()
 
@@ -48,6 +49,11 @@ def register_model():
 
     ModelRegistry.register_model(
         "HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP"
+    )
+
+    ModelRegistry.register_model(
+        "DSparkDraftModel",
+        "vllm_hcu.models.deepseek_v4_dspark:DSparkDeepseekV4ForCausalLM",
     )
 
 

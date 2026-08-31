@@ -24,7 +24,10 @@ from types import ModuleType
 from typing import Literal
 
 from vllm_hcu.compatibility import ensure_vllm_compatible
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.patch.config import (
+    HcuFeatureConfig,
+    get_hcu_config,
+)
 from vllm_hcu.patch.import_coordinator import (
     IMPORT_COORDINATOR,
     ExactImportCoordinator,
@@ -206,7 +209,13 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
@@ -759,6 +768,18 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         if HcuFeatureConfig.from_mapping(config.to_dict()) != config:
             raise RuntimeError("HCU feature sidecar failed its worker round-trip check")
         if vllm_config is not None:
+            if isinstance(vllm_config, dict):
+                parallel_config = vllm_config.get("parallel_config")
+            else:
+                parallel_config = getattr(vllm_config, "parallel_config", None)
+            if isinstance(parallel_config, dict):
+                parallel_config["_vllm_hcu_deepep_auto"] = config.deepep_auto
+            elif parallel_config is not None:
+                setattr(
+                    parallel_config,
+                    "_vllm_hcu_deepep_auto",
+                    config.deepep_auto,
+                )
             rebound = _bind_deserialized_hcu_config(vllm_config)
             if rebound != config:
                 raise RuntimeError(

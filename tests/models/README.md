@@ -17,6 +17,12 @@ Available local configurations:
 
 - `deepseek_r1_gsm8k_evalscope.yaml`: DeepSeek-R1 Channel-FP8 W8A8 server
   plus EvalScope GSM8K.
+- `deepseek_v4_flash_0731_dspark_humaneval.yaml`: DeepSeek-V4-Flash-0731
+  Channel-FP8 TP8 and unified DP8+EP8 DSpark server profiles plus strict
+  ModelScope HumanEval-32 acceptance.
+- `deepseek_v4_flash_0731_int8_dspark_humaneval.yaml`:
+  DeepSeek-V4-Flash-0731 Channel-INT8 TP8 and unified DP8+EP8 DSpark server
+  profiles plus strict ModelScope HumanEval-32 acceptance.
 - `glm52_pcp_humaneval_evalscope.yaml`: GLM-5.2 Channel-FP8 W8A8
   model-runner-v2 server with TP=4, PCP=2, EP, and EvalScope HumanEval (32
   deterministic samples).

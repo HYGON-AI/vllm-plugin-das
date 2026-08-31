@@ -440,6 +440,10 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.patch.worker.op_opt.moe import patch_int8_oracle
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kInt8DynamicTokenSym,
+        kInt8StaticChannelSym,
+    )
 
     import vllm.config as vllm_config_module
 
@@ -507,6 +511,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         w1_bias=None,
         w2_bias=None,
         per_act_token_quant=False,
+        gemm1_clamp_limit=None,
     ):
         return SimpleNamespace(
             w1_scale=w1_scale,
@@ -516,8 +521,27 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             per_act_token_quant=per_act_token_quant,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             use_int8_w8a8=True,
         )
+
+    def make_int8_moe_kernel(
+        int8_backend,
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        routing_tables=None,
+        layer=None,
+    ):
+        del (
+            int8_backend,
+            moe_quant_config,
+            moe_config,
+            experts_cls,
+            routing_tables,
+            layer,
+        )
+        return "official-int8-kernel"
 
     target = _module(
         patch_int8_oracle.TARGET_MODULE,
@@ -529,6 +553,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
         make_int8_moe_quant_config=make_int8_moe_quant_config,
         int8_w8a8_moe_quant_config=int8_w8a8_moe_quant_config,
+        make_int8_moe_kernel=make_int8_moe_kernel,
         mk=SimpleNamespace(
             FusedMoEActivationFormat=SimpleNamespace(
                 Standard="standard",
@@ -577,6 +602,28 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
                 "requires batched activation format",
             )
 
+    class DeepEPAutoInt8Experts:
+        pass
+
+    auto_kernel_calls: list[tuple[object, object, object]] = []
+    auto_processed_layers: list[object] = []
+
+    class AutoExperts:
+        def process_weights_after_loading(self, layer):
+            auto_processed_layers.append(layer)
+
+    auto_kernel = SimpleNamespace(
+        fused_experts=SimpleNamespace(experts=AutoExperts())
+    )
+
+    def make_deepep_auto_deepgemm_int8_moe_kernel(
+        *, moe_quant_config, moe_config, routing_tables
+    ):
+        auto_kernel_calls.append(
+            (moe_quant_config, moe_config, routing_tables)
+        )
+        return auto_kernel
+
     monkeypatch.setitem(
         sys.modules,
         "vllm_hcu.model_executor.layers.fused_moe.experts.deep_gemm_moe",
@@ -591,6 +638,23 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         _module(
             "vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
             BatchedDeepGemmExperts=BatchedDeepGemmExperts,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        (
+            "vllm_hcu.model_executor.layers.fused_moe.experts."
+            "dpsk_v4_deep_gemm_moe"
+        ),
+        _module(
+            (
+                "vllm_hcu.model_executor.layers.fused_moe.experts."
+                "dpsk_v4_deep_gemm_moe"
+            ),
+            DeepEPDeepGemmContiguousExperts=DeepEPAutoInt8Experts,
+            make_deepep_auto_deepgemm_int8_moe_kernel=(
+                make_deepep_auto_deepgemm_int8_moe_kernel
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -639,7 +703,10 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
                 "hcu": {
                     "moe_backend": "deep_gemm",
                 }
-            }
+            },
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+            ),
         ),
     )
     backend, experts = target.select_int8_moe_backend(
@@ -653,9 +720,11 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         w1_scale,
         w2_scale,
         per_act_token_quant=True,
+        layer=SimpleNamespace(swiglu_limit=10.0),
     )
     assert getattr(deep_gemm_quant_config, "use_int8_w8a8", False) is True
     assert deep_gemm_quant_config.per_act_token_quant is True
+    assert deep_gemm_quant_config.gemm1_clamp_limit == 10.0
 
     config.moe_parallel_config.use_batched_activation_format = True
     backend, experts = target.select_int8_moe_backend(
@@ -663,34 +732,66 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     )
     assert experts is BatchedDeepGemmExperts
 
-    config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = True
-    with pytest.raises(
-        ValueError,
-        match="INT8.*deepep_auto.*not supported",
-    ):
-        target.select_int8_moe_backend(config, "weight", "activation")
+    config.moe_backend = "auto"
+    config._hcu_vllm_config.additional_config["hcu"].update(
+        deepep_auto=True,
+        moe_backend="auto",
+    )
+    auto_backend, auto_experts = target.select_int8_moe_backend(
+        config,
+        kInt8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+    assert auto_backend is target.Int8MoeBackend.HCU_DEEPGEMM
+    assert auto_experts is DeepEPAutoInt8Experts
+    config.moe_parallel_config.use_deepep_auto_kernels = True
+    auto_quant_config = SimpleNamespace()
+    auto_layer = SimpleNamespace()
+    assert target.make_int8_moe_kernel(
+        auto_backend,
+        auto_quant_config,
+        config,
+        auto_experts,
+        routing_tables="routing",
+        layer=auto_layer,
+    ) is auto_kernel
+    assert auto_kernel_calls == [(auto_quant_config, config, "routing")]
+    assert auto_processed_layers == [auto_layer]
+
+    config._hcu_vllm_config.model_config.architectures = [
+        "GlmMoeDsaForCausalLM"
+    ]
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        target.select_int8_moe_backend(
+            config,
+            kInt8StaticChannelSym,
+            kInt8DynamicTokenSym,
+        )
+    config._hcu_vllm_config.model_config.architectures = [
+        "DeepseekV4ForCausalLM"
+    ]
     config._hcu_vllm_config.additional_config["hcu"]["deepep_auto"] = False
+    config.moe_parallel_config.use_deepep_auto_kernels = False
+    config._hcu_vllm_config.additional_config["hcu"]["moe_backend"] = "deep_gemm"
+    config.moe_backend = "deep_gemm"
 
     deep_gemm_w13 = torch.arange(2 * 16 * 64, dtype=torch.int32).to(torch.int8)
     deep_gemm_w13 = deep_gemm_w13.reshape(2, 16, 64)
     deep_gemm_w2 = torch.arange(2 * 64 * 64, dtype=torch.int32).to(torch.int8)
     deep_gemm_w2 = deep_gemm_w2.reshape(2, 64, 64)
+    deepgemm = _module("deepgemm")
+    m_group_gemm = _module("deepgemm.m_group_gemm")
+
     def real_contiguous_pack(weight: torch.Tensor) -> torch.Tensor:
-        return weight.flip(-1).contiguous()
+        return weight.flip(-1).clone()
 
     def real_masked_pack(weight: torch.Tensor) -> torch.Tensor:
-        return weight.flip(-2).contiguous()
+        return weight.flip(-2).clone()
 
-    m_group_gemm = _module(
-        "deepgemm.m_group_gemm",
-        pack_int8_weight_enk_to_w6_low_latency=lambda weight: weight,
-    )
-    deepgemm = _package(
-        "deepgemm",
-        marlin_i8_contiguous_weight=real_contiguous_pack,
-        marlin_i8_masked_weight=real_masked_pack,
-        m_group_gemm=m_group_gemm,
-    )
+    deepgemm.marlin_i8_contiguous_weight = real_contiguous_pack
+    deepgemm.marlin_i8_masked_weight = real_masked_pack
+    deepgemm.m_group_gemm = m_group_gemm
+    m_group_gemm.pack_int8_weight_enk_to_w6_low_latency = lambda weight: weight
     monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
     monkeypatch.setitem(sys.modules, "deepgemm.m_group_gemm", m_group_gemm)
 
@@ -723,6 +824,25 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         "pack_int8_weight_enk_to_w6_low_latency",
         reject_w6_packer,
     )
+
+    auto_layout_layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_batched_activation_format=True,
+                use_deepep_auto_kernels=True,
+            )
+        )
+    )
+    auto_w13, auto_w2 = target.convert_to_int8_moe_kernel_format(
+        backend,
+        deep_gemm_w13,
+        deep_gemm_w2,
+        layer=auto_layout_layer,
+    )
+    assert auto_w13 is deep_gemm_w13
+    assert auto_w2 is deep_gemm_w2
+    assert contiguous_calls == []
+    assert masked_calls == []
 
     standard_layer = SimpleNamespace(
         moe_config=SimpleNamespace(
@@ -805,6 +925,23 @@ def test_int8_oracle_reports_quant_config_target_for_abi_drift():
     def make_int8_moe_quant_config(incompatible_parameter):
         del incompatible_parameter
 
+    def make_int8_moe_kernel(
+        int8_backend,
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        routing_tables=None,
+        layer=None,
+    ):
+        del (
+            int8_backend,
+            moe_quant_config,
+            moe_config,
+            experts_cls,
+            routing_tables,
+            layer,
+        )
+
     target = _module(
         patch_int8_oracle.TARGET_MODULE,
         Int8MoeBackend=Int8MoeBackend,
@@ -814,6 +951,7 @@ def test_int8_oracle_reports_quant_config_target_for_abi_drift():
         convert_to_int8_moe_kernel_format=convert_to_int8_moe_kernel_format,
         make_int8_moe_quant_config=make_int8_moe_quant_config,
         int8_w8a8_moe_quant_config=lambda: None,
+        make_int8_moe_kernel=make_int8_moe_kernel,
     )
 
     with pytest.raises(RuntimeError) as error:
@@ -1534,6 +1672,9 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
     cache_module = _module(
         "aiter.ops.cache",
         reshape_and_cache=cache,
+    )
+    fa_utils_module = _module(
+        "vllm_hcu.v1.attention.backends.fa_utils",
         reshape_and_cache_flash=cache_flash,
     )
     rope_module = _module(
@@ -1545,6 +1686,11 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
     monkeypatch.setitem(sys.modules, "aiter.ops.triton", triton)
     monkeypatch.setitem(sys.modules, "aiter.ops.cache", cache_module)
     monkeypatch.setitem(sys.modules, "aiter.ops.triton.rope", rope_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        fa_utils_module,
+    )
 
     query = torch.zeros(2, 8)
     key = torch.zeros(2, 4)
@@ -3233,34 +3379,16 @@ def test_moe_fp8_explicit_deepgemm_accepts_hcu_oracle_selection():
     assert len(method_class.init_calls) == 1
 
 
-def test_moe_fp8_deepep_auto_requires_explicit_backend():
-    module = _fake_moe_fp8_module()
-    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
-    method_class.selected_backend = "HCU_DEEPGEMM"
-    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-
-    with pytest.raises(RuntimeError, match="requires explicit"):
-        method_class(
-            *_channel_fp8_moe_args(module),
-            SimpleNamespace(
-                moe_backend="auto",
-                moe_parallel_config=SimpleNamespace(
-                    use_deepep_auto_kernels=True,
-                ),
-            ),
-        )
-
-
-def test_moe_fp8_requires_explicit_backend_and_checks_target_selection():
+def test_moe_fp8_auto_delegates_selection_and_explicit_checks_match():
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
     patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
-    with pytest.raises(RuntimeError, match="--moe-backend aiter, deep_gemm, or triton"):
-        method_class(
-            *_channel_fp8_moe_args(module),
-            SimpleNamespace(moe_backend="auto"),
-        )
-    assert method_class.init_calls == []
+    automatic = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="auto"),
+    )
+    assert automatic.fp8_backend.value == "TRITON"
+    assert len(method_class.init_calls) == 1
 
     method_class.selected_backend = "AITER"
     with pytest.raises(RuntimeError, match="selected='AITER'"):
@@ -3268,7 +3396,7 @@ def test_moe_fp8_requires_explicit_backend_and_checks_target_selection():
             *_channel_fp8_moe_args(module),
             SimpleNamespace(moe_backend="triton"),
         )
-    assert len(method_class.init_calls) == 1
+    assert len(method_class.init_calls) == 2
 
     method_class.selected_backend = "TRITON"
     with pytest.raises(RuntimeError, match="selected='TRITON'"):
@@ -3276,7 +3404,7 @@ def test_moe_fp8_requires_explicit_backend_and_checks_target_selection():
             *_channel_fp8_moe_args(module),
             SimpleNamespace(moe_backend="aiter"),
         )
-    assert len(method_class.init_calls) == 2
+    assert len(method_class.init_calls) == 3
 
 
 def test_moe_fp8_non_channel_routes_delegate_target_without_triton_policy(

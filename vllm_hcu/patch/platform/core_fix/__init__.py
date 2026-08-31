@@ -28,6 +28,7 @@ from . import (
     patch_hy_v3_tool_parser,
     patch_import_utils,
     patch_logits_processor_head_dtype,
+    patch_nixl_utils,
     patch_slimquant_registry,
     patch_vllm_config,
     register_hy_v4_reasoning_parser,
@@ -41,6 +42,7 @@ from . import (
 _ORDERED_ADAPTERS = (
     patch_envs,
     patch_import_utils,
+    patch_nixl_utils,
     patch_engine_args,
     patch_compilation_config,
     patch_vllm_config,

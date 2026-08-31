@@ -56,13 +56,14 @@ def _is_channel_token_route(fp8_moe_module, weight_quant, input_quant) -> bool:
         ) from exc
 
 
-def _required_selected_backend(moe) -> str:
+def _requested_selected_backend(moe) -> str | None:
     requested_backend = getattr(moe, "moe_backend", None)
+    if requested_backend == "auto":
+        return None
     selected_backend = _EXPLICIT_BACKENDS.get(requested_backend)
     if selected_backend is None:
         raise RuntimeError(
-            "Channel-FP8 MoE requires explicit --moe-backend "
-            "aiter, deep_gemm, or triton"
+            "Channel-FP8 MoE backend must be auto, aiter, deep_gemm, or triton"
         )
     return selected_backend
 
@@ -127,21 +128,29 @@ def apply_to_module(module: ModuleType) -> bool:
         channel_token = _is_channel_token_route(
             fp8_moe_module, weight_quant, input_quant
         )
-        expected_backend = None
+        requested_backend = None
         if channel_token:
-            expected_backend = _required_selected_backend(moe)
+            requested_backend = _requested_selected_backend(moe)
         original_init(self, weight_quant, input_quant, moe, layer_name)
         if channel_token:
             selected_backend = _selected_backend_name(self)
-            if selected_backend != expected_backend:
+            if selected_backend is None:
+                raise RuntimeError(
+                    "vLLM v0.25.1 did not select a Channel-FP8 MoE backend"
+                )
+            if (
+                requested_backend is not None
+                and selected_backend != requested_backend
+            ):
                 raise RuntimeError(
                     "vLLM v0.25.1 selected a Channel-FP8 MoE backend "
                     "different from the explicit request "
-                    f"(expected={expected_backend!r}, selected={selected_backend!r})"
+                    f"(expected={requested_backend!r}, "
+                    f"selected={selected_backend!r})"
                 )
         use_w8a16 = bool(
             channel_token
-            and expected_backend == "AITER"
+            and requested_backend == "AITER"
             and os.environ.get(
                 "VLLM_HCU_USE_CHANNEL_FP8_W8A16_MOE", "False"
             ).lower()
@@ -149,7 +158,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         use_bf16 = bool(
             channel_token
-            and expected_backend == "AITER"
+            and requested_backend == "AITER"
             and os.environ.get(
                 "VLLM_HCU_USE_CHANNEL_FP8_BF16_MOE", "False"
             ).lower()
@@ -286,7 +295,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_get_fused_moe_quant_config,
     )
     setattr(method_class, _CLASS_MARKER, True)
-    setattr(method_class, "_vllm_hcu_fp8_moe_owner", "target-explicit")
+    setattr(method_class, "_vllm_hcu_fp8_moe_owner", "target-owned")
     return True
 
 
