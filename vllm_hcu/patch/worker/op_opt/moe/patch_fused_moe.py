@@ -62,11 +62,13 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         from vllm_hcu.platforms import envs as henvs
         from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+            is_aiter_moe_explicitly_disabled,
             is_aiter_moe_requested,
         )
 
         enabled = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and not is_aiter_moe_explicitly_disabled()
             and (
                 henvs.VLLM_HCU_USE_AITER_W4A16_MOE
                 or is_aiter_moe_requested()

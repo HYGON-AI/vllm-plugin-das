@@ -14,7 +14,6 @@ import torch
 from enum import Enum
 from typing import Optional
 from compressed_tensors.quantization import (QuantizationStrategy)
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
@@ -47,8 +46,14 @@ __all__ = [
 ]
 # ── AITER W8A8 MoE env guard ────────────────────────────────────────
 
-def _is_hcu_aiter_w8a8_moe_requested() -> bool:
-    return envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MOE
+def _is_hcu_aiter_w8a8_moe_requested(
+    moe_config: object | None = None,
+) -> bool:
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+        is_aiter_moe_requested,
+    )
+
+    return is_aiter_moe_requested(moe_config)
 
 
 # ── Weight layout helpers (Marlin interleave) ───────────────────────
@@ -494,7 +499,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # AITER W8A8 MoE fast-path: skip Marlin interleave, defer to AITER
-        if _is_hcu_aiter_w8a8_moe_requested():
+        if _is_hcu_aiter_w8a8_moe_requested(self.moe):
             if not rocm_aiter_ops.is_fused_moe_enabled():
                 raise RuntimeError(
                     "VLLM_ROCM_USE_AITER=1 and VLLM_ROCM_USE_AITER_MOE=1 "
@@ -558,7 +563,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         # combines them after the routed kernel returns.
         del shared_experts, shared_experts_input
         # AITER W8A8 MoE fast-path
-        if _is_hcu_aiter_w8a8_moe_requested():
+        if _is_hcu_aiter_w8a8_moe_requested(self.moe):
             if not rocm_aiter_ops.is_fused_moe_enabled():
                 raise RuntimeError(
                     "VLLM_ROCM_USE_AITER=1 and VLLM_ROCM_USE_AITER_MOE=1 "

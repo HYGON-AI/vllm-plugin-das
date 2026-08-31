@@ -81,65 +81,37 @@ def _fp8_quant_abi_stub(
 
 
 @pytest.mark.parametrize(
-    ("new_value", "legacy_value", "expected"),
+    ("value", "expected"),
     [
-        (None, None, True),
-        ("0", None, False),
-        ("1", "0", True),
-        (None, "0", False),
+        (None, True),
+        ("0", False),
+        ("1", True),
     ],
 )
-def test_unified_aiter_moe_shuffle_env_precedence(
+def test_unified_aiter_moe_shuffle_env(
     monkeypatch: pytest.MonkeyPatch,
-    new_value: str | None,
-    legacy_value: str | None,
+    value: str | None,
     expected: bool,
 ):
-    for name, value in (
-        ("VLLM_HCU_USE_AITER_MOE_SHUFFLE", new_value),
-        ("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", legacy_value),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
+    if value is None:
+        monkeypatch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", value)
 
     henvs.resolve_aiter_moe_shuffle.cache_clear()
     assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is expected
 
 
-def test_unified_aiter_moe_shuffle_legacy_alias_warns_once(
+def test_removed_w16a16_shuffle_env_cannot_change_unified_behavior(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ):
     monkeypatch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
     monkeypatch.setenv("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "0")
     henvs.resolve_aiter_moe_shuffle.cache_clear()
 
-    with caplog.at_level("WARNING", logger=henvs.__name__):
-        assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is False
-        assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is False
-
-    warnings = [
-        record.message for record in caplog.records
-        if "W16A16_MOE_SHUFFLE" in record.message
-    ]
-    assert len(warnings) == 1
-    assert "deprecated" in warnings[0]
-
-
-def test_unified_aiter_moe_shuffle_new_name_wins(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-):
-    monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", "1")
-    monkeypatch.setenv("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "0")
-    henvs.resolve_aiter_moe_shuffle.cache_clear()
-
-    with caplog.at_level("WARNING", logger=henvs.__name__):
-        assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is True
-
-    assert any("takes precedence" in record.message for record in caplog.records)
+    assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is True
+    with pytest.raises(AttributeError):
+        getattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE")
 
 
 def test_unified_aiter_moe_config_disable_is_ignored(
@@ -2814,6 +2786,34 @@ def test_explicit_aiter_backend_enables_mask_construction_from_current_config(
     assert aiter_runtime.is_aiter_moe_requested()
 
 
+def test_explicit_triton_backend_overrides_enabled_aiter_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_vllm_envs(
+        monkeypatch,
+        VLLM_ROCM_USE_AITER=True,
+        VLLM_ROCM_USE_AITER_MOE=True,
+    )
+    moe_config = SimpleNamespace(moe_backend="triton", num_experts=4)
+
+    assert not aiter_runtime.is_aiter_moe_requested(moe_config)
+    with aiter_runtime.aiter_moe_request_context(moe_config):
+        assert not aiter_runtime.is_aiter_moe_requested()
+
+
+def test_explicit_triton_backend_overrides_legacy_w4a16_aiter_flag(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
+
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_backend="triton")
+    )
+
+    assert not patch_compressed_tensors_moe_wna16._aiter_requested(layer)
+
+
 def test_aiter_w16a16_no_solution_falls_back_to_vllm_triton(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3568,6 +3568,60 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda *args: pytest.fail("explicit Triton must not prewarm AITER"),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            moe_backend="triton",
+            experts_per_token=1,
+            hidden_dim=4,
+            in_dtype=torch.float16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
+                dtype=torch.uint8,
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    fallback_w1, fallback_w2 = (
+        layer.w13_weight._hcu_vllm_w4a8_fallback_weights
+    )
+    assert fallback_w1.shape == (1, 4, 4)
+    assert fallback_w2.shape == (1, 4, 2)
+    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_unsupported_m1_does_not_expand_weights_at_load(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3828,6 +3882,62 @@ def test_slimquant_w4a8_no_config_unpacks_for_vllm_triton_without_cache(
     assert kwargs["use_int8_w8a8"] is True
     assert kwargs["use_int4_w4a16"] is False
     assert kwargs["per_channel_quant"] is True
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe import fused_moe
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "select_aiter_moe_config",
+        lambda *args, **kwargs: pytest.fail(
+            "explicit Triton must not query the AITER selector"
+        ),
+    )
+    expected = torch.full((2, 4), 3.0, dtype=torch.float16)
+    monkeypatch.setattr(
+        fused_moe,
+        "fused_experts_impl",
+        lambda *args, **kwargs: expected,
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            moe_backend="triton",
+            hidden_dim=4,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+    )
+    method.moe_quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 4, 1), 16.0),
+        w2_scale=torch.full((1, 4, 1), 16.0),
+        a1_scale=None,
+        a2_scale=None,
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8),
+        w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8),
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+    )
+    x = torch.zeros((2, 4), dtype=torch.float16)
+
+    actual = method.apply(
+        layer,
+        x,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        None,
+        None,
+    )
+
+    assert actual is expected
 
 
 @pytest.mark.hcu
@@ -5865,7 +5975,11 @@ def test_marlin_aiter_moe_no_solution_uses_native_triton_not_lmslim(
         a2_scale=None,
         block_shape=None,
     )
-    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: True)
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe=None: True,
+    )
     monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
 
     class MoeQuantType:
@@ -5919,6 +6033,24 @@ def test_marlin_aiter_moe_no_solution_uses_native_triton_not_lmslim(
     assert fallback_calls[0][1]["use_int8_w8a8"] is True
 
 
+def test_marlin_explicit_triton_backend_bypasses_aiter_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    _install_fake_vllm_envs(
+        monkeypatch,
+        VLLM_ROCM_USE_AITER=True,
+        VLLM_ROCM_USE_AITER_MOE=True,
+    )
+
+    assert not marlin._is_hcu_aiter_w8a8_moe_requested(
+        SimpleNamespace(moe_backend="triton")
+    )
+
+
 def test_marlin_aiter_moe_prewarms_m1_during_weight_loading(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -5939,7 +6071,11 @@ def test_marlin_aiter_moe_prewarms_m1_during_weight_loading(
         block_shape=None,
     )
     method.get_fused_moe_quant_config = lambda unused_layer: quant_config
-    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: True)
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe=None: True,
+    )
     monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
     calls: list[tuple[object, object, object]] = []
     monkeypatch.setattr(
@@ -5974,7 +6110,11 @@ def test_marlin_aiter_moe_config_fault_does_not_fallback(
         w2_scale=torch.ones((3, 4, 1)),
         block_shape=None,
     )
-    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: True)
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe=None: True,
+    )
     monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
 
     class MoeQuantType:

@@ -217,11 +217,18 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             if not isinstance(parameter, Parameter):
                 raise TypeError(f"SlimQuant W4A8 requires Parameter {name}")
             parameter.requires_grad_(False)
-        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-            prewarm_aiter_w4a8_moe,
-        )
+        if getattr(self.moe, "moe_backend", "auto") == "triton":
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                prepare_vllm_w4a8_moe,
+            )
 
-        prewarm_aiter_w4a8_moe(self, layer)
+            prepare_vllm_w4a8_moe(self, layer)
+        else:
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                prewarm_aiter_w4a8_moe,
+            )
+
+            prewarm_aiter_w4a8_moe(self, layer)
 
     def apply(
         self,
@@ -254,11 +261,17 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 f"token count as x, got x={tuple(x.shape)}, "
                 f"topk_ids={tuple(topk_ids.shape)}"
             )
-        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-            apply_aiter_w4a8_moe,
+        from vllm_hcu.model_executor.layers.quantization import (
+            compressed_tensors_moe_runtime as moe_runtime,
         )
 
-        return apply_aiter_w4a8_moe(
+        operation = (
+            moe_runtime.apply_vllm_w4a8_moe
+            if getattr(getattr(self, "moe", None), "moe_backend", "auto")
+            == "triton"
+            else moe_runtime.apply_aiter_w4a8_moe
+        )
+        return operation(
             self,
             layer,
             x,

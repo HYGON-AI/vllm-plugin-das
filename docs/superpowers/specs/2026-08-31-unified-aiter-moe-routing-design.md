@@ -129,14 +129,8 @@ as integer `use_shuffle=1` or `0`, including W16A16, INT8/FP8 W8A8, and W4A16.
 The switch is a selection hint only. Weight transformation occurs only when the
 returned config has `need_shuffle=True`.
 
-Keep `VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE` for one release as a deprecated
-alias:
-
-1. If the new variable is explicitly set, it wins.
-2. Otherwise, an explicitly set legacy variable supplies the value.
-3. If neither is set, the value is `True`.
-4. Explicit legacy use logs one deprecation warning per process.
-5. If both are set, the new value wins and one warning explains the precedence.
+The former W16A16-specific switch is removed rather than retained as an alias.
+Only the unified switch can affect routing, and its unset default is `True`.
 
 `VLLM_HCU_USE_AITER_MOE_CONFIG` remains parseable for one release but no longer
 disables config lookup. Explicitly setting it to false emits one deprecation

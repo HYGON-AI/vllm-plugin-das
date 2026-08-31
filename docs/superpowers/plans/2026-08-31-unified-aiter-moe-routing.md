@@ -47,7 +47,7 @@
 **Interfaces:**
 - Produces: `resolve_aiter_moe_shuffle() -> bool`
 - Produces: dynamic attribute `VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool`
-- Preserves: `VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE` as a one-release alias
+- Removes the former W16A16-specific shuffle variable
 
 - [ ] **Step 1: Write failing environment-resolution tests**
 
@@ -55,27 +55,17 @@ Add tests that clear the resolver cache around each environment combination:
 
 ```python
 @pytest.mark.parametrize(
-    ("new_value", "legacy_value", "expected"),
-    [(None, None, True), ("0", None, False),
-     ("1", "0", True), (None, "0", False)],
+    ("value", "expected"),
+    [(None, True), ("0", False), ("1", True)],
 )
-def test_unified_aiter_moe_shuffle_env_precedence(
-    monkeypatch, new_value, legacy_value, expected
-):
-    for name, value in (
-        ("VLLM_HCU_USE_AITER_MOE_SHUFFLE", new_value),
-        ("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", legacy_value),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
+def test_unified_aiter_moe_shuffle_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", value)
     henvs.resolve_aiter_moe_shuffle.cache_clear()
     assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is expected
 ```
-
-Add `caplog` assertions that explicit legacy use warns once and that the new
-variable wins when both are set.
 
 - [ ] **Step 2: Run the new tests and verify RED**
 

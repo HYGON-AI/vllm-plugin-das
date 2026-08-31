@@ -49,8 +49,8 @@ def aiter_gate_mode_kwargs(
     return {"gate_mode": gate_mode}
 
 
-_EXPLICIT_AITER_MOE: ContextVar[bool] = ContextVar(
-    "vllm_hcu_explicit_aiter_moe", default=False
+_EXPLICIT_MOE_BACKEND: ContextVar[str | None] = ContextVar(
+    "vllm_hcu_explicit_moe_backend", default=None
 )
 _AITER_MOE_GLOBAL_NUM_EXPERTS: ContextVar[int | None] = ContextVar(
     "vllm_hcu_aiter_moe_global_num_experts", default=None
@@ -233,25 +233,46 @@ def aiter_asm_boltops_fp8_quant_context(enabled: bool):
         _AITER_ASM_BOLTOPS_FP8_QUANT.reset(token)
 
 
-def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
-    """Keep explicit ``moe_backend=aiter`` independent of auto env gates."""
+def _explicit_moe_backend(moe_config: object | None = None) -> str | None:
+    """Return the highest-priority non-auto MoE backend selection."""
 
-    if getattr(moe_config, "moe_backend", None) == "aiter":
-        return True
-    if _EXPLICIT_AITER_MOE.get():
-        return True
+    backend = getattr(moe_config, "moe_backend", None)
+    if backend not in (None, "auto"):
+        return str(backend)
+
+    backend = _EXPLICIT_MOE_BACKEND.get()
+    if backend not in (None, "auto"):
+        return str(backend)
+
     try:
         from vllm.config import get_current_vllm_config_or_none
 
         config = get_current_vllm_config_or_none()
-        if (
-            config is not None
-            and getattr(getattr(config, "kernel_config", None), "moe_backend", None)
-            == "aiter"
-        ):
-            return True
+        backend = getattr(
+            getattr(config, "kernel_config", None), "moe_backend", None
+        )
+        if backend not in (None, "auto"):
+            return str(backend)
     except (AttributeError, ImportError):
         pass
+    return None
+
+
+def is_aiter_moe_explicitly_disabled(
+    moe_config: object | None = None,
+) -> bool:
+    """Whether an explicit backend requires bypassing every AITER MoE path."""
+
+    backend = _explicit_moe_backend(moe_config)
+    return backend is not None and backend != "aiter"
+
+
+def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
+    """Resolve explicit backend selection before legacy auto env gates."""
+
+    backend = _explicit_moe_backend(moe_config)
+    if backend is not None:
+        return backend == "aiter"
 
     import vllm.envs as envs
 
@@ -262,8 +283,8 @@ def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
 
 @contextmanager
 def aiter_moe_request_context(moe_config: object):
-    request_token = _EXPLICIT_AITER_MOE.set(
-        getattr(moe_config, "moe_backend", None) == "aiter"
+    request_token = _EXPLICIT_MOE_BACKEND.set(
+        getattr(moe_config, "moe_backend", None)
     )
     global_num_experts = getattr(moe_config, "num_experts", None)
     if not isinstance(global_num_experts, int) or global_num_experts <= 0:
@@ -273,7 +294,7 @@ def aiter_moe_request_context(moe_config: object):
         yield
     finally:
         _AITER_MOE_GLOBAL_NUM_EXPERTS.reset(experts_token)
-        _EXPLICIT_AITER_MOE.reset(request_token)
+        _EXPLICIT_MOE_BACKEND.reset(request_token)
 
 
 def _import_optional_aiter_module(module_name: str) -> object | None:
@@ -620,6 +641,9 @@ def _activation_name(activation_method: int) -> str:
         return {
             0: "silu",
             1: "gelu",
+            # vLLM maps MoEActivation.SWIGLUOAI to AITER's numeric
+            # ActivationType.Swiglu (2).  The public AITER MoE API uses the
+            # semantic spelling below to retain interleaved OAI SwiGLU math.
             2: "swigluoai",
             3: "gelu_tanh",
         }[activation_method]
@@ -999,6 +1023,8 @@ __all__ = [
     "get_aiter_activation_type",
     "get_gelu_tanh_activation_type",
     "is_aiter_found_and_supported",
+    "is_aiter_moe_explicitly_disabled",
+    "is_aiter_moe_requested",
     "rmsnorm_add_dynamic_quant_impl",
     "rmsnorm_dynamic_quant_impl",
     "triton_rope_and_cache_impl",

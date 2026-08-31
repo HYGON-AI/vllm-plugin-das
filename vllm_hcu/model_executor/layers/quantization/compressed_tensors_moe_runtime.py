@@ -277,12 +277,26 @@ def _vllm_w4a8_fallback_weights(
         )
 
 
+def prepare_vllm_w4a8_moe(
+    method: object,
+    layer: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare and cache unpacked weights for an explicit vLLM Triton route."""
+
+    w1, w2, _, _ = _slimquant_w4a8_metadata(method, layer)
+    fallback_weights = _vllm_w4a8_fallback_weights(w1, w2)
+    w1._hcu_vllm_w4a8_fallback_weights = fallback_weights
+    return fallback_weights
+
+
 def apply_aiter_w4a8_moe(
     method: object,
     layer: object,
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    *,
+    allow_aiter: bool = True,
 ) -> torch.Tensor:
     """Route SlimQuant W4A8 through AITER, or vLLM Triton if unsupported."""
 
@@ -305,7 +319,7 @@ def apply_aiter_w4a8_moe(
     w1_scale = _required_tensor(quant_config, "w1_scale")
     w2_scale = _required_tensor(quant_config, "w2_scale")
     aiter_config = None
-    if getattr(w1, "_hcu_aiter_moe_m1_supported", None) is not False:
+    if allow_aiter and getattr(w1, "_hcu_aiter_moe_m1_supported", None) is not False:
         from aiter.moe import MoeQuantType
 
         quant_type = getattr(MoeQuantType, "W4A8", None)
@@ -340,11 +354,21 @@ def apply_aiter_w4a8_moe(
     )
     expert_mask = getattr(layer, "expert_mask", None)
     if aiter_config is None:
-        fallback_w1, fallback_w2 = _vllm_w4a8_fallback_weights(w1, w2)
+        fallback_weights = getattr(
+            w1, "_hcu_vllm_w4a8_fallback_weights", None
+        )
+        if (
+            not isinstance(fallback_weights, tuple)
+            or len(fallback_weights) != 2
+            or not all(
+                isinstance(weight, torch.Tensor) for weight in fallback_weights
+            )
+        ):
+            fallback_weights = _vllm_w4a8_fallback_weights(w1, w2)
+        fallback_w1, fallback_w2 = fallback_weights
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_experts_impl,
         )
-
         return fused_experts_impl(
             hidden_states,
             fallback_w1,
@@ -405,6 +429,25 @@ def apply_aiter_w4a8_moe(
         routed_scaling_factor=1.0,
         use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
         output_dtype=hidden_states.dtype,
+    )
+
+
+def apply_vllm_w4a8_moe(
+    method: object,
+    layer: object,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Run SlimQuant W4A8 directly with vLLM Triton, without AITER probes."""
+
+    return apply_aiter_w4a8_moe(
+        method,
+        layer,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        allow_aiter=False,
     )
 
 
@@ -893,8 +936,10 @@ __all__ = [
     "apply_aiter_quantized_moe",
     "apply_aiter_w4a8_moe",
     "apply_aiter_w8a8_fp8_moe",
+    "apply_vllm_w4a8_moe",
     "build_aiter_w4a16_quant_config",
     "create_aiter_w4a16_qzeros",
     "prewarm_aiter_w4a8_moe",
+    "prepare_vllm_w4a8_moe",
     "process_dpsk_deepgemm_weights",
 ]

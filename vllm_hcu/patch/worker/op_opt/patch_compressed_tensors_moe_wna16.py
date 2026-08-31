@@ -33,12 +33,16 @@ def _aiter_requested(layer: object | None = None) -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
         from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+            is_aiter_moe_explicitly_disabled,
             is_aiter_moe_requested,
         )
 
+        moe_config = getattr(layer, "moe_config", None)
+        if is_aiter_moe_explicitly_disabled(moe_config):
+            return False
         return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
             henvs.VLLM_HCU_USE_AITER_W4A16_MOE
-            or is_aiter_moe_requested(getattr(layer, "moe_config", None))
+            or is_aiter_moe_requested(moe_config)
         )
     except (AttributeError, ImportError) as exc:
         raise PatchCompatibilityError(

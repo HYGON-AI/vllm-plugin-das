@@ -56,7 +56,6 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
-    VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
@@ -88,29 +87,8 @@ def _environment_flag(raw: str) -> bool:
 def resolve_aiter_moe_shuffle() -> bool:
     """Resolve the unified AITER MoE weight-shuffle switch."""
 
-    new_name = "VLLM_HCU_USE_AITER_MOE_SHUFFLE"
-    legacy_name = "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE"
-    new_value = os.environ.get(new_name)
-    legacy_value = os.environ.get(legacy_name)
-
-    if new_value is not None:
-        if legacy_value is not None:
-            logger.warning(
-                "%s takes precedence over deprecated %s",
-                new_name,
-                legacy_name,
-            )
-        return _environment_flag(new_value)
-
-    if legacy_value is not None:
-        logger.warning(
-            "%s is deprecated; use %s for all AITER MoE quantization modes",
-            legacy_name,
-            new_name,
-        )
-        return _environment_flag(legacy_value)
-
-    return True
+    raw = os.environ.get("VLLM_HCU_USE_AITER_MOE_SHUFFLE")
+    return True if raw is None else _environment_flag(raw)
 
 
 @functools.lru_cache(maxsize=1)
@@ -379,11 +357,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Shuffle AITER MoE weights for any quantization mode (default True).
     "VLLM_HCU_USE_AITER_MOE_SHUFFLE": resolve_aiter_moe_shuffle,
-
-    # Deprecated one-release alias retained for direct compatibility access.
-    "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE":
-        lambda: (os.environ.get("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "True").lower() in
-                    ("true", "1")),
 
     # Deprecated compatibility switch; unified routing always uses the config.
     "VLLM_HCU_USE_AITER_MOE_CONFIG": resolve_aiter_moe_config_compat,
