@@ -96,11 +96,13 @@ def test_sink_incapable_backend_fails_closed() -> None:
         require_hyv4_sink_backend(SinkIncapableSparseBackend)
 
 
-def test_hcu_backend_advertises_sink_support() -> None:
+def test_hcu_backend_advertises_sink_and_pcp_support() -> None:
+    impl_cls = HYV4FlashMLASparseBackend.get_impl_cls()
     assert HYV4FlashMLASparseBackend.supports_sink()
     assert HYV4FlashMLASparseBackend.is_sparse()
     assert HYV4FlashMLASparseBackend.get_name() == "FLASHMLA_SPARSE"
-    assert HYV4FlashMLASparseBackend.get_impl_cls() is HYV4FlashMLASparseImpl
+    assert impl_cls is HYV4FlashMLASparseImpl
+    assert impl_cls.supports_pcp is True
 
 
 def test_sink_prefill_requires_sparse_mqa_impl_without_global_config_flag() -> None:
