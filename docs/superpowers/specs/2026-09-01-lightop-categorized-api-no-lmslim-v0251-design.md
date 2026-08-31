@@ -24,7 +24,8 @@ third-party Torch deprecation warnings.
 
 ## Goals
 
-1. Use `lightop.<category>.<name>` at every production LightOp call site.
+1. Use `lightop.<category>.<name>` at every production LightOp call site that
+   has a categorized public export in the installed LightOp 0.6 package.
 2. Remove every production import and call of the external LMSlim package.
 3. Preserve the existing runtime ownership and lazy-import boundaries.
 4. Adapt ABI changes instead of treating the migration as import-only.
@@ -44,6 +45,11 @@ third-party Torch deprecation warnings.
 - Do not redesign unrelated quantization, attention, MoE, or patch lifecycle
   behavior.
 - Do not retain external LMSlim as a runtime fallback.
+- Do not replace the post-PR-27
+  `lightop.fuse_silu_mul_clamp_quant` and
+  `lightop.fuse_silu_mul_clamp_quant_ep` calls in this pull request. Installed
+  LightOp 0.6 has no categorized public exports for these fused kernels, and
+  decomposing them would introduce an unrequested performance change.
 
 ## Integration Strategy
 
@@ -74,6 +80,13 @@ Production code imports only from a documented category:
 Required optimized paths fail with an owner-specific error if the categorized
 symbol is unavailable. They do not retry an old LightOp path or LMSlim after
 an import, signature, kernel, dtype, shape, or device failure.
+
+There are exactly two temporary top-level exceptions:
+`lightop.fuse_silu_mul_clamp_quant` and
+`lightop.fuse_silu_mul_clamp_quant_ep`. They remain only at the existing
+DeepSeek V4 INT8 clamp boundary because installed LightOp 0.6 does not expose
+them from `lightop.activation.__all__`. No new caller may use these paths, and
+the exception is removed once LightOp publishes categorized equivalents.
 
 Existing algorithmic fallbacks remain valid when they are part of the
 feature's design rather than compatibility with an obsolete API. Examples
@@ -125,7 +138,9 @@ The latest branch adds owners that pull request #27 could not cover:
 
 These owners are inspected against the installed LightOp API independently.
 They are not assumed to be correct merely because the older pull request
-passes.
+passes. The DeepSeek V4 FP8 and unclamped INT8 activation helpers move to
+`lightop.activation`; the two fused INT8 clamp helpers remain the documented
+top-level exception described above.
 
 ## Environment Variable Boundary
 
@@ -177,7 +192,8 @@ explicit setting instead of inventing an unsupported `LIGHTOP_*` name.
 ### Test-first contract coverage
 
 1. An AST/import-boundary test rejects production `lmslim` imports and direct
-   calls through obsolete LightOp namespaces.
+   calls through obsolete LightOp namespaces, with an exact allowlist for the
+   two unchanged DeepSeek V4 clamp helpers.
 2. A categorized export contract imports every symbol used by production and
    verifies membership in the installed category's public `__all__`.
 3. Fake-module tests prove each owner selects the categorized callable and
@@ -199,7 +215,8 @@ After focused red-green cycles:
    checks applicable to the changed files;
 4. run live HCU LightOp numerical tests on the available BW1100 devices;
 5. search the final production tree for `lmslim`, `lightop.op`,
-   `lightop.gemmopt`, and moved top-level exports and account for every result.
+   `lightop.gemmopt`, and moved top-level exports and account for every result;
+   only the two explicitly allowed clamp helpers may remain at top level.
 
 ### Model validation
 
