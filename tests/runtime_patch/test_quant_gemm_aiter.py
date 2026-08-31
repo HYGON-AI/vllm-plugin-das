@@ -15,6 +15,15 @@ import pytest
 import torch
 
 from vllm_hcu.model_executor.layers.fused_moe import aiter_runtime
+from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+    AiterMoeProblem,
+    HcuAiterMoeDispatchError,
+    aiter_expert_map_for_solution,
+    execute_aiter_moe,
+    prepare_aiter_moe_scales,
+    prepare_aiter_moe_weights,
+    select_aiter_moe_config,
+)
 from vllm_hcu.model_executor.layers.quantization import (
     compressed_tensors_moe_runtime,
     int8_runtime,
@@ -138,6 +147,306 @@ def test_unified_aiter_moe_config_disable_is_ignored(
     assert any(
         "deprecated and ignored" in record.message for record in caplog.records
     )
+
+
+def test_aiter_dispatch_selector_passes_problem_without_forcing_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    expected_config = SimpleNamespace(solution_type="triton")
+
+    def get_config(**kwargs: object):
+        captured.update(kwargs)
+        return True, expected_config
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    problem = AiterMoeProblem(
+        M=2,
+        E=4,
+        N1=16,
+        N2=8,
+        K=8,
+        top_k=2,
+        block_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+        activation="silu",
+        use_shuffle=True,
+    )
+
+    actual = select_aiter_moe_config(problem, cache_owner=torch.empty(1))
+
+    assert actual is expected_config
+    assert captured == {
+        "M": 2,
+        "E": 4,
+        "N1": 16,
+        "N2": 8,
+        "K": 8,
+        "top_k": 2,
+        "block_size": 0,
+        "dtype": torch.bfloat16,
+        "quant_type": "w16a16",
+        "activation": "silu",
+        "use_shuffle": 1,
+    }
+    assert "spec_sol_type" not in captured
+    assert "device" not in captured
+
+
+def test_aiter_dispatch_selector_returns_none_only_for_explicit_no_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (False, None),
+        ),
+    )
+    problem = AiterMoeProblem(
+        M=1,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+    )
+
+    assert select_aiter_moe_config(problem, cache_owner=object()) is None
+
+
+def test_aiter_dispatch_selector_rejects_success_without_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (True, None),
+        ),
+    )
+    problem = AiterMoeProblem(
+        M=3,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+
+    with pytest.raises(HcuAiterMoeDispatchError, match="status=True"):
+        select_aiter_moe_config(problem, cache_owner=object())
+
+
+@pytest.mark.parametrize(
+    ("solution", "need_shuffle", "should_shuffle"),
+    [
+        ("asm", True, True),
+        ("moe_c", True, True),
+        ("triton", False, False),
+        ("ck", False, False),
+    ],
+)
+def test_aiter_dispatch_prepares_solution_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    solution: str,
+    need_shuffle: bool,
+    should_shuffle: bool,
+):
+    calls: list[object] = []
+
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        calls.append(config)
+        return w1.clone(), w2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type=solution,
+        need_shuffle=need_shuffle,
+        config={"layout": solution},
+    )
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+
+    actual_w1, actual_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        config,
+        cache_owner=w1,
+    )
+
+    assert bool(calls) is should_shuffle
+    assert (actual_w1 is not w1) is should_shuffle
+    assert (actual_w2 is not w2) is should_shuffle
+
+
+def test_aiter_dispatch_prepares_weight_cache_tracks_generation_and_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, str]] = []
+
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        calls.append(dict(config.config))
+        return w1.clone(), w2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"layout": "a"},
+    )
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+
+    first = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    second = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    assert second[0] is first[0]
+    assert second[1] is first[1]
+    assert calls == [{"layout": "a"}]
+
+    w1.add_(1)
+    third = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    assert third[0] is not first[0]
+
+    config.config["layout"] = "b"
+    fourth = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    assert fourth[0] is not third[0]
+    assert calls == [
+        {"layout": "a"},
+        {"layout": "a"},
+        {"layout": "b"},
+    ]
+
+
+def test_aiter_dispatch_prepares_scale_layout_and_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[object] = []
+
+    def shuffle(scale1: torch.Tensor, scale2: torch.Tensor, config: object):
+        calls.append(config)
+        return scale1.clone(), scale2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_scale=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="asm",
+        need_shuffle_scale=True,
+        config={"scale_layout": 1},
+    )
+    scale1 = torch.ones((2, 8))
+    scale2 = torch.ones((2, 4))
+
+    first = prepare_aiter_moe_scales(
+        scale1,
+        scale2,
+        config,
+        cache_owner=scale1,
+    )
+    second = prepare_aiter_moe_scales(
+        scale1,
+        scale2,
+        config,
+        cache_owner=scale1,
+    )
+
+    assert first[0] is not scale1
+    assert first[1] is not scale2
+    assert second[0] is first[0]
+    assert second[1] is first[1]
+    assert calls == [config]
+
+
+@pytest.mark.parametrize("solution", ["moe_c", "triton", "ck"])
+def test_aiter_dispatch_expert_map_preserves_non_asm_solutions(solution: str):
+    expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int64)
+    config = SimpleNamespace(solution_type=solution)
+
+    actual = aiter_expert_map_for_solution(expert_map, config, 4)
+
+    assert actual is expert_map
+
+
+def test_aiter_dispatch_expert_map_converts_asm_to_mask():
+    expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int64)
+    config = SimpleNamespace(solution_type="asm")
+
+    actual = aiter_expert_map_for_solution(expert_map, config, 4)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([0, 1, 1, 0], dtype=torch.int32),
+    )
+
+
+def test_aiter_dispatch_execute_uses_public_aiter_moe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    expected = torch.ones((2, 4))
+
+    def aiter_moe(**kwargs: object):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe=aiter_moe),
+    )
+    hidden_states = torch.ones((2, 4))
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+    topk_weights = torch.ones((2, 1))
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    config = SimpleNamespace(solution_type="triton")
+
+    actual = execute_aiter_moe(
+        config,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation="silu",
+        global_num_experts=2,
+    )
+
+    assert actual is expected
+    assert captured["moe_config"] is config
+    assert captured["w1"] is w1
+    assert captured["w2"] is w2
+    assert captured["global_num_experts"] == 2
 
 
 def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
