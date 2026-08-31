@@ -103,11 +103,13 @@ and argument expressions remain unchanged; only the owning module changes:
 | `lmslim.layers.fused_moe...fused_experts_impl_fp8_marlin` | `lightop.moe.fused_experts_impl_fp8_marlin` |
 | `lmslim.layers.fused_moe...fused_experts_impl_int8_marlin` | `lightop.moe.fused_experts_impl_int8_marlin` |
 | `lmslim.layers.gemm.int8_utils.per_token_quant_int8` | `lightop.quant.per_token_quant_int8` |
-| `lmslim.quant_ops.hipblaslt_w8a8_gemm` | `lightop.gemm_ops.hipblaslt_w8a8_channelwise_gemm` |
+| `lmslim.quant_ops.hipblaslt_w8a8_gemm` | `lightop.gemm_ops.hipblaslt_w8a8_gemm` |
 
 The installed LightOp implementation returns the same `(status, output)`
-contract for channel-wise W8A8 GEMM and exposes compatible Marlin expert and
-INT8 quantization signatures. Existing result validation stays in the plugin.
+contract for W8A8 GEMM and exposes compatible Marlin expert and INT8
+quantization signatures. The terminal call name remains
+`hipblaslt_w8a8_gemm`, as required by the migration document. Existing result
+validation stays in the plugin.
 
 ### Categorized LightOp migration
 
