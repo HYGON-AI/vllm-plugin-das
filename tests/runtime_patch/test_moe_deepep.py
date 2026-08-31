@@ -1881,8 +1881,10 @@ def test_channel_fp8_experts_repack_reloaded_weights_in_declared_layout(
     assert replacement._deepgemm_w2 is layer.w2_weight
 
 
+@pytest.mark.parametrize("clamp_limit", (None, 10.0))
 def test_channel_fp8_masked_experts_execute_public_deepgemm_kernel(
     monkeypatch: pytest.MonkeyPatch,
+    clamp_limit: float | None,
 ):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
@@ -1895,6 +1897,7 @@ def test_channel_fp8_masked_experts_execute_public_deepgemm_kernel(
     experts.quant_config = SimpleNamespace(
         w1_scale=torch.ones((2, 8)),
         w2_scale=torch.ones((2, 4)),
+        gemm1_clamp_limit=clamp_limit,
     )
     experts.moe_problem_size = lambda *_args: (2, 3, 8, 4, 1)
 
@@ -1918,13 +1921,19 @@ def test_channel_fp8_masked_experts_execute_public_deepgemm_kernel(
         public_masked_kernel,
         raising=False,
     )
+    activation_limits = []
+
+    def quantize_with_clamp(output, **kwargs):
+        activation_limits.append(kwargs.get("limit"))
+        return (
+            output[..., :4].to(torch.int8),
+            torch.ones(output.shape[:2]),
+        )
+
     monkeypatch.setattr(
         module,
         "fuse_silu_mul_fp8_quant_ep",
-        lambda output, **_kwargs: (
-            output[..., :4].to(torch.int8),
-            torch.ones(output.shape[:2]),
-        ),
+        quantize_with_clamp,
     )
 
     output = torch.empty((2, 3, 4))
@@ -1949,10 +1958,13 @@ def test_channel_fp8_masked_experts_execute_public_deepgemm_kernel(
     )
 
     assert torch.equal(output, torch.full_like(output, 2))
+    assert activation_limits == [clamp_limit]
 
 
+@pytest.mark.parametrize("clamp_limit", (None, 10.0))
 def test_channel_fp8_contiguous_experts_accept_v0251_permute_contract(
     monkeypatch: pytest.MonkeyPatch,
+    clamp_limit: float | None,
 ):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
@@ -1965,6 +1977,7 @@ def test_channel_fp8_contiguous_experts_accept_v0251_permute_contract(
     experts.quant_config = SimpleNamespace(
         w1_scale=torch.ones((1, 8)),
         w2_scale=torch.ones((1, 4)),
+        gemm1_clamp_limit=clamp_limit,
     )
     experts.moe_problem_size = lambda *_args: (1, 3, 8, 4, 1)
 
@@ -1998,13 +2011,19 @@ def test_channel_fp8_contiguous_experts_accept_v0251_permute_contract(
         "m_grouped_fp8_gemm_nt_contiguous",
         public_contiguous_kernel,
     )
+    activation_limits = []
+
+    def quantize_with_clamp(output, **kwargs):
+        activation_limits.append(kwargs.get("limit"))
+        return (
+            output[..., :4].to(torch.int8),
+            torch.ones((output.shape[0], 1)),
+        )
+
     monkeypatch.setattr(
         module,
         "fuse_silu_mul_fp8_quant",
-        lambda output, **_kwargs: (
-            output[..., :4].to(torch.int8),
-            torch.ones((output.shape[0], 1)),
-        ),
+        quantize_with_clamp,
     )
     monkeypatch.setattr(
         module,
@@ -2035,6 +2054,7 @@ def test_channel_fp8_contiguous_experts_accept_v0251_permute_contract(
     )
 
     assert torch.equal(output, torch.full_like(output, 2))
+    assert activation_limits == [clamp_limit]
 
 
 def test_channel_fp8_auto_experts_restore_layouts_after_kernel_recreation(

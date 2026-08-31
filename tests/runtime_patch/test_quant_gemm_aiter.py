@@ -3233,6 +3233,24 @@ def test_moe_fp8_explicit_deepgemm_accepts_hcu_oracle_selection():
     assert len(method_class.init_calls) == 1
 
 
+def test_moe_fp8_deepep_auto_requires_explicit_backend():
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "HCU_DEEPGEMM"
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+
+    with pytest.raises(RuntimeError, match="requires explicit"):
+        method_class(
+            *_channel_fp8_moe_args(module),
+            SimpleNamespace(
+                moe_backend="auto",
+                moe_parallel_config=SimpleNamespace(
+                    use_deepep_auto_kernels=True,
+                ),
+            ),
+        )
+
+
 def test_moe_fp8_requires_explicit_backend_and_checks_target_selection():
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod

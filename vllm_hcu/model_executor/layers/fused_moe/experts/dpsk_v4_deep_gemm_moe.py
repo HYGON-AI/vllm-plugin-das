@@ -335,7 +335,10 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         del a2_scale
 
         q_activation, q_activation_scale = fuse_silu_mul_fp8_quant(
-            gateup_output, fp8type=0, expert_ids=m_indices
+            gateup_output,
+            fp8type=0,
+            expert_ids=m_indices,
+            limit=self.quant_config.gemm1_clamp_limit,
         )
         del gateup_output
 
@@ -588,6 +591,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             gateup_output,
             fp8type=0,
             tokens_per_expert=expert_num_tokens,
+            limit=self.quant_config.gemm1_clamp_limit,
         )
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         q_activation = q_activation.view(local_num_experts, max_tokens,

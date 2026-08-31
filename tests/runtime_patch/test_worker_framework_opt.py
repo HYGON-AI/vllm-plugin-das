@@ -613,6 +613,48 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
     assert created == [("cpu-group", "tcp")]
 
 
+def test_cuda_communicator_auto_rejects_non_all2all_groups(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.config
+
+    config = _config(deepep_auto=True)
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config_or_none", lambda: config
+    )
+
+    class CudaCommunicator:
+        def __init__(
+            self,
+            cpu_group,
+            device=None,
+            device_group=None,
+            unique_name="",
+            global_ranks=None,
+            global_world_size=None,
+            tcp_store_group=None,
+        ):
+            del (
+                device,
+                device_group,
+                unique_name,
+                global_ranks,
+                global_world_size,
+                tcp_store_group,
+            )
+            self.cpu_group = cpu_group
+            self.use_all2all = False
+            self.all2all_manager = None
+
+    module = _module(
+        patch_cuda_communicator.TARGET_MODULE,
+        CudaCommunicator=CudaCommunicator,
+    )
+    assert patch_cuda_communicator.apply_to_module(module)
+    with pytest.raises(RuntimeError, match="active all-to-all group"):
+        module.CudaCommunicator("dp-group", unique_name="dp:0")
+
+
 @dataclasses.dataclass
 class _Function:
     name: str

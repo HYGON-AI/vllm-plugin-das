@@ -27,10 +27,10 @@ def _require_supported_moe_backend(
     model_config: PretrainedConfig,
 ) -> None:
     backend = vllm_config.kernel_config.moe_backend
-    if backend not in ("triton", "aiter"):
+    if backend not in ("triton", "aiter", "deep_gemm"):
         raise RuntimeError(
-            "HY V4 FP8 W8A8 requires an explicit --moe-backend triton or "
-            "--moe-backend aiter route; "
+            "HY V4 FP8 W8A8 requires an explicit --moe-backend triton, "
+            "--moe-backend aiter, or --moe-backend deep_gemm route; "
             f"got {backend!r}."
         )
     del model_config
