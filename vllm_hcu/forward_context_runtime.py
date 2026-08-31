@@ -36,6 +36,7 @@ def choose_deepep_auto_low_latency(
     num_tokens_across_dp: object | None,
     batch_descriptor: object | None,
     attn_metadata: object | None = None,
+    is_prefilling: object | None = None,
 ) -> bool:
     """Choose LL for uniform decode and HT for prefill/mixed batches."""
 
@@ -50,12 +51,17 @@ def choose_deepep_auto_low_latency(
     fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
     if fixed_use_low_latency is not None:
         return fixed_use_low_latency
-    explicit_decode = _attention_metadata_is_explicit_decode(attn_metadata)
-    local_decode = bool(
-        batch_descriptor is not None
-        and getattr(batch_descriptor, "uniform", False)
-        and explicit_decode
-    ) or _attention_metadata_is_pure_spec_decode(vllm_config, attn_metadata)
+    # Backend-specific attention metadata does not consistently retain
+    # CommonAttentionMetadata.is_prefilling.  Require the runner's explicit
+    # per-request phase vector instead of inferring phase from query lengths.
+    explicit_decode = _is_explicitly_non_prefilling(is_prefilling)
+    local_decode = explicit_decode and (
+        bool(
+            batch_descriptor is not None
+            and getattr(batch_descriptor, "uniform", False)
+        )
+        or _attention_metadata_is_pure_spec_decode(vllm_config, attn_metadata)
+    )
 
     parallel_config = getattr(vllm_config, "parallel_config", None)
     data_parallel_size = int(
@@ -119,9 +125,6 @@ def _attention_metadata_is_pure_spec_decode(
     )
     if max_decode_query <= 1 or attn_metadata is None:
         return False
-    if not _attention_metadata_is_explicit_decode(attn_metadata):
-        return False
-
     pending = [attn_metadata]
     seen: set[int] = set()
     found_attention_metadata = False
@@ -142,53 +145,12 @@ def _attention_metadata_is_pure_spec_decode(
         if max_query_len is None or max_seq_len is None:
             continue
         found_attention_metadata = True
-        if not _is_explicitly_non_prefilling(
-            getattr(metadata, "is_prefilling", None)
-        ):
-            return False
         max_query_len = int(max_query_len)
         max_seq_len = int(max_seq_len)
         if not (
             0 < max_query_len <= max_decode_query
             and max_seq_len > max_query_len
         ):
-            return False
-    return found_attention_metadata
-
-
-def _attention_metadata_is_explicit_decode(
-    attn_metadata: object | None,
-) -> bool:
-    """Require every attention metadata item to explicitly be non-prefill."""
-
-    if attn_metadata is None:
-        return False
-    pending = [attn_metadata]
-    seen: set[int] = set()
-    found_attention_metadata = False
-    while pending:
-        metadata = pending.pop()
-        identity = id(metadata)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if isinstance(metadata, dict):
-            pending.extend(metadata.values())
-            continue
-        if isinstance(metadata, (list, tuple)):
-            pending.extend(metadata)
-            continue
-        is_prefilling = getattr(metadata, "is_prefilling", None)
-        max_query_len = getattr(metadata, "max_query_len", None)
-        max_seq_len = getattr(metadata, "max_seq_len", None)
-        if (
-            is_prefilling is None
-            and max_query_len is None
-            and max_seq_len is None
-        ):
-            continue
-        found_attention_metadata = True
-        if not _is_explicitly_non_prefilling(is_prefilling):
             return False
     return found_attention_metadata
 

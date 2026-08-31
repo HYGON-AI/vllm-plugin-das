@@ -92,6 +92,36 @@ def test_hcu_runner_uses_v0251_routed_experts_contract():
     assert all(name in source for name in required_v0251_api)
 
 
+def test_hcu_runner_passes_request_phase_to_deepep_auto_selector():
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+
+    def context_calls(method_name: str) -> list[ast.Call]:
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
+        )
+        return [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set_forward_context"
+        ]
+
+    execute_calls = context_calls("execute_model")
+    dummy_calls = context_calls("_dummy_run")
+    assert execute_calls and dummy_calls
+    for call in (*execute_calls, *dummy_calls):
+        assert "deepep_auto_is_prefilling" in {
+            keyword.arg for keyword in call.keywords
+        }
+
+
 def test_hcu_runner_uses_v0251_kv_block_zeroer_constructor_contract():
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
         encoding="utf-8-sig"
@@ -839,11 +869,8 @@ def test_deepep_auto_forward_mode_requires_decode_phase_evidence():
         1,
         None,
         SimpleNamespace(uniform=True),
-        SimpleNamespace(
-            max_query_len=1,
-            max_seq_len=100,
-            is_prefilling=torch.tensor([False]),
-        ),
+        SimpleNamespace(max_query_len=1, max_seq_len=100),
+        torch.tensor([False]),
     )
     assert not choose_deepep_auto_low_latency(
         config, 1, None, SimpleNamespace(uniform=False)
@@ -885,11 +912,8 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
         2,
         None,
         SimpleNamespace(uniform=True),
-        SimpleNamespace(
-            max_query_len=2,
-            max_seq_len=100,
-            is_prefilling=torch.tensor([True]),
-        ),
+        SimpleNamespace(max_query_len=2, max_seq_len=100),
+        torch.tensor([True]),
     )
     assert not choose_deepep_auto_low_latency(config, 64, None, None)
     assert not choose_deepep_auto_low_latency(config, 65, None, None)
@@ -906,6 +930,7 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
         None,
         SimpleNamespace(uniform=False),
         decode_metadata,
+        torch.tensor([False]),
     )
     prefill_metadata = SimpleNamespace(
         max_query_len=8,
@@ -918,6 +943,7 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
         None,
         SimpleNamespace(uniform=False),
         prefill_metadata,
+        torch.tensor([True]),
     )
 
     mixed_metadata = {
@@ -938,17 +964,15 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
         None,
         SimpleNamespace(uniform=False),
         mixed_metadata,
+        torch.tensor([True, False]),
     )
     assert not choose_deepep_auto_low_latency(
         config,
         2,
         None,
         SimpleNamespace(uniform=False),
-        SimpleNamespace(
-            max_query_len=2,
-            max_seq_len=100,
-            is_prefilling=torch.tensor([True]),
-        ),
+        SimpleNamespace(max_query_len=2, max_seq_len=100),
+        torch.tensor([True]),
     )
     assert not choose_deepep_auto_low_latency(
         config,
@@ -962,11 +986,8 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
         1,
         None,
         SimpleNamespace(uniform=False),
-        SimpleNamespace(
-            max_query_len=1,
-            max_seq_len=100,
-            is_prefilling=torch.tensor([False]),
-        ),
+        SimpleNamespace(max_query_len=1, max_seq_len=100),
+        torch.tensor([False]),
     )
 
 
@@ -1012,11 +1033,8 @@ def test_dspark_deepep_auto_uses_dp_global_phase_on_empty_ranks(
         8,
         decode_tokens,
         nonuniform,
-        SimpleNamespace(
-            max_query_len=8,
-            max_seq_len=128,
-            is_prefilling=torch.tensor([False]),
-        ),
+        SimpleNamespace(max_query_len=8, max_seq_len=128),
+        torch.tensor([False]),
     )
     assert choose_deepep_auto_low_latency(
         config,
@@ -1035,11 +1053,8 @@ def test_dspark_deepep_auto_uses_dp_global_phase_on_empty_ranks(
         8,
         short_prefill_tokens,
         nonuniform,
-        SimpleNamespace(
-            max_query_len=8,
-            max_seq_len=8,
-            is_prefilling=torch.tensor([True]),
-        ),
+        SimpleNamespace(max_query_len=8, max_seq_len=8),
+        torch.tensor([True]),
     )
     assert not choose_deepep_auto_low_latency(
         config,
