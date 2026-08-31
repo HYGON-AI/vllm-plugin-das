@@ -12,10 +12,10 @@ Current TP+EP coverage:
 The Qwen3.5-35B-A3B matrix intentionally fails on backend/runtime errors so a
 single run reports which path is broken:
 
-- `aiter-tuned-shuffle`: AITER W16A16 with tuned solution lookup enabled.
-- `aiter-asm-shuffle`: AITER W16A16 ASM shuffle path with tuned lookup disabled.
-- `aiter-asm-nonshuffle`: AITER W16A16 ASM non-shuffle path with tuned lookup
-  disabled.
+- `aiter-auto-shuffle`: AITER automatically selects ASM, HIP C++, Triton, or
+  CK and may prepare the selected weight layout.
+- `aiter-auto-nonshuffle`: the same AITER automatic selection with weight
+  shuffle disabled.
 - `triton`: vLLM Triton unquantized MoE path.
 
 The DeepSeek-R1-0528-Channel-INT8 matrix also fails on backend/runtime errors:
@@ -65,9 +65,8 @@ python tools/run_patch_tests.py --suite model -- -k qwen35_35b_a3b_tp_ep_smoke
 The Qwen3.5-35B-A3B path matrix writes separate logs under
 `/tmp/vllm-hcu-integration/logs/`, for example:
 
-- `*_Qwen3.5-35B-A3B_tp-ep-smoke-tp4-ep4-aiter-tuned-shuffle.log`
-- `*_Qwen3.5-35B-A3B_tp-ep-smoke-tp4-ep4-aiter-asm-shuffle.log`
-- `*_Qwen3.5-35B-A3B_tp-ep-smoke-tp2-ep2-aiter-asm-nonshuffle.log`
+- `*_Qwen3.5-35B-A3B_tp-ep-smoke-tp4-ep4-aiter-auto-shuffle.log`
+- `*_Qwen3.5-35B-A3B_tp-ep-smoke-tp2-ep2-aiter-auto-nonshuffle.log`
 - `*_Qwen3.5-35B-A3B_tp-ep-smoke-tp2-ep2-triton.log`
 
 The DeepSeek-R1-0528-Channel-INT8 path matrix also writes separate logs, for

@@ -34,31 +34,20 @@ QWEN35_35B_A3B_GPU_MEMORY_UTILIZATION = {
 }
 QWEN35_35B_A3B_TP_EP_MOE_PATHS = (
     pytest.param(
-        "aiter-tuned-shuffle",
+        "aiter-auto-shuffle",
         "aiter",
         {
-            "VLLM_HCU_USE_AITER_MOE_CONFIG": "1",
-            "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE": "1",
+            "VLLM_HCU_USE_AITER_MOE_SHUFFLE": "1",
         },
-        id="aiter-tuned-shuffle",
+        id="aiter-auto-shuffle",
     ),
     pytest.param(
-        "aiter-asm-shuffle",
+        "aiter-auto-nonshuffle",
         "aiter",
         {
-            "VLLM_HCU_USE_AITER_MOE_CONFIG": "0",
-            "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE": "1",
+            "VLLM_HCU_USE_AITER_MOE_SHUFFLE": "0",
         },
-        id="aiter-asm-shuffle",
-    ),
-    pytest.param(
-        "aiter-asm-nonshuffle",
-        "aiter",
-        {
-            "VLLM_HCU_USE_AITER_MOE_CONFIG": "0",
-            "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE": "0",
-        },
-        id="aiter-asm-nonshuffle",
+        id="aiter-auto-nonshuffle",
     ),
     pytest.param(
         "triton",
