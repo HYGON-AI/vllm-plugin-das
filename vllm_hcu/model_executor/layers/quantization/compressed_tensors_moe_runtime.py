@@ -319,7 +319,7 @@ def apply_aiter_w4a8_moe(
     w1_scale = _required_tensor(quant_config, "w1_scale")
     w2_scale = _required_tensor(quant_config, "w2_scale")
     aiter_config = None
-    if allow_aiter and getattr(w1, "_hcu_aiter_moe_m1_supported", None) is not False:
+    if allow_aiter:
         from aiter.moe import MoeQuantType
 
         quant_type = getattr(MoeQuantType, "W4A8", None)

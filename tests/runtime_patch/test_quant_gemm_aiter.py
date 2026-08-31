@@ -206,14 +206,17 @@ def test_aiter_dispatch_selector_returns_none_only_for_explicit_no_solution(
     assert select_aiter_moe_config(problem, cache_owner=object()) is None
 
 
-def test_aiter_dispatch_prewarm_m1_gates_unsupported_static_shape(
+def test_aiter_dispatch_prewarm_m1_does_not_gate_supported_runtime_shape(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[int] = []
 
     def get_config(**kwargs: object):
-        calls.append(int(kwargs["M"]))
-        return False, None
+        m = int(kwargs["M"])
+        calls.append(m)
+        if m == 1:
+            return False, None
+        return True, SimpleNamespace(solution_type=f"route-m{m}")
 
     monkeypatch.setitem(
         sys.modules,
@@ -241,8 +244,18 @@ def test_aiter_dispatch_prewarm_m1_gates_unsupported_static_shape(
         )
         is None
     )
-    assert select_aiter_moe_config(runtime_problem, cache_owner=owner) is None
-    assert calls == [1]
+    runtime_config = select_aiter_moe_config(
+        runtime_problem,
+        cache_owner=owner,
+    )
+    cached_config = select_aiter_moe_config(
+        runtime_problem,
+        cache_owner=owner,
+    )
+
+    assert runtime_config.solution_type == "route-m64"
+    assert cached_config is runtime_config
+    assert calls == [1, 64]
 
 
 def test_aiter_dispatch_prewarm_m1_keeps_actual_m_routing_dynamic(
@@ -3564,7 +3577,7 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
             "use_shuffle": 1,
         }
     ]
-    assert layer.w13_weight._hcu_aiter_moe_m1_supported is True
+    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
 
 
 @pytest.mark.hcu
@@ -3673,12 +3686,12 @@ def test_slimquant_w4a8_unsupported_m1_does_not_expand_weights_at_load(
 
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight._hcu_aiter_moe_m1_supported is False
+    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
     assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_runtime_lets_aiter_select_and_execute(
+def test_slimquant_w4a8_runtime_rechecks_actual_m_after_m1_miss(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: dict[str, object] = {}
@@ -3715,6 +3728,7 @@ def test_slimquant_w4a8_runtime_lets_aiter_select_and_execute(
     topk_ids = torch.zeros(3, 2, dtype=torch.int32)
     w1 = torch.zeros(2, 8, 2, dtype=torch.int8)
     w2 = torch.zeros(2, 4, 2, dtype=torch.int8)
+    w1._hcu_aiter_moe_m1_supported = False
     w1_scale = torch.full((2, 8, 1), 16.0)
     w2_scale = torch.full((2, 4, 1), 16.0)
     method = SimpleNamespace(
@@ -3761,12 +3775,30 @@ def test_slimquant_w4a8_runtime_lets_aiter_select_and_execute(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_no_config_unpacks_for_vllm_triton_without_cache(
+def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.model_executor.layers.fused_moe import fused_moe
 
     calls: list[dict[str, object]] = []
+    selector_calls: list[int] = []
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        selector_calls.append(int(kwargs["M"]))
+        return False, None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+        ),
+    )
 
     def fused_experts_impl(
         hidden_states,
@@ -3811,13 +3843,6 @@ def test_slimquant_w4a8_no_config_unpacks_for_vllm_triton_without_cache(
         return hidden_states + 1
 
     monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
-    monkeypatch.setattr(
-        compressed_tensors_moe_runtime,
-        "select_aiter_moe_config",
-        lambda *args, **kwargs: pytest.fail(
-            "M=1 unsupported capability must bypass runtime AITER selection"
-        ),
-    )
     packed_w1 = torch.tensor(
         [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
         dtype=torch.uint8,
@@ -3825,7 +3850,6 @@ def test_slimquant_w4a8_no_config_unpacks_for_vllm_triton_without_cache(
     packed_w2 = torch.tensor(
         [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
     ).view(torch.int8)
-    packed_w1._hcu_aiter_moe_m1_supported = False
     method = SimpleNamespace(
         moe=SimpleNamespace(num_experts=1),
         moe_quant_config=SimpleNamespace(
@@ -3855,6 +3879,7 @@ def test_slimquant_w4a8_no_config_unpacks_for_vllm_triton_without_cache(
 
     torch.testing.assert_close(first, x + 1)
     torch.testing.assert_close(second, x + 1)
+    assert selector_calls == [2]
     assert len(calls) == 2
     first_args = calls[0]["args"]
     second_args = calls[1]["args"]

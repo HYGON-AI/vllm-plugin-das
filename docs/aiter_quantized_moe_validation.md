@@ -371,18 +371,30 @@ python -m pytest \
   tests/accuracy/test_unified_aiter_moe_operator.py -vv -s -rs
 ```
 
-All nine cases passed against vLLM's native Triton fused-MoE reference:
+All nine numerical cases passed against vLLM's native Triton fused-MoE
+reference. Three additional `gfx938` gates proved that every target
+quantization retained at least one non-fallback AITER route:
 
 - W16A16: `E=8`, `K=128`, `N=64`, `M=1/16/64`; AITER selected `TRITON`;
-  `rtol=atol=0.02`.
+  observed NMAE at most `0.00321`, NRMSE at most `0.00405`, and maximum
+  absolute error at most `3.82e-6`.
 - INT8 W8A8 channel quantization: `E=256`, `K=2048`, `N=128`,
-  `M=1/16/64`; AITER selected `MOE_C`; `rtol=atol=0.08`.
+  `M=1/16/64`; AITER selected `MOE_C`; observed NMAE at most `0.00792`,
+  NRMSE at most `0.00890`, and maximum absolute error at most `1.84e-4`.
 - FP8 W8A8 channel quantization: `E=256`, `K=2048`, `N=128`,
-  `M=1/16/64`; AITER selected `MOE_C`; `rtol=atol=0.05`.
+  `M=1/16/64`; AITER selected `MOE_C`; observed NMAE at most `0.01145`,
+  NRMSE at most `0.01615`, and maximum absolute error at most `4.43e-4`.
+
+The comparison now requires a deterministic reference RMS signal floor and
+checks NMAE, NRMSE, and maximum absolute error. The limits are respectively
+`0.02/0.02/2e-5` for W16A16, `0.03/0.03/1e-3` for INT8 W8A8, and
+`0.04/0.04/2e-3` for FP8 W8A8. A zero-output negative control is run against
+the same helper for every numerical case and must raise. Before this change,
+all nine zero outputs incorrectly passed the former absolute tolerances.
 
 The quantized shape uses the smallest hidden size supported by the installed
 AITER channel-quantized `MOE_C` bottom GEMM. The result was:
 
 ```text
-9 passed, 14 warnings in 22.78s
+12 passed, 14 warnings in 19.80s
 ```

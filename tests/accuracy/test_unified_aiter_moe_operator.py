@@ -21,10 +21,25 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
     aiter_asm_boltops_int8_quant_context,
 )
 
-TOLERANCES = {
-    "w16a16": {"rtol": 2e-2, "atol": 2e-2},
-    "int8_w8a8": {"rtol": 8e-2, "atol": 8e-2},
-    "fp8_w8a8": {"rtol": 5e-2, "atol": 5e-2},
+NUMERICAL_LIMITS = {
+    "w16a16": {
+        "min_reference_rms": 5e-5,
+        "max_nmae": 2e-2,
+        "max_nrmse": 2e-2,
+        "max_abs_error": 2e-5,
+    },
+    "int8_w8a8": {
+        "min_reference_rms": 1e-3,
+        "max_nmae": 3e-2,
+        "max_nrmse": 3e-2,
+        "max_abs_error": 1e-3,
+    },
+    "fp8_w8a8": {
+        "min_reference_rms": 1e-3,
+        "max_nmae": 4e-2,
+        "max_nrmse": 4e-2,
+        "max_abs_error": 2e-3,
+    },
 }
 
 TOP_K = 2
@@ -104,6 +119,92 @@ def _solution_token(config: object) -> str:
     solution = getattr(config, "solution_type", None)
     solution = getattr(solution, "value", solution)
     return str(solution).rsplit(".", 1)[-1].upper()
+
+
+def _assert_moe_numerics(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    quantization: str,
+) -> None:
+    assert actual.shape == reference.shape
+    assert actual.dtype == reference.dtype
+    assert torch.isfinite(reference).all()
+    assert torch.isfinite(actual).all()
+
+    limits = NUMERICAL_LIMITS[quantization]
+    reference_float = reference.float()
+    error = actual.float() - reference_float
+    reference_rms = reference_float.square().mean().sqrt()
+    reference_mean_abs = reference_float.abs().mean()
+    assert reference_rms.item() >= limits["min_reference_rms"], (
+        f"{quantization} reference RMS {reference_rms.item():.6g} is below "
+        f"the signal floor {limits['min_reference_rms']:.6g}"
+    )
+
+    nmae = error.abs().mean() / reference_mean_abs
+    nrmse = error.square().mean().sqrt() / reference_rms
+    max_abs_error = error.abs().max()
+    assert nmae.item() <= limits["max_nmae"], (
+        f"{quantization} NMAE {nmae.item():.6g} exceeds "
+        f"{limits['max_nmae']:.6g}"
+    )
+    assert nrmse.item() <= limits["max_nrmse"], (
+        f"{quantization} NRMSE {nrmse.item():.6g} exceeds "
+        f"{limits['max_nrmse']:.6g}"
+    )
+    assert max_abs_error.item() <= limits["max_abs_error"], (
+        f"{quantization} max absolute error {max_abs_error.item():.6g} "
+        f"exceeds {limits['max_abs_error']:.6g}"
+    )
+
+
+@pytest.mark.parametrize(
+    "quantization",
+    ["w16a16", "int8_w8a8", "fp8_w8a8"],
+)
+def test_gfx938_has_at_least_one_aiter_route(quantization: str) -> None:
+    device = _hcu_device()
+    arch = str(
+        getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    ).lower()
+    if "gfx938" not in arch:
+        pytest.skip(f"fixed AITER route-presence gate requires gfx938, got {arch}")
+
+    from aiter.moe import MoeQuantType
+
+    quant_type = {
+        "w16a16": MoeQuantType.W16A16,
+        "int8_w8a8": MoeQuantType.W8A8,
+        "fp8_w8a8": MoeQuantType.FP8_W8A8,
+    }[quantization]
+    experts, hidden_size, intermediate_size = SHAPES[quantization]
+    cache_owner = torch.empty(1, device=device)
+    routes = []
+    for m in (1, 16, 64):
+        config = select_aiter_moe_config(
+            AiterMoeProblem(
+                M=m,
+                E=experts,
+                N1=2 * intermediate_size,
+                N2=hidden_size,
+                K=hidden_size,
+                top_k=TOP_K,
+                block_size=0,
+                dtype=torch.bfloat16,
+                device=device,
+                quant_type=quant_type,
+                activation="silu",
+                use_shuffle=True,
+            ),
+            cache_owner=cache_owner,
+        )
+        if config is not None:
+            routes.append((m, _solution_token(config)))
+
+    assert routes, (
+        f"gfx938 AITER exposes no supported {quantization} route for "
+        "M in (1, 16, 64)"
+    )
 
 
 @pytest.mark.parametrize("m", [1, 16, 64])
@@ -224,6 +325,16 @@ def test_unified_aiter_moe_matches_vllm_triton(
             output_dtype=hidden_states.dtype,
         )
 
-    assert torch.isfinite(reference).all()
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, reference, **TOLERANCES[quantization])
+    with pytest.raises(AssertionError):
+        _assert_moe_numerics(
+            torch.zeros_like(reference),
+            reference,
+            quantization,
+        )
+    with pytest.raises(AssertionError):
+        _assert_moe_numerics(
+            reference * 0.5,
+            reference,
+            quantization,
+        )
+    _assert_moe_numerics(actual, reference, quantization)

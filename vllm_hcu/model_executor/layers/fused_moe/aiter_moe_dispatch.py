@@ -22,7 +22,6 @@ _SELECTION_CACHE_ATTR = "_hcu_aiter_moe_selection_cache"
 _WEIGHT_CACHE_ATTR = "_hcu_aiter_moe_weight_cache"
 _SCALE_CACHE_ATTR = "_hcu_aiter_moe_scale_cache"
 _NATIVE_EXPERT_MAP_ATTR = "_vllm_hcu_native_expert_map"
-_M1_CAPABILITY_ATTR = "_hcu_aiter_moe_m1_supported"
 _ROUTE_LOG_CACHE: OrderedDict["AiterMoeProblem", None] = OrderedDict()
 _ROUTE_LOG_LOCK = Lock()
 
@@ -217,9 +216,6 @@ def select_aiter_moe_config(
 ) -> object | None:
     """Ask AITER to route the problem, preserving explicit no-solution status."""
 
-    if getattr(cache_owner, _M1_CAPABILITY_ATTR, None) is False:
-        return None
-
     cache = _owner_cache(cache_owner, _SELECTION_CACHE_ATTR)
     if problem in cache:
         cache.move_to_end(problem)
@@ -287,17 +283,10 @@ def prewarm_aiter_moe_config(
     problem: AiterMoeProblem,
     cache_owner: object,
 ) -> object | None:
-    """Probe M=1 at model load and cache static AITER capability."""
+    """Probe and cache the M=1 route without constraining other M values."""
 
     m1_problem = replace(problem, M=1)
-    config = select_aiter_moe_config(m1_problem, cache_owner=cache_owner)
-    try:
-        setattr(cache_owner, _M1_CAPABILITY_ATTR, config is not None)
-    except (AttributeError, TypeError) as exc:
-        raise HcuAiterMoeDispatchError(
-            "AITER M=1 capability cannot be attached to the weight owner"
-        ) from exc
-    return config
+    return select_aiter_moe_config(m1_problem, cache_owner=cache_owner)
 
 
 def prepare_aiter_moe_weights(

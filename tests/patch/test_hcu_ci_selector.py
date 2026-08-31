@@ -515,9 +515,22 @@ def test_moe_change_selects_kernel_and_tp_ep_jobs() -> None:
         ["vllm_hcu/model_executor/layers/fused_moe/aiter_runtime.py"],
     )
     assert {job["registry_job"] for job in jobs}.issuperset(
-        {"accuracy-gfx936", "qwen35-tp-ep"}
+        {"accuracy-gfx936", "accuracy-gfx938", "qwen35-tp-ep"}
     )
     assert "moe" in groups
+    assert fallback is False
+
+
+def test_unified_aiter_moe_accuracy_test_selects_gfx938() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["tests/accuracy/test_unified_aiter_moe_operator.py"],
+    )
+    assert {job["registry_job"] for job in jobs} == {
+        "accuracy-gfx936",
+        "accuracy-gfx938",
+    }
+    assert groups == ["kernel-accuracy-tests"]
     assert fallback is False
 
 

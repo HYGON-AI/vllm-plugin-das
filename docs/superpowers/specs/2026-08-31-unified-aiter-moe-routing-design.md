@@ -84,8 +84,11 @@ aiter.moe.aiter_moe()
 The adapter will define a typed problem description and focused helpers for:
 
 - calling `get_aiter_moe_config()` without `spec_sol_type`;
-- returning `None` only for `(status=False)` or an empty returned config;
+- returning `None` only when AITER reports `status=False`; a true status paired
+  with an empty or invalid config is a contract error;
 - caching config results by the complete runtime problem key;
+- treating the load-time `M=1` probe as an ordinary cache entry, never as a
+  global capability gate for other runtime `M` values;
 - preparing and caching solution-specific shuffled weights;
 - preserving canonical weights for solutions whose `need_shuffle` is false;
 - converting vLLM's EP expert map only when the selected AITER solution
@@ -171,8 +174,8 @@ The derived-weight cache key includes:
 - a stable representation of layout-affecting config data;
 - block shape and shuffle hint.
 
-The cache is bounded. Config caches clear at 128 entries and per-weight layout
-caches clear at 8 entries, matching the existing bounded behavior. A source
+The cache is bounded. Config caches evict the least-recently-used entry beyond
+128 entries and per-weight layout caches do the same beyond 8 entries. A source
 weight update changes `_version` and invalidates derived layouts. Changing `M`
 may select another config without mutating or replacing canonical parameters.
 
@@ -236,11 +239,14 @@ No model is loaded. Small device tensors cover:
 
 For several `M` values, the validation records the AITER-selected solution and
 compares unified-dispatch output with the existing vLLM Triton implementation
-using dtype-appropriate absolute and relative tolerances. It separately injects
-or identifies a no-solution case to prove framework fallback and injects an
-AITER execution error to prove fail-closed behavior. Unsupported hardware or
-missing optional quantized kernels produce an explicit skip rather than a
-false pass.
+using a reference RMS signal floor plus dtype-appropriate NMAE, NRMSE, and
+maximum-absolute-error limits. A zero-output negative control must fail the
+same comparison. A fixed `gfx938` gate requires at least one supported AITER
+route per target quantization so a dependency upgrade cannot turn every case
+into a skip. Individual unsupported problem shapes may still skip because
+framework fallback is valid for a specific `M`. The validation separately
+injects or identifies a no-solution case to prove framework fallback and
+injects an AITER execution error to prove fail-closed behavior.
 
 The final verification runs the focused runtime-patch tests, the MoE scoped
 suite, and the synthetic operator tests. It does not start a server, load a
