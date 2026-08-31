@@ -23,6 +23,8 @@ _FEATURE_FIELDS = (
     "deepep_auto",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "expert_map_record_path",
+    "expert_map_path",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -69,6 +71,8 @@ class HcuFeatureConfig:
     deepep_auto: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    expert_map_record_path: str | None = None
+    expert_map_path: str | None = None
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -103,6 +107,17 @@ class HcuFeatureConfig:
                     "unsupported HCU hcu_flash_attn_mode "
                     f"{self.hcu_flash_attn_mode!r}; expected one of {supported}"
                 )
+        for name in ("expert_map_record_path", "expert_map_path"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(
+                    f"HCU config field {name!r} must be str or None, "
+                    f"got {type(value).__name__}"
+                )
+        if self.expert_map_record_path and self.expert_map_path:
+            raise ValueError(
+                "expert_map_record_path and expert_map_path are mutually exclusive"
+            )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
 

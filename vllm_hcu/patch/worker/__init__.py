@@ -307,6 +307,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_eplb_communicator"),
     ),
     _CallbackSpec(
+        _adapter("framework_opt", "patch_offline_eplb"),
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
     _CallbackSpec(
@@ -774,11 +777,27 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
                 parallel_config = getattr(vllm_config, "parallel_config", None)
             if isinstance(parallel_config, dict):
                 parallel_config["_vllm_hcu_deepep_auto"] = config.deepep_auto
+                parallel_config["_vllm_hcu_expert_map_record_path"] = (
+                    config.expert_map_record_path
+                )
+                parallel_config["_vllm_hcu_expert_map_path"] = (
+                    config.expert_map_path
+                )
             elif parallel_config is not None:
                 setattr(
                     parallel_config,
                     "_vllm_hcu_deepep_auto",
                     config.deepep_auto,
+                )
+                setattr(
+                    parallel_config,
+                    "_vllm_hcu_expert_map_record_path",
+                    config.expert_map_record_path,
+                )
+                setattr(
+                    parallel_config,
+                    "_vllm_hcu_expert_map_path",
+                    config.expert_map_path,
                 )
             rebound = _bind_deserialized_hcu_config(vllm_config)
             if rebound != config:

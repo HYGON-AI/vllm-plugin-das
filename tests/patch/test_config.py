@@ -55,6 +55,8 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "deepep_auto": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
+                "expert_map_record_path": None,
+                "expert_map_path": None,
             }
         }
     }
@@ -119,6 +121,14 @@ def test_legacy_deep_gemm_sidecar_is_normalized_with_one_warning(
         ({"hcu_flash_attn_mode": "future"}, ValueError),
         ({"future_typo": True}, ValueError),
         ({"enable_lightly_cplb": True}, ValueError),
+        (
+            {
+                "expert_map_record_path": "/tmp/record.json",
+                "expert_map_path": "/tmp/load.json",
+            },
+            ValueError,
+        ),
+        ({"expert_map_record_path": 7}, TypeError),
     ],
 )
 def test_invalid_values_are_rejected(payload: dict[str, object], error: type[Exception]) -> None:
@@ -129,3 +139,11 @@ def test_invalid_values_are_rejected(payload: dict[str, object], error: type[Exc
 def test_write_requires_mutable_mapping() -> None:
     with pytest.raises(TypeError, match="mutable mapping"):
         write_hcu_config(({},), HcuFeatureConfig())  # type: ignore[arg-type]
+
+
+def test_offline_eplb_paths_round_trip_through_sidecar() -> None:
+    record = HcuFeatureConfig(expert_map_record_path="/models/maps/record.json")
+    load = HcuFeatureConfig(expert_map_path="/models/maps/load.json")
+
+    assert HcuFeatureConfig.from_mapping(record.to_dict()) == record
+    assert pickle.loads(pickle.dumps(load)) == load

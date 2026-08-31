@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass as official_dataclass
@@ -45,6 +46,13 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_custom_sp",
     "enable_multi_layers_mtp",
 )
+_OFFLINE_EPLB_KEYS = (
+    "expert_map_record_path",
+    "expert_map_path",
+)
+_OFFLINE_EPLB_ATTRS = {
+    name: f"_vllm_hcu_{name}" for name in _OFFLINE_EPLB_KEYS
+}
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
@@ -94,6 +102,7 @@ def _require_engine_args_class(module: ModuleType, name: str) -> type:
         "moe_backend",
         "kernel_config",
         "speculative_config",
+        "eplb_config",
     }
     if not required.issubset(parameters):
         raise PatchCompatibilityError(
@@ -305,6 +314,41 @@ def _normalise_constructor_kwargs(
         normalized_speculative.pop("enable_multi_layers_mtp")
         kwargs["speculative_config"] = normalized_speculative
         updates["enable_multi_layers_mtp"] = nested_multi_mtp
+
+    eplb_config = bound.arguments.get("eplb_config")
+    if isinstance(eplb_config, Mapping):
+        nested_offline_paths = {
+            name: eplb_config[name]
+            for name in _OFFLINE_EPLB_KEYS
+            if name in eplb_config
+        }
+        if nested_offline_paths:
+            if "eplb_config" not in kwargs:
+                raise TypeError(
+                    "positional eplb_config containing offline EPLB paths is "
+                    "not supported; pass eplb_config by keyword"
+                )
+            normalized_eplb = dict(eplb_config)
+            for name, value in nested_offline_paths.items():
+                normalized_eplb.pop(name)
+                explicit_value = explicit_sidecar.get(name)
+                if explicit_value is not None and explicit_value != value:
+                    raise ValueError(
+                        f"conflicting {name} values in HCU sidecar and eplb_config"
+                    )
+                updates[name] = value
+            kwargs["eplb_config"] = normalized_eplb
+    elif eplb_config is not None:
+        for name, attr_name in _OFFLINE_EPLB_ATTRS.items():
+            if not hasattr(eplb_config, attr_name):
+                continue
+            value = getattr(eplb_config, attr_name)
+            explicit_value = explicit_sidecar.get(name)
+            if explicit_value is not None and explicit_value != value:
+                raise ValueError(
+                    f"conflicting {name} values in HCU sidecar and eplb_config"
+                )
+            updates[name] = value
 
     if requested_deep_gemm:
         updates["moe_backend"] = _DEEP_GEMM_BACKEND
@@ -536,6 +580,44 @@ def apply_to_module(module: ModuleType) -> bool:
         else:
             raise PatchCompatibilityError(
                 "EngineArgs.add_cli_args did not install --all2all-backend"
+            )
+        for action in getattr(result, "_actions", ()):
+            if getattr(action, "dest", None) != "eplb_config":
+                continue
+            official_eplb_parser = getattr(action, "type", None)
+            if not callable(official_eplb_parser):
+                raise PatchCompatibilityError(
+                    "--eplb-config CLI action has no audited parser"
+                )
+
+            @functools.wraps(official_eplb_parser)
+            def hcu_parse_eplb_config(value):
+                try:
+                    raw_config = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    return official_eplb_parser(value)
+                if not isinstance(raw_config, Mapping):
+                    return official_eplb_parser(value)
+                offline_paths = {
+                    name: raw_config[name]
+                    for name in _OFFLINE_EPLB_KEYS
+                    if name in raw_config
+                }
+                if not offline_paths:
+                    return official_eplb_parser(value)
+                normalized = dict(raw_config)
+                for name in offline_paths:
+                    normalized.pop(name)
+                parsed = official_eplb_parser(json.dumps(normalized))
+                for name, path in offline_paths.items():
+                    setattr(parsed, _OFFLINE_EPLB_ATTRS[name], path)
+                return parsed
+
+            action.type = hcu_parse_eplb_config
+            break
+        else:
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install --eplb-config"
             )
         return result
 

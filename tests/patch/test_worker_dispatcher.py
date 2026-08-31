@@ -690,6 +690,25 @@ def test_invalid_spawned_sidecar_fails_before_worker_registration():
     assert "enable_lightly_cplb requires enable_lightly_cp" in result.stderr
 
 
+def test_worker_binds_offline_eplb_paths_to_parallel_config():
+    result = _run_fresh(
+        "import json; from types import SimpleNamespace; "
+        "CompilationConfig=type('CompilationConfig',(),{}); "
+        "from vllm_hcu.patch.worker import apply_worker_patches; "
+        "parallel=SimpleNamespace(all2all_backend='allgather_reducescatter'); "
+        "config=SimpleNamespace(additional_config={'hcu':{"
+        "'expert_map_record_path':'/models/maps/hy4.json'}},"
+        "compilation_config=CompilationConfig(),parallel_config=parallel); "
+        "apply_worker_patches(config); "
+        "print(json.dumps({'record':getattr(parallel,"
+        "'_vllm_hcu_expert_map_record_path',None),'load':getattr(parallel,"
+        "'_vllm_hcu_expert_map_path',None)}))"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {"record": "/models/maps/hy4.json", "load": None}
+
+
 def test_pcp_model_state_adapter_matches_exact_v0251_target():
     result = _run_fresh(
         """
