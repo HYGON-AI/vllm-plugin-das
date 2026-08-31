@@ -28,6 +28,19 @@ from vllm_hcu.models.hy_v4.model import (
 from vllm_hcu.patch.platform.core_fix import patch_logits_processor_head_dtype
 
 
+def _add_fake_moe_metadata(model: torch.nn.Module) -> None:
+    model.expert_weights = []
+    model.num_moe_layers = 1
+    model.num_expert_groups = 1
+    model.num_logical_experts = 4
+    model.num_physical_experts = 4
+    model.num_local_physical_experts = 4
+    model.num_routed_experts = 4
+    model.num_shared_experts = 1
+    model.num_redundant_experts = 0
+    model.moe_layers = []
+
+
 def test_excluded_quant_config_is_not_forwarded_to_lm_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -44,6 +57,7 @@ def test_excluded_quant_config_is_not_forwarded_to_lm_head(
         def __init__(self, **kwargs) -> None:
             super().__init__()
             self.make_empty_intermediate_tensors = object()
+            _add_fake_moe_metadata(self)
 
     class FakeLMHead(torch.nn.Module):
         def __init__(self, *args, **kwargs) -> None:
@@ -88,6 +102,7 @@ def test_non_modelopt_quant_config_is_forwarded_to_lm_head(
         def __init__(self, **kwargs) -> None:
             super().__init__()
             self.make_empty_intermediate_tensors = object()
+            _add_fake_moe_metadata(self)
 
     class FakeLMHead(torch.nn.Module):
         def __init__(self, *args, **kwargs) -> None:

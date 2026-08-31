@@ -60,7 +60,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import (
     get_spec_layer_idx_from_weight_name,
 )
-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    MixtureOfExperts,
+    SupportsLoRA,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -436,7 +440,7 @@ class HYV4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
-class HYV4Model(nn.Module):
+class HYV4Model(nn.Module, MixtureOfExperts):
     """HY V4 backbone."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -540,6 +544,7 @@ class HYV4Model(nn.Module):
             self.num_physical_experts = 0
             self.num_local_physical_experts = 0
             self.num_routed_experts = 0
+            self.num_shared_experts = 0
             self.num_redundant_experts = 0
             return
 
@@ -548,6 +553,7 @@ class HYV4Model(nn.Module):
         self.num_physical_experts = example_layer.n_physical_experts
         self.num_local_physical_experts = example_layer.n_local_physical_experts
         self.num_routed_experts = example_layer.n_routed_experts
+        self.num_shared_experts = config.num_shared_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -571,6 +577,24 @@ class HYV4Model(nn.Module):
                 moe.n_physical_experts = num_physical_experts
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
+        if hasattr(self, "_cached_expert_params_mapping"):
+            del self._cached_expert_params_mapping
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.expert_weights.clear()
+        for layer_idx, layer in enumerate(self.moe_layers):
+            self.expert_weights.append(layer.get_expert_weights())
+            layer.set_eplb_state(
+                moe_layer_idx=layer_idx,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+            )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # (param_name, weight_name, expert_id, shard_id) for weights, fp8
@@ -632,12 +656,13 @@ class HYV4Model(nn.Module):
         loaded_weight: torch.Tensor,
         shard_id: str,
         num_experts: int,
+        num_redundant_experts: int = 0,
     ) -> bool:
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
         loaded_local_expert = False
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
+        for expert_id in range(num_experts + num_redundant_experts):
+            curr_expert_weight = loaded_weight[expert_id % num_experts]
             success = weight_loader(
                 param,
                 curr_expert_weight,
@@ -812,10 +837,20 @@ class HYV4Model(nn.Module):
                     if "experts.gate_up_proj" in name:
                         chunks = loaded_weight.chunk(2, dim=-2)
                         success_w1 = self.load_fused_expert_weights(
-                            name_mapped, params_dict, chunks[0], "w1", num_experts
+                            name_mapped,
+                            params_dict,
+                            chunks[0],
+                            "w1",
+                            num_experts,
+                            self.num_redundant_experts,
                         )
                         success_w3 = self.load_fused_expert_weights(
-                            name_mapped, params_dict, chunks[1], "w3", num_experts
+                            name_mapped,
+                            params_dict,
+                            chunks[1],
+                            "w3",
+                            num_experts,
+                            self.num_redundant_experts,
                         )
                         success = success_w1 and success_w3
                     else:
@@ -825,6 +860,7 @@ class HYV4Model(nn.Module):
                             loaded_weight,
                             shard_id,
                             num_experts,
+                            self.num_redundant_experts,
                         )
                     if success:
                         name = name_mapped
@@ -927,7 +963,7 @@ class HYV4Model(nn.Module):
         return loaded_params
 
 
-class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
     packed_modules_mapping = HYV4_PACKED_MODULES_MAPPING
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -971,9 +1007,44 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.expert_weights = self.model.expert_weights
+        self.num_moe_layers = self.model.num_moe_layers
+        self.num_expert_groups = self.model.num_expert_groups
+        self.num_logical_experts = self.model.num_logical_experts
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_routed_experts = self.model.num_routed_experts
+        self.num_shared_experts = self.model.num_shared_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
+        self.moe_layers = self.model.moe_layers
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.model.set_eplb_state(
+            expert_load_view,
+            logical_to_physical_map,
+            logical_replica_count,
+        )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        self.model.update_physical_experts_metadata(
+            num_physical_experts,
+            num_local_physical_experts,
+        )
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
 
     def forward(
         self,

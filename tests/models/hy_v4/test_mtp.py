@@ -403,12 +403,24 @@ def test_mtp_load_weights_rewrites_wrapper_weight_and_is_strict(monkeypatch) -> 
     nn.Module.__init__(mtp)
     mtp.config = SimpleNamespace(
         num_hidden_layers=78,
-        n_routed_experts=0,
+        n_routed_experts=4,
         num_attention_heads=8,
     )
+    mtp.num_redundant_experts = 2
     mtp.quant_config = None
     loaded_weight = torch.arange(8, dtype=torch.float32).view(2, 4)
-    monkeypatch.setattr(hy_v4_mtp, "fused_moe_make_expert_params_mapping", lambda *a, **k: [])
+    mapping_kwargs: dict[str, object] = {}
+
+    def fake_expert_mapping(*args, **kwargs):
+        del args
+        mapping_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        hy_v4_mtp,
+        "fused_moe_make_expert_params_mapping",
+        fake_expert_mapping,
+    )
     monkeypatch.setattr(hy_v4_mtp, "get_pp_missing_layer_names", lambda model: set())
     monkeypatch.setattr(hy_v4_mtp, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(hy_v4_mtp, "get_tensor_model_parallel_rank", lambda: 0)
@@ -418,6 +430,8 @@ def test_mtp_load_weights_rewrites_wrapper_weight_and_is_strict(monkeypatch) -> 
     )
 
     assert loaded == {parameter_name}
+    assert mapping_kwargs["num_experts"] == 4
+    assert mapping_kwargs["num_redundant_experts"] == 2
     torch.testing.assert_close(parameter, loaded_weight)
     with pytest.raises(RuntimeError, match=r"model\.layers\.78\.eh_proj\.weight"):
         mtp.load_weights([])

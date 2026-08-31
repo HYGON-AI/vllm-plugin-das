@@ -28,6 +28,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_cuda_communicator,
     patch_dp_utils,
     patch_eagle_utils,
+    patch_eplb_communicator,
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
@@ -47,6 +48,59 @@ def _module(name: str, **attributes: object) -> ModuleType:
 def _config(**updates: object) -> SimpleNamespace:
     values = HcuFeatureConfig(**updates).to_dict()
     return SimpleNamespace(additional_config={"hcu": values})
+
+
+def _fake_eplb_communicator_module() -> ModuleType:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    class PyNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    return _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistNcclEplbCommunicator=TorchDistNcclEplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+        PyNcclEplbCommunicator=PyNcclEplbCommunicator,
+    )
+
+
+def test_gloo_eplb_skips_device_collective_profile_reservation_on_hcu() -> None:
+    module = _fake_eplb_communicator_module()
+    gloo = module.TorchDistGlooStagedEplbCommunicator
+
+    assert patch_eplb_communicator.apply_to_module(module) is True
+    assert gloo().needs_profile_buffer_reservation is False
+    assert (
+        module.TorchDistNcclEplbCommunicator(
+        ).needs_profile_buffer_reservation
+        is True
+    )
+    assert module.PyNcclEplbCommunicator().needs_profile_buffer_reservation is True
+    assert patch_eplb_communicator.apply_to_module(module) is False
+
+
+def test_gloo_eplb_patch_fails_closed_when_upstream_owns_profile_policy() -> None:
+    module = _fake_eplb_communicator_module()
+    gloo = module.TorchDistGlooStagedEplbCommunicator
+    setattr(gloo, "needs_profile_buffer_reservation", property(lambda self: True))
+
+    with pytest.raises(
+        patch_eplb_communicator.PatchCompatibilityError,
+        match="already defines needs_profile_buffer_reservation",
+    ):
+        patch_eplb_communicator.apply_to_module(module)
 
 
 def test_kernel_warmup_skips_cuda_only_minimax_import_on_hcu(
@@ -1570,13 +1624,15 @@ assert target_file.is_relative_to(target_root), (
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
-    patch_dp_utils, patch_eagle_utils, patch_forward_context,
+    patch_dp_utils, patch_eagle_utils, patch_eplb_communicator,
+    patch_forward_context,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
     patch_llm_base_proposer, patch_dp_utils, patch_eagle_utils,
+    patch_eplb_communicator,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
 for adapter in adapters:

@@ -6,7 +6,7 @@
 
 import copy
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, MutableSequence, Sequence
 
 import torch
 from torch import nn
@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -327,7 +328,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
         return hidden_states
 
 
-class HYV4MultiTokenPredictor(nn.Module):
+class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
     """Own the reusable MTP block, embedding, and logits path."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -390,8 +391,74 @@ class HYV4MultiTokenPredictor(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.spec_step_idx = 0
 
+        self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
+        self.num_expert_groups = 1
+        self.moe_layers: list[nn.Module] = []
+        example_layer = None
+        for layer in self.layers.values():
+            mtp_block = layer.mtp_block
+            if mtp_block.block_type == "moe":
+                example_layer = mtp_block.mlp
+                self.moe_layers.append(mtp_block.mlp.experts)
+
+        if example_layer is None:
+            self.num_moe_layers = 0
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_shared_experts = 0
+            self.num_redundant_experts = 0
+        else:
+            self.num_moe_layers = len(self.moe_layers)
+            self.num_logical_experts = example_layer.n_logical_experts
+            self.num_physical_experts = example_layer.n_physical_experts
+            self.num_local_physical_experts = (
+                example_layer.n_local_physical_experts
+            )
+            self.num_routed_experts = example_layer.n_routed_experts
+            self.num_shared_experts = config.num_shared_experts
+            self.num_redundant_experts = example_layer.n_redundant_experts
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.expert_weights.clear()
+        for layer_idx, layer in enumerate(self.moe_layers):
+            self.expert_weights.append(layer.get_expert_weights())
+            layer.set_eplb_state(
+                moe_layer_idx=layer_idx,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+            )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = (
+            num_physical_experts - self.num_logical_experts
+        )
+        for layer in self.layers.values():
+            mtp_block = layer.mtp_block
+            if mtp_block.block_type != "moe":
+                continue
+            moe = mtp_block.mlp
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def set_skip_topk(self, skip: bool) -> None:
         for layer in self.layers.values():
@@ -434,7 +501,7 @@ class HYV4MultiTokenPredictor(nn.Module):
         return self.logits_processor(lm_head, projection_input)
 
 
-class HYV4MTP(nn.Module):
+class HYV4MTP(nn.Module, MixtureOfExperts):
     """HY V4 native MTP draft model."""
 
     packed_modules_mapping = {
@@ -451,6 +518,41 @@ class HYV4MTP(nn.Module):
         )
         self.quant_config = self.model.quant_config
         self.sampler = Sampler()
+        self.expert_weights = self.model.expert_weights
+        self.num_moe_layers = self.model.num_moe_layers
+        self.num_expert_groups = self.model.num_expert_groups
+        self.num_logical_experts = self.model.num_logical_experts
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_routed_experts = self.model.num_routed_experts
+        self.num_shared_experts = self.model.num_shared_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
+        self.moe_layers = self.model.moe_layers
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.model.set_eplb_state(
+            expert_load_view,
+            logical_to_physical_map,
+            logical_replica_count,
+        )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        self.model.update_physical_experts_metadata(
+            num_physical_experts,
+            num_local_physical_experts,
+        )
+        self.num_physical_experts = self.model.num_physical_experts
+        self.num_local_physical_experts = self.model.num_local_physical_experts
+        self.num_redundant_experts = self.model.num_redundant_experts
 
     def set_topk_indices_buffer(self, topk_indices_buffer) -> None:
         """Share one target-produced top-k buffer with all draft consumers."""
@@ -523,16 +625,17 @@ class HYV4MTP(nn.Module):
         loaded_weight: torch.Tensor,
         shard_id: str,
         num_experts: int,
+        num_redundant_experts: int = 0,
     ) -> bool:
         if name not in params_dict:
             return False
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
         loaded_local_expert = False
-        for expert_id in range(num_experts):
+        for expert_id in range(num_experts + num_redundant_experts):
             success = weight_loader(
                 param,
-                loaded_weight[expert_id],
+                loaded_weight[expert_id % num_experts],
                 name,
                 shard_id,
                 expert_id,
@@ -552,6 +655,7 @@ class HYV4MTP(nn.Module):
         fused_expert_param_names: dict[tuple[str, str], str],
         num_experts: int,
     ) -> bool:
+        num_redundant_experts = getattr(self, "num_redundant_experts", 0)
         base = name.split(".experts.")[0]
         for checkpoint_projection, parameter_tag in (
             (".experts.gate_up_proj", "w13_weight"),
@@ -577,12 +681,14 @@ class HYV4MTP(nn.Module):
                     gate_weight,
                     "w1",
                     num_experts,
+                    num_redundant_experts,
                 ) and self._load_fused_expert_weights(
                     target,
                     params_dict,
                     up_weight,
                     "w3",
                     num_experts,
+                    num_redundant_experts,
                 )
             else:
                 loaded = self._load_fused_expert_weights(
@@ -591,6 +697,7 @@ class HYV4MTP(nn.Module):
                     loaded_weight,
                     "w2",
                     num_experts,
+                    num_redundant_experts,
                 )
             if loaded:
                 loaded_params.add(target)
@@ -639,6 +746,7 @@ class HYV4MTP(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=num_experts,
+            num_redundant_experts=self.num_redundant_experts,
         )
         fused_expert_param_names: dict[tuple[str, str], str] = {}
         for param_name in params_dict:
