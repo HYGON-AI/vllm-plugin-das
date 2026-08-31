@@ -108,6 +108,11 @@ def apply_to_module(module: ModuleType) -> bool:
             use_fp8_dispatch = (
                 quant_config.quant_dtype == target.current_platform.fp8_dtype()
             )
+            use_int8_dispatch = quant_config.quant_dtype == target.torch.int8
+            if use_fp8_dispatch and use_int8_dispatch:
+                raise RuntimeError(
+                    "DeepEP auto cannot enable FP8 and INT8 dispatch together"
+                )
             ht_prepare_finalize = target.DeepEPHTPrepareAndFinalize(
                 handle,
                 num_dispatchers=all2all_manager.world_size,
@@ -121,6 +126,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 max_tokens_per_rank=max_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
+                use_int8_dispatch=use_int8_dispatch,
                 global_to_physical=global_to_physical,
                 physical_to_global=physical_to_global,
                 local_expert_global_ids=local_expert_global_ids,

@@ -226,6 +226,21 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "max_tokens_per_rank": 12,
         "num_dispatchers": 2,
         "use_fp8_dispatch": True,
+        "use_int8_dispatch": False,
+        "global_to_physical": "global-to-physical",
+        "physical_to_global": "physical-to-global",
+        "local_expert_global_ids": "local-ids",
+    }
+    int8_result = module.maybe_make_prepare_finalize(
+        moe,
+        SimpleNamespace(quant_dtype=torch.int8),
+        routing_tables,
+    )
+    assert int8_result.ll_prepare_finalize.kwargs == {
+        "max_tokens_per_rank": 12,
+        "num_dispatchers": 2,
+        "use_fp8_dispatch": False,
+        "use_int8_dispatch": True,
         "global_to_physical": "global-to-physical",
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
