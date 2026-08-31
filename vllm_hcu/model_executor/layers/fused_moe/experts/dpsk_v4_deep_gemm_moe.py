@@ -43,6 +43,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+    DeepEPDeepGemmW4A8ContiguousExperts,
+    DeepEPDeepGemmW4A8MaskedExperts,
+)
 
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
@@ -945,6 +949,57 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             workspace2=workspace2,
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+
+class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
+    """Select the W4A8 HIPC layout captured by ``deepep_auto``."""
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int,
+        num_dispatchers: int,
+        fixed_use_low_latency: bool | None = None,
+    ):
+        self.moe_config = moe_config
+        self.quant_config = quant_config
+        self.max_num_tokens = max_num_tokens
+        self.num_dispatchers = num_dispatchers
+        self._fixed_use_low_latency = fixed_use_low_latency
+        self._use_low_latency_snapshot = False
+        if fixed_use_low_latency is not True:
+            self.ht_experts = DeepEPDeepGemmW4A8ContiguousExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+            )
+        if fixed_use_low_latency is not False:
+            self.ll_experts = DeepEPDeepGemmW4A8MaskedExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+                max_num_tokens=max_num_tokens,
+                num_dispatchers=num_dispatchers,
+            )
+        if fixed_use_low_latency is True:
+            self.ht_experts = self.ll_experts
+        elif fixed_use_low_latency is False:
+            self.ll_experts = self.ht_experts
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._fixed_use_low_latency is not None:
+            self._current().process_weights_after_loading(layer)
+            return
+        self.ht_experts.process_weights_after_loading(layer)
+        self.ll_experts.process_weights_after_loading(layer)
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return DeepEPDeepGemmW4A8ContiguousExperts._supports_quant_scheme(
+            weight_key, activation_key
         )
 
 

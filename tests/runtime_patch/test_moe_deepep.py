@@ -443,6 +443,29 @@ def test_slimquant_w4a8_deepep_auto_empty_rank_keeps_global_snapshot(
     assert selected_layouts == contiguous_by_rank
 
 
+def test_slimquant_w4a8_deepep_auto_advertises_w4a8_quant_scheme_only():
+    """The W4A8 auto wrapper must not inherit the channel-W8A8 oracle."""
+
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8DynamicTokenSym,
+        kFp8StaticChannelSym,
+        kInt4W4A8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPAutoW4A8Experts,
+    )
+
+    assert DeepEPAutoW4A8Experts._supports_quant_scheme(
+        kInt4W4A8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+    assert not DeepEPAutoW4A8Experts._supports_quant_scheme(
+        kFp8StaticChannelSym,
+        kFp8DynamicTokenSym,
+    )
+
+
 def test_modular_prepare_begins_auto_call_before_expert_contract_queries():
     from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
 

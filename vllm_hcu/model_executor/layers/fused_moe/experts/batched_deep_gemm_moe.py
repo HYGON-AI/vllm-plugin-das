@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTokenSym,
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
+    kInt4W4A8StaticChannelSym,
     kInt8DynamicTokenSym,
     kInt8StaticChannelSym,
 )
@@ -293,6 +294,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         if current_platform.is_rocm() and (
             self.quant_config.use_int8_w8a8
+            or getattr(self.quant_config, "weight_quant_dtype", None) == "int4"
             or self.quant_config.use_fp8_w8a8
         ):
             # HCU LightOP consumes per-token Channel scales (block_shape=None).
@@ -331,6 +333,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             SUPPORTED_W_A.extend(
                 [
                     (kInt8StaticChannelSym, kInt8DynamicTokenSym),
+                    (kInt4W4A8StaticChannelSym, kInt8DynamicTokenSym),
                     (kFp8StaticChannelSym, kFp8DynamicTokenSym),
                 ]
             )
@@ -438,6 +441,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             current_platform.is_rocm()
             and (
                 self.quant_config.use_int8_w8a8
+                or getattr(self.quant_config, "weight_quant_dtype", None) == "int4"
                 or self.quant_config.use_fp8_w8a8
             )
         )
@@ -450,6 +454,12 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             N = self._hcu_logical_n
             K = self._hcu_logical_k
 
+        use_w4a8 = (
+            getattr(self.quant_config, "weight_quant_dtype", None) == "int4"
+        )
+        if use_w4a8 and max_num_tokens == 0:
+            return
+
         workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
 
         expected_m = self.estimate_expected_m(
@@ -458,7 +468,40 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             topk=topk_ids.size(-1),
         )
 
-        if self.quant_config.use_int8_w8a8:
+        if use_w4a8:
+            if activation != MoEActivation.SILU:
+                raise ValueError(
+                    "HCU Channel W4A8 batched DeepGEMM supports only SiLU activation"
+                )
+            if (
+                getattr(self, "_deepgemm_w13", None) is None
+                or getattr(self, "_deepgemm_w2", None) is None
+            ):
+                raise RuntimeError(
+                    "SlimQuant W4A8 masked weights were not packed before apply"
+                )
+            from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
+            from lightop import fuse_silu_mul_quant_ep
+
+            m_grouped_w4a8_gemm_nt_masked_hipc(
+                (a1q, a1q_scale),
+                (self._deepgemm_w13, self.w1_scale),
+                workspace1,
+                expert_num_tokens,
+                expected_m,
+            )
+            a2q, a2q_scale = fuse_silu_mul_quant_ep(
+                workspace1,
+                tokens_per_expert=expert_num_tokens,
+            )
+            m_grouped_w4a8_gemm_nt_masked_hipc(
+                (a2q, a2q_scale),
+                (self._deepgemm_w2, self.w2_scale),
+                output,
+                expert_num_tokens,
+                expected_m,
+            )
+        elif self.quant_config.use_int8_w8a8:
             if activation != MoEActivation.SILU:
                 raise ValueError(
                     "HCU Channel INT8 batched DeepGEMM supports only SiLU activation"
