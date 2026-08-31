@@ -23,15 +23,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
-try:
-    import aiter.ops.triton.fused_moe as aiter_triton_fused_moe
-except ImportError as exc:
-    aiter_triton_fused_moe = None
-    _AITER_TRITON_IMPORT_ERROR: ImportError | None = exc
-else:
-    _AITER_TRITON_IMPORT_ERROR = None
-
-
 class SlimQuantW4A8Int8Config(QuantizationConfig):
     """SlimQuant W4A8 configuration.
 
@@ -120,7 +111,7 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
 
 
 class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
-    """Channel-wise AITER Triton MoE for raw packed SlimQuant W4A8 weights."""
+    """Channel-wise SlimQuant W4A8 routed by the shared AITER adapter."""
 
     def __init__(self, quant_config, moe):
         self.moe = moe
@@ -131,10 +122,14 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
+        # The checkpoint scales target SlimQuant's high-nibble INT8 domain.
+        # AITER and the vLLM fallback consume signed INT4 values after unpack,
+        # so compensate for the four-bit shift without mutating checkpoint
+        # parameters used as the canonical cache owners.
         self.moe_quant_config = FusedMoEQuantConfig.make(
             torch.int8,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+            w1_scale=layer.w13_weight_scale * 16.0,
+            w2_scale=layer.w2_weight_scale * 16.0,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             per_act_token_quant=True,
@@ -222,6 +217,11 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             if not isinstance(parameter, Parameter):
                 raise TypeError(f"SlimQuant W4A8 requires Parameter {name}")
             parameter.requires_grad_(False)
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            prewarm_aiter_w4a8_moe,
+        )
+
+        prewarm_aiter_w4a8_moe(self, layer)
 
     def apply(
         self,
@@ -229,18 +229,18 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: object | None,
         shared_experts_input: torch.Tensor | None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+
+        # RoutedExperts owns shared-expert execution and combines its result.
+        del shared_experts, shared_experts_input
 
         if x.dim() != 2:
             raise ValueError(
                 "SlimQuant W4A8 AITER Triton MoE expects rank-2 hidden states, "
                 f"got shape {tuple(x.shape)}"
-            )
-        if shared_experts_input is not None:
-            raise ValueError(
-                "SlimQuant W4A8 Triton MoE does not support shared_experts_input"
             )
         if topk_weights.shape != topk_ids.shape:
             raise ValueError(
@@ -254,24 +254,14 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 f"token count as x, got x={tuple(x.shape)}, "
                 f"topk_ids={tuple(topk_ids.shape)}"
             )
-        if aiter_triton_fused_moe is None:
-            raise RuntimeError(
-                "SlimQuant W4A8 requires aiter.ops.triton.fused_moe"
-            ) from _AITER_TRITON_IMPORT_ERROR
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            apply_aiter_w4a8_moe,
+        )
 
-        return aiter_triton_fused_moe.fused_experts_impl(
+        return apply_aiter_w4a8_moe(
+            self,
+            layer,
             x,
-            layer.w13_weight,
-            layer.w2_weight,
             topk_weights,
             topk_ids,
-            output_dtype=x.dtype,
-            use_int4_w4a8=True,
-            per_channel_quant=True,
-            global_num_experts=layer.w13_weight.size(0),
-            expert_map=None,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            activation="silu",
-            is_gated=True,
         )

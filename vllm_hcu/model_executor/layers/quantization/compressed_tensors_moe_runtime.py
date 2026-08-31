@@ -177,6 +177,237 @@ def prewarm_aiter_w4a16_moe(
     return prewarm_aiter_moe_config(problem, cache_owner=w1)
 
 
+def _slimquant_w4a8_metadata(
+    method: object,
+    layer: object,
+) -> tuple[torch.Tensor, torch.Tensor, int, str]:
+    """Validate packed SlimQuant weights and return logical MoE metadata."""
+
+    w1 = _required_tensor(layer, "w13_weight")
+    w2 = _required_tensor(layer, "w2_weight")
+    if w1.dtype != torch.int8 or w2.dtype != torch.int8:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 requires packed INT8 storage"
+        )
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 expects compatible rank-3 packed weights"
+        )
+    logical_k = int(w1.shape[2]) * 2
+    if int(w2.shape[1]) != logical_k or int(w2.shape[2]) * 4 != int(w1.shape[1]):
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 packed weight dimensions are inconsistent"
+        )
+    moe = getattr(method, "moe", None)
+    hidden_dim = getattr(moe, "hidden_dim", logical_k)
+    if not isinstance(hidden_dim, int) or hidden_dim != logical_k:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 logical hidden size does not match packed weights"
+        )
+    activation = getattr(getattr(moe, "activation", None), "value", None)
+    if activation is None:
+        activation = "silu"
+    if str(activation) != "silu":
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 supports only silu activation"
+        )
+    return w1, w2, logical_k, str(activation)
+
+
+def prewarm_aiter_w4a8_moe(
+    method: object,
+    layer: object,
+) -> object | None:
+    """Probe SlimQuant W4A8 at M=1 while canonical weights are loaded."""
+
+    w1, w2, logical_k, activation = _slimquant_w4a8_metadata(method, layer)
+    moe = getattr(method, "moe", None)
+    top_k = getattr(moe, "experts_per_token", None)
+    dtype = getattr(moe, "in_dtype", None)
+    if not isinstance(top_k, int) or top_k <= 0 or not isinstance(dtype, torch.dtype):
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 prewarm requires valid top-k and input dtype"
+        )
+    from aiter.moe import MoeQuantType
+
+    quant_type = getattr(MoeQuantType, "W4A8", None)
+    if quant_type is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER does not expose required MoeQuantType.W4A8"
+        )
+    problem = AiterMoeProblem(
+        M=1,
+        E=int(w1.shape[0]),
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=logical_k,
+        top_k=top_k,
+        block_size=0,
+        dtype=dtype,
+        device=w1.device,
+        quant_type=quant_type,
+        activation=activation,
+        use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+    )
+    config = prewarm_aiter_moe_config(problem, cache_owner=w1)
+    return config
+
+
+def _unpack_slimquant_w4a8_tensor(packed: torch.Tensor) -> torch.Tensor:
+    """Expand HIPC high-nibble-first signed INT4 storage to canonical INT8."""
+
+    packed_u8 = packed.view(torch.uint8)
+    high = ((packed_u8 >> 4) & 0xF).to(torch.int16)
+    low = (packed_u8 & 0xF).to(torch.int16)
+    high = torch.where(high >= 8, high - 16, high).to(torch.int8)
+    low = torch.where(low >= 8, low - 16, low).to(torch.int8)
+    return torch.stack((high, low), dim=-1).flatten(-2).contiguous()
+
+
+def _vllm_w4a8_fallback_weights(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create transient W8 storage consumed by vLLM's Triton fallback."""
+
+    with torch.no_grad():
+        return (
+            _unpack_slimquant_w4a8_tensor(w1),
+            _unpack_slimquant_w4a8_tensor(w2),
+        )
+
+
+def apply_aiter_w4a8_moe(
+    method: object,
+    layer: object,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Route SlimQuant W4A8 through AITER, or vLLM Triton if unsupported."""
+
+    if (
+        hidden_states.ndim != 2
+        or topk_weights.ndim != 2
+        or topk_ids.ndim != 2
+        or topk_weights.shape != topk_ids.shape
+        or topk_ids.shape[0] != hidden_states.shape[0]
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 requires matching rank-2 hidden and top-k tensors"
+        )
+    w1, w2, logical_k, activation = _slimquant_w4a8_metadata(method, layer)
+    if int(hidden_states.shape[1]) != logical_k:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 hidden states do not match the packed logical K"
+        )
+    quant_config = getattr(method, "moe_quant_config", None)
+    w1_scale = _required_tensor(quant_config, "w1_scale")
+    w2_scale = _required_tensor(quant_config, "w2_scale")
+    aiter_config = None
+    if getattr(w1, "_hcu_aiter_moe_m1_supported", None) is not False:
+        from aiter.moe import MoeQuantType
+
+        quant_type = getattr(MoeQuantType, "W4A8", None)
+        if quant_type is None:
+            raise HcuCompressedTensorsMoeError(
+                "AITER does not expose required MoeQuantType.W4A8"
+            )
+        problem = AiterMoeProblem(
+            M=int(hidden_states.shape[0]),
+            E=int(w1.shape[0]),
+            N1=int(w1.shape[1]),
+            N2=int(w2.shape[1]),
+            K=logical_k,
+            top_k=int(topk_ids.shape[1]),
+            block_size=0,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            quant_type=quant_type,
+            activation=activation,
+            use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+        )
+        aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
+    global_num_experts = getattr(
+        layer,
+        "global_num_experts",
+        getattr(getattr(method, "moe", None), "num_experts", int(w1.shape[0])),
+    )
+    native_expert_map = getattr(
+        layer,
+        "_expert_map",
+        getattr(layer, "expert_map", None),
+    )
+    expert_mask = getattr(layer, "expert_mask", None)
+    if aiter_config is None:
+        fallback_w1, fallback_w2 = _vllm_w4a8_fallback_weights(w1, w2)
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl,
+        )
+
+        return fused_experts_impl(
+            hidden_states,
+            fallback_w1,
+            fallback_w2,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=True,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=True,
+            global_num_experts=global_num_experts,
+            expert_map=native_expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=getattr(quant_config, "a1_scale", None),
+            a2_scale=getattr(quant_config, "a2_scale", None),
+            block_shape=None,
+        )
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        aiter_config,
+        cache_owner=w1,
+        preserve_inputs=True,
+    )
+    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+        w1_scale,
+        w2_scale,
+        aiter_config,
+        cache_owner=w1_scale,
+    )
+    aiter_expert_map = aiter_expert_map_for_solution(
+        native_expert_map,
+        aiter_config,
+        int(global_num_experts),
+        expert_mask=expert_mask,
+    )
+    return execute_aiter_moe(
+        aiter_config,
+        hidden_states=hidden_states,
+        w1=prepared_w1,
+        w2=prepared_w2,
+        topk_weights=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        inplace=False,
+        activation=activation,
+        w1_scale=prepared_w1_scale,
+        w2_scale=prepared_w2_scale,
+        a1_scale=getattr(quant_config, "a1_scale", None),
+        a2_scale=getattr(quant_config, "a2_scale", None),
+        block_shape=None,
+        global_num_experts=int(global_num_experts),
+        expert_map=aiter_expert_map,
+        routed_scaling_factor=1.0,
+        use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
+        output_dtype=hidden_states.dtype,
+    )
+
+
 def apply_aiter_quantized_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -660,8 +891,10 @@ def build_aiter_w4a16_quant_config(
 __all__ = [
     "HcuCompressedTensorsMoeError",
     "apply_aiter_quantized_moe",
+    "apply_aiter_w4a8_moe",
     "apply_aiter_w8a8_fp8_moe",
     "build_aiter_w4a16_quant_config",
     "create_aiter_w4a16_qzeros",
+    "prewarm_aiter_w4a8_moe",
     "process_dpsk_deepgemm_weights",
 ]

@@ -600,6 +600,45 @@ def test_aiter_dispatch_prepares_weight_cache_tracks_generation_and_layout(
     ]
 
 
+def test_aiter_dispatch_can_preserve_weights_from_mutating_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        del config
+        w1.add_(1)
+        w2.add_(2)
+        return w1, w2
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        config={},
+    )
+    w1 = torch.ones((2, 8, 4), dtype=torch.int8)
+    w2 = torch.ones((2, 4, 4), dtype=torch.int8)
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        config,
+        cache_owner=w1,
+        preserve_inputs=True,
+    )
+
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.ones_like(w2))
+    torch.testing.assert_close(prepared_w1, torch.full_like(w1, 2))
+    torch.testing.assert_close(prepared_w2, torch.full_like(w2, 3))
+    assert prepared_w1 is not w1
+    assert prepared_w2 is not w2
+
+
 def test_aiter_dispatch_weight_cache_ignores_tuning_solution_ids(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3424,8 +3463,14 @@ def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     assert len(calls) == 1
     call = calls[0]
     assert call["args"] == (torch.int8,)
-    assert call["w1_scale"] is layer.w13_weight_scale
-    assert call["w2_scale"] is layer.w2_weight_scale
+    torch.testing.assert_close(
+        call["w1_scale"], torch.full_like(layer.w13_weight_scale, 16.0)
+    )
+    torch.testing.assert_close(
+        call["w2_scale"], torch.full_like(layer.w2_weight_scale, 16.0)
+    )
+    torch.testing.assert_close(layer.w13_weight_scale, torch.ones(2, 4, 1))
+    torch.testing.assert_close(layer.w2_weight_scale, torch.ones(2, 2, 1))
     assert call["a1_scale"] is None
     assert call["a2_scale"] is None
     assert call["per_act_token_quant"] is True
@@ -3448,77 +3493,345 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_apply_uses_triton_channelwise_raw_packed_weights(
+def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
     calls: list[dict[str, object]] = []
-
-    def fake_fused_experts_impl(*args, **kwargs):
-        calls.append({"args": args, "kwargs": kwargs})
-        hidden_states = args[0]
-        return hidden_states + 1
-
-    monkeypatch.setattr(
-        slimquant_w4a8.aiter_triton_fused_moe,
-        "fused_experts_impl",
-        fake_fused_experts_impl,
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
     )
 
-    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
-    w13_weight = torch.arange(2 * 4 * 2, dtype=torch.int8).reshape(2, 4, 2)
-    w2_weight = torch.arange(2 * 2 * 2, dtype=torch.int8).reshape(2, 2, 2)
-    w13_parameter = torch.nn.Parameter(w13_weight.clone(), requires_grad=False)
-    w2_parameter = torch.nn.Parameter(w2_weight.clone(), requires_grad=False)
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        calls.append(kwargs)
+        return True, selected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            experts_per_token=2,
+            hidden_dim=4,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=2,
+        ),
+    )
     layer = SimpleNamespace(
-        w13_weight=w13_parameter,
-        w2_weight=w2_parameter,
+        w13_weight=torch.nn.Parameter(
+            torch.zeros(2, 8, 2, dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros(2, 4, 2, dtype=torch.int8), requires_grad=False
+        ),
         w13_weight_scale=torch.nn.Parameter(
-            torch.ones(2, 4, 1), requires_grad=False
+            torch.ones(2, 8, 1), requires_grad=False
         ),
         w2_weight_scale=torch.nn.Parameter(
-            torch.ones(2, 2, 1), requires_grad=False
+            torch.ones(2, 4, 1), requires_grad=False
         ),
     )
 
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight is w13_parameter
-    assert layer.w2_weight is w2_parameter
-    torch.testing.assert_close(layer.w13_weight.data, w13_weight)
-    torch.testing.assert_close(layer.w2_weight.data, w2_weight)
+    assert calls == [
+        {
+            "M": 1,
+            "E": 2,
+            "N1": 8,
+            "N2": 4,
+            "K": 4,
+            "top_k": 2,
+            "block_size": 0,
+            "dtype": torch.bfloat16,
+            "quant_type": "w4a8",
+            "activation": "silu",
+            "use_shuffle": 1,
+        }
+    ]
+    assert layer.w13_weight._hcu_aiter_moe_m1_supported is True
 
-    x = torch.zeros(3, 2, dtype=torch.float16)
-    topk_weights = torch.ones(3, 1, dtype=torch.float16)
-    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
-    result = method.apply(layer, x, topk_weights, topk_ids, None)
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_unsupported_m1_does_not_expand_weights_at_load(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_: (False, None),
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            experts_per_token=1,
+            hidden_dim=4,
+            in_dtype=torch.float16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
+                dtype=torch.uint8,
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight._hcu_aiter_moe_m1_supported is False
+    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_runtime_lets_aiter_select_and_execute(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: dict[str, object] = {}
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+    )
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        calls["selector"] = kwargs
+        return True, selected
+
+    def aiter_moe(**kwargs: object):
+        calls["execute"] = kwargs
+        return kwargs["hidden_states"] + 1
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    x = torch.zeros(3, 4, dtype=torch.bfloat16)
+    topk_weights = torch.ones(3, 2, dtype=torch.float32)
+    topk_ids = torch.zeros(3, 2, dtype=torch.int32)
+    w1 = torch.zeros(2, 8, 2, dtype=torch.int8)
+    w2 = torch.zeros(2, 4, 2, dtype=torch.int8)
+    w1_scale = torch.full((2, 8, 1), 16.0)
+    w2_scale = torch.full((2, 4, 1), 16.0)
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=2),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=w1,
+        w2_weight=w2,
+        global_num_experts=2,
+        _expert_map=None,
+        expert_mask=None,
+    )
+
+    result = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
 
     torch.testing.assert_close(result, x + 1)
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["args"][:4] == (
-        x,
-        layer.w13_weight,
-        layer.w2_weight,
+    assert calls["selector"] == {
+        "M": 3,
+        "E": 2,
+        "N1": 8,
+        "N2": 4,
+        "K": 4,
+        "top_k": 2,
+        "block_size": 0,
+        "dtype": torch.bfloat16,
+        "quant_type": "w4a8",
+        "activation": "silu",
+        "use_shuffle": 1,
+    }
+    execute = calls["execute"]
+    assert execute["moe_config"] is selected
+    assert execute["w1"] is w1
+    assert execute["w2"] is w2
+    assert execute["w1_scale"] is w1_scale
+    assert execute["w2_scale"] is w2_scale
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_no_config_unpacks_for_vllm_triton_without_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe import fused_moe
+
+    calls: list[dict[str, object]] = []
+
+    def fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
         topk_weights,
+        topk_ids,
+        *,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=False,
+        global_num_experts=-1,
+        expert_map=None,
+        w1_scale=None,
+        w2_scale=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    ):
+        args = (hidden_states, w1, w2, topk_weights, topk_ids)
+        kwargs = {
+            "activation": activation,
+            "apply_router_weight_on_input": apply_router_weight_on_input,
+            "use_fp8_w8a8": use_fp8_w8a8,
+            "use_int8_w8a8": use_int8_w8a8,
+            "use_int8_w8a16": use_int8_w8a16,
+            "use_int4_w4a16": use_int4_w4a16,
+            "per_channel_quant": per_channel_quant,
+            "global_num_experts": global_num_experts,
+            "expert_map": expert_map,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "a1_scale": a1_scale,
+            "a2_scale": a2_scale,
+            "block_shape": block_shape,
+        }
+        calls.append({"args": args, "kwargs": kwargs})
+        return hidden_states + 1
+
+    monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "select_aiter_moe_config",
+        lambda *args, **kwargs: pytest.fail(
+            "M=1 unsupported capability must bypass runtime AITER selection"
+        ),
     )
-    assert call["args"][4] is topk_ids
-    kwargs = call["kwargs"]
-    assert kwargs["output_dtype"] is x.dtype
-    assert kwargs["use_int4_w4a8"] is True
+    packed_w1 = torch.tensor(
+        [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
+        dtype=torch.uint8,
+    ).view(torch.int8)
+    packed_w2 = torch.tensor(
+        [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
+    ).view(torch.int8)
+    packed_w1._hcu_aiter_moe_m1_supported = False
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=1),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.full((1, 4, 1), 16.0),
+            w2_scale=torch.full((1, 4, 1), 16.0),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=packed_w1,
+        w2_weight=packed_w2,
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+    )
+    x = torch.zeros(2, 4, dtype=torch.float16)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
+
+    first = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
+    second = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
+
+    torch.testing.assert_close(first, x + 1)
+    torch.testing.assert_close(second, x + 1)
+    assert len(calls) == 2
+    first_args = calls[0]["args"]
+    second_args = calls[1]["args"]
+    assert first_args[1] is not second_args[1]
+    assert first_args[2] is not second_args[2]
+    torch.testing.assert_close(
+        first_args[1],
+        torch.tensor(
+            [[
+                [-8, -1, 7, 0],
+                [1, -2, -6, 5],
+                [7, 0, -8, -1],
+                [-6, 5, 1, -2],
+            ]],
+            dtype=torch.int8,
+        ),
+    )
+    torch.testing.assert_close(
+        first_args[2],
+        torch.tensor(
+            [[[-8, -1], [7, 0], [1, -2], [-6, 5]]], dtype=torch.int8
+        ),
+    )
+    kwargs = calls[0]["kwargs"]
+    assert kwargs["use_int8_w8a8"] is True
+    assert kwargs["use_int4_w4a16"] is False
     assert kwargs["per_channel_quant"] is True
-    assert kwargs["global_num_experts"] == 2
-    assert kwargs["expert_map"] is None
-    assert kwargs["w1_scale"] is layer.w13_weight_scale
-    assert kwargs["w2_scale"] is layer.w2_weight_scale
-    assert kwargs["activation"] == "silu"
-    assert kwargs["is_gated"] is True
 
 
 @pytest.mark.hcu
 def test_slimquant_w4a8_apply_fails_closed_for_unsupported_inputs(
-    monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -3529,19 +3842,40 @@ def test_slimquant_w4a8_apply_fails_closed_for_unsupported_inputs(
     topk_ids = torch.zeros(3, 1, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="rank-2 hidden states"):
-        method.apply(layer, x.unsqueeze(0), topk_weights, topk_ids, None)
-    with pytest.raises(ValueError, match="shared_experts_input"):
-        method.apply(layer, x, topk_weights, topk_ids, x)
+        method.apply(layer, x.unsqueeze(0), topk_weights, topk_ids, None, None)
     with pytest.raises(ValueError, match="same shape"):
-        method.apply(layer, x, topk_weights[:, :0], topk_ids, None)
+        method.apply(layer, x, topk_weights[:, :0], topk_ids, None, None)
     with pytest.raises(ValueError, match="same token count"):
-        method.apply(layer, x, topk_weights[:2], topk_ids[:2], None)
+        method.apply(layer, x, topk_weights[:2], topk_ids[:2], None, None)
 
-    import_error = ImportError("missing aiter Triton fused MoE")
-    monkeypatch.setattr(slimquant_w4a8, "aiter_triton_fused_moe", None)
-    monkeypatch.setattr(slimquant_w4a8, "_AITER_TRITON_IMPORT_ERROR", import_error)
-    with pytest.raises(RuntimeError, match="requires aiter.ops.triton.fused_moe"):
-        method.apply(layer, x, topk_weights, topk_ids, None)
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_apply_accepts_runner_owned_shared_experts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    layer = SimpleNamespace()
+    x = torch.zeros(3, 2, dtype=torch.float16)
+    topk_weights = torch.ones(3, 1, dtype=torch.float16)
+    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a8_moe",
+        lambda *args: args[2],
+    )
+
+    result = method.apply(
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        shared_experts=object(),
+        shared_experts_input=x,
+    )
+
+    assert result is x
 
 
 def _fake_moe_fp8_module():

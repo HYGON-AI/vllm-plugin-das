@@ -306,6 +306,7 @@ def prepare_aiter_moe_weights(
     config: object,
     cache_owner: object,
     block_shape: list[int] | None = None,
+    preserve_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Derive and cache the weight layout requested by an AITER config."""
 
@@ -318,6 +319,7 @@ def prepare_aiter_moe_weights(
         _tensor_generation(w2),
         _weight_layout_generation(config),
         _freeze(block_shape),
+        preserve_inputs,
     )
     if cache_key in cache:
         cache.move_to_end(cache_key)
@@ -331,12 +333,14 @@ def prepare_aiter_moe_weights(
             f"solution={_solution_token(config)}"
         )
     with torch.no_grad():
+        shuffle_w1 = w1.clone() if preserve_inputs else w1
+        shuffle_w2 = w2.clone() if preserve_inputs else w2
         if block_shape is None:
-            derived_w1, derived_w2 = shuffle(w1, w2, config)
+            derived_w1, derived_w2 = shuffle(shuffle_w1, shuffle_w2, config)
         else:
             derived_w1, derived_w2 = shuffle(
-                w1,
-                w2,
+                shuffle_w1,
+                shuffle_w2,
                 config,
                 block_shape=block_shape,
             )
