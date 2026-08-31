@@ -3445,6 +3445,60 @@ def test_compressed_scheme_inactive_anchor_is_corrected_at_runtime():
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_dispatches_current_routed_experts_to_aiter_method():
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    # FusedMoE is a factory in v0.25.1. It constructs RoutedExperts, whose
+    # constructor immediately calls get_quant_method. Build that exact public
+    # layer type without recursively entering the dispatch under test.
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = SimpleNamespace(
+        moe_backend="aiter",
+        moe_parallel_config=SimpleNamespace(
+            tp_size=8,
+            dp_size=1,
+            use_ep=False,
+            all2all_backend="allgather_reducescatter",
+        ),
+    )
+    config = slimquant_w4a8.SlimQuantW4A8Int8Config()
+
+    method = config.get_quant_method(layer, "model.layers.0.mlp.experts")
+
+    assert type(method) is slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod
+    assert method.moe is layer.moe_config
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_dispatch_preserves_linear_method():
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    layer = ReplicatedLinear.__new__(ReplicatedLinear)
+    torch.nn.Module.__init__(layer)
+
+    method = slimquant_w4a8.SlimQuantW4A8Int8Config().get_quant_method(
+        layer, "model.layers.0.self_attn.q_proj"
+    )
+
+    assert type(method) is slimquant_w4a8.SlimQuantW4A8Int8LinearMethod
+    assert isinstance(layer.scheme, slimquant_w4a8.CompressedTensorsW8A8Int8)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_dispatch_returns_none_for_unsupported_layer():
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    method = slimquant_w4a8.SlimQuantW4A8Int8Config().get_quant_method(
+        torch.nn.Embedding(4, 4), "model.embed_tokens"
+    )
+
+    assert method is None
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):

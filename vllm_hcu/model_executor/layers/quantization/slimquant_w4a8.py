@@ -8,9 +8,9 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
@@ -60,7 +60,7 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
                 QuantizationStrategy.CHANNEL, False, True
             )
             return SlimQuantW4A8Int8LinearMethod(self)
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             return SlimQuantW4A8Int8AiterMoEMethod(self, layer.moe_config)
         return None
 
@@ -262,7 +262,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
