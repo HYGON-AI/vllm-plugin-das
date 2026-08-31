@@ -19,6 +19,13 @@ from typing import Any
 
 import torch
 
+from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+    AiterMoeProblem,
+    execute_aiter_moe,
+    prepare_aiter_moe_weights,
+    select_aiter_moe_config,
+)
+
 
 class HcuAiterRuntimeError(RuntimeError):
     """An explicitly requested HCU AITER path cannot be provided."""
@@ -621,87 +628,6 @@ def _activation_name(activation_method: int) -> str:
         ) from exc
 
 
-@functools.cache
-def get_w16a16_moe_config(
-    M: int,
-    E: int,
-    N1: int,
-    N2: int,
-    K: int,
-    top_k: int,
-    dtype: torch.dtype,
-    activation: str,
-    use_shuffle: int,
-) -> object:
-    try:
-        from aiter.moe import MoeQuantType, MoeSolutionType, get_aiter_moe_config
-    except Exception as exc:
-        raise HcuAiterRuntimeError(
-            "HCU AITER W16A16 ASM MoE configuration was requested, but "
-            "aiter.moe.get_aiter_moe_config is unavailable"
-        ) from exc
-
-    status, moe_config = get_aiter_moe_config(
-        M=M,
-        E=E,
-        N1=N1,
-        N2=N2,
-        K=K,
-        top_k=top_k,
-        block_size=0,
-        dtype=dtype,
-        quant_type=MoeQuantType.W16A16,
-        activation=activation,
-        spec_sol_type=MoeSolutionType.ASM,
-        use_shuffle=use_shuffle,
-    )
-    if (
-        not status
-        or moe_config is None
-        or moe_config.solution_type != MoeSolutionType.ASM
-    ):
-        raise HcuAiterRuntimeError(
-            "AITER W16A16 MoE did not find an ASM solution for "
-            f"M={M}, E={E}, N1={N1}, N2={N2}, K={K}, top_k={top_k}, "
-            f"dtype={dtype}, activation={activation}, use_shuffle={use_shuffle}"
-        )
-    return moe_config
-
-
-@functools.cache
-def get_w16a16_moe_solution_id(
-    M: int,
-    E: int,
-    N1: int,
-    N2: int,
-    K: int,
-    top_k: int,
-    dtype: torch.dtype,
-    activation: str,
-    use_shuffle: int,
-) -> str:
-    moe_config = get_w16a16_moe_config(
-        M,
-        E,
-        N1,
-        N2,
-        K,
-        top_k,
-        dtype,
-        activation,
-        use_shuffle,
-    )
-
-    config = getattr(moe_config, "config", None) or {}
-    try:
-        return f"{config['SOL_ID1']}+{config['SOL_ID2']}"
-    except KeyError as exc:
-        raise HcuAiterRuntimeError(
-            "AITER W16A16 ASM configuration is missing SOL_ID1/SOL_ID2: "
-            f"{config}"
-        ) from exc
-
-
 def _aiter_asm_expert_mask_contract(
     expert_mask: torch.Tensor | None,
     local_num_experts: int,
@@ -762,6 +688,25 @@ def _aiter_asm_expert_mask_contract(
     return global_num_experts, expert_mask
 
 
+def _aiter_mask_to_vllm_expert_map(
+    expert_mask: torch.Tensor | None,
+    global_num_experts: int,
+) -> torch.Tensor | None:
+    if expert_mask is None:
+        return None
+    routed_mask = expert_mask[:global_num_experts].to(torch.bool)
+    local_ids = torch.cumsum(
+        routed_mask.to(torch.int32),
+        dim=0,
+        dtype=torch.int32,
+    ) - 1
+    return torch.where(
+        routed_mask,
+        local_ids,
+        torch.full_like(local_ids, -1),
+    )
+
+
 def fused_moe_impl(
     original: Callable[..., torch.Tensor],
     hidden_states: torch.Tensor,
@@ -787,11 +732,11 @@ def fused_moe_impl(
     moe_sorting_dispatch_policy: int = 0,
     swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
-    """Select HCU's W16A16 ASM path, otherwise preserve upstream exactly."""
+    """Route unquantized HCU MoE through AITER, otherwise preserve upstream."""
 
     from aiter import QuantType
 
-    use_w16a16_asm = (
+    use_w16a16_aiter = (
         is_aiter_moe_requested()
         and QuantType(quant_method) == QuantType.No
         and w1_scale is None
@@ -799,7 +744,7 @@ def fused_moe_impl(
         and a1_scale is None
         and a2_scale is None
     )
-    if not use_w16a16_asm:
+    if not use_w16a16_aiter:
         if activation_method != 3:
             return original(
                 hidden_states,
@@ -870,7 +815,7 @@ def fused_moe_impl(
     from vllm_hcu.platforms import envs as henvs
 
     activation = _activation_name(activation_method)
-    use_shuffle = int(bool(henvs.VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE))
+    use_shuffle = bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE)
     global_num_experts, expert_mask = _aiter_asm_expert_mask_contract(
         expert_mask,
         int(w1.shape[0]),
@@ -915,42 +860,83 @@ def fused_moe_impl(
             f"w2.shape={tuple(w2.shape)}"
         )
 
-    direct_kwargs: dict[str, object] = {
-        "activation": activation,
-        "global_num_experts": global_num_experts,
-        "expert_map": expert_mask,
-        "use_shuffle": use_shuffle,
-    }
-    if swiglu_limit:
-        direct_kwargs["gemm1_limit"] = swiglu_limit
-    if bool(henvs.VLLM_HCU_USE_AITER_MOE_CONFIG):
-        direct_kwargs["solution_id"] = get_w16a16_moe_solution_id(
-            M=int(hidden_states.shape[0]),
-            E=global_num_experts,
-            N1=int(w1.shape[1]),
-            N2=int(w2.shape[1]),
-            K=int(w1.shape[2]),
-            top_k=int(topk_ids.shape[1]),
-            dtype=hidden_states.dtype,
-            activation=activation,
-            use_shuffle=use_shuffle,
+    problem = AiterMoeProblem(
+        M=int(hidden_states.shape[0]),
+        E=global_num_experts,
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=int(w1.shape[2]),
+        top_k=int(topk_ids.shape[1]),
+        block_size=0,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        quant_type="w16a16",
+        activation=activation,
+        use_shuffle=use_shuffle,
+    )
+    aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
+    native_expert_map = _aiter_mask_to_vllm_expert_map(
+        expert_mask,
+        global_num_experts,
+    )
+    if aiter_config is None:
+        if swiglu_limit:
+            raise HcuAiterRuntimeError(
+                "vLLM Triton W16A16 fallback does not support swiglu_limit"
+            )
+        if output_dtype not in (None, hidden_states.dtype):
+            raise HcuAiterRuntimeError(
+                "vLLM Triton W16A16 fallback cannot override output_dtype"
+            )
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl,
         )
 
-    try:
-        from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
-    except Exception as exc:
-        raise HcuAiterRuntimeError(
-            "HCU AITER direct W16A16 ASM path was selected, but "
-            "aiter.fused_moe_asm_wna16.fused_experts_asm_impl is unavailable"
-        ) from exc
-    return fused_experts_asm_impl(
-        hidden_states,
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            global_num_experts=global_num_experts,
+            expert_map=native_expert_map,
+        )
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
         w1,
         w2,
-        topk_weight,
-        topk_ids,
-        output_dtype or hidden_states.dtype,
-        **direct_kwargs,
+        aiter_config,
+        cache_owner=w1,
+    )
+    solution = getattr(aiter_config, "solution_type", None)
+    solution = getattr(solution, "value", solution)
+    aiter_expert_map = (
+        expert_mask
+        if str(solution).rsplit(".", 1)[-1].upper() == "ASM"
+        else native_expert_map
+    )
+    return execute_aiter_moe(
+        aiter_config,
+        hidden_states=hidden_states,
+        w1=prepared_w1,
+        w2=prepared_w2,
+        topk_weights=topk_weight,
+        topk_ids=topk_ids,
+        inplace=False,
+        activation=activation,
+        global_num_experts=global_num_experts,
+        expert_map=aiter_expert_map,
+        use_weight_shuffle=bool(
+            getattr(aiter_config, "need_shuffle", False)
+        ),
+        output_dtype=output_dtype or hidden_states.dtype,
+        gemm1_limit=swiglu_limit or None,
     )
 
 
@@ -1028,8 +1014,6 @@ __all__ = [
     "fused_moe_impl",
     "get_aiter_activation_type",
     "get_gelu_tanh_activation_type",
-    "get_w16a16_moe_config",
-    "get_w16a16_moe_solution_id",
     "is_aiter_found_and_supported",
     "rmsnorm_add_dynamic_quant_impl",
     "rmsnorm_dynamic_quant_impl",
