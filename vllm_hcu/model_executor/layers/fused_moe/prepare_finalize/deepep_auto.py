@@ -66,7 +66,9 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self._use_low_latency_snapshot = False
         self._auto_experts: mk.FusedMoEExperts | None = None
 
-    def _snapshot_forward_mode(self) -> None:
+    def begin_moe_call(self) -> bool:
+        """Latch one delegate before the modular kernel queries its contract."""
+
         if self._fixed_use_low_latency is None:
             self._use_low_latency_snapshot = _forward_uses_low_latency()
         else:
@@ -84,6 +86,7 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             self._auto_experts.set_deepep_auto_use_low_latency(
                 self._use_low_latency_snapshot
             )
+        return self._use_low_latency_snapshot
 
     def _current(self) -> FusedMoEPrepareAndFinalize:
         return (
@@ -146,7 +149,6 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> Callable | tuple[Callable, Callable]:
-        self._snapshot_forward_mode()
         return self._current().prepare_async(
             a1,
             topk_weights,
@@ -169,7 +171,6 @@ class DeepEPAutoPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        self._snapshot_forward_mode()
         return self._current().prepare(
             a1,
             topk_weights,

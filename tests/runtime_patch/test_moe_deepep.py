@@ -308,6 +308,7 @@ def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
     assert ht.calls == [("post_init_setup", ("ht-experts",))]
     assert ll.calls == [("post_init_setup", ("ll-experts",))]
 
+    assert prepare_finalize.begin_moe_call() is True
     assert prepare_finalize.prepare(
         "a1", "weights", "ids", 8, None, False, "quant"
     ) == "ll"
@@ -318,6 +319,7 @@ def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
     )
     assert [name for name, _ in ll.calls[-2:]] == ["prepare", "finalize"]
 
+    assert prepare_finalize.begin_moe_call() is False
     assert prepare_finalize.prepare(
         "a1", "weights", "ids", 8, None, False, "quant"
     ) == "ht"
@@ -329,6 +331,58 @@ def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
     assert selected_modes == [
         "DeepEP auto selected masked low-latency experts for this forward.",
         "DeepEP auto selected contiguous high-throughput experts for this forward.",
+    ]
+
+
+def test_modular_prepare_begins_auto_call_before_expert_contract_queries():
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
+
+    events: list[str] = []
+
+    class PrepareFinalize:
+        def begin_moe_call(self):
+            events.append("begin")
+
+        def supports_async(self):
+            return False
+
+        def prepare(self, *args, **kwargs):
+            del args, kwargs
+            events.append("prepare")
+            return "a1q", None, None, None, None
+
+    class Experts:
+        quant_config = SimpleNamespace()
+        num_dispatchers = None
+
+        def activation_format(self):
+            events.append("activation_format")
+            return module.FusedMoEActivationFormat.Standard
+
+        @property
+        def expects_unquantized_inputs(self):
+            events.append("expects_unquantized_inputs")
+            return True
+
+    kernel = object.__new__(module.FusedMoEKernelModularImpl)
+    kernel.prepare_finalize = PrepareFinalize()
+    kernel.fused_experts = Experts()
+    kernel.moe_parallel_config = None
+
+    kernel._prepare(
+        torch.ones((1, 4)),
+        torch.ones((1, 1)),
+        torch.zeros((1, 1), dtype=torch.int64),
+        1,
+        None,
+        False,
+    )
+
+    assert events == [
+        "begin",
+        "activation_format",
+        "expects_unquantized_inputs",
+        "prepare",
     ]
 
 
@@ -436,6 +490,7 @@ def test_deepep_auto_prepare_pins_mooncake_pd_role(
     experts = Experts()
     prepare_finalize.post_init_setup(experts)
 
+    assert prepare_finalize.begin_moe_call() is fixed_use_low_latency
     assert prepare_finalize.prepare(
         "a1", "weights", "ids", 8, None, False, "quant"
     ) == selected

@@ -1100,6 +1100,18 @@ def test_deepep_auto_rejects_non_dp_ep_topology_before_model_loading(
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 
+def test_deepep_auto_rejects_ubatching_before_model_loading() -> None:
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.use_ubatching = True
+
+    with pytest.raises(
+        ValueError,
+        match="deepep_auto.*ubatching.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
 def _dspark_pd_config(
     connector: str,
     architecture: str = "DeepseekV4ForCausalLM",

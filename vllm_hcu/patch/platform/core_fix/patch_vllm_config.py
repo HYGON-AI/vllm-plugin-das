@@ -257,6 +257,11 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             raise ValueError(
                 "HCU deepep_auto requires enable_expert_parallel=True."
             )
+        if bool(getattr(parallel_config, "use_ubatching", False)):
+            raise ValueError(
+                "deepep_auto with ubatching is not supported because HT/LL "
+                "delegate selection is not invocation-local"
+            )
         if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(
                 "deepep_auto requires HCU moe_backend='auto' or "

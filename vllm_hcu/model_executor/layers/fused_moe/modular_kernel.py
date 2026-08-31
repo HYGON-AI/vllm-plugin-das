@@ -1161,6 +1161,14 @@ class FusedMoEKernelModularImpl:
         The _prepare method is a wrapper around self.prepare_finalize.prepare
         that handles DBO and async.
         """
+        begin_moe_call = getattr(
+            self.prepare_finalize,
+            "begin_moe_call",
+            None,
+        )
+        if begin_moe_call is not None:
+            begin_moe_call()
+
         # Skip cudagraph/DP padding tokens uniformly across all a2a backends:
         # forcing padded rows' expert ids to -1 makes every prepare_finalize drop
         # them (not dispatched / not computed by the experts). The V2 model runner
