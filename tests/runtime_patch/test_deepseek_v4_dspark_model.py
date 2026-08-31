@@ -183,7 +183,7 @@ def test_dspark_context_insert_uses_only_non_pcp_lightop(
     )
     monkeypatch.setitem(sys.modules, "lightop", lightop)
 
-    cache = torch.zeros((2, 4, 8), dtype=torch.float32)
+    cache = torch.zeros((2, 4, 8), dtype=torch.uint8)
     cos_sin_cache = torch.arange(16, dtype=torch.float32)
     attn = SimpleNamespace(
         n_local_heads=2,
@@ -211,3 +211,42 @@ def test_dspark_context_insert_uses_only_non_pcp_lightop(
     assert rope is cos_sin_cache
     assert eps == 1e-6
     assert block == 4
+
+
+def test_dspark_context_insert_delegates_non_uint8_cache_upstream(
+    dspark_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        dspark_module._dspark,
+        "_insert_context_kv",
+        lambda *args: fallback_calls.append(args),
+    )
+    lightop = ModuleType("lightop")
+    lightop.op = SimpleNamespace(
+        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert=(
+            lambda *_args: pytest.fail("uint8 LightOp used for BF16 cache")
+        )
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+
+    attn = SimpleNamespace(
+        n_local_heads=2,
+        head_dim=8,
+        eps=1e-6,
+        rotary_emb=SimpleNamespace(
+            cos_sin_cache=torch.arange(16, dtype=torch.float32)
+        ),
+        swa_cache_layer=SimpleNamespace(
+            kv_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            block_size=4,
+        ),
+    )
+    kv = torch.ones((3, 8), dtype=torch.bfloat16)
+    positions = torch.tensor([0, 1, 2], dtype=torch.int32)
+    slot_mapping = torch.tensor([4, 5, 6], dtype=torch.int64)
+
+    dspark_module._insert_context_kv(attn, kv, positions, slot_mapping)
+
+    assert fallback_calls == [(attn, kv, positions, slot_mapping)]

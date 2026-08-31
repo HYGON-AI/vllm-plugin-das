@@ -170,6 +170,15 @@ class DSparkDeepseekV4Model(_dspark.DSparkDeepseekV4Model):
 def _insert_context_kv(attn, kv, positions, slot_mapping) -> None:
     """Insert DSpark context KV using the non-PCP HCU fused cache op."""
 
+    swa_cache = attn.swa_cache_layer.kv_cache
+    if swa_cache.dtype != torch.uint8:
+        return _dspark._insert_context_kv(
+            attn,
+            kv,
+            positions,
+            slot_mapping,
+        )
+
     import lightop
 
     num_tokens = kv.shape[0]
@@ -178,7 +187,6 @@ def _insert_context_kv(attn, kv, positions, slot_mapping) -> None:
         dtype=kv.dtype,
         device=kv.device,
     )
-    swa_cache = attn.swa_cache_layer.kv_cache
     lightop.op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         dummy_q,
         kv,
