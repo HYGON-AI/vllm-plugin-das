@@ -109,7 +109,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(get_weights)
     def hcu_get_expert_weights(self):
-        if getattr(self, "_dsv4_channel_fp8_deepgemm_repacked", False):
+        if getattr(self, "_dsv4_channel_deepgemm_repacked", False):
             names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
             weights = [getattr(self, name, None) for name in names]
             if all(weight is not None for weight in weights):

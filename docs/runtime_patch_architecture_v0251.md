@@ -220,15 +220,16 @@ not substitute for it. Every consumer must observe the same final
 
 ### 6.2 Channel quantization ownership
 
-The accepted v0.25.1 Channel-FP8 product route keeps the target release's Triton
-implementations as the compute owners:
+The accepted v0.25.1 Channel-FP8 product route keeps the target release's
+public backend selection as the pure-TP compute owner:
 
 - compressed-tensors selects
   `ChannelWiseTorchFP8ScaledMMLinearKernel` for Channel-FP8 linear layers;
 - the HCU scaled-mm boundary validates HCU layout and metadata, then delegates
   the dense calculation to target vLLM `triton_scaled_mm`;
-- FP8 MoE uses the target `TRITON Fp8 MoE backend`;
-- an explicit AITER FP8-MoE selection is not the supported product route.
+- pure-TP FP8 MoE explicitly selects the target `triton` or `aiter` backend;
+- non-DeepEP `auto` delegates to the target vLLM oracle;
+- DP+EP `deepep_auto` selects the HCU contiguous/masked DeepGEMM experts.
 
 `patch_scaled_mm_linear_kernel.py` adds the narrow prequantized-input bridge to
 the reviewed target kernel. A supplied `(quantized_activation, scale)` pair
@@ -237,9 +238,10 @@ scaled-mm owner. The adapter reports this capability only on the reviewed HCU
 Channel-FP8 target class; unsupported kernels keep upstream behavior or fail at
 the compatibility gate instead of consuming the tuple silently.
 
-Channel-INT8 remains a separate contract. Its accepted route is
-SlimQuant/compressed-tensors Marlin with `moe_w8a8_channel` PERCHANNEL UP and
-DOWN kernels; Block/PERBLOCK fallback is not equivalent.
+Channel-INT8 remains a separate contract. Pure TP supports the target Triton
+backend and the HCU explicit-AITER extension; DP+EP uses the HCU
+contiguous/masked DeepGEMM experts. Block/PERBLOCK fallback is not equivalent
+to the reviewed channel/token W8A8 route.
 
 ### 6.3 Dynamic-shape and custom-op boundaries
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+from vllm_hcu.deepseek_v4_runtime import model_architectures
 from vllm_hcu.patch.config import get_hcu_config
 
 from ._common import (
@@ -27,6 +28,7 @@ TARGETS = (
     f"{TARGET_MODULE}.convert_to_int8_moe_kernel_format",
     f"{TARGET_MODULE}.make_int8_moe_quant_config",
     f"{TARGET_MODULE}.int8_w8a8_moe_quant_config",
+    f"{TARGET_MODULE}.make_int8_moe_kernel",
 )
 _MARKER = "_vllm_hcu_int8_aiter_oracle_applied"
 
@@ -38,6 +40,15 @@ def _sidecar_config(config):
     if vllm_config is None:
         vllm_config = getattr(config, "_hcu_vllm_config", None)
     return get_hcu_config(vllm_config)
+
+
+def _model_architectures(config) -> tuple[str, ...]:
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        vllm_config = getattr(config, "_hcu_vllm_config", None)
+    return model_architectures(vllm_config)
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -64,6 +75,13 @@ def apply_to_module(module: ModuleType) -> bool:
         "int8_w8a8_moe_quant_config",
         TARGETS[6],
     )
+    make_kernel = require_callable(target, "make_int8_moe_kernel", TARGETS[7])
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kInt8DynamicTokenSym,
+        kInt8StaticChannelSym,
+    )
+
+    channel_int8_scheme = (kInt8StaticChannelSym, kInt8DynamicTokenSym)
     require_parameter_names(backend_to_cls, TARGETS[1], ("backend",))
     require_parameter_names(map_backend, TARGETS[2], ("runner_backend",))
     require_parameter_names(
@@ -88,6 +106,18 @@ def apply_to_module(module: ModuleType) -> bool:
             "w1_bias",
             "w2_bias",
             "per_act_token_quant",
+            "layer",
+        ),
+    )
+    require_parameter_names(
+        make_kernel,
+        TARGETS[7],
+        (
+            "int8_backend",
+            "moe_quant_config",
+            "moe_config",
+            "experts_cls",
+            "routing_tables",
             "layer",
         ),
     )
@@ -134,10 +164,33 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_select_int8_moe_backend(config, weight_key, activation_key):
         sidecar = _sidecar_config(config)
         if sidecar.deepep_auto:
-            raise ValueError(
-                "INT8 with deepep_auto is not supported; it requires a "
-                "dedicated Auto INT8 experts factory"
+            architectures = _model_architectures(config)
+            if "DeepseekV4ForCausalLM" not in architectures:
+                raise ValueError(
+                    "HCU Channel-INT8 deepep_auto is validated only for "
+                    "DeepSeek-V4; use an explicit DeepEP high-throughput or "
+                    "low-latency backend for other models. "
+                    f"Got architectures={architectures!r}."
+                )
+            if sidecar.moe_backend not in ("auto", "deep_gemm"):
+                raise ValueError(
+                    "deepep_auto requires moe_backend='auto' or 'deep_gemm'"
+                )
+            if getattr(config, "moe_backend", "auto") != sidecar.moe_backend:
+                raise ValueError(
+                    "deepep_auto requires the official FusedMoEConfig "
+                    f"moe_backend to match {sidecar.moe_backend!r}"
+                )
+            if (weight_key, activation_key) != channel_int8_scheme:
+                raise ValueError(
+                    "deepep_auto HCU DeepGEMM supports only channel-wise "
+                    "INT8 weights with dynamic per-token INT8 activations"
+                )
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                DeepEPDeepGemmContiguousExperts,
             )
+
+            return hcu_enum.HCU_DEEPGEMM, DeepEPDeepGemmContiguousExperts
         if sidecar.moe_backend != "deep_gemm":
             return select_backend(config, weight_key, activation_key)
         if getattr(config, "moe_backend", "auto") != "deep_gemm":
@@ -184,14 +237,15 @@ def apply_to_module(module: ModuleType) -> bool:
                     "HCU DeepGEMM INT8 weight conversion requires the MoE layer "
                     "to select its masked or contiguous weight layout"
                 )
+            parallel_config = layer.moe_config.moe_parallel_config
+            if getattr(parallel_config, "use_deepep_auto_kernels", False):
+                return w13, w2
             from deepgemm import (
                 marlin_i8_contiguous_weight,
                 marlin_i8_masked_weight,
             )
 
-            use_batched = bool(
-                layer.moe_config.moe_parallel_config.use_batched_activation_format
-            )
+            use_batched = bool(parallel_config.use_batched_activation_format)
             pack_weight = (
                 marlin_i8_masked_weight
                 if use_batched
@@ -224,6 +278,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 w1_bias=w1_bias,
                 w2_bias=w2_bias,
                 per_act_token_quant=True,
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
             )
         return make_quant_config(
             int8_backend=int8_backend,
@@ -237,6 +292,53 @@ def apply_to_module(module: ModuleType) -> bool:
             layer=layer,
         )
 
+    @functools.wraps(make_kernel)
+    def hcu_make_int8_moe_kernel(
+        int8_backend,
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        routing_tables=None,
+        layer=None,
+    ):
+        if getattr(
+            moe_config.moe_parallel_config,
+            "use_deepep_auto_kernels",
+            False,
+        ):
+            if int8_backend != hcu_enum.HCU_DEEPGEMM:
+                raise ValueError(
+                    "deepep_auto currently supports only the "
+                    f"HCU_DEEPGEMM INT8 backend, got {int8_backend.value}"
+                )
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                make_deepep_auto_deepgemm_int8_moe_kernel,
+            )
+
+            moe_kernel = make_deepep_auto_deepgemm_int8_moe_kernel(
+                moe_quant_config=moe_quant_config,
+                moe_config=moe_config,
+                routing_tables=routing_tables,
+            )
+            fused_experts = getattr(moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            process = getattr(experts, "process_weights_after_loading", None)
+            if layer is None or not callable(process):
+                raise RuntimeError(
+                    "deepep_auto HCU DeepGEMM INT8 kernel did not construct "
+                    "modular experts before weight postprocessing"
+                )
+            process(layer)
+            return moe_kernel
+        return make_kernel(
+            int8_backend,
+            moe_quant_config,
+            moe_config,
+            experts_cls,
+            routing_tables,
+            layer,
+        )
+
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls
     target._vllm_hcu_original_map_int8_backend = map_backend
@@ -247,6 +349,8 @@ def apply_to_module(module: ModuleType) -> bool:
     target.convert_to_int8_moe_kernel_format = hcu_convert_to_int8_moe_kernel_format
     target._vllm_hcu_original_make_int8_moe_quant_config = make_quant_config
     target.make_int8_moe_quant_config = hcu_make_int8_moe_quant_config
+    target._vllm_hcu_original_make_int8_moe_kernel = make_kernel
+    target.make_int8_moe_kernel = hcu_make_int8_moe_kernel
     setattr(target, _MARKER, True)
     return True
 

@@ -165,6 +165,7 @@ def apply_to_module(module: ModuleType) -> bool:
         gather_indexes_tensor=None,
         enable_lightly_cp=False,
         enable_lightly_cplb=False,
+        deepep_auto_is_prefilling=None,
     ):
         deepep_auto = get_hcu_config(vllm_config).deepep_auto
         low_latency = (
@@ -213,6 +214,8 @@ def apply_to_module(module: ModuleType) -> bool:
                     num_tokens,
                     num_tokens_across_dp,
                     batch_descriptor,
+                    attn_metadata,
+                    deepep_auto_is_prefilling,
                 )
             ),
         )

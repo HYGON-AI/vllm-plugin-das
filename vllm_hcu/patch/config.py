@@ -57,9 +57,9 @@ def normalize_hcu_moe_backend(value: Any) -> Any:
 class HcuFeatureConfig:
     """Normalized HCU-specific switches.
 
-    ``moe_backend='auto'`` means that no HCU DeepGEMM implementation was
-    selected.  The explicit ``deep_gemm`` value mirrors vLLM's official
-    backend selection so the HCU worker can install its compatible kernels.
+    ``moe_backend='auto'`` delegates non-DeepEP selection to vLLM's normal
+    oracle. The explicit ``deep_gemm`` value mirrors vLLM's official backend
+    request; ``deepep_auto`` owns the HCU Channel-FP8/INT8 specialization.
     """
 
     enable_lightly_cp: bool = False

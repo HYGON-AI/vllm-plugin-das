@@ -4262,6 +4262,12 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        deepep_auto_is_prefilling = None
+        if self.hcu_feature_config.deepep_auto:
+            deepep_auto_is_prefilling = (
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
+            )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4276,7 +4282,8 @@ class GPUModelRunner(
                 scatter_indexes_tensor=scatter_indexes_tensor,
                 gather_indexes_tensor=gather_indexes_tensor,
                 enable_lightly_cp=self.enable_lightly_cp and num_tokens_unpadded > self.lightly_cp_threshold,
-                enable_lightly_cplb=self.enable_lightly_cplb
+                enable_lightly_cplb=self.enable_lightly_cplb,
+                deepep_auto_is_prefilling=deepep_auto_is_prefilling,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -5741,6 +5748,17 @@ class GPUModelRunner(
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
+            deepep_auto_is_prefilling = None
+            if self.hcu_feature_config.deepep_auto:
+                if uniform_decode:
+                    deepep_auto_is_prefilling = torch.zeros(
+                        num_reqs, dtype=torch.bool
+                    )
+                elif create_mixed_batch:
+                    deepep_auto_is_prefilling = torch.tensor(
+                        [False] * num_decode_tokens + [True],
+                        dtype=torch.bool,
+                    )
             model_kwargs = self._init_model_kwargs()
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
@@ -5799,6 +5817,7 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    deepep_auto_is_prefilling=deepep_auto_is_prefilling,
                 ),
             ):
                 outputs = self.model(

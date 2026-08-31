@@ -92,6 +92,36 @@ def test_hcu_runner_uses_v0251_routed_experts_contract():
     assert all(name in source for name in required_v0251_api)
 
 
+def test_hcu_runner_passes_request_phase_to_deepep_auto_selector():
+    source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+
+    def context_calls(method_name: str) -> list[ast.Call]:
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
+        )
+        return [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set_forward_context"
+        ]
+
+    execute_calls = context_calls("execute_model")
+    dummy_calls = context_calls("_dummy_run")
+    assert execute_calls and dummy_calls
+    for call in (*execute_calls, *dummy_calls):
+        assert "deepep_auto_is_prefilling" in {
+            keyword.arg for keyword in call.keywords
+        }
+
+
 def test_hcu_runner_uses_v0251_kv_block_zeroer_constructor_contract():
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
         encoding="utf-8-sig"
@@ -568,6 +598,47 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
     assert created == [("cpu-group", "tcp")]
 
 
+def test_cuda_communicator_auto_ignores_non_ep_collective_groups(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.config
+
+    config = _config(deepep_auto=True)
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config_or_none", lambda: config
+    )
+
+    class CudaCommunicator:
+        def __init__(
+            self,
+            cpu_group,
+            device=None,
+            device_group=None,
+            unique_name="",
+            global_ranks=None,
+            global_world_size=None,
+            tcp_store_group=None,
+        ):
+            del (
+                device,
+                device_group,
+                global_ranks,
+                global_world_size,
+                tcp_store_group,
+            )
+            self.cpu_group = cpu_group
+            self.use_all2all = unique_name.split(":")[0] == "ep"
+            self.all2all_manager = "official-collective"
+
+    module = _module(
+        patch_cuda_communicator.TARGET_MODULE,
+        CudaCommunicator=CudaCommunicator,
+    )
+    assert patch_cuda_communicator.apply_to_module(module)
+    communicator = module.CudaCommunicator("cpu-group", unique_name="dp:0")
+    assert communicator.all2all_manager == "official-collective"
+
+
 @dataclasses.dataclass
 class _Function:
     name: str
@@ -781,7 +852,7 @@ def test_forward_context_keeps_dataclass_and_attaches_runtime_fields(
         assert value == "hcu"
 
 
-def test_deepep_auto_forward_mode_uses_uniform_descriptor_then_token_fallback():
+def test_deepep_auto_forward_mode_requires_decode_phase_evidence():
     from vllm_hcu.forward_context_runtime import (
         choose_deepep_auto_low_latency,
     )
@@ -790,19 +861,265 @@ def test_deepep_auto_forward_mode_uses_uniform_descriptor_then_token_fallback():
     config.scheduler_config = SimpleNamespace(max_num_seqs=8)
     config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
 
-    assert choose_deepep_auto_low_latency(
+    assert not choose_deepep_auto_low_latency(
         config, 512, None, SimpleNamespace(uniform=True)
+    )
+    from vllm_hcu.forward_context_runtime import (
+        deepep_auto_request_phase_scope,
+        set_deepep_auto_request_phase,
+    )
+
+    with deepep_auto_request_phase_scope():
+        set_deepep_auto_request_phase(torch.tensor([False]))
+        assert choose_deepep_auto_low_latency(
+            config,
+            1,
+            None,
+            SimpleNamespace(uniform=True),
+            SimpleNamespace(max_query_len=1, max_seq_len=100),
+        )
+    assert choose_deepep_auto_low_latency(
+        config,
+        1,
+        None,
+        SimpleNamespace(uniform=True),
+        SimpleNamespace(max_query_len=1, max_seq_len=100),
+        torch.tensor([False]),
     )
     assert not choose_deepep_auto_low_latency(
         config, 1, None, SimpleNamespace(uniform=False)
     )
-    assert choose_deepep_auto_low_latency(config, 32, None, None)
+    assert not choose_deepep_auto_low_latency(config, 32, None, None)
     assert not choose_deepep_auto_low_latency(config, 33, None, None)
-    assert choose_deepep_auto_low_latency(
+    assert not choose_deepep_auto_low_latency(
         config, None, torch.tensor([4, 32, 16]), None
     )
     assert not choose_deepep_auto_low_latency(
         config, None, torch.tensor([4, 33, 16]), None
+    )
+
+
+def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
+    from vllm_hcu.forward_context_runtime import choose_deepep_auto_low_latency
+
+    config = _config(deepep_auto=True)
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8)
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+    )
+
+    assert not choose_deepep_auto_low_latency(
+        config,
+        512,
+        None,
+        SimpleNamespace(uniform=False),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        8,
+        None,
+        SimpleNamespace(uniform=True),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        2,
+        None,
+        SimpleNamespace(uniform=True),
+        SimpleNamespace(max_query_len=2, max_seq_len=100),
+        torch.tensor([True]),
+    )
+    assert not choose_deepep_auto_low_latency(config, 64, None, None)
+    assert not choose_deepep_auto_low_latency(config, 65, None, None)
+    decode_metadata = {
+        "model.layers.0.self_attn": SimpleNamespace(
+            max_query_len=8,
+            max_seq_len=128,
+            is_prefilling=torch.tensor([False]),
+        )
+    }
+    assert choose_deepep_auto_low_latency(
+        config,
+        256,
+        None,
+        SimpleNamespace(uniform=False),
+        decode_metadata,
+        torch.tensor([False]),
+    )
+    prefill_metadata = SimpleNamespace(
+        max_query_len=8,
+        max_seq_len=8,
+        is_prefilling=torch.tensor([True]),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        8,
+        None,
+        SimpleNamespace(uniform=False),
+        prefill_metadata,
+        torch.tensor([True]),
+    )
+
+    mixed_metadata = {
+        "prefill": SimpleNamespace(
+            max_query_len=2,
+            max_seq_len=100,
+            is_prefilling=torch.tensor([True]),
+        ),
+        "decode": SimpleNamespace(
+            max_query_len=1,
+            max_seq_len=128,
+            is_prefilling=torch.tensor([False]),
+        ),
+    }
+    assert not choose_deepep_auto_low_latency(
+        config,
+        16,
+        None,
+        SimpleNamespace(uniform=False),
+        mixed_metadata,
+        torch.tensor([True, False]),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        2,
+        None,
+        SimpleNamespace(uniform=False),
+        SimpleNamespace(max_query_len=2, max_seq_len=100),
+        torch.tensor([True]),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        2,
+        None,
+        SimpleNamespace(uniform=False),
+        SimpleNamespace(max_query_len=2, max_seq_len=100),
+    )
+    assert choose_deepep_auto_low_latency(
+        config,
+        1,
+        None,
+        SimpleNamespace(uniform=False),
+        SimpleNamespace(max_query_len=1, max_seq_len=100),
+        torch.tensor([False]),
+    )
+
+
+def test_dspark_deepep_auto_uses_dp_global_phase_on_empty_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_hcu.forward_context_runtime as runtime
+
+    choose_deepep_auto_low_latency = runtime.choose_deepep_auto_low_latency
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=8)
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8)
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+    )
+    nonuniform = SimpleNamespace(uniform=False)
+    decode_tokens = torch.tensor([8, 0, 0, 0, 0, 0, 0, 0])
+
+    synchronized_phase = True
+    local_evidence: list[tuple[bool, bool]] = []
+
+    def synchronize_phase(
+        _config: object,
+        *,
+        local_active: bool,
+        local_decode: bool,
+    ) -> bool:
+        local_evidence.append((local_active, local_decode))
+        return synchronized_phase
+
+    monkeypatch.setattr(
+        runtime,
+        "_synchronize_deepep_auto_phase",
+        synchronize_phase,
+        raising=False,
+    )
+
+    # The active and seven empty ranks must select the same DeepEP collective.
+    assert choose_deepep_auto_low_latency(
+        config,
+        8,
+        decode_tokens,
+        nonuniform,
+        SimpleNamespace(max_query_len=8, max_seq_len=128),
+        torch.tensor([False]),
+    )
+    assert choose_deepep_auto_low_latency(
+        config,
+        0,
+        decode_tokens,
+        nonuniform,
+        None,
+    )
+    assert local_evidence == [(True, True), (False, False)]
+
+    synchronized_phase = False
+    local_evidence.clear()
+    short_prefill_tokens = torch.tensor([8, 0, 0, 0, 0, 0, 0, 0])
+    assert not choose_deepep_auto_low_latency(
+        config,
+        8,
+        short_prefill_tokens,
+        nonuniform,
+        SimpleNamespace(max_query_len=8, max_seq_len=8),
+        torch.tensor([True]),
+    )
+    assert not choose_deepep_auto_low_latency(
+        config,
+        0,
+        short_prefill_tokens,
+        nonuniform,
+        None,
+    )
+    assert local_evidence == [(True, False), (False, False)]
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "expected"),
+    [("kv_producer", False), ("kv_consumer", True)],
+)
+def test_dspark_mooncake_pd_role_skips_dynamic_phase_collective(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_role: str,
+    expected: bool,
+):
+    import vllm_hcu.forward_context_runtime as runtime
+
+    config = _config(deepep_auto=True)
+    config.parallel_config = SimpleNamespace(data_parallel_size=4)
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+    )
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MooncakeConnector",
+        kv_role=kv_role,
+    )
+    config.model_config = SimpleNamespace(
+        architectures=["DeepseekV4ForCausalLM"]
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_synchronize_deepep_auto_phase",
+        lambda *args, **kwargs: pytest.fail(
+            "role-fixed Mooncake P/D must not add a DP collective"
+        ),
+    )
+
+    assert (
+        runtime.choose_deepep_auto_low_latency(
+            config,
+            8,
+            torch.tensor([8, 0, 0, 0]),
+            SimpleNamespace(uniform=expected),
+        )
+        is expected
     )
 
 

@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: deepseek_v4_flash_0731_dspark_mooncake_pd_humaneval
+model: /models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+served_model_name: DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+
+pd:
+  host: 127.0.0.1
+  proxy_port: 10140
+  startup_timeout_s: 7200
+  shutdown_timeout_s: 30
+  common_args:
+    - --trust-remote-code
+    - --kv-cache-dtype
+    - fp8
+    - --block-size
+    - "256"
+    - --tokenizer-mode
+    - deepseek_v4
+    - --distributed-executor-backend
+    - mp
+    - --max-model-len
+    - "4096"
+    - --max-num-seqs
+    - "8"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --tensor-parallel-size
+    - "1"
+    - --data-parallel-size
+    - "4"
+    - --enable-expert-parallel
+    - --all2all-backend
+    - deepep_auto
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+  environment:
+    VLLM_LOGGING_LEVEL: DEBUG
+  prefill:
+    port: 10141
+    bootstrap_port: 18998
+    data_parallel_rpc_port: 29551
+    data_parallel_master_port: 29561
+    visible_devices: "0,1,2,3"
+    args:
+      - --max-num-batched-tokens
+      - "512"
+      - --kv-transfer-config
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"rdma"}}'
+  decode:
+    port: 10142
+    bootstrap_port: 18999
+    data_parallel_rpc_port: 29552
+    data_parallel_master_port: 29562
+    visible_devices: "4,5,6,7"
+    args:
+      - --max-num-batched-tokens
+      - "64"
+      - --kv-transfer-config
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"rdma"}}'
+
+evalscope:
+  api_key: EMPTY
+  eval_type: openai_api
+  generation_config:
+    temperature: 0
+    do_sample: false
+    max_tokens: 2048
+    extra_body:
+      chat_template_kwargs:
+        thinking: false
+  stream: true
+  eval_batch_size: 1
+  timeout: 7200
+  limit: 32
+  datasets:
+    - humaneval
+  dataset_args:
+    humaneval: {}
+  pass_criteria:
+    dataset: humaneval
+    num_predictions: 32
+    num_reviews: 32
+    normalize_code_fences: true
+    mean_acc: 1.0
+    mean_acc_pass@1: 1.0
+  no_timestamp: true
+
+profiles:
+  fp8:
+    model: /models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+    served_model_name: DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/deepseek_v4_fp8_dspark_mooncake_pd
+
+  int8:
+    model: /models/DeepSeek-V4-Flash-0731-Channel-INT8-w8a8
+    served_model_name: DeepSeek-V4-Flash-0731-Channel-INT8-w8a8
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/deepseek_v4_int8_dspark_mooncake_pd

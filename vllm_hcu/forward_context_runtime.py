@@ -6,7 +6,35 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
+
+
+_DEEPEP_AUTO_REQUEST_PHASE: ContextVar[list[object | None] | None] = ContextVar(
+    "vllm_hcu_deepep_auto_request_phase", default=None
+)
+
+
+@contextmanager
+def deepep_auto_request_phase_scope():
+    """Keep Model Runner V2 phase evidence local to one invocation."""
+
+    token = _DEEPEP_AUTO_REQUEST_PHASE.set([None])
+    try:
+        yield
+    finally:
+        _DEEPEP_AUTO_REQUEST_PHASE.reset(token)
+
+
+def set_deepep_auto_request_phase(is_prefilling: object) -> None:
+    phase_holder = _DEEPEP_AUTO_REQUEST_PHASE.get()
+    if phase_holder is not None:
+        phase_holder[0] = is_prefilling
+
+
+def get_deepep_auto_request_phase() -> object | None:
+    phase_holder = _DEEPEP_AUTO_REQUEST_PHASE.get()
+    return None if phase_holder is None else phase_holder[0]
 
 
 def attach_hcu_context_fields(
@@ -35,6 +63,8 @@ def choose_deepep_auto_low_latency(
     num_tokens: int | None,
     num_tokens_across_dp: object | None,
     batch_descriptor: object | None,
+    attn_metadata: object | None = None,
+    is_prefilling: object | None = None,
 ) -> bool:
     """Choose LL for uniform decode and HT for prefill/mixed batches."""
 
@@ -42,28 +72,135 @@ def choose_deepep_auto_low_latency(
 
     if not get_hcu_config(vllm_config).deepep_auto:
         return False
-    if batch_descriptor is not None:
-        return bool(getattr(batch_descriptor, "uniform", False))
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
+        dspark_mooncake_pd_use_low_latency,
+    )
 
-    # Draft/profiling forwards do not always carry BatchDescriptor. Preserve
-    # the bounded-token fallback at this boundary, using the target scheduler
-    # and speculative configuration rather than runner globals.
-    if num_tokens_across_dp is None:
-        max_num_tokens = int(num_tokens or 0)
-    else:
-        maximum = getattr(num_tokens_across_dp, "max", None)
-        if not callable(maximum):
-            raise TypeError("num_tokens_across_dp must expose max()")
-        value = maximum()
-        item = getattr(value, "item", None)
-        max_num_tokens = int(item() if callable(item) else value)
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0))
+    fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
+    if fixed_use_low_latency is not None:
+        return fixed_use_low_latency
+    # Backend-specific attention metadata does not consistently retain
+    # CommonAttentionMetadata.is_prefilling.  Require the runner's explicit
+    # per-request phase vector instead of inferring phase from query lengths.
+    if is_prefilling is None:
+        is_prefilling = get_deepep_auto_request_phase()
+    explicit_decode = _is_explicitly_non_prefilling(is_prefilling)
+    local_decode = explicit_decode and (
+        bool(
+            batch_descriptor is not None
+            and getattr(batch_descriptor, "uniform", False)
+        )
+        or _attention_metadata_is_pure_spec_decode(vllm_config, attn_metadata)
+    )
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    data_parallel_size = int(
+        getattr(parallel_config, "data_parallel_size", 1)
+    )
+    if data_parallel_size > 1:
+        # Token counts cannot distinguish a short prefill from a short decode.
+        # Synchronize phase evidence so every EP participant enters the same
+        # DeepEP collective; ranks with no local tokens are neutral.
+        return _synchronize_deepep_auto_phase(
+            vllm_config,
+            local_active=int(num_tokens or 0) > 0,
+            local_decode=local_decode,
+        )
+
+    # Missing descriptor/metadata is not proof of decode. HT is safe for draft
+    # and profiling forwards, while a token-count guess can send short prefills
+    # through the masked LL path.
+    return local_decode
+
+
+def _synchronize_deepep_auto_phase(
+    vllm_config: object,
+    *,
+    local_active: bool,
+    local_decode: bool,
+) -> bool:
+    """Return true only when every active DP rank reports pure decode."""
+
+    import torch
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_dp_group
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    dp_group = get_dp_group()
+    device = dp_group.device
+    process_group = dp_group.device_group
+    if bool(
+        getattr(parallel_config, "disable_nccl_for_dp_synchronization", False)
+    ):
+        device = "cpu"
+        process_group = dp_group.cpu_group
+
+    evidence = torch.tensor(
+        [int(local_active), int(local_active and local_decode)],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(evidence, group=process_group)
+    active_ranks, decode_ranks = (int(value) for value in evidence.cpu().tolist())
+    return active_ranks > 0 and decode_ranks == active_ranks
+
+
+def _attention_metadata_is_pure_spec_decode(
+    vllm_config: object,
+    attn_metadata: object | None,
+) -> bool:
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    num_speculative_tokens = int(
+    max_decode_query = 1 + int(
         getattr(speculative_config, "num_speculative_tokens", 0) or 0
     )
-    return max_num_tokens <= max_num_seqs * (1 + num_speculative_tokens)
+    if max_decode_query <= 1 or attn_metadata is None:
+        return False
+    pending = [attn_metadata]
+    seen: set[int] = set()
+    found_attention_metadata = False
+    while pending:
+        metadata = pending.pop()
+        identity = id(metadata)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(metadata, dict):
+            pending.extend(metadata.values())
+            continue
+        if isinstance(metadata, (list, tuple)):
+            pending.extend(metadata)
+            continue
+        max_query_len = getattr(metadata, "max_query_len", None)
+        max_seq_len = getattr(metadata, "max_seq_len", None)
+        if max_query_len is None or max_seq_len is None:
+            continue
+        found_attention_metadata = True
+        max_query_len = int(max_query_len)
+        max_seq_len = int(max_seq_len)
+        if not (
+            0 < max_query_len <= max_decode_query
+            and max_seq_len > max_query_len
+        ):
+            return False
+    return found_attention_metadata
+
+
+def _is_explicitly_non_prefilling(value: object | None) -> bool:
+    """Return true only for non-empty phase evidence containing only false."""
+
+    if value is None:
+        return False
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            value = tolist()
+        except (TypeError, ValueError):
+            return False
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(
+            _is_explicitly_non_prefilling(item) for item in value
+        )
+    return isinstance(value, bool) and not value
 
 
 @contextmanager

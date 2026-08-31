@@ -9,6 +9,7 @@ import inspect
 from types import ModuleType
 from typing import Any
 
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
@@ -186,10 +187,31 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     return True
 
 
+def _validate_dspark_pd_scope(vllm_config: object) -> None:
+    """Allow only the validated DeepSeek-V4 Mooncake DSpark P/D path."""
+
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    connector = getattr(kv_transfer_config, "kv_connector", None)
+    if not is_dspark_enabled(vllm_config) or connector is None:
+        return
+
+    if connector == "MooncakeConnector" and is_deepseek_v4(vllm_config):
+        return
+    architectures = getattr(
+        getattr(vllm_config, "model_config", None), "architectures", ()
+    )
+    raise ValueError(
+        "DeepSeek-V4 DSpark P/D disaggregation on HCU supports only "
+        f"MooncakeConnector; got connector={connector!r}, "
+        f"architectures={architectures!r}."
+    )
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
     _validate_hcu_pcp_scope(vllm_config)
+    _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
     updates: dict[str, str] = {}
     if feature_config.hcu_flash_attn_mode is None:
@@ -228,6 +250,17 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             raise ValueError(
                 "deepep_auto with EPLB is not supported because the HT and "
                 "LL expert weight layouts cannot be rebalanced atomically"
+            )
+        if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
+            raise ValueError("HCU deepep_auto requires data_parallel_size > 1.")
+        if not getattr(parallel_config, "enable_expert_parallel", False):
+            raise ValueError(
+                "HCU deepep_auto requires enable_expert_parallel=True."
+            )
+        if bool(getattr(parallel_config, "use_ubatching", False)):
+            raise ValueError(
+                "deepep_auto with ubatching is not supported because HT/LL "
+                "delegate selection is not invocation-local"
             )
         if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(

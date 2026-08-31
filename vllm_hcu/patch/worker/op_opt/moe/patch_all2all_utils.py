@@ -72,6 +72,11 @@ def apply_to_module(module: ModuleType) -> bool:
                     "DeepEP auto requires DeepEPAutoAll2AllManager"
                 )
             assert moe.dp_size == all2all_manager.dp_world_size
+            if moe.num_experts % all2all_manager.world_size != 0:
+                raise ValueError(
+                    "deepep_auto requires num_experts to be divisible by the "
+                    "EP world size"
+                )
             global_to_physical = None
             physical_to_global = None
             local_expert_global_ids = None
@@ -103,6 +108,11 @@ def apply_to_module(module: ModuleType) -> bool:
             use_fp8_dispatch = (
                 quant_config.quant_dtype == target.current_platform.fp8_dtype()
             )
+            use_int8_dispatch = quant_config.quant_dtype == target.torch.int8
+            if use_fp8_dispatch and use_int8_dispatch:
+                raise RuntimeError(
+                    "DeepEP auto cannot enable FP8 and INT8 dispatch together"
+                )
             ht_prepare_finalize = target.DeepEPHTPrepareAndFinalize(
                 handle,
                 num_dispatchers=all2all_manager.world_size,
@@ -116,17 +126,21 @@ def apply_to_module(module: ModuleType) -> bool:
                 max_tokens_per_rank=max_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
+                use_int8_dispatch=use_int8_dispatch,
                 global_to_physical=global_to_physical,
                 physical_to_global=physical_to_global,
                 local_expert_global_ids=local_expert_global_ids,
             )
-            from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
-                DeepEPAutoPrepareAndFinalize,
+            from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+                deepep_auto,
             )
 
-            return DeepEPAutoPrepareAndFinalize(
+            return deepep_auto.DeepEPAutoPrepareAndFinalize(
                 ht_prepare_finalize,
                 ll_prepare_finalize,
+                fixed_use_low_latency=(
+                    deepep_auto.dspark_mooncake_pd_use_low_latency(vllm_config)
+                ),
             )
 
         prepare_finalize = original(
