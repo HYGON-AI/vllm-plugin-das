@@ -75,6 +75,23 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             assert batch_desc == "batch-desc"
             return self.global_batch
 
+        def execute_model(
+            self,
+            scheduler_output,
+            intermediate_tensors=None,
+            dummy_run=False,
+            skip_attn_for_dummy_run=False,
+            is_profile=False,
+        ):
+            events.append("super.execute_model")
+            return (
+                scheduler_output,
+                intermediate_tensors,
+                dummy_run,
+                skip_attn_for_dummy_run,
+                is_profile,
+            )
+
         def prepare_attn(self, input_batch):
             events.append("super.prepare_attn")
             return ("global-blocks", input_batch), "global-slots"
@@ -141,8 +158,12 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     """Moving partition or restore across its upstream boundary is a bug."""
 
     runner_module, events = pcp_runner_module
-    global_batch = object()
-    local_batch = object()
+    global_batch = SimpleNamespace(
+        is_prefilling_np=np.array([True], dtype=np.bool_)
+    )
+    local_batch = SimpleNamespace(
+        is_prefilling_np=np.array([True], dtype=np.bool_)
+    )
     global_hidden = object()
     local_hidden = object()
     synchronized_batches: list[object] = []
@@ -424,7 +445,9 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     """PCP=1 must not call a manager helper or bypass an upstream method."""
 
     runner_module, events = pcp_runner_module
-    global_batch = object()
+    global_batch = SimpleNamespace(
+        is_prefilling_np=np.array([False], dtype=np.bool_)
+    )
     hidden_states = object()
 
     def unexpected_builder(*args):
