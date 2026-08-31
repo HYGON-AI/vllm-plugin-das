@@ -14,6 +14,16 @@ from typing import Any
 
 import torch
 
+from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+    AiterMoeProblem,
+    aiter_expert_map_for_solution,
+    execute_aiter_moe,
+    prepare_aiter_moe_scales,
+    prepare_aiter_moe_weights,
+    select_aiter_moe_config,
+)
+from vllm_hcu.platforms import envs as henvs
+
 
 class HcuCompressedTensorsMoeError(RuntimeError):
     """An explicitly selected HCU compressed-tensors MoE path is invalid."""
@@ -43,140 +53,6 @@ def _enum_token(value: object) -> str:
         if token:
             return token
     return ""
-
-
-def _tensor_generation(tensor: torch.Tensor) -> tuple[object, ...]:
-    """Identity used to invalidate cached shuffled weights after reloads."""
-
-    return (
-        id(tensor),
-        getattr(tensor, "_version", None),
-        tuple(tensor.shape),
-        tensor.dtype,
-        tensor.device,
-    )
-
-
-def _tensor_cache(
-    tensor: torch.Tensor,
-    name: str,
-) -> dict[tuple[object, ...], object]:
-    cache = getattr(tensor, name, None)
-    if cache is None:
-        cache = {}
-        setattr(tensor, name, cache)
-    if not isinstance(cache, dict):
-        raise HcuCompressedTensorsMoeError(
-            f"AITER quantized MoE tensor cache {name!r} has an invalid type"
-        )
-    return cache
-
-
-def _get_aiter_quantized_runtime_config(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_ids: torch.Tensor,
-    quant_type: object,
-    activation: str,
-) -> object:
-    try:
-        from aiter.moe import get_aiter_moe_config
-    except Exception as exc:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE is selected, but get_aiter_moe_config is "
-            "unavailable"
-        ) from exc
-
-    cache = _tensor_cache(w1, "_hcu_aiter_quantized_config_cache")
-    cache_key = (
-        hidden_states.shape[0],
-        w1.shape[0],
-        w1.shape[1],
-        w2.shape[1],
-        w1.shape[2],
-        topk_ids.shape[1],
-        hidden_states.dtype,
-        hidden_states.device,
-        _enum_token(quant_type),
-        activation,
-    )
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    status, aiter_config = get_aiter_moe_config(
-        M=hidden_states.shape[0],
-        E=w1.shape[0],
-        N1=w1.shape[1],
-        N2=w2.shape[1],
-        K=w1.shape[2],
-        top_k=topk_ids.shape[1],
-        block_size=0,
-        dtype=hidden_states.dtype,
-        quant_type=quant_type,
-        activation=activation,
-    )
-    if not status or aiter_config is None:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE found no backend config for "
-            f"M={hidden_states.shape[0]}, E={w1.shape[0]}, "
-            f"top_k={topk_ids.shape[1]}, dtype={hidden_states.dtype}, "
-            f"quant_type={quant_type}"
-        )
-    if len(cache) >= 128:
-        cache.clear()
-    cache[cache_key] = aiter_config
-    return aiter_config
-
-
-def _get_aiter_quantized_weights(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    aiter_config: object,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not bool(getattr(aiter_config, "need_shuffle", False)):
-        return w1, w2
-
-    cache = _tensor_cache(w1, "_hcu_aiter_quantized_weight_cache")
-    cache_key = (
-        _tensor_generation(w1),
-        _tensor_generation(w2),
-        _enum_token(getattr(aiter_config, "quant_type", None)),
-        _enum_token(getattr(aiter_config, "solution_type", None)),
-    )
-    cached = cache.get(cache_key)
-    if (
-        isinstance(cached, tuple)
-        and len(cached) == 2
-        and isinstance(cached[0], torch.Tensor)
-        and isinstance(cached[1], torch.Tensor)
-    ):
-        return cached
-
-    try:
-        from aiter.moe import aiter_moe_shfl_weight
-    except Exception as exc:
-        raise HcuCompressedTensorsMoeError(
-            "AITER selected a shuffled quantized MoE solution, but "
-            "aiter_moe_shfl_weight is unavailable"
-        ) from exc
-    with torch.no_grad():
-        shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(w1, w2, aiter_config)
-    if not isinstance(shuffled_w1, torch.Tensor) or not isinstance(
-        shuffled_w2, torch.Tensor
-    ):
-        raise HcuCompressedTensorsMoeError(
-            "AITER returned missing shuffled quantized MoE weights"
-        )
-    if shuffled_w1.shape != w1.shape or shuffled_w2.shape != w2.shape:
-        raise HcuCompressedTensorsMoeError(
-            "AITER returned incompatible shuffled quantized MoE weight shapes"
-        )
-    if len(cache) >= 8:
-        cache.clear()
-    cache[cache_key] = (shuffled_w1, shuffled_w2)
-    return shuffled_w1, shuffled_w2
 
 
 def apply_aiter_quantized_moe(
@@ -224,13 +100,7 @@ def apply_aiter_quantized_moe(
             "AITER quantized MoE supports only channel/token W8A8 in this path"
         )
 
-    try:
-        from aiter.moe import MoeQuantType, aiter_moe
-    except Exception as exc:
-        raise HcuCompressedTensorsMoeError(
-            "AITER quantized MoE is selected, but the public aiter.moe API "
-            "is unavailable"
-        ) from exc
+    from aiter.moe import MoeQuantType
 
     use_fp8 = bool(getattr(quant_config, "use_fp8_w8a8", False))
     use_int8 = bool(getattr(quant_config, "use_int8_w8a8", False))
@@ -253,18 +123,66 @@ def apply_aiter_quantized_moe(
             "AITER quantized MoE requires an activation"
         )
     activation_name = str(activation_value)
-    aiter_config = _get_aiter_quantized_runtime_config(
-        hidden_states,
-        w1,
-        w2,
-        topk_ids,
-        quant_type,
-        activation_name,
+    problem = AiterMoeProblem(
+        M=int(hidden_states.shape[0]),
+        E=int(w1.shape[0]),
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=int(w1.shape[2]),
+        top_k=int(topk_ids.shape[1]),
+        block_size=0,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        quant_type=quant_type,
+        activation=activation_name,
+        use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
     )
-    prepared_w1, prepared_w2 = _get_aiter_quantized_weights(
+    aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
+    global_num_experts = getattr(vllm_moe_config, "num_experts", w1.shape[0])
+    if aiter_config is None:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl,
+        )
+
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=activation_name,
+            apply_router_weight_on_input=False,
+            use_fp8_w8a8=use_fp8,
+            use_int8_w8a8=use_int8,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=True,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=getattr(quant_config, "w1_zp", None),
+            w2_zp=getattr(quant_config, "w2_zp", None),
+            a1_scale=(
+                a1q_scale
+                if a1q_scale is not None
+                else getattr(quant_config, "a1_scale", None)
+            ),
+            a2_scale=getattr(quant_config, "a2_scale", None),
+            block_shape=None,
+        )
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
         w1,
         w2,
         aiter_config,
+        cache_owner=w1,
+    )
+    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+        w1_scale,
+        w2_scale,
+        aiter_config,
+        cache_owner=w1_scale,
     )
 
     from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
@@ -277,38 +195,26 @@ def apply_aiter_quantized_moe(
     )
     align_int8_quant = bool(use_int8 and is_asm_solution)
     align_fp8_quant = bool(use_fp8 and is_asm_solution)
-    aiter_expert_map = expert_map
-    if is_asm_solution and expert_map is not None:
-        global_num_experts = getattr(vllm_moe_config, "num_experts", None)
-        if (
-            expert_map.ndim != 1
-            or expert_map.dtype not in (torch.int32, torch.int64)
-            or (
-                isinstance(global_num_experts, int)
-                and global_num_experts > 0
-                and expert_map.numel() != global_num_experts
-            )
-        ):
-            raise HcuCompressedTensorsMoeError(
-                "AITER ASM requires a rank-1 integer expert_map matching "
-                "the global expert count"
-            )
-        aiter_expert_map = (expert_map >= 0).to(torch.int32)
+    aiter_expert_map = aiter_expert_map_for_solution(
+        expert_map,
+        aiter_config,
+        int(global_num_experts),
+    )
     with (
         aiter_asm_boltops_int8_quant_context(enabled=align_int8_quant),
         aiter_asm_boltops_fp8_quant_context(enabled=align_fp8_quant),
     ):
-        return aiter_moe(
+        return execute_aiter_moe(
+            aiter_config,
             hidden_states=hidden_states,
             w1=prepared_w1,
             w2=prepared_w2,
             topk_weights=topk_weights.to(torch.float32),
             topk_ids=topk_ids.to(torch.int32),
-            moe_config=aiter_config,
             inplace=False,
             activation=activation_name,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
+            w1_scale=prepared_w1_scale,
+            w2_scale=prepared_w2_scale,
             w1_zp=getattr(quant_config, "w1_zp", None),
             w2_zp=getattr(quant_config, "w2_zp", None),
             a1_scale=(
@@ -318,9 +224,7 @@ def apply_aiter_quantized_moe(
             ),
             a2_scale=getattr(quant_config, "a2_scale", None),
             block_shape=None,
-            global_num_experts=getattr(
-                vllm_moe_config, "num_experts", w1.shape[0]
-            ),
+            global_num_experts=global_num_experts,
             expert_map=aiter_expert_map,
             routed_scaling_factor=1.0,
             use_weight_shuffle=bool(
@@ -328,151 +232,6 @@ def apply_aiter_quantized_moe(
             ),
             output_dtype=output_dtype,
         )
-
-
-def get_aiter_w8a8_runtime_config(
-    method: object,
-    layer: object,
-    x: torch.Tensor,
-    topk_ids: torch.Tensor,
-) -> object:
-    """Get a layer-aware, shape-aware AITER FP8-W8A8 MoE config."""
-
-    if x.ndim != 2 or topk_ids.ndim != 2 or x.shape[0] != topk_ids.shape[0]:
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE expects x and topk_ids to be matching 2D tensors"
-        )
-    w1 = _required_tensor(layer, "w13_weight")
-    w2 = _required_tensor(layer, "w2_weight")
-    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE expects compatible rank-3 expert weights"
-        )
-
-    activation_value = getattr(getattr(layer, "activation", None), "value", None)
-    if activation_value is None:
-        activation_value = getattr(layer, "activation", None)
-    if activation_value is None:
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE requires a layer activation"
-        )
-    activation = str(activation_value)
-
-    cache = getattr(method, "_hcu_aiter_moe_config_cache", None)
-    if cache is None:
-        cache = {}
-        setattr(method, "_hcu_aiter_moe_config_cache", cache)
-    if not isinstance(cache, dict):
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE config cache has an invalid type"
-        )
-
-    cache_key = (
-        id(layer),
-        x.shape[0],
-        w1.shape[0],
-        w1.shape[1],
-        w2.shape[1],
-        w1.shape[2],
-        topk_ids.shape[1],
-        x.dtype,
-        x.device,
-        activation,
-    )
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    try:
-        from aiter.moe import MoeQuantType, get_aiter_moe_config
-    except Exception as exc:
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE is enabled, but aiter.moe is unavailable"
-        ) from exc
-    quant_type = getattr(MoeQuantType, "FP8_W8A8", None)
-    if quant_type is None:
-        raise HcuCompressedTensorsMoeError(
-            "AITER does not expose the required FP8_W8A8 MoE quant type"
-        )
-
-    status, moe_config = get_aiter_moe_config(
-        M=x.shape[0],
-        E=w1.shape[0],
-        N1=w1.shape[1],
-        N2=w2.shape[1],
-        K=w1.shape[2],
-        top_k=topk_ids.shape[1],
-        block_size=0,
-        dtype=x.dtype,
-        quant_type=quant_type,
-        activation=activation,
-    )
-    if not status or moe_config is None:
-        layer_name = getattr(layer, "layer_name", "unknown")
-        raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE found no backend config for "
-            f"layer {layer_name!r}, M={x.shape[0]}, "
-            f"top_k={topk_ids.shape[1]}, dtype={x.dtype}"
-        )
-    cache[cache_key] = moe_config
-    return moe_config
-
-
-def get_aiter_weights_for_solution(
-    layer: object,
-    moe_config: object,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return weights prepared by the public HCU AITER API."""
-
-    w1 = _required_tensor(layer, "w13_weight")
-    w2 = _required_tensor(layer, "w2_weight")
-    if not bool(getattr(moe_config, "need_shuffle", False)):
-        return w1, w2
-
-    cache_key = (
-        _tensor_generation(w1),
-        _tensor_generation(w2),
-        _enum_token(getattr(moe_config, "quant_type", None)),
-        _enum_token(getattr(moe_config, "solution_type", None)),
-    )
-    cache = getattr(layer, "_hcu_aiter_shuffled_weights", None)
-    if cache is None:
-        cache = {}
-        setattr(layer, "_hcu_aiter_shuffled_weights", cache)
-    if not isinstance(cache, dict):
-        raise HcuCompressedTensorsMoeError(
-            "AITER shuffled-weight cache has an invalid type"
-        )
-    cached = cache.get(cache_key)
-    if (
-        isinstance(cached, tuple)
-        and len(cached) == 2
-        and isinstance(cached[0], torch.Tensor)
-        and isinstance(cached[1], torch.Tensor)
-    ):
-        return cached
-
-    try:
-        from aiter.moe import aiter_moe_shfl_weight
-    except Exception as exc:
-        raise HcuCompressedTensorsMoeError(
-            "HCU AITER selected a shuffled MoE layout, but "
-            "aiter.moe.aiter_moe_shfl_weight is unavailable"
-        ) from exc
-    with torch.no_grad():
-        shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(w1, w2, moe_config)
-    if not isinstance(shuffled_w1, torch.Tensor) or not isinstance(
-        shuffled_w2, torch.Tensor
-    ):
-        raise HcuCompressedTensorsMoeError(
-            "HCU AITER returned missing shuffled MoE weights"
-        )
-    if shuffled_w1.shape != w1.shape or shuffled_w2.shape != w2.shape:
-        raise HcuCompressedTensorsMoeError(
-            "HCU AITER returned incompatible shuffled MoE weight shapes"
-        )
-    cache[cache_key] = (shuffled_w1, shuffled_w2)
-    return shuffled_w1, shuffled_w2
 
 
 def apply_aiter_w8a8_fp8_moe(
@@ -519,45 +278,125 @@ def apply_aiter_w8a8_fp8_moe(
                 "AITER FP8-W8A8 prequantized input shapes do not match x"
             )
 
-    moe_config = get_aiter_w8a8_runtime_config(method, layer, x, topk_ids)
-    w1, w2 = get_aiter_weights_for_solution(layer, moe_config)
-    try:
-        from aiter.moe import aiter_moe
-    except Exception as exc:
+    w1 = _required_tensor(layer, "w13_weight")
+    w2 = _required_tensor(layer, "w2_weight")
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
         raise HcuCompressedTensorsMoeError(
-            "AITER FP8-W8A8 MoE is enabled, but aiter_moe is unavailable"
-        ) from exc
-    if not callable(aiter_moe):
-        raise HcuCompressedTensorsMoeError("aiter.moe.aiter_moe is not callable")
-
+            "AITER FP8-W8A8 MoE expects compatible rank-3 expert weights"
+        )
     activation = getattr(getattr(layer, "activation", None), "value", None)
     if activation is None:
         activation = getattr(layer, "activation", None)
-    return aiter_moe(
-        hidden_states=x if i_q is None else i_q,
-        w1=w1,
-        w2=w2,
-        topk_weights=topk_weights.to(torch.float32),
-        topk_ids=topk_ids.to(torch.int32),
-        moe_config=moe_config,
-        # vLLM v0.25.1 removed FusedMoEConfig.disable_inplace together with
-        # the in-place fused-experts mechanism.  Preserve the target contract
-        # and keep x available to the runner/shared-expert lifecycle.
-        inplace=False,
+    if activation is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER FP8-W8A8 MoE requires a layer activation"
+        )
+    activation = str(activation)
+    from aiter.moe import MoeQuantType
+
+    quant_type = getattr(MoeQuantType, "FP8_W8A8", None)
+    if quant_type is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER does not expose the required FP8_W8A8 MoE quant type"
+        )
+    problem = AiterMoeProblem(
+        M=int(x.shape[0]),
+        E=int(w1.shape[0]),
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=int(w1.shape[2]),
+        top_k=int(topk_ids.shape[1]),
+        block_size=0,
+        dtype=x.dtype,
+        device=x.device,
+        quant_type=quant_type,
         activation=activation,
-        w1_scale=_required_tensor(layer, "w13_weight_scale"),
-        w2_scale=_required_tensor(layer, "w2_weight_scale"),
-        w1_zp=None,
-        w2_zp=None,
-        a1_scale=i_s if i_s is not None else getattr(layer, "w13_input_scale", None),
-        a2_scale=getattr(layer, "w2_input_scale", None),
-        block_shape=None,
-        global_num_experts=getattr(layer, "global_num_experts", -1),
-        expert_map=getattr(layer, "expert_map", None),
-        routed_scaling_factor=1.0,
-        use_weight_shuffle=bool(getattr(moe_config, "need_shuffle", False)),
-        output_dtype=None if i_q is None else x.dtype,
+        use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
     )
+    moe_config = select_aiter_moe_config(problem, cache_owner=w1)
+    w1_scale = _required_tensor(layer, "w13_weight_scale")
+    w2_scale = _required_tensor(layer, "w2_weight_scale")
+    global_num_experts = getattr(layer, "global_num_experts", -1)
+    expert_map = getattr(layer, "expert_map", None)
+    if moe_config is None:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl,
+        )
+
+        return fused_experts_impl(
+            x,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            use_fp8_w8a8=True,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=True,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=getattr(layer, "w13_input_scale", None),
+            a2_scale=getattr(layer, "w2_input_scale", None),
+            block_shape=None,
+        )
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        moe_config,
+        cache_owner=w1,
+    )
+    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+        w1_scale,
+        w2_scale,
+        moe_config,
+        cache_owner=w1_scale,
+    )
+    aiter_expert_map = aiter_expert_map_for_solution(
+        expert_map,
+        moe_config,
+        int(global_num_experts),
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+        aiter_asm_boltops_fp8_quant_context,
+    )
+
+    with aiter_asm_boltops_fp8_quant_context(
+        enabled=_enum_token(getattr(moe_config, "solution_type", None)) == "ASM"
+    ):
+        return execute_aiter_moe(
+            moe_config,
+            hidden_states=x if i_q is None else i_q,
+            w1=prepared_w1,
+            w2=prepared_w2,
+            topk_weights=topk_weights.to(torch.float32),
+            topk_ids=topk_ids.to(torch.int32),
+            inplace=False,
+            activation=activation,
+            w1_scale=prepared_w1_scale,
+            w2_scale=prepared_w2_scale,
+            w1_zp=None,
+            w2_zp=None,
+            a1_scale=(
+                i_s
+                if i_s is not None
+                else getattr(layer, "w13_input_scale", None)
+            ),
+            a2_scale=getattr(layer, "w2_input_scale", None),
+            block_shape=None,
+            global_num_experts=global_num_experts,
+            expert_map=aiter_expert_map,
+            routed_scaling_factor=1.0,
+            use_weight_shuffle=bool(
+                getattr(moe_config, "need_shuffle", False)
+            ),
+            output_dtype=None if i_q is None else x.dtype,
+        )
 
 
 def process_dpsk_deepgemm_weights(method: object, layer: object) -> None:
@@ -693,7 +532,5 @@ __all__ = [
     "apply_aiter_w8a8_fp8_moe",
     "build_aiter_w4a16_quant_config",
     "create_aiter_w4a16_qzeros",
-    "get_aiter_w8a8_runtime_config",
-    "get_aiter_weights_for_solution",
     "process_dpsk_deepgemm_weights",
 ]
