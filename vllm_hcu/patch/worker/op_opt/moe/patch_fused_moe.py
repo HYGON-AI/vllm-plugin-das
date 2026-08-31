@@ -77,22 +77,19 @@ def apply_to_module(module: ModuleType) -> bool:
         if enabled:
             if not block_shape or len(block_shape) < 2:
                 raise ValueError("HCU AITER W4A16 MoE requires a two-dimensional block_shape")
-            try:
-                from aiter.moe import (
-                    MoeQuantType,
-                    aiter_moe,
-                    aiter_moe_shfl_scale,
-                    aiter_moe_shfl_weight,
-                    get_aiter_moe_config,
-                )
-            except (ImportError, AttributeError) as exc:
-                raise RuntimeError(
-                    "VLLM_HCU_USE_AITER_W4A16_MOE is enabled, but the required "
-                    "HCU AITER aiter.moe API is unavailable"
-                ) from exc
+            from aiter.moe import MoeQuantType
+            from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+                AiterMoeProblem,
+                aiter_expert_map_for_solution,
+                execute_aiter_moe,
+                prepare_aiter_moe_scales,
+                prepare_aiter_moe_weights,
+                select_aiter_moe_config,
+            )
+
             _, n1, _ = w1.shape
             _, n2, _ = w2.shape
-            status, moe_config = get_aiter_moe_config(
+            problem = AiterMoeProblem(
                 M=hidden_states.shape[0],
                 E=w1.shape[0],
                 N1=n1,
@@ -101,36 +98,38 @@ def apply_to_module(module: ModuleType) -> bool:
                 top_k=topk_ids.size(1),
                 block_size=block_shape[1],
                 dtype=hidden_states.dtype,
+                device=hidden_states.device,
                 quant_type=MoeQuantType.W4A16,
+                activation=activation,
+                use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
             )
-            if status:
-                prepared_w1, prepared_w2 = w1, w2
-                prepared_w1_scale, prepared_w2_scale = w1_scale, w2_scale
-                if bool(getattr(moe_config, "need_shuffle", False)):
-                    prepared_w1, prepared_w2 = aiter_moe_shfl_weight(
-                        w1,
-                        w2,
-                        moe_config,
-                    )
-                if bool(getattr(moe_config, "need_shuffle_scale", False)):
-                    prepared_w1_scale, prepared_w2_scale = (
-                        aiter_moe_shfl_scale(
-                            w1_scale,
-                            w2_scale,
-                            moe_config,
-                        )
-                    )
-                if prepared_w1 is None or prepared_w2 is None:
-                    raise RuntimeError(
-                        "HCU AITER returned missing W4A16 MoE weights"
-                    )
-                return aiter_moe(
+            moe_config = select_aiter_moe_config(problem, cache_owner=w1)
+            if moe_config is not None:
+                prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+                    w1,
+                    w2,
+                    moe_config,
+                    cache_owner=w1,
+                    block_shape=block_shape,
+                )
+                prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+                    w1_scale,
+                    w2_scale,
+                    moe_config,
+                    cache_owner=w1_scale if w1_scale is not None else w1,
+                )
+                aiter_expert_map = aiter_expert_map_for_solution(
+                    expert_map,
+                    moe_config,
+                    int(global_num_experts),
+                )
+                return execute_aiter_moe(
+                    moe_config,
                     hidden_states=hidden_states,
                     w1=prepared_w1,
                     w2=prepared_w2,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
-                    moe_config=moe_config,
                     inplace=False,
                     activation=activation,
                     w1_scale=prepared_w1_scale,
@@ -141,10 +140,11 @@ def apply_to_module(module: ModuleType) -> bool:
                     a2_scale=a2_scale,
                     block_shape=block_shape,
                     global_num_experts=global_num_experts,
-                    expert_map=expert_map,
+                    expert_map=aiter_expert_map,
                     use_weight_shuffle=bool(
                         getattr(moe_config, "need_shuffle", False)
                     ),
+                    output_dtype=hidden_states.dtype,
                 )
         return original(
             hidden_states, w1, w2, topk_weights, topk_ids, activation,

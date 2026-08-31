@@ -2,57 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
-"""
-AITER W8A8 MoE修改说明:
-Patch for vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin
--- AITER W8A8 MoE 双后端方案
+"""HCU compressed-tensors Marlin methods with optional AITER routing.
 
-=== 替换方式 ===
-
-本模块是 HCU 定制的 W8A8 MoE 实现，采用双后端设计，通过环境变量切换：
-
-  - **AITER W8A8 MoE**（VLLM_ROCM_USE_AITER=1 + VLLM_ROCM_USE_AITER_MOE=1）
-    通过 aiter.moe 的 hipBLASLt 底层算子执行 W8A8 INT8 MoE
-  - **Marlin W8A8 MoE**（默认）
-    通过 lmslim 的 Marlin 内核执行 INT8/FP8 MoE
-
-=== 替换内容 ===
-
-CompressedTensorsW8A8Int8MarlinMoEMethod 类实现：
-
-    重写的方法                                  HCU 新增行为
-    ───────────────────────────────────────    ──────────────────────────────────
-    process_weights_after_loading(layer)       如果 AITER MoE 启用：
-                                              → 预加载 aiter 模块，设置重排权重缓存
-                                              → 跳过 Marlin 权重重排
-                                              否则 → Marlin interleave / kpack2 权重重排
-
-    apply(layer, x, topk_weights,             如果 AITER MoE 启用：
-         topk_ids, ...)                       → _get_aiter_moe_runtime_config() 获取配置
-                                              → _get_aiter_weights_for_solution() 准备权重
-                                              → 调用 aiter.moe.aiter_moe()
-                                              否则 → 调用 lmslim fused_experts_impl_int8_marlin
-
-    新增的辅助方法：
-      _get_aiter_moe_runtime_config()     —— 获取 AITER MoE 运行时配置（带缓存）
-      _get_aiter_weights_for_solution()   —— 通过 aiter.moe 公共接口准备重排权重
-
-    新增的模块级辅助函数：
-      _is_hcu_aiter_w8a8_moe_requested()  —— 环境变量检测
-
-CompressedTensorsW8A8FP8MarlinMoEMethod 类：
-  使用 Marlin FP8 路径（lmslim fused_experts_impl_fp8_marlin）
-
-=== 环境变量 ===
-
-    VLLM_ROCM_USE_AITER=1      启用 AITER 加速
-    VLLM_ROCM_USE_AITER_MOE=1  启用 AITER W8A8 MoE 路径
-
-=== 相比旧方案的优势 ===
-
-  旧方案（v0.18.1）：直接内联在 upstream vllm 代码中，无法独立维护。
-  新方案（canako.py 风格）：独立的 HCU 模块，清晰的 AITER / Marlin 双分支，
-  通过环境变量一键切换，代码组织清晰、易于维护。
+The AITER INT8 branch keeps canonical weights at load time and delegates
+shape/config selection, derived layouts, public execution, and native Triton
+fallback to ``compressed_tensors_moe_runtime``. The non-AITER branch retains
+the LMSlim Marlin layout and execution path.
 """
 import enum
 import torch
@@ -470,11 +425,6 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             assert all2all_manager is not None
             self.num_dispatchers = all2all_manager.world_size
 
-        # ── AITER W8A8 config cache ───────────────────────────
-        self._aiter_moe_config_cache: dict[
-            tuple[int, int, torch.dtype, str], object
-        ] = {}
-
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -557,20 +507,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                     "apply_router_weight_on_input=True."
                 )
 
-            try:
-                from aiter.moe import (  # noqa: F401
-                    MoeQuantType,
-                    aiter_moe,
-                    aiter_moe_shfl_weight,
-                    get_aiter_moe_config,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "AITER W8A8 MoE is enabled but required aiter modules "
-                    "are unavailable."
-                ) from exc
-
-            setattr(layer, "_hcu_aiter_shuffled_weights", {})
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             return
         # Default Marlin weight interleave path
         #if not self.use_deepep:
@@ -596,90 +533,6 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
 
-    # ── AITER W8A8 MoE runtime helpers ───────────────────────────────
-    def _get_aiter_moe_runtime_config(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ):
-        """Get or cache the AITER MoE runtime configuration for this layer."""
-        from aiter.moe import MoeQuantType, get_aiter_moe_config
-
-        activation = getattr(layer.activation, "value", layer.activation)
-        activation = str(activation)
-        cache_key = (x.shape[0], topk_ids.shape[1], x.dtype, activation)
-        moe_config = self._aiter_moe_config_cache.get(cache_key)
-        if moe_config is not None:
-            return moe_config
-
-        status, moe_config = get_aiter_moe_config(
-            M=x.shape[0],
-            E=layer.w13_weight.shape[0],
-            N1=layer.w13_weight.shape[1],
-            N2=layer.w2_weight.shape[1],
-            K=layer.w13_weight.shape[2],
-            top_k=topk_ids.shape[1],
-            block_size=0,
-            dtype=x.dtype,
-            quant_type=MoeQuantType.W8A8,
-            activation=activation,
-        )
-        if not status:
-            raise RuntimeError(
-                "AITER W8A8 MoE did not find a valid backend config for "
-                f"layer '{getattr(layer, 'layer_name', 'unknown')}' with "
-                f"M={x.shape[0]}, top_k={topk_ids.shape[1]}, "
-                f"dtype={x.dtype}."
-            )
-
-        self._aiter_moe_config_cache[cache_key] = moe_config
-        return moe_config
-
-    def _get_aiter_weights_for_solution(
-        self,
-        layer: RoutedExperts,
-        moe_config: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare weights through the public HCU AITER API."""
-        from aiter.moe import aiter_moe_shfl_weight
-
-        if not bool(getattr(moe_config, "need_shuffle", False)):
-            return layer.w13_weight, layer.w2_weight
-
-        cache = getattr(layer, "_hcu_aiter_shuffled_weights", None)
-        if not isinstance(cache, dict):
-            raise RuntimeError("AITER shuffled-weight cache has an invalid type.")
-        cache_key = (
-            id(layer.w13_weight),
-            getattr(layer.w13_weight, "_version", None),
-            id(layer.w2_weight),
-            getattr(layer.w2_weight, "_version", None),
-            str(getattr(moe_config, "quant_type", None)),
-            str(getattr(moe_config, "solution_type", None)),
-        )
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        with torch.no_grad():
-            shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(
-                layer.w13_weight,
-                layer.w2_weight,
-                moe_config,
-            )
-        if (
-            not isinstance(shuffled_w1, torch.Tensor)
-            or not isinstance(shuffled_w2, torch.Tensor)
-            or shuffled_w1.shape != layer.w13_weight.shape
-            or shuffled_w2.shape != layer.w2_weight.shape
-        ):
-            raise RuntimeError(
-                "HCU AITER returned incompatible shuffled MoE weights."
-            )
-        cache[cache_key] = (shuffled_w1, shuffled_w2)
-        return shuffled_w1, shuffled_w2
-
     # ── apply ───────────────────────────────────────────────────────
     def apply(
         self,
@@ -697,8 +550,6 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         del shared_experts, shared_experts_input
         # AITER W8A8 MoE fast-path
         if _is_hcu_aiter_w8a8_moe_requested():
-            from aiter.moe import aiter_moe
-
             if not rocm_aiter_ops.is_fused_moe_enabled():
                 raise RuntimeError(
                     "VLLM_ROCM_USE_AITER=1 and VLLM_ROCM_USE_AITER_MOE=1 "
@@ -711,39 +562,29 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                     "apply_router_weight_on_input=True."
                 )
 
-            moe_config = self._get_aiter_moe_runtime_config(
-                layer, x, topk_ids
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                apply_aiter_quantized_moe,
             )
-            w1, w2 = self._get_aiter_weights_for_solution(
-                layer, moe_config
-            )
-            output = aiter_moe(
+
+            quant_config = getattr(self, "moe_quant_config", None)
+            if quant_config is None:
+                quant_config = self.get_fused_moe_quant_config(layer)
+                self.moe_quant_config = quant_config
+            return apply_aiter_quantized_moe(
                 hidden_states=x,
-                w1=w1,
-                w2=w2,
-                topk_weights=topk_weights.to(torch.float32),
-                topk_ids=topk_ids.to(torch.int32),
-                moe_config=moe_config,
-                # vLLM v0.25.1 removed FusedMoEConfig.disable_inplace and its
-                # fused-experts in-place contract.  This retained HCU AITER
-                # backend must therefore return a distinct output tensor.
-                inplace=False,
-                activation=layer.activation.value,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w1_zp=None,
-                w2_zp=None,
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=None,
-                global_num_experts=layer.global_num_experts,
-                expert_map=layer.expert_map,
-                routed_scaling_factor=1.0,
-                use_weight_shuffle=bool(
-                    getattr(moe_config, "need_shuffle", False)
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                vllm_moe_config=self.moe,
+                activation=layer.activation,
+                apply_router_weight_on_input=(
+                    layer.apply_router_weight_on_input
                 ),
+                expert_map=layer.expert_map,
+                quant_config=quant_config,
+                output_dtype=x.dtype,
             )
-            return output
 
         # Default Marlin INT8 path
 
