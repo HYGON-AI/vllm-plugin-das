@@ -278,6 +278,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 w1_bias=w1_bias,
                 w2_bias=w2_bias,
                 per_act_token_quant=True,
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
             )
         return make_quant_config(
             int8_backend=int8_backend,

@@ -483,6 +483,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         w1_bias=None,
         w2_bias=None,
         per_act_token_quant=False,
+        gemm1_clamp_limit=None,
     ):
         return SimpleNamespace(
             w1_scale=w1_scale,
@@ -492,6 +493,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             per_act_token_quant=per_act_token_quant,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             use_int8_w8a8=True,
         )
 
@@ -690,9 +692,11 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         w1_scale,
         w2_scale,
         per_act_token_quant=True,
+        layer=SimpleNamespace(swiglu_limit=10.0),
     )
     assert getattr(deep_gemm_quant_config, "use_int8_w8a8", False) is True
     assert deep_gemm_quant_config.per_act_token_quant is True
+    assert deep_gemm_quant_config.gemm1_clamp_limit == 10.0
 
     config.moe_parallel_config.use_batched_activation_format = True
     backend, experts = target.select_int8_moe_backend(

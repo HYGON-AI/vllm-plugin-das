@@ -476,6 +476,7 @@ def _fake_config_module() -> ModuleType:
                 per_act_token_quant=per_act_token_quant,
                 per_out_ch_quant=per_out_ch_quant,
                 block_shape=block_shape,
+                gemm1_clamp_limit=gemm1_clamp_limit,
             )
 
     def int8_config(
@@ -563,6 +564,15 @@ def test_hcu_block_quant_group_shapes_and_sequence_parallel_contract(
     assert int8_config.per_act_token_quant is False
     assert int8_config.per_out_ch_quant is False
     assert int8_config.block_shape == [128, 128]
+    clamped_int8_config = module.int8_w8a8_moe_quant_config(
+        torch.ones(1),
+        torch.ones(1),
+        None,
+        None,
+        per_act_token_quant=True,
+        gemm1_clamp_limit=10.0,
+    )
+    assert clamped_int8_config.gemm1_clamp_limit == 10.0
     special = SimpleNamespace(
         quant_dtype=torch.int8,
         block_shape=[128, 128],

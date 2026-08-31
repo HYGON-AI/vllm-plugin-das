@@ -153,10 +153,12 @@ def apply_to_module(module: ModuleType) -> bool:
         w2_bias=None,
         per_act_token_quant=False,
         block_shape=None,
+        gemm1_clamp_limit=None,
     ):
         return config_runtime.int8_w8a8_moe_quant_config(
             target, int8_config, w1_scale, w2_scale, a1_scale, a2_scale,
             w1_bias, w2_bias, per_act_token_quant, block_shape,
+            gemm1_clamp_limit,
         )
 
     del hcu_int8_config.__wrapped__
