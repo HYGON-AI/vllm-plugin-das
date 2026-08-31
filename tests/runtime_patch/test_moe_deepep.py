@@ -334,6 +334,98 @@ def test_deepep_auto_prepare_snapshots_mode_for_matching_finalize(
     ]
 
 
+@pytest.mark.parametrize(
+    ("use_low_latency",),
+    [
+        (False,),
+        (True,),
+    ],
+)
+def test_slimquant_w4a8_deepep_auto_snapshot_selects_matching_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    use_low_latency: bool,
+):
+    """One W4A8 forward snapshot must select the matching HT or LL experts."""
+
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto as auto_module,
+    )
+
+    contiguous = object.__new__(
+        deepgemm_module.DeepEPDeepGemmW4A8ContiguousExperts
+    )
+    masked = object.__new__(deepgemm_module.DeepEPDeepGemmW4A8MaskedExperts)
+    experts = object.__new__(deepgemm_module.DeepEPAutoW4A8Experts)
+    experts._fixed_use_low_latency = None
+    experts._use_low_latency_snapshot = not use_low_latency
+    experts.ht_experts = contiguous
+    experts.ll_experts = masked
+
+    class Delegate:
+        def post_init_setup(self, _experts: object) -> None:
+            pass
+
+    prepare_finalize = auto_module.DeepEPAutoPrepareAndFinalize(
+        Delegate(), Delegate()
+    )
+    monkeypatch.setattr(
+        auto_module,
+        "_forward_uses_low_latency",
+        lambda: use_low_latency,
+    )
+
+    prepare_finalize.post_init_setup(experts)
+    assert prepare_finalize.begin_moe_call() is use_low_latency
+    assert experts._current() is (masked if use_low_latency else contiguous)
+
+
+def test_slimquant_w4a8_deepep_auto_empty_rank_keeps_global_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An empty DP rank must not reinterpret a shared HT snapshot as LL."""
+
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto as auto_module,
+    )
+
+    class Delegate:
+        def post_init_setup(self, _experts: object) -> None:
+            pass
+
+    monkeypatch.setattr(auto_module, "_forward_uses_low_latency", lambda: False)
+    selected_layouts: list[tuple[int, object]] = []
+    contiguous_by_rank: list[tuple[int, object]] = []
+    local_token_counts = (0, 5)
+    for local_token_count in local_token_counts:
+        contiguous = object.__new__(
+            deepgemm_module.DeepEPDeepGemmW4A8ContiguousExperts
+        )
+        masked = object.__new__(
+            deepgemm_module.DeepEPDeepGemmW4A8MaskedExperts
+        )
+        experts = object.__new__(deepgemm_module.DeepEPAutoW4A8Experts)
+        experts._fixed_use_low_latency = None
+        experts._use_low_latency_snapshot = True
+        experts.ht_experts = contiguous
+        experts.ll_experts = masked
+        contiguous_by_rank.append((local_token_count, contiguous))
+        prepare_finalize = auto_module.DeepEPAutoPrepareAndFinalize(
+            Delegate(), Delegate()
+        )
+        prepare_finalize.post_init_setup(experts)
+
+        assert prepare_finalize.begin_moe_call() is False
+        selected_layouts.append((local_token_count, experts._current()))
+
+    assert selected_layouts == contiguous_by_rank
+
+
 def test_modular_prepare_begins_auto_call_before_expert_contract_queries():
     from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
 

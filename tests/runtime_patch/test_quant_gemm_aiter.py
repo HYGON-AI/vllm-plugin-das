@@ -3506,6 +3506,110 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DP+EP W4A8 must own an auto DeepGEMM kernel, not an AITER fallback."""
+
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    factory_calls: list[tuple[object, object, object]] = []
+    processed_layers: list[object] = []
+
+    class W4A8Experts:
+        def process_weights_after_loading(self, layer: object) -> None:
+            processed_layers.append(layer)
+
+    class W4A8Kernel:
+        fused_experts = SimpleNamespace(experts=W4A8Experts())
+
+        @staticmethod
+        def apply(**kwargs: object) -> torch.Tensor:
+            return kwargs["hidden_states"] + 3
+
+    def make_deepep_auto_deepgemm_w4a8_moe_kernel(
+        *,
+        moe_quant_config: object,
+        moe_config: object,
+        routing_tables: object = None,
+    ) -> W4A8Kernel:
+        factory_calls.append((moe_quant_config, moe_config, routing_tables))
+        return W4A8Kernel()
+
+    monkeypatch.setattr(
+        deepgemm_module,
+        "make_deepep_auto_deepgemm_w4a8_moe_kernel",
+        make_deepep_auto_deepgemm_w4a8_moe_kernel,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda *_args: pytest.fail(
+            "deepep_auto W4A8 must create DeepGEMM experts, not prewarm AITER"
+        ),
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a8_moe",
+        lambda *_args: pytest.fail(
+            "deepep_auto W4A8 must execute its DeepGEMM kernel, not AITER"
+        ),
+    )
+
+    moe = SimpleNamespace(
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(object(), moe)
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros((2, 8, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros((2, 4, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 8, 1)), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 4, 1)), requires_grad=False
+        ),
+        w13_input_scale=None,
+        w2_input_scale=None,
+    )
+
+    quant_config = method.get_fused_moe_quant_config(layer)
+    assert quant_config.weight_quant_dtype == "int4"
+
+    method.process_weights_after_loading(layer)
+
+    assert factory_calls == [(quant_config, moe, None)]
+    assert processed_layers == [layer]
+    assert method.moe_kernel is not None
+    x = torch.zeros((2, 4), dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        method.apply(
+            layer,
+            x,
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.zeros((2, 1), dtype=torch.int32),
+            None,
+            None,
+        ),
+        x + 3,
+    )
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
     monkeypatch: pytest.MonkeyPatch,
 ):
