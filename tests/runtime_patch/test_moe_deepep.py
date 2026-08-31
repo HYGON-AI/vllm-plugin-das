@@ -387,6 +387,8 @@ def test_slimquant_w4a8_deepep_auto_empty_rank_keeps_global_snapshot(
 ):
     """An empty DP rank must not reinterpret a shared HT snapshot as LL."""
 
+    import vllm.forward_context as forward_context
+
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as deepgemm_module,
     )
@@ -398,11 +400,26 @@ def test_slimquant_w4a8_deepep_auto_empty_rank_keeps_global_snapshot(
         def post_init_setup(self, _experts: object) -> None:
             pass
 
-    monkeypatch.setattr(auto_module, "_forward_uses_low_latency", lambda: False)
+    active_tokens = torch.ones((5, 4), dtype=torch.bfloat16)
+    empty_tokens = torch.empty((0, 4), dtype=torch.bfloat16)
+    synchronized_snapshot = False
+    current_context: object | None = None
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: current_context,
+    )
+
     selected_layouts: list[tuple[int, object]] = []
     contiguous_by_rank: list[tuple[int, object]] = []
-    local_token_counts = (0, 5)
-    for local_token_count in local_token_counts:
+    for local_tokens in (active_tokens, empty_tokens):
+        local_token_count = local_tokens.size(0)
+        assert (local_token_count > 0) is (local_tokens is active_tokens)
+        current_context = SimpleNamespace(
+            deepep_auto_use_low_latency=synchronized_snapshot,
+            local_token_count=local_token_count,
+        )
+        assert auto_module._forward_uses_low_latency() is synchronized_snapshot
         contiguous = object.__new__(
             deepgemm_module.DeepEPDeepGemmW4A8ContiguousExperts
         )
@@ -420,7 +437,7 @@ def test_slimquant_w4a8_deepep_auto_empty_rank_keeps_global_snapshot(
         )
         prepare_finalize.post_init_setup(experts)
 
-        assert prepare_finalize.begin_moe_call() is False
+        assert prepare_finalize.begin_moe_call() is synchronized_snapshot
         selected_layouts.append((local_token_count, experts._current()))
 
     assert selected_layouts == contiguous_by_rank
