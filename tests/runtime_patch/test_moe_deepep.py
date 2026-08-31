@@ -3011,6 +3011,17 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
     calls: dict[str, object] = {}
 
     class Buffer:
+        def clean_low_latency_buffer(
+            self,
+            max_tokens,
+            hidden_size,
+            num_experts,
+            quant_group_size,
+        ):
+            calls.setdefault("clean", []).append(
+                (max_tokens, hidden_size, num_experts, quant_group_size)
+            )
+
         def low_latency_dispatch(
             self,
             x,
@@ -3048,7 +3059,7 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
     instance.use_ue8m0_dispatch = False
     quant_config = SimpleNamespace(
         quant_dtype=torch.float8_e4m3fn,
-        block_shape=None,
+        block_shape=[1, 128],
         per_act_token_quant=True,
         a1_scale=None,
         a2_scale=None,
@@ -3086,7 +3097,11 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
     assert signature_calls == 1
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
-    assert calls["quant_group_size"] == 0
+    assert calls["quant_group_size"] == 128
+    assert calls["clean"] == [
+        (8, 2048, 1, 128),
+        (8, 2048, 1, 128),
+    ]
 
 
 def test_deepep_ll_hcu_int8_dispatch_contract(
@@ -3116,7 +3131,7 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
     cls.SUPPORTED_HIDDEN_SIZES = [2048]
     cls._map_global_to_physical_ids = lambda self, ids: ids
 
-    calls = {}
+    calls = {"order": []}
     expert_x = (
         torch.ones((1, 1, 2048), dtype=torch.int8),
         torch.ones((1, 1, 1)),
@@ -3124,7 +3139,11 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
     expert_counts = torch.tensor([1], dtype=torch.int32)
 
     class Buffer:
+        def clean_low_latency_buffer(self, *args):
+            calls["order"].append(("clean", args))
+
         def low_latency_dispatch(self, *args, **kwargs):
+            calls["order"].append(("dispatch", kwargs["quant_type"]))
             calls["args"] = args
             calls["kwargs"] = kwargs
             return expert_x, expert_counts, "handle", None, lambda: None
@@ -3169,6 +3188,21 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
     assert scales is expert_x[1]
     assert metadata.expert_num_tokens is expert_counts
     assert routed_ids is None and routed_weights is None
+    instance.prepare_async(
+        hidden,
+        topk_weights,
+        topk_ids,
+        1,
+        None,
+        False,
+        quant_config,
+    )
+    assert calls["order"] == [
+        ("clean", (8, 2048, 1, 0)),
+        ("dispatch", 1),
+        ("clean", (8, 2048, 1, 0)),
+        ("dispatch", 1),
+    ]
 
     fp8_instance = cls(None, 8, 1, use_fp8_dispatch=True)
     fp8_instance.use_int8_dispatch = False
