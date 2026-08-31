@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
+import functools
+import logging
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     VLLM_USE_NN : bool = False
@@ -51,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_PD_SPLIT: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
+    VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
@@ -73,6 +78,52 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
     return int(value)
+
+
+def _environment_flag(raw: str) -> bool:
+    return raw.lower() in ("true", "1")
+
+
+@functools.lru_cache(maxsize=1)
+def resolve_aiter_moe_shuffle() -> bool:
+    """Resolve the unified AITER MoE weight-shuffle switch."""
+
+    new_name = "VLLM_HCU_USE_AITER_MOE_SHUFFLE"
+    legacy_name = "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE"
+    new_value = os.environ.get(new_name)
+    legacy_value = os.environ.get(legacy_name)
+
+    if new_value is not None:
+        if legacy_value is not None:
+            logger.warning(
+                "%s takes precedence over deprecated %s",
+                new_name,
+                legacy_name,
+            )
+        return _environment_flag(new_value)
+
+    if legacy_value is not None:
+        logger.warning(
+            "%s is deprecated; use %s for all AITER MoE quantization modes",
+            legacy_name,
+            new_name,
+        )
+        return _environment_flag(legacy_value)
+
+    return True
+
+
+@functools.lru_cache(maxsize=1)
+def resolve_aiter_moe_config_compat() -> bool:
+    """Keep the obsolete selector switch as an enabled compatibility alias."""
+
+    raw = os.environ.get("VLLM_HCU_USE_AITER_MOE_CONFIG")
+    if raw is not None and not _environment_flag(raw):
+        logger.warning(
+            "VLLM_HCU_USE_AITER_MOE_CONFIG=0 is deprecated and ignored; "
+            "unified AITER MoE routing always uses AiterMoeConfig"
+        )
+    return True
 
 
 def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
@@ -326,15 +377,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", "False").lower() in
                     ("true", "1")),
 
-    # If use shuffle for AITER W16A16 MoE, please set True (default True)
+    # Shuffle AITER MoE weights for any quantization mode (default True).
+    "VLLM_HCU_USE_AITER_MOE_SHUFFLE": resolve_aiter_moe_shuffle,
+
+    # Deprecated one-release alias retained for direct compatibility access.
     "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "True").lower() in
                     ("true", "1")),
 
-    # If use AITER MoE config (solution_id lookup), please set True (default True)
-    "VLLM_HCU_USE_AITER_MOE_CONFIG":
-        lambda: (os.environ.get("VLLM_HCU_USE_AITER_MOE_CONFIG", "True").lower() in
-                    ("true", "1")),
+    # Deprecated compatibility switch; unified routing always uses the config.
+    "VLLM_HCU_USE_AITER_MOE_CONFIG": resolve_aiter_moe_config_compat,
 
     # Emit Mooncake TTFT_EVENT DEBUG lines with wall-clock ts for PD TTFT analysis.
     "VLLM_HCU_MOONCAKE_TTFT_TRACE":

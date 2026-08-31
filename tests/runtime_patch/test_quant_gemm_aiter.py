@@ -20,6 +20,7 @@ from vllm_hcu.model_executor.layers.quantization import (
     int8_runtime,
     lightop_fp8_runtime,
 )
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.patch.worker.op_opt import (
     patch_activation,
     patch_aiter_ops,
@@ -60,6 +61,83 @@ def _fp8_quant_abi_stub(
 ):
     del quant_dtype, num_rows, num_rows_factor
     return x, scale
+
+
+@pytest.mark.parametrize(
+    ("new_value", "legacy_value", "expected"),
+    [
+        (None, None, True),
+        ("0", None, False),
+        ("1", "0", True),
+        (None, "0", False),
+    ],
+)
+def test_unified_aiter_moe_shuffle_env_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    new_value: str | None,
+    legacy_value: str | None,
+    expected: bool,
+):
+    for name, value in (
+        ("VLLM_HCU_USE_AITER_MOE_SHUFFLE", new_value),
+        ("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", legacy_value),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    henvs.resolve_aiter_moe_shuffle.cache_clear()
+    assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is expected
+
+
+def test_unified_aiter_moe_shuffle_legacy_alias_warns_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "0")
+    henvs.resolve_aiter_moe_shuffle.cache_clear()
+
+    with caplog.at_level("WARNING", logger=henvs.__name__):
+        assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is False
+        assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is False
+
+    warnings = [
+        record.message for record in caplog.records
+        if "W16A16_MOE_SHUFFLE" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "deprecated" in warnings[0]
+
+
+def test_unified_aiter_moe_shuffle_new_name_wins(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "0")
+    henvs.resolve_aiter_moe_shuffle.cache_clear()
+
+    with caplog.at_level("WARNING", logger=henvs.__name__):
+        assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is True
+
+    assert any("takes precedence" in record.message for record in caplog.records)
+
+
+def test_unified_aiter_moe_config_disable_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_CONFIG", "0")
+    henvs.resolve_aiter_moe_config_compat.cache_clear()
+
+    with caplog.at_level("WARNING", logger=henvs.__name__):
+        assert henvs.VLLM_HCU_USE_AITER_MOE_CONFIG is True
+
+    assert any(
+        "deprecated and ignored" in record.message for record in caplog.records
+    )
 
 
 def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
