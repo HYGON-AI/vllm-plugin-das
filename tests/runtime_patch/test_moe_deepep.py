@@ -79,6 +79,44 @@ def _install_lightop_moe(
     return moe
 
 
+def test_deepseek_expert_resolvers_strictly_separate_activation_and_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    activation = _module(
+        "lightop.activation",
+        fuse_silu_mul_quant=lambda value: ("activation", value),
+        fuse_silu_mul_quant_ep=lambda value: ("activation-ep", value),
+    )
+    top = _module(
+        "lightop",
+        fuse_silu_mul_quant=lambda value: ("obsolete-top-level", value),
+        fuse_silu_mul_quant_ep=lambda value: ("obsolete-top-level-ep", value),
+        fuse_silu_mul_clamp_quant=lambda value: ("clamp", value),
+    )
+    top.__path__ = []
+    top.activation = activation
+    monkeypatch.setitem(sys.modules, "lightop", top)
+    monkeypatch.setitem(sys.modules, "lightop.activation", activation)
+
+    module._lightop_activation.cache_clear()
+    module._lightop_clamp.cache_clear()
+    assert module.fuse_silu_mul_quant("value") == (
+        "activation",
+        "value",
+    )
+    assert module.fuse_silu_mul_quant_ep("value") == ("activation-ep", "value")
+    assert module._lightop_clamp("fuse_silu_mul_clamp_quant")("value") == (
+        "clamp",
+        "value",
+    )
+    with pytest.raises(AttributeError):
+        module._lightop_clamp("fuse_silu_mul_quant")
+
+
 def test_all2all_dispatch_selection_contract():
     class DeepEPLLPrepareAndFinalize:
         pass

@@ -236,19 +236,19 @@ def _lazy_activation_import(
             "dpsk_v4_deep_gemm_moe.py"
         ).body
         if isinstance(node, ast.FunctionDef)
-        and node.name in {"_lightop_op", "_lightop_activation_op"}
+        and node.name in {"_lightop_activation", "_lightop_clamp"}
     }
     module = ast.Module(
-        body=[functions["_lightop_op"], functions["_lightop_activation_op"]],
+        body=[functions["_lightop_activation"], functions["_lightop_clamp"]],
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
     exec(compile(module, "dpsk_v4_deep_gemm_moe", "exec"), namespace)
     namespace["fuse_silu_mul_fp8_quant"] = lambda *args, **kwargs: namespace[
-        "_lightop_activation_op"
+        "_lightop_activation"
     ]("fuse_silu_mul_fp8_quant")(*args, **kwargs)
     namespace["fuse_silu_mul_fp8_quant_ep"] = lambda *args, **kwargs: namespace[
-        "_lightop_activation_op"
+        "_lightop_activation"
     ]("fuse_silu_mul_fp8_quant_ep")(*args, **kwargs)
 
 
@@ -564,35 +564,29 @@ def test_fuse_silu_quant_prefers_categorized_kernel_and_consumes_result(
     assert torch.equal(scales, torch.full_like(scales, 0.25))
 
 
-def test_fuse_silu_quant_uses_legacy_abi_once_when_categorized_missing(
+def test_fuse_silu_quant_rejects_same_named_top_level_kernel_when_category_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
-    observed: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    observed: list[object] = []
 
     def legacy_quant(
         input: torch.Tensor, *, output: torch.Tensor, scales: torch.Tensor
     ) -> None:
-        observed.append((input, output, scales))
-        output.fill_(7)
-        scales.fill_(0.5)
+        del input, output, scales
+        observed.append("called")
 
     legacy.fuse_silu_mul_per_token_quant = legacy_quant
-    logger = _WarningLogger()
     _install_lightop(monkeypatch, legacy=legacy)
     real = _function(
         "vllm_hcu/ops/fuse_silu_mul_quant.py",
         "fuse_silu_mul_quant_real",
-        {"torch": torch, "logger": logger},
+        {"torch": torch, "logger": _WarningLogger()},
     )
 
-    first = real(torch.ones((1, 4)), torch.int8)
-    second = real(torch.ones((1, 4)), torch.int8)
-
-    assert len(observed) == 2
-    assert torch.equal(first[0], torch.full_like(first[0], 7))
-    assert torch.equal(second[1], torch.full_like(second[1], 0.5))
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        real(torch.ones((1, 4)), torch.int8)
+    assert observed == []
 
 
 def test_fuse_silu_quant_does_not_fallback_after_kernel_runtime_error(
@@ -648,13 +642,9 @@ def _execute_silu_module_selection(namespace: dict[str, object]) -> None:
         next(
             node
             for node in _module("vllm_hcu/ops/silu_and_mul.py").body
-            if isinstance(node, ast.Try)
-            and any(
-                isinstance(item, ast.ImportFrom)
-                and item.module == "lightop.activation"
-                and any(alias.name == "silu_and_mul_opt" for alias in item.names)
-                for item in node.body
-            )
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "lightop.activation"
+            and any(alias.name == "silu_and_mul_opt" for alias in node.names)
         )
     )
     module = ast.Module(body=[selection], type_ignores=[])
@@ -662,30 +652,23 @@ def _execute_silu_module_selection(namespace: dict[str, object]) -> None:
     exec(compile(module, "silu_and_mul", "exec"), namespace)
 
 
-def test_silu_and_mul_uses_legacy_module_once_when_categorized_missing(
+def test_silu_and_mul_rejects_same_named_legacy_operator_when_category_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     incomplete_activation = ModuleType("lightop.activation")
     legacy_op = ModuleType("lightop.op")
-    legacy_op.silu_and_mul_opt = lambda output, _input: output.fill_(5)
-    logger = _WarningLogger()
+    legacy_calls: list[object] = []
+    legacy_op.silu_and_mul_opt = lambda *_args: legacy_calls.append("called")
     _install_lightop(
         monkeypatch,
         activation=incomplete_activation,
         op=legacy_op,
     )
-    namespace: dict[str, object] = {"torch": torch, "logger": logger}
+    namespace: dict[str, object] = {"torch": torch, "logger": _WarningLogger()}
 
-    _execute_silu_module_selection(namespace)
-    _execute_silu_module_selection(namespace)
-    impl = _function(
-        "vllm_hcu/ops/silu_and_mul.py",
-        "silu_and_mul_opt_lightop_impl",
-        namespace,
-    )
-
-    assert torch.equal(impl(torch.ones((1, 4))), torch.full((1, 2), 5.0))
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        _execute_silu_module_selection(namespace)
+    assert legacy_calls == []
 
 
 def _deep_apply_namespace(logger: _WarningLogger) -> dict[str, object]:
@@ -765,6 +748,7 @@ def test_contiguous_deep_gemm_prefers_categorized_kernels_and_consumes_activatio
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     activation = ModuleType("lightop.activation")
+    gemm_ops = ModuleType("lightop.gemm_ops")
     calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 
     def gemm(*args, **kwargs) -> None:
@@ -777,8 +761,8 @@ def test_contiguous_deep_gemm_prefers_categorized_kernels_and_consumes_activatio
         return torch.full((1, 2), 6, dtype=torch.int8), torch.ones((1, 1))
 
     activation.fuse_silu_mul_quant = quant
-    _install_lightop(monkeypatch, activation=activation)
-    _install_deepgemm_i8(monkeypatch, contiguous=gemm)
+    gemm_ops.m_grouped_w8a8_gemm_nt_contig_asm = gemm
+    _install_lightop(monkeypatch, activation=activation, gemm_ops=gemm_ops)
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
         "DeepGemmExperts",
@@ -795,35 +779,35 @@ def test_contiguous_deep_gemm_prefers_categorized_kernels_and_consumes_activatio
     assert torch.equal(calls[2][1][0][0], torch.full((1, 2), 6, dtype=torch.int8))
 
 
-def test_contiguous_deep_gemm_legacy_fallback_warns_once(
+def test_contiguous_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
-    legacy.m_grouped_w8a8_gemm_nt_contig_asm = lambda *_args, **_kwargs: None
-    legacy.fuse_silu_mul_quant = lambda *_args, **_kwargs: (
-        torch.ones((1, 2), dtype=torch.int8),
-        torch.ones((1, 1)),
+    legacy_calls: list[str] = []
+    legacy.m_grouped_w8a8_gemm_nt_contig_asm = lambda *_args, **_kwargs: legacy_calls.append(
+        "gemm"
     )
-    logger = _WarningLogger()
+    legacy.fuse_silu_mul_quant = lambda *_args, **_kwargs: legacy_calls.append(
+        "activation"
+    )
     _install_lightop(monkeypatch, legacy=legacy)
-    _install_deepgemm_i8(monkeypatch, contiguous=lambda *_args: None)
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
         "DeepGemmExperts",
         "apply",
-        _deep_apply_namespace(logger),
+        _deep_apply_namespace(_WarningLogger()),
     )
 
-    _run_deep_int8_apply(apply, torch.empty((1, 2)))
-    _run_deep_int8_apply(apply, torch.empty((1, 2)))
-
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        _run_deep_int8_apply(apply, torch.empty((1, 2)))
+    assert legacy_calls == []
 
 
 def test_masked_deep_gemm_prefers_categorized_kernels_and_consumes_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     activation = ModuleType("lightop.activation")
+    gemm_ops = ModuleType("lightop.gemm_ops")
     calls: list[tuple[str, tuple[object, ...]]] = []
 
     def gemm(*args) -> None:
@@ -836,8 +820,8 @@ def test_masked_deep_gemm_prefers_categorized_kernels_and_consumes_activation(
         return torch.full((1, 1, 2), 7, dtype=torch.int8), torch.ones((1, 1, 1))
 
     activation.fuse_silu_mul_quant_ep = quant
-    _install_lightop(monkeypatch, activation=activation)
-    _install_deepgemm_i8(monkeypatch, masked=gemm)
+    gemm_ops.m_grouped_w8a8_gemm_nt_masked = gemm
+    _install_lightop(monkeypatch, activation=activation, gemm_ops=gemm_ops)
     namespace = {
         "torch": torch,
         "MoEActivation": SimpleNamespace(SILU="silu"),
@@ -888,24 +872,24 @@ def test_masked_deep_gemm_prefers_categorized_kernels_and_consumes_activation(
     assert torch.equal(calls[2][1][0][0], torch.full((1, 1, 2), 7, dtype=torch.int8))
 
 
-def test_masked_deep_gemm_legacy_fallback_warns_once(
+def test_masked_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
-    legacy.m_grouped_w8a8_gemm_nt_masked = lambda *_args, **_kwargs: None
-    legacy.fuse_silu_mul_quant_ep = lambda *_args, **_kwargs: (
-        torch.ones((1, 1, 2), dtype=torch.int8),
-        torch.ones((1, 1, 1)),
+    legacy_calls: list[str] = []
+    legacy.m_grouped_w8a8_gemm_nt_masked = lambda *_args, **_kwargs: legacy_calls.append(
+        "gemm"
+    )
+    legacy.fuse_silu_mul_quant_ep = lambda *_args, **_kwargs: legacy_calls.append(
+        "activation"
     )
     _install_lightop(monkeypatch, legacy=legacy)
-    _install_deepgemm_i8(monkeypatch, masked=lambda *_args: None)
-    logger = _WarningLogger()
     namespace = {
         "torch": torch,
         "MoEActivation": SimpleNamespace(SILU="silu"),
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "_resize_cache": lambda _cache, shape: torch.empty(shape),
-        "logger": logger,
+        "logger": _WarningLogger(),
     }
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py",
@@ -941,10 +925,9 @@ def test_masked_deep_gemm_legacy_fallback_warns_once(
         apply_router_weight_on_input=False,
     )
 
-    apply(self, **kwargs)
-    apply(self, **kwargs)
-
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        apply(self, **kwargs)
+    assert legacy_calls == []
 
 
 def _run_contiguous_fp8_apply(apply, output: torch.Tensor) -> None:
@@ -1008,24 +991,21 @@ def test_contiguous_fp8_deep_gemm_uses_categorized_activation_and_its_result(
     assert torch.equal(output, torch.full_like(output, 9))
 
 
-def test_contiguous_fp8_deep_gemm_legacy_activation_fallback_warns_once(
+def test_contiguous_fp8_deep_gemm_rejects_same_named_top_level_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
-    calls: list[tuple[object, ...]] = []
-    gemm_calls: list[tuple[object, ...]] = []
+    legacy_calls: list[object] = []
 
     def legacy_quant(input: torch.Tensor, **kwargs):
-        calls.append((input, kwargs))
-        return torch.full((1, 2), 8), torch.ones((1, 1))
+        del input, kwargs
+        legacy_calls.append("called")
 
     legacy.fuse_silu_mul_fp8_quant = legacy_quant
-    logger = _WarningLogger()
     _install_lightop(monkeypatch, legacy=legacy)
-    namespace = _deep_apply_namespace(logger)
+    namespace = _deep_apply_namespace(_WarningLogger())
 
     def gemm(*args, **_kwargs) -> None:
-        gemm_calls.append(args)
         args[2].fill_(3)
 
     namespace["m_grouped_fp8_gemm_nt_contiguous"] = gemm
@@ -1036,16 +1016,9 @@ def test_contiguous_fp8_deep_gemm_legacy_activation_fallback_warns_once(
         namespace,
     )
 
-    _run_contiguous_fp8_apply(apply, torch.empty((1, 2)))
-    _run_contiguous_fp8_apply(apply, torch.empty((1, 2)))
-
-    assert len(calls) == 2
-    assert set(calls[0][1]) == {"fp8type", "output", "expert_ids"}
-    assert calls[0][1]["fp8type"] == 0
-    assert calls[0][1]["output"].shape == (1, 2)
-    assert torch.equal(calls[0][1]["expert_ids"], torch.tensor([0]))
-    assert torch.equal(gemm_calls[1][0][0], torch.full((1, 2), 8))
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        _run_contiguous_fp8_apply(apply, torch.empty((1, 2)))
+    assert legacy_calls == []
 
 
 def _install_masked_fp8_gemm(
@@ -1137,41 +1110,33 @@ def test_masked_fp8_deep_gemm_uses_categorized_ep_activation_and_its_result(
     assert torch.equal(calls[2][1][0][1], torch.full((1, 1, 1), 0.25))
 
 
-def test_masked_fp8_deep_gemm_legacy_ep_activation_fallback_warns_once(
+def test_masked_fp8_deep_gemm_rejects_same_named_top_level_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
-    calls: list[dict[str, object]] = []
-    gemm_calls: list[tuple[object, ...]] = []
+    legacy_calls: list[object] = []
 
     def legacy_quant(**kwargs):
-        calls.append(kwargs)
-        return torch.ones((1, 1, 2)), torch.ones((1, 1, 1))
+        del kwargs
+        legacy_calls.append("called")
 
     legacy.fuse_silu_mul_fp8_quant_ep = legacy_quant
-    logger = _WarningLogger()
     _install_lightop(monkeypatch, legacy=legacy)
 
     def gemm(*args) -> None:
-        gemm_calls.append(args)
+        del args
 
     _install_masked_fp8_gemm(monkeypatch, gemm)
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py",
         "BatchedDeepGemmExperts",
         "apply",
-        _masked_fp8_namespace(logger),
+        _masked_fp8_namespace(_WarningLogger()),
     )
 
-    _run_masked_fp8_apply(apply, _masked_fp8_self())
-    _run_masked_fp8_apply(apply, _masked_fp8_self())
-
-    assert len(calls) == 2
-    assert calls[0]["fp8type"] == 0
-    assert calls[0]["input"].shape == (1, 1, 4)
-    assert torch.equal(calls[0]["tokens_per_expert"], torch.tensor([1]))
-    assert torch.equal(gemm_calls[1][0][0], torch.ones((1, 1, 2)))
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        _run_masked_fp8_apply(apply, _masked_fp8_self())
+    assert legacy_calls == []
 
 
 def _dpsk_namespace(logger: _WarningLogger, calls: list[tuple[str, tuple, dict]]):
@@ -1338,42 +1303,28 @@ def test_dpsk_lazy_fp8_exports_use_categorized_kernels_and_consume_results(
     assert torch.equal(contiguous_output, torch.full_like(contiguous_output, 9))
 
 
-def test_dpsk_lazy_fp8_exports_use_legacy_abi_and_warn_once(
+def test_dpsk_lazy_fp8_exports_reject_same_named_top_level_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
     calls: list[tuple[str, tuple, dict]] = []
+    legacy_calls: list[str] = []
 
     def quant(input: torch.Tensor, **kwargs):
-        calls.append(("quant", (input,), kwargs))
-        return torch.ones((1, 2)), torch.ones((1, 1))
+        del input, kwargs
+        legacy_calls.append("quant")
 
     def quant_ep(input: torch.Tensor, **kwargs):
-        calls.append(("quant-ep", (input,), kwargs))
-        return torch.ones((1, 1, 2)), torch.ones((1, 1))
+        del input, kwargs
+        legacy_calls.append("quant-ep")
 
     legacy.fuse_silu_mul_fp8_quant = quant
     legacy.fuse_silu_mul_fp8_quant_ep = quant_ep
-    logger = _WarningLogger()
     _install_lightop(monkeypatch, legacy=legacy)
-    namespace = _dpsk_namespace(logger, calls)
+    namespace = _dpsk_namespace(_WarningLogger(), calls)
     namespace.update({"functools": __import__("functools"), "import_module": importlib.import_module})
     _lazy_activation_import(namespace)
 
-    _run_dpsk_fp8_exports(namespace)
-
-    assert [name for name, _, _ in calls] == [
-        "contiguous-gemm",
-        "quant",
-        "contiguous-gemm",
-        "masked-gemm",
-        "quant-ep",
-        "masked-gemm",
-    ]
-    assert calls[1][2]["fp8type"] == 0
-    assert torch.equal(calls[1][2]["expert_ids"], torch.tensor([0]))
-    assert calls[4][2]["fp8type"] == 0
-    assert torch.equal(calls[4][2]["tokens_per_expert"], torch.tensor([1]))
-    assert torch.equal(calls[2][1][0][0], torch.ones((1, 2)))
-    assert torch.equal(calls[5][1][0][0], torch.ones((1, 1, 2)))
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError):
+        _run_dpsk_fp8_exports(namespace)
+    assert legacy_calls == []

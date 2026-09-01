@@ -10,7 +10,6 @@ activation scales.
 """
 
 import functools
-from importlib import import_module
 
 import torch
 
@@ -91,49 +90,48 @@ def m_grouped_i8_gemm_nt_masked(*args, **kwargs):
 
 
 @functools.lru_cache(maxsize=None)
-def _lightop_op(name: str):
-    """Resolve LightOp only when an HCU worker first needs an operator."""
+def _lightop_activation(name: str):
+    """Resolve categorized activation kernels without eager worker imports."""
+
+    from lightop import activation
+
+    return getattr(activation, name)
+
+
+@functools.lru_cache(maxsize=None)
+def _lightop_clamp(name: str):
+    """Resolve the two uncategorized LightOp clamp kernels lazily."""
+
+    if name not in {"fuse_silu_mul_clamp_quant", "fuse_silu_mul_clamp_quant_ep"}:
+        raise AttributeError(name)
 
     import lightop
 
     return getattr(lightop, name)
 
 
-@functools.lru_cache(maxsize=None)
-def _lightop_activation_op(name: str):
-    """Resolve categorized activation kernels without eager worker imports."""
-
-    try:
-        return getattr(import_module("lightop.activation"), name)
-    except (ImportError, AttributeError):
-        logger.warning_once(
-            "Using deprecated top-level LightOp activation APIs; upgrade LightOp."
-        )
-        return _lightop_op(name)
-
-
 def fuse_silu_mul_fp8_quant(*args, **kwargs):
-    return _lightop_activation_op("fuse_silu_mul_fp8_quant")(*args, **kwargs)
+    return _lightop_activation("fuse_silu_mul_fp8_quant")(*args, **kwargs)
 
 
 def fuse_silu_mul_fp8_quant_ep(*args, **kwargs):
-    return _lightop_activation_op("fuse_silu_mul_fp8_quant_ep")(*args, **kwargs)
+    return _lightop_activation("fuse_silu_mul_fp8_quant_ep")(*args, **kwargs)
 
 
 def fuse_silu_mul_quant(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_quant")(*args, **kwargs)
+    return _lightop_activation("fuse_silu_mul_quant")(*args, **kwargs)
 
 
 def fuse_silu_mul_quant_ep(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_quant_ep")(*args, **kwargs)
+    return _lightop_activation("fuse_silu_mul_quant_ep")(*args, **kwargs)
 
 
 def fuse_silu_mul_clamp_quant(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_clamp_quant")(*args, **kwargs)
+    return _lightop_clamp("fuse_silu_mul_clamp_quant")(*args, **kwargs)
 
 
 def fuse_silu_mul_clamp_quant_ep(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_clamp_quant_ep")(*args, **kwargs)
+    return _lightop_clamp("fuse_silu_mul_clamp_quant_ep")(*args, **kwargs)
 
 
 class DeepEPDeepGemmContiguousExperts(TritonExperts):

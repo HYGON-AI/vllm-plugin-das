@@ -228,8 +228,8 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
     }
     assert "use_nn_moe" not in experts_source
     assert "use_nn_moe" not in batched_source
-    assert "m_grouped_i8_gemm_nt_contiguous" in experts_source
-    assert "m_grouped_i8_gemm_nt_masked" in batched_source
+    assert "m_grouped_w8a8_gemm_nt_contig_asm" in experts_source
+    assert "m_grouped_w8a8_gemm_nt_masked" in batched_source
     assert "m_grouped_w8a8_gemm_nt_masked_ll" not in batched_source
     assert "VLLM_HCU_USE_LIGHTOP_EP_SCATTER" in utils_source
     assert "_HCU_TOKEN_ALIGNMENT = 256" in utils_source
