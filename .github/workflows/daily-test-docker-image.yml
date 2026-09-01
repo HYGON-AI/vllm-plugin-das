@@ -30,9 +30,6 @@ jobs:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
         - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
         - /opt/hyhal:/opt/hyhal:ro
-        - /var/run/docker.sock:/var/run/docker.sock:ro
-        - /usr/bin/docker.orig:/usr/local/bin/docker:ro
-        - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
     steps:
       - uses: actions/checkout@v4
 
