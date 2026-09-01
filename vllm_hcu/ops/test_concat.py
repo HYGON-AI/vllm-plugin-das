@@ -26,18 +26,10 @@ logger = init_logger(__name__)
 try:
     from lightop.tensor import ds_cat
 except (ImportError, AttributeError):
-    try:
-        from lightop import ds_cat
-    except (ImportError, AttributeError):
-        ds_cat = None
-        logger.warning_once(
-            "LightOp ds_cat is unavailable; using torch.cat."
-        )
-    else:
-        logger.warning_once(
-            "Using deprecated top-level lightop.ds_cat because "
-            "lightop.tensor is unavailable; upgrade LightOp."
-        )
+    ds_cat = None
+    logger.warning_once(
+        "LightOp ds_cat is unavailable; using torch.cat."
+    )
 
 
 def test_concat_Acc_prefill(shape_pair, dim):

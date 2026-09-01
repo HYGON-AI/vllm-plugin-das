@@ -33,7 +33,6 @@ def _isolated_concat_module(
     monkeypatch: pytest.MonkeyPatch,
     *,
     tensor_ds_cat: object = _MISSING,
-    legacy_ds_cat: object = _MISSING,
 ):
     """Reload test_concat against an isolated LightOp package hierarchy."""
     original_ds_cat = test_concat.ds_cat
@@ -51,9 +50,6 @@ def _isolated_concat_module(
                 tensor.ds_cat = tensor_ds_cat
                 lightop.tensor = tensor
                 isolated.setitem(sys.modules, "lightop.tensor", tensor)
-            if legacy_ds_cat is not _MISSING:
-                lightop.ds_cat = legacy_ds_cat
-
             yield importlib.reload(test_concat)
     finally:
         test_concat.ds_cat = original_ds_cat
@@ -98,11 +94,11 @@ def test_concat_prefers_tensor_ds_cat_and_preserves_kernel_modes(
     ]
 
 
-def test_concat_legacy_ds_cat_warns_once_and_executes_real_helpers(
+def test_concat_ignores_top_level_ds_cat_and_falls_back_to_torch_cat(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The real eager module accepts legacy ds_cat and logs once across reloads."""
+    """Only the categorized helper is eligible before the torch.cat fallback."""
     calls: list[int] = []
 
     def legacy(
@@ -112,33 +108,23 @@ def test_concat_legacy_ds_cat_warns_once_and_executes_real_helpers(
         output.copy_(torch.cat((left, right), dim=2))
 
     caplog.set_level(logging.WARNING, logger="vllm_hcu.ops.test_concat")
-    with _isolated_concat_module(monkeypatch, legacy_ds_cat=legacy) as module:
+    with _isolated_concat_module(monkeypatch) as module:
+        sys.modules["lightop"].ds_cat = legacy
+        module = importlib.reload(module)
         left, right = _concat_inputs()
         decoded = module.concat_helper_decode(left, right, dim=2)
         prefilled = module.lightop_concat_prefill_helper(left, right, dim=2)
-        module = importlib.reload(module)
-        decoded_after_reload = module.concat_helper_decode(left, right, dim=2)
-        prefilled_after_reload = module.lightop_concat_prefill_helper(
-            left, right, dim=2
-        )
 
-        assert module.ds_cat is legacy
+        assert module.ds_cat is None
         torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
         torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
-        torch.testing.assert_close(decoded_after_reload, torch.cat((left, right), dim=2))
-        torch.testing.assert_close(
-            prefilled_after_reload, torch.cat((left, right), dim=2)
-        )
 
-    assert calls == [0, 6, 0, 6]
+    assert calls == []
     assert [
         record.getMessage()
         for record in caplog.records
         if record.name == "vllm_hcu.ops.test_concat"
-    ] == [
-        "Using deprecated top-level lightop.ds_cat because "
-        "lightop.tensor is unavailable; upgrade LightOp."
-    ]
+    ] == ["LightOp ds_cat is unavailable; using torch.cat."]
 
 
 def test_concat_missing_ds_cat_warns_once_and_falls_back_to_torch_cat(
@@ -300,16 +286,25 @@ def _execute_rmsnorm_import_boundary(namespace: dict[str, object]) -> None:
         next(
             node
             for node in _module("vllm_hcu/ops/rms_norm.py").body
-            if isinstance(node, ast.Try)
-            and any(
-                isinstance(item, ast.ImportFrom) and item.module == "lightop.norm"
-                for item in node.body
-            )
+            if isinstance(node, ast.ImportFrom) and node.module == "lightop.norm"
         )
     )
     module = ast.Module(body=[boundary], type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, "rms_norm_import_boundary", "exec"), namespace)
+
+
+def _execute_gemma_import_boundary(namespace: dict[str, object]) -> None:
+    boundary = copy.deepcopy(
+        next(
+            node
+            for node in _module("vllm_hcu/ops/gemma_rms_norm.py").body
+            if isinstance(node, ast.ImportFrom) and node.module == "lightop.norm"
+        )
+    )
+    module = ast.Module(body=[boundary], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, "gemma_rms_norm_import_boundary", "exec"), namespace)
 
 
 def test_rmsnorm_prefers_categorized_kernels(
@@ -353,7 +348,7 @@ def test_rmsnorm_prefers_categorized_kernels(
     assert len(calls) == 2
 
 
-def test_rmsnorm_legacy_fallback_warns_once(
+def test_rmsnorm_rejects_legacy_only_installation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy = ModuleType("lightop")
@@ -362,30 +357,25 @@ def test_rmsnorm_legacy_fallback_warns_once(
     legacy_op = ModuleType("lightop.op")
     legacy_op.rmsnorm_forward_autograd = lambda *args: args[0]
     legacy.op = legacy_op
-    logger = _WarningLogger()
     monkeypatch.setitem(sys.modules, "lightop", legacy)
     monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
     monkeypatch.delitem(sys.modules, "lightop.norm", raising=False)
-    namespace: dict[str, object] = {"logger": logger}
+    namespace: dict[str, object] = {"logger": _WarningLogger()}
 
-    _execute_rmsnorm_import_boundary(namespace)
-    _execute_rmsnorm_import_boundary(namespace)
-
-    assert namespace["rmsnorm_forward_autograd"] is legacy_op.rmsnorm_forward_autograd
-    assert namespace["fused_add_rms_norm"] is legacy.fused_add_rms_norm
-    assert len(logger.messages) == 1
+    with pytest.raises(ImportError, match="lightop.norm"):
+        _execute_rmsnorm_import_boundary(namespace)
 
 
 def test_fp8_quant_uses_categorized_output_keywords(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[torch.Tensor, torch.dtype, torch.Tensor, torch.Tensor]] = []
+    calls: list[tuple[torch.Tensor, dict[str, torch.Tensor | torch.dtype]]] = []
 
     def per_token_quant_fp8(
-        x: torch.Tensor, *, dtype: torch.dtype, out_q: torch.Tensor, out_scale: torch.Tensor
+        x: torch.Tensor, **kwargs: torch.Tensor | torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        calls.append((x, dtype, out_q, out_scale))
-        return out_q, out_scale
+        calls.append((x, kwargs))
+        return kwargs["out_q"], kwargs["out_scale"]  # type: ignore[return-value]
 
     _install_lightop_submodule(
         monkeypatch, "quant", per_token_quant_fp8=per_token_quant_fp8
@@ -397,9 +387,10 @@ def test_fp8_quant_uses_categorized_output_keywords(
 
     assert len(calls) == 1
     assert calls[0][0] is x
-    assert calls[0][1] is torch.float8_e4m3fn
-    assert calls[0][2] is output
-    assert calls[0][3] is scale
+    assert set(calls[0][1]) == {"dtype", "out_q", "out_scale"}
+    assert calls[0][1]["dtype"] is torch.float8_e4m3fn
+    assert calls[0][1]["out_q"] is output
+    assert calls[0][1]["out_scale"] is scale
 
 
 def test_fp8_quant_rejects_legacy_output_first_api(
@@ -525,12 +516,17 @@ def test_gemma_rmsnorm_uses_new_out_keyword() -> None:
     assert calls[0][3] is actual
 
 
-def test_gemma_rmsnorm_rejects_legacy_only_installation() -> None:
-    forward = _load_gemma_forward(None)
-    owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+def test_gemma_rmsnorm_rejects_legacy_only_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = ModuleType("lightop")
+    legacy.__path__ = []
+    legacy.op = SimpleNamespace(gemma_rmsnorm=lambda *args: args[0])
+    monkeypatch.setitem(sys.modules, "lightop", legacy)
+    monkeypatch.delitem(sys.modules, "lightop.norm", raising=False)
 
-    with pytest.raises(RuntimeError, match="lightop.norm.gemma_rmsnorm"):
-        forward(owner, torch.ones((2, 4)))
+    with pytest.raises(ImportError, match="lightop.norm"):
+        _execute_gemma_import_boundary({})
 
 
 def test_fuse_silu_quant_prefers_categorized_kernel_and_consumes_result(

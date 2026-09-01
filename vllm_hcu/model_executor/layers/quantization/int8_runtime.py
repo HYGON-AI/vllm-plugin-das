@@ -5,9 +5,6 @@
 from __future__ import annotations
 
 import torch
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 class HcuInt8LinearError(RuntimeError):
@@ -114,18 +111,10 @@ def apply_int8_linear(
     else:
         try:
             from lightop.quant import per_token_quant_int8
-        except (ImportError, AttributeError):
-            try:
-                from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-            except (ImportError, AttributeError) as exc:
-                raise HcuInt8LinearError(
-                    "HCU W8A8 linear is enabled, but LMSlim per-token INT8 "
-                    "quantization is unavailable"
-                ) from exc
-            logger.warning_once(
-                "Using deprecated LMSlim per-token INT8 quantization because "
-                "lightop.quant is unavailable; upgrade LightOp."
-            )
+        except (ImportError, AttributeError) as exc:
+            raise HcuInt8LinearError(
+                "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
+            ) from exc
         x_q, x_scale = per_token_quant_int8(input)
 
     if x_q.shape != input.shape or x_scale.shape != (*input.shape[:-1], 1):
@@ -158,26 +147,18 @@ def apply_int8_linear(
         )
 
     try:
-        from lightop.gemm_ops import hipblaslt_w8a8_channelwise_gemm
-    except (ImportError, AttributeError):
-        try:
-            from lmslim import quant_ops
-        except (ImportError, AttributeError) as exc:
-            raise HcuInt8LinearError(
-                "HCU W8A8 linear is enabled, but LMSlim quant_ops is unavailable"
-            ) from exc
-        hipblaslt_w8a8_channelwise_gemm = quant_ops.hipblaslt_w8a8_gemm
-        logger.warning_once(
-            "Using deprecated LMSlim W8A8 GEMM because lightop.gemm_ops is "
-            "unavailable; upgrade LightOp."
-        )
+        from lightop.gemm_ops import hipblaslt_w8a8_gemm
+    except (ImportError, AttributeError) as exc:
+        raise HcuInt8LinearError(
+            "HCU W8A8 linear requires lightop.gemm_ops.hipblaslt_w8a8_gemm"
+        ) from exc
 
     x_q_2d = x_q.reshape(m, k).contiguous()
     x_scale_2d = x_scale.reshape(m, 1).contiguous()
     weight = weight.contiguous()
     weight_scale = weight_scale.contiguous()
     try:
-        status, output = hipblaslt_w8a8_channelwise_gemm(
+        status, output = hipblaslt_w8a8_gemm(
             x_q_2d,
             weight,
             x_scale_2d,

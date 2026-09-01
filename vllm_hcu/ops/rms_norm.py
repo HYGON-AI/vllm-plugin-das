@@ -2,23 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 import torch
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import direct_register_custom_op
 import vllm_hcu.platforms.envs as henvs
 
-logger = init_logger(__name__)
-
-try:
-    from lightop.norm import fused_add_rms_norm, rmsnorm_forward_autograd
-except (ImportError, AttributeError):
-    from lightop import fused_add_rms_norm
-    from lightop.op import rmsnorm_forward_autograd
-
-    logger.warning_once(
-        "Using deprecated top-level lightop and lightop.op RMSNorm APIs "
-        "because lightop.norm is unavailable; upgrade LightOp."
-    )
+from lightop.norm import fused_add_rms_norm, rmsnorm_forward_autograd
 
 
 # lightop's HCU RMSNorm kernel currently rejects reductions narrower than one

@@ -8,7 +8,7 @@ import importlib.util
 import math
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
@@ -130,61 +130,6 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
-def _install_fake_lmslim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def per_token_quant_int8(
-        value: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        absmax = value.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
-        scale = absmax / 127.0
-        quantized = torch.round(value.float() / scale).clamp(-127, 127).to(torch.int8)
-        return quantized, scale.to(torch.float32)
-
-    def hipblaslt_w8a8_gemm(
-        activation: torch.Tensor,
-        weight: torch.Tensor,
-        activation_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        m: int,
-        n: int,
-        k: int,
-        layout: str,
-        output_dtype: torch.dtype,
-    ) -> tuple[bool, torch.Tensor]:
-        assert activation.shape == (m, k)
-        assert weight.shape == (n, k)
-        assert layout == "NT"
-        output = (activation.float() * activation_scale) @ (
-            weight.float() * weight_scale
-        ).t()
-        return True, output.to(output_dtype)
-
-    lmslim = _module(
-        "lmslim",
-        quant_ops=SimpleNamespace(
-            hipblaslt_w8a8_gemm=hipblaslt_w8a8_gemm,
-        ),
-    )
-    lmslim.__path__ = []
-    layers = _module("lmslim.layers")
-    layers.__path__ = []
-    gemm = _module("lmslim.layers.gemm")
-    gemm.__path__ = []
-    int8_utils = _module(
-        "lmslim.layers.gemm.int8_utils",
-        per_token_quant_int8=per_token_quant_int8,
-    )
-    monkeypatch.setitem(sys.modules, "lmslim", lmslim)
-    monkeypatch.setitem(sys.modules, "lmslim.layers", layers)
-    monkeypatch.setitem(sys.modules, "lmslim.layers.gemm", gemm)
-    monkeypatch.setitem(
-        sys.modules,
-        "lmslim.layers.gemm.int8_utils",
-        int8_utils,
-    )
-
-
 def _install_fake_lightop_quant_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -220,7 +165,7 @@ def _install_fake_lightop_quant_gemm(
     quant = _module("lightop.quant", per_token_quant_int8=per_token_quant_int8)
     gemm_ops = _module(
         "lightop.gemm_ops",
-        hipblaslt_w8a8_channelwise_gemm=hipblaslt_w8a8_gemm,
+        hipblaslt_w8a8_gemm=hipblaslt_w8a8_gemm,
     )
     lightop.quant = quant
     lightop.gemm_ops = gemm_ops
@@ -299,49 +244,6 @@ def test_w8a8_linear_matches_dequantized_reference(
         rtol=2e-2,
         atol=2e-2,
     )
-
-
-def test_w8a8_linear_lmslim_fallback_warns_once_and_matches_reference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_hcu.platforms import envs as henvs
-    from vllm_hcu.model_executor.layers.quantization import int8_runtime
-
-    class WarningLogger:
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        def warning_once(self, message: str) -> None:
-            if message not in self.messages:
-                self.messages.append(message)
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", False)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", False)
-    logger = WarningLogger()
-    monkeypatch.setattr(int8_runtime, "logger", logger, raising=False)
-    lightop = _module("lightop")
-    lightop.__path__ = []
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
-    monkeypatch.delitem(sys.modules, "lightop.quant", raising=False)
-    monkeypatch.delitem(sys.modules, "lightop.gemm_ops", raising=False)
-    _install_fake_lmslim(monkeypatch)
-
-    activation = torch.tensor([[1.0, -2.0]], dtype=torch.float32)
-    weight = torch.tensor([[2, -1]], dtype=torch.int8)
-    weight_scale = torch.tensor([[0.5]], dtype=torch.float32)
-    actual = apply_int8_linear(activation, weight, weight_scale, torch.bfloat16)
-    actual_again = apply_int8_linear(activation, weight, weight_scale, torch.bfloat16)
-
-    activation_scale = torch.tensor([[2.0 / 127.0]], dtype=torch.float32)
-    activation_q = torch.tensor([[64, -127]], dtype=torch.int8)
-    expected = (activation_q.float() * activation_scale) @ (
-        weight.float() * weight_scale
-    ).t()
-    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_again.float(), expected, rtol=2e-2, atol=2e-2)
-    assert len(logger.messages) == 2
-    assert all("deprecated LMSlim" in message for message in logger.messages)
 
 
 class _CpuPerTokenQuantLauncher:

@@ -35,7 +35,7 @@ def _lightop_per_token_quant_fp8(
     out = torch.empty_like(x, dtype=_FP8_DTYPE)
     scale = torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32)
     try:
-        per_token_quant_fp8(
+        output, output_scale = per_token_quant_fp8(
             x,
             dtype=_FP8_DTYPE,
             out_q=out,
@@ -45,7 +45,7 @@ def _lightop_per_token_quant_fp8(
         raise HcuLightOpRegistrationError(
             "LightOp per_token_quant_fp8 kernel execution failed"
         ) from exc
-    return out, scale
+    return output, output_scale
 
 
 def _lightop_per_token_quant_fp8_fake(

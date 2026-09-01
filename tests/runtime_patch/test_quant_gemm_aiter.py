@@ -5720,9 +5720,7 @@ def test_int8_hcu_owned_kernel_validates_and_computes_shapes(
 
     lightop = _module("lightop")
     lightop.__path__ = []
-    gemm_ops = _module(
-        "lightop.gemm_ops", hipblaslt_w8a8_channelwise_gemm=gemm
-    )
+    gemm_ops = _module("lightop.gemm_ops", hipblaslt_w8a8_gemm=gemm)
     lightop.gemm_ops = gemm_ops
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
@@ -5793,14 +5791,13 @@ def test_int8_linear_prefers_categorized_lightop_quant_and_gemm(
     lightop = _module("lightop")
     lightop.__path__ = []
     quant_module = _module("lightop.quant", per_token_quant_int8=quant)
-    gemm_module = _module(
-        "lightop.gemm_ops", hipblaslt_w8a8_channelwise_gemm=gemm
-    )
+    gemm_module = _module("lightop.gemm_ops", hipblaslt_w8a8_gemm=gemm)
     lightop.quant = quant_module
     lightop.gemm_ops = gemm_module
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.quant", quant_module)
     monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_module)
+    _reject_import_prefix(monkeypatch, "lmslim")
 
     input = torch.ones((1, 2, 3), dtype=torch.bfloat16)
     weight = torch.ones((4, 3), dtype=torch.int8)
@@ -5814,7 +5811,7 @@ def test_int8_linear_prefers_categorized_lightop_quant_and_gemm(
     assert torch.equal(actual, torch.full_like(actual, 3))
 
 
-def test_int8_quant_fallback_propagates_lmslim_runtime_import_failure(
+def test_int8_quant_missing_categorized_export_fails_without_lmslim_retry(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.platforms import envs as henvs
@@ -5826,31 +5823,18 @@ def test_int8_quant_fallback_propagates_lmslim_runtime_import_failure(
     lightop.quant = _module("lightop.quant")
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.quant", lightop.quant)
-    real_import = builtins.__import__
-
-    def import_with_lmslim_failure(
-        name, globals=None, locals=None, fromlist=(), level=0
-    ):
-        if name == "lmslim.layers.gemm.int8_utils":
-            raise RuntimeError("LMSlim quant binary initialization failed")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", import_with_lmslim_failure)
+    _reject_import_prefix(monkeypatch, "lmslim")
 
     with pytest.raises(
-        RuntimeError, match="LMSlim quant binary initialization failed"
-    ) as exc_info:
+        int8_runtime.HcuInt8LinearError, match="lightop.quant"
+    ):
         int8_runtime.apply_int8_linear(
             torch.ones((1, 3), dtype=torch.bfloat16),
             torch.ones((2, 3), dtype=torch.int8),
             torch.ones((2, 1), dtype=torch.float32),
             torch.bfloat16,
         )
-
-    assert type(exc_info.value) is RuntimeError
-
-
-def test_int8_gemm_fallback_propagates_lmslim_runtime_import_failure(
+def test_int8_gemm_missing_categorized_export_fails_without_lmslim_retry(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.platforms import envs as henvs
@@ -5862,23 +5846,14 @@ def test_int8_gemm_fallback_propagates_lmslim_runtime_import_failure(
     lightop.gemm_ops = _module("lightop.gemm_ops")
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.gemm_ops", lightop.gemm_ops)
-    real_import = builtins.__import__
-
-    def import_with_lmslim_failure(
-        name, globals=None, locals=None, fromlist=(), level=0
-    ):
-        if name == "lmslim":
-            raise RuntimeError("LMSlim GEMM binary initialization failed")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", import_with_lmslim_failure)
+    _reject_import_prefix(monkeypatch, "lmslim")
     activation = torch.ones((1, 3), dtype=torch.bfloat16)
     quantized = torch.ones_like(activation, dtype=torch.int8)
     activation_scale = torch.ones((1, 1), dtype=torch.float32)
 
     with pytest.raises(
-        RuntimeError, match="LMSlim GEMM binary initialization failed"
-    ) as exc_info:
+        int8_runtime.HcuInt8LinearError, match="lightop.gemm_ops"
+    ):
         int8_runtime.apply_int8_linear(
             activation,
             torch.ones((2, 3), dtype=torch.int8),
@@ -5886,8 +5861,6 @@ def test_int8_gemm_fallback_propagates_lmslim_runtime_import_failure(
             torch.bfloat16,
             x_and_scale_quanted=(quantized, activation_scale),
         )
-
-    assert type(exc_info.value) is RuntimeError
 
 
 def _fake_int8_scheme_module():
