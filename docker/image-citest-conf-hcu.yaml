@@ -68,19 +68,19 @@ GLM-5-Channel-INT8-w8a8:
     VLLM_USE_MODELSCOPE: 1
   evalscope:
     datasets:
-    - swe_bench_lite_agentic
-    - mcp_atlas
-    - ifbench
-    - bfcl_v3
-    - humaneval
+    # - swe_bench_lite_agentic
+    # - mcp_atlas
+    # - ifbench
+    # - bfcl_v3
+    # - humaneval
     - gsm8k
     - math_500
     limit: 5
-    dataset_args:
-      swe_bench_lite_agentic:
-        limit: 1
-      mcp_atlas:
-        limit: 1
+    # dataset_args:
+    #   swe_bench_lite_agentic:
+    #     limit: 1
+    #   mcp_atlas:
+    #     limit: 1
   model: GLM-5-Channel-INT8-w8a8
   server: vllm
   server_args:
