@@ -4957,6 +4957,14 @@ def test_moe_fp8_aiter_path_accepts_v0251_shared_expert_contract(
             aiter_moe=aiter_moe,
         ),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            per_token_quant_hip=_fp8_quant_abi_stub,
+        ),
+    )
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
     assert "disable_inplace" not in FusedMoEConfig.__dataclass_fields__

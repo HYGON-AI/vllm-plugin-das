@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Live gfx938 numerical checks for the DeepSeek-V4 DSpark operator path."""
+"""Live gfx938 numerical cases collected by the unified AITER test module."""
 
 from __future__ import annotations
 
