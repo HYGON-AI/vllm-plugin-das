@@ -173,40 +173,53 @@ def test_dspark_context_insert_uses_only_non_pcp_lightop(
     def normal(*args: object) -> None:
         calls.append(args)
 
-    def pcp(*args: object) -> None:
-        raise AssertionError(f"PCP kernel must not be called: {args!r}")
-
     lightop = ModuleType("lightop")
-    lightop.op = SimpleNamespace(
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert=normal,
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp=pcp,
+    lightop.__path__ = []  # type: ignore[attr-defined]
+    attention = ModuleType("lightop.attention")
+    attention.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32 = (
+        normal
     )
+    lightop.attention = attention  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.attention", attention)
 
     cache = torch.zeros((2, 4, 8), dtype=torch.uint8)
     cos_sin_cache = torch.arange(16, dtype=torch.float32)
+    kv_weight = object()
     attn = SimpleNamespace(
         n_local_heads=2,
         head_dim=8,
         eps=1e-6,
+        kv_norm=SimpleNamespace(weight=SimpleNamespace(data=kv_weight)),
         rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin_cache),
         swa_cache_layer=SimpleNamespace(kv_cache=cache, block_size=4),
     )
     kv = torch.ones((3, 8), dtype=torch.float32)
     positions = torch.tensor([0, 1, 2], dtype=torch.int32)
-    slot_mapping = torch.tensor([4, 5, 6], dtype=torch.int64)
+    slot_mapping = torch.tensor([4, 99, 5, 99, 6, 99], dtype=torch.int64)[::2]
 
     dspark_module._insert_context_kv(attn, kv, positions, slot_mapping)
 
     assert len(calls) == 1
-    dummy_q, passed_kv, cache_2d, passed_slots, passed_positions, rope, eps, block = (
-        calls[0]
-    )
+    (
+        dummy_q,
+        passed_kv,
+        passed_weight,
+        cache_2d,
+        passed_slots,
+        passed_positions,
+        rope,
+        eps,
+        block,
+    ) = calls[0]
     assert dummy_q.shape == (3, 2, 8)
     assert dummy_q.dtype == kv.dtype
     assert passed_kv is kv
+    assert passed_weight is kv_weight
     assert cache_2d.shape == (2, 32)
-    assert passed_slots is slot_mapping
+    assert passed_slots.dtype is torch.int32
+    assert passed_slots.is_contiguous()
+    assert torch.equal(passed_slots, torch.tensor([4, 5, 6], dtype=torch.int32))
     assert passed_positions.dtype == torch.int64
     assert rope is cos_sin_cache
     assert eps == 1e-6
