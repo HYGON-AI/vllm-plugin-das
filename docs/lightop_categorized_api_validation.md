@@ -402,3 +402,76 @@ evidence is:
 The new contract count adds the CPU-only registration regression to the
 previous 1,215-pass final-fix count. GitHub CI rerun status is external state
 and is not represented by these local results.
+
+### Second control-container collection fix and final model rerun
+
+The next PR #42 static-gate run passed registration but exposed two remaining
+eager imports outside the registration package: the manual concat harness
+imported `lightop.tensor.ds_cat` during pytest collection, and the fused MoE
+gate owner imported `lightop.moe.moe_fused_gate` when its module was loaded.
+The fresh-process regression now imports both owners while rejecting every
+LightOp import. Before the fix it failed first with
+`eager LightOp import: lightop.moe`; the GitHub control-container traceback
+independently failed at `vllm_hcu/ops/test_concat.py` while importing
+`lightop.tensor.ds_cat`.
+
+Both categorized imports are now deferred until the corresponding runtime
+path executes. The MoE path remains strict: a missing
+`lightop.moe.moe_fused_gate` raises `ImportError` at execution and never uses
+a legacy export. Concat still falls back to `torch.cat` when the categorized
+optional helper is unavailable. Final local evidence for this follow-up is:
+
+| Command | Result |
+| --- | --- |
+| Fresh-process import regression covering `vllm_hcu.ops`, `fuse_moe_gate`, and `test_concat` | RED: `eager LightOp import: lightop.moe`; interim GREEN: 1 passed in 9.38s |
+| `python -m pytest -q tests/runtime_patch/test_lightop_ops_api.py -k concat` | 3 passed, 22 deselected, 14 warnings in 6.43s |
+| Categorized and missing-export fused-MoE gate probes | 2 passed, 88 deselected, 14 warnings in 25.22s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix2` | 1,216 passed, 83 deselected, 15 warnings in 334.83s |
+| Real HCU 7 categorized-export probe | BW1100; `lightop.tensor.ds_cat` and `lightop.moe.moe_fused_gate` both callable |
+
+The specified `/models/Qwen3.5-35B-A3B-W8A8` validation was then repeated on
+that follow-up tree using HCU 7, port 18012, and the same documented
+`slimquant_marlin` command. All eight devices were at the 2 MiB baseline with
+no KFD PIDs before startup. The server loaded all shards, `/health` returned
+HTTP 200, and the deterministic completion returned HTTP 200 with
+`finish_reason="stop"`, 9 prompt tokens, 39 completion tokens, and non-empty
+text. Log lines 136--137 confirm successful LightOp Marlin W8A8 MoE UP and
+DOWN code-object loading; line 928 records the successful completion request.
+
+The final log audit again found exactly one case-insensitive `lmslim` match,
+inside LightOp's own `lightop._lmslim_native.vllm_compat` namespace, and no
+plugin fallback or migration-related LightOp error. Only captured API server
+PID 1041650 was sent SIGTERM; its engine child exited normally. All devices
+returned to 2 MiB with no KFD PIDs. Evidence for this rerun is stored under
+`/tmp/vllm-hcu-lightop-qwen35-pr42-final/`.
+
+An AST audit performed before committing then found the last production
+module-level LightOp import in the sparse MLA attention adapter. Extending the
+same fresh-process guard to import that owner produced a third RED result:
+`eager LightOp import: lightop`. The adapter now caches
+`lightop.attention` only when a LightOp attention kernel path first executes.
+Its categorized-only ABI and legacy-namespace rejection behavior are
+unchanged. The all-production-module AST audit now reports an empty list for
+module-level `lightop` and `lightop.*` imports.
+
+Final evidence after this last production change is:
+
+| Command | Result |
+| --- | --- |
+| Fresh-process guard importing the registration package, fused MoE gate, concat owner, and sparse MLA attention owner | 1 passed in 21.11s |
+| `python -m pytest -q tests/runtime_patch/test_lightop_attention_api.py tests/runtime_patch/test_sparse_indexer_loading.py` | 20 passed, 14 warnings in 18.42s |
+| AST module-level LightOp import audit across `vllm_hcu/**/*.py` | no findings |
+| `python -m compileall -q vllm_hcu tests` | clean |
+| `python tools/check_production_boundary.py` | 248 Python files, clean |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix3` | 1,216 passed, 83 deselected, 15 warnings in 334.44s |
+
+The Qwen3.5 W8A8 validation was repeated once more on this exact final tree.
+Captured API PID 1067821 loaded 14/14 shards and 36.7 GiB of weights; health
+and deterministic completion both returned HTTP 200 with the same 9 prompt
+tokens, 39 completion tokens, and non-empty response. Log lines 135--136 show
+the LightOp Marlin W8A8 MoE UP/DOWN code objects loading successfully, and
+line 926 records the completion request. This final log's case-insensitive
+`lmslim` audit and migration-error audit were both empty. Only PID 1067821 was
+sent SIGTERM; the engine exited normally, KFD reported no PIDs, and HCU 7
+returned to the 2 MiB baseline. Final runtime evidence is stored under
+`/tmp/vllm-hcu-lightop-qwen35-pr42-final2/`.

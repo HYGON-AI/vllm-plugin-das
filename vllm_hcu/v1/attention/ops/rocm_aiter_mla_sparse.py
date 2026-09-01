@@ -27,7 +27,16 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
 
-from lightop import attention as lightop_attention
+lightop_attention = None
+
+
+def _get_lightop_attention():
+    global lightop_attention
+    if lightop_attention is None:
+        from lightop import attention
+
+        lightop_attention = attention
+    return lightop_attention
 
 
 _GLOBAL_LOGITS_BUFFERS = {}
@@ -103,7 +112,7 @@ def mqa_logits_inner_chunked(
 
         chunk_k_scale = k_scale.view(torch.float32).flatten() if on_gfx938() else None
 
-        lightop_attention.mqa_logits(
+        _get_lightop_attention().mqa_logits(
             q_slice,  
             k_fp8, 
             weights_slice.float().contiguous(),
@@ -123,7 +132,7 @@ def mqa_logits_inner_chunked(
             chunk.token_start + q_start : chunk.token_start + q_end, :topk_tokens
         ]
         
-        top_k_per_row_prefill_impl = lightop_attention.top_k_per_row_prefill if \
+        top_k_per_row_prefill_impl = _get_lightop_attention().top_k_per_row_prefill if \
             henvs.VLLM_HCU_USE_LIGHTOP_TOPK and \
             henvs.VLLM_HCU_USE_CUSTOM_OPS \
             else torch.ops._C.top_k_per_row_prefill
@@ -801,7 +810,7 @@ def rocm_fp8_paged_mqa_logits(
         )
         return out_qk.sum(dim=0)
     elif current_platform.is_rocm():
-        return lightop_attention.paged_mqa_logits(
+        return _get_lightop_attention().paged_mqa_logits(
             q_fp8, 
             kv_cache_fp8, 
             weights.float().contiguous(),
@@ -918,7 +927,7 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
     elif current_platform.is_rocm():
         k_fp8, scale = kv
-        return lightop_attention.mqa_logits(
+        return _get_lightop_attention().mqa_logits(
             q,
             k_fp8,
             weights.float().contiguous(),
@@ -1028,7 +1037,7 @@ def _lightop_topk_indices_prefill(
             device=topk_indices.device,
         )
     )
-    lightop_attention.top_k_per_row_prefill(
+    _get_lightop_attention().top_k_per_row_prefill(
         logits,
         row_starts_i32,
         row_ends_i32,
@@ -1050,7 +1059,7 @@ def _lightop_topk_indices_decode(
     topk_tokens: int,
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
-    lightop_attention.top_k_per_row_decode(
+    _get_lightop_attention().top_k_per_row_decode(
         logits,
         1,
         row_ends.to(device=logits.device, dtype=torch.int32),

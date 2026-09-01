@@ -548,7 +548,7 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     assert torch.equal(calls[0][2], weights.float().contiguous())
 
 
-def test_sparse_mla_import_rejects_legacy_attention_namespaces(
+def test_sparse_mla_runtime_rejects_legacy_attention_namespaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Sparse MLA must fail closed when only obsolete LightOp APIs exist."""
@@ -570,8 +570,11 @@ def test_sparse_mla_import_rejects_legacy_attention_namespaces(
         raising=False,
     )
 
+    runtime = importlib.import_module(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
+    )
     with pytest.raises(ImportError):
-        importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+        runtime._get_lightop_attention()
 
 
 def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():

@@ -358,6 +358,9 @@ def reject_lightop(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = reject_lightop
 try:
     import vllm_hcu.ops
+    import vllm_hcu.ops.fuse_moe_gate
+    import vllm_hcu.ops.test_concat
+    import vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse
 finally:
     builtins.__import__ = real_import
 

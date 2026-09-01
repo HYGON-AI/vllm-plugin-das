@@ -5,9 +5,6 @@ import torch
 import vllm_hcu.platforms.envs as henvs
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 
-from lightop.moe import moe_fused_gate as lightop_moe_fused_gate
-
-
 class HcuGroupedTopKRouter(GroupedTopKRouter):
     def _valid_grouping(self, router_logits: torch.Tensor) -> bool:
         """Mirror GroupedTopKRouter._compute_routing.<locals>.valid_grouping (not accessible from outside)."""
@@ -26,6 +23,8 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
         condition = self._valid_grouping(router_logits) and self.e_score_correction_bias is not None and henvs.VLLM_HCU_USE_FUSE_MOE_GATE and henvs.VLLM_HCU_USE_CUSTOM_OPS
         enable_shared_experts_fusion = False
         if condition:
+            from lightop.moe import moe_fused_gate as lightop_moe_fused_gate
+
             topk_weights, topk_ids = lightop_moe_fused_gate(
                 router_logits,
                 self.e_score_correction_bias,

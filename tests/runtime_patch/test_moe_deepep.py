@@ -3382,8 +3382,20 @@ module_name = "_hcu_fuse_moe_gate_fallback_probe"
 spec = importlib.util.spec_from_file_location(module_name, {str(module_path)!r})
 assert spec is not None and spec.loader is not None
 module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+router = object.__new__(module.HcuGroupedTopKRouter)
+router.num_expert_group = 2
+router.topk_group = 1
+router.top_k = 1
+router.num_fused_shared_experts = 0
+router.e_score_correction_bias = torch.ones(4)
+router.routed_scaling_factor = 1.0
+logits = torch.ones((1, 4))
+henvs.VLLM_HCU_USE_CUSTOM_OPS = True
+henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
 try:
-    spec.loader.exec_module(module)
+    router._compute_routing(None, logits, torch.int32)
 except ImportError:
     pass
 else:

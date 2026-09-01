@@ -35,7 +35,6 @@ def _isolated_concat_module(
     tensor_ds_cat: object = _MISSING,
 ):
     """Reload test_concat against an isolated LightOp package hierarchy."""
-    original_ds_cat = test_concat.ds_cat
     vllm_logger._print_warning_once.cache_clear()
     try:
         with monkeypatch.context() as isolated:
@@ -52,7 +51,6 @@ def _isolated_concat_module(
                 isolated.setitem(sys.modules, "lightop.tensor", tensor)
             yield importlib.reload(test_concat)
     finally:
-        test_concat.ds_cat = original_ds_cat
         vllm_logger._print_warning_once.cache_clear()
 
 
@@ -67,7 +65,7 @@ def test_concat_prefers_tensor_ds_cat_and_preserves_kernel_modes(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The real eager module uses categorized ds_cat for modes 0 and 6."""
+    """The runtime path uses categorized ds_cat for modes 0 and 6."""
     calls: list[int] = []
 
     def categorized(
@@ -82,7 +80,6 @@ def test_concat_prefers_tensor_ds_cat_and_preserves_kernel_modes(
         decoded = module.concat_helper_decode(left, right, dim=2)
         prefilled = module.lightop_concat_prefill_helper(left, right, dim=2)
 
-        assert module.ds_cat is categorized
         torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
         torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
 
@@ -115,7 +112,6 @@ def test_concat_ignores_top_level_ds_cat_and_falls_back_to_torch_cat(
         decoded = module.concat_helper_decode(left, right, dim=2)
         prefilled = module.lightop_concat_prefill_helper(left, right, dim=2)
 
-        assert module.ds_cat is None
         torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
         torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
 
@@ -131,7 +127,7 @@ def test_concat_missing_ds_cat_warns_once_and_falls_back_to_torch_cat(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The real eager module returns torch.cat results when ds_cat is absent."""
+    """The runtime path returns torch.cat results when ds_cat is absent."""
     caplog.set_level(logging.WARNING, logger="vllm_hcu.ops.test_concat")
     with _isolated_concat_module(monkeypatch) as module:
         left, right = _concat_inputs()
@@ -143,7 +139,6 @@ def test_concat_missing_ds_cat_warns_once_and_falls_back_to_torch_cat(
             left, right, dim=2
         )
 
-        assert module.ds_cat is None
         torch.testing.assert_close(decoded, torch.cat((left, right), dim=2))
         torch.testing.assert_close(prefilled, torch.cat((left, right), dim=2))
         torch.testing.assert_close(decoded_after_reload, torch.cat((left, right), dim=2))
