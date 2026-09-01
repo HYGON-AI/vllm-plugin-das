@@ -258,6 +258,17 @@ def apply_to_module(module: ModuleType) -> bool:
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
+        vllm_config = getattr(self, "_vllm_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if (
+            attn_metadata is None
+            and getattr(cache_config, "kv_cache_memory_bytes", None)
+        ):
+            # The target allocates a worst-case MLA prefill workspace when
+            # metadata is absent so automatic KV-cache profiling sees its
+            # peak. Manual KV sizing skips that profiling, and capture warmup
+            # only needs the same zero output used to keep DP+EP ranks aligned.
+            return output.fill_(0)
         if not config.enable_lightly_cp:
             return original_forward(
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,

@@ -454,6 +454,59 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     assert module.split_calls[-1] == (warmup, 3, True, True)
 
 
+@pytest.mark.parametrize(
+    ("kv_cache_memory_bytes", "has_metadata", "expected_delegate"),
+    (
+        pytest.param(3 * 1024**3, False, False, id="manual-kv-profile"),
+        pytest.param(3 * 1024**3, True, True, id="manual-kv-real-request"),
+        pytest.param(None, False, True, id="automatic-kv-profile"),
+        pytest.param(0, False, True, id="zero-kv-profile"),
+    ),
+)
+def test_mla_manual_kv_profile_guard_preserves_upstream_paths(
+    kv_cache_memory_bytes,
+    has_metadata,
+    expected_delegate,
+):
+    adapter = _adapter()
+    target_calls = []
+    module = _fake_mla_module(adapter, target_calls)
+    assert adapter.apply_to_module(module) is True
+
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
+    instance._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=kv_cache_memory_bytes
+        )
+    )
+    output = torch.ones(2, 3)
+    metadata = object() if has_metadata else None
+    args = (
+        object(),
+        object(),
+        object(),
+        object(),
+        metadata,
+        output,
+    )
+
+    result = instance.forward_impl(*args)
+
+    if expected_delegate:
+        assert result == "target-v0.25.1"
+        assert len(target_calls) == 1
+        delegated_instance, delegated_args = target_calls[0]
+        assert delegated_instance is instance
+        for actual, expected in zip(delegated_args[:6], args, strict=True):
+            assert actual is expected
+        assert delegated_args[6:] == (None,) * 6
+    else:
+        assert result is output
+        torch.testing.assert_close(result, torch.zeros_like(output))
+        assert target_calls == []
+
+
 def test_mla_feature_on_uses_hcu_lightly_cp_delta(monkeypatch):
     adapter = _adapter()
     target_calls = []
