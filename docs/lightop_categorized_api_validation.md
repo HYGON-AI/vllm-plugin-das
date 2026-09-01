@@ -361,3 +361,44 @@ HIP_VISIBLE_DEVICES=3 CUDA_VISIBLE_DEVICES=3 \
 Result: 3 passed, no skips, 14 warnings in 19.82s. The third test compares
 LightOp cache output to vLLM's reference path. At 2026-09-01T05:08:53Z,
 physical HCU 3 had returned to 2 MiB and still had no KFD owner.
+
+## PR #42 CPU-only control-container follow-up
+
+The first `Static gate and test selection` run for PR #42 failed during
+collection in the GPU-less HCU CI control container. The exact traceback
+ended at the package-level import in `vllm_hcu/ops/silu_and_mul.py`, where
+LightOp device discovery attempted to assign `LIGHTOP_GPU_CUS=None` to
+`os.environ`. The same `vllm_hcu.ops` registration chain also had eager
+LightOp imports in the RMSNorm and Gemma RMSNorm owners. This violated the
+existing CPU-only discovery and lazy-kernel-import boundary; it was not a
+LightOp ABI or kernel failure.
+
+The regression test imports the real `vllm_hcu.ops` package in a fresh
+process while rejecting every attempted `lightop` or `lightop.*` import. It
+failed before the production fix with:
+
+```text
+VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm \
+  python -m pytest -q \
+  tests/patch/test_plugin_lifecycle.py::test_ops_registration_defers_lightop_until_kernel_execution
+
+AssertionError: eager LightOp import: lightop.activation
+1 failed in 8.41s
+```
+
+The three owners now import only their categorized modules inside the actual
+kernel/custom branch. Missing categorized exports and runtime kernel errors
+still propagate without an obsolete fallback. The current local GREEN
+evidence is:
+
+| Command | Result |
+| --- | --- |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_plugin_lifecycle.py::test_ops_registration_defers_lightop_until_kernel_execution` | 1 passed in 8.33s |
+| `python -m pytest -q tests/runtime_patch/test_lightop_ops_api.py -k 'silu_and_mul or rmsnorm or gemma'` | 6 passed, 19 deselected, 14 warnings in 6.15s |
+| `python -m pytest -q tests/patch/test_lightop_api_boundary.py tests/runtime_patch/test_lightop_categorized_api.py` | 22 passed in 8.86s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_plugin_lifecycle.py tests/runtime_patch/test_lightop_ops_api.py` | 60 passed, 14 warnings in 85.10s |
+| `env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract` | 1,216 passed, 83 deselected, 14 warnings in 333.71s |
+
+The new contract count adds the CPU-only registration regression to the
+previous 1,215-pass final-fix count. GitHub CI rerun status is external state
+and is not represented by these local results.

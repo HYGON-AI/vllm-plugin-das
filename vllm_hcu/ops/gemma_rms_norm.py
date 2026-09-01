@@ -5,9 +5,6 @@ import torch
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 import vllm_hcu.platforms.envs as henvs
 
-from lightop.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
-
-
 @GemmaRMSNorm.register_oot
 class HcuGemmaRMSNorm(GemmaRMSNorm):
     def forward_hip(
@@ -16,6 +13,8 @@ class HcuGemmaRMSNorm(GemmaRMSNorm):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM:
+            from lightop.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+
             if residual is None:
                 out = x.clone()
                 gemma_rmsnorm(x, self.weight, self.variance_epsilon, out=out)

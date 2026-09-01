@@ -8,10 +8,9 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_hcu.platforms import envs as henvs
 
-from lightop.activation import silu_and_mul_opt
-
-
 def silu_and_mul_opt_lightop_impl(input: torch.Tensor) -> torch.Tensor:
+    from lightop.activation import silu_and_mul_opt
+
     d = input.shape[-1] // 2
     output_shape = input.shape[:-1] + (d,)
     out = torch.empty(output_shape, dtype=input.dtype, device=input.device)

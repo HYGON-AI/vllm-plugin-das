@@ -281,32 +281,6 @@ def _fused_rmsquant_impl():
     )
 
 
-def _execute_rmsnorm_import_boundary(namespace: dict[str, object]) -> None:
-    boundary = copy.deepcopy(
-        next(
-            node
-            for node in _module("vllm_hcu/ops/rms_norm.py").body
-            if isinstance(node, ast.ImportFrom) and node.module == "lightop.norm"
-        )
-    )
-    module = ast.Module(body=[boundary], type_ignores=[])
-    ast.fix_missing_locations(module)
-    exec(compile(module, "rms_norm_import_boundary", "exec"), namespace)
-
-
-def _execute_gemma_import_boundary(namespace: dict[str, object]) -> None:
-    boundary = copy.deepcopy(
-        next(
-            node
-            for node in _module("vllm_hcu/ops/gemma_rms_norm.py").body
-            if isinstance(node, ast.ImportFrom) and node.module == "lightop.norm"
-        )
-    )
-    module = ast.Module(body=[boundary], type_ignores=[])
-    ast.fix_missing_locations(module)
-    exec(compile(module, "gemma_rms_norm_import_boundary", "exec"), namespace)
-
-
 def test_rmsnorm_prefers_categorized_kernels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,17 +300,15 @@ def test_rmsnorm_prefers_categorized_kernels(
         rmsnorm_forward_autograd=categorized_forward,
         fused_add_rms_norm=categorized_fused,
     )
-    namespace: dict[str, object] = {"logger": _WarningLogger()}
-    _execute_rmsnorm_import_boundary(namespace)
     forward = _function(
         "vllm_hcu/ops/rms_norm.py",
         "_hcu_rmsnorm_forward_autograd_impl",
-        {"torch": torch, **namespace},
+        {"torch": torch},
     )
     fused = _function(
         "vllm_hcu/ops/rms_norm.py",
         "_hcu_fused_add_rms_norm_impl",
-        {"torch": torch, **namespace},
+        {"torch": torch},
     )
     x = torch.ones((1, 4))
     residual = torch.zeros_like(x)
@@ -360,10 +332,14 @@ def test_rmsnorm_rejects_legacy_only_installation(
     monkeypatch.setitem(sys.modules, "lightop", legacy)
     monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
     monkeypatch.delitem(sys.modules, "lightop.norm", raising=False)
-    namespace: dict[str, object] = {"logger": _WarningLogger()}
+    forward = _function(
+        "vllm_hcu/ops/rms_norm.py",
+        "_hcu_rmsnorm_forward_autograd_impl",
+        {"torch": torch},
+    )
 
     with pytest.raises(ImportError, match="lightop.norm"):
-        _execute_rmsnorm_import_boundary(namespace)
+        forward(torch.ones((1, 4)), torch.ones(4), 1e-6, False)
 
 
 def test_fp8_quant_uses_categorized_output_keywords(
@@ -469,7 +445,7 @@ def test_dynamic_rms_quant_consumes_returned_tensors(
     assert actual_s is expected_s
 
 
-def _load_gemma_forward(gemma_rmsnorm: object):
+def _load_gemma_forward():
     method = copy.deepcopy(
         next(
             node
@@ -490,14 +466,14 @@ def _load_gemma_forward(gemma_rmsnorm: object):
             VLLM_HCU_USE_CUSTOM_OPS=True,
             VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM=True,
         ),
-        "gemma_rmsnorm": gemma_rmsnorm,
-        "gemma_fused_add_rmsnorm": lambda *args: None,
     }
     exec(compile(module, "gemma_forward_contract", "exec"), namespace)
     return namespace["forward_hip"]
 
 
-def test_gemma_rmsnorm_uses_new_out_keyword() -> None:
+def test_gemma_rmsnorm_uses_new_out_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]] = []
 
     def gemma_rmsnorm(
@@ -505,7 +481,13 @@ def test_gemma_rmsnorm_uses_new_out_keyword() -> None:
     ) -> None:
         calls.append((x, weight, epsilon, out))
 
-    forward = _load_gemma_forward(gemma_rmsnorm)
+    _install_lightop_submodule(
+        monkeypatch,
+        "norm",
+        gemma_rmsnorm=gemma_rmsnorm,
+        gemma_fused_add_rmsnorm=lambda *args: None,
+    )
+    forward = _load_gemma_forward()
     owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
     x = torch.ones((2, 4))
     actual = forward(owner, x)
@@ -524,9 +506,11 @@ def test_gemma_rmsnorm_rejects_legacy_only_installation(
     legacy.op = SimpleNamespace(gemma_rmsnorm=lambda *args: args[0])
     monkeypatch.setitem(sys.modules, "lightop", legacy)
     monkeypatch.delitem(sys.modules, "lightop.norm", raising=False)
+    forward = _load_gemma_forward()
+    owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
 
     with pytest.raises(ImportError, match="lightop.norm"):
-        _execute_gemma_import_boundary({})
+        forward(owner, torch.ones((2, 4)))
 
 
 def test_fuse_silu_quant_prefers_categorized_kernel_and_consumes_result(
@@ -620,32 +604,15 @@ def test_silu_and_mul_selects_categorized_module_and_returns_its_output(
 
     activation.silu_and_mul_opt = categorized
     _install_lightop(monkeypatch, activation=activation)
-    namespace: dict[str, object] = {"torch": torch, "logger": _WarningLogger()}
-    _execute_silu_module_selection(namespace)
     impl = _function(
         "vllm_hcu/ops/silu_and_mul.py",
         "silu_and_mul_opt_lightop_impl",
-        namespace,
+        {"torch": torch},
     )
 
     result = impl(torch.ones((1, 6)))
 
     assert torch.equal(result, torch.full_like(result, 3))
-
-
-def _execute_silu_module_selection(namespace: dict[str, object]) -> None:
-    selection = copy.deepcopy(
-        next(
-            node
-            for node in _module("vllm_hcu/ops/silu_and_mul.py").body
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "lightop.activation"
-            and any(alias.name == "silu_and_mul_opt" for alias in node.names)
-        )
-    )
-    module = ast.Module(body=[selection], type_ignores=[])
-    ast.fix_missing_locations(module)
-    exec(compile(module, "silu_and_mul", "exec"), namespace)
 
 
 def test_silu_and_mul_rejects_same_named_legacy_operator_when_category_missing(
@@ -660,10 +627,14 @@ def test_silu_and_mul_rejects_same_named_legacy_operator_when_category_missing(
         activation=incomplete_activation,
         op=legacy_op,
     )
-    namespace: dict[str, object] = {"torch": torch, "logger": _WarningLogger()}
+    impl = _function(
+        "vllm_hcu/ops/silu_and_mul.py",
+        "silu_and_mul_opt_lightop_impl",
+        {"torch": torch},
+    )
 
     with pytest.raises(ImportError):
-        _execute_silu_module_selection(namespace)
+        impl(torch.ones((1, 6)))
     assert legacy_calls == []
 
 
