@@ -129,16 +129,18 @@ All commands below exited 0.
 | `python -m pytest -q tests/patch/test_lightop_api_boundary.py` | 10 passed after fix round 1 |
 | `python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py` | 9 passed after fix round 1 |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract` | 1,199 passed, 82 deselected, 15 warnings in 332.99s |
+| `python tools/run_patch_tests.py --suite contract` | 1,207 passed, 82 deselected, 14 warnings in 310.54s against the installed vLLM root after the model-evidence commit |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite integration-smoke -- -rs` | 73 passed, 3 skipped, 56 deselected in 3.62s |
 | `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite accuracy-hcu -- -k 'lightop or int8 or deepseek_v4 or dspark' -rs` | 41 passed, 98 deselected, 14 warnings in 24.24s |
 | `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract-hcu -- -k 'lightop or moe_align or deepseek_v4' -rs` | 7 passed, 1,135 deselected, 14 warnings in 22.20s |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_hcu_ci_selector.py` | 44 passed |
 | `python .github/scripts/hcu_ci/verify_hcu_registration.py` | 40 registrations across 22 jobs; valid |
 
-The contract total remains above the documented 1,162-pass baseline. Its 15
-warnings are one source-checkout `vllm._version` runtime warning and 14
-third-party `torch.jit.script_method` deprecation warnings. Each live-HCU
-suite reports only the same 14 Torch deprecation warnings.
+Both contract totals remain above the documented 1,162-pass baseline. The
+source-checkout run's 15 warnings are one `vllm._version` runtime warning and
+14 third-party `torch.jit.script_method` deprecation warnings; the final
+installed-root run and each live-HCU suite report only the same 14 Torch
+deprecation warnings.
 
 The three integration-smoke skips are not counted as passes:
 
@@ -148,7 +150,80 @@ The three integration-smoke skips are not counted as passes:
 
 There were no skips in either selected live-HCU suite.
 
+## Qwen3.5 W8A8 model validation
+
+At 2026-09-01T03:30:14Z, a fresh read-only device check reported all eight
+BW1100 devices at 2 MiB used with no KFD PIDs. Port 18012 accepted a local
+bind probe, so the validation selected physical device 7 and retained the
+planned port. The server was started from this worktree with captured PID
+782837:
+
+```text
+export SELECTED_HCU=7
+export PLUGIN_ROOT=/models/.worktrees/vllm-plugin-das-lightop-no-lmslim
+export HIP_VISIBLE_DEVICES="$SELECTED_HCU"
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KV_CACHE_LAYOUT=HND
+export VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1
+export VLLM_HCU_USE_GLOBAL_MOE_CACHE=1
+export VLLM_CACHE_ROOT=/tmp/vllm-cache-qwen35-lightop
+export PYTHONPATH="${PLUGIN_ROOT}"
+
+vllm serve /models/Qwen3.5-35B-A3B-W8A8 \
+  --served-model-name qwen35-int8-lightop \
+  --tensor-parallel-size 1 \
+  --max-model-len 65536 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.90 \
+  --trust-remote-code \
+  --quantization slimquant_marlin \
+  --port 18012
+```
+
+The engine loaded 14 checkpoint shards and 36.7 GiB of weights, completed
+startup, and returned HTTP 200 for `/health`. The prescribed temperature-zero
+completion request also returned HTTP 200 with `finish_reason="stop"`, 9
+prompt tokens, 39 completion tokens, and this non-empty text:
+
+```text
+Interface stability is crucial because it ensures that changes to a system's
+internal implementation do not disrupt dependent components, thereby
+maintaining system reliability and reducing the cost of software evolution.
+```
+
+The runtime route is explicit in the server log:
+
+- line 11 records the requested `quantization='slimquant_marlin'`;
+- line 29 resolves it to `quantization=slimquant_compressed_tensors_marlin`;
+- lines 136--137 show LightOp successfully loading the Marlin W8A8 MoE UP and
+  DOWN code objects from `lightop/hsa/gfx938/moe_w8a8_channel`;
+- lines 926--929 record completed application startup, two successful health
+  requests, and the successful completion request.
+
+The sole case-insensitive `lmslim` log match is line 135 under LightOp's own
+internal `lightop._lmslim_native.vllm_compat` implementation namespace. It is
+not an import or external LMSlim fallback by plugin production code and is an
+explicit non-goal of this migration. The error/traceback scan found 47 repeated
+Torch Dynamo metrics-only serialization reports, all ending with
+`TypeError: Object of type function is not JSON serializable`; model startup,
+health, and generation continued successfully afterward. There was no LightOp
+ABI, kernel, dtype, shape, device, or external LMSlim fallback failure.
+
+Of the server processes, only captured API server PID 782837 was directly sent
+SIGTERM. Its engine child shut down, the API completed application shutdown,
+and the post-run process check found neither PID. Physical device 7 returned
+to 2 MiB used. Runtime evidence is at
+`/tmp/vllm-hcu-lightop-qwen35/server.log` and
+`/tmp/vllm-hcu-lightop-qwen35/response.json`.
+
 ## Diagnosed non-final runs
+
+The first model health client inherited `ALL_PROXY=http://127.0.0.1:2097` and
+held its pre-start request open even after the server became healthy. A second
+bounded probe established HTTP 200; only the task-owned stuck curl PID 782840
+was terminated, after which the original loop retried successfully. The server
+remained PID 782837 throughout, and port 18012 did not require replacement.
 
 The first full contract run exited 1 with 17 failed, 1,211 passed, 53
 deselected, and 15 warnings. Four failures exposed cached real LightOp modules
