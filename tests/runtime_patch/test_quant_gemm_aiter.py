@@ -4419,6 +4419,25 @@ def test_moe_fp8_aiter_path_accepts_v0251_shared_expert_contract(
             aiter_moe=aiter_moe,
         ),
     )
+
+    def per_token_quant_hip(
+        x,
+        scale=None,
+        quant_dtype=torch.int8,
+        num_rows=None,
+        num_rows_factor=1,
+    ):
+        del scale, quant_dtype, num_rows, num_rows_factor
+        return x, torch.ones((x.shape[0], 1), dtype=torch.float32)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.fused_moe_asm_wna16",
+        _module(
+            "aiter.fused_moe_asm_wna16",
+            per_token_quant_hip=per_token_quant_hip,
+        ),
+    )
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
     assert "disable_inplace" not in FusedMoEConfig.__dataclass_fields__

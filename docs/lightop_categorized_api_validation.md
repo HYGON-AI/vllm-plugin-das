@@ -475,3 +475,26 @@ line 926 records the completion request. This final log's case-insensitive
 sent SIGTERM; the engine exited normally, KFD reported no PIDs, and HCU 7
 returned to the 2 MiB baseline. Final runtime evidence is stored under
 `/tmp/vllm-hcu-lightop-qwen35-pr42-final2/`.
+
+### GPU-less full-contract test isolation follow-up
+
+The next GitHub static-gate run reached the end of the full contract suite and
+reported four GPU-less-only test failures: two subprocess audits initialized
+the real LightOp wheel without deterministic ROCm metadata, one sparse-MLA
+negative test did not force its intended ROCm branch, and one AITER unit test
+stubbed `aiter.moe` but not the ASM quantization submodule that the production
+context manager resolves. The run completed with 1,212 passes before those
+four failures, confirming that the earlier collection failures were closed.
+
+These are test-harness isolation fixes only. The LightOp subprocess probes now
+provide deterministic gfx936/80-CU device metadata and ROCm home while still
+importing the installed wheel and checking its real categorized exports. The
+sparse test explicitly selects ROCm, and the AITER test injects the exact ASM
+submodule boundary it exercises. No production file changed in this wave.
+
+Final evidence:
+
+| Command | Result |
+| --- | --- |
+| Hidden-device/reduced-PATH rerun of the exact four GitHub failures | 4 passed, 14 warnings in 14.01s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix4` | 1,216 passed, 83 deselected, 15 warnings in 342.07s |

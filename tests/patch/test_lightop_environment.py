@@ -119,6 +119,7 @@ def test_package_bootstrap_configures_lightop_before_lightop_import():
     ):
         env.pop(name, None)
     env["VLLM_HCU_USE_GLOBAL_MOE_CACHE"] = "1"
+    env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(REPOSITORY), env.get("PYTHONPATH")) if part
     )
@@ -127,6 +128,16 @@ def test_package_bootstrap_configures_lightop_before_lightop_import():
         [
             sys.executable,
             "-c",
+            "import subprocess; from types import SimpleNamespace; "
+            "subprocess.run = lambda *_a, **_k: "
+            "SimpleNamespace(stdout="
+            "'Name: gfx936\\nCompute Unit: 80\\n' "
+            "if _k.get('text') else b'26.04'); "
+            "import torch; "
+            "torch.cuda.get_device_properties = lambda *_a, **_k: "
+            "SimpleNamespace(gcnArchName='gfx936:sramecc+:xnack-', "
+            "multi_processor_count=80, name='HYGON HCU'); "
+            "torch.cuda.current_device = lambda: 0; "
             "import vllm_hcu; import lightop.envs; "
             "assert lightop.envs.LMSLIM_USE_GLOBAL_MOE_CACHE is True",
         ],

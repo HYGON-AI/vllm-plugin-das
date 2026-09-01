@@ -191,6 +191,7 @@ def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
 def test_sparse_mla_does_not_retry_legacy_namespace(monkeypatch):
     runtime = _runtime()
     legacy = SimpleNamespace(mqa_logits=lambda *_: pytest.fail("legacy called"))
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr(runtime, "lightop_attention", SimpleNamespace())
     monkeypatch.setattr(runtime, "lightop", legacy, raising=False)
     with pytest.raises(AttributeError):

@@ -744,12 +744,17 @@ def test_installed_category_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
     env = dict(os.environ)
     env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
+    env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     result = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import importlib, json, os, torch; "
+            "import importlib, json, os, subprocess, torch; "
             "from types import SimpleNamespace; "
+            "subprocess.run = lambda *_a, **_k: "
+            "SimpleNamespace(stdout="
+            "'Name: gfx936\\nCompute Unit: 80\\n' "
+            "if _k.get('text') else b'26.04'); "
             "torch.cuda.get_device_properties = lambda *_a, **_k: "
             "SimpleNamespace(gcnArchName='gfx936:sramecc+:xnack-', "
             "multi_processor_count=80, name='HYGON HCU', major=9, minor=3, "
