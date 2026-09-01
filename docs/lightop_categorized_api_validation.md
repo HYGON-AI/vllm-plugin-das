@@ -129,7 +129,8 @@ All commands below exited 0.
 | `python -m pytest -q tests/patch/test_lightop_api_boundary.py` | 10 passed after fix round 1 |
 | `python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py` | 9 passed after fix round 1 |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract` | 1,199 passed, 82 deselected, 15 warnings in 332.99s |
-| `python tools/run_patch_tests.py --suite contract` | 1,207 passed, 82 deselected, 14 warnings in 310.54s against the installed vLLM root after the model-evidence commit |
+| `python tools/run_patch_tests.py --suite contract` | 1,207 passed, 82 deselected, 14 warnings in 310.54s against the installed vLLM root after the initial model-evidence commit and before its docs-only amendment |
+| `python tools/run_patch_tests.py --suite contract` | 1,207 passed, 82 deselected, 14 warnings in 304.70s against final commit `d034f84` after the docs-only amendment |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite integration-smoke -- -rs` | 73 passed, 3 skipped, 56 deselected in 3.62s |
 | `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite accuracy-hcu -- -k 'lightop or int8 or deepseek_v4 or dspark' -rs` | 41 passed, 98 deselected, 14 warnings in 24.24s |
 | `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract-hcu -- -k 'lightop or moe_align or deepseek_v4' -rs` | 7 passed, 1,135 deselected, 14 warnings in 22.20s |
@@ -201,9 +202,15 @@ The runtime route is explicit in the server log:
 - lines 926--929 record completed application startup, two successful health
   requests, and the successful completion request.
 
-The sole case-insensitive `lmslim` log match is line 135 under LightOp's own
-internal `lightop._lmslim_native.vllm_compat` implementation namespace. It is
-not an import or external LMSlim fallback by plugin production code and is an
+The case-insensitive LMSlim audit was run separately as:
+
+```text
+rg -ni 'lmslim' /tmp/vllm-hcu-lightop-qwen35/server.log
+```
+
+Its exact sole match is line 135 under LightOp's own internal
+`lightop._lmslim_native.vllm_compat` implementation namespace. It is not an
+import or external LMSlim fallback by plugin production code and is an
 explicit non-goal of this migration. The error/traceback scan found 47 repeated
 Torch Dynamo metrics-only serialization reports, all ending with
 `TypeError: Object of type function is not JSON serializable`; model startup,
