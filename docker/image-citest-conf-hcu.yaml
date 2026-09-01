@@ -64,7 +64,7 @@ Qwen3.6-35B-A3B:
   type: precision
 GLM-5-Channel-INT8-w8a8:
   env:
-    VLLM_HCU_USE_GLOBAL_MOE_CACHE: 1
+    LMSLIM_USE_GLOBAL_MOE_CACHE: 1
     VLLM_USE_MODELSCOPE: 1
   evalscope:
     datasets:
