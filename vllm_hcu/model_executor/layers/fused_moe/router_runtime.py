@@ -4,11 +4,6 @@
 
 from __future__ import annotations
 
-from vllm.logger import init_logger
-
-
-logger = init_logger(__name__)
-
 def eplb_map_to_physical_and_record(
     module,
     original,
@@ -94,15 +89,7 @@ def make_hcu_grouped_topk_router(base_class):
                     indices_type,
                     input_ids=input_ids,
                 )
-            try:
-                from lightop.moe import moe_fused_gate
-            except (ImportError, AttributeError):
-                from lightop.op import moe_fused_gate
-
-                logger.warning_once(
-                    "Using deprecated lightop.op MoE APIs because lightop.moe is "
-                    "unavailable; upgrade LightOp."
-                )
+            from lightop.moe import moe_fused_gate
             topk_weights, topk_ids = moe_fused_gate(
                 router_logits,
                 self.e_score_correction_bias,

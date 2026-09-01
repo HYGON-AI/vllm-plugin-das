@@ -3,21 +3,9 @@
 
 import torch
 import vllm_hcu.platforms.envs as henvs
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 
-
-logger = init_logger(__name__)
-
-try:
-    from lightop.moe import moe_fused_gate as lightop_moe_fused_gate
-except (ImportError, AttributeError):
-    from lightop.op import moe_fused_gate as lightop_moe_fused_gate
-
-    logger.warning_once(
-        "Using deprecated lightop.op MoE APIs because lightop.moe is "
-        "unavailable; upgrade LightOp."
-    )
+from lightop.moe import moe_fused_gate as lightop_moe_fused_gate
 
 
 class HcuGroupedTopKRouter(GroupedTopKRouter):

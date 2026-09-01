@@ -9,7 +9,6 @@ and updated to fit vllm needs and terminology.
 
 import torch
 
-from vllm.logger import init_logger
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.platforms import current_platform
@@ -18,9 +17,6 @@ from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
 
 import vllm_hcu.platforms.envs as henvs
-
-
-logger = init_logger(__name__)
 
 
 # HCU DeepEP/LightOP kernels use 256-row expert slices. Keep this separate
@@ -348,31 +344,22 @@ def ep_scatter(
         and henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
     ):
-        try:
-            from lightop import moe as lightop_moe
-        except (ImportError, AttributeError):
-            from lightop import op as lightop_moe
+        from lightop.moe import ep_scatter as lightop_ep_scatter
 
-            logger.warning_once(
-                "Using deprecated lightop.op MoE APIs because lightop.moe is "
-                "unavailable; upgrade LightOp."
-            )
-
-        if hasattr(lightop_moe, "ep_scatter"):
-            lightop_moe.ep_scatter(
-                recv_x,
-                recv_x_scale,
-                recv_topk,
-                expert_map,
-                num_recv_tokens_per_expert,
-                output_tensor,
-                output_tensor_scale,
-                m_indices,
-                output_index,
-                num_experts,
-                align_m,
-            )
-            return
+        lightop_ep_scatter(
+            recv_x,
+            recv_x_scale,
+            recv_topk,
+            expert_map,
+            num_recv_tokens_per_expert,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+            num_experts,
+            align_m,
+        )
+        return
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
@@ -499,26 +486,17 @@ def ep_gather(
         and henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
     ):
-        try:
-            from lightop import moe as lightop_moe
-        except (ImportError, AttributeError):
-            from lightop import op as lightop_moe
+        from lightop.moe import ep_gather as lightop_ep_gather
 
-            logger.warning_once(
-                "Using deprecated lightop.op MoE APIs because lightop.moe is "
-                "unavailable; upgrade LightOp."
-            )
-
-        if hasattr(lightop_moe, "ep_gather"):
-            lightop_moe.ep_gather(
-                input_tensor,
-                recv_topk_ids,
-                recv_topk_weight,
-                input_index,
-                expert_map,
-                output_tensor,
-            )
-            return
+        lightop_ep_gather(
+            input_tensor,
+            recv_topk_ids,
+            recv_topk_weight,
+            input_index,
+            expert_map,
+            output_tensor,
+        )
+        return
 
     num_warps = 2
     num_tokens = output_tensor.shape[0]
