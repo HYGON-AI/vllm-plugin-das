@@ -28,6 +28,7 @@ REQUIRED_EXPORTS = {
         "top_k_per_row_prefill",
     },
     "lightop.gemm_ops": {
+        "hipblaslt_w8a8_gemm",
         "hipblaslt_w8a8_channelwise_gemm",
         "m_grouped_w8a8_gemm_nt_contig_asm",
         "m_grouped_w8a8_gemm_nt_masked",
@@ -93,6 +94,7 @@ def test_isolated_lightop_modules_evicts_stale_cache(
 
 
 @pytest.mark.usefixtures("isolated_lightop_modules")
+@pytest.mark.hcu
 @pytest.mark.parametrize("module_name", sorted(REQUIRED_EXPORTS))
 def test_categorized_lightop_exports(
     module_name: str,

@@ -496,11 +496,21 @@
       "patterns": [
         "tests/accuracy/test_hcu_kernel_accuracy.py",
         "tests/accuracy/test_aiter_silu_and_mul.py",
-        "tests/accuracy/test_unified_aiter_moe_operator.py"
+        "tests/accuracy/test_unified_aiter_moe_operator.py",
+        "tests/accuracy/test_deepseek_v4_dspark_ops.py"
       ],
       "jobs": [
         "accuracy-gfx936",
         "accuracy-gfx938"
+      ]
+    },
+    "lightop-api-contract": {
+      "patterns": [
+        "tests/patch/test_lightop_api_boundary.py",
+        "tests/runtime_patch/test_lightop_categorized_api.py"
+      ],
+      "jobs": [
+        "contract-hcu-gfx936"
       ]
     },
     "platform-runtime": {

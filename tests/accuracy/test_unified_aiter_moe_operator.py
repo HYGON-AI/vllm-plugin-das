@@ -21,6 +21,9 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
     aiter_asm_boltops_int8_quant_context,
 )
 
+
+pytestmark = pytest.mark.hcu
+
 NUMERICAL_LIMITS = {
     "w16a16": {
         "min_reference_rms": 5e-5,
