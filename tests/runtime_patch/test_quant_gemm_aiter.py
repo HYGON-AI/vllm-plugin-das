@@ -3615,12 +3615,18 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
     )
 
     moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
         moe_backend="auto",
         moe_parallel_config=SimpleNamespace(
             dp_size=2,
             use_ep=True,
             all2all_backend="deepep_auto",
             use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"]
+            )
         ),
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(object(), moe)
@@ -3665,6 +3671,136 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         ),
         x + 3,
     )
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
+    from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+        slimquant_w4a8_uses_deepep_auto,
+    )
+
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV3ForCausalLM"]
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="validated only for DeepSeek-V4"):
+        slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_rejects_non_silu_activation():
+    from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+        slimquant_w4a8_uses_deepep_auto,
+    )
+
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="gelu"),
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"]
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="supports only SiLU activation"):
+        slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_rejects_non_rocm_platform(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: False),
+        raising=False,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"]
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the HCU ROCm runtime"):
+        deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_rejects_incomplete_hipc_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+    noop = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            pack_w4a8_moe_hipc_weight=noop,
+            view_w4a8_moe_hipc_weight_n32_layout=noop,
+            m_grouped_w4a8_gemm_nt_contiguous_hipc=noop,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lightop",
+        _module("lightop", fuse_silu_mul_quant=noop),
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"]
+            )
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="m_grouped_w4a8_gemm_nt_masked_hipc",
+    ):
+        deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe)
 
 
 @pytest.mark.hcu
@@ -4332,6 +4468,109 @@ def test_slimquant_w4a8_apply_accepts_runner_owned_shared_experts(
         topk_ids,
         shared_experts=object(),
         shared_experts_input=x,
+    )
+
+    assert result is x
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_restores_native_nonidentity_expert_map(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "slimquant_w4a8_uses_deepep_auto",
+        lambda _moe: True,
+    )
+    calls: list[dict[str, object]] = []
+
+    class W4A8Kernel:
+        @staticmethod
+        def apply(**kwargs: object) -> torch.Tensor:
+            calls.append(kwargs)
+            return kwargs["hidden_states"]
+
+    native_expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(num_experts=4)
+    method.moe_kernel = W4A8Kernel()
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((2, 8, 2), dtype=torch.int8),
+        w2_weight=torch.zeros((2, 4, 2), dtype=torch.int8),
+        activation=SimpleNamespace(value="silu"),
+        global_num_experts=4,
+        expert_map=expert_mask,
+        apply_router_weight_on_input=False,
+    )
+    x = torch.zeros((2, 4), dtype=torch.bfloat16)
+
+    result = method.apply(
+        layer,
+        x,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        None,
+        None,
+    )
+
+    assert result is x
+    assert calls[0]["expert_map"] is native_expert_map
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_apply_reuses_initialized_deepep_auto_route(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.config
+
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config_or_none",
+        lambda: None,
+    )
+
+    class W4A8Kernel:
+        @staticmethod
+        def apply(**kwargs: object) -> torch.Tensor:
+            return kwargs["hidden_states"]
+
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="auto",
+        num_experts=2,
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+    )
+    method.moe_kernel = W4A8Kernel()
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((2, 8, 2), dtype=torch.int8),
+        w2_weight=torch.zeros((2, 4, 2), dtype=torch.int8),
+        activation=SimpleNamespace(value="silu"),
+        global_num_experts=2,
+        expert_map=torch.tensor([0, 1], dtype=torch.int32),
+        apply_router_weight_on_input=False,
+    )
+    x = torch.zeros((2, 4), dtype=torch.bfloat16)
+
+    result = method.apply(
+        layer,
+        x,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        None,
+        None,
     )
 
     assert result is x

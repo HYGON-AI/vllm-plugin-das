@@ -292,13 +292,32 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             slimquant_w4a8_uses_deepep_auto,
         )
 
-        if slimquant_w4a8_uses_deepep_auto(getattr(self, "moe", None)):
-            if self.moe_kernel is None:
+        moe_kernel = getattr(self, "moe_kernel", None)
+        uses_deepep_auto = moe_kernel is not None
+        if not uses_deepep_auto:
+            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
+                getattr(self, "moe", None)
+            )
+        if uses_deepep_auto:
+            if moe_kernel is None:
                 raise RuntimeError(
                     "SlimQuant W4A8 deepep_auto kernel was not initialized; "
                     "process_weights_after_loading must run before apply"
                 )
-            return self.moe_kernel.apply(
+            from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+                resolve_aiter_expert_maps,
+            )
+
+            global_num_experts = getattr(
+                layer,
+                "global_num_experts",
+                getattr(self.moe, "num_experts", -1),
+            )
+            native_expert_map, _ = resolve_aiter_expert_maps(
+                getattr(layer, "expert_map", None),
+                global_num_experts,
+            )
+            return moe_kernel.apply(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
@@ -309,12 +328,8 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                     "activation",
                     getattr(self.moe, "activation", None),
                 ),
-                global_num_experts=getattr(
-                    layer,
-                    "global_num_experts",
-                    getattr(self.moe, "num_experts", -1),
-                ),
-                expert_map=getattr(layer, "expert_map", None),
+                global_num_experts=global_num_experts,
+                expert_map=native_expert_map,
                 apply_router_weight_on_input=getattr(
                     layer,
                     "apply_router_weight_on_input",

@@ -3308,6 +3308,7 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as module,
     )
@@ -3349,7 +3350,15 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "FusedMoEKernel",
         lambda prepare, experts: (prepare, experts),
     )
-    quant_config = SimpleNamespace(weight_quant_dtype="int4")
+    quant_config = FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        per_act_token_quant=True,
+        per_out_ch_quant=False,
+        block_shape=None,
+        weight_dtype="int4",
+    )
     moe_config = SimpleNamespace()
 
     kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
@@ -3368,6 +3377,113 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "num_dispatchers": 8,
         "fixed_use_low_latency": None,
     }
+
+
+def test_slimquant_w4a8_auto_factory_rejects_non_dynamic_token_scheme(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_make_deepep_auto_deepgemm_moe_kernel",
+        lambda **_kwargs: pytest.fail(
+            "invalid W4A8 quantization reached DeepGEMM construction"
+        ),
+    )
+    quant_config = FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        per_act_token_quant=False,
+        per_out_ch_quant=False,
+        block_shape=None,
+        weight_dtype="int4",
+    )
+
+    with pytest.raises(ValueError, match="dynamic per-token INT8"):
+        module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+            moe_quant_config=quant_config,
+            moe_config=SimpleNamespace(),
+        )
+
+
+def test_slimquant_w4a8_auto_factory_requires_channel_weight_scales(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_make_deepep_auto_deepgemm_moe_kernel",
+        lambda **_kwargs: pytest.fail(
+            "unscaled W4A8 weights reached DeepGEMM construction"
+        ),
+    )
+    quant_config = FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=None,
+        w2_scale=torch.ones((2, 4, 1)),
+        per_act_token_quant=True,
+        per_out_ch_quant=False,
+        block_shape=None,
+        weight_dtype="int4",
+    )
+
+    with pytest.raises(ValueError, match="channel weight scales"):
+        module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+            moe_quant_config=quant_config,
+            moe_config=SimpleNamespace(),
+        )
+
+
+@pytest.mark.parametrize(
+    "unsupported_metadata",
+    [
+        {"w1_zp": torch.zeros((2, 8, 1), dtype=torch.int8)},
+        {"a1_scale": torch.ones((1,), dtype=torch.float32)},
+        {"g1_alphas": torch.ones((2, 8, 1), dtype=torch.float32)},
+        {"w1_bias": torch.zeros((2, 8), dtype=torch.float32)},
+    ],
+)
+def test_slimquant_w4a8_auto_factory_rejects_auxiliary_quant_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported_metadata: dict[str, torch.Tensor],
+):
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_make_deepep_auto_deepgemm_moe_kernel",
+        lambda **_kwargs: pytest.fail(
+            "unsupported W4A8 metadata reached DeepGEMM construction"
+        ),
+    )
+    quant_config = FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        per_act_token_quant=True,
+        per_out_ch_quant=False,
+        block_shape=None,
+        weight_dtype="int4",
+        **unsupported_metadata,
+    )
+
+    with pytest.raises(ValueError, match="symmetric.*without auxiliary"):
+        module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+            moe_quant_config=quant_config,
+            moe_config=SimpleNamespace(),
+        )
 
 
 @pytest.mark.parametrize("use_fp8", [True, False])

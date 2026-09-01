@@ -1188,6 +1188,44 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
 
     if moe_quant_config.weight_quant_dtype != "int4":
         raise ValueError("SlimQuant auto factory requires INT4 W4A8 quantization")
+    if (
+        moe_quant_config.quant_dtype != torch.int8
+        or not moe_quant_config.is_per_act_token
+        or moe_quant_config.is_block_quantized
+    ):
+        raise ValueError(
+            "SlimQuant auto factory requires dynamic per-token INT8 "
+            "activation quantization"
+        )
+    if (
+        moe_quant_config.per_out_ch_quant
+        or moe_quant_config.w1_scale is None
+        or moe_quant_config.w2_scale is None
+    ):
+        raise ValueError(
+            "SlimQuant auto factory requires symmetric INT4 channel weight "
+            "scales for both MoE GEMMs"
+        )
+    unsupported_metadata = (
+        moe_quant_config.a1_scale,
+        moe_quant_config.a2_scale,
+        moe_quant_config.a1_gscale,
+        moe_quant_config.a2_gscale,
+        moe_quant_config.w1_zp,
+        moe_quant_config.w2_zp,
+        moe_quant_config.g1_alphas,
+        moe_quant_config.g2_alphas,
+        moe_quant_config.w1_bias,
+        moe_quant_config.w2_bias,
+        moe_quant_config.gemm1_alpha,
+        moe_quant_config.gemm1_beta,
+        moe_quant_config.gemm1_clamp_limit,
+    )
+    if any(value is not None for value in unsupported_metadata):
+        raise ValueError(
+            "SlimQuant auto factory requires symmetric W4A8 without "
+            "auxiliary scales, zero points, biases, or clamps"
+        )
     return _make_deepep_auto_deepgemm_moe_kernel(
         moe_quant_config=moe_quant_config,
         moe_config=moe_config,

@@ -9,7 +9,41 @@ argument avoids importing optional communication libraries eagerly.
 
 from __future__ import annotations
 
+import functools
+import importlib
 import inspect
+
+from vllm.platforms import current_platform
+
+
+@functools.lru_cache(maxsize=1)
+def _require_slimquant_w4a8_hipc_runtime() -> None:
+    required_ops = {
+        "deepgemm": (
+            "pack_w4a8_moe_hipc_weight",
+            "view_w4a8_moe_hipc_weight_n32_layout",
+            "m_grouped_w4a8_gemm_nt_contiguous_hipc",
+            "m_grouped_w4a8_gemm_nt_masked_hipc",
+        ),
+        "lightop": ("fuse_silu_mul_quant",),
+    }
+    missing: list[str] = []
+    for module_name, op_names in required_ops.items():
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            missing.append(module_name)
+            continue
+        missing.extend(
+            f"{module_name}.{name}"
+            for name in op_names
+            if not callable(getattr(module, name, None))
+        )
+    if missing:
+        raise RuntimeError(
+            "SlimQuant W4A8 deepep_auto requires HIPC DeepGEMM/LightOP "
+            f"operators; missing {', '.join(missing)}"
+        )
 
 
 def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
@@ -72,6 +106,30 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             "SlimQuant W4A8 deepep_auto requires moe_backend='auto' or "
             f"'deep_gemm', got {moe_backend!r}"
         )
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
+    architectures = model_architectures(vllm_config)
+    if "DeepseekV4ForCausalLM" not in architectures:
+        raise ValueError(
+            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4; "
+            f"got architectures={architectures!r}"
+        )
+    activation = getattr(moe_config, "activation", None)
+    activation_name = getattr(activation, "value", activation)
+    if activation_name != "silu":
+        raise ValueError(
+            "SlimQuant W4A8 deepep_auto supports only SiLU activation; "
+            f"got {activation_name!r}"
+        )
+    if not current_platform.is_rocm():
+        raise RuntimeError(
+            "SlimQuant W4A8 deepep_auto requires the HCU ROCm runtime"
+        )
+    _require_slimquant_w4a8_hipc_runtime()
     return True
 
 
