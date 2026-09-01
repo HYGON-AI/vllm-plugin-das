@@ -116,9 +116,12 @@ bound module attribute. This permanently pins exact
 `vllm_hcu` package; it intentionally does not inspect or reject LightOp's own
 internal implementation namespaces.
 
-## Final verification
+## Pre-final-review verification (historical)
 
-All commands below exited 0.
+The commands in this section exited 0 before the final whole-branch review.
+They are retained as historical evidence and are superseded by the final-fix
+verification at implementation HEAD
+`07f5d261cc3fc3a5b567e870baceb55625f84dcd` below.
 
 | Command | Result |
 | --- | --- |
@@ -137,11 +140,12 @@ All commands below exited 0.
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_hcu_ci_selector.py` | 44 passed |
 | `python .github/scripts/hcu_ci/verify_hcu_registration.py` | 40 registrations across 22 jobs; valid |
 
-Both contract totals remain above the documented 1,162-pass baseline. The
-source-checkout run's 15 warnings are one `vllm._version` runtime warning and
-14 third-party `torch.jit.script_method` deprecation warnings; the final
-installed-root run and each live-HCU suite report only the same 14 Torch
-deprecation warnings.
+Both historical contract totals remain above the documented 1,162-pass
+baseline. The source-checkout run's 15 warnings are one `vllm._version`
+runtime warning and
+14 third-party `torch.jit.script_method` deprecation warnings; the then-latest
+installed-root run and each historical live-HCU suite report only the same 14
+Torch deprecation warnings.
 
 The three integration-smoke skips are not counted as passes:
 
@@ -275,3 +279,85 @@ VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py 
 
 The affected HCU selector remains at 44 passed, and the registry remains valid
 with 40 registrations across 22 jobs.
+
+## Final whole-branch review fix wave
+
+The final-review implementation HEAD is
+`07f5d261cc3fc3a5b567e870baceb55625f84dcd` (`fix: close final LightOp review
+findings`), based directly on `e48c14ab8b8616d7973dad98637a46d13b0ca2ad`.
+This is the final code-and-test tree validated below; the validation-document
+commit that follows it changes evidence text only.
+
+The fix wave closes all five whole-branch findings:
+
+1. The core-fix patch now replaces the actual upstream `forward` caller so
+   uint8 cache insertion receives raw KV and owns KVNorm exactly once. The
+   non-uint8 delegation branch normalizes KV before calling the original
+   insertion method.
+2. Empty LightOp neutral aliases are treated as unconfigured and populated
+   with the canonical value for all four `VLLM_HCU_*` mappings. Conflicting
+   non-empty settings still fail closed.
+3. Both Mooncake examples use only the four plugin-owned `VLLM_HCU_*` names.
+4. The AST boundary recognizes an injected/direct `lmslim` root and rejects
+   `lmslim.foo()` with the exact repository-relative path and line.
+5. The dynamic production-symbol export audit checks both `__all__`
+   membership and bound module attributes. The pinned installed-wheel audit
+   explicitly includes
+   `lightop.sampling.top_k_top_p_sampling_from_probs`.
+
+RED was reconstructed in memory against `e48c14a` without changing the
+worktree. The old environment bridge left
+`VLLM_USE_GLOBAL_CACHE13=''`; the old core-fix caller failed the new
+exactly-once assertion; the old scanner returned `[]` for injected
+`lmslim.foo()`; and the old export helper allowed public-but-unbound sampling.
+The base Mooncake guide had eight neutral/legacy export lines. These commands
+exited nonzero or produced the eight expected matches before the current
+GREEN commands were run.
+
+All final commands below exited 0 unless the result explicitly describes a
+historical RED probe:
+
+| Command | Result |
+| --- | --- |
+| In-memory empty-alias probe using `git show e48c14a:vllm_hcu/lightop_env.py` | RED: exit 1; the neutral alias remained `''` |
+| In-memory core-fix probe using `git show e48c14a:vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_attention.py` plus the new caller test | RED: exit 1 at the exactly-once assertion |
+| In-memory `_LightOpVisitor` probe using `git show e48c14a:tests/patch/test_lightop_api_boundary.py` and `lmslim.foo()` | RED: exit 1; `violations=[]` |
+| In-memory base export-helper probe with public-but-unbound `lightop.sampling.top_k_top_p_sampling_from_probs` | RED: exit 1; the invalid export escaped |
+| `git show 'e48c14a:docs/pd分离mooncake使用.md' \| rg -n 'export (USE_FUSED_RMS_QUANT\|USE_FUSED_SILU_MUL_QUANT\|VLLM_USE_GLOBAL_CACHE13\|VLLM_FUSED_MOE_CHUNK_SIZE)='` | RED: eight neutral/legacy example lines |
+| `python -m pytest -q tests/patch/test_lightop_environment.py tests/runtime_patch/test_lightop_deepseek_v4_latest_api.py tests/runtime_patch/test_deepseek_v4_dspark_patches.py tests/patch/test_lightop_api_boundary.py tests/runtime_patch/test_lightop_categorized_api.py` | 55 passed in 27.33s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_lightop_environment.py tests/patch/test_plugin_lifecycle.py tests/patch/test_clean_process_bootstrap.py` | 44 passed, 14 warnings in 114.89s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/runtime_patch/test_lightop_deepseek_v4_latest_api.py tests/runtime_patch/test_deepseek_v4_dspark_patches.py tests/patch/test_module_exchange.py -k deepseek_v4` | 26 passed, 20 deselected in 1.23s |
+| `env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract` | 1,215 passed, 83 deselected, 14 warnings in 321.04s |
+| `python -m compileall -q vllm_hcu tests` | clean |
+| `python tools/check_production_boundary.py` | 248 Python files, clean |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/check_patch_test_coverage.py` | 96 files: 95 adapters, 1 helper, 0 untested, 0 invalid contracts |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_hcu_ci_selector.py` | 44 passed in 1.61s |
+| `python .github/scripts/hcu_ci/verify_hcu_registration.py` | 40 registrations across 22 jobs; valid |
+| `git diff --check e48c14a..07f5d26` | clean |
+| `git diff --check origin/v0.25.1...07f5d26` | clean |
+
+The contract increase from the historical 1,207 passed/82 deselected to
+1,215 passed/83 deselected is exact: eight new non-HCU contract cases pass,
+while the explicit sampling export parameter inherits the installed-wheel
+test's existing `hcu` mark and is correctly deselected from the portable
+contract suite. The warnings are the same 14 third-party Torch deprecations.
+
+### Final live gfx938 insertion accuracy
+
+The final live run used only read-only ownership selection. At
+2026-09-01T05:08:07Z, physical HCU 3 mapped to KFD GPU ID `12987`, had no
+nonzero per-process KFD VRAM entry, and was at its 2--3 MiB baseline. A
+device-property probe exposed exactly one `BW1100` with architecture `gfx938`.
+No process was signalled or terminated.
+
+```text
+HIP_VISIBLE_DEVICES=3 CUDA_VISIBLE_DEVICES=3 \
+  env -u VLLM_V0251_SOURCE_ROOT python -m pytest -q -rs \
+  tests/accuracy/test_hcu_kernel_accuracy.py::test_lightop_deepseek_v4_fused_insert_updates_q_and_cache \
+  tests/accuracy/test_deepseek_v4_dspark_ops.py::test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache \
+  tests/accuracy/test_deepseek_v4_dspark_ops.py::test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference
+```
+
+Result: 3 passed, no skips, 14 warnings in 19.82s. The third test compares
+LightOp cache output to vLLM's reference path. At 2026-09-01T05:08:53Z,
+physical HCU 3 had returned to 2 MiB and still had no KFD owner.
