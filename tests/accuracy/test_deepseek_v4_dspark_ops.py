@@ -169,7 +169,10 @@ def test_masked_channel_fp8_deepgemm_matches_dequantized_reference(
 
 
 def test_lightop_fp8_silu_quant_matches_float_reference_for_ht_and_ll() -> None:
-    from lightop import fuse_silu_mul_fp8_quant, fuse_silu_mul_fp8_quant_ep
+    from lightop.activation import (
+        fuse_silu_mul_fp8_quant,
+        fuse_silu_mul_fp8_quant_ep,
+    )
 
     device = _hcu_device()
     generator = torch.Generator(device=device).manual_seed(735)
@@ -423,6 +426,15 @@ def test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache() -> None:
         n_local_heads=1,
         head_dim=head_dim,
         eps=1e-6,
+        kv_norm=SimpleNamespace(
+            weight=SimpleNamespace(
+                data=torch.ones(
+                    head_dim,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+            )
+        ),
         rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin_cache),
         swa_cache_layer=SimpleNamespace(kv_cache=cache, block_size=block_size),
     )
@@ -481,10 +493,16 @@ def test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference() -> None:
         dtype=torch.uint8,
     )
     reference_cache = torch.zeros_like(lightop_cache)
+    kv_norm_weight = torch.ones(
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     attention = SimpleNamespace(
         n_local_heads=1,
         head_dim=head_dim,
         eps=1e-6,
+        kv_norm=SimpleNamespace(weight=SimpleNamespace(data=kv_norm_weight)),
         rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin_cache),
         swa_cache_layer=SimpleNamespace(
             kv_cache=lightop_cache,
@@ -496,8 +514,15 @@ def test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference() -> None:
 
     half_rope = 32
     nope_dim = head_dim - 2 * half_rope
+    kv_reference = (
+        kv.float()
+        * torch.rsqrt(
+            kv.float().square().mean(dim=-1, keepdim=True) + attention.eps
+        )
+        * kv_norm_weight.float()
+    ).to(torch.bfloat16)
     cos_sin = cos_sin_cache[positions].float()
-    rope = kv[:, nope_dim:].float().view(num_tokens, half_rope, 2)
+    rope = kv_reference[:, nope_dim:].float().view(num_tokens, half_rope, 2)
     even, odd = rope[..., 0], rope[..., 1]
     cos, sin = cos_sin[:, :half_rope], cos_sin[:, half_rope:]
     rotated = torch.stack(
@@ -507,7 +532,6 @@ def test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference() -> None:
         ),
         dim=-1,
     ).reshape(num_tokens, 2 * half_rope)
-    kv_reference = kv.clone()
     kv_reference[:, nope_dim:] = rotated.to(torch.bfloat16)
     quantize_and_insert_k_cache(
         kv_reference,

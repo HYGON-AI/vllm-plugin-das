@@ -215,18 +215,26 @@ def apply_to_module(module: ModuleType) -> bool:
         assert swa_metadata is not None
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
-        import lightop
+        try:
+            from lightop.attention import (
+                fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32,
+            )
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "DeepSeek V4 core fix requires lightop.attention."
+                "fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32; "
+                "upgrade LightOp"
+            ) from exc
 
-        insert = require_callable(
-            lightop.op,
-            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-            "lightop.op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-        )
-        insert(
+        swa_slot_mapping_i32 = swa_metadata.slot_mapping.to(
+            dtype=torch.int32
+        ).contiguous()
+        fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
             q,
             kv,
+            self.kv_norm.weight.data,
             swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
+            swa_slot_mapping_i32,
             positions.to(torch.int64),
             self.rotary_emb.cos_sin_cache,
             self.eps,
