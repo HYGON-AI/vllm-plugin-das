@@ -25,14 +25,13 @@ jobs:
     runs-on: nmz36
     container:
       image: ${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:0.25.1-latest
-      options: --privileged --cap-add=SYS_PTRACE --network=host --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
+      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
         - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
-        - /opt/hyhal:/opt/hyhal:ro
-        - /var/run/docker.sock:/var/run/docker.sock:ro
-        - /usr/bin/docker.orig:/usr/local/bin/docker:ro
+        - /usr/bin/docker:/usr/local/bin/docker:ro
         - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
+        - /opt/hyhal:/opt/hyhal:ro
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +59,7 @@ jobs:
                        --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           CInotificate --notificate_conf "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
                        --notificate_type PrecisionTest \
-                       --group_name "框架发版对接 高性能推理加速部"
+                       --group_name 框架发版对接 高性能推理加速部
 
       - name: 归档测试结果
         if: always()
