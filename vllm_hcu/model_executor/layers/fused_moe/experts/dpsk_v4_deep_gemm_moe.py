@@ -958,6 +958,8 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
     _LAYOUT_MARKER = "_slimquant_w4a8_deepep_auto_layout"
     _PACKED_W13 = "_slimquant_w4a8_deepep_auto_packed_w13"
     _PACKED_W2 = "_slimquant_w4a8_deepep_auto_packed_w2"
+    _PACKING_LAYOUT = "packing"
+    _REPACKING_LAYOUT = "repacking"
 
     def __init__(
         self,
@@ -1027,6 +1029,7 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
             # v0.25.1 layerwise reload processes temporary raw Parameters and
             # then restores the original kernel storage. Reuse that storage so
             # the temporary allocation cannot become a second resident owner.
+            setattr(layer, self._LAYOUT_MARKER, self._REPACKING_LAYOUT)
             reloaded = self._pack_in_place(runtime, weights)
             with torch.no_grad():
                 for owner, weight in zip(owners, reloaded):
@@ -1034,14 +1037,18 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
             replace_parameter(layer, "w13_weight", owners[0])
             replace_parameter(layer, "w2_weight", owners[1])
             self._bind_packed_owners(runtime, *owners)
+            setattr(layer, self._LAYOUT_MARKER, expected_layout)
             return
 
+        # The packer mutates each registered Parameter in sequence. Mark the
+        # transition first so a partial failure can never be retried as raw.
+        setattr(layer, self._LAYOUT_MARKER, self._PACKING_LAYOUT)
         self._pack_in_place(runtime, weights)
         owners = tuple(weight.detach() for weight in weights)
         setattr(layer, self._PACKED_W13, owners[0])
         setattr(layer, self._PACKED_W2, owners[1])
-        setattr(layer, self._LAYOUT_MARKER, expected_layout)
         self._bind_packed_owners(runtime, *owners)
+        setattr(layer, self._LAYOUT_MARKER, expected_layout)
 
     @staticmethod
     def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:

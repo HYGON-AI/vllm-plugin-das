@@ -3136,6 +3136,119 @@ def test_slimquant_w4a8_auto_rejects_incompatible_marker_before_repacking(
     assert len(pack_calls) == 2
 
 
+@pytest.mark.parametrize("failure_mode", ["raise", "wrong_rank"])
+def test_slimquant_w4a8_auto_pack_failure_leaves_fail_closed_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+):
+    """A partially transformed owner must never be accepted as raw again."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    layer = _slimquant_w4a8_auto_layer()
+    experts = _slimquant_w4a8_auto_experts(None)
+    pack_calls: list[torch.Tensor] = []
+
+    def fail_second_pack(weight: torch.Tensor) -> torch.Tensor:
+        pack_calls.append(weight)
+        if len(pack_calls) == 1:
+            weight.fill_(91)
+            return weight
+        if failure_mode == "raise":
+            raise RuntimeError("second pack failed")
+        return weight.flatten()
+
+    monkeypatch.setattr(
+        runtime,
+        "pack_w4a8_moe_hipc_weight",
+        fail_second_pack,
+    )
+    expected_error = (
+        "second pack failed"
+        if failure_mode == "raise"
+        else "must reuse rank-3 weight storage"
+    )
+    with pytest.raises(RuntimeError, match=expected_error):
+        experts.process_weights_after_loading(layer)
+
+    assert layer._slimquant_w4a8_deepep_auto_layout == "packing"
+    assert torch.count_nonzero(layer.w13_weight != 91) == 0
+    with pytest.raises(RuntimeError, match="invalid.*deepep_auto.*marker"):
+        experts.process_weights_after_loading(layer)
+    assert len(pack_calls) == 2
+
+
+def test_slimquant_w4a8_auto_n32_bind_failure_leaves_packing_marker(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The final layout must not publish before both child handles bind."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    pack_calls, _ = _install_in_place_w4a8_packers(monkeypatch)
+    layer = _slimquant_w4a8_auto_layer()
+    experts = _slimquant_w4a8_auto_experts(None)
+    monkeypatch.setattr(
+        runtime,
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        lambda _weight: (_ for _ in ()).throw(RuntimeError("N32 view failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="N32 view failed"):
+        experts.process_weights_after_loading(layer)
+
+    assert layer._slimquant_w4a8_deepep_auto_layout == "packing"
+    with pytest.raises(RuntimeError, match="invalid.*deepep_auto.*marker"):
+        experts.process_weights_after_loading(layer)
+    assert len(pack_calls) == 2
+
+
+def test_slimquant_w4a8_auto_reload_pack_failure_leaves_repacking_marker(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A partial reload must not retry transformed temporary Parameters."""
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    _install_in_place_w4a8_packers(monkeypatch)
+    layer = _slimquant_w4a8_auto_layer()
+    _slimquant_w4a8_auto_experts(None).process_weights_after_loading(layer)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros_like(layer.w13_weight), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros_like(layer.w2_weight), requires_grad=False
+    )
+    reload_pack_calls: list[torch.Tensor] = []
+
+    def fail_second_reload_pack(weight: torch.Tensor) -> torch.Tensor:
+        reload_pack_calls.append(weight)
+        if len(reload_pack_calls) == 1:
+            weight.fill_(92)
+            return weight
+        raise RuntimeError("second reload pack failed")
+
+    monkeypatch.setattr(
+        runtime,
+        "pack_w4a8_moe_hipc_weight",
+        fail_second_reload_pack,
+    )
+    replacement = _slimquant_w4a8_auto_experts(None)
+    with pytest.raises(RuntimeError, match="second reload pack failed"):
+        replacement.process_weights_after_loading(layer)
+
+    assert layer._slimquant_w4a8_deepep_auto_layout == "repacking"
+    with pytest.raises(RuntimeError, match="invalid.*deepep_auto.*marker"):
+        replacement.process_weights_after_loading(layer)
+    assert len(reload_pack_calls) == 2
+
+
 def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ):
