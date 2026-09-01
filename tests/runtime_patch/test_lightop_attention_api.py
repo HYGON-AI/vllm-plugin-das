@@ -192,6 +192,9 @@ def test_sparse_mla_does_not_retry_legacy_namespace(monkeypatch):
     runtime = _runtime()
     legacy = SimpleNamespace(mqa_logits=lambda *_: pytest.fail("legacy called"))
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
     monkeypatch.setattr(runtime, "lightop_attention", SimpleNamespace())
     monkeypatch.setattr(runtime, "lightop", legacy, raising=False)
     with pytest.raises(AttributeError):

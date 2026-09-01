@@ -498,3 +498,11 @@ Final evidence:
 | --- | --- |
 | Hidden-device/reduced-PATH rerun of the exact four GitHub failures | 4 passed, 14 warnings in 14.01s |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix4` | 1,216 passed, 83 deselected, 15 warnings in 342.07s |
+
+The subsequent GitHub run passed 1,215 tests and left only the sparse-MLA
+negative case failing: its call to the real `rocm_aiter_ops.is_enabled()`
+performed GPU discovery before reaching the intended LightOp assertion. The
+test now stubs AITER availability to false, exactly as the adjacent positive
+ABI test already does, so the case isolates only the categorized LightOp
+boundary it names. The exact hidden-device/reduced-PATH case passes in 5.78s,
+and both affected attention/sparse-indexer files pass 20 tests in 18.54s.
