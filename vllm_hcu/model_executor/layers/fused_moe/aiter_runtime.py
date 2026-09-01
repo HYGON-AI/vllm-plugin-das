@@ -880,8 +880,21 @@ def fused_moe_impl(
         activation=activation,
         use_shuffle=use_shuffle,
     )
-    aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
+    weights_are_shuffled = bool(getattr(w1, "is_shuffled", False))
+    if weights_are_shuffled != bool(getattr(w2, "is_shuffled", False)):
+        raise HcuAiterRuntimeError(
+            "HCU AITER W16A16 weights have inconsistent shuffle state"
+        )
+    aiter_config = select_aiter_moe_config(
+        problem,
+        cache_owner=w1,
+        solution_type="asm" if weights_are_shuffled else None,
+    )
     if aiter_config is None:
+        if weights_are_shuffled:
+            raise HcuAiterRuntimeError(
+                "AITER has no ASM solution for installed ASM-layout weights"
+            )
         native_expert_map, _ = resolve_aiter_expert_maps(
             expert_mask,
             global_num_experts,
@@ -914,12 +927,19 @@ def fused_moe_impl(
             expert_map=native_expert_map,
         )
 
-    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
-        w1,
-        w2,
-        aiter_config,
-        cache_owner=w1,
-    )
+    if weights_are_shuffled:
+        if not bool(getattr(aiter_config, "need_shuffle", False)):
+            raise HcuAiterRuntimeError(
+                "AITER returned a non-shuffle config for ASM-layout weights"
+            )
+        prepared_w1, prepared_w2 = w1, w2
+    else:
+        prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+            w1,
+            w2,
+            aiter_config,
+            cache_owner=w1,
+        )
     solution = getattr(aiter_config, "solution_type", None)
     solution = getattr(solution, "value", solution)
     if str(solution).rsplit(".", 1)[-1].upper() == "ASM":

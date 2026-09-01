@@ -3,11 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
-"""
-HCU version of UnquantizedFusedMoEMethod.
-Inherits from vllm's version and overrides process_weights_after_loading
-to preserve canonical AITER weights while initializing the MoE kernel.
-"""
+"""HCU unquantized MoE integration."""
 
 from __future__ import annotations
 
@@ -20,9 +16,12 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod as _Original,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
-    prewarm_aiter_moe_config,
+    HcuAiterMoeDispatchError,
+    prepare_aiter_moe_weights,
+    select_aiter_moe_config,
 )
 from vllm_hcu.platforms import envs as henvs
 
@@ -48,11 +47,9 @@ def _expert_routing_tables(
 
     return None
 
-class HcuUnquantizedFusedMoEMethod(_Original):
-    """HCU version of UnquantizedFusedMoEMethod.
 
-    Initializes the AITER runner without replacing canonical model weights.
-    """
+class HcuUnquantizedFusedMoEMethod(_Original):
+    """Install the AITER ASM layout once instead of caching a second copy."""
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (
@@ -65,6 +62,45 @@ class HcuUnquantizedFusedMoEMethod(_Original):
         if getattr(layer, "_hcu_aiter_moe_initialized", False):
             return
 
+        original_w13 = layer.w13_weight
+        original_w2 = layer.w2_weight
+        activation = getattr(self.moe.activation, "value", self.moe.activation)
+        problem = AiterMoeProblem(
+            M=1,
+            E=int(self.moe.num_experts),
+            N1=int(original_w13.shape[1]),
+            N2=int(original_w2.shape[1]),
+            K=int(original_w13.shape[2]),
+            top_k=int(self.moe.experts_per_token),
+            block_size=0,
+            dtype=self.moe.in_dtype,
+            device=original_w13.device,
+            quant_type="w16a16",
+            activation=str(activation),
+            use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+        )
+        if problem.use_shuffle:
+            config = select_aiter_moe_config(
+                problem,
+                cache_owner=original_w13,
+                solution_type="asm",
+            )
+            if config is None or not bool(getattr(config, "need_shuffle", False)):
+                raise HcuAiterMoeDispatchError(
+                    "HCU AITER BF16 MoE requires an ASM shuffle solution before "
+                    "installing the runtime weight layout; " + problem.describe()
+                )
+            shuffled_w13, shuffled_w2 = prepare_aiter_moe_weights(
+                original_w13,
+                original_w2,
+                config,
+                cache_owner=object(),
+            )
+            replace_parameter(layer, "w13_weight", shuffled_w13)
+            replace_parameter(layer, "w2_weight", shuffled_w2)
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         self.moe_kernel = make_unquantized_moe_kernel(
             quant_config=self.moe_quant_config,
@@ -72,23 +108,5 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             backend=self.unquantized_backend,
             experts_cls=self.experts_cls,
             routing_tables=_expert_routing_tables(layer),
-        )
-        activation = getattr(self.moe.activation, "value", self.moe.activation)
-        prewarm_aiter_moe_config(
-            AiterMoeProblem(
-                M=1,
-                E=int(self.moe.num_experts),
-                N1=int(layer.w13_weight.shape[1]),
-                N2=int(layer.w2_weight.shape[1]),
-                K=int(layer.w13_weight.shape[2]),
-                top_k=int(self.moe.experts_per_token),
-                block_size=0,
-                dtype=self.moe.in_dtype,
-                device=layer.w13_weight.device,
-                quant_type="w16a16",
-                activation=str(activation),
-                use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
-            ),
-            cache_owner=layer.w13_weight,
         )
         layer._hcu_aiter_moe_initialized = True

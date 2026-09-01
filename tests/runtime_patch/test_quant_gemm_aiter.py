@@ -179,6 +179,46 @@ def test_aiter_dispatch_selector_passes_problem_without_forcing_solution(
     assert "device" not in captured
 
 
+def test_aiter_dispatch_can_pin_asm_shuffle_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    expected = SimpleNamespace(solution_type="asm", need_shuffle=True)
+
+    def get_config(**kwargs: object):
+        captured.update(kwargs)
+        return True, expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    problem = AiterMoeProblem(
+        M=1,
+        E=2,
+        N1=8,
+        N2=4,
+        K=4,
+        top_k=2,
+        block_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+        use_shuffle=True,
+    )
+
+    actual = select_aiter_moe_config(
+        problem,
+        cache_owner=torch.empty(1),
+        solution_type="asm",
+    )
+
+    assert actual is expected
+    assert captured["spec_sol_type"] == "asm"
+    assert captured["use_shuffle"] == 1
+
+
 def test_aiter_dispatch_selector_returns_none_only_for_explicit_no_solution(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2640,7 +2680,93 @@ def test_aiter_w16a16_routes_public_api_with_canonical_weights(
     assert execute_calls[0]["gemm1_limit"] == 7.5
 
 
-def test_aiter_w16a16_post_load_preserves_canonical_parameters(
+def test_aiter_w16a16_reuses_installed_asm_layout_without_reshuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    w1.is_shuffled = True
+    w2.is_shuffled = True
+    selector_calls: list[dict[str, object]] = []
+    execute_calls: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={},
+    )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (
+                selector_calls.append(kwargs) or True,
+                config,
+            ),
+            aiter_moe_shfl_weight=lambda *_args, **_kwargs: pytest.fail(
+                "installed ASM weights must not be shuffled again"
+            ),
+            aiter_moe=lambda **kwargs: execute_calls.append(kwargs)
+            or kwargs["hidden_states"].clone(),
+        ),
+    )
+
+    aiter_runtime.fused_moe_impl(
+        lambda *_args: pytest.fail("must not delegate"),
+        torch.ones(2, 4),
+        w1,
+        w2,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        activation_method=0,
+    )
+
+    assert selector_calls[0]["spec_sol_type"] == "asm"
+    assert execute_calls[0]["w1"] is w1
+    assert execute_calls[0]["w2"] is w2
+    assert execute_calls[0]["use_weight_shuffle"] is True
+
+
+def test_aiter_w16a16_shuffled_weights_never_fall_back_to_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    w1.is_shuffled = True
+    w2.is_shuffled = True
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **_kwargs: (False, None),
+        ),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="no ASM solution",
+    ):
+        aiter_runtime.fused_moe_impl(
+            lambda *_args: pytest.fail("must not delegate"),
+            torch.ones(2, 4),
+            w1,
+            w2,
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            activation_method=0,
+        )
+
+
+def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.fused_moe import (
@@ -2681,30 +2807,52 @@ def test_aiter_w16a16_post_load_preserves_canonical_parameters(
         "make_unquantized_moe_kernel",
         lambda **kwargs: kernels.append(kwargs) or object(),
     )
-    prewarm_calls: list[tuple[AiterMoeProblem, object]] = []
     monkeypatch.setattr(
         hcu_unquantized,
-        "prewarm_aiter_moe_config",
-        lambda problem, cache_owner: prewarm_calls.append(
-            (problem, cache_owner)
+        "replace_parameter",
+        lambda owner, name, value, **_kwargs: setattr(
+            owner,
+            name,
+            torch.nn.Parameter(value, requires_grad=False),
         ),
-        raising=False,
     )
+    select_calls: list[tuple[AiterMoeProblem, object, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={},
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "select_aiter_moe_config",
+        lambda problem, cache_owner, solution_type=None: select_calls.append(
+            (problem, cache_owner, solution_type)
+        ) or config,
+    )
+    shuffled_w13 = torch.full_like(w13, 13)
+    shuffled_w2 = torch.full_like(w2, 2)
     monkeypatch.setitem(
         sys.modules,
-        "aiter.moe",
-        _module("aiter.moe"),
+        "aiter.moe", _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=lambda *_args: (shuffled_w13, shuffled_w2),
+        ),
     )
 
     method.process_weights_after_loading(layer)
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight is w13
-    assert layer.w2_weight is w2
+    assert layer.w13_weight is not w13
+    assert layer.w2_weight is not w2
+    torch.testing.assert_close(layer.w13_weight, shuffled_w13)
+    torch.testing.assert_close(layer.w2_weight, shuffled_w2)
+    assert layer.w13_weight.is_shuffled is True
+    assert layer.w2_weight.is_shuffled is True
     assert len(kernels) == 1
     assert method.moe_kernel is not None
-    assert len(prewarm_calls) == 1
-    problem, cache_owner = prewarm_calls[0]
+    assert len(select_calls) == 1
+    problem, cache_owner, solution_type = select_calls[0]
     assert problem == AiterMoeProblem(
         M=1,
         E=2,
@@ -2720,6 +2868,46 @@ def test_aiter_w16a16_post_load_preserves_canonical_parameters(
         use_shuffle=True,
     )
     assert cache_owner is w13
+    assert solution_type == "asm"
+
+
+def test_aiter_w16a16_post_load_keeps_canonical_weights_when_shuffle_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as hcu_unquantized,
+    )
+
+    w13 = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    layer = SimpleNamespace(w13_weight=w13, w2_weight=w2)
+    method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace(
+        num_experts=2,
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+    )
+    method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = lambda _layer: object()
+    monkeypatch.setattr(hcu_unquantized, "_is_hcu_aiter_moe_requested", lambda *_: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "select_aiter_moe_config",
+        lambda *_args, **_kwargs: pytest.fail("disabled shuffle must not be selected"),
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "make_unquantized_moe_kernel",
+        lambda **_kwargs: object(),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is w13
+    assert layer.w2_weight is w2
 
 
 def test_explicit_aiter_backend_uses_public_router_without_auto_env_gate(
