@@ -25,7 +25,10 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
             "m_grouped_w4a8_gemm_nt_contiguous_hipc",
             "m_grouped_w4a8_gemm_nt_masked_hipc",
         ),
-        "lightop": ("fuse_silu_mul_quant",),
+        "lightop": (
+            "fuse_silu_mul_quant",
+            "fuse_silu_mul_quant_ep",
+        ),
     }
     missing: list[str] = []
     for module_name, op_names in required_ops.items():

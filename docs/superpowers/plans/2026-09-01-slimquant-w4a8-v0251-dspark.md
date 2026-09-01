@@ -307,7 +307,7 @@ Expected: all tests pass.
 
 ```bash
 HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=__disabled__ \
-pytest -q tests/accuracy/test_deepseek_v4_dspark_ops.py -s
+pytest -q tests/accuracy/test_unified_aiter_moe_operator.py -s
 ```
 
 Expected: existing DSpark operators pass; add a focused W4A8 device test if the
