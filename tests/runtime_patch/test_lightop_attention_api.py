@@ -33,7 +33,11 @@ def _load_fused_qkv_impl():
     )
     module = ast.Module(body=[function], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"torch": torch, "split_kv_cache": lambda *_args, **_kwargs: None}
+    namespace = {
+        "torch": torch,
+        "split_kv_cache": lambda *_args, **_kwargs: None,
+        "logger": SimpleNamespace(warning_once=lambda *_args, **_kwargs: None),
+    }
     exec(compile(module, "attention_runtime_contract", "exec"), namespace)
     return namespace[function.name]
 
@@ -94,6 +98,51 @@ def test_fused_qkv_runtime_uses_categorized_lightop_kernel(
     assert all(tensor.shape == (1, 1, 2) for tensor in result)
 
 
+def test_fused_qkv_runtime_rejects_top_level_lightop_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lazy boundary must not retry the removed top-level export."""
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []  # type: ignore[attr-defined]
+    lightop.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant = (
+        lambda *_args, **_kwargs: pytest.fail("legacy top-level kernel called")
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.delitem(sys.modules, "lightop.attention", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.forward_context",
+        SimpleNamespace(
+            get_forward_context=lambda: SimpleNamespace(
+                slot_mapping={},
+                no_compile_layers={"layer": SimpleNamespace(kv_cache=None)},
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.platforms.hcu",
+        SimpleNamespace(get_hcu_flash_attn_mode=lambda: "other"),
+    )
+
+    with pytest.raises(ImportError):
+        _load_fused_qkv_impl()(
+            torch.ones((1, 6)),
+            torch.tensor([0]),
+            "layer",
+            "auto",
+            torch.ones((1, 2)),
+            torch.ones(2),
+            torch.ones(2),
+            1e-5,
+            2,
+            2,
+            2,
+            2,
+            16,
+        )
+
+
 def _runtime():
     return importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
 
@@ -137,6 +186,21 @@ def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     assert supplied_weights.dtype is torch.float32
     assert supplied_weights.is_contiguous()
     assert torch.equal(supplied_weights, weights.float().contiguous())
+
+
+def test_sparse_mla_does_not_retry_legacy_namespace(monkeypatch):
+    runtime = _runtime()
+    legacy = SimpleNamespace(mqa_logits=lambda *_: pytest.fail("legacy called"))
+    monkeypatch.setattr(runtime, "lightop_attention", SimpleNamespace())
+    monkeypatch.setattr(runtime, "lightop", legacy, raising=False)
+    with pytest.raises(AttributeError):
+        runtime.rocm_fp8_mqa_logits(
+            torch.ones((1, 1, 2)),
+            (torch.ones((1, 2)), torch.ones(1)),
+            torch.ones((1, 1)),
+            torch.zeros(1, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        )
 
 
 def test_chunked_sparse_mla_uses_new_abi_and_categorized_topk(

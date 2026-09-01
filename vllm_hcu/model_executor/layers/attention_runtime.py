@@ -196,23 +196,9 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
         key_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
         value_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
 
-    try:
-        from lightop.attention import (
-            split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant,
-        )
-    except (ImportError, AttributeError):
-        try:
-            from lightop import (
-                split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant,
-            )
-        except (ImportError, AttributeError) as exc:
-            raise RuntimeError(
-                "VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE requires lightop"
-            ) from exc
-        logger.warning_once(
-            "Using deprecated top-level lightop split QKV API because "
-            "lightop.attention is unavailable; upgrade LightOp."
-        )
+    from lightop.attention import (
+        split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant,
+    )
 
     q, k, v = split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant(
         positions,

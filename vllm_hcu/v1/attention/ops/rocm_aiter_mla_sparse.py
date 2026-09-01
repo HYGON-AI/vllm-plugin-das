@@ -6,13 +6,11 @@ import functools
 import importlib
 import math
 from importlib.util import find_spec
-from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
@@ -29,26 +27,7 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
 
-logger = init_logger(__name__)
-
-try:
-    from lightop import attention as lightop_attention
-except (ImportError, AttributeError):
-    from lightop import gemmopt as _legacy_gemmopt
-    from lightop import mqa_logits as _legacy_mqa_logits
-    from lightop import op as _legacy_op
-
-    lightop_attention = SimpleNamespace(
-        mqa_logits=_legacy_mqa_logits,
-        paged_mqa_logits=_legacy_gemmopt.paged_mqa_logits,
-        top_k_per_row_decode=_legacy_op.top_k_per_row_decode,
-        top_k_per_row_prefill=_legacy_op.top_k_per_row_prefill,
-    )
-    logger.warning_once(
-        "Using deprecated top-level lightop, lightop.op, and "
-        "lightop.gemmopt attention APIs because lightop.attention is "
-        "unavailable; upgrade LightOp."
-    )
+from lightop import attention as lightop_attention
 
 
 _GLOBAL_LOGITS_BUFFERS = {}

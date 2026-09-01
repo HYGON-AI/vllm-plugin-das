@@ -501,9 +501,12 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
         return output
 
     fake_lightop = ModuleType("lightop")
-    fake_lightop.op = SimpleNamespace()
-    fake_lightop.gemmopt = SimpleNamespace(paged_mqa_logits=paged_mqa_logits)
+    fake_lightop.__path__ = []  # type: ignore[attr-defined]
+    attention = ModuleType("lightop.attention")
+    attention.paged_mqa_logits = paged_mqa_logits
+    fake_lightop.attention = attention
     monkeypatch.setitem(sys.modules, "lightop", fake_lightop)
+    monkeypatch.setitem(sys.modules, "lightop.attention", attention)
     monkeypatch.delitem(
         sys.modules,
         "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse",
@@ -543,6 +546,32 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     assert calls[0][2].dtype is torch.float32
     assert calls[0][2].is_contiguous()
     assert torch.equal(calls[0][2], weights.float().contiguous())
+
+
+def test_sparse_mla_import_rejects_legacy_attention_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sparse MLA must fail closed when only obsolete LightOp APIs exist."""
+    legacy = ModuleType("lightop")
+    legacy.__path__ = []  # type: ignore[attr-defined]
+    legacy.mqa_logits = lambda *_args: pytest.fail("legacy mqa called")
+    legacy.op = SimpleNamespace(
+        top_k_per_row_decode=lambda *_args: pytest.fail("legacy top-k called"),
+        top_k_per_row_prefill=lambda *_args: pytest.fail("legacy top-k called"),
+    )
+    legacy.gemmopt = SimpleNamespace(
+        paged_mqa_logits=lambda *_args: pytest.fail("legacy paged mqa called")
+    )
+    monkeypatch.setitem(sys.modules, "lightop", legacy)
+    monkeypatch.delitem(sys.modules, "lightop.attention", raising=False)
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse",
+        raising=False,
+    )
+
+    with pytest.raises(ImportError):
+        importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
 
 
 def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
