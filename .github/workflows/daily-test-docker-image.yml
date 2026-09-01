@@ -29,7 +29,7 @@ jobs:
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
         - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
-        - /usr/bin/docker.orig:/usr/local/bin/docker:ro
+        - /usr/bin/docker:/usr/local/bin/docker:ro
         - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
         - /opt/hyhal:/opt/hyhal:ro
     steps:
