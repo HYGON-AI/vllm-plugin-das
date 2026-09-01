@@ -53,6 +53,31 @@ REQUIRED_EXPORTS = {
 }
 
 
+def _assert_required_public_exports(
+    module_name: str,
+    module: ModuleType,
+    required: set[str],
+) -> None:
+    public = getattr(module, "__all__", None)
+    assert isinstance(public, (list, tuple)), (
+        f"{module_name} has no public __all__"
+    )
+    assert all(isinstance(name, str) for name in public), (
+        f"{module_name}.__all__ contains non-string entries"
+    )
+    assert len(public) == len(set(public)), (
+        f"{module_name}.__all__ contains duplicates"
+    )
+    not_public = sorted(required - set(public))
+    assert not not_public, (
+        f"{module_name} required exports are not public: {not_public}"
+    )
+    not_bound = sorted(name for name in required if not hasattr(module, name))
+    assert not not_bound, (
+        f"{module_name} public exports are not bound: {not_bound}"
+    )
+
+
 @pytest.fixture
 def isolated_lightop_modules():
     original_modules = {
@@ -93,6 +118,28 @@ def test_isolated_lightop_modules_evicts_stale_cache(
             next(lifecycle)
 
 
+def test_required_export_must_be_public_and_bound() -> None:
+    gemm_ops = ModuleType("lightop.gemm_ops")
+    gemm_ops.__all__ = ["hipblaslt_w8a8_channelwise_gemm"]
+    gemm_ops.hipblaslt_w8a8_gemm = lambda: None  # type: ignore[attr-defined]
+
+    with pytest.raises(AssertionError, match="not public"):
+        _assert_required_public_exports(
+            "lightop.gemm_ops",
+            gemm_ops,
+            {"hipblaslt_w8a8_gemm"},
+        )
+
+    gemm_ops.__all__ = ["hipblaslt_w8a8_gemm"]
+    del gemm_ops.hipblaslt_w8a8_gemm  # type: ignore[attr-defined]
+    with pytest.raises(AssertionError, match="not bound"):
+        _assert_required_public_exports(
+            "lightop.gemm_ops",
+            gemm_ops,
+            {"hipblaslt_w8a8_gemm"},
+        )
+
+
 @pytest.mark.usefixtures("isolated_lightop_modules")
 @pytest.mark.hcu
 @pytest.mark.parametrize("module_name", sorted(REQUIRED_EXPORTS))
@@ -117,7 +164,8 @@ def test_categorized_lightop_exports(
 
     import_module("lightop")
     module = import_module(module_name)
-    missing = sorted(
-        name for name in REQUIRED_EXPORTS[module_name] if not hasattr(module, name)
+    _assert_required_public_exports(
+        module_name,
+        module,
+        REQUIRED_EXPORTS[module_name],
     )
-    assert not missing, f"{module_name} is missing required exports: {missing}"

@@ -62,8 +62,17 @@ The two exceptions are present exactly once, and only in
 - `fuse_silu_mul_clamp_quant`
 - `fuse_silu_mul_clamp_quant_ep`
 
-The structural guard and call-count checks reject a missing, duplicated,
-stale, or broadened exception. The 30 categorized production symbols are:
+The clamp exception is accepted only when `_lightop_clamp` is the exact cached
+resolver: one `name` argument, one exact membership guard whose sole body is
+`raise AttributeError(name)`, one exact `import lightop`, and one exact
+`return getattr(lightop, name)`. Extra statements, branches, assignments,
+decorators beyond the required one, lookups, missing calls, duplicated calls,
+and broadened/stale names are rejected; the one exact `lru_cache` decorator is
+required.
+`_lightop_activation` has an equally exact categorized resolver
+shape; every call to it must pass one literal symbol. Literal category
+`getattr` calls are recorded, while unsupported dynamic category lookups are
+rejected. The 30 categorized production symbols are:
 
 ```text
 lightop.activation.fuse_silu_mul_fp8_quant
@@ -99,8 +108,11 @@ lightop.tensor.ds_cat
 ```
 
 Every symbol is in the installed category module's public `__all__`.
-`lightop.gemm_ops.hipblaslt_w8a8_gemm` is also pinned explicitly by the
-installed export contract. The audit scans only this repository's
+The direct installed export contract validates each required module's
+`__all__` as a string-only, duplicate-free list/tuple, requires every pinned
+name to be a member, and separately requires every pinned name to remain a
+bound module attribute. This permanently pins exact
+`lightop.gemm_ops.hipblaslt_w8a8_gemm`. The audit scans only this repository's
 `vllm_hcu` package; it intentionally does not inspect or reject LightOp's own
 internal implementation namespaces.
 
@@ -114,8 +126,8 @@ All commands below exited 0.
 | `python -m compileall -q vllm_hcu tests` | clean |
 | `python tools/check_production_boundary.py` | 248 Python files, clean |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/check_patch_test_coverage.py` | 96 files: 95 adapters, 1 helper, 0 untested, 0 invalid contracts |
-| `python -m pytest -q tests/patch/test_lightop_api_boundary.py` | 3 passed |
-| `python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py` | 8 passed |
+| `python -m pytest -q tests/patch/test_lightop_api_boundary.py` | 10 passed after fix round 1 |
+| `python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py` | 9 passed after fix round 1 |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract` | 1,199 passed, 82 deselected, 15 warnings in 332.99s |
 | `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite integration-smoke -- -rs` | 73 passed, 3 skipped, 56 deselected in 3.62s |
 | `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite accuracy-hcu -- -k 'lightop or int8 or deepseek_v4 or dspark' -rs` | 41 passed, 98 deselected, 14 warnings in 24.24s |
@@ -154,3 +166,30 @@ vLLM reference, whose source checkout has no compiled `_C.silu_and_mul` or
 `_moe_C.moe_align_block_size` extensions. Repeating the unchanged test
 selection against the installed vLLM binary root produced the final 41-pass
 result above.
+
+## Review fix round 1
+
+Permanent mutations now cover clamp-name reassignment, an extra post-guard
+branch, a broadened guard, a stale missing clamp caller, a nonliteral
+activation-resolver call, an unsupported dynamic category lookup, and a
+literal category lookup that must appear in the categorized-symbol audit. The
+export test also covers both failure directions: bound-but-not-public and
+public-but-not-bound.
+
+The pre-fix focused run exited 1 with 5 failed and 13 passed. The failures were
+the two resolver-shape evasions, nonliteral activation call, dynamic category
+lookup, and missing public-export assertion helper. After the fixes:
+
+```text
+python -m pytest -q tests/patch/test_lightop_api_boundary.py
+10 passed in 3.10s
+
+python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py
+9 passed in 2.80s
+
+VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -k 'lightop or hcu_ci or deep_gemm_utils'
+120 passed, 1169 deselected, 15 warnings in 56.87s
+```
+
+The affected HCU selector remains at 44 passed, and the registry remains valid
+with 40 registrations across 22 jobs.

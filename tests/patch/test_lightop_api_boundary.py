@@ -191,11 +191,18 @@ class _LightOpVisitor(ast.NodeVisitor):
             isinstance(node.func, ast.Name)
             and node.func.id == "_lightop_activation"
             and self.relative_path == CLAMP_OWNER
-            and len(node.args) == 1
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
         ):
-            self.used.add(("lightop.activation", node.args[0].value))
+            if (
+                len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                self.used.add(("lightop.activation", node.args[0].value))
+            else:
+                self._violate(
+                    node, "activation resolver call must use one literal name"
+                )
 
         if (
             isinstance(node.func, ast.Name)
@@ -204,6 +211,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         ):
             if (
                 len(node.args) == 1
+                and not node.keywords
                 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)
             ):
@@ -218,48 +226,197 @@ class _LightOpVisitor(ast.NodeVisitor):
             and node.func.id == "getattr"
             and len(node.args) >= 2
             and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in self.root_aliases
         ):
-            allowed_resolver = (
-                self.relative_path == CLAMP_OWNER
-                and self._functions[-1:] == ["_lightop_clamp"]
-                and isinstance(node.args[1], ast.Name)
-                and node.args[1].id == "name"
-            )
-            if not allowed_resolver:
-                self._violate(node, "dynamic top-level LightOp attribute lookup")
+            owner = node.args[0].id
+            if owner in self.root_aliases:
+                allowed_resolver = (
+                    self.relative_path == CLAMP_OWNER
+                    and self._functions[-1:] == ["_lightop_clamp"]
+                    and len(node.args) == 2
+                    and not node.keywords
+                    and isinstance(node.args[1], ast.Name)
+                    and node.args[1].id == "name"
+                )
+                if not allowed_resolver:
+                    self._violate(node, "dynamic top-level LightOp attribute lookup")
+            elif owner in self.category_aliases:
+                category = self.category_aliases[owner]
+                if (
+                    len(node.args) == 2
+                    and not node.keywords
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                ):
+                    self.used.add((f"lightop.{category}", node.args[1].value))
+                else:
+                    allowed_activation_resolver = (
+                        self.relative_path == CLAMP_OWNER
+                        and self._functions[-1:] == ["_lightop_activation"]
+                        and category == "activation"
+                        and len(node.args) == 2
+                        and not node.keywords
+                        and isinstance(node.args[1], ast.Name)
+                        and node.args[1].id == "name"
+                    )
+                    if not allowed_activation_resolver:
+                        self._violate(
+                            node,
+                            "dynamic categorized LightOp attribute lookup",
+                        )
         self.generic_visit(node)
+
+
+def _resolver(tree: ast.Module, name: str) -> ast.FunctionDef | None:
+    resolvers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return resolvers[0] if len(resolvers) == 1 else None
+
+
+def _resolver_body(resolver: ast.FunctionDef) -> list[ast.stmt]:
+    body = list(resolver.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body.pop(0)
+    return body
+
+
+def _has_exact_name_argument(resolver: ast.FunctionDef) -> bool:
+    arguments = resolver.args
+    return (
+        not arguments.posonlyargs
+        and len(arguments.args) == 1
+        and arguments.args[0].arg == "name"
+        and arguments.vararg is None
+        and not arguments.kwonlyargs
+        and arguments.kwarg is None
+        and not arguments.defaults
+        and not arguments.kw_defaults
+    )
+
+
+def _has_exact_lru_cache_decorator(resolver: ast.FunctionDef) -> bool:
+    if len(resolver.decorator_list) != 1:
+        return False
+    decorator = resolver.decorator_list[0]
+    return (
+        isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id == "functools"
+        and decorator.func.attr == "lru_cache"
+        and not decorator.args
+        and len(decorator.keywords) == 1
+        and decorator.keywords[0].arg == "maxsize"
+        and isinstance(decorator.keywords[0].value, ast.Constant)
+        and decorator.keywords[0].value.value is None
+    )
+
+
+def _is_exact_getattr_return(
+    node: ast.stmt,
+    *,
+    owner: str,
+) -> bool:
+    if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "getattr"
+        and len(call.args) == 2
+        and not call.keywords
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == owner
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "name"
+    )
 
 
 def _clamp_resolver_is_exact(tree: ast.Module) -> bool:
     expected = {symbol for _, symbol in ALLOWED_TOP_LEVEL}
-    resolvers = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_lightop_clamp"
-    ]
-    if len(resolvers) != 1:
+    resolver = _resolver(tree, "_lightop_clamp")
+    if (
+        resolver is None
+        or not _has_exact_name_argument(resolver)
+        or not _has_exact_lru_cache_decorator(resolver)
+    ):
         return False
-    resolver = resolvers[0]
-    for node in ast.walk(resolver):
-        if (
-            isinstance(node, ast.Compare)
-            and isinstance(node.left, ast.Name)
-            and node.left.id == "name"
-            and len(node.ops) == 1
-            and isinstance(node.ops[0], ast.NotIn)
-            and len(node.comparators) == 1
-            and isinstance(node.comparators[0], (ast.Set, ast.Tuple))
-        ):
-            values = {
-                element.value
-                for element in node.comparators[0].elts
-                if isinstance(element, ast.Constant)
-                and isinstance(element.value, str)
-            }
-            return values == expected and len(node.comparators[0].elts) == len(expected)
-    return False
+    body = _resolver_body(resolver)
+    if len(body) != 3:
+        return False
+    guard, import_node, return_node = body
+    if not (
+        isinstance(guard, ast.If)
+        and not guard.orelse
+        and isinstance(guard.test, ast.Compare)
+        and isinstance(guard.test.left, ast.Name)
+        and guard.test.left.id == "name"
+        and len(guard.test.ops) == 1
+        and isinstance(guard.test.ops[0], ast.NotIn)
+        and len(guard.test.comparators) == 1
+        and isinstance(guard.test.comparators[0], ast.Set)
+    ):
+        return False
+    elements = guard.test.comparators[0].elts
+    values = {
+        element.value
+        for element in elements
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+    if values != expected or len(elements) != len(expected):
+        return False
+    if len(guard.body) != 1 or not isinstance(guard.body[0], ast.Raise):
+        return False
+    raised = guard.body[0]
+    if not (
+        isinstance(raised.exc, ast.Call)
+        and isinstance(raised.exc.func, ast.Name)
+        and raised.exc.func.id == "AttributeError"
+        and len(raised.exc.args) == 1
+        and not raised.exc.keywords
+        and isinstance(raised.exc.args[0], ast.Name)
+        and raised.exc.args[0].id == "name"
+        and raised.cause is None
+    ):
+        return False
+    if not (
+        isinstance(import_node, ast.Import)
+        and len(import_node.names) == 1
+        and import_node.names[0].name == "lightop"
+        and import_node.names[0].asname is None
+    ):
+        return False
+    return _is_exact_getattr_return(return_node, owner="lightop")
+
+
+def _activation_resolver_is_exact(tree: ast.Module) -> bool:
+    resolver = _resolver(tree, "_lightop_activation")
+    if (
+        resolver is None
+        or not _has_exact_name_argument(resolver)
+        or not _has_exact_lru_cache_decorator(resolver)
+    ):
+        return False
+    body = _resolver_body(resolver)
+    if len(body) != 2:
+        return False
+    import_node, return_node = body
+    return (
+        isinstance(import_node, ast.ImportFrom)
+        and import_node.module == "lightop"
+        and import_node.level == 0
+        and len(import_node.names) == 1
+        and import_node.names[0].name == "activation"
+        and import_node.names[0].asname is None
+        and _is_exact_getattr_return(return_node, owner="activation")
+    )
 
 
 def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
@@ -290,8 +447,13 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
         violations.append(f"{CLAMP_OWNER}:1: clamp allowlist mismatch: {details}")
     if owner_tree is None or not _clamp_resolver_is_exact(owner_tree):
         violations.append(
-            f"{CLAMP_OWNER}:1: clamp resolver guard is missing or broader than "
-            f"{sorted(symbol for _, symbol in ALLOWED_TOP_LEVEL)}"
+            f"{CLAMP_OWNER}:1: clamp resolver body is not the exact guarded "
+            "top-level lookup"
+        )
+    if owner_tree is None or not _activation_resolver_is_exact(owner_tree):
+        violations.append(
+            f"{CLAMP_OWNER}:1: activation resolver body is not the exact "
+            "categorized lookup"
         )
 
     return sorted(violations), used
@@ -341,23 +503,55 @@ def test_production_uses_public_lightop_categories_only() -> None:
     assert violations == []
 
 
-def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
+def _write_mutation_owner(
+    tmp_path: Path,
+    *,
+    clamp_body: str | None = None,
+    activation_call: str | None = None,
+    include_second_clamp_call: bool = True,
+) -> Path:
     root = tmp_path / "vllm_hcu"
     owner = tmp_path / CLAMP_OWNER
     owner.parent.mkdir(parents=True)
-    owner.write_text(
-        "import lightop\n"
-        "def _lightop_clamp(name):\n"
+    resolver = clamp_body or (
         "    if name not in {\"fuse_silu_mul_clamp_quant\", "
         "\"fuse_silu_mul_clamp_quant_ep\"}:\n"
         "        raise AttributeError(name)\n"
+        "    import lightop\n"
         "    return getattr(lightop, name)\n"
+    )
+    second_call = (
+        "def clamp_ep(*args):\n"
+        "    return _lightop_clamp(\"fuse_silu_mul_clamp_quant_ep\")(*args)\n"
+        if include_second_clamp_call
+        else ""
+    )
+    activation_wrapper = (
+        "def activation_wrapper(name):\n"
+        f"    return _lightop_activation({activation_call})\n"
+        if activation_call is not None
+        else ""
+    )
+    owner.write_text(
+        "import functools\n"
+        "@functools.lru_cache(maxsize=None)\n"
+        "def _lightop_activation(name):\n"
+        "    from lightop import activation\n"
+        "    return getattr(activation, name)\n"
+        "@functools.lru_cache(maxsize=None)\n"
+        "def _lightop_clamp(name):\n"
+        f"{resolver}"
         "def clamp(*args):\n"
         "    return _lightop_clamp(\"fuse_silu_mul_clamp_quant\")(*args)\n"
-        "def clamp_ep(*args):\n"
-        "    return _lightop_clamp(\"fuse_silu_mul_clamp_quant_ep\")(*args)\n",
+        f"{second_call}"
+        f"{activation_wrapper}",
         encoding="utf-8",
     )
+    return root
+
+
+def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
     mutation = root / "mutation.py"
     mutation.write_text(
         "import lmslim\n"
@@ -380,6 +574,110 @@ def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
         "vllm_hcu/mutation.py:6: moved top-level LightOp import 'moved'",
     }
     assert expected <= set(violations)
+
+
+@pytest.mark.parametrize(
+    ("clamp_body", "include_second_clamp_call"),
+    [
+        pytest.param(
+            "    if name not in {\"fuse_silu_mul_clamp_quant\", "
+            "\"fuse_silu_mul_clamp_quant_ep\"}:\n"
+            "        raise AttributeError(name)\n"
+            "    import lightop\n"
+            "    name = \"fuse_silu_mul_quant\"\n"
+            "    return getattr(lightop, name)\n",
+            True,
+            id="reassigned-name",
+        ),
+        pytest.param(
+            "    if name not in {\"fuse_silu_mul_clamp_quant\", "
+            "\"fuse_silu_mul_clamp_quant_ep\"}:\n"
+            "        raise AttributeError(name)\n"
+            "    import lightop\n"
+            "    if name == \"fuse_silu_mul_clamp_quant\":\n"
+            "        pass\n"
+            "    return getattr(lightop, name)\n",
+            True,
+            id="extra-branch",
+        ),
+        pytest.param(
+            "    if name not in {\"fuse_silu_mul_clamp_quant\", "
+            "\"fuse_silu_mul_clamp_quant_ep\", \"broadened\"}:\n"
+            "        raise AttributeError(name)\n"
+            "    import lightop\n"
+            "    return getattr(lightop, name)\n",
+            True,
+            id="broadened-guard",
+        ),
+        pytest.param(
+            None,
+            False,
+            id="stale-missing-call",
+        ),
+    ],
+)
+def test_scanner_rejects_mutated_clamp_boundary(
+    tmp_path: Path,
+    clamp_body: str | None,
+    include_second_clamp_call: bool,
+) -> None:
+    root = _write_mutation_owner(
+        tmp_path,
+        clamp_body=clamp_body,
+        include_second_clamp_call=include_second_clamp_call,
+    )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "clamp resolver" in item or "clamp allowlist" in item
+        for item in violations
+    )
+
+
+def test_scanner_rejects_nonliteral_activation_resolver_call(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path, activation_call="name")
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "activation resolver call must use one literal name" in item
+        for item in violations
+    )
+
+
+def test_scanner_rejects_dynamic_category_getattr(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    mutation = root / "dynamic_category.py"
+    mutation.write_text(
+        "from lightop import activation\n"
+        "def resolve(name):\n"
+        "    return getattr(activation, name)\n",
+        encoding="utf-8",
+    )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "dynamic categorized LightOp attribute lookup" in item
+        for item in violations
+    )
+
+
+def test_scanner_records_literal_category_getattr(tmp_path: Path) -> None:
+    root = _write_mutation_owner(tmp_path)
+    mutation = root / "literal_category.py"
+    mutation.write_text(
+        "from lightop import quant\n"
+        "kernel = getattr(quant, \"literal_quant_kernel\")\n",
+        encoding="utf-8",
+    )
+
+    violations = scan_lightop_imports(root)
+    used = categorized_symbols(root)
+
+    assert violations == []
+    assert ("lightop.quant", "literal_quant_kernel") in used
 
 
 @pytest.mark.usefixtures("isolated_lightop_modules")
