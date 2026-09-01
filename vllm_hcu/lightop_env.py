@@ -97,5 +97,7 @@ def configure_lightop_environment(
             _warn_legacy_once(legacy_name, hcu_name)
         if configured:
             canonical = next(iter(configured.values()))
-            environ.setdefault(hcu_name, canonical)
-            environ.setdefault(alias_name, canonical)
+            if not environ.get(hcu_name):
+                environ[hcu_name] = canonical
+            if not environ.get(alias_name):
+                environ[alias_name] = canonical

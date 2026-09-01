@@ -7,14 +7,15 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
+import os
+import subprocess
 import sys
 from collections import Counter
-from importlib import invalidate_caches
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -55,6 +56,9 @@ class _LightOpVisitor(ast.NodeVisitor):
         # ``lightop.op.foo()`` cannot evade the policy by omitting its import
         # from the scanned file.
         self.root_aliases: set[str] = {"lightop"}
+        # Production must not use an injected/global LMSlim binding either;
+        # requiring a local import would leave dynamic bindings unscanned.
+        self.lmslim_root_aliases: set[str] = {"lmslim"}
         self.category_aliases: dict[str, str] = {}
         self.used: set[tuple[str, str]] = set()
         self.allowed_calls: list[tuple[str, str, int]] = []
@@ -71,6 +75,7 @@ class _LightOpVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         saved_root_aliases = self.root_aliases.copy()
+        saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
         arguments = (
             list(node.args.posonlyargs)
@@ -83,26 +88,33 @@ class _LightOpVisitor(ast.NodeVisitor):
             arguments.append(node.args.kwarg)
         for argument in arguments:
             self.root_aliases.discard(argument.arg)
+            self.lmslim_root_aliases.discard(argument.arg)
             self.category_aliases.pop(argument.arg, None)
         self._functions.append(node.name)
         self.generic_visit(node)
         self._functions.pop()
         self.root_aliases = saved_root_aliases
+        self.lmslim_root_aliases = saved_lmslim_root_aliases
         self.category_aliases = saved_category_aliases
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         saved_root_aliases = self.root_aliases.copy()
+        saved_lmslim_root_aliases = self.lmslim_root_aliases.copy()
         saved_category_aliases = self.category_aliases.copy()
         self.generic_visit(node)
         self.root_aliases = saved_root_aliases
+        self.lmslim_root_aliases = saved_lmslim_root_aliases
         self.category_aliases = saved_category_aliases
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             module = alias.name
             if module == "lmslim" or module.startswith("lmslim."):
+                self.lmslim_root_aliases.add(
+                    alias.asname or module.split(".", maxsplit=1)[0]
+                )
                 self._violate(node, f"external LMSlim import {module!r}")
                 continue
             if module == "lightop":
@@ -158,6 +170,12 @@ class _LightOpVisitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         root, parts = _attribute_parts(node)
         if isinstance(root, ast.Name) and parts:
+            if root.id in self.lmslim_root_aliases:
+                reference = ".".join((root.id, *parts))
+                self._violate(
+                    node, f"external LMSlim attribute {reference!r}"
+                )
+                return
             if root.id in self.root_aliases:
                 namespace = parts[0]
                 if namespace in {"op", "gemmopt"}:
@@ -175,7 +193,29 @@ class _LightOpVisitor(ast.NodeVisitor):
                 self.used.add((f"lightop.{self.category_aliases[root.id]}", parts[0]))
         self.generic_visit(node)
 
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in self.lmslim_root_aliases:
+            self._violate(node, f"external LMSlim root {node.id!r}")
+
     def visit_Call(self, node: ast.Call) -> None:
+        direct_lmslim_call: str | None = None
+        if isinstance(node.func, ast.Name):
+            if node.func.id in self.lmslim_root_aliases:
+                direct_lmslim_call = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            root, parts = _attribute_parts(node.func)
+            if isinstance(root, ast.Name) and root.id in self.lmslim_root_aliases:
+                direct_lmslim_call = ".".join((root.id, *parts))
+        if direct_lmslim_call is not None:
+            self._violate(
+                node, f"external LMSlim call {direct_lmslim_call!r}"
+            )
+            for argument in node.args:
+                self.visit(argument)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            return
+
         if isinstance(node.func, ast.Attribute):
             root, parts = _attribute_parts(node.func)
             if isinstance(root, ast.Name) and parts:
@@ -467,35 +507,36 @@ def categorized_symbols(root: Path) -> set[tuple[str, str]]:
     return _scan(root)[1]
 
 
-def installed_public_exports() -> set[tuple[str, str]]:
+def installed_public_exports(
+    required: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
     exports: set[tuple[str, str]] = set()
-    for category in sorted(PUBLIC_CATEGORIES):
-        module_name = f"lightop.{category}"
+    module_names = sorted({module_name for module_name, _ in required})
+    for module_name in module_names:
         module = importlib.import_module(module_name)
         public = getattr(module, "__all__", None)
         assert isinstance(public, (list, tuple)), f"{module_name} has no public __all__"
+        assert all(isinstance(name, str) for name in public), (
+            f"{module_name}.__all__ contains non-string entries"
+        )
+        assert len(public) == len(set(public)), (
+            f"{module_name}.__all__ contains duplicates"
+        )
+        module_required = {
+            symbol for owner, symbol in required if owner == module_name
+        }
+        not_public = sorted(module_required - set(public))
+        assert not not_public, (
+            f"{module_name} required exports are not public: {not_public}"
+        )
+        not_bound = sorted(
+            symbol for symbol in module_required if not hasattr(module, symbol)
+        )
+        assert not not_bound, (
+            f"{module_name} public exports are not bound: {not_bound}"
+        )
         exports.update((module_name, symbol) for symbol in public)
     return exports
-
-
-@pytest.fixture
-def isolated_lightop_modules():
-    original_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == "lightop" or name.startswith("lightop.")
-    }
-    for name in tuple(original_modules):
-        sys.modules.pop(name, None)
-    invalidate_caches()
-    try:
-        yield
-    finally:
-        for name in tuple(sys.modules):
-            if name == "lightop" or name.startswith("lightop."):
-                sys.modules.pop(name, None)
-        invalidate_caches()
-        sys.modules.update(original_modules)
 
 
 def test_production_uses_public_lightop_categories_only() -> None:
@@ -574,6 +615,25 @@ def test_scanner_rejects_forbidden_forms_with_locations(tmp_path: Path) -> None:
         "vllm_hcu/mutation.py:6: moved top-level LightOp import 'moved'",
     }
     assert expected <= set(violations)
+
+
+def test_scanner_rejects_injected_direct_lmslim_call_with_location(
+    tmp_path: Path,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    mutation = root / "injected_lmslim.py"
+    mutation.write_text(
+        "def invoke():\n"
+        "    return lmslim.foo()\n",
+        encoding="utf-8",
+    )
+
+    violations = scan_lightop_imports(root)
+
+    assert (
+        "vllm_hcu/injected_lmslim.py:2: external LMSlim call 'lmslim.foo'"
+        in violations
+    )
 
 
 @pytest.mark.parametrize(
@@ -680,23 +740,55 @@ def test_scanner_records_literal_category_getattr(tmp_path: Path) -> None:
     assert ("lightop.quant", "literal_quant_kernel") in used
 
 
-@pytest.mark.usefixtures("isolated_lightop_modules")
-def test_installed_category_exports_cover_production_symbols(monkeypatch) -> None:
-    device_properties = SimpleNamespace(
-        gcnArchName="gfx936:sramecc+:xnack-",
-        multi_processor_count=80,
-        name="HYGON HCU",
-        major=9,
-        minor=3,
-        total_memory=64 << 30,
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda *args, **kwargs: device_properties,
-    )
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-
+def test_installed_category_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
-    exported = installed_public_exports()
-    assert used - exported == set()
+    env = dict(os.environ)
+    env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib, json, os, torch; "
+            "from types import SimpleNamespace; "
+            "torch.cuda.get_device_properties = lambda *_a, **_k: "
+            "SimpleNamespace(gcnArchName='gfx936:sramecc+:xnack-', "
+            "multi_processor_count=80, name='HYGON HCU', major=9, minor=3, "
+            "total_memory=64 << 30); "
+            "torch.cuda.current_device = lambda: 0; "
+            "required=json.loads(os.environ['LIGHTOP_REQUIRED_EXPORTS']); "
+            "modules={name: importlib.import_module(name) "
+            "for name, _symbol in required}; "
+            "missing_public=[(name, symbol) for name, symbol in required "
+            "if symbol not in modules[name].__all__]; "
+            "missing_bound=[(name, symbol) for name, symbol in required "
+            "if not hasattr(modules[name], symbol)]; "
+            "assert not missing_public, f'not public: {missing_public}'; "
+            "assert not missing_bound, f'not bound: {missing_bound}'",
+        ],
+        cwd=REPOSITORY,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_dynamic_export_audit_rejects_public_but_unbound_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampling = SimpleNamespace(
+        __all__=["top_k_top_p_sampling_from_probs"],
+    )
+    def import_sampling(name: str) -> SimpleNamespace:
+        assert name == "lightop.sampling"
+        return sampling
+
+    monkeypatch.setattr(importlib, "import_module", import_sampling)
+
+    with pytest.raises(AssertionError, match="public exports are not bound"):
+        installed_public_exports(
+            {("lightop.sampling", "top_k_top_p_sampling_from_probs")}
+        )

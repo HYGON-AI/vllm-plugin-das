@@ -106,6 +106,10 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
         def attn_gemm_parallel_execute(self, hidden_states):
             return hidden_states
 
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
+            return hidden_states
+
         def _fused_qnorm_rope_kv_insert(
             self,
             q,
@@ -177,6 +181,10 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
             seen_ignore.append(list(vllm_config.quant_config.ignore))
 
         def attn_gemm_parallel_execute(self, hidden_states):
+            return hidden_states
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
             return hidden_states
 
         def _fused_qnorm_rope_kv_insert(

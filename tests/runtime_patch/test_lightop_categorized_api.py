@@ -49,6 +49,7 @@ REQUIRED_EXPORTS = {
         "rmsnorm_forward_autograd",
     },
     "lightop.quant": {"per_token_quant_fp8", "per_token_quant_int8"},
+    "lightop.sampling": {"top_k_top_p_sampling_from_probs"},
     "lightop.tensor": {"ds_cat"},
 }
 

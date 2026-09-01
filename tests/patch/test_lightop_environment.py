@@ -38,6 +38,51 @@ def test_new_hcu_names_populate_lightop_supported_aliases():
     assert env["VLLM_USE_FUSE_SILU_AND_MUL"] == "1"
 
 
+@pytest.mark.parametrize(
+    ("hcu_name", "alias_name", "configured", "canonical"),
+    (
+        (
+            "VLLM_HCU_FUSED_MOE_CHUNK_SIZE",
+            "VLLM_FUSED_MOE_CHUNK_SIZE",
+            "08192",
+            "8192",
+        ),
+        (
+            "VLLM_HCU_USE_GLOBAL_MOE_CACHE",
+            "VLLM_USE_GLOBAL_CACHE13",
+            "true",
+            "1",
+        ),
+        (
+            "VLLM_HCU_USE_FUSED_RMS_QUANT",
+            "USE_FUSED_RMS_QUANT",
+            "yes",
+            "1",
+        ),
+        (
+            "VLLM_HCU_USE_FUSE_SILU_AND_MUL",
+            "VLLM_USE_FUSE_SILU_AND_MUL",
+            "off",
+            "0",
+        ),
+    ),
+)
+def test_hcu_names_replace_empty_lightop_aliases_with_canonical_values(
+    hcu_name: str,
+    alias_name: str,
+    configured: str,
+    canonical: str,
+) -> None:
+    """An empty dependency alias is unconfigured, not an override."""
+
+    env = {hcu_name: configured, alias_name: ""}
+
+    configure_lightop_environment(env)
+
+    assert env[hcu_name] == configured
+    assert env[alias_name] == canonical
+
+
 def test_conflicting_hcu_and_dependency_values_fail_closed():
     """A plugin value cannot silently override a conflicting LightOp alias."""
 

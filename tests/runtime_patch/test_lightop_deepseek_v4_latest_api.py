@@ -133,7 +133,9 @@ def test_dspark_context_passes_raw_kv_and_kv_norm_weight(
     assert slots.is_contiguous()
 
 
-def _core_fix_instance() -> tuple[
+def _core_fix_instance(
+    official_inserted_kv: list[torch.Tensor] | None = None,
+) -> tuple[
     object, object, torch.Tensor, torch.Tensor, object
 ]:
     class DeepseekV4Attention:
@@ -149,9 +151,33 @@ def _core_fix_instance() -> tuple[
         def attn_gemm_parallel_execute(self, hidden_states):
             return hidden_states
 
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del llama_4_scaling
+            qr_kv, *_ = self.attn_gemm_parallel_execute(hidden_states)
+            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+            qr = self.q_norm(qr)
+            kv = self.kv_norm(kv)
+            out = torch.empty(
+                (hidden_states.shape[0], self.padded_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+            )
+            self.attention_impl(
+                hidden_states,
+                qr,
+                kv,
+                None,
+                None,
+                None,
+                positions,
+                out,
+            )
+            return self._o_proj(out[:, : self.n_local_heads, :], positions)
+
         def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
-            del q, kv, positions, attn_metadata
-            return "official"
+            del positions, attn_metadata
+            if official_inserted_kv is not None:
+                official_inserted_kv.append(kv.clone())
+            return q
 
     module = ModuleType(patch_deepseek_v4_attention.TARGET_MODULE)
     module.DeepseekV4Attention = DeepseekV4Attention  # type: ignore[attr-defined]
@@ -175,6 +201,148 @@ def _core_fix_instance() -> tuple[
         block_size=4,
     )
     return instance, kv_weight, torch.ones((2, 8)), torch.tensor([6, 7]), metadata
+
+
+def test_core_fix_forward_applies_kv_norm_exactly_once_in_uint8_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The patched upstream caller must pass raw KV into the KVNorm kernel."""
+
+    normalized_by: list[str] = []
+    inserted_kv: list[torch.Tensor] = []
+
+    def lightop_insert(
+        _q,
+        kv,
+        _kv_norm_weight,
+        _cache,
+        _slots,
+        _positions,
+        _cos_sin_cache,
+        _eps,
+        _block_size,
+    ) -> None:
+        inserted_kv.append(kv.clone())
+        normalized_by.append("lightop-kernel")
+
+    _install_lightop_attention(monkeypatch, lightop_insert)
+    instance, _kv_weight, _raw_kv, positions, metadata = _core_fix_instance()
+    instance.q_lora_rank = 2
+    instance.head_dim = 4
+    instance.n_local_heads = 1
+    instance.padded_heads = 1
+    raw_qr_kv = torch.tensor(
+        [[1.0, 2.0, 10.0, 20.0, 30.0, 40.0],
+         [3.0, 4.0, 50.0, 60.0, 70.0, 80.0]]
+    )
+    instance.attn_gemm_parallel_execute = lambda _hidden: (
+        raw_qr_kv,
+        None,
+        None,
+        None,
+    )
+    instance.q_norm = lambda qr: qr + 100
+
+    class KvNorm:
+        weight = instance.kv_norm.weight
+
+        def __call__(self, kv):
+            normalized_by.append("caller")
+            return kv + 1000
+
+    instance.kv_norm = KvNorm()
+
+    def attention_impl(
+        _hidden_states,
+        q,
+        kv,
+        _kv_score,
+        _indexer_kv_score,
+        _indexer_weights,
+        forwarded_positions,
+        out,
+    ) -> None:
+        instance._fused_qnorm_rope_kv_insert(
+            q, kv, forwarded_positions, {"layer.swa": metadata}
+        )
+        out.zero_()
+
+    instance.attention_impl = attention_impl
+    instance._o_proj = lambda out, _positions: out
+
+    instance.forward(positions.to(torch.int64), torch.zeros((2, 6)))
+
+    assert normalized_by == ["lightop-kernel"]
+    torch.testing.assert_close(inserted_kv[0], raw_qr_kv[:, 2:])
+
+
+def test_core_fix_forward_normalizes_kv_when_delegating_non_uint8_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The official cache implementation still receives normalized KV."""
+
+    _install_lightop_attention(
+        monkeypatch,
+        lambda *_args: pytest.fail("selected uint8 LightOp insertion kernel"),
+    )
+    official_inserted_kv: list[torch.Tensor] = []
+    instance, _kv_weight, _raw_kv, positions, metadata = _core_fix_instance(
+        official_inserted_kv
+    )
+    instance.swa_cache_layer.kv_cache = torch.zeros(
+        (2, 4, 4), dtype=torch.bfloat16
+    )
+    instance.q_lora_rank = 2
+    instance.head_dim = 4
+    instance.n_local_heads = 1
+    instance.padded_heads = 1
+    raw_qr_kv = torch.tensor(
+        [
+            [1.0, 2.0, 10.0, 20.0, 30.0, 40.0],
+            [3.0, 4.0, 50.0, 60.0, 70.0, 80.0],
+        ]
+    )
+    instance.attn_gemm_parallel_execute = lambda _hidden: (
+        raw_qr_kv,
+        None,
+        None,
+        None,
+    )
+    instance.q_norm = lambda qr: qr + 100
+    kv_norm_inputs: list[torch.Tensor] = []
+
+    class KvNorm:
+        weight = instance.kv_norm.weight
+
+        def __call__(self, kv):
+            kv_norm_inputs.append(kv.clone())
+            return kv + 1000
+
+    instance.kv_norm = KvNorm()
+
+    def attention_impl(
+        _hidden_states,
+        q,
+        kv,
+        _kv_score,
+        _indexer_kv_score,
+        _indexer_weights,
+        forwarded_positions,
+        out,
+    ) -> None:
+        instance._fused_qnorm_rope_kv_insert(
+            q, kv, forwarded_positions, {"layer.swa": metadata}
+        )
+        out.zero_()
+
+    instance.attention_impl = attention_impl
+    instance._o_proj = lambda out, _positions: out
+
+    instance.forward(positions.to(torch.int64), torch.zeros((2, 6)))
+
+    assert len(kv_norm_inputs) == 1
+    torch.testing.assert_close(kv_norm_inputs[0], raw_qr_kv[:, 2:])
+    torch.testing.assert_close(official_inserted_kv[0], raw_qr_kv[:, 2:] + 1000)
 
 
 def test_core_fix_patch_passes_kv_norm_weight_and_int32_slots(
