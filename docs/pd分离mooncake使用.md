@@ -229,13 +229,13 @@ python3 "${VLLM_SOURCE_ROOT}/examples/online_serving/disaggregated_serving/moonc
 ```bash
 10.16.1.15:
 export VLLM_HCU_USE_FLASHMLA=1
-export LMSLIM_USE_GLOBAL_MOE_CACHE=1
+export VLLM_HCU_USE_GLOBAL_MOE_CACHE=1
 export VLLM_DP_MASTER_IP=10.16.1.15
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 ray start --head --node-ip-address=10.16.1.15  --port=1255 --num-gpus=8 --num-cpus=32
 10.16.1.16:
 export VLLM_HCU_USE_FLASHMLA=1
-export LMSLIM_USE_GLOBAL_MOE_CACHE=1
+export VLLM_HCU_USE_GLOBAL_MOE_CACHE=1
 export VLLM_DP_MASTER_IP=10.16.1.15
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 ray start --address=10.16.1.15:1255  --num-gpus=8 --num-cpus=32
@@ -260,7 +260,7 @@ vllm serve /models/v2_6/GLM-w4a8-V2_6_test \
 
 ```bash
 export VLLM_HCU_USE_FLASHMLA=1
-export LMSLIM_USE_GLOBAL_MOE_CACHE=1
+export VLLM_HCU_USE_GLOBAL_MOE_CACHE=1
 export VLLM_DP_MASTER_IP=10.16.1.15
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 vllm serve /models/v2_6/GLM-w4a8-V2_6_test \
@@ -294,12 +294,11 @@ python3 "${VLLM_SOURCE_ROOT}/examples/online_serving/disaggregated_serving/moonc
 export VLLM_HCU_USE_CUSTOM_FLASH_ATTN=1
 export GPU_MAX_HW_QUEUES=4
 export VLLM_HCU_USE_LIGHTOP_MOE_ALIGN=1
-export LMSLIM_USE_LIGHTOP=1
 export HIPBLASLT_TUNING_OVERRIDE_FILE="${HIPBLASLT_TUNING_CONFIG}"
 export ROCBLAS_TENSILE_LIBPATH="${ROCBLAS_TENSILE_LIB_DIR}"
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 
-LMSLIM_USE_FUSED_RMS_QUANT=1 \
+VLLM_HCU_USE_FUSED_RMS_QUANT=1 \
 VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE=0 \
 vllm serve /models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3 \
   --speculative-config.method mtp \
