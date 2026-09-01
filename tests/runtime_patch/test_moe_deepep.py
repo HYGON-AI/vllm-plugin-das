@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import linecache
+import logging
 import os
 import subprocess
 import sys
@@ -64,6 +65,18 @@ def _module(name: str, **attributes: object) -> ModuleType:
     for key, value in attributes.items():
         setattr(module, key, value)
     return module
+
+
+def _install_lightop_moe(
+    monkeypatch: pytest.MonkeyPatch, **exports: object
+) -> ModuleType:
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    moe = _module("lightop.moe", **exports)
+    lightop.moe = moe
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.moe", moe)
+    return moe
 
 
 def test_all2all_dispatch_selection_contract():
@@ -1701,31 +1714,17 @@ def test_moe_align_feature_off_and_lightop_contract(
 
     calls = []
 
-    def lightop_align(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map=None,
-        expert_mask=None,
-        num_local_tokens=None,
-        is_ep=False,
-        is_fuse_fill=True,
-    ):
-        calls.append(
-            (
-                topk_ids,
-                num_experts,
-                block_size,
-                expert_map,
-                expert_mask,
-                num_local_tokens,
-                is_ep,
-                is_fuse_fill,
-            )
-        )
+    def moe_align_block_size_out(*args, **kwargs):
+        calls.append((args, kwargs))
+        (
+            topk_ids,
+            _num_experts,
+            _block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            *_rest,
+        ) = args
         assert torch.all(sorted_ids == topk_ids.numel())
         # Model one token per expert in a four-entry padded valid range.
         sorted_ids[0] = 0
@@ -1733,13 +1732,15 @@ def test_moe_align_feature_off_and_lightop_contract(
         expert_ids.copy_(torch.arange(expert_ids.numel(), dtype=torch.int32))
         num_tokens_post_pad.fill_(sorted_ids.numel())
 
-    lightop_package = ModuleType("lightop")
-    lightop_package.op = SimpleNamespace(moe_align_block_size=lightop_align)
-    monkeypatch.setitem(sys.modules, "lightop", lightop_package)
+    _install_lightop_moe(
+        monkeypatch,
+        moe_align_block_size_out=moe_align_block_size_out,
+    )
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", True)
     sorted_ids, expert_ids, count = module.moe_align_block_size(ids, 2, 2)
-    assert calls[0][1:] == (2, 2, None, None, None, False, False)
+    assert calls[0][0][3:6] == (sorted_ids, expert_ids, count)
+    assert calls[0][1] == {"is_ep": False, "is_fuse_fill": False}
     assert count.item() == 4
     assert torch.equal(
         sorted_ids[: count.item()],
@@ -1755,7 +1756,7 @@ def test_moe_align_feature_off_and_lightop_contract(
         expert_map,
         ignore_invalid_experts=True,
     )
-    assert calls[-1][3] is expert_map
+    assert calls[-1][0][6] is expert_map
     assert torch.equal(expert_ids, torch.tensor([0, 1], dtype=torch.int32))
 
     _, expert_ids, _ = module.moe_align_block_size(
@@ -1765,8 +1766,225 @@ def test_moe_align_feature_off_and_lightop_contract(
         expert_map,
         ignore_invalid_experts=False,
     )
-    assert calls[-1][3] is None
+    assert calls[-1][0][6] is None
     assert torch.equal(expert_ids, torch.tensor([1, 0], dtype=torch.int32))
+
+
+def test_moe_align_requires_categorized_out_api(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def official(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=None,
+        pad_sorted_ids=False,
+        ignore_invalid_experts=False,
+    ):
+        del (
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+        raise AssertionError("LightOp alignment must not use the official path")
+
+    module = _module(
+        patch_moe_align_block_size.TARGET_MODULE,
+        torch=torch,
+        triton=SimpleNamespace(cdiv=lambda value, block: (value + block - 1) // block),
+        round_up=lambda value, block: (value + block - 1) // block * block,
+        moe_align_block_size=official,
+    )
+    assert patch_moe_align_block_size.apply_to_module(module) is True
+    from vllm_hcu.platforms import envs as henvs
+
+    def stale_kernel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("cached lightop.moe must not leak into this test")
+
+    stale_moe = _module("lightop.moe", moe_align_block_size_out=stale_kernel)
+    monkeypatch.setitem(sys.modules, "lightop.moe", stale_moe)
+    legacy = _module("lightop.op", moe_align_block_size=lambda *args: None)
+    lightop = _module("lightop", op=legacy)
+    lightop.__path__ = []
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.op", legacy)
+    monkeypatch.delitem(sys.modules, "lightop.moe", raising=False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", True)
+
+    with pytest.raises(RuntimeError, match="lightop.moe.moe_align_block_size_out"):
+        module.moe_align_block_size(torch.tensor([[0]], dtype=torch.int32), 2, 2)
+
+
+def test_moe_align_does_not_mask_categorized_kernel_abi_failures(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def official(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=None,
+        pad_sorted_ids=False,
+        ignore_invalid_experts=False,
+    ):
+        del (
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+        raise AssertionError("LightOp alignment must not use the official path")
+
+    module = _module(
+        patch_moe_align_block_size.TARGET_MODULE,
+        torch=torch,
+        triton=SimpleNamespace(cdiv=lambda value, block: (value + block - 1) // block),
+        round_up=lambda value, block: (value + block - 1) // block * block,
+        moe_align_block_size=official,
+    )
+    assert patch_moe_align_block_size.apply_to_module(module) is True
+    from vllm_hcu.platforms import envs as henvs
+
+    def malformed_kernel(*args, **kwargs):
+        del args, kwargs
+        raise TypeError("strict LightOp ABI")
+
+    _install_lightop_moe(monkeypatch, moe_align_block_size_out=malformed_kernel)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", True)
+
+    with pytest.raises(TypeError, match="strict LightOp ABI"):
+        module.moe_align_block_size(torch.tensor([[0]], dtype=torch.int32), 2, 2)
+
+
+def test_deep_gemm_ep_uses_categorized_lightop_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    del monkeypatch
+    repo = Path(__file__).resolve().parents[2]
+    script = """
+import sys
+from types import ModuleType
+import logging
+import torch
+
+lightop = ModuleType("lightop")
+lightop.__path__ = []
+moe = ModuleType("lightop.moe")
+lightop.moe = moe
+sys.modules["lightop"] = lightop
+sys.modules["lightop.moe"] = moe
+from vllm_hcu.model_executor.layers.fused_moe import deep_gemm_utils
+from vllm_hcu.platforms import envs as henvs
+
+calls = []
+def ep_scatter(*args):
+    calls.append(("scatter", args))
+    args[5].fill_(7)
+def ep_gather(*args):
+    calls.append(("gather", args))
+    args[-1].fill_(9)
+moe.ep_scatter = ep_scatter
+moe.ep_gather = ep_gather
+deep_gemm_utils.current_platform.is_rocm = lambda: True
+henvs.VLLM_HCU_USE_CUSTOM_OPS = True
+henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER = True
+recv_x = torch.ones(2, 2)
+recv_x_scale = torch.ones(2, 1)
+recv_topk = torch.zeros(2, 1, dtype=torch.int32)
+counts = torch.tensor([2], dtype=torch.int32)
+scatter_out = torch.zeros(2, 2)
+deep_gemm_utils.ep_scatter(
+    recv_x, recv_x_scale, recv_topk, counts, None,
+    torch.tensor([0], dtype=torch.int32), scatter_out, torch.zeros(2, 1),
+    torch.empty(128, dtype=torch.int32), torch.empty(2, 1, dtype=torch.int32),
+    align_m=128,
+)
+assert torch.equal(scatter_out, torch.full((2, 2), 7.0))
+assert calls[0][0] == "scatter"
+assert calls[0][1][0] is recv_x
+assert calls[0][1][4] is counts
+assert calls[0][1][5] is scatter_out
+assert calls[0][1][-2:] == (1, 128)
+gather_out = torch.zeros(2, 2)
+deep_gemm_utils.ep_gather(
+    recv_x, recv_topk, torch.ones(2, 1),
+    torch.zeros(2, 1, dtype=torch.int32), None, gather_out,
+)
+assert torch.equal(gather_out, torch.full((2, 2), 9.0))
+assert calls[1][0] == "gather"
+assert calls[1][1][0] is recv_x
+assert calls[1][1][-1] is gather_out
+
+del sys.modules["lightop.moe"]
+delattr(lightop, "moe")
+legacy_calls = []
+op = ModuleType("lightop.op")
+def legacy_ep_scatter(*args):
+    legacy_calls.append(("scatter", args))
+    args[5].fill_(11)
+def legacy_ep_gather(*args):
+    legacy_calls.append(("gather", args))
+    args[-1].fill_(13)
+op.ep_scatter = legacy_ep_scatter
+op.ep_gather = legacy_ep_gather
+lightop.op = op
+sys.modules["lightop.op"] = op
+from vllm import logger as vllm_logger
+records = []
+class Capture(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+handler = Capture()
+vllm_logger._print_warning_once.cache_clear()
+deep_gemm_utils.logger.addHandler(handler)
+try:
+    legacy_scatter_out = torch.zeros(2, 2)
+    deep_gemm_utils.ep_scatter(
+        recv_x, recv_x_scale, recv_topk, counts, None,
+        torch.tensor([0], dtype=torch.int32), legacy_scatter_out, torch.zeros(2, 1),
+        torch.empty(128, dtype=torch.int32), torch.empty(2, 1, dtype=torch.int32),
+        align_m=128,
+    )
+    legacy_gather_out = torch.zeros(2, 2)
+    deep_gemm_utils.ep_gather(
+        recv_x, recv_topk, torch.ones(2, 1),
+        torch.zeros(2, 1, dtype=torch.int32), None, legacy_gather_out,
+    )
+finally:
+    deep_gemm_utils.logger.removeHandler(handler)
+assert torch.equal(legacy_scatter_out, torch.full((2, 2), 11.0))
+assert torch.equal(legacy_gather_out, torch.full((2, 2), 13.0))
+assert legacy_calls[0][0] == "scatter"
+assert legacy_calls[0][1][0] is recv_x
+assert legacy_calls[0][1][4] is counts
+assert legacy_calls[0][1][5] is legacy_scatter_out
+assert legacy_calls[0][1][-2:] == (1, 128)
+assert legacy_calls[1][0] == "gather"
+assert legacy_calls[1][1][0] is recv_x
+assert legacy_calls[1][1][-1] is legacy_gather_out
+assert records == [
+    "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+    "upgrade LightOp."
+]
+"""
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
@@ -3020,19 +3238,226 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     logits = torch.ones((1, 4))
     assert router._compute_routing(None, logits, torch.int32) == "official"
 
-    lightop_package = ModuleType("lightop")
-    lightop_package.op = SimpleNamespace(
-        moe_fused_gate=lambda *args: (
-            torch.ones((1, 1)),
-            torch.zeros((1, 1), dtype=torch.int64),
-        )
+    routed: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def moe_fused_gate(router_logits, *args):
+        del args
+        routed.append((router_logits, torch.tensor([[3]], dtype=torch.int64)))
+        return torch.ones((1, 1)), routed[-1][1]
+
+    _install_lightop_moe(
+        monkeypatch,
+        moe_fused_gate=moe_fused_gate,
     )
-    monkeypatch.setitem(sys.modules, "lightop", lightop_package)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
     weights, ids = router._compute_routing(None, logits, torch.int32)
     assert weights.shape == (1, 1)
     assert ids.dtype == torch.int32
+    assert ids.item() == 3
+    assert routed[0][0] is logits
+
+    legacy_calls: list[tuple[object, ...]] = []
+
+    def legacy_moe_fused_gate(*args):
+        legacy_calls.append(args)
+        return torch.full((1, 1), 0.25), torch.tensor([[1]], dtype=torch.int64)
+
+    lightop = sys.modules["lightop"]
+    incomplete_moe = _module("lightop.moe")
+    lightop.moe = incomplete_moe
+    monkeypatch.setitem(sys.modules, "lightop.moe", incomplete_moe)
+    legacy_op = _module("lightop.op", moe_fused_gate=legacy_moe_fused_gate)
+    lightop.op = legacy_op
+    monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
+    from vllm import logger as vllm_logger
+    from vllm_hcu.model_executor.layers.fused_moe import router_runtime
+
+    warning_messages: list[str] = []
+    vllm_logger._print_warning_once.cache_clear()
+    monkeypatch.setattr(
+        router_runtime.logger,
+        "warning",
+        lambda message, *args, **kwargs: warning_messages.append(message % args),
+    )
+    legacy_weights, legacy_ids = router._compute_routing(None, logits, torch.int32)
+    router._compute_routing(None, logits, torch.int32)
+    torch.testing.assert_close(legacy_weights, torch.full((1, 1), 0.25))
+    assert legacy_ids.dtype == torch.int32
+    assert legacy_ids.item() == 1
+    assert legacy_calls[0][0] is logits
+    assert legacy_calls[0][1] is router.e_score_correction_bias
+    assert legacy_calls[0][2:] == (
+        router.num_expert_group,
+        router.topk_group,
+        router.top_k,
+        0,
+        router.routed_scaling_factor,
+    )
+    assert warning_messages == [
+        "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+        "upgrade LightOp."
+    ]
+
+
+@pytest.mark.filterwarnings(
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
+)
+def test_fuse_moe_gate_routes_through_categorized_lightop() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    module_path = repo / "vllm_hcu/ops/fuse_moe_gate.py"
+    script = f"""
+import importlib.util
+import sys
+from types import ModuleType
+
+import torch
+
+from vllm_hcu.platforms import envs as henvs
+
+calls = []
+def moe_fused_gate(*args):
+    calls.append(args)
+    return torch.full((1, 1), 0.5), torch.tensor([[2]], dtype=torch.int64)
+
+lightop = ModuleType("lightop")
+lightop.__path__ = []
+moe = ModuleType("lightop.moe")
+moe.moe_fused_gate = moe_fused_gate
+lightop.moe = moe
+sys.modules["lightop"] = lightop
+sys.modules["lightop.moe"] = moe
+
+spec = importlib.util.spec_from_file_location(
+    "_hcu_fuse_moe_gate_categorized_probe", {str(module_path)!r}
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+router = object.__new__(module.HcuGroupedTopKRouter)
+router.num_expert_group = 2
+router.topk_group = 1
+router.top_k = 1
+router.num_fused_shared_experts = 0
+router.e_score_correction_bias = torch.ones(4)
+router.routed_scaling_factor = 1.0
+logits = torch.ones((1, 4))
+henvs.VLLM_HCU_USE_CUSTOM_OPS = True
+henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
+weights, ids = router._compute_routing(None, logits, torch.int32)
+torch.testing.assert_close(weights, torch.full((1, 1), 0.5))
+assert ids.item() == 2
+assert calls[0][0] is logits
+"""
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.filterwarnings(
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
+)
+def test_fuse_moe_gate_eagerly_falls_back_to_legacy_lightop_once() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    module_path = repo / "vllm_hcu/ops/fuse_moe_gate.py"
+    script = f"""
+import importlib.util
+import logging
+import sys
+from types import ModuleType
+
+import torch
+
+from vllm import logger as vllm_logger
+from vllm_hcu.platforms import envs as henvs
+
+calls = []
+def moe_fused_gate(*args):
+    calls.append(args)
+    return torch.full((1, 1), 0.75), torch.tensor([[0]], dtype=torch.int64)
+
+lightop = ModuleType("lightop")
+lightop.__path__ = []
+incomplete_moe = ModuleType("lightop.moe")
+legacy_op = ModuleType("lightop.op")
+legacy_op.moe_fused_gate = moe_fused_gate
+lightop.moe = incomplete_moe
+lightop.op = legacy_op
+sys.modules["lightop"] = lightop
+sys.modules["lightop.moe"] = incomplete_moe
+sys.modules["lightop.op"] = legacy_op
+
+records = []
+class Capture(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+
+vllm_logger._print_warning_once.cache_clear()
+module_name = "_hcu_fuse_moe_gate_fallback_probe"
+module = None
+handler = Capture()
+try:
+    for _ in range(2):
+        spec = importlib.util.spec_from_file_location(module_name, {str(module_path)!r})
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        module.logger = logging.getLogger(module_name)
+        module.logger.addHandler(handler)
+        spec.loader.exec_module(module)
+        module.logger.removeHandler(handler)
+finally:
+    if module is not None and handler in module.logger.handlers:
+        module.logger.removeHandler(handler)
+
+warning = (
+    "Using deprecated lightop.op MoE APIs because lightop.moe is unavailable; "
+    "upgrade LightOp."
+)
+assert [message for message in records if message == warning] == [warning]
+
+router = object.__new__(module.HcuGroupedTopKRouter)
+router.num_expert_group = 2
+router.topk_group = 1
+router.top_k = 1
+router.num_fused_shared_experts = 0
+router.e_score_correction_bias = torch.ones(4)
+router.routed_scaling_factor = 1.0
+logits = torch.ones((1, 4))
+henvs.VLLM_HCU_USE_CUSTOM_OPS = True
+henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
+weights, ids = router._compute_routing(None, logits, torch.int32)
+torch.testing.assert_close(weights, torch.full((1, 1), 0.75))
+assert ids.item() == 0
+assert calls[0][0] is logits
+assert calls[0][1] is router.e_score_correction_bias
+assert calls[0][2:] == (
+    router.num_expert_group,
+    router.topk_group,
+    router.top_k,
+    0,
+    router.routed_scaling_factor,
+)
+"""
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _fake_deepep_ll_module() -> ModuleType:

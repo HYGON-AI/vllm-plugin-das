@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import enum
 import inspect
 import logging
@@ -67,6 +68,17 @@ def _package(name: str, **attributes: object) -> ModuleType:
     module.__package__ = name
     module.__path__ = []  # type: ignore[attr-defined]
     return module
+
+
+def _install_lightop_moe(
+    monkeypatch: pytest.MonkeyPatch, **exports: object
+) -> ModuleType:
+    lightop = _package("lightop")
+    moe = _module("lightop.moe", **exports)
+    lightop.moe = moe
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.moe", moe)
+    return moe
 
 
 def _fp8_quant_abi_stub(
@@ -5693,11 +5705,14 @@ def test_int8_hcu_owned_kernel_validates_and_computes_shapes(
         output = (a.float() * scale_a) @ (b.float() * scale_b).t()
         return True, output.to(out_dtype)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "lmslim",
-        _module("lmslim", quant_ops=SimpleNamespace(hipblaslt_w8a8_gemm=gemm)),
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    gemm_ops = _module(
+        "lightop.gemm_ops", hipblaslt_w8a8_channelwise_gemm=gemm
     )
+    lightop.gemm_ops = gemm_ops
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
     x = torch.ones(1, 2, 3, dtype=torch.bfloat16)
     x_q = torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=torch.int8)
     x_scale = torch.tensor([[[0.5], [0.25]]], dtype=torch.float32)
@@ -5734,6 +5749,132 @@ def test_int8_hcu_owned_kernel_validates_and_computes_shapes(
             input_zero_point=torch.ones(1, dtype=torch.int8),
             x_and_scale_quanted=(x_q, x_scale),
         )
+
+
+def test_int8_linear_prefers_categorized_lightop_quant_and_gemm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", False)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def quant(value: torch.Tensor):
+        calls.append(("quant", (value,)))
+        return torch.ones_like(value, dtype=torch.int8), torch.ones(
+            (*value.shape[:-1], 1), dtype=torch.float32
+        )
+
+    def gemm(*args: object):
+        calls.append(("gemm", args))
+        activation, weight, activation_scale, weight_scale, m, n, k, layout, dtype = args
+        assert activation.shape == (m, k)
+        assert weight.shape == (n, k)
+        assert activation_scale.shape == (m, 1)
+        assert weight_scale.shape == (n, 1)
+        assert layout == "NT"
+        return True, torch.full((m, n), 3, dtype=dtype)
+
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    quant_module = _module("lightop.quant", per_token_quant_int8=quant)
+    gemm_module = _module(
+        "lightop.gemm_ops", hipblaslt_w8a8_channelwise_gemm=gemm
+    )
+    lightop.quant = quant_module
+    lightop.gemm_ops = gemm_module
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.quant", quant_module)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_module)
+
+    input = torch.ones((1, 2, 3), dtype=torch.bfloat16)
+    weight = torch.ones((4, 3), dtype=torch.int8)
+    weight_scale = torch.ones((4, 1), dtype=torch.float32)
+    actual = int8_runtime.apply_int8_linear(
+        input, weight, weight_scale, torch.bfloat16
+    )
+
+    assert [name for name, _ in calls] == ["quant", "gemm"]
+    assert actual.shape == (1, 2, 4)
+    assert torch.equal(actual, torch.full_like(actual, 3))
+
+
+def test_int8_quant_fallback_propagates_lmslim_runtime_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", False)
+    lightop = _package("lightop")
+    lightop.quant = _module("lightop.quant")
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.quant", lightop.quant)
+    real_import = builtins.__import__
+
+    def import_with_lmslim_failure(
+        name, globals=None, locals=None, fromlist=(), level=0
+    ):
+        if name == "lmslim.layers.gemm.int8_utils":
+            raise RuntimeError("LMSlim quant binary initialization failed")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_lmslim_failure)
+
+    with pytest.raises(
+        RuntimeError, match="LMSlim quant binary initialization failed"
+    ) as exc_info:
+        int8_runtime.apply_int8_linear(
+            torch.ones((1, 3), dtype=torch.bfloat16),
+            torch.ones((2, 3), dtype=torch.int8),
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.bfloat16,
+        )
+
+    assert type(exc_info.value) is RuntimeError
+
+
+def test_int8_gemm_fallback_propagates_lmslim_runtime_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", False)
+    lightop = _package("lightop")
+    lightop.gemm_ops = _module("lightop.gemm_ops")
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", lightop.gemm_ops)
+    real_import = builtins.__import__
+
+    def import_with_lmslim_failure(
+        name, globals=None, locals=None, fromlist=(), level=0
+    ):
+        if name == "lmslim":
+            raise RuntimeError("LMSlim GEMM binary initialization failed")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_lmslim_failure)
+    activation = torch.ones((1, 3), dtype=torch.bfloat16)
+    quantized = torch.ones_like(activation, dtype=torch.int8)
+    activation_scale = torch.ones((1, 1), dtype=torch.float32)
+
+    with pytest.raises(
+        RuntimeError, match="LMSlim GEMM binary initialization failed"
+    ) as exc_info:
+        int8_runtime.apply_int8_linear(
+            activation,
+            torch.ones((2, 3), dtype=torch.int8),
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.bfloat16,
+            x_and_scale_quanted=(quantized, activation_scale),
+        )
+
+    assert type(exc_info.value) is RuntimeError
 
 
 def _fake_int8_scheme_module():
@@ -5928,6 +6069,112 @@ def test_weight8bit_marlin2_layout_2d_3d_and_validation():
     assert result_3d.shape == (2, 1, 1024)
     with pytest.raises(ValueError, match="rank 2 or 3"):
         module.weight8bit_nt_kpack2_marlin2(torch.ones(16, dtype=torch.int8))
+
+
+def test_marlin_moe_prefers_categorized_lightop_implementations(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def fp8_kernel(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"] + 2
+
+    def int8_kernel(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"] + 3
+
+    _install_lightop_moe(
+        monkeypatch,
+        fused_experts_impl_fp8_marlin=fp8_kernel,
+        fused_experts_impl_int8_marlin=int8_kernel,
+    )
+    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: False)
+    layer = _fp8_moe_layer()
+    x = torch.ones(2, 4)
+    weights = torch.ones(2, 2)
+    ids = torch.zeros(2, 2, dtype=torch.int64)
+
+    fp8_method = object.__new__(marlin.CompressedTensorsW8A8FP8MarlinMoEMethod)
+    fp8_output = fp8_method.fused_moe_forward(layer, x, weights, ids)
+    torch.testing.assert_close(fp8_output, x + 2)
+    assert calls[0]["hidden_states"] is x
+    assert calls[0]["topk_ids"] is ids
+    assert calls[0]["use_fp8_w8a8"] is True
+
+    int8_method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
+    int8_method.moe_quant_config = "int8-config"
+    int8_output = int8_method.apply(layer, x, weights, ids, None, None)
+    torch.testing.assert_close(int8_output, x + 3)
+    assert calls[1]["hidden_states"] is x
+    assert calls[1]["topk_ids"] is ids
+    assert calls[1]["quant_config"] == "int8-config"
+    assert calls[1]["use_int8_w8a8"] is True
+
+
+def test_marlin_moe_falls_back_to_lmslim_when_lightop_moe_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    lightop = _package("lightop")
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.delitem(sys.modules, "lightop.moe", raising=False)
+    lmslim = _package("lmslim")
+    layers = _package("lmslim.layers")
+    fused_moe = _package("lmslim.layers.fused_moe")
+    fp8_module = _module(
+        "lmslim.layers.fused_moe.fuse_moe_fp8_marlin",
+        fused_experts_impl_fp8_marlin=lambda **kwargs: kwargs["hidden_states"] + 5,
+    )
+    int8_module = _module(
+        "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
+        fused_experts_impl_int8_marlin=lambda **kwargs: kwargs["hidden_states"] + 6,
+    )
+    monkeypatch.setitem(sys.modules, "lmslim", lmslim)
+    monkeypatch.setitem(sys.modules, "lmslim.layers", layers)
+    monkeypatch.setitem(sys.modules, "lmslim.layers.fused_moe", fused_moe)
+    monkeypatch.setitem(
+        sys.modules,
+        "lmslim.layers.fused_moe.fuse_moe_fp8_marlin",
+        fp8_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
+        int8_module,
+    )
+    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: False)
+
+    layer = _fp8_moe_layer()
+    x = torch.ones(2, 4)
+    output = object.__new__(
+        marlin.CompressedTensorsW8A8FP8MarlinMoEMethod
+    ).fused_moe_forward(
+        layer,
+        x,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+    )
+    torch.testing.assert_close(output, x + 5)
+
+    int8_method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
+    int8_method.moe_quant_config = "int8-config"
+    int8_output = int8_method.apply(
+        layer,
+        x,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        None,
+        None,
+    )
+    torch.testing.assert_close(int8_output, x + 6)
 
 
 def test_slimquant_marlin_module_imports_before_worker_patch():

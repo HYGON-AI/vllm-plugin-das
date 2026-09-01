@@ -35,7 +35,6 @@ from vllm_hcu.v1.attention.ops.deepseek_v4_ops import (
     dequantize_and_gather_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
-    fused_q_kv_rmsnorm,
 )
 from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_forward_decode_fallback,
@@ -456,13 +455,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        qr = self.q_norm(qr)
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -593,18 +586,31 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        swa_slot_mapping_i32 = swa_metadata.slot_mapping.to(
+            dtype=torch.int32
+        ).contiguous()
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
-        #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
-        # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
+        #   KV side: KV RMSNorm + GPT-J RoPE + UE8M0 FP8 quant + paged insert.
+        # kv remains raw; the categorized kernel is its sole KVNorm owner.
+        try:
+            from lightop.attention import (
+                fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32,
+            )
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "DeepSeek V4 requires lightop.attention."
+                "fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32; "
+                "upgrade LightOp"
+            ) from exc
 
-        import lightop
-        lightop.op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
             q,
             kv,
+            self.kv_norm.weight.data,
             swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
+            swa_slot_mapping_i32,
             positions.to(torch.int64),
             self.rotary_emb.cos_sin_cache,
             self.eps,

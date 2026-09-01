@@ -464,7 +464,14 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                     "HCU Channel INT8 batched DeepGEMM supports only SiLU activation"
                 )
             from deepgemm import m_grouped_i8_gemm_nt_masked
-            from lightop import fuse_silu_mul_quant_ep
+            try:
+                from lightop.activation import fuse_silu_mul_quant_ep
+            except (ImportError, AttributeError):
+                from lightop import fuse_silu_mul_quant_ep
+
+                logger.warning_once(
+                    "Using deprecated top-level LightOp activation API; upgrade LightOp."
+                )
 
             m_grouped_i8_gemm_nt_masked(
                 (a1q, a1q_scale),
@@ -488,7 +495,15 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             # HCU's low-latency masked kernel and fused activation are supplied
             # by the proprietary DeepGEMM/LightOP wheels and imported lazily.
             from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
-            from lightop import fuse_silu_mul_fp8_quant_ep
+            try:
+                from lightop.activation import fuse_silu_mul_fp8_quant_ep
+            except (ImportError, AttributeError):
+                from lightop import fuse_silu_mul_fp8_quant_ep
+
+                logger.warning_once(
+                    "Using deprecated top-level LightOp activation/GEMM APIs; "
+                    "upgrade LightOp."
+                )
 
             m_grouped_fp8_gemm_nt_masked_ll(
                 (a1q, a1q_scale),

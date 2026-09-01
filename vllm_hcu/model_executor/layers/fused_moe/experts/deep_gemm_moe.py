@@ -431,7 +431,14 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                         "HCU Channel INT8 DeepGEMM supports only SiLU activation"
                     )
                 from deepgemm import m_grouped_i8_gemm_nt_contiguous
-                from lightop import fuse_silu_mul_quant
+                try:
+                    from lightop.activation import fuse_silu_mul_quant
+                except (ImportError, AttributeError):
+                    from lightop import fuse_silu_mul_quant
+
+                    logger.warning_once(
+                        "Using deprecated top-level LightOp activation API; upgrade LightOp."
+                    )
 
                 m_grouped_i8_gemm_nt_contiguous(
                     (a1q, a1q_scale),
@@ -471,7 +478,15 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     (M_sum, activation_out_dim),
                 )
                 if current_platform.is_rocm() and activation == MoEActivation.SILU:
-                    from lightop import fuse_silu_mul_fp8_quant
+                    try:
+                        from lightop.activation import fuse_silu_mul_fp8_quant
+                    except (ImportError, AttributeError):
+                        from lightop import fuse_silu_mul_fp8_quant
+
+                        logger.warning_once(
+                            "Using deprecated top-level LightOp activation/GEMM APIs; "
+                            "upgrade LightOp."
+                        )
 
                     a2q, a2q_scale = fuse_silu_mul_fp8_quant(
                         mm1_out,

@@ -634,6 +634,7 @@
         "vllm_hcu/**deepseek*"
       ],
       "jobs": [
+        "accuracy-gfx938",
         "deepseek-tp-ep",
         "deepseek-gsm8k"
       ]

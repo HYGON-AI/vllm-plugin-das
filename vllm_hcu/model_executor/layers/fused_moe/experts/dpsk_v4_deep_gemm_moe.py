@@ -10,6 +10,7 @@ activation scales.
 """
 
 import functools
+from importlib import import_module
 
 import torch
 
@@ -43,7 +44,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
-
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
 logger = init_logger("vllm.hcu.deepseek_v4_deepep_experts")
@@ -99,12 +99,25 @@ def _lightop_op(name: str):
     return getattr(lightop, name)
 
 
+@functools.lru_cache(maxsize=None)
+def _lightop_activation_op(name: str):
+    """Resolve categorized activation kernels without eager worker imports."""
+
+    try:
+        return getattr(import_module("lightop.activation"), name)
+    except (ImportError, AttributeError):
+        logger.warning_once(
+            "Using deprecated top-level LightOp activation APIs; upgrade LightOp."
+        )
+        return _lightop_op(name)
+
+
 def fuse_silu_mul_fp8_quant(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_fp8_quant")(*args, **kwargs)
+    return _lightop_activation_op("fuse_silu_mul_fp8_quant")(*args, **kwargs)
 
 
 def fuse_silu_mul_fp8_quant_ep(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_fp8_quant_ep")(*args, **kwargs)
+    return _lightop_activation_op("fuse_silu_mul_fp8_quant_ep")(*args, **kwargs)
 
 
 def fuse_silu_mul_quant(*args, **kwargs):

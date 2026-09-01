@@ -18,10 +18,26 @@ import pytest
 import torch
 import math
 import vllm.envs as envs
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 try:
-    from lightop import ds_cat
-except Exception:
-    print("INFO: Please install the 'lightop' package to use 'ds_cat'.\n")
+    from lightop.tensor import ds_cat
+except (ImportError, AttributeError):
+    try:
+        from lightop import ds_cat
+    except (ImportError, AttributeError):
+        ds_cat = None
+        logger.warning_once(
+            "LightOp ds_cat is unavailable; using torch.cat."
+        )
+    else:
+        logger.warning_once(
+            "Using deprecated top-level lightop.ds_cat because "
+            "lightop.tensor is unavailable; upgrade LightOp."
+        )
 
 
 def test_concat_Acc_prefill(shape_pair, dim):
@@ -182,6 +198,8 @@ def concat_prefill_helper_Triton(A:torch.Tensor, B:torch.Tensor, dim:int):
 
 def concat_helper_decode(A:torch.Tensor, B:torch.Tensor, dim:int):
     assert dim==2 , "tensor dim must be 3 and concat dim must be 2"
+    if ds_cat is None:
+        return torch.cat((A, B), dim=dim)
     output_shape = list(A.shape)
     output_shape[dim] = A.shape[dim] + B.shape[dim]  
     C = torch.empty(output_shape, device=A.device, dtype=A.dtype)
@@ -193,6 +211,8 @@ def concat_helper_decode(A:torch.Tensor, B:torch.Tensor, dim:int):
 
 def lightop_concat_prefill_helper(A:torch.Tensor, B:torch.Tensor, dim:int):
     assert dim==2 , "tensor dim must be 3 and concat dim must be 2"
+    if ds_cat is None:
+        return torch.cat((A, B), dim=dim)
     output_shape = list(A.shape)
     output_shape[dim] = A.shape[dim] + B.shape[dim]  
     C = torch.empty(output_shape, device=A.device, dtype=A.dtype)

@@ -531,6 +531,15 @@ def test_unified_aiter_moe_accuracy_test_selects_gfx938() -> None:
         "accuracy-gfx938",
     }
     assert groups == ["kernel-accuracy-tests"]
+
+
+def test_deepseek_runtime_change_selects_gfx938_accuracy() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["vllm_hcu/model_executor/layers/deepseek_v4_attention.py"],
+    )
+    assert "accuracy-gfx938" in {job["id"] for job in jobs}
+    assert "deepseek-runtime" in groups
     assert fallback is False
 
 
