@@ -60,8 +60,6 @@ def test_attention_impl_normalizes_only_qr_and_keeps_raw_kv_for_insert() -> None
     raw_qr = object()
     raw_kv = object()
     normalized_qr = object()
-    legacy_qr = object()
-    legacy_kv = object()
     qnorm_inputs: list[object] = []
     projection_inputs: list[object] = []
     inserted: list[tuple[object, object]] = []
@@ -97,11 +95,13 @@ def test_attention_impl_normalizes_only_qr_and_keeps_raw_kv_for_insert() -> None
         ) -> None:
             inserted.append((q, kv))
 
-    # Keep the old helper callable so this test fails on its data flow, not
-    # because the extracted method is missing a global.
-    attention_impl.__globals__["fused_q_kv_rmsnorm"] = (
-        lambda *args: (legacy_qr, legacy_kv)
-    )
+    # An obsolete two-output helper must never be selected: KVNorm belongs to
+    # the categorized insertion kernel, while QR alone is normalized upstream.
+    def obsolete_fused_q_kv_rmsnorm(*args: object) -> tuple[object, object]:
+        del args
+        pytest.fail("attention_impl selected obsolete fused_q_kv_rmsnorm")
+
+    attention_impl.__globals__["fused_q_kv_rmsnorm"] = obsolete_fused_q_kv_rmsnorm
     attention_impl.__globals__["get_forward_context"] = lambda: SimpleNamespace(
         attn_metadata={}
     )
@@ -122,7 +122,11 @@ def _install_attention_module(
         attention.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32 = kernel
     lightop.attention = attention
     lightop.op = SimpleNamespace(
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert=lambda *args: None
+        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert=(
+            lambda *args, **kwargs: pytest.fail(
+                "selected obsolete lightop.op DeepSeek V4 kernel"
+            )
+        )
     )
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.attention", attention)

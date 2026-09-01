@@ -454,7 +454,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.attn_gemm_parallel_execute(hidden_states)
         )
 
-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        qr, raw_kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr = self.q_norm(qr)
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
@@ -472,7 +472,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             def wq_b_kv_insert_and_compress() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                self._fused_qnorm_rope_kv_insert(
+                    q, raw_kv, positions, attn_metadata
+                )
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
@@ -510,7 +512,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             def wq_b_kv_insert() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                self._fused_qnorm_rope_kv_insert(
+                    q, raw_kv, positions, attn_metadata
+                )
                 return q
 
             # HCU/ROCm profiling shows overlap can be slower at larger token
@@ -535,7 +539,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         else:
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            self._fused_qnorm_rope_kv_insert(q, raw_kv, positions, attn_metadata)
 
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
@@ -564,12 +568,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, n_local_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        self.mla_attn(q, raw_kv, positions, output=out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
         q: torch.Tensor,
-        kv: torch.Tensor,
+        raw_kv: torch.Tensor,
         positions: torch.Tensor,
         attn_metadata: (
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
@@ -593,7 +597,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
         #   KV side: KV RMSNorm + GPT-J RoPE + UE8M0 FP8 quant + paged insert.
-        # kv remains raw; the categorized kernel is its sole KVNorm owner.
+        # raw_kv remains raw; the categorized kernel is its sole KVNorm owner.
         try:
             from lightop.attention import (
                 fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32,
@@ -607,7 +611,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
             q,
-            kv,
+            raw_kv,
             self.kv_norm.weight.data,
             swa_kv_cache_2d,
             swa_slot_mapping_i32,

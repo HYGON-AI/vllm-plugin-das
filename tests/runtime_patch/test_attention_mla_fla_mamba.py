@@ -807,7 +807,7 @@ def test_fused_attention_rejects_incompatible_stacked_kv_axis(
         runtime.split_kv_cache(torch.empty(cache_shape), kv_axis=kv_axis)
 
 
-def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
+def test_lightop_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
     monkeypatch: pytest.MonkeyPatch,
 ):
     try:
@@ -837,6 +837,8 @@ def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
 
     lightop_calls: list[dict[str, object]] = []
     lightop_module = ModuleType("lightop")
+    lightop_module.__path__ = []  # type: ignore[attr-defined]
+    lightop_attention_module = ModuleType("lightop.attention")
 
     def fake_lightop(*args, **kwargs):
         del args
@@ -856,11 +858,15 @@ def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
             .add(100),
         )
 
-    lightop_module.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant = (
+    lightop_attention_module.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant = (
         fake_lightop
     )
+    lightop_module.attention = lightop_attention_module
+    lightop_module.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant = (
+        lambda *args, **kwargs: pytest.fail("selected obsolete top-level LightOp API")
+    )
     monkeypatch.setitem(sys.modules, "lightop", lightop_module)
-    monkeypatch.delitem(sys.modules, "lightop.attention", raising=False)
+    monkeypatch.setitem(sys.modules, "lightop.attention", lightop_attention_module)
 
     writer_calls: list[tuple[object, ...]] = []
     # The cache-writer dispatch itself is covered in
