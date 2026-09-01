@@ -25,7 +25,7 @@ jobs:
     runs-on: nmz36
     container:
       image: ${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:0.25.1-latest
-      options: --privileged --cap-add=SYS_PTRACE --network=host --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
+      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
         - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
