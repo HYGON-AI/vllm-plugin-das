@@ -2897,6 +2897,60 @@ def test_aiter_w16a16_rejects_runtime_config_for_different_asm_layout(
         )
 
 
+def test_aiter_w16a16_runtime_selects_with_installed_logical_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"ORIGINAL_K": 4, "PADDED_K": 8},
+    )
+    layout = (
+        "w16a16",
+        "ASM",
+        True,
+        8,
+    )
+    w1 = torch.ones(3, 8, 8)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = True
+        weight._hcu_aiter_moe_solution_type = "asm"
+        weight._hcu_aiter_moe_weight_layout = layout
+        weight._hcu_aiter_moe_logical_shape = (3, 8, 4, 4)
+    selector_calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (
+                selector_calls.append(kwargs) or True,
+                config,
+            ),
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"].clone(),
+        ),
+    )
+
+    aiter_runtime.fused_moe_impl(
+        lambda *_args: pytest.fail("must not delegate"),
+        torch.ones(2, 4),
+        w1,
+        w2,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        activation_method=0,
+    )
+
+    assert selector_calls[0]["E"] == 3
+    assert selector_calls[0]["N1"] == 8
+    assert selector_calls[0]["N2"] == 4
+    assert selector_calls[0]["K"] == 4
+
+
 def test_aiter_w16a16_installed_native_fallback_bypasses_selector(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3036,6 +3090,8 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
         True,
         64,
     )
+    assert layer.w13_weight._hcu_aiter_moe_logical_shape == (2, 8, 4, 4)
+    assert layer.w2_weight._hcu_aiter_moe_logical_shape == (2, 8, 4, 4)
     assert len(kernels) == 1
     assert method.moe_kernel is not None
     assert len(select_calls) == 1
@@ -3134,7 +3190,7 @@ def test_aiter_w16a16_post_load_locks_native_fallback_on_m1_miss(
     method.experts_cls = object
     method.get_fused_moe_quant_config = lambda _layer: object()
     monkeypatch.setattr(hcu_unquantized, "_is_hcu_aiter_moe_requested", lambda *_: True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
     monkeypatch.setattr(
         hcu_unquantized,
         "select_aiter_moe_config",
