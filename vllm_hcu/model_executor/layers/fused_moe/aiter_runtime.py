@@ -853,26 +853,54 @@ def fused_moe_impl(
             f"{moe_sorting_dispatch_policy}"
         )
 
-    # HCU AITER consumes vLLM's canonical w1=[E, N1, K] and
-    # w2=[E, N2, K2]. N2 is GEMM2's hidden/output dimension at w2.shape[1].
-    if (
-        w1.dim() != 3
-        or w2.dim() != 3
-        or int(w1.shape[0]) != int(w2.shape[0])
-        or int(w1.shape[1]) != 2 * int(w2.shape[2])
-        or int(w1.shape[2]) != int(w2.shape[1])
-    ):
+    logical_shape = getattr(w1, "_hcu_aiter_moe_logical_shape", None)
+    if logical_shape != getattr(w2, "_hcu_aiter_moe_logical_shape", None):
+        raise HcuAiterRuntimeError(
+            "HCU AITER W16A16 weights have inconsistent logical dimensions"
+        )
+    if w1.dim() != 3 or w2.dim() != 3 or w1.shape[0] != w2.shape[0]:
         raise ValueError(
             f"unexpected MoE weight layout: w1.shape={tuple(w1.shape)}, "
             f"w2.shape={tuple(w2.shape)}"
         )
+    if logical_shape is None:
+        if (
+            int(w1.shape[1]) != 2 * int(w2.shape[2])
+            or int(w1.shape[2]) != int(w2.shape[1])
+        ):
+            raise ValueError(
+                f"unexpected MoE weight layout: w1.shape={tuple(w1.shape)}, "
+                f"w2.shape={tuple(w2.shape)}"
+            )
+        logical_e = global_num_experts
+        logical_n1 = int(w1.shape[1])
+        logical_n2 = int(w2.shape[1])
+        logical_k = int(w1.shape[2])
+    else:
+        if (
+            not isinstance(logical_shape, tuple)
+            or len(logical_shape) != 4
+            or not all(isinstance(value, int) and value > 0 for value in logical_shape)
+        ):
+            raise HcuAiterRuntimeError(
+                "HCU AITER W16A16 weights have invalid logical dimensions"
+            )
+        logical_e, logical_n1, logical_n2, logical_k = logical_shape
+        if logical_e != global_num_experts:
+            raise HcuAiterRuntimeError(
+                "HCU AITER W16A16 logical expert count does not match routing"
+            )
+    if int(hidden_states.shape[1]) != logical_k:
+        raise HcuAiterRuntimeError(
+            "HCU AITER W16A16 hidden states do not match logical K"
+        )
 
     problem = AiterMoeProblem(
         M=int(hidden_states.shape[0]),
-        E=global_num_experts,
-        N1=int(w1.shape[1]),
-        N2=int(w2.shape[1]),
-        K=int(w1.shape[2]),
+        E=logical_e,
+        N1=logical_n1,
+        N2=logical_n2,
+        K=logical_k,
         top_k=int(topk_ids.shape[1]),
         block_size=0,
         dtype=hidden_states.dtype,

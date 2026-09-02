@@ -85,8 +85,8 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             cache_owner=original_w13,
             solution_type="asm" if problem.use_shuffle else None,
         )
-        if problem.use_shuffle:
-            if config is None or not bool(getattr(config, "need_shuffle", False)):
+        if config is not None and problem.use_shuffle:
+            if not bool(getattr(config, "need_shuffle", False)):
                 raise HcuAiterMoeDispatchError(
                     "HCU AITER BF16 MoE requires an ASM shuffle solution before "
                     "installing the runtime weight layout; " + problem.describe()
@@ -121,9 +121,12 @@ class HcuUnquantizedFusedMoEMethod(_Original):
         else:
             solution = "native"
             layout = None
+        installed_shuffle = bool(config is not None and problem.use_shuffle)
+        logical_shape = (problem.E, problem.N1, problem.N2, problem.K)
         for weight in (layer.w13_weight, layer.w2_weight):
-            weight.is_shuffled = bool(problem.use_shuffle)
+            weight.is_shuffled = installed_shuffle
             weight._hcu_aiter_moe_solution_type = solution
+            weight._hcu_aiter_moe_logical_shape = logical_shape
             if layout is not None:
                 weight._hcu_aiter_moe_weight_layout = layout
 
