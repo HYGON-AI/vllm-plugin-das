@@ -4838,10 +4838,10 @@ def test_w8a8_prewarm_installs_selected_scale_layout_once(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_tp_aiter_keeps_raw_canonical_owner(
+def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """The DP auto ownership exception must not mutate pure-TP AITER weights."""
+    """The DP auto ownership exception must not transform pure-TP weights."""
 
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -4869,11 +4869,27 @@ def test_slimquant_w4a8_tp_aiter_keeps_raw_canonical_owner(
     )
     expected_w13 = w13.detach().clone()
     expected_w2 = w2.detach().clone()
+    method.moe_quant_config = SimpleNamespace(
+        w1_scale=layer.w13_weight_scale * 16.0,
+        w2_scale=layer.w2_weight_scale * 16.0,
+    )
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+        config={},
+    )
     prewarm_calls: list[object] = []
+
+    def prewarm(_method, owner):
+        prewarm_calls.append(owner)
+        return selected
+
     monkeypatch.setattr(
         compressed_tensors_moe_runtime,
         "prewarm_aiter_w4a8_moe",
-        lambda _method, owner: prewarm_calls.append(owner),
+        prewarm,
     )
 
     method.process_weights_after_loading(layer)
