@@ -5080,13 +5080,12 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones((1, 4, 1), dtype=torch.float32), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
     expected_w13 = w13.detach().clone()
     expected_w2 = w2.detach().clone()
-    method.moe_quant_config = SimpleNamespace(
-        w1_scale=layer.w13_weight_scale * 16.0,
-        w2_scale=layer.w2_weight_scale * 16.0,
-    )
+    assert method.moe_quant_config is None
     selected = SimpleNamespace(
         quant_type="w4a8",
         solution_type="moe_c",
@@ -5108,12 +5107,33 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
 
     method.process_weights_after_loading(layer)
 
+    assert method.moe_quant_config is not None
     assert prewarm_calls == [layer]
     assert layer.w13_weight is w13
     assert layer.w2_weight is w2
     torch.testing.assert_close(layer.w13_weight, expected_w13)
     torch.testing.assert_close(layer.w2_weight, expected_w2)
     assert not hasattr(layer, "_slimquant_w4a8_deepep_auto_layout")
+
+    installed_quant_config = method.moe_quant_config
+    method.process_weights_after_loading(layer)
+    assert method.moe_quant_config is installed_quant_config
+    assert prewarm_calls == [layer]
+
+    with torch.no_grad():
+        layer.w13_weight_scale.add_(1.0)
+        layer.w2_weight_scale.add_(2.0)
+    method.process_weights_after_loading(layer)
+    assert method.moe_quant_config is not installed_quant_config
+    assert prewarm_calls == [layer]
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        torch.full((1, 8, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        torch.full((1, 4, 1), 48.0),
+    )
 
 
 @pytest.mark.hcu
@@ -5158,7 +5178,12 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones(1, 4, 1), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
+    assert method.moe_quant_config is None
+    packed_w13 = layer.w13_weight.detach().clone()
+    packed_w2 = layer.w2_weight.detach().clone()
 
     method.process_weights_after_loading(layer)
 
@@ -5168,6 +5193,83 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     assert layer.w2_weight._hcu_vllm_w4a8_unpacked is True
     assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
     assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert method.moe_quant_config is not None
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        layer.w13_weight_scale * 16.0,
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        layer.w2_weight_scale * 16.0,
+    )
+
+    from vllm.model_executor.layers.fused_moe import fused_moe
+
+    kernel_calls: list[dict[str, object]] = []
+
+    def fused_experts_impl(hidden_states, *_args, **kwargs):
+        kernel_calls.append(kwargs)
+        return hidden_states + 1
+
+    monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
+    hidden_states = torch.zeros((2, 4), dtype=torch.float16)
+    result = method.apply(
+        layer,
+        hidden_states,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int64),
+        None,
+        None,
+    )
+
+    torch.testing.assert_close(result, hidden_states + 1)
+    assert kernel_calls[0]["w1_scale"] is method.moe_quant_config.w1_scale
+    assert kernel_calls[0]["w2_scale"] is method.moe_quant_config.w2_scale
+
+    installed_w13 = layer.w13_weight
+    installed_w2 = layer.w2_weight
+    installed_quant_config = method.moe_quant_config
+    method.process_weights_after_loading(layer)
+    assert layer.w13_weight is installed_w13
+    assert layer.w2_weight is installed_w2
+    assert method.moe_quant_config is installed_quant_config
+
+    with torch.no_grad():
+        layer.w13_weight_scale.add_(1.0)
+        layer.w2_weight_scale.add_(2.0)
+    method.process_weights_after_loading(layer)
+    scale_updated_quant_config = method.moe_quant_config
+    assert layer.w13_weight is installed_w13
+    assert layer.w2_weight is installed_w2
+    assert scale_updated_quant_config is not installed_quant_config
+    torch.testing.assert_close(
+        scale_updated_quant_config.w1_scale,
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        scale_updated_quant_config.w2_scale,
+        torch.full((1, 4, 1), 48.0),
+    )
+
+    layer.w13_weight = torch.nn.Parameter(packed_w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(packed_w2, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.full((1, 4, 1), 2.0), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.full((1, 4, 1), 3.0), requires_grad=False
+    )
+    method.process_weights_after_loading(layer)
+
+    assert method.moe_quant_config is not installed_quant_config
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        torch.full((1, 4, 1), 48.0),
+    )
 
 
 @pytest.mark.hcu
@@ -5224,6 +5326,7 @@ def test_slimquant_w4a8_m1_miss_installs_single_native_triton_layout(
 
     method.process_weights_after_loading(layer)
 
+    assert method.moe_quant_config is not None
     assert layer.w13_weight.shape == (1, 4, 4)
     assert layer.w2_weight.shape == (1, 4, 2)
     assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
