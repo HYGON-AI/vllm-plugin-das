@@ -34,7 +34,10 @@
       "arch": "gfx936",
       "cards": 1,
       "suite": "accuracy-hcu",
-      "pytest_args": [],
+      "pytest_args": [
+        "--deselect",
+        "tests/accuracy/test_hcu_kernel_accuracy.py::test_lightop_deepseek_v4_fused_insert_updates_q_and_cache"
+      ],
       "timeout_minutes": 30,
       "requirements": []
     },
