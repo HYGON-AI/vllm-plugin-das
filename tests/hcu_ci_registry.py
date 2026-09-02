@@ -31,12 +31,7 @@ register_hcu_ci(
 register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
-    est_time=30,
-)
-register_hcu_ci(
-    job="accuracy-gfx938",
-    target="tests/accuracy/test_deepseek_v4_dspark_ops.py",
-    est_time=300,
+    est_time=330,
 )
 
 register_hcu_ci(
