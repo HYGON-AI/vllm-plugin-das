@@ -1,4 +1,7 @@
 Qwen3.5-35B-A3B-W8A8:
+  env:
+    VLLM_USE_V2_MODEL_RUNNER: 1
+    VLLM_KV_CACHE_LAYOUT: HND
   evalscope:
     datasets:
     - swe_bench_lite_agentic
@@ -11,20 +14,19 @@ Qwen3.5-35B-A3B-W8A8:
     limit: 50
     dataset_args:
       swe_bench_lite_agentic:
-        limit: 5 
+        limit: 5
       mcp_atlas:
         limit: 5
   model: Qwen3.5-35B-A3B-W8A8
   server: vllm
   server_args:
-    attention-backend: FLASH_ATTN_CUSTOM
+    attention-backend: FLASH_ATTN
     kv-cache-dtype: fp8_e4m3
     max-num-batched-tokens: 16384
     max-num-seqs: 128
     quantization: slimquant_marlin
     speculative-config.method: mtp
     speculative-config.num_speculative_tokens: 3
-    speculative-config.quantization: slimquant_marlin
     tensor-parallel-size: 1
     trust-remote-code: true
     enable-auto-tool-choice: true
@@ -32,6 +34,9 @@ Qwen3.5-35B-A3B-W8A8:
     reasoning-parser: qwen3
   type: precision
 Qwen3.6-35B-A3B:
+  env:
+    VLLM_USE_V2_MODEL_RUNNER: 1
+    VLLM_KV_CACHE_LAYOUT: HND
   evalscope:
     datasets:
     - swe_bench_lite_agentic
@@ -44,13 +49,13 @@ Qwen3.6-35B-A3B:
     limit: 50
     dataset_args:
       swe_bench_lite_agentic:
-        limit: 5 
+        limit: 5
       mcp_atlas:
         limit: 5
   model: Qwen3.6-35B-A3B
   server: vllm
   server_args:
-    attention-backend: FLASH_ATTN_CUSTOM
+    attention-backend: FLASH_ATTN
     kv-cache-dtype: fp8_e4m3
     max-num-batched-tokens: 10240
     moe-backend: aiter
@@ -64,8 +69,7 @@ Qwen3.6-35B-A3B:
   type: precision
 GLM-5-Channel-INT8-w8a8:
   env:
-    LMSLIM_USE_GLOBAL_MOE_CACHE: 1
-    VLLM_USE_MODELSCOPE: 1
+    VLLM_USE_V2_MODEL_RUNNER: 1
   evalscope:
     datasets:
     - swe_bench_lite_agentic
@@ -101,7 +105,8 @@ GLM-5-Channel-INT8-w8a8:
   type: precision
 Hy3-Channel-FP8-w8a8:
   env:
-    VLLM_HCU_USE_CUSTOM_FLASH_ATTN: 1
+    VLLM_USE_V2_MODEL_RUNNER: 1
+    VLLM_KV_CACHE_LAYOUT: HND
     GPU_MAX_HW_QUEUES: 4
   evalscope:
     datasets:
@@ -121,6 +126,7 @@ Hy3-Channel-FP8-w8a8:
   model: Hy3-Channel-FP8-w8a8
   server: vllm
   server_args:
+    attention-backend: FLASH_ATTN
     enable-prefix-caching: true
     gpu-memory-utilization: 0.92
     kv-cache-dtype: fp8_e4m3
