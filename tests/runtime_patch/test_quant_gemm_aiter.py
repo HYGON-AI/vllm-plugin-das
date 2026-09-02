@@ -4453,7 +4453,7 @@ def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
+def test_slimquant_w4a8_installs_moe_c_layout_at_load(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
@@ -4462,7 +4462,7 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
     selected = SimpleNamespace(
         quant_type="w4a8",
         solution_type="moe_c",
-        need_shuffle=False,
+        need_shuffle=True,
         need_shuffle_scale=False,
     )
 
@@ -4480,6 +4480,10 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
             "aiter.moe",
             MoeQuantType=MoeQuantType,
             get_aiter_moe_config=get_config,
+            aiter_moe_shfl_weight=lambda w1, w2, _config: (
+                w1.clone().add_(1),
+                w2.clone().add_(2),
+            ),
         ),
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
@@ -4522,9 +4526,71 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
             "quant_type": "w4a8",
             "activation": "silu",
             "use_shuffle": 1,
+            "spec_sol_type": "moe_c",
         }
     ]
-    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert layer.w13_weight.is_shuffled is True
+    assert layer.w2_weight.is_shuffled is True
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "moe_c"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "moe_c"
+    torch.testing.assert_close(layer.w13_weight, torch.ones_like(layer.w13_weight))
+    torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 2))
+
+
+def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="asm",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={},
+    )
+
+    class MoeQuantType:
+        W8A8 = "w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_kwargs: (True, config),
+            aiter_moe_shfl_weight=lambda w1, w2, _config: (
+                w1.clone().add_(3),
+                w2.clone().add_(4),
+            ),
+        ),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((3, 8, 4), dtype=torch.int8), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((3, 4, 4), dtype=torch.int8), requires_grad=False
+    )
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        block_shape=None,
+    )
+
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "asm"
+    torch.testing.assert_close(layer.w13_weight, torch.full_like(layer.w13_weight, 3))
+    torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 4))
 
 
 @pytest.mark.hcu
@@ -4622,11 +4688,11 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
 
     method.process_weights_after_loading(layer)
 
-    fallback_w1, fallback_w2 = (
-        layer.w13_weight._hcu_vllm_w4a8_fallback_weights
-    )
-    assert fallback_w1.shape == (1, 4, 4)
-    assert fallback_w2.shape == (1, 4, 2)
+    assert layer.w13_weight.shape == (1, 4, 4)
+    assert layer.w2_weight.shape == (1, 4, 2)
+    assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
+    assert layer.w2_weight._hcu_vllm_w4a8_unpacked is True
+    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
     assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
 
 
