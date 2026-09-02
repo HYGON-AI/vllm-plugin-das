@@ -25,8 +25,54 @@ permissions:
   contents: read
 
 jobs:
+  resolve-image:
+    name: Resolve immutable HCU image
+    if: inputs.matrix != '[]'
+    runs-on:
+      - self-hosted
+      - hcu-ci-pr
+    env:
+      SOURCE_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - name: Pull configured image and pin digest
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SOURCE_IMAGE:-}" ]]; then
+            echo "HCU CI image is required" >&2
+            exit 2
+          fi
+
+          if [[ "$SOURCE_IMAGE" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
+            docker pull "$SOURCE_IMAGE"
+            resolved_image="$SOURCE_IMAGE"
+          else
+            docker pull "$SOURCE_IMAGE"
+            repository="$SOURCE_IMAGE"
+            last_component="${repository##*/}"
+            if [[ "$last_component" == *:* ]]; then
+              repository="${repository%:*}"
+            fi
+            resolved_image="$(
+              docker image inspect "$SOURCE_IMAGE" \
+                --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                | awk -v prefix="${repository}@" 'index($0, prefix) == 1 {print; exit}'
+            )"
+          fi
+
+          if [[ ! "$resolved_image" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
+            echo "Unable to resolve immutable digest for HCU CI image: $SOURCE_IMAGE" >&2
+            exit 2
+          fi
+          echo "Using immutable HCU CI image: $resolved_image"
+          echo "image=$resolved_image" >> "$GITHUB_OUTPUT"
+
   hcu:
     name: ${{ matrix.id }}
+    needs: resolve-image
     if: inputs.matrix != '[]'
     strategy:
       fail-fast: false
@@ -46,7 +92,7 @@ jobs:
       HCU_CI_PARTITION_SIZE: ${{ matrix.partition_size }}
       HCU_CI_PYTEST_ARGS_JSON: ${{ toJSON(matrix.pytest_args) }}
       HCU_CI_REQUIREMENTS_JSON: ${{ toJSON(matrix.requirements) }}
-      HCU_CI_IMAGE: ${{ inputs.image || vars.HCU_CI_IMAGE }}
+      HCU_CI_IMAGE: ${{ needs.resolve-image.outputs.image }}
       HCU_CI_CONTAINER_NAME: vllm_hcu_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.id }}
       HCU_CI_JOB_ROOT: /hcu-ci-artifacts
       HCU_CI_HOST_JOB_ROOT: /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}

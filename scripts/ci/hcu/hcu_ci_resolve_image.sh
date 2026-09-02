@@ -45,8 +45,14 @@ refresh_ref() {
 
 emit_usable_ref() {
   local ref="$1"
+  local refresh="${2:-0}"
 
-  if ! has_control_python "$ref"; then
+  if [[ "$refresh" == "1" ]]; then
+    if ! refresh_ref "$ref"; then
+      echo "unable to refresh configured HCU CI image: $ref" >&2
+      return 1
+    fi
+  elif ! has_control_python "$ref"; then
     refresh_ref "$ref" || true
   fi
   if ! has_control_python "$ref"; then
@@ -57,8 +63,20 @@ emit_usable_ref() {
 }
 
 if [[ -n "${HCU_CI_IMAGE:-}" ]]; then
-  printf '%s\n' "$HCU_CI_IMAGE"
-  exit 0
+  if [[ "$HCU_CI_IMAGE" =~ @sha256:[0-9a-fA-F]{64}$ \
+      || "$HCU_CI_IMAGE" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    printf '%s\n' "$HCU_CI_IMAGE"
+    exit 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is unavailable and configured HCU_CI_IMAGE is mutable" >&2
+    exit 2
+  fi
+  if emit_usable_ref "$HCU_CI_IMAGE" 1; then
+    exit 0
+  fi
+  echo "configured HCU_CI_IMAGE could not be resolved to an immutable digest: $HCU_CI_IMAGE" >&2
+  exit 2
 fi
 
 if [[ -r "${HCU_CI_IMAGE_FILE:-/etc/vllm-hcu-ci/image}" ]]; then

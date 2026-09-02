@@ -443,6 +443,7 @@ def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
         ".github/workflows/hcu-pr-ci.yml",
         ".github/workflows/_selected-hcu-tests.yml",
         ".github/workflows/release-docker-image.yml",
+        ".github/workflows/validate-docker-image.yml",
     ):
         source = (REPOSITORY / relative).read_text(encoding="utf-8")
         assert '! -uid "$uid"' in source
@@ -452,6 +453,7 @@ def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
     for relative in (
         ".github/workflows/hcu-pr-ci.yml",
         ".github/workflows/release-docker-image.yml",
+        ".github/workflows/validate-docker-image.yml",
     ):
         source = (REPOSITORY / relative).read_text(encoding="utf-8")
         assert "docker image ls --format '{{.ID}}'" in source
@@ -507,6 +509,66 @@ def test_pr_selector_uses_shared_has_jobs_output(
     )
     assert values["has_jobs"] == expected
     assert "has_hcu" not in values
+
+
+def test_selected_hcu_workflow_pins_mutable_image_before_matrix() -> None:
+    source = (
+        REPOSITORY / ".github/workflows/_selected-hcu-tests.yml"
+    ).read_text(encoding="utf-8")
+    assert "resolve-image:" in source
+    assert "docker pull \"$SOURCE_IMAGE\"" in source
+    assert "Using immutable HCU CI image" in source
+    assert "needs: resolve-image" in source
+    assert "HCU_CI_IMAGE: ${{ needs.resolve-image.outputs.image }}" in source
+
+
+def test_fork_pr_uses_non_secret_hcu_image_fallback() -> None:
+    default_image = (
+        "10.16.1.152:5000/jenkins/model_test_env/"
+        "vllm:0.25.1-latest"
+    )
+    pr_workflow = (
+        REPOSITORY / ".github/workflows/hcu-pr-ci.yml"
+    ).read_text(encoding="utf-8")
+    selected_workflow = (
+        REPOSITORY / ".github/workflows/_selected-hcu-tests.yml"
+    ).read_text(encoding="utf-8")
+
+    assert default_image in pr_workflow
+    assert default_image in selected_workflow
+    assert "Repository variables are unavailable" in pr_workflow
+
+
+def test_release_push_is_independent_from_image_validation() -> None:
+    release = (
+        REPOSITORY / ".github/workflows/release-docker-image.yml"
+    ).read_text(encoding="utf-8")
+    validation = (
+        REPOSITORY / ".github/workflows/validate-docker-image.yml"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"'
+        in release
+    )
+    assert (
+        'docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"'
+        in release
+    )
+    assert 'echo "LATEST_TAG=vllm:${BASE_VERSION}-latest"' in release
+    assert "CANDIDATE_TAG" not in release
+    assert "hcu-image-reference" not in release
+    assert "tools/run_patch_tests.py --suite contract" not in release
+    assert "HCU_CI_VARIABLE_TOKEN" not in release
+
+    assert "workflow_run:" in validation
+    assert "- docker-image" in validation
+    assert "actions/download-artifact@v4" not in validation
+    assert "vllm:0.25.1-latest" in validation
+    assert 'docker pull "$SOURCE_IMAGE"' in validation
+    assert "tools/run_patch_tests.py --suite contract" in validation
+    assert "promote_latest" not in validation
+    assert 'docker push "$latest_image"' not in validation
 
 
 def test_moe_change_selects_kernel_and_tp_ep_jobs() -> None:
