@@ -147,8 +147,10 @@ def _runtime():
     return importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
 
 
+@pytest.mark.parametrize("is_gfx938", [False, True])
 def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     monkeypatch: pytest.MonkeyPatch,
+    is_gfx938: bool,
 ) -> None:
     runtime = _runtime()
     calls: list[tuple[object, ...]] = []
@@ -159,6 +161,7 @@ def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
         return output
 
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
     from vllm._aiter_ops import rocm_aiter_ops
 
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
@@ -171,9 +174,10 @@ def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     monkeypatch.delattr(runtime, "lightop", raising=False)
 
     weights = torch.arange(8, dtype=torch.float16).reshape(2, 4).transpose(0, 1)
+    scale = torch.ones(3)
     result = runtime.rocm_fp8_mqa_logits(
         torch.ones((4, 1, 2)),
-        (torch.ones((3, 2)), torch.ones(3)),
+        (torch.ones((3, 2)), scale),
         weights,
         torch.zeros(4, dtype=torch.int32),
         torch.full((4,), 3, dtype=torch.int32),
@@ -186,6 +190,7 @@ def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     assert supplied_weights.dtype is torch.float32
     assert supplied_weights.is_contiguous()
     assert torch.equal(supplied_weights, weights.float().contiguous())
+    assert calls[0][5] is (scale if is_gfx938 else None)
 
 
 def test_sparse_mla_does_not_retry_legacy_namespace(monkeypatch):

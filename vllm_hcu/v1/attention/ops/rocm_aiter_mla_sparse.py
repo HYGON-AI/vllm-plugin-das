@@ -927,13 +927,14 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
     elif current_platform.is_rocm():
         k_fp8, scale = kv
+        kernel_scale = scale if on_gfx938() else None
         return _get_lightop_attention().mqa_logits(
             q,
             k_fp8,
             weights.float().contiguous(),
             cu_seqlen_ks,
             cu_seqlen_ke,
-            scale,
+            kernel_scale,
         )
         # mqa_logits_inner_chunked(
         #     chunk,
