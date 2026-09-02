@@ -1290,6 +1290,89 @@ def test_proposer_registers_hcu_spec_decode_metadata_once() -> None:
     )
 
 
+def test_proposer_without_allowlist_does_not_import_optional_flash_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    from vllm_hcu.v1.spec_decode import proposer_runtime
+
+    original_import = builtins.__import__
+
+    def import_without_flash_attention(name, *args, **kwargs):
+        if name in {
+            "vllm.v1.attention.backends.mla.flashmla_sparse",
+            "vllm_hcu.v1.attention.backends.flash_attn",
+        }:
+            raise AssertionError("optional attention metadata was imported")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_flash_attention)
+    proposer = SimpleNamespace(allowed_attn_types=None)
+
+    proposer_runtime.initialize_proposer(
+        SimpleNamespace(), proposer, _proposer_config(), "cpu", None
+    )
+
+    assert proposer.allowed_attn_types is None
+
+
+def test_proposer_allows_triton_fallback_when_flash_attn_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    from vllm_hcu.v1.spec_decode import proposer_runtime
+
+    original_import = builtins.__import__
+
+    def import_without_flash_attention(name, *args, **kwargs):
+        if name == "vllm_hcu.v1.attention.backends.flash_attn":
+            error = ModuleNotFoundError("No module named 'flash_attn'")
+            error.name = "flash_attn"
+            raise error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_flash_attention)
+    proposer = SimpleNamespace(allowed_attn_types=(str,))
+
+    proposer_runtime.initialize_proposer(
+        SimpleNamespace(), proposer, _proposer_config(), "cpu", None
+    )
+
+    assert proposer.allowed_attn_types[0] is str
+
+
+def test_proposer_propagates_flash_attention_symbol_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    from vllm_hcu.v1.spec_decode import proposer_runtime
+
+    original_import = builtins.__import__
+
+    def import_with_incompatible_flash_attention(name, *args, **kwargs):
+        if name == "vllm_hcu.v1.attention.backends.flash_attn":
+            raise ImportError("cannot import name 'hg_flash_attn_varlen_func'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        builtins,
+        "__import__",
+        import_with_incompatible_flash_attention,
+    )
+
+    with pytest.raises(ImportError, match="hg_flash_attn_varlen_func"):
+        proposer_runtime.initialize_proposer(
+            SimpleNamespace(),
+            SimpleNamespace(allowed_attn_types=(str,)),
+            _proposer_config(),
+            "cpu",
+            None,
+        )
+
+
 def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     monkeypatch: pytest.MonkeyPatch,
 ):

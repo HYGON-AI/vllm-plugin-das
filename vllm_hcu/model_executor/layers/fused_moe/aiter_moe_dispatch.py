@@ -179,7 +179,7 @@ def _validate_derived_tensor(
         )
     compatible_shape = derived.shape == original.shape
     config_values = getattr(config, "config", None)
-    if not compatible_shape and isinstance(config_values, dict):
+    if isinstance(config_values, dict):
         padded_k = config_values.get("PADDED_K")
         original_k = config_values.get("ORIGINAL_K")
         try:
@@ -187,19 +187,23 @@ def _validate_derived_tensor(
             original_k = int(original_k)
         except (TypeError, ValueError):
             padded_k = original_k = -1
-        padded_axis = {"w1": 2, "w2": 1}.get(label)
-        compatible_shape = (
-            padded_axis is not None
-            and derived.ndim == original.ndim == 3
-            and all(
-                derived.shape[index] == original.shape[index]
-                for index in range(derived.ndim)
-                if index != padded_axis
+        padded_axis = {
+            "w1": 2,
+            "w2": 1,
+            "w1_scale": 2,
+            "w2_scale": 1,
+        }.get(label)
+        if padded_axis is not None and padded_k > original_k > 0:
+            compatible_shape = (
+                derived.ndim == original.ndim == 3
+                and all(
+                    derived.shape[index] == original.shape[index]
+                    for index in range(derived.ndim)
+                    if index != padded_axis
+                )
+                and derived.shape[padded_axis] == padded_k
+                and original.shape[padded_axis] == original_k
             )
-            and derived.shape[padded_axis] == padded_k
-            and original.shape[padded_axis] == original_k
-            and padded_k >= original_k > 0
-        )
     if not compatible_shape:
         raise HcuAiterMoeDispatchError(
             f"AITER returned incompatible {label} shape {tuple(derived.shape)} "

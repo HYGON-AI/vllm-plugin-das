@@ -49,6 +49,59 @@ def _expert_routing_tables(
     return None
 
 
+def _has_installed_aiter_layout(
+    layer: torch.nn.Module,
+    *,
+    activation: object,
+) -> bool:
+    """Return whether the current parameter pair is already runtime-ready."""
+
+    w13 = getattr(layer, "w13_weight", None)
+    w2 = getattr(layer, "w2_weight", None)
+    if not isinstance(w13, torch.Tensor) or not isinstance(w2, torch.Tensor):
+        return False
+    solution = getattr(w13, "_hcu_aiter_moe_solution_type", None)
+    logical_shape = getattr(w13, "_hcu_aiter_moe_logical_shape", None)
+    layout = getattr(w13, "_hcu_aiter_moe_weight_layout", None)
+    shuffled = getattr(w13, "is_shuffled", None)
+    if (
+        solution is None
+        or solution != getattr(w2, "_hcu_aiter_moe_solution_type", None)
+        or logical_shape != getattr(w2, "_hcu_aiter_moe_logical_shape", None)
+        or layout != getattr(w2, "_hcu_aiter_moe_weight_layout", None)
+        or shuffled != getattr(w2, "is_shuffled", None)
+        or not isinstance(logical_shape, tuple)
+        or len(logical_shape) != 4
+    ):
+        return False
+    try:
+        experts, w13_n, _w2_k, logical_k = map(int, logical_shape)
+    except (TypeError, ValueError):
+        return False
+    physical_k = logical_k
+    if shuffled:
+        if not isinstance(layout, tuple) or len(layout) != 4:
+            return False
+        padded_k = layout[3]
+        if padded_k is not None:
+            try:
+                physical_k = int(padded_k)
+            except (TypeError, ValueError):
+                return False
+    activation = str(getattr(activation, "value", activation)).lower()
+    gated = activation in {
+        "silu",
+        "situ",
+        "gelu",
+        "swigluoai",
+        "swiglustep",
+        "gelu_tanh",
+    }
+    expected_w13 = (experts, w13_n, physical_k)
+    expected_w2 = (experts, physical_k, w13_n // 2 if gated else w13_n)
+    return tuple(w13.shape) == expected_w13 and tuple(w2.shape) == expected_w2
+
+
 class HcuUnquantizedFusedMoEMethod(_Original):
     """Install the AITER ASM layout once instead of caching a second copy."""
 
@@ -60,12 +113,12 @@ class HcuUnquantizedFusedMoEMethod(_Original):
         ):
             return super().process_weights_after_loading(layer)
 
-        if getattr(layer, "_hcu_aiter_moe_initialized", False):
+        activation = getattr(self.moe.activation, "value", self.moe.activation)
+        if _has_installed_aiter_layout(layer, activation=activation):
             return
 
         original_w13 = layer.w13_weight
         original_w2 = layer.w2_weight
-        activation = getattr(self.moe.activation, "value", self.moe.activation)
         problem = AiterMoeProblem(
             M=1,
             E=int(self.moe.num_experts),
@@ -138,4 +191,3 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             experts_cls=self.experts_cls,
             routing_tables=_expert_routing_tables(layer),
         )
-        layer._hcu_aiter_moe_initialized = True

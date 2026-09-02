@@ -3048,7 +3048,7 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
         quant_type="w16a16",
         solution_type="asm",
         need_shuffle=True,
-        config={"PADDED_K": 64},
+        config={"PADDED_K": 64, "ORIGINAL_K": 4},
     )
     monkeypatch.setattr(
         hcu_unquantized,
@@ -3057,17 +3057,32 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
             (problem, cache_owner, solution_type)
         ) or config,
     )
-    shuffled_w13 = torch.full_like(w13, 13)
-    shuffled_w2 = torch.full_like(w2, 2)
+    shuffled_w13 = torch.full((2, 8, 64), 13.0)
+    shuffled_w2 = torch.full((2, 64, 4), 2.0)
+    shuffle_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(current_w13, current_w2, _config):
+        shuffle_calls.append((current_w13, current_w2))
+        return shuffled_w13.clone(), shuffled_w2.clone()
+
     monkeypatch.setitem(
         sys.modules,
         "aiter.moe", _module(
             "aiter.moe",
-            aiter_moe_shfl_weight=lambda *_args: (shuffled_w13, shuffled_w2),
+            aiter_moe_shfl_weight=shuffle_weights,
         ),
     )
 
     method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+
+    # Upstream layerwise reload restores new canonical Parameters but does not
+    # know about legacy HCU-owned layer markers.
+    layer._hcu_aiter_moe_initialized = True
+    reloaded_w13 = torch.nn.Parameter(torch.full_like(w13, 5), requires_grad=False)
+    reloaded_w2 = torch.nn.Parameter(torch.full_like(w2, 6), requires_grad=False)
+    layer.w13_weight = reloaded_w13
+    layer.w2_weight = reloaded_w2
     method.process_weights_after_loading(layer)
 
     assert layer.w13_weight is not w13
@@ -3092,9 +3107,14 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
     )
     assert layer.w13_weight._hcu_aiter_moe_logical_shape == (2, 8, 4, 4)
     assert layer.w2_weight._hcu_aiter_moe_logical_shape == (2, 8, 4, 4)
-    assert len(kernels) == 1
+    assert len(kernels) == 2
     assert method.moe_kernel is not None
-    assert len(select_calls) == 1
+    assert len(select_calls) == 2
+    assert len(shuffle_calls) == 2
+    assert shuffle_calls[0][0] is w13
+    assert shuffle_calls[0][1] is w2
+    assert shuffle_calls[1][0] is reloaded_w13
+    assert shuffle_calls[1][1] is reloaded_w2
     problem, cache_owner, solution_type = select_calls[0]
     assert problem == AiterMoeProblem(
         M=1,
@@ -4569,6 +4589,12 @@ def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
     class MoeQuantType:
         W8A8 = "w8a8"
 
+    shuffle_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(w1, w2, _config):
+        shuffle_calls.append((w1, w2))
+        return w1.clone().add_(3), w2.clone().add_(4)
+
     monkeypatch.setitem(
         sys.modules,
         "aiter.moe",
@@ -4576,10 +4602,7 @@ def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
             "aiter.moe",
             MoeQuantType=MoeQuantType,
             get_aiter_moe_config=lambda **_kwargs: (True, config),
-            aiter_moe_shfl_weight=lambda w1, w2, _config: (
-                w1.clone().add_(3),
-                w2.clone().add_(4),
-            ),
+            aiter_moe_shfl_weight=shuffle_weights,
         ),
     )
     layer = _fp8_moe_layer()
@@ -4604,6 +4627,15 @@ def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
         ),
         quant_config,
     )
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
 
     assert layer.w13_weight._hcu_aiter_moe_solution_type == "asm"
     assert layer.w2_weight._hcu_aiter_moe_solution_type == "asm"
@@ -4619,6 +4651,31 @@ def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
         True,
         None,
     )
+    torch.testing.assert_close(layer.w13_weight, torch.full_like(layer.w13_weight, 3))
+    torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 4))
+    assert len(shuffle_calls) == 1
+
+    reloaded_w13 = torch.nn.Parameter(
+        torch.zeros((3, 8, 4), dtype=torch.int8), requires_grad=False
+    )
+    reloaded_w2 = torch.nn.Parameter(
+        torch.zeros((3, 4, 4), dtype=torch.int8), requires_grad=False
+    )
+    layer.w13_weight = reloaded_w13
+    layer.w2_weight = reloaded_w2
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+
+    assert len(shuffle_calls) == 2
+    assert shuffle_calls[1][0] is reloaded_w13
+    assert shuffle_calls[1][1] is reloaded_w2
     torch.testing.assert_close(layer.w13_weight, torch.full_like(layer.w13_weight, 3))
     torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 4))
 
@@ -4732,6 +4789,63 @@ def test_padded_layout_validation_rejects_wrong_w2_axis(
             config,
             cache_owner=object(),
         )
+
+
+def test_padded_scale_layout_accepts_weight_matching_k_axes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    scale1 = torch.ones((2, 8, 4))
+    scale2 = torch.ones((2, 4, 4))
+    expected1 = torch.full((2, 8, 8), 3.0)
+    expected2 = torch.full((2, 8, 4), 4.0)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_scale=lambda *_args: (expected1, expected2),
+        ),
+    )
+
+    actual1, actual2 = prepare_aiter_moe_scales(
+        scale1, scale2, config, cache_owner=object()
+    )
+
+    assert actual1 is expected1
+    assert actual2 is expected2
+
+
+def test_padded_scale_layout_rejects_wrong_w2_axis(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    scale1 = torch.ones((2, 8, 4))
+    scale2 = torch.ones((2, 4, 4))
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_scale=lambda *_args: (
+                torch.zeros((2, 8, 8)),
+                torch.zeros((2, 4, 8)),
+            ),
+        ),
+    )
+
+    with pytest.raises(HcuAiterMoeDispatchError, match="incompatible w2_scale shape"):
+        prepare_aiter_moe_scales(scale1, scale2, config, cache_owner=object())
 
 
 def test_w8a8_m1_miss_locks_native_weights_without_runtime_relayout(
@@ -4854,6 +4968,15 @@ def test_w8a8_prewarm_installs_selected_scale_layout_once(
         ),
         quant_config,
     )
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
 
     assert len(scale_calls) == 1
     assert layer.w13_weight_scale is not original_w1_scale
@@ -4864,12 +4987,68 @@ def test_w8a8_prewarm_installs_selected_scale_layout_once(
         "w8a8",
         "MOE_C",
         True,
+        None,
+        None,
     )
     assert layer.w2_weight_scale._hcu_aiter_moe_scale_layout == (
         "w8a8",
         "MOE_C",
         True,
+        None,
+        None,
     )
+
+
+def test_installed_scale_layout_rejects_different_padded_k(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        W8A8 = "w8a8"
+
+    first_config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    second_config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 16, "ORIGINAL_K": 4},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            aiter_moe_shfl_scale=lambda scale1, scale2, _config: (
+                torch.zeros((2, 8, 8), dtype=scale1.dtype),
+                torch.zeros((2, 8, 4), dtype=scale2.dtype),
+            ),
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight_scale=torch.ones((2, 8, 4)),
+        w2_weight_scale=torch.ones((2, 4, 4)),
+    )
+    quant_config = SimpleNamespace(
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+    )
+
+    compressed_tensors_moe_runtime.install_aiter_moe_scale_layout(
+        layer, quant_config, first_config
+    )
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="selected layout",
+    ):
+        compressed_tensors_moe_runtime.install_aiter_moe_scale_layout(
+            layer, quant_config, second_config
+        )
 
 
 @pytest.mark.hcu
