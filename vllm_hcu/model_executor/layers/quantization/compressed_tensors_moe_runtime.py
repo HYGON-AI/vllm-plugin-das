@@ -232,6 +232,8 @@ def install_aiter_moe_weight_layout(
 def _installed_weight_logical_shape(
     w1: torch.Tensor,
     w2: torch.Tensor,
+    *,
+    activation: object = "silu",
 ) -> tuple[int, int, int, int]:
     first = getattr(w1, _WEIGHT_LOGICAL_SHAPE_ATTR, None)
     second = getattr(w2, _WEIGHT_LOGICAL_SHAPE_ATTR, None)
@@ -258,7 +260,15 @@ def _installed_weight_logical_shape(
             "AITER weights have invalid logical dimensions"
         )
     logical_e, logical_n1, logical_n2, logical_k = first
-    if logical_n1 % 2:
+    gated = _enum_token(activation) in {
+        "SILU",
+        "SITU",
+        "GELU",
+        "SWIGLUOAI",
+        "SWIGLUSTEP",
+        "GELU_TANH",
+    }
+    if gated and logical_n1 % 2:
         raise HcuCompressedTensorsMoeError(
             "AITER weights have invalid logical dimensions"
         )
@@ -277,7 +287,8 @@ def _installed_weight_logical_shape(
     padded_k = first_layout[3] if first_layout is not None else None
     physical_k = int(padded_k) if padded_k is not None else logical_k
     expected_w1 = (logical_e, logical_n1, physical_k)
-    expected_w2 = (logical_e, physical_k, logical_n1 // 2)
+    intermediate_size = logical_n1 // 2 if gated else logical_n1
+    expected_w2 = (logical_e, physical_k, intermediate_size)
     if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
         raise HcuCompressedTensorsMoeError(
             "AITER weights do not match their installed physical layout"
@@ -289,8 +300,14 @@ def _quantized_problem_dimensions(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    *,
+    activation: object,
 ) -> tuple[int, int, int, int]:
-    logical_shape = _installed_weight_logical_shape(w1, w2)
+    logical_shape = _installed_weight_logical_shape(
+        w1,
+        w2,
+        activation=activation,
+    )
     if int(hidden_states.shape[1]) != logical_shape[3]:
         raise HcuCompressedTensorsMoeError(
             "AITER quantized MoE hidden states do not match logical K"
@@ -884,7 +901,10 @@ def apply_aiter_quantized_moe(
         )
     activation_name = str(activation_value)
     logical_e, logical_n1, logical_n2, logical_k = _quantized_problem_dimensions(
-        hidden_states, w1, w2
+        hidden_states,
+        w1,
+        w2,
+        activation=activation_name,
     )
     problem = AiterMoeProblem(
         M=int(hidden_states.shape[0]),
@@ -1082,7 +1102,10 @@ def apply_aiter_w8a8_fp8_moe(
             "AITER does not expose the required FP8_W8A8 MoE quant type"
         )
     logical_e, logical_n1, logical_n2, logical_k = _quantized_problem_dimensions(
-        x, w1, w2
+        x,
+        w1,
+        w2,
+        activation=activation,
     )
     problem = AiterMoeProblem(
         M=int(x.shape[0]),

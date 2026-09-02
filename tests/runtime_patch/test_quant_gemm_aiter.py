@@ -5878,6 +5878,85 @@ def test_moe_fp8_installed_layout_rejects_hidden_width_mismatch(
         )
 
 
+@pytest.mark.parametrize("entrypoint", ["generic", "explicit"])
+def test_quantized_native_layout_accepts_non_gated_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", MoeQuantType=MoeQuantType),
+    )
+    expected = torch.ones((2, 4))
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *_args, **_kwargs: expected,
+    )
+    w1 = torch.zeros((2, 6, 4))
+    w2 = torch.zeros((2, 4, 6))
+    for weight in (w1, w2):
+        weight._hcu_aiter_moe_solution_type = "native"
+        weight._hcu_aiter_moe_logical_shape = (2, 6, 4, 4)
+        weight.is_shuffled = False
+    hidden_states = torch.ones((2, 4))
+    topk_weights = torch.ones((2, 1))
+    topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+    if entrypoint == "generic":
+        quant_config = SimpleNamespace(
+            use_fp8_w8a8=True,
+            use_int8_w8a8=False,
+            block_shape=None,
+            w1_scale=torch.ones((2, 6, 1)),
+            w2_scale=torch.ones((2, 4, 1)),
+            a1_scale=None,
+            a2_scale=None,
+        )
+        actual = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            SimpleNamespace(num_experts=2),
+            SimpleNamespace(value="relu2"),
+            False,
+            None,
+            quant_config,
+        )
+    else:
+        layer = SimpleNamespace(
+            activation=SimpleNamespace(value="relu2"),
+            apply_router_weight_on_input=False,
+            w13_weight=w1,
+            w2_weight=w2,
+            w13_weight_scale=torch.ones((2, 6, 1)),
+            w2_weight_scale=torch.ones((2, 4, 1)),
+            w13_input_scale=None,
+            w2_input_scale=None,
+            global_num_experts=2,
+            expert_map=None,
+        )
+        actual = compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            SimpleNamespace(moe=object()),
+            layer,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            None,
+            None,
+        )
+    assert actual is expected
+
+
 def test_moe_fp8_uses_unified_shuffle_cache_and_invalidates_on_weight_change(
     monkeypatch: pytest.MonkeyPatch,
 ):
