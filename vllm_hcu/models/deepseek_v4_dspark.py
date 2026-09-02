@@ -172,9 +172,10 @@ def _insert_context_kv(attn, raw_kv, positions, slot_mapping) -> None:
 
     swa_cache = attn.swa_cache_layer.kv_cache
     if swa_cache.dtype != torch.uint8:
+        normalized_kv = attn.kv_norm(raw_kv)
         return _dspark._insert_context_kv(
             attn,
-            raw_kv,
+            normalized_kv,
             positions,
             slot_mapping,
         )

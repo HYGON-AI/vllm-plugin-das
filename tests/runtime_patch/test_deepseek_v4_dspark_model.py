@@ -226,9 +226,17 @@ def test_dspark_context_insert_uses_only_non_pcp_lightop(
     assert block == 4
 
 
-def test_dspark_context_insert_delegates_non_uint8_cache_upstream(
+@pytest.mark.parametrize(
+    "cache_dtype",
+    [
+        pytest.param(torch.bfloat16, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, id="per-tensor-fp8"),
+    ],
+)
+def test_dspark_context_insert_normalizes_non_uint8_cache_before_upstream(
     dspark_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: torch.dtype,
 ) -> None:
     fallback_calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(
@@ -236,30 +244,37 @@ def test_dspark_context_insert_delegates_non_uint8_cache_upstream(
         "_insert_context_kv",
         lambda *args: fallback_calls.append(args),
     )
-    lightop = ModuleType("lightop")
-    lightop.op = SimpleNamespace(
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert=(
-            lambda *_args: pytest.fail("uint8 LightOp used for BF16 cache")
-        )
-    )
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    kv = torch.arange(24, dtype=torch.bfloat16).view(3, 8)
+    normalized_kv = kv + 2
+    norm_calls: list[torch.Tensor] = []
+
+    def kv_norm(value: torch.Tensor) -> torch.Tensor:
+        norm_calls.append(value)
+        return normalized_kv
 
     attn = SimpleNamespace(
         n_local_heads=2,
         head_dim=8,
         eps=1e-6,
+        kv_norm=kv_norm,
         rotary_emb=SimpleNamespace(
             cos_sin_cache=torch.arange(16, dtype=torch.float32)
         ),
         swa_cache_layer=SimpleNamespace(
-            kv_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            kv_cache=torch.empty((2, 4, 8), dtype=cache_dtype),
             block_size=4,
         ),
     )
-    kv = torch.ones((3, 8), dtype=torch.bfloat16)
     positions = torch.tensor([0, 1, 2], dtype=torch.int32)
     slot_mapping = torch.tensor([4, 5, 6], dtype=torch.int64)
 
     dspark_module._insert_context_kv(attn, kv, positions, slot_mapping)
 
-    assert fallback_calls == [(attn, kv, positions, slot_mapping)]
+    assert len(norm_calls) == 1
+    assert norm_calls[0] is kv
+    assert len(fallback_calls) == 1
+    passed_attn, passed_kv, passed_positions, passed_slots = fallback_calls[0]
+    assert passed_attn is attn
+    assert passed_kv is normalized_kv
+    assert passed_positions is positions
+    assert passed_slots is slot_mapping
