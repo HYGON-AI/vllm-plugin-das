@@ -256,12 +256,33 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         else:
             from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
                 install_aiter_moe_weight_layout,
+                install_aiter_moe_scale_layout,
+                mark_aiter_moe_native_layout,
                 prewarm_aiter_w4a8_moe,
+                prepare_vllm_w4a8_moe,
             )
 
             config = prewarm_aiter_w4a8_moe(self, layer)
             if config is not None:
-                install_aiter_moe_weight_layout(layer, config)
+                install_aiter_moe_weight_layout(
+                    layer,
+                    config,
+                    logical_shape=(
+                        int(layer.w13_weight.shape[0]),
+                        int(layer.w13_weight.shape[1]),
+                        int(layer.w2_weight.shape[1]),
+                        int(layer.w13_weight.shape[2]) * 2,
+                    ),
+                )
+                install_aiter_moe_scale_layout(
+                    layer,
+                    self.moe_quant_config,
+                    config,
+                    prefer_quant_config=True,
+                )
+            else:
+                prepare_vllm_w4a8_moe(self, layer)
+                mark_aiter_moe_native_layout(layer)
 
     def apply(
         self,

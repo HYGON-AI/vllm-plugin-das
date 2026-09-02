@@ -17,6 +17,7 @@ from vllm.model_executor.utils import replace_parameter
 
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
+    aiter_moe_weight_layout_signature,
     aiter_expert_map_for_solution,
     execute_aiter_moe,
     prewarm_aiter_moe_config,
@@ -59,6 +60,122 @@ def _enum_token(value: object) -> str:
 
 
 _WEIGHT_SOLUTION_ATTR = "_hcu_aiter_moe_solution_type"
+_WEIGHT_LAYOUT_ATTR = "_hcu_aiter_moe_weight_layout"
+_WEIGHT_LOGICAL_SHAPE_ATTR = "_hcu_aiter_moe_logical_shape"
+_SCALE_LAYOUT_ATTR = "_hcu_aiter_moe_scale_layout"
+
+
+def _scale_layout_signature(config: object) -> tuple[object, ...]:
+    return (
+        _enum_token(getattr(config, "quant_type", None)).lower(),
+        _enum_token(getattr(config, "solution_type", None)),
+        bool(getattr(config, "need_shuffle_scale", False)),
+    )
+
+
+def _replace_tensor_reference(owner: object, name: str, value: torch.Tensor) -> None:
+    descriptor_name = {"w1_scale": "_w1", "w2_scale": "_w2"}.get(name)
+    descriptor = getattr(owner, descriptor_name, None) if descriptor_name else None
+    if descriptor is not None and hasattr(descriptor, "scale"):
+        descriptor.scale = value
+    elif isinstance(owner, torch.nn.Module) and name in owner._parameters:
+        replace_parameter(owner, name, value)
+    else:
+        setattr(owner, name, value)
+
+
+def install_aiter_moe_scale_layout(
+    layer: object,
+    quant_config: object | None,
+    config: object,
+    *,
+    prefer_quant_config: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Install the selected scale layout and update every owning reference."""
+
+    layer_has_scales = not prefer_quant_config and isinstance(
+        getattr(layer, "w13_weight_scale", None), torch.Tensor
+    ) and isinstance(getattr(layer, "w2_weight_scale", None), torch.Tensor)
+    owner = layer if layer_has_scales else quant_config
+    if owner is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER selected scale shuffle without a quantization config"
+        )
+    first_name, second_name = (
+        ("w13_weight_scale", "w2_weight_scale")
+        if layer_has_scales
+        else ("w1_scale", "w2_scale")
+    )
+    scale1 = _required_tensor(owner, first_name)
+    scale2 = _required_tensor(owner, second_name)
+    installed1, installed2 = prepare_aiter_moe_scales(
+        scale1,
+        scale2,
+        config,
+        cache_owner=object(),
+    )
+    assert installed1 is not None and installed2 is not None
+    _replace_tensor_reference(owner, first_name, installed1)
+    _replace_tensor_reference(owner, second_name, installed2)
+    installed1 = _required_tensor(owner, first_name)
+    installed2 = _required_tensor(owner, second_name)
+    if layer_has_scales and quant_config is not None:
+        _replace_tensor_reference(quant_config, "w1_scale", installed1)
+        _replace_tensor_reference(quant_config, "w2_scale", installed2)
+    signature = _scale_layout_signature(config)
+    for scale in (installed1, installed2):
+        setattr(scale, _SCALE_LAYOUT_ATTR, signature)
+    return installed1, installed2
+
+
+def _scales_for_selected_config(
+    scale1: torch.Tensor,
+    scale2: torch.Tensor,
+    config: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    first_layout = getattr(scale1, _SCALE_LAYOUT_ATTR, None)
+    second_layout = getattr(scale2, _SCALE_LAYOUT_ATTR, None)
+    if first_layout != second_layout:
+        raise HcuCompressedTensorsMoeError(
+            "AITER scales have inconsistent physical layouts"
+        )
+    if first_layout is not None:
+        if _scale_layout_signature(config) != first_layout:
+            raise HcuCompressedTensorsMoeError(
+                "AITER config scale layout does not match installed scales"
+            )
+        return scale1, scale2
+    prepared1, prepared2 = prepare_aiter_moe_scales(
+        scale1,
+        scale2,
+        config,
+        cache_owner=scale1,
+    )
+    assert prepared1 is not None and prepared2 is not None
+    return prepared1, prepared2
+
+
+def mark_aiter_moe_native_layout(
+    layer: object,
+    *,
+    w1_name: str = "w13_weight",
+    w2_name: str = "w2_weight",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lock canonical weights to the native fallback without a second layout."""
+
+    w1 = _required_tensor(layer, w1_name)
+    w2 = _required_tensor(layer, w2_name)
+    logical_shape = (
+        int(w1.shape[0]),
+        int(w1.shape[1]),
+        int(w2.shape[1]),
+        int(w1.shape[2]),
+    )
+    for weight in (w1, w2):
+        setattr(weight, _WEIGHT_SOLUTION_ATTR, "native")
+        setattr(weight, _WEIGHT_LOGICAL_SHAPE_ATTR, logical_shape)
+        weight.is_shuffled = False
+    return w1, w2
 
 
 def install_aiter_moe_weight_layout(
@@ -68,11 +185,19 @@ def install_aiter_moe_weight_layout(
     w1_name: str = "w13_weight",
     w2_name: str = "w2_weight",
     block_shape: list[int] | None = None,
+    logical_shape: tuple[int, int, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Install one selected AITER layout and record its routing contract."""
 
     w1 = _required_tensor(layer, w1_name)
     w2 = _required_tensor(layer, w2_name)
+    if logical_shape is None:
+        logical_shape = (
+            int(w1.shape[0]),
+            int(w1.shape[1]),
+            int(w2.shape[1]),
+            int(w1.shape[2]),
+        )
     need_shuffle = bool(getattr(config, "need_shuffle", False))
     if need_shuffle:
         w1, w2 = prepare_aiter_moe_weights(
@@ -94,8 +219,38 @@ def install_aiter_moe_weight_layout(
         )
     for weight in (w1, w2):
         setattr(weight, _WEIGHT_SOLUTION_ATTR, solution)
+        setattr(
+            weight,
+            _WEIGHT_LAYOUT_ATTR,
+            aiter_moe_weight_layout_signature(config),
+        )
+        setattr(weight, _WEIGHT_LOGICAL_SHAPE_ATTR, logical_shape)
         weight.is_shuffled = need_shuffle
     return w1, w2
+
+
+def _installed_weight_logical_shape(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+) -> tuple[int, int, int, int]:
+    first = getattr(w1, _WEIGHT_LOGICAL_SHAPE_ATTR, None)
+    second = getattr(w2, _WEIGHT_LOGICAL_SHAPE_ATTR, None)
+    if first != second:
+        raise HcuCompressedTensorsMoeError(
+            "AITER weights have inconsistent logical dimensions"
+        )
+    if first is None:
+        return (
+            int(w1.shape[0]),
+            int(w1.shape[1]),
+            int(w2.shape[1]),
+            int(w1.shape[2]),
+        )
+    if not isinstance(first, tuple) or len(first) != 4:
+        raise HcuCompressedTensorsMoeError(
+            "AITER weights have invalid logical dimensions"
+        )
+    return tuple(int(value) for value in first)
 
 
 def _installed_weight_solution(
@@ -137,6 +292,19 @@ def _weights_for_selected_config(
         if expected_shuffle != bool(getattr(config, "need_shuffle", False)):
             raise HcuCompressedTensorsMoeError(
                 "AITER config layout does not match installed weights"
+            )
+        first_layout = getattr(w1, _WEIGHT_LAYOUT_ATTR, None)
+        second_layout = getattr(w2, _WEIGHT_LAYOUT_ATTR, None)
+        if first_layout != second_layout:
+            raise HcuCompressedTensorsMoeError(
+                "AITER weights have inconsistent physical layouts"
+            )
+        if (
+            first_layout is not None
+            and aiter_moe_weight_layout_signature(config) != first_layout
+        ):
+            raise HcuCompressedTensorsMoeError(
+                "AITER config physical layout does not match installed weights"
             )
         return w1, w2
     return prepare_aiter_moe_weights(
@@ -207,6 +375,9 @@ def prewarm_aiter_quantized_moe(
     config = prewarm_aiter_moe_config(problem, cache_owner=w1)
     if config is not None:
         install_aiter_moe_weight_layout(layer, config)
+        install_aiter_moe_scale_layout(layer, quant_config, config)
+    else:
+        mark_aiter_moe_native_layout(layer)
     return config
 
 
@@ -411,7 +582,7 @@ def apply_aiter_w4a8_moe(
         raise HcuCompressedTensorsMoeError(
             "SlimQuant W4A8 requires matching rank-2 hidden and top-k tensors"
         )
-    explicit_vllm_layout = not allow_aiter and bool(
+    explicit_vllm_layout = bool(
         getattr(
             getattr(layer, "w13_weight", None),
             "_hcu_vllm_w4a8_unpacked",
@@ -486,11 +657,12 @@ def apply_aiter_w4a8_moe(
         installed_solution = _installed_weight_solution(
             w1, w2, label="SlimQuant W4A8"
         )
-        aiter_config = select_aiter_moe_config(
-            problem,
-            cache_owner=w1,
-            solution_type=installed_solution,
-        )
+        if installed_solution != "native":
+            aiter_config = select_aiter_moe_config(
+                problem,
+                cache_owner=w1,
+                solution_type="moe_c",
+            )
     else:
         installed_solution = None
     global_num_experts = getattr(
@@ -505,7 +677,7 @@ def apply_aiter_w4a8_moe(
     )
     expert_mask = getattr(layer, "expert_mask", None)
     if aiter_config is None:
-        if installed_solution is not None:
+        if installed_solution not in (None, "native"):
             raise HcuCompressedTensorsMoeError(
                 "AITER has no MOE_C solution for installed W4A8 weights"
             )
@@ -546,11 +718,10 @@ def apply_aiter_w4a8_moe(
         installed_solution=installed_solution,
         preserve_inputs=True,
     )
-    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+    prepared_w1_scale, prepared_w2_scale = _scales_for_selected_config(
         w1_scale,
         w2_scale,
         aiter_config,
-        cache_owner=w1_scale,
     )
     aiter_expert_map = aiter_expert_map_for_solution(
         native_expert_map,
@@ -667,12 +838,15 @@ def apply_aiter_quantized_moe(
             "AITER quantized MoE requires an activation"
         )
     activation_name = str(activation_value)
+    logical_e, logical_n1, logical_n2, logical_k = _installed_weight_logical_shape(
+        w1, w2
+    )
     problem = AiterMoeProblem(
         M=int(hidden_states.shape[0]),
-        E=int(w1.shape[0]),
-        N1=int(w1.shape[1]),
-        N2=int(w2.shape[1]),
-        K=int(w1.shape[2]),
+        E=logical_e,
+        N1=logical_n1,
+        N2=logical_n2,
+        K=logical_k,
         top_k=int(topk_ids.shape[1]),
         block_size=0,
         dtype=hidden_states.dtype,
@@ -684,10 +858,14 @@ def apply_aiter_quantized_moe(
     installed_solution = _installed_weight_solution(
         w1, w2, label="AITER quantized MoE"
     )
-    aiter_config = select_aiter_moe_config(
-        problem,
-        cache_owner=w1,
-        solution_type=installed_solution,
+    aiter_config = (
+        None
+        if installed_solution == "native"
+        else select_aiter_moe_config(
+            problem,
+            cache_owner=w1,
+            solution_type=installed_solution,
+        )
     )
     global_num_experts = getattr(vllm_moe_config, "num_experts", w1.shape[0])
     native_expert_map, expert_mask = resolve_aiter_expert_maps(
@@ -695,7 +873,7 @@ def apply_aiter_quantized_moe(
         int(global_num_experts),
     )
     if aiter_config is None:
-        if installed_solution is not None:
+        if installed_solution not in (None, "native"):
             raise HcuCompressedTensorsMoeError(
                 "AITER has no solution compatible with installed quantized weights"
             )
@@ -737,11 +915,10 @@ def apply_aiter_quantized_moe(
         aiter_config,
         installed_solution=installed_solution,
     )
-    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+    prepared_w1_scale, prepared_w2_scale = _scales_for_selected_config(
         w1_scale,
         w2_scale,
         aiter_config,
-        cache_owner=w1_scale,
     )
 
     from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
@@ -876,10 +1053,14 @@ def apply_aiter_w8a8_fp8_moe(
     installed_solution = _installed_weight_solution(
         w1, w2, label="AITER FP8-W8A8"
     )
-    moe_config = select_aiter_moe_config(
-        problem,
-        cache_owner=w1,
-        solution_type=installed_solution,
+    moe_config = (
+        None
+        if installed_solution == "native"
+        else select_aiter_moe_config(
+            problem,
+            cache_owner=w1,
+            solution_type=installed_solution,
+        )
     )
     w1_scale = _required_tensor(layer, "w13_weight_scale")
     w2_scale = _required_tensor(layer, "w2_weight_scale")
@@ -887,7 +1068,7 @@ def apply_aiter_w8a8_fp8_moe(
     expert_map = getattr(layer, "_expert_map", None)
     expert_mask = getattr(layer, "expert_mask", None)
     if moe_config is None:
-        if installed_solution is not None:
+        if installed_solution not in (None, "native"):
             raise HcuCompressedTensorsMoeError(
                 "AITER has no solution compatible with installed FP8 weights"
             )
@@ -923,11 +1104,10 @@ def apply_aiter_w8a8_fp8_moe(
         moe_config,
         installed_solution=installed_solution,
     )
-    prepared_w1_scale, prepared_w2_scale = prepare_aiter_moe_scales(
+    prepared_w1_scale, prepared_w2_scale = _scales_for_selected_config(
         w1_scale,
         w2_scale,
         moe_config,
-        cache_owner=w1_scale,
     )
     aiter_expert_map = aiter_expert_map_for_solution(
         expert_map,
@@ -1110,6 +1290,8 @@ __all__ = [
     "build_aiter_w4a16_quant_config",
     "create_aiter_w4a16_qzeros",
     "install_aiter_moe_weight_layout",
+    "install_aiter_moe_scale_layout",
+    "mark_aiter_moe_native_layout",
     "prewarm_aiter_w4a8_moe",
     "prepare_vllm_w4a8_moe",
     "process_dpsk_deepgemm_weights",
