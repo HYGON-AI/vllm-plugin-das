@@ -24,7 +24,7 @@ else:
     
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMetadata
 import vllm_hcu.platforms.envs as henvs 
-from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.platforms.hcu import on_gfx93x, on_gfx938
 
 
 lightop_attention = None
@@ -888,6 +888,30 @@ def mqa_logits_module():
     return None
 
 
+def _rocm_fp8_mqa_logits_gfx936_bf16_fallback(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Run the gfx936 LightOp compatibility path with BF16 Q/K inputs.
+
+    The gfx936 sparse-indexer cache path gathers K as BF16 and does not produce
+    a valid per-token FP8 scale.  LightOp 0.6.0 returns zero logits for FP8 Q/K
+    inputs on gfx936, so discard the unused scale and use the BF16 ABI instead.
+    """
+    k_bf16, _uninitialized_scale = kv
+    return _get_lightop_attention().mqa_logits(
+        q.to(torch.bfloat16),
+        k_bf16,
+        weights.float().contiguous(),
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        None,
+    )
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -900,9 +924,10 @@ def rocm_fp8_mqa_logits(
     Args:
         q: Query tensor of shape [M, H, D]. Casted to
             `torch.float8_e4m3fn` by caller.
-        kv: Tuple `(k_fp8, k_scales)` where `k_fp8` has shape [N, D] with
-            dtype `torch.float8_e4m3fn` and `k_scales` has shape [N] (or
-            [N, 1]) with dtype `torch.float32`.
+        kv: Tuple ``(k_tensor, k_scales)``. On gfx938, ``k_tensor`` is FP8
+            and ``k_scales`` contains valid float32 scales. On gfx936,
+            ``k_tensor`` is BF16 from the compatibility cache path and
+            ``k_scales`` is uninitialized and discarded by the fallback.
         weights: weights of shape [M, H], dtype `torch.float32`.
         cu_seqlen_ks: Start indices (inclusive) for valid K per query position,
             shape [M], dtype int32.
@@ -925,6 +950,20 @@ def rocm_fp8_mqa_logits(
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
         k_fp8, scale = kv
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+    elif current_platform.is_rocm() and on_gfx938():
+        k_fp8, scale = kv
+        return _get_lightop_attention().mqa_logits(
+            q,
+            k_fp8,
+            weights.float().contiguous(),
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            scale,
+        )
+    elif current_platform.is_rocm() and on_gfx93x() and not on_gfx938():
+        return _rocm_fp8_mqa_logits_gfx936_bf16_fallback(
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
     elif current_platform.is_rocm():
         k_fp8, scale = kv
         return _get_lightop_attention().mqa_logits(
@@ -935,15 +974,6 @@ def rocm_fp8_mqa_logits(
             cu_seqlen_ke,
             scale,
         )
-        # mqa_logits_inner_chunked(
-        #     chunk,
-        #     q_fp8,
-        #     k_fp8,
-        #     weights,
-        #     scale,
-        #     topk_indices_buffer,
-        #     topk_tokens,
-        # )
     else:
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
