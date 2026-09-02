@@ -20,6 +20,7 @@ from vllm.model_executor.utils import replace_parameter
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
     HcuAiterMoeDispatchError,
+    aiter_moe_weight_layout_signature,
     prepare_aiter_moe_weights,
     select_aiter_moe_config,
 )
@@ -79,12 +80,12 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             activation=str(activation),
             use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
         )
+        config = select_aiter_moe_config(
+            problem,
+            cache_owner=original_w13,
+            solution_type="asm" if problem.use_shuffle else None,
+        )
         if problem.use_shuffle:
-            config = select_aiter_moe_config(
-                problem,
-                cache_owner=original_w13,
-                solution_type="asm",
-            )
             if config is None or not bool(getattr(config, "need_shuffle", False)):
                 raise HcuAiterMoeDispatchError(
                     "HCU AITER BF16 MoE requires an ASM shuffle solution before "
@@ -98,8 +99,33 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             )
             replace_parameter(layer, "w13_weight", shuffled_w13)
             replace_parameter(layer, "w2_weight", shuffled_w2)
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
+        elif config is not None and bool(getattr(config, "need_shuffle", False)):
+            raise HcuAiterMoeDispatchError(
+                "HCU AITER selected a shuffle solution for canonical BF16 "
+                "weights; " + problem.describe()
+            )
+
+        if config is not None:
+            solution = getattr(config, "solution_type", None)
+            solution = getattr(solution, "value", solution)
+            if solution is None:
+                raise HcuAiterMoeDispatchError(
+                    "HCU AITER selected a BF16 MoE config without a solution type"
+                )
+            solution = str(solution).rsplit(".", 1)[-1].lower()
+            if not solution:
+                raise HcuAiterMoeDispatchError(
+                    "HCU AITER selected a BF16 MoE config without a solution type"
+                )
+            layout = aiter_moe_weight_layout_signature(config)
+        else:
+            solution = "native"
+            layout = None
+        for weight in (layer.w13_weight, layer.w2_weight):
+            weight.is_shuffled = bool(problem.use_shuffle)
+            weight._hcu_aiter_moe_solution_type = solution
+            if layout is not None:
+                weight._hcu_aiter_moe_weight_layout = layout
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         self.moe_kernel = make_unquantized_moe_kernel(

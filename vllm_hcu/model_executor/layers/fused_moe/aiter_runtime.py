@@ -21,6 +21,7 @@ import torch
 
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
+    aiter_moe_weight_layout_signature,
     execute_aiter_moe,
     prepare_aiter_moe_weights,
     resolve_aiter_expert_maps,
@@ -885,11 +886,29 @@ def fused_moe_impl(
         raise HcuAiterRuntimeError(
             "HCU AITER W16A16 weights have inconsistent shuffle state"
         )
-    aiter_config = select_aiter_moe_config(
-        problem,
-        cache_owner=w1,
-        solution_type="asm" if weights_are_shuffled else None,
-    )
+    installed_solution = getattr(w1, "_hcu_aiter_moe_solution_type", None)
+    if installed_solution != getattr(
+        w2, "_hcu_aiter_moe_solution_type", None
+    ):
+        raise HcuAiterRuntimeError(
+            "HCU AITER W16A16 weights have inconsistent installed solutions"
+        )
+    if installed_solution == "native":
+        if weights_are_shuffled:
+            raise HcuAiterRuntimeError(
+                "HCU AITER native fallback cannot use shuffled W16A16 weights"
+            )
+        aiter_config = None
+    else:
+        aiter_config = select_aiter_moe_config(
+            problem,
+            cache_owner=w1,
+            solution_type=(
+                installed_solution
+                if installed_solution is not None
+                else ("asm" if weights_are_shuffled else None)
+            ),
+        )
     if aiter_config is None:
         if weights_are_shuffled:
             raise HcuAiterRuntimeError(
@@ -927,6 +946,44 @@ def fused_moe_impl(
             expert_map=native_expert_map,
         )
 
+    selected_solution = getattr(aiter_config, "solution_type", None)
+    selected_solution = getattr(selected_solution, "value", selected_solution)
+    if selected_solution is None:
+        raise HcuAiterRuntimeError(
+            "AITER selected a W16A16 config without a solution type"
+        )
+    selected_solution = str(selected_solution).rsplit(".", 1)[-1].lower()
+    if not selected_solution:
+        raise HcuAiterRuntimeError(
+            "AITER selected a W16A16 config without a solution type"
+        )
+    if (
+        installed_solution is not None
+        and selected_solution != installed_solution
+    ):
+        raise HcuAiterRuntimeError(
+            "AITER selected a solution incompatible with installed W16A16 weights"
+        )
+    if installed_solution is not None and bool(
+        getattr(aiter_config, "need_shuffle", False)
+    ) != weights_are_shuffled:
+        raise HcuAiterRuntimeError(
+            "AITER config layout does not match installed W16A16 weights"
+        )
+    installed_layout = getattr(w1, "_hcu_aiter_moe_weight_layout", None)
+    if installed_layout != getattr(
+        w2, "_hcu_aiter_moe_weight_layout", None
+    ):
+        raise HcuAiterRuntimeError(
+            "HCU AITER W16A16 weights have inconsistent physical layouts"
+        )
+    if (
+        installed_layout is not None
+        and aiter_moe_weight_layout_signature(aiter_config) != installed_layout
+    ):
+        raise HcuAiterRuntimeError(
+            "AITER config physical layout does not match installed W16A16 weights"
+        )
     if weights_are_shuffled:
         if not bool(getattr(aiter_config, "need_shuffle", False)):
             raise HcuAiterRuntimeError(
@@ -940,9 +997,7 @@ def fused_moe_impl(
             aiter_config,
             cache_owner=w1,
         )
-    solution = getattr(aiter_config, "solution_type", None)
-    solution = getattr(solution, "value", solution)
-    if str(solution).rsplit(".", 1)[-1].upper() == "ASM":
+    if selected_solution == "asm":
         aiter_expert_map = expert_mask
     else:
         aiter_expert_map, _ = resolve_aiter_expert_maps(
