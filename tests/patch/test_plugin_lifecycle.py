@@ -339,6 +339,48 @@ print(
     }
 
 
+def test_ops_registration_defers_lightop_until_kernel_execution():
+    result = _fresh_python(
+        r'''
+import builtins
+import json
+import sys
+
+attempts = []
+real_import = builtins.__import__
+
+def reject_lightop(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "lightop" or name.startswith("lightop."):
+        attempts.append(name)
+        raise AssertionError(f"eager LightOp import: {name}")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = reject_lightop
+try:
+    import vllm_hcu.ops
+    import vllm_hcu.ops.fuse_moe_gate
+    import vllm_hcu.ops.test_concat
+    import vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse
+finally:
+    builtins.__import__ = real_import
+
+print(
+    json.dumps(
+        {
+            "attempts": attempts,
+            "loaded": sorted(
+                name for name in sys.modules if name == "lightop" or name.startswith("lightop.")
+            ),
+        }
+    )
+)
+'''
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {"attempts": [], "loaded": []}
+
+
 @pytest.mark.hcu
 def test_engine_core_first_import_does_not_patch_partial_modules_or_fallback():
     result = _fresh_python(

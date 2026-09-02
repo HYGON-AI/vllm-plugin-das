@@ -129,11 +129,11 @@ class DSparkDeepseekV4Model(_dspark.DSparkDeepseekV4Model):
             )
             attn = layer.attn
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = attn.kv_norm(qr_kv[..., attn.q_lora_rank :])
+            raw_kv = qr_kv[..., attn.q_lora_rank :]
             if slot_mapping is not None:
                 _insert_context_kv(
                     attn,
-                    kv,
+                    raw_kv,
                     context_positions,
                     slot_mapping,
                 )
@@ -167,31 +167,43 @@ class DSparkDeepseekV4Model(_dspark.DSparkDeepseekV4Model):
         )
 
 
-def _insert_context_kv(attn, kv, positions, slot_mapping) -> None:
+def _insert_context_kv(attn, raw_kv, positions, slot_mapping) -> None:
     """Insert DSpark context KV using the non-PCP HCU fused cache op."""
 
     swa_cache = attn.swa_cache_layer.kv_cache
     if swa_cache.dtype != torch.uint8:
+        normalized_kv = attn.kv_norm(raw_kv)
         return _dspark._insert_context_kv(
             attn,
-            kv,
+            normalized_kv,
             positions,
             slot_mapping,
         )
 
-    import lightop
+    try:
+        from lightop.attention import (
+            fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "DSpark DeepSeek V4 requires lightop.attention."
+            "fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32; "
+            "upgrade LightOp"
+        ) from exc
 
-    num_tokens = kv.shape[0]
+    num_tokens = raw_kv.shape[0]
     dummy_q = torch.zeros(
         (num_tokens, attn.n_local_heads, attn.head_dim),
-        dtype=kv.dtype,
-        device=kv.device,
+        dtype=raw_kv.dtype,
+        device=raw_kv.device,
     )
-    lightop.op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    swa_slot_mapping_i32 = slot_mapping.to(dtype=torch.int32).contiguous()
+    fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
         dummy_q,
-        kv,
+        raw_kv,
+        attn.kv_norm.weight.data,
         swa_cache.view(swa_cache.shape[0], -1),
-        slot_mapping,
+        swa_slot_mapping_i32,
         positions.to(torch.int64),
         attn.rotary_emb.cos_sin_cache,
         attn.eps,

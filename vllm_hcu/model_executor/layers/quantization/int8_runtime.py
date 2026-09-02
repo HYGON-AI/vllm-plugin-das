@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""HCU-owned INT8 linear implementation backed by LMSlim hipBLASLt."""
+"""HCU-owned INT8 linear implementation backed by W8A8 hipBLASLt."""
 
 from __future__ import annotations
 
@@ -110,11 +110,10 @@ def apply_int8_linear(
         x_q, x_scale = x_and_scale_quanted
     else:
         try:
-            from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-        except Exception as exc:
+            from lightop.quant import per_token_quant_int8
+        except (ImportError, AttributeError) as exc:
             raise HcuInt8LinearError(
-                "HCU W8A8 linear is enabled, but LMSlim per-token INT8 "
-                "quantization is unavailable"
+                "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
             ) from exc
         x_q, x_scale = per_token_quant_int8(input)
 
@@ -148,10 +147,10 @@ def apply_int8_linear(
         )
 
     try:
-        from lmslim import quant_ops
-    except Exception as exc:
+        from lightop.gemm_ops import hipblaslt_w8a8_gemm
+    except (ImportError, AttributeError) as exc:
         raise HcuInt8LinearError(
-            "HCU W8A8 linear is enabled, but LMSlim quant_ops is unavailable"
+            "HCU W8A8 linear requires lightop.gemm_ops.hipblaslt_w8a8_gemm"
         ) from exc
 
     x_q_2d = x_q.reshape(m, k).contiguous()
@@ -159,7 +158,7 @@ def apply_int8_linear(
     weight = weight.contiguous()
     weight_scale = weight_scale.contiguous()
     try:
-        status, output = quant_ops.hipblaslt_w8a8_gemm(
+        status, output = hipblaslt_w8a8_gemm(
             x_q_2d,
             weight,
             x_scale_2d,
@@ -172,11 +171,11 @@ def apply_int8_linear(
         )
     except Exception as exc:
         raise HcuInt8LinearError(
-            f"LMSlim hipBLASLt W8A8 GEMM failed for M={m}, N={n}, K={k}"
+            f"HCU hipBLASLt W8A8 GEMM failed for M={m}, N={n}, K={k}"
         ) from exc
     if status is not True or output.shape != (m, n):
         raise HcuInt8LinearError(
-            "LMSlim hipBLASLt W8A8 GEMM returned an invalid status or shape"
+            "HCU hipBLASLt W8A8 GEMM returned an invalid status or shape"
         )
     if bias is not None:
         output = output + bias

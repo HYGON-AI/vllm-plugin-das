@@ -3,11 +3,8 @@
 
 import torch
 from vllm.model_executor.layers.layernorm import RMSNorm
-from lightop import fused_add_rms_norm
-from lightop.op import rmsnorm_forward_autograd
 from vllm.utils.torch_utils import direct_register_custom_op
 import vllm_hcu.platforms.envs as henvs
-
 
 # lightop's HCU RMSNorm kernel currently rejects reductions narrower than one
 # wave.  Small Mamba projections (for example Falcon-Mamba's time_step_rank
@@ -23,6 +20,8 @@ def _hcu_rmsnorm_forward_autograd_impl(
     variance_epsilon: float,
     training: bool,
 ) -> torch.Tensor:
+    from lightop.norm import rmsnorm_forward_autograd
+
     return rmsnorm_forward_autograd(x, weight, variance_epsilon, training)
 
 
@@ -41,6 +40,8 @@ def _hcu_fused_add_rms_norm_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.norm import fused_add_rms_norm
+
     fused_add_rms_norm(x, residual, weight, variance_epsilon)
     return x, residual
 

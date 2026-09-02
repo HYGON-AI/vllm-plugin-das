@@ -6,8 +6,8 @@
 
 The AITER INT8 branch keeps canonical weights at load time and delegates
 shape/config selection, derived layouts, public execution, and native Triton
-fallback to ``compressed_tensors_moe_runtime``. The non-AITER branch retains
-the LMSlim Marlin layout and execution path.
+fallback to ``compressed_tensors_moe_runtime``. The non-AITER branch uses the
+LightOp Marlin layout and execution path.
 """
 import enum
 import torch
@@ -299,7 +299,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             i_q: torch.Tensor | None = None,
             i_s: torch.Tensor | None = None,
     ):
-        from lmslim.layers.fused_moe.fuse_moe_fp8_marlin import fused_experts_impl_fp8_marlin
+        from lightop.moe import fused_experts_impl_fp8_marlin
         return fused_experts_impl_fp8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -602,7 +602,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
         # Default Marlin INT8 path
 
-        from lmslim.layers.fused_moe.fuse_moe_int8_marlin import fused_experts_impl_int8_marlin
+        from lightop.moe import fused_experts_impl_int8_marlin
         return fused_experts_impl_int8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,

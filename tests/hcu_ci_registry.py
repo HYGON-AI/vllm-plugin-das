@@ -31,7 +31,7 @@ register_hcu_ci(
 register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
-    est_time=30,
+    est_time=330,
 )
 
 register_hcu_ci(
@@ -73,6 +73,11 @@ register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_hcu_model_runner_packed_kv_contract.py",
     est_time=180,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_lightop_categorized_api.py",
+    est_time=60,
 )
 
 register_hcu_ci(

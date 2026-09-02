@@ -3,11 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
-"""
-HCU version of UnquantizedFusedMoEMethod.
-Inherits from vllm's version and overrides process_weights_after_loading
-to preserve canonical AITER weights while initializing the MoE kernel.
-"""
+"""HCU unquantized MoE integration."""
 
 from __future__ import annotations
 
@@ -20,9 +16,13 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod as _Original,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
-    prewarm_aiter_moe_config,
+    HcuAiterMoeDispatchError,
+    aiter_moe_weight_layout_signature,
+    prepare_aiter_moe_weights,
+    select_aiter_moe_config,
 )
 from vllm_hcu.platforms import envs as henvs
 
@@ -48,11 +48,62 @@ def _expert_routing_tables(
 
     return None
 
-class HcuUnquantizedFusedMoEMethod(_Original):
-    """HCU version of UnquantizedFusedMoEMethod.
 
-    Initializes the AITER runner without replacing canonical model weights.
-    """
+def _has_installed_aiter_layout(
+    layer: torch.nn.Module,
+    *,
+    activation: object,
+) -> bool:
+    """Return whether the current parameter pair is already runtime-ready."""
+
+    w13 = getattr(layer, "w13_weight", None)
+    w2 = getattr(layer, "w2_weight", None)
+    if not isinstance(w13, torch.Tensor) or not isinstance(w2, torch.Tensor):
+        return False
+    solution = getattr(w13, "_hcu_aiter_moe_solution_type", None)
+    logical_shape = getattr(w13, "_hcu_aiter_moe_logical_shape", None)
+    layout = getattr(w13, "_hcu_aiter_moe_weight_layout", None)
+    shuffled = getattr(w13, "is_shuffled", None)
+    if (
+        solution is None
+        or solution != getattr(w2, "_hcu_aiter_moe_solution_type", None)
+        or logical_shape != getattr(w2, "_hcu_aiter_moe_logical_shape", None)
+        or layout != getattr(w2, "_hcu_aiter_moe_weight_layout", None)
+        or shuffled != getattr(w2, "is_shuffled", None)
+        or not isinstance(logical_shape, tuple)
+        or len(logical_shape) != 4
+    ):
+        return False
+    try:
+        experts, w13_n, _w2_k, logical_k = map(int, logical_shape)
+    except (TypeError, ValueError):
+        return False
+    physical_k = logical_k
+    if shuffled:
+        if not isinstance(layout, tuple) or len(layout) != 4:
+            return False
+        padded_k = layout[3]
+        if padded_k is not None:
+            try:
+                physical_k = int(padded_k)
+            except (TypeError, ValueError):
+                return False
+    activation = str(getattr(activation, "value", activation)).lower()
+    gated = activation in {
+        "silu",
+        "situ",
+        "gelu",
+        "swigluoai",
+        "swiglustep",
+        "gelu_tanh",
+    }
+    expected_w13 = (experts, w13_n, physical_k)
+    expected_w2 = (experts, physical_k, w13_n // 2 if gated else w13_n)
+    return tuple(w13.shape) == expected_w13 and tuple(w2.shape) == expected_w2
+
+
+class HcuUnquantizedFusedMoEMethod(_Original):
+    """Install the AITER ASM layout once instead of caching a second copy."""
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (
@@ -62,8 +113,75 @@ class HcuUnquantizedFusedMoEMethod(_Original):
         ):
             return super().process_weights_after_loading(layer)
 
-        if getattr(layer, "_hcu_aiter_moe_initialized", False):
+        activation = getattr(self.moe.activation, "value", self.moe.activation)
+        if _has_installed_aiter_layout(layer, activation=activation):
             return
+
+        original_w13 = layer.w13_weight
+        original_w2 = layer.w2_weight
+        problem = AiterMoeProblem(
+            M=1,
+            E=int(self.moe.num_experts),
+            N1=int(original_w13.shape[1]),
+            N2=int(original_w2.shape[1]),
+            K=int(original_w13.shape[2]),
+            top_k=int(self.moe.experts_per_token),
+            block_size=0,
+            dtype=self.moe.in_dtype,
+            device=original_w13.device,
+            quant_type="w16a16",
+            activation=str(activation),
+            use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+        )
+        config = select_aiter_moe_config(
+            problem,
+            cache_owner=original_w13,
+            solution_type="asm" if problem.use_shuffle else None,
+        )
+        if config is not None and problem.use_shuffle:
+            if not bool(getattr(config, "need_shuffle", False)):
+                raise HcuAiterMoeDispatchError(
+                    "HCU AITER BF16 MoE requires an ASM shuffle solution before "
+                    "installing the runtime weight layout; " + problem.describe()
+                )
+            shuffled_w13, shuffled_w2 = prepare_aiter_moe_weights(
+                original_w13,
+                original_w2,
+                config,
+                cache_owner=object(),
+            )
+            replace_parameter(layer, "w13_weight", shuffled_w13)
+            replace_parameter(layer, "w2_weight", shuffled_w2)
+        elif config is not None and bool(getattr(config, "need_shuffle", False)):
+            raise HcuAiterMoeDispatchError(
+                "HCU AITER selected a shuffle solution for canonical BF16 "
+                "weights; " + problem.describe()
+            )
+
+        if config is not None:
+            solution = getattr(config, "solution_type", None)
+            solution = getattr(solution, "value", solution)
+            if solution is None:
+                raise HcuAiterMoeDispatchError(
+                    "HCU AITER selected a BF16 MoE config without a solution type"
+                )
+            solution = str(solution).rsplit(".", 1)[-1].lower()
+            if not solution:
+                raise HcuAiterMoeDispatchError(
+                    "HCU AITER selected a BF16 MoE config without a solution type"
+                )
+            layout = aiter_moe_weight_layout_signature(config)
+        else:
+            solution = "native"
+            layout = None
+        installed_shuffle = bool(config is not None and problem.use_shuffle)
+        logical_shape = (problem.E, problem.N1, problem.N2, problem.K)
+        for weight in (layer.w13_weight, layer.w2_weight):
+            weight.is_shuffled = installed_shuffle
+            weight._hcu_aiter_moe_solution_type = solution
+            weight._hcu_aiter_moe_logical_shape = logical_shape
+            if layout is not None:
+                weight._hcu_aiter_moe_weight_layout = layout
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         self.moe_kernel = make_unquantized_moe_kernel(
@@ -73,22 +191,3 @@ class HcuUnquantizedFusedMoEMethod(_Original):
             experts_cls=self.experts_cls,
             routing_tables=_expert_routing_tables(layer),
         )
-        activation = getattr(self.moe.activation, "value", self.moe.activation)
-        prewarm_aiter_moe_config(
-            AiterMoeProblem(
-                M=1,
-                E=int(self.moe.num_experts),
-                N1=int(layer.w13_weight.shape[1]),
-                N2=int(layer.w2_weight.shape[1]),
-                K=int(layer.w13_weight.shape[2]),
-                top_k=int(self.moe.experts_per_token),
-                block_size=0,
-                dtype=self.moe.in_dtype,
-                device=layer.w13_weight.device,
-                quant_type="w16a16",
-                activation=str(activation),
-                use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
-            ),
-            cache_owner=layer.w13_weight,
-        )
-        layer._hcu_aiter_moe_initialized = True

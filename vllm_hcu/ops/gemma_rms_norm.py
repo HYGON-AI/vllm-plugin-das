@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-import os
 import torch
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-import lightop.op as op
 import vllm_hcu.platforms.envs as henvs
-    
+
 @GemmaRMSNorm.register_oot
 class HcuGemmaRMSNorm(GemmaRMSNorm):
     def forward_hip(
@@ -14,14 +12,15 @@ class HcuGemmaRMSNorm(GemmaRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if  henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM:
+        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM:
+            from lightop.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+
             if residual is None:
                 out = x.clone()
-                op.gemma_rmsnorm(out, x, self.weight, self.variance_epsilon)
+                gemma_rmsnorm(x, self.weight, self.variance_epsilon, out=out)
                 return out
             else:
-                out = x.clone()
-                op.gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
+                gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
                 return x, residual
         else:
             if torch.compiler.is_compiling():

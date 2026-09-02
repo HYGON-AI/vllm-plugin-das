@@ -16,6 +16,10 @@ from __future__ import annotations
 import importlib
 import threading
 
+from vllm_hcu.lightop_env import configure_lightop_environment
+
+configure_lightop_environment()
+
 from vllm_hcu.compatibility import (
     VllmCompatibilityError,
     ensure_vllm_compatible,

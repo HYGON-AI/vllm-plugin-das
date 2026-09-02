@@ -53,11 +53,12 @@ def test_compressor_mm_accepts_hcu_nn_and_upstream_nt_layouts(
 def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[torch.dtype, int]] = []
+    calls: list[tuple[torch.dtype, torch.dtype, bool, object, int]] = []
 
     def lightop_insert(
         q,
         kv,
+        kv_norm_weight,
         cache,
         slot_mapping,
         positions,
@@ -65,25 +66,32 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
         eps,
         block_size,
     ) -> None:
-        del kv, slot_mapping, cos_sin_cache, eps
-        calls.append((positions.dtype, block_size))
+        del kv, cos_sin_cache, eps
+        calls.append(
+            (
+                positions.dtype,
+                slot_mapping.dtype,
+                slot_mapping.is_contiguous(),
+                kv_norm_weight,
+                block_size,
+            )
+        )
         q.add_(4)
         cache.fill_(9)
 
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []  # type: ignore[attr-defined]
+    lightop_attention = ModuleType("lightop.attention")
+    lightop_attention.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32 = (
+        lightop_insert
+    )
+    lightop.attention = lightop_attention  # type: ignore[attr-defined]
     monkeypatch.setitem(
         sys.modules,
         "lightop",
-        SimpleNamespace(
-            op=SimpleNamespace(
-                fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert=(
-                    lightop_insert
-                ),
-                fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp=(
-                    lambda *args: pytest.fail("PCP LightOp must not be called")
-                ),
-            )
-        ),
+        lightop,
     )
+    monkeypatch.setitem(sys.modules, "lightop.attention", lightop_attention)
 
     class DeepseekV4Attention:
         def __init__(
@@ -96,6 +104,10 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
             del vllm_config, prefix, topk_indices_buffer, aux_stream_list
 
         def attn_gemm_parallel_execute(self, hidden_states):
+            return hidden_states
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
             return hidden_states
 
         def _fused_qnorm_rope_kv_insert(
@@ -131,8 +143,12 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     )
     attention.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(4))
     attention.eps = 1e-6
+    kv_norm_weight = object()
+    attention.kv_norm = SimpleNamespace(
+        weight=SimpleNamespace(data=kv_norm_weight)
+    )
     metadata = SimpleNamespace(
-        slot_mapping=torch.tensor([3], dtype=torch.int64),
+        slot_mapping=torch.tensor([3, 99], dtype=torch.int64)[::2],
         block_size=16,
     )
     q = torch.zeros((1, 2, 4))
@@ -145,7 +161,7 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     )
 
     assert result is q
-    assert calls == [(torch.int64, 16)]
+    assert calls == [(torch.int64, torch.int32, True, kv_norm_weight, 16)]
     assert q.tolist() == [[[4.0] * 4, [4.0] * 4]]
     assert torch.count_nonzero(attention.swa_cache_layer.kv_cache == 9) == 32
 
@@ -165,6 +181,10 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
             seen_ignore.append(list(vllm_config.quant_config.ignore))
 
         def attn_gemm_parallel_execute(self, hidden_states):
+            return hidden_states
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
             return hidden_states
 
         def _fused_qnorm_rope_kv_insert(

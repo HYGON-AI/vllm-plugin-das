@@ -22,12 +22,14 @@ from ._common import (
 TARGET_MODULE = "vllm.models.deepseek_v4.attention"
 PATCH_ID = "worker.core_fix.deepseek_v4.attention_compressor_weight_layout"
 _INIT_TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Attention.__init__"
+_FORWARD_TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Attention.forward"
 TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Attention.attn_gemm_parallel_execute"
 _INSERT_TARGET_SYMBOL = (
     f"{TARGET_MODULE}.DeepseekV4Attention._fused_qnorm_rope_kv_insert"
 )
 _CLASS_MARKER = "_vllm_hcu_compressor_weight_layout_applied"
 _INIT_WRAPPER_MARKER = "_vllm_hcu_int8_wo_a_ignore_wrapper"
+_FORWARD_WRAPPER_MARKER = "_vllm_hcu_raw_kv_caller_wrapper"
 _WRAPPER_MARKER = "_vllm_hcu_compressor_weight_layout_wrapper"
 _INSERT_WRAPPER_MARKER = "_vllm_hcu_fp8_ds_mla_lightop_insert_wrapper"
 
@@ -57,10 +59,12 @@ def apply_to_module(module: ModuleType) -> bool:
     original = require_callable(cls, "attn_gemm_parallel_execute", TARGET_SYMBOL)
     if getattr(cls, _CLASS_MARKER, False):
         current_init = vars(cls).get("__init__")
+        current_forward = vars(cls).get("forward")
         current = vars(cls).get("attn_gemm_parallel_execute")
         current_insert = vars(cls).get("_fused_qnorm_rope_kv_insert")
         if not (
             getattr(current_init, _INIT_WRAPPER_MARKER, False)
+            and getattr(current_forward, _FORWARD_WRAPPER_MARKER, False)
             and getattr(current, _WRAPPER_MARKER, False)
             and getattr(current_insert, _INSERT_WRAPPER_MARKER, False)
         ):
@@ -88,6 +92,13 @@ def apply_to_module(module: ModuleType) -> bool:
         original,
         TARGET_SYMBOL,
         positional=("self", "hidden_states"),
+    )
+    original_forward = require_callable(cls, "forward", _FORWARD_TARGET_SYMBOL)
+    require_exact_signature(
+        original_forward,
+        _FORWARD_TARGET_SYMBOL,
+        positional=("self", "positions", "hidden_states", "llama_4_scaling"),
+        defaults={"llama_4_scaling": None},
     )
     original_insert = require_callable(
         cls,
@@ -141,6 +152,47 @@ def apply_to_module(module: ModuleType) -> bool:
             quant_config.ignore = previous_ignore
 
     setattr(hcu_attention_init, _INIT_WRAPPER_MARKER, True)
+
+    @functools.wraps(original_forward)
+    def hcu_attention_forward(
+        self,
+        positions,
+        hidden_states,
+        llama_4_scaling=None,
+    ):
+        # Upstream normalizes QR and KV together before attention_impl. The
+        # uint8 LightOp insert owns KVNorm itself, so keep KV raw here and let
+        # the insert wrapper normalize it only for official non-uint8 caches.
+        del llama_4_scaling
+        num_tokens = hidden_states.shape[0]
+        o_padded = torch.empty(
+            (num_tokens, self.padded_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            self.attn_gemm_parallel_execute(hidden_states)
+        )
+        qr, raw_kv = qr_kv.split(
+            [self.q_lora_rank, self.head_dim], dim=-1
+        )
+        qr = self.q_norm(qr)
+
+        self.attention_impl(
+            hidden_states,
+            qr,
+            raw_kv,
+            kv_score,
+            indexer_kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+        output = o_padded[:, : self.n_local_heads, :]
+        return self._o_proj(output, positions)
+
+    setattr(hcu_attention_forward, _FORWARD_WRAPPER_MARKER, True)
 
     @functools.wraps(original)
     def hcu_attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
@@ -209,24 +261,35 @@ def apply_to_module(module: ModuleType) -> bool:
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         if swa_kv_cache.dtype != torch.uint8:
-            return original_insert(self, q, kv, positions, attn_metadata)
+            normalized_kv = self.kv_norm(kv)
+            return original_insert(
+                self, q, normalized_kv, positions, attn_metadata
+            )
 
         swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
         assert swa_metadata is not None
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
-        import lightop
+        try:
+            from lightop.attention import (
+                fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32,
+            )
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "DeepSeek V4 core fix requires lightop.attention."
+                "fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32; "
+                "upgrade LightOp"
+            ) from exc
 
-        insert = require_callable(
-            lightop.op,
-            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-            "lightop.op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-        )
-        insert(
+        swa_slot_mapping_i32 = swa_metadata.slot_mapping.to(
+            dtype=torch.int32
+        ).contiguous()
+        fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
             q,
             kv,
+            self.kv_norm.weight.data,
             swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
+            swa_slot_mapping_i32,
             positions.to(torch.int64),
             self.rotary_emb.cos_sin_cache,
             self.eps,
@@ -236,9 +299,11 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_fused_qnorm_rope_kv_insert, _INSERT_WRAPPER_MARKER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
+    setattr(cls, "_vllm_hcu_original_forward", original_forward)
     setattr(cls, "_vllm_hcu_original_attn_gemm_parallel_execute", original)
     setattr(cls, "_vllm_hcu_original_fused_qnorm_rope_kv_insert", original_insert)
     setattr(cls, "__init__", hcu_attention_init)
+    setattr(cls, "forward", hcu_attention_forward)
     setattr(cls, "attn_gemm_parallel_execute", hcu_attn_gemm_parallel_execute)
     setattr(cls, "_fused_qnorm_rope_kv_insert", hcu_fused_qnorm_rope_kv_insert)
     setattr(cls, _CLASS_MARKER, True)

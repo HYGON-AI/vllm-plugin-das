@@ -47,7 +47,10 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
+    VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
+    VLLM_HCU_USE_GLOBAL_MOE_CACHE: bool = False
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
+    VLLM_HCU_USE_FUSE_SILU_AND_MUL: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
@@ -313,9 +316,25 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "False").lower() in
                  ("true", "1")),
 
+    # Optional override for LightOp's fused-MoE chunk size.
+    "VLLM_HCU_FUSED_MOE_CHUNK_SIZE":
+        lambda: maybe_convert_int(
+            os.getenv("VLLM_HCU_FUSED_MOE_CHUNK_SIZE", None)
+        ),
+
+    # Use LightOp's global MoE cache.
+    "VLLM_HCU_USE_GLOBAL_MOE_CACHE":
+        lambda: (os.environ.get("VLLM_HCU_USE_GLOBAL_MOE_CACHE", "False").lower() in
+                 ("true", "1")),
+
     # If use fused rmsnorm and quant, please set True
     "VLLM_HCU_USE_FUSED_RMS_QUANT":
         lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "False").lower() in
+                 ("true", "1")),
+
+    # If set, use LightOp's fused SiLU-and-multiply kernel.
+    "VLLM_HCU_USE_FUSE_SILU_AND_MUL":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSE_SILU_AND_MUL", "False").lower() in
                  ("true", "1")),
 
     # If use fused silu and mul and quant, please set True

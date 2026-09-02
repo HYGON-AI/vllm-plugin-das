@@ -22,24 +22,32 @@ def initialize_proposer(
     proposer._hcu_feature_config = config
     proposer.runner = runner
 
-    # HCU FlashMLA sparse explicitly supports speculative tokens as decode
-    # queries, but target vLLM v0.25.1 does not include its metadata class in
-    # the ROCm multi-step drafting allowlist.  Keep the target proposer and
-    # extend only the HCU-owned backend capability registration.
-    try:
-        from vllm.v1.attention.backends.mla.flashmla_sparse import (
-            FlashMLASparseMetadata,
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name != "vllm.v1.attention.backends.mla.flashmla_sparse":
-            raise
-    else:
-        allowed_attn_types = getattr(proposer, "allowed_attn_types", None)
-        if (
-            allowed_attn_types is not None
-            and FlashMLASparseMetadata not in allowed_attn_types
-        ):
-            proposer.allowed_attn_types += (FlashMLASparseMetadata,)
+    # HCU attention backends support speculative tokens as decode queries,
+    # but target vLLM v0.25.1 cannot discover plugin-owned metadata classes
+    # for its ROCm multi-step drafting allowlist.
+    allowed_attn_types = getattr(proposer, "allowed_attn_types", None)
+    if allowed_attn_types is not None:
+        try:
+            from vllm.v1.attention.backends.mla.flashmla_sparse import (
+                FlashMLASparseMetadata,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "vllm.v1.attention.backends.mla.flashmla_sparse":
+                raise
+        else:
+            if FlashMLASparseMetadata not in proposer.allowed_attn_types:
+                proposer.allowed_attn_types += (FlashMLASparseMetadata,)
+
+        try:
+            from vllm_hcu.v1.attention.backends.flash_attn import (
+                FlashAttentionMetadata,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "flash_attn":
+                raise
+        else:
+            if FlashAttentionMetadata not in allowed_attn_types:
+                proposer.allowed_attn_types += (FlashAttentionMetadata,)
 
     proposer.enable_multi_layers_mtp = config.enable_multi_layers_mtp
     proposer.enable_lightly_cp = config.enable_lightly_cp

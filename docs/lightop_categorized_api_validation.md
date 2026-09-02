@@ -1,0 +1,508 @@
+# LightOp categorized API validation
+
+Validation date: 2026-09-01 UTC
+
+## Environment
+
+- Repository: `/models/.worktrees/vllm-plugin-das-lightop-no-lmslim`
+- Repository-test vLLM source: `/models/zb/vllm_025/vllm`
+- Live-HCU vLLM root: `/usr/local/lib/python3.10/dist-packages` (the matching
+  installed binary package and compiled extensions)
+- Python: 3.10.12
+- pytest: 9.1.1
+- torch: `2.11.0+das.opt1.dtk2604.202604021232.g1175f0`
+- vLLM: `0.25.1+das185.dtk2604.torch2110.2608171710.g7b108a`
+- LightOp: `0.6.0+das.dtk2604.torch2110.2608171227.g8c835c`
+- AITER: `0.1.5+das185.dtk2604.torch2110.2608180853.g40a705`
+- DeepGEMM: `2.1.0+das185.dtk2604.torch2110.2608171132.g493d80`
+- LMSlim: `0.3.1+das.opt4.dtk2604.torch2110.2608171800.gf9a687`
+  remains installed but is not imported or called by plugin production code.
+  The Docker `das-install lmslim` line is outside this change by design.
+- `vllm-plugin-das` is exercised from the worktree and is not installed as a
+  distribution in this environment.
+
+At 2026-09-01T02:25:38Z all eight BW1100 devices were owned by an unrelated
+DP8 vLLM job at approximately 143.6--144.0 GiB of 147.4 GiB VRAM each. No
+process was signalled or terminated. At 2026-09-01T02:45:34Z physical devices
+0, 1, 5, 6, and 7 had returned to their approximately 6.1 GiB baseline while
+devices 2--4 remained occupied. The live suites selected physical device 7
+with `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7`.
+
+## Boundary TDD and residual audit
+
+The final production scan passed immediately after the scanner was written,
+so a copied temporary production fixture was mutated with `import lmslim`.
+The targeted RED command was:
+
+```text
+python -m pytest -q tests/patch/test_lightop_api_boundary.py::test_scanner_rejects_external_lmslim_with_location
+```
+
+It exited 1 with one failed test and the exact detected diagnostic
+`vllm_hcu/mutation.py:1: external LMSlim import 'lmslim'`. The permanent
+mutation test now also proves file-and-line diagnostics for `lightop.op`,
+`lightop.gemmopt`, a moved package-root import, and an aliased package-root
+attribute call. The final command exits 0 with 3 passed:
+
+```text
+python -m pytest -q tests/patch/test_lightop_api_boundary.py
+```
+
+The final scanner audit reports:
+
+```text
+violations: []
+categorized symbols: 30
+allowed top-level calls: 2
+```
+
+The two exceptions are present exactly once, and only in
+`vllm_hcu/model_executor/layers/fused_moe/experts/dpsk_v4_deep_gemm_moe.py`:
+
+- `fuse_silu_mul_clamp_quant`
+- `fuse_silu_mul_clamp_quant_ep`
+
+The clamp exception is accepted only when `_lightop_clamp` is the exact cached
+resolver: one `name` argument, one exact membership guard whose sole body is
+`raise AttributeError(name)`, one exact `import lightop`, and one exact
+`return getattr(lightop, name)`. Extra statements, branches, assignments,
+decorators beyond the required one, lookups, missing calls, duplicated calls,
+and broadened/stale names are rejected; the one exact `lru_cache` decorator is
+required.
+`_lightop_activation` has an equally exact categorized resolver
+shape; every call to it must pass one literal symbol. Literal category
+`getattr` calls are recorded, while unsupported dynamic category lookups are
+rejected. The 30 categorized production symbols are:
+
+```text
+lightop.activation.fuse_silu_mul_fp8_quant
+lightop.activation.fuse_silu_mul_fp8_quant_ep
+lightop.activation.fuse_silu_mul_per_token_quant
+lightop.activation.fuse_silu_mul_quant
+lightop.activation.fuse_silu_mul_quant_ep
+lightop.activation.silu_and_mul_opt
+lightop.attention.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32
+lightop.attention.mqa_logits
+lightop.attention.paged_mqa_logits
+lightop.attention.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant
+lightop.attention.top_k_per_row_decode
+lightop.attention.top_k_per_row_prefill
+lightop.gemm_ops.hipblaslt_w8a8_gemm
+lightop.gemm_ops.m_grouped_w8a8_gemm_nt_contig_asm
+lightop.gemm_ops.m_grouped_w8a8_gemm_nt_masked
+lightop.moe.ep_gather
+lightop.moe.ep_scatter
+lightop.moe.fused_experts_impl_fp8_marlin
+lightop.moe.fused_experts_impl_int8_marlin
+lightop.moe.moe_align_block_size_out
+lightop.moe.moe_fused_gate
+lightop.norm.fused_add_rms_norm
+lightop.norm.gemma_fused_add_rmsnorm
+lightop.norm.gemma_rmsnorm
+lightop.norm.rms_norm_dynamic_per_token_quant
+lightop.norm.rmsnorm_forward_autograd
+lightop.quant.per_token_quant_fp8
+lightop.quant.per_token_quant_int8
+lightop.sampling.top_k_top_p_sampling_from_probs
+lightop.tensor.ds_cat
+```
+
+Every symbol is in the installed category module's public `__all__`.
+The direct installed export contract validates each required module's
+`__all__` as a string-only, duplicate-free list/tuple, requires every pinned
+name to be a member, and separately requires every pinned name to remain a
+bound module attribute. This permanently pins exact
+`lightop.gemm_ops.hipblaslt_w8a8_gemm`. The audit scans only this repository's
+`vllm_hcu` package; it intentionally does not inspect or reject LightOp's own
+internal implementation namespaces.
+
+## Pre-final-review verification (historical)
+
+The commands in this section exited 0 before the final whole-branch review.
+They are retained as historical evidence and are superseded by the final-fix
+verification at implementation HEAD
+`07f5d261cc3fc3a5b567e870baceb55625f84dcd` below.
+
+| Command | Result |
+| --- | --- |
+| `git diff --check origin/v0.25.1...HEAD` | clean |
+| `python -m compileall -q vllm_hcu tests` | clean |
+| `python tools/check_production_boundary.py` | 248 Python files, clean |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/check_patch_test_coverage.py` | 96 files: 95 adapters, 1 helper, 0 untested, 0 invalid contracts |
+| `python -m pytest -q tests/patch/test_lightop_api_boundary.py` | 10 passed after fix round 1 |
+| `python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py` | 9 passed after fix round 1 |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract` | 1,199 passed, 82 deselected, 15 warnings in 332.99s |
+| `python tools/run_patch_tests.py --suite contract` | 1,207 passed, 82 deselected, 14 warnings in 310.54s against the installed vLLM root after the initial model-evidence commit and before its docs-only amendment |
+| `python tools/run_patch_tests.py --suite contract` | 1,207 passed, 82 deselected, 14 warnings in 304.70s against final commit `d034f84` after the docs-only amendment |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite integration-smoke -- -rs` | 73 passed, 3 skipped, 56 deselected in 3.62s |
+| `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite accuracy-hcu -- -k 'lightop or int8 or deepseek_v4 or dspark' -rs` | 41 passed, 98 deselected, 14 warnings in 24.24s |
+| `HIP_VISIBLE_DEVICES=7 CUDA_VISIBLE_DEVICES=7 env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract-hcu -- -k 'lightop or moe_align or deepseek_v4' -rs` | 7 passed, 1,135 deselected, 14 warnings in 22.20s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_hcu_ci_selector.py` | 44 passed |
+| `python .github/scripts/hcu_ci/verify_hcu_registration.py` | 40 registrations across 22 jobs; valid |
+
+Both historical contract totals remain above the documented 1,162-pass
+baseline. The source-checkout run's 15 warnings are one `vllm._version`
+runtime warning and
+14 third-party `torch.jit.script_method` deprecation warnings; the then-latest
+installed-root run and each historical live-HCU suite report only the same 14
+Torch deprecation warnings.
+
+The three integration-smoke skips are not counted as passes:
+
+- `tests/integration/graph/test_qwen35_9b_graph_parity.py::test_qwen35_9b_eager_graph_token_parity` — Qwen3.5-9B graph model path unavailable at `qwen3.5/Qwen3.5-9B`.
+- `tests/integration/lora/test_qwen3_4b_lora_switching.py::test_qwen3_4b_lora_adapter_switching` — Qwen3-4B LoRA base model path unavailable at `qwen3/Qwen3-4B`.
+- `tests/integration/models/test_qwen35_9b_smoke.py::test_qwen35_9b_greedy_generation_smoke` — Qwen3.5-9B model path unavailable at `qwen3.5/Qwen3.5-9B`.
+
+There were no skips in either selected live-HCU suite.
+
+## Qwen3.5 W8A8 model validation
+
+At 2026-09-01T03:30:14Z, a fresh read-only device check reported all eight
+BW1100 devices at 2 MiB used with no KFD PIDs. Port 18012 accepted a local
+bind probe, so the validation selected physical device 7 and retained the
+planned port. The server was started from this worktree with captured PID
+782837:
+
+```text
+export SELECTED_HCU=7
+export PLUGIN_ROOT=/models/.worktrees/vllm-plugin-das-lightop-no-lmslim
+export HIP_VISIBLE_DEVICES="$SELECTED_HCU"
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KV_CACHE_LAYOUT=HND
+export VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1
+export VLLM_HCU_USE_GLOBAL_MOE_CACHE=1
+export VLLM_CACHE_ROOT=/tmp/vllm-cache-qwen35-lightop
+export PYTHONPATH="${PLUGIN_ROOT}"
+
+vllm serve /models/Qwen3.5-35B-A3B-W8A8 \
+  --served-model-name qwen35-int8-lightop \
+  --tensor-parallel-size 1 \
+  --max-model-len 65536 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.90 \
+  --trust-remote-code \
+  --quantization slimquant_marlin \
+  --port 18012
+```
+
+The engine loaded 14 checkpoint shards and 36.7 GiB of weights, completed
+startup, and returned HTTP 200 for `/health`. The prescribed temperature-zero
+completion request also returned HTTP 200 with `finish_reason="stop"`, 9
+prompt tokens, 39 completion tokens, and this non-empty text:
+
+```text
+Interface stability is crucial because it ensures that changes to a system's
+internal implementation do not disrupt dependent components, thereby
+maintaining system reliability and reducing the cost of software evolution.
+```
+
+The runtime route is explicit in the server log:
+
+- line 11 records the requested `quantization='slimquant_marlin'`;
+- line 29 resolves it to `quantization=slimquant_compressed_tensors_marlin`;
+- lines 136--137 show LightOp successfully loading the Marlin W8A8 MoE UP and
+  DOWN code objects from `lightop/hsa/gfx938/moe_w8a8_channel`;
+- lines 926--929 record completed application startup, two successful health
+  requests, and the successful completion request.
+
+The case-insensitive LMSlim audit was run separately as:
+
+```text
+rg -ni 'lmslim' /tmp/vllm-hcu-lightop-qwen35/server.log
+```
+
+Its exact sole match is line 135 under LightOp's own internal
+`lightop._lmslim_native.vllm_compat` implementation namespace. It is not an
+import or external LMSlim fallback by plugin production code and is an
+explicit non-goal of this migration. The error/traceback scan found 47 repeated
+Torch Dynamo metrics-only serialization reports, all ending with
+`TypeError: Object of type function is not JSON serializable`; model startup,
+health, and generation continued successfully afterward. There was no LightOp
+ABI, kernel, dtype, shape, device, or external LMSlim fallback failure.
+
+Of the server processes, only captured API server PID 782837 was directly sent
+SIGTERM. Its engine child shut down, the API completed application shutdown,
+and the post-run process check found neither PID. Physical device 7 returned
+to 2 MiB used. Runtime evidence is at
+`/tmp/vllm-hcu-lightop-qwen35/server.log` and
+`/tmp/vllm-hcu-lightop-qwen35/response.json`.
+
+## Diagnosed non-final runs
+
+The first model health client inherited `ALL_PROXY=http://127.0.0.1:2097` and
+held its pre-start request open even after the server became healthy. A second
+bounded probe established HTTP 200; only the task-owned stuck curl PID 782840
+was terminated, after which the original loop retried successfully. The server
+remained PID 782837 throughout, and port 18012 did not require replacement.
+
+The first full contract run exited 1 with 17 failed, 1,211 passed, 53
+deselected, and 15 warnings. Four failures exposed cached real LightOp modules
+from the new export probe; three DeepGEMM fixtures still modeled the removed
+root API, four EPLB cases exposed an accidentally removed `SimpleNamespace`
+test import, and nine live unified-AITER cases lacked the `hcu` marker. A
+focused regression run after the corrections passed 12 with 12 correctly
+deselected. A later selector run intentionally failed because the newly
+HCU-marked export probe was not yet in the literal CI registry; the existing
+registration invariant covered that defect before its registry/map fix.
+
+The first selected accuracy-HCU run used the repository source checkout and
+reported 38 passed and 3 failed. The failures were confined to the upstream
+vLLM reference, whose source checkout has no compiled `_C.silu_and_mul` or
+`_moe_C.moe_align_block_size` extensions. Repeating the unchanged test
+selection against the installed vLLM binary root produced the final 41-pass
+result above.
+
+## Review fix round 1
+
+Permanent mutations now cover clamp-name reassignment, an extra post-guard
+branch, a broadened guard, a stale missing clamp caller, a nonliteral
+activation-resolver call, an unsupported dynamic category lookup, and a
+literal category lookup that must appear in the categorized-symbol audit. The
+export test also covers both failure directions: bound-but-not-public and
+public-but-not-bound.
+
+The pre-fix focused run exited 1 with 5 failed and 13 passed. The failures were
+the two resolver-shape evasions, nonliteral activation call, dynamic category
+lookup, and missing public-export assertion helper. After the fixes:
+
+```text
+python -m pytest -q tests/patch/test_lightop_api_boundary.py
+10 passed in 3.10s
+
+python -m pytest -q tests/runtime_patch/test_lightop_categorized_api.py
+9 passed in 2.80s
+
+VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -k 'lightop or hcu_ci or deep_gemm_utils'
+120 passed, 1169 deselected, 15 warnings in 56.87s
+```
+
+The affected HCU selector remains at 44 passed, and the registry remains valid
+with 40 registrations across 22 jobs.
+
+## Final whole-branch review fix wave
+
+The final-review implementation HEAD is
+`07f5d261cc3fc3a5b567e870baceb55625f84dcd` (`fix: close final LightOp review
+findings`), based directly on `e48c14ab8b8616d7973dad98637a46d13b0ca2ad`.
+This is the final code-and-test tree validated below; the validation-document
+commit that follows it changes evidence text only.
+
+The fix wave closes all five whole-branch findings:
+
+1. The core-fix patch now replaces the actual upstream `forward` caller so
+   uint8 cache insertion receives raw KV and owns KVNorm exactly once. The
+   non-uint8 delegation branch normalizes KV before calling the original
+   insertion method.
+2. Empty LightOp neutral aliases are treated as unconfigured and populated
+   with the canonical value for all four `VLLM_HCU_*` mappings. Conflicting
+   non-empty settings still fail closed.
+3. Both Mooncake examples use only the four plugin-owned `VLLM_HCU_*` names.
+4. The AST boundary recognizes an injected/direct `lmslim` root and rejects
+   `lmslim.foo()` with the exact repository-relative path and line.
+5. The dynamic production-symbol export audit checks both `__all__`
+   membership and bound module attributes. The pinned installed-wheel audit
+   explicitly includes
+   `lightop.sampling.top_k_top_p_sampling_from_probs`.
+
+RED was reconstructed in memory against `e48c14a` without changing the
+worktree. The old environment bridge left
+`VLLM_USE_GLOBAL_CACHE13=''`; the old core-fix caller failed the new
+exactly-once assertion; the old scanner returned `[]` for injected
+`lmslim.foo()`; and the old export helper allowed public-but-unbound sampling.
+The base Mooncake guide had eight neutral/legacy export lines. These commands
+exited nonzero or produced the eight expected matches before the current
+GREEN commands were run.
+
+All final commands below exited 0 unless the result explicitly describes a
+historical RED probe:
+
+| Command | Result |
+| --- | --- |
+| In-memory empty-alias probe using `git show e48c14a:vllm_hcu/lightop_env.py` | RED: exit 1; the neutral alias remained `''` |
+| In-memory core-fix probe using `git show e48c14a:vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_attention.py` plus the new caller test | RED: exit 1 at the exactly-once assertion |
+| In-memory `_LightOpVisitor` probe using `git show e48c14a:tests/patch/test_lightop_api_boundary.py` and `lmslim.foo()` | RED: exit 1; `violations=[]` |
+| In-memory base export-helper probe with public-but-unbound `lightop.sampling.top_k_top_p_sampling_from_probs` | RED: exit 1; the invalid export escaped |
+| `git show 'e48c14a:docs/pd分离mooncake使用.md' \| rg -n 'export (USE_FUSED_RMS_QUANT\|USE_FUSED_SILU_MUL_QUANT\|VLLM_USE_GLOBAL_CACHE13\|VLLM_FUSED_MOE_CHUNK_SIZE)='` | RED: eight neutral/legacy example lines |
+| `python -m pytest -q tests/patch/test_lightop_environment.py tests/runtime_patch/test_lightop_deepseek_v4_latest_api.py tests/runtime_patch/test_deepseek_v4_dspark_patches.py tests/patch/test_lightop_api_boundary.py tests/runtime_patch/test_lightop_categorized_api.py` | 55 passed in 27.33s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_lightop_environment.py tests/patch/test_plugin_lifecycle.py tests/patch/test_clean_process_bootstrap.py` | 44 passed, 14 warnings in 114.89s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/runtime_patch/test_lightop_deepseek_v4_latest_api.py tests/runtime_patch/test_deepseek_v4_dspark_patches.py tests/patch/test_module_exchange.py -k deepseek_v4` | 26 passed, 20 deselected in 1.23s |
+| `env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract` | 1,215 passed, 83 deselected, 14 warnings in 321.04s |
+| `python -m compileall -q vllm_hcu tests` | clean |
+| `python tools/check_production_boundary.py` | 248 Python files, clean |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/check_patch_test_coverage.py` | 96 files: 95 adapters, 1 helper, 0 untested, 0 invalid contracts |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_hcu_ci_selector.py` | 44 passed in 1.61s |
+| `python .github/scripts/hcu_ci/verify_hcu_registration.py` | 40 registrations across 22 jobs; valid |
+| `git diff --check e48c14a..07f5d26` | clean |
+| `git diff --check origin/v0.25.1...07f5d26` | clean |
+
+The contract increase from the historical 1,207 passed/82 deselected to
+1,215 passed/83 deselected is exact: eight new non-HCU contract cases pass,
+while the explicit sampling export parameter inherits the installed-wheel
+test's existing `hcu` mark and is correctly deselected from the portable
+contract suite. The warnings are the same 14 third-party Torch deprecations.
+
+### Final live gfx938 insertion accuracy
+
+The final live run used only read-only ownership selection. At
+2026-09-01T05:08:07Z, physical HCU 3 mapped to KFD GPU ID `12987`, had no
+nonzero per-process KFD VRAM entry, and was at its 2--3 MiB baseline. A
+device-property probe exposed exactly one `BW1100` with architecture `gfx938`.
+No process was signalled or terminated.
+
+```text
+HIP_VISIBLE_DEVICES=3 CUDA_VISIBLE_DEVICES=3 \
+  env -u VLLM_V0251_SOURCE_ROOT python -m pytest -q -rs \
+  tests/accuracy/test_hcu_kernel_accuracy.py::test_lightop_deepseek_v4_fused_insert_updates_q_and_cache \
+  tests/accuracy/test_deepseek_v4_dspark_ops.py::test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache \
+  tests/accuracy/test_deepseek_v4_dspark_ops.py::test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference
+```
+
+Result: 3 passed, no skips, 14 warnings in 19.82s. The third test compares
+LightOp cache output to vLLM's reference path. At 2026-09-01T05:08:53Z,
+physical HCU 3 had returned to 2 MiB and still had no KFD owner.
+
+## PR #42 CPU-only control-container follow-up
+
+The first `Static gate and test selection` run for PR #42 failed during
+collection in the GPU-less HCU CI control container. The exact traceback
+ended at the package-level import in `vllm_hcu/ops/silu_and_mul.py`, where
+LightOp device discovery attempted to assign `LIGHTOP_GPU_CUS=None` to
+`os.environ`. The same `vllm_hcu.ops` registration chain also had eager
+LightOp imports in the RMSNorm and Gemma RMSNorm owners. This violated the
+existing CPU-only discovery and lazy-kernel-import boundary; it was not a
+LightOp ABI or kernel failure.
+
+The regression test imports the real `vllm_hcu.ops` package in a fresh
+process while rejecting every attempted `lightop` or `lightop.*` import. It
+failed before the production fix with:
+
+```text
+VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm \
+  python -m pytest -q \
+  tests/patch/test_plugin_lifecycle.py::test_ops_registration_defers_lightop_until_kernel_execution
+
+AssertionError: eager LightOp import: lightop.activation
+1 failed in 8.41s
+```
+
+The three owners now import only their categorized modules inside the actual
+kernel/custom branch. Missing categorized exports and runtime kernel errors
+still propagate without an obsolete fallback. The current local GREEN
+evidence is:
+
+| Command | Result |
+| --- | --- |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_plugin_lifecycle.py::test_ops_registration_defers_lightop_until_kernel_execution` | 1 passed in 8.33s |
+| `python -m pytest -q tests/runtime_patch/test_lightop_ops_api.py -k 'silu_and_mul or rmsnorm or gemma'` | 6 passed, 19 deselected, 14 warnings in 6.15s |
+| `python -m pytest -q tests/patch/test_lightop_api_boundary.py tests/runtime_patch/test_lightop_categorized_api.py` | 22 passed in 8.86s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python -m pytest -q tests/patch/test_plugin_lifecycle.py tests/runtime_patch/test_lightop_ops_api.py` | 60 passed, 14 warnings in 85.10s |
+| `env -u VLLM_V0251_SOURCE_ROOT python tools/run_patch_tests.py --suite contract` | 1,216 passed, 83 deselected, 14 warnings in 333.71s |
+
+The new contract count adds the CPU-only registration regression to the
+previous 1,215-pass final-fix count. GitHub CI rerun status is external state
+and is not represented by these local results.
+
+### Second control-container collection fix and final model rerun
+
+The next PR #42 static-gate run passed registration but exposed two remaining
+eager imports outside the registration package: the manual concat harness
+imported `lightop.tensor.ds_cat` during pytest collection, and the fused MoE
+gate owner imported `lightop.moe.moe_fused_gate` when its module was loaded.
+The fresh-process regression now imports both owners while rejecting every
+LightOp import. Before the fix it failed first with
+`eager LightOp import: lightop.moe`; the GitHub control-container traceback
+independently failed at `vllm_hcu/ops/test_concat.py` while importing
+`lightop.tensor.ds_cat`.
+
+Both categorized imports are now deferred until the corresponding runtime
+path executes. The MoE path remains strict: a missing
+`lightop.moe.moe_fused_gate` raises `ImportError` at execution and never uses
+a legacy export. Concat still falls back to `torch.cat` when the categorized
+optional helper is unavailable. Final local evidence for this follow-up is:
+
+| Command | Result |
+| --- | --- |
+| Fresh-process import regression covering `vllm_hcu.ops`, `fuse_moe_gate`, and `test_concat` | RED: `eager LightOp import: lightop.moe`; interim GREEN: 1 passed in 9.38s |
+| `python -m pytest -q tests/runtime_patch/test_lightop_ops_api.py -k concat` | 3 passed, 22 deselected, 14 warnings in 6.43s |
+| Categorized and missing-export fused-MoE gate probes | 2 passed, 88 deselected, 14 warnings in 25.22s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix2` | 1,216 passed, 83 deselected, 15 warnings in 334.83s |
+| Real HCU 7 categorized-export probe | BW1100; `lightop.tensor.ds_cat` and `lightop.moe.moe_fused_gate` both callable |
+
+The specified `/models/Qwen3.5-35B-A3B-W8A8` validation was then repeated on
+that follow-up tree using HCU 7, port 18012, and the same documented
+`slimquant_marlin` command. All eight devices were at the 2 MiB baseline with
+no KFD PIDs before startup. The server loaded all shards, `/health` returned
+HTTP 200, and the deterministic completion returned HTTP 200 with
+`finish_reason="stop"`, 9 prompt tokens, 39 completion tokens, and non-empty
+text. Log lines 136--137 confirm successful LightOp Marlin W8A8 MoE UP and
+DOWN code-object loading; line 928 records the successful completion request.
+
+The final log audit again found exactly one case-insensitive `lmslim` match,
+inside LightOp's own `lightop._lmslim_native.vllm_compat` namespace, and no
+plugin fallback or migration-related LightOp error. Only captured API server
+PID 1041650 was sent SIGTERM; its engine child exited normally. All devices
+returned to 2 MiB with no KFD PIDs. Evidence for this rerun is stored under
+`/tmp/vllm-hcu-lightop-qwen35-pr42-final/`.
+
+An AST audit performed before committing then found the last production
+module-level LightOp import in the sparse MLA attention adapter. Extending the
+same fresh-process guard to import that owner produced a third RED result:
+`eager LightOp import: lightop`. The adapter now caches
+`lightop.attention` only when a LightOp attention kernel path first executes.
+Its categorized-only ABI and legacy-namespace rejection behavior are
+unchanged. The all-production-module AST audit now reports an empty list for
+module-level `lightop` and `lightop.*` imports.
+
+Final evidence after this last production change is:
+
+| Command | Result |
+| --- | --- |
+| Fresh-process guard importing the registration package, fused MoE gate, concat owner, and sparse MLA attention owner | 1 passed in 21.11s |
+| `python -m pytest -q tests/runtime_patch/test_lightop_attention_api.py tests/runtime_patch/test_sparse_indexer_loading.py` | 20 passed, 14 warnings in 18.42s |
+| AST module-level LightOp import audit across `vllm_hcu/**/*.py` | no findings |
+| `python -m compileall -q vllm_hcu tests` | clean |
+| `python tools/check_production_boundary.py` | 248 Python files, clean |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix3` | 1,216 passed, 83 deselected, 15 warnings in 334.44s |
+
+The Qwen3.5 W8A8 validation was repeated once more on this exact final tree.
+Captured API PID 1067821 loaded 14/14 shards and 36.7 GiB of weights; health
+and deterministic completion both returned HTTP 200 with the same 9 prompt
+tokens, 39 completion tokens, and non-empty response. Log lines 135--136 show
+the LightOp Marlin W8A8 MoE UP/DOWN code objects loading successfully, and
+line 926 records the completion request. This final log's case-insensitive
+`lmslim` audit and migration-error audit were both empty. Only PID 1067821 was
+sent SIGTERM; the engine exited normally, KFD reported no PIDs, and HCU 7
+returned to the 2 MiB baseline. Final runtime evidence is stored under
+`/tmp/vllm-hcu-lightop-qwen35-pr42-final2/`.
+
+### GPU-less full-contract test isolation follow-up
+
+The next GitHub static-gate run reached the end of the full contract suite and
+reported four GPU-less-only test failures: two subprocess audits initialized
+the real LightOp wheel without deterministic ROCm metadata, one sparse-MLA
+negative test did not force its intended ROCm branch, and one AITER unit test
+stubbed `aiter.moe` but not the ASM quantization submodule that the production
+context manager resolves. The run completed with 1,212 passes before those
+four failures, confirming that the earlier collection failures were closed.
+
+These are test-harness isolation fixes only. The LightOp subprocess probes now
+provide deterministic gfx936/80-CU device metadata and ROCm home while still
+importing the installed wheel and checking its real categorized exports. The
+sparse test explicitly selects ROCm, and the AITER test injects the exact ASM
+submodule boundary it exercises. No production file changed in this wave.
+
+Final evidence:
+
+| Command | Result |
+| --- | --- |
+| Hidden-device/reduced-PATH rerun of the exact four GitHub failures | 4 passed, 14 warnings in 14.01s |
+| `VLLM_V0251_SOURCE_ROOT=/models/zb/vllm_025/vllm python tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache-lightop-pr42-fix4` | 1,216 passed, 83 deselected, 15 warnings in 342.07s |
+
+The subsequent GitHub run passed 1,215 tests and left only the sparse-MLA
+negative case failing: its call to the real `rocm_aiter_ops.is_enabled()`
+performed GPU discovery before reaching the intended LightOp assertion. The
+test now stubs AITER availability to false, exactly as the adjacent positive
+ABI test already does, so the case isolates only the categorized LightOp
+boundary it names. The exact hidden-device/reduced-PATH case passes in 5.78s,
+and both affected attention/sparse-indexer files pass 20 tests in 18.54s.

@@ -16,12 +16,16 @@ import torch
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 
 from vllm_hcu.model_executor.layers.attention_forward_runtime import attention_forward
 from vllm_hcu.model_executor.layers.kv_cache_utils import split_kv_cache
 from vllm_hcu.platforms import envs as henvs
+
+
+logger = init_logger(__name__)
 
 
 def init_kv_cache_quant_e5m2(
@@ -192,12 +196,9 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
         key_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
         value_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
 
-    try:
-        from lightop import split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant
-    except ImportError as exc:
-        raise RuntimeError(
-            "VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE requires lightop"
-        ) from exc
+    from lightop.attention import (
+        split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant,
+    )
 
     q, k, v = split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant(
         positions,

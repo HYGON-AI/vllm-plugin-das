@@ -6,7 +6,6 @@ import torch.nn as nn
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
-
 class FusedSiluAndMulAndQuant(nn.Module):
     """Fuse silu and mul and int8 quant.
     """
@@ -20,7 +19,9 @@ class FusedSiluAndMulAndQuant(nn.Module):
 def fuse_silu_mul_quant_real(input: torch.Tensor,
                              quant_dtype: torch.dtype
                                    ) -> tuple[torch.Tensor, torch.Tensor]:
-    from lightop import fuse_silu_mul_per_token_quant as fuse_silu_mul_quant_lightop
+    from lightop.activation import (
+        fuse_silu_mul_per_token_quant as fuse_silu_mul_quant_lightop,
+    )
     output = torch.empty(input.shape[0], input.shape[-1] // 2, dtype=quant_dtype, device=input.device)
     scales = torch.empty((input.shape[0], 1),
                         device=input.device,

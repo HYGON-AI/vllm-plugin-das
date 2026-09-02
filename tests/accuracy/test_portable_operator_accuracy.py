@@ -130,7 +130,7 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
-def _install_fake_lmslim(
+def _install_fake_lightop_quant_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def per_token_quant_int8(
@@ -160,29 +160,18 @@ def _install_fake_lmslim(
         ).t()
         return True, output.to(output_dtype)
 
-    lmslim = _module(
-        "lmslim",
-        quant_ops=SimpleNamespace(
-            hipblaslt_w8a8_gemm=hipblaslt_w8a8_gemm,
-        ),
+    lightop = _module("lightop")
+    lightop.__path__ = []
+    quant = _module("lightop.quant", per_token_quant_int8=per_token_quant_int8)
+    gemm_ops = _module(
+        "lightop.gemm_ops",
+        hipblaslt_w8a8_gemm=hipblaslt_w8a8_gemm,
     )
-    lmslim.__path__ = []
-    layers = _module("lmslim.layers")
-    layers.__path__ = []
-    gemm = _module("lmslim.layers.gemm")
-    gemm.__path__ = []
-    int8_utils = _module(
-        "lmslim.layers.gemm.int8_utils",
-        per_token_quant_int8=per_token_quant_int8,
-    )
-    monkeypatch.setitem(sys.modules, "lmslim", lmslim)
-    monkeypatch.setitem(sys.modules, "lmslim.layers", layers)
-    monkeypatch.setitem(sys.modules, "lmslim.layers.gemm", gemm)
-    monkeypatch.setitem(
-        sys.modules,
-        "lmslim.layers.gemm.int8_utils",
-        int8_utils,
-    )
+    lightop.quant = quant
+    lightop.gemm_ops = gemm_ops
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.quant", quant)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
 
 
 @pytest.mark.parametrize(
@@ -206,7 +195,7 @@ def test_w8a8_linear_matches_dequantized_reference(
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_SILU_MUL_QUANT", False)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", False)
-    _install_fake_lmslim(monkeypatch)
+    _install_fake_lightop_quant_gemm(monkeypatch)
 
     generator = torch.Generator().manual_seed(20250724)
     activation = torch.randn(input_shape, generator=generator, dtype=torch.float32)

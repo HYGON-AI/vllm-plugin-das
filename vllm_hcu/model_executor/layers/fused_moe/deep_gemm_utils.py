@@ -344,23 +344,22 @@ def ep_scatter(
         and henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
     ):
-        from lightop import op
+        from lightop.moe import ep_scatter as lightop_ep_scatter
 
-        if hasattr(op, "ep_scatter"):
-            op.ep_scatter(
-                recv_x,
-                recv_x_scale,
-                recv_topk,
-                expert_map,
-                num_recv_tokens_per_expert,
-                output_tensor,
-                output_tensor_scale,
-                m_indices,
-                output_index,
-                num_experts,
-                align_m,
-            )
-            return
+        lightop_ep_scatter(
+            recv_x,
+            recv_x_scale,
+            recv_topk,
+            expert_map,
+            num_recv_tokens_per_expert,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+            num_experts,
+            align_m,
+        )
+        return
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
@@ -487,18 +486,17 @@ def ep_gather(
         and henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
     ):
-        from lightop import op
+        from lightop.moe import ep_gather as lightop_ep_gather
 
-        if hasattr(op, "ep_gather"):
-            op.ep_gather(
-                input_tensor,
-                recv_topk_ids,
-                recv_topk_weight,
-                input_index,
-                expert_map,
-                output_tensor,
-            )
-            return
+        lightop_ep_gather(
+            input_tensor,
+            recv_topk_ids,
+            recv_topk_weight,
+            input_index,
+            expert_map,
+            output_tensor,
+        )
+        return
 
     num_warps = 2
     num_tokens = output_tensor.shape[0]

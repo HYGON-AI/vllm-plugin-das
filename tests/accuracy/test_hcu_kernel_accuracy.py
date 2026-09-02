@@ -4,12 +4,72 @@
 
 from __future__ import annotations
 
+import __future__
+import ast
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 import torch
 import torch.nn.functional as functional
 
 
 pytestmark = pytest.mark.hcu
+
+_REPOSITORY = Path(__file__).resolve().parents[2]
+
+
+def _deepseek_v4_fused_insert_method() -> Any:
+    """Compile the production wrapper method without importing its vLLM graph."""
+    source_path = (
+        _REPOSITORY
+        / "vllm_hcu/model_executor/layers/deepseek_v4_attention.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    wrapper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "DeepseekV4MultiHeadLatentAttentionWrapper"
+    )
+    method = next(
+        node
+        for node in wrapper.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_fused_qnorm_rope_kv_insert"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    namespace: dict[str, Any] = {
+        "cast": lambda _type, value: value,
+        "torch": torch,
+    }
+    exec(
+        compile(
+            module,
+            str(source_path),
+            "exec",
+            __future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    return namespace[method.name]
+
+
+def _deepseek_v4_cache_gather() -> Any:
+    """Load the cache decoder without its vLLM-version-sensitive package init."""
+    source_path = (
+        _REPOSITORY
+        / "vllm_hcu/v1/attention/ops/deepseek_v4_ops/cache_utils.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_hcu_test_deepseek_v4_cache_utils", source_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.dequantize_and_gather_k_cache
 
 
 def _hcu_device() -> torch.device:
@@ -27,7 +87,7 @@ def test_lightop_silu_and_mul_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import op
+        from lightop.activation import silu_and_mul_opt
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop silu_and_mul kernel is unavailable: {exc}")
 
@@ -43,7 +103,7 @@ def test_lightop_silu_and_mul_matches_float32_reference(
         device=device,
         dtype=value.dtype,
     )
-    op.silu_and_mul_opt(actual, value)
+    silu_and_mul_opt(actual, value)
     left, right = value.float().chunk(2, dim=-1)
     reference = functional.silu(left) * right
 
@@ -70,7 +130,7 @@ def test_lightop_fused_add_rms_norm_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import fused_add_rms_norm
+        from lightop.norm import fused_add_rms_norm
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop fused_add_rms_norm kernel is unavailable: {exc}")
 
@@ -180,7 +240,7 @@ def test_lightop_rms_norm_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop.op import rmsnorm_forward_autograd
+        from lightop.norm import rmsnorm_forward_autograd
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop RMSNorm kernel is unavailable: {exc}")
 
@@ -215,7 +275,7 @@ def test_lightop_gemma_rms_norm_matches_float32_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import op
+        from lightop.norm import gemma_rmsnorm
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop Gemma RMSNorm kernel is unavailable: {exc}")
 
@@ -234,7 +294,7 @@ def test_lightop_gemma_rms_norm_matches_float32_reference(
     )
     epsilon = 1e-6
     actual = torch.empty_like(value)
-    op.gemma_rmsnorm(actual, value, weight, epsilon)
+    gemma_rmsnorm(value, weight, epsilon, out=actual)
     normalized = value.float() * torch.rsqrt(
         value.float().square().mean(dim=-1, keepdim=True) + epsilon
     )
@@ -254,7 +314,7 @@ def test_lightop_fused_silu_quant_has_bounded_dequant_error(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import fuse_silu_mul_per_token_quant
+        from lightop.activation import fuse_silu_mul_per_token_quant
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop fused SiluAndMul quant kernel is unavailable: {exc}")
 
@@ -296,7 +356,7 @@ def test_lightop_fused_rms_quant_has_bounded_dequant_error(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop.op import rms_norm_dynamic_per_token_quant
+        from lightop.norm import rms_norm_dynamic_per_token_quant
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop fused RMS quant kernel is unavailable: {exc}")
 
@@ -314,17 +374,14 @@ def test_lightop_fused_rms_quant_has_bounded_dequant_error(
         dtype=torch.bfloat16,
     )
     original_value = value.float().clone()
-    output = torch.empty_like(value, dtype=torch.int8)
-    scales = torch.empty((shape[0], 1), device=device, dtype=torch.float32)
     epsilon = 1e-6
-    rms_norm_dynamic_per_token_quant(
-        output,
+    output, scales = rms_norm_dynamic_per_token_quant(
         value,
         weight,
-        scales,
         epsilon,
-        None,
-        True,
+        torch.int8,
+        residual=None,
+        update_input=True,
     )
     reference = (
         original_value
@@ -350,7 +407,7 @@ def test_lightop_per_token_fp8_quant_matches_dequant_reference(
 ) -> None:
     device = _hcu_device()
     try:
-        from lightop import op
+        from lightop.quant import per_token_quant_fp8
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop per-token FP8 kernel is unavailable: {exc}")
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
@@ -368,7 +425,12 @@ def test_lightop_per_token_fp8_quant_matches_dequant_reference(
     )
     output = torch.empty_like(value, dtype=fp8_dtype)
     scales = torch.empty((shape[0], 1), device=device, dtype=torch.float32)
-    op.per_token_quant_fp8(output, value, scales)
+    per_token_quant_fp8(
+        value,
+        dtype=fp8_dtype,
+        out_q=output,
+        out_scale=scales,
+    )
     dequantized = output.float() * scales
 
     torch.testing.assert_close(
@@ -377,3 +439,328 @@ def test_lightop_per_token_fp8_quant_matches_dequant_reference(
         rtol=1.2e-1,
         atol=1.2e-1,
     )
+
+
+def test_lightop_moe_align_out_kernel_produces_valid_expert_blocks() -> None:
+    device = _hcu_device()
+    try:
+        from lightop.moe import moe_align_block_size_out
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop MoE align kernel is unavailable: {exc}")
+
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [3, 0], [2, 3]],
+        device=device,
+        dtype=torch.int32,
+    )
+    num_experts = 4
+    block_size = 4
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,),
+        topk_ids.numel(),
+        device=device,
+        dtype=torch.int32,
+    )
+    expert_ids = torch.empty(
+        ((max_num_tokens_padded + block_size - 1) // block_size,),
+        device=device,
+        dtype=torch.int32,
+    )
+    num_tokens_post_pad = torch.empty((1,), device=device, dtype=torch.int32)
+
+    moe_align_block_size_out(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        None,
+        None,
+        None,
+        is_ep=False,
+        is_fuse_fill=False,
+    )
+    torch.cuda.synchronize(device)
+
+    valid_count = int(num_tokens_post_pad.item())
+    assert valid_count == 16
+    valid_sorted = sorted_ids[:valid_count].cpu()
+    valid_experts = expert_ids[: valid_count // block_size].cpu()
+    flattened_topk = topk_ids.flatten().cpu()
+    routed = valid_sorted[valid_sorted < topk_ids.numel()]
+    assert torch.equal(torch.sort(routed).values, torch.arange(topk_ids.numel()))
+    for block_index, expert in enumerate(valid_experts.tolist()):
+        token_indices = valid_sorted[
+            block_index * block_size : (block_index + 1) * block_size
+        ]
+        token_indices = token_indices[token_indices < topk_ids.numel()]
+        assert torch.all(flattened_topk[token_indices] == expert)
+
+
+def test_lightop_sparse_mqa_matches_fp32_reference() -> None:
+    device = _hcu_device()
+    try:
+        from lightop.attention import mqa_logits
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop sparse MQA kernel is unavailable: {exc}")
+    from vllm.platforms import current_platform
+    from vllm_hcu.platforms.hcu import on_gfx938
+
+    use_fp8 = on_gfx938()
+    kernel_dtype = current_platform.fp8_dtype() if use_fp8 else torch.bfloat16
+    num_queries, num_keys, num_heads, head_dim = 4, 128, 8, 128
+    generator = torch.Generator(device=device).manual_seed(20250825)
+    query = torch.randn(
+        (num_queries, num_heads, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(kernel_dtype)
+    key = torch.randn(
+        (num_keys, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(kernel_dtype)
+    weights = torch.rand(
+        (num_queries, num_heads),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ).contiguous()
+    row_starts = torch.zeros((num_queries,), device=device, dtype=torch.int32)
+    row_ends = torch.full(
+        (num_queries,), num_keys, device=device, dtype=torch.int32
+    )
+    key_scale = torch.ones((num_keys,), device=device, dtype=torch.float32)
+    kernel_key_scale = key_scale if use_fp8 else None
+
+    actual = mqa_logits(
+        query,
+        key,
+        weights,
+        row_starts,
+        row_ends,
+        kernel_key_scale,
+    )
+    score = (
+        torch.einsum(
+            "mhd,nd->hmn",
+            query.to(torch.bfloat16),
+            key.to(torch.bfloat16),
+        ).float()
+        * key_scale
+    )
+    reference = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+
+    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-1)
+
+
+def test_lightop_paged_sparse_mqa_matches_packed_cache_reference() -> None:
+    device = _hcu_device()
+    try:
+        from lightop.attention import paged_mqa_logits
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop paged sparse MQA kernel is unavailable: {exc}")
+    from vllm.platforms import current_platform
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+        indexer_k_quant_and_cache_triton,
+    )
+
+    fp8_dtype = current_platform.fp8_dtype()
+    block_size, num_heads, head_dim = 64, 8, 128
+    generator = torch.Generator(device=device).manual_seed(20250826)
+    query = torch.randn(
+        (1, 1, num_heads, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(fp8_dtype)
+    key = torch.randn(
+        (block_size, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.zeros(
+        (1, block_size, 1, head_dim + 4),
+        device=device,
+        dtype=torch.uint8,
+    )
+    slot_mapping = torch.arange(block_size, device=device, dtype=torch.int64)
+    indexer_k_quant_and_cache_triton(
+        key,
+        kv_cache,
+        slot_mapping,
+        quant_block_size=128,
+        scale_fmt=None,
+    )
+    weights = torch.rand(
+        (1, num_heads),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ).contiguous()
+    context_lens = torch.tensor([block_size], device=device, dtype=torch.int32)
+    block_tables = torch.tensor([[0]], device=device, dtype=torch.int32)
+
+    actual = paged_mqa_logits(
+        query,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        None,
+        block_size,
+        False,
+    )
+    reference = fp8_paged_mqa_logits_torch(
+        query,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        block_size,
+    )
+
+    torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-4)
+
+
+def test_lightop_deepseek_v4_fused_insert_updates_q_and_cache() -> None:
+    device = _hcu_device()
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    if arch != "gfx938":
+        pytest.skip("LightOp DeepSeek V4 fused insert requires gfx938")
+    try:
+        from lightop import attention as lightop_attention
+
+        getattr(
+            lightop_attention,
+            "fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32",
+        )
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"lightop DeepSeek V4 fused insert is unavailable: {exc}")
+    fused_insert = _deepseek_v4_fused_insert_method()
+    dequantize_and_gather_k_cache = _deepseek_v4_cache_gather()
+
+    num_tokens, num_heads, head_dim = 2, 4, 512
+    block_size = 64
+    epsilon = 1e-6
+    generator = torch.Generator(device=device).manual_seed(20250827)
+    query = torch.randn(
+        (num_tokens, num_heads, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query_before = query.float().clone()
+    key_value = torch.randn(
+        (num_tokens, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key_value_before = key_value.float().clone()
+    kv_norm_weight = torch.randn(
+        (head_dim,),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    sentinel = 0xA5
+    cache = torch.full(
+        (1, block_size, 584), sentinel, device=device, dtype=torch.uint8
+    )
+    slot_mapping = torch.tensor(
+        [1, 99, 3, 99], device=device, dtype=torch.int64
+    )[::2]
+    assert not slot_mapping.is_contiguous()
+    positions = torch.tensor([1, 3], device=device, dtype=torch.int64)
+    angles = torch.linspace(
+        0.1, 1.2, steps=4 * 32, device=device, dtype=torch.float32
+    ).view(4, 32)
+    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    metadata = SimpleNamespace(slot_mapping=slot_mapping, block_size=block_size)
+    wrapper = SimpleNamespace(
+        swa_cache_layer=SimpleNamespace(prefix="swa", kv_cache=cache),
+        kv_norm=SimpleNamespace(weight=SimpleNamespace(data=kv_norm_weight)),
+        rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin_cache),
+        eps=epsilon,
+    )
+
+    fused_insert(wrapper, query, key_value, positions, {"swa": metadata})
+    torch.cuda.synchronize(device)
+
+    def apply_rope(value: torch.Tensor) -> torch.Tensor:
+        result = value.clone()
+        rope = result[..., 448:].reshape(*result.shape[:-1], 32, 2)
+        selected = cos_sin_cache[positions]
+        broadcast_dims = (positions.shape[0],) + (1,) * (
+            value.ndim - 2
+        ) + (32,)
+        cos = selected[:, :32].reshape(broadcast_dims)
+        sin = selected[:, 32:].reshape(broadcast_dims)
+        even = rope[..., 0].clone()
+        odd = rope[..., 1].clone()
+        rope[..., 0] = even * cos - odd * sin
+        rope[..., 1] = odd * cos + even * sin
+        return result
+
+    reference_query = apply_rope(
+        query_before
+        * torch.rsqrt(
+            query_before.square().mean(dim=-1, keepdim=True) + epsilon
+        )
+    )
+    torch.testing.assert_close(
+        query.float(), reference_query, rtol=1e-2, atol=1e-2
+    )
+
+    gathered_key = torch.empty(
+        (1, 4, head_dim), device=device, dtype=torch.bfloat16
+    )
+    dequantize_and_gather_k_cache(
+        gathered_key,
+        cache,
+        torch.tensor([4], device=device, dtype=torch.int32),
+        None,
+        torch.tensor([[0]], device=device, dtype=torch.int32),
+        block_size,
+        0,
+    )
+    torch.cuda.synchronize(device)
+    reference_key = (
+        key_value_before
+        * torch.rsqrt(
+            key_value_before.square().mean(dim=-1, keepdim=True) + epsilon
+        )
+        * kv_norm_weight.float()
+    )
+    reference_key = apply_rope(reference_key)
+    gathered_targets = gathered_key[0, slot_mapping].float()
+    torch.testing.assert_close(
+        gathered_targets[:, :448],
+        reference_key[:, :448],
+        rtol=1.5e-1,
+        atol=2.5e-1,
+    )
+    torch.testing.assert_close(
+        gathered_targets[:, 448:],
+        reference_key[:, 448:],
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    raw_cache = cache.view(-1)
+    scale_base = block_size * 576
+    for untouched_slot in (0, 2):
+        token_data = raw_cache[
+            untouched_slot * 576 : (untouched_slot + 1) * 576
+        ]
+        scale_start = scale_base + untouched_slot * 8
+        token_scales = raw_cache[scale_start : scale_start + 8]
+        assert torch.all(token_data == sentinel)
+        assert torch.all(token_scales == sentinel)
