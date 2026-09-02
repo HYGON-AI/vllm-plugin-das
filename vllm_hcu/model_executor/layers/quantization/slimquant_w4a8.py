@@ -262,6 +262,13 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 prepare_vllm_w4a8_moe,
             )
 
+            if self.moe_quant_config is None:
+                self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if self.moe_quant_config is None:
+                raise RuntimeError(
+                    "SlimQuant W4A8 AITER requires its MoE quantization "
+                    "config before weight postprocessing"
+                )
             config = prewarm_aiter_w4a8_moe(self, layer)
             if config is not None:
                 install_aiter_moe_weight_layout(

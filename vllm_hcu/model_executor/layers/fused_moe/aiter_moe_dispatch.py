@@ -187,21 +187,17 @@ def _validate_derived_tensor(
             original_k = int(original_k)
         except (TypeError, ValueError):
             padded_k = original_k = -1
-        mismatched_dims = (
-            [
-                index
-                for index, (actual, expected) in enumerate(
-                    zip(derived.shape, original.shape, strict=True)
-                )
-                if actual != expected
-            ]
-            if derived.ndim == original.ndim
-            else []
-        )
+        padded_axis = {"w1": 2, "w2": 1}.get(label)
         compatible_shape = (
-            len(mismatched_dims) == 1
-            and derived.shape[mismatched_dims[0]] == padded_k
-            and original.shape[mismatched_dims[0]] == original_k
+            padded_axis is not None
+            and derived.ndim == original.ndim == 3
+            and all(
+                derived.shape[index] == original.shape[index]
+                for index in range(derived.ndim)
+                if index != padded_axis
+            )
+            and derived.shape[padded_axis] == padded_k
+            and original.shape[padded_axis] == original_k
             and padded_k >= original_k > 0
         )
     if not compatible_shape:

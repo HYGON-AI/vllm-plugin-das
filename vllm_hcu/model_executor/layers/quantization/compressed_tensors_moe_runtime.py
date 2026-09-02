@@ -246,11 +246,56 @@ def _installed_weight_logical_shape(
             int(w2.shape[1]),
             int(w1.shape[2]),
         )
-    if not isinstance(first, tuple) or len(first) != 4:
+    if (
+        not isinstance(first, tuple)
+        or len(first) != 4
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in first
+        )
+    ):
         raise HcuCompressedTensorsMoeError(
             "AITER weights have invalid logical dimensions"
         )
-    return tuple(int(value) for value in first)
+    logical_e, logical_n1, logical_n2, logical_k = first
+    if logical_n1 % 2:
+        raise HcuCompressedTensorsMoeError(
+            "AITER weights have invalid logical dimensions"
+        )
+    first_layout = getattr(w1, _WEIGHT_LAYOUT_ATTR, None)
+    second_layout = getattr(w2, _WEIGHT_LAYOUT_ATTR, None)
+    if first_layout != second_layout:
+        raise HcuCompressedTensorsMoeError(
+            "AITER weights have inconsistent physical layouts"
+        )
+    if first_layout is not None and (
+        not isinstance(first_layout, tuple) or len(first_layout) != 4
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "AITER weights have invalid physical layout signature"
+        )
+    padded_k = first_layout[3] if first_layout is not None else None
+    physical_k = int(padded_k) if padded_k is not None else logical_k
+    expected_w1 = (logical_e, logical_n1, physical_k)
+    expected_w2 = (logical_e, physical_k, logical_n1 // 2)
+    if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+        raise HcuCompressedTensorsMoeError(
+            "AITER weights do not match their installed physical layout"
+        )
+    return first
+
+
+def _quantized_problem_dimensions(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+) -> tuple[int, int, int, int]:
+    logical_shape = _installed_weight_logical_shape(w1, w2)
+    if int(hidden_states.shape[1]) != logical_shape[3]:
+        raise HcuCompressedTensorsMoeError(
+            "AITER quantized MoE hidden states do not match logical K"
+        )
+    return logical_shape
 
 
 def _installed_weight_solution(
@@ -838,8 +883,8 @@ def apply_aiter_quantized_moe(
             "AITER quantized MoE requires an activation"
         )
     activation_name = str(activation_value)
-    logical_e, logical_n1, logical_n2, logical_k = _installed_weight_logical_shape(
-        w1, w2
+    logical_e, logical_n1, logical_n2, logical_k = _quantized_problem_dimensions(
+        hidden_states, w1, w2
     )
     problem = AiterMoeProblem(
         M=int(hidden_states.shape[0]),
@@ -1036,12 +1081,15 @@ def apply_aiter_w8a8_fp8_moe(
         raise HcuCompressedTensorsMoeError(
             "AITER does not expose the required FP8_W8A8 MoE quant type"
         )
+    logical_e, logical_n1, logical_n2, logical_k = _quantized_problem_dimensions(
+        x, w1, w2
+    )
     problem = AiterMoeProblem(
         M=int(x.shape[0]),
-        E=int(w1.shape[0]),
-        N1=int(w1.shape[1]),
-        N2=int(w2.shape[1]),
-        K=int(w1.shape[2]),
+        E=logical_e,
+        N1=logical_n1,
+        N2=logical_n2,
+        K=logical_k,
         top_k=int(topk_ids.shape[1]),
         block_size=0,
         dtype=x.dtype,

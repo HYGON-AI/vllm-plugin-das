@@ -4509,11 +4509,10 @@ def test_slimquant_w4a8_installs_moe_c_layout_at_load(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones(2, 4, 1), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
-    method.moe_quant_config = SimpleNamespace(
-        w1_scale=layer.w13_weight_scale * 16.0,
-        w2_scale=layer.w2_weight_scale * 16.0,
-    )
+    assert method.moe_quant_config is None
 
     method.process_weights_after_loading(layer)
 
@@ -4537,6 +4536,7 @@ def test_slimquant_w4a8_installs_moe_c_layout_at_load(
     assert layer.w2_weight.is_shuffled is True
     assert layer.w13_weight._hcu_aiter_moe_solution_type == "moe_c"
     assert layer.w2_weight._hcu_aiter_moe_solution_type == "moe_c"
+    assert method.moe_quant_config is not None
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
         torch.full_like(method.moe_quant_config.w1_scale, 16.0),
@@ -4645,7 +4645,7 @@ def test_w8a8_padded_layout_keeps_original_logical_problem_dimensions(
     def shuffle_weights(w1, w2, _config):
         return (
             torch.zeros((w1.shape[0], w1.shape[1], 8), dtype=w1.dtype),
-            torch.zeros((w2.shape[0], w2.shape[1], 8), dtype=w2.dtype),
+            torch.zeros((w2.shape[0], 8, w2.shape[2]), dtype=w2.dtype),
         )
 
     monkeypatch.setitem(
@@ -4693,10 +4693,45 @@ def test_w8a8_padded_layout_keeps_original_logical_problem_dimensions(
     )
 
     assert layer.w13_weight.shape[2] == 8
-    assert layer.w2_weight.shape[2] == 8
+    assert layer.w2_weight.shape[1] == 8
     assert config_calls[1]["K"] == 4
     assert config_calls[1]["N1"] == 8
     assert config_calls[1]["N2"] == 4
+
+
+def test_padded_layout_validation_rejects_wrong_w2_axis(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    w1 = torch.zeros((2, 8, 4))
+    w2 = torch.zeros((2, 4, 4))
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=lambda *_args: (
+                torch.zeros((2, 8, 8)),
+                torch.zeros((2, 4, 8)),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        HcuAiterMoeDispatchError,
+        match="incompatible w2 shape",
+    ):
+        prepare_aiter_moe_weights(
+            w1,
+            w2,
+            config,
+            cache_owner=object(),
+        )
 
 
 def test_w8a8_m1_miss_locks_native_weights_without_runtime_relayout(
@@ -5004,6 +5039,8 @@ def test_slimquant_w4a8_m1_miss_installs_single_native_triton_layout(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones(1, 4, 1), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
 
     method.process_weights_after_loading(layer)
@@ -5724,6 +5761,121 @@ def test_moe_fp8_aiter_route_is_layer_aware_and_cached(
     assert calls[0]["quant_type"] == "fp8_w8a8"
     assert calls[0]["M"] == 2 and calls[0]["top_k"] == 2
     assert calls[0]["use_shuffle"] == 1
+
+
+def test_moe_fp8_padded_layout_routes_with_installed_logical_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    def get_config(**kwargs):
+        calls.append(kwargs)
+        return True, config
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"],
+        ),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.zeros((3, 8, 8))
+    layer.w2_weight = torch.zeros((3, 8, 4))
+    logical_shape = (3, 8, 4, 4)
+    layout = ("fp8_w8a8", "MOE_C", True, 8)
+    for weight in (layer.w13_weight, layer.w2_weight):
+        weight._hcu_aiter_moe_solution_type = "moe_c"
+        weight._hcu_aiter_moe_logical_shape = logical_shape
+        weight._hcu_aiter_moe_weight_layout = layout
+        weight.is_shuffled = True
+
+    compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+        SimpleNamespace(moe=object()),
+        layer,
+        torch.ones((2, 4)),
+        torch.ones((2, 2)),
+        torch.zeros((2, 2), dtype=torch.int64),
+        None,
+        None,
+    )
+
+    assert calls[0]["E"] == 3
+    assert calls[0]["N1"] == 8
+    assert calls[0]["N2"] == 4
+    assert calls[0]["K"] == 4
+
+
+def test_quantized_installed_logical_contract_rejects_invalid_dimensions():
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+    w1._hcu_aiter_moe_logical_shape = (3, 8, 4, -1)
+    w2._hcu_aiter_moe_logical_shape = (3, 8, 4, -1)
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="invalid logical dimensions",
+    ):
+        compressed_tensors_moe_runtime._installed_weight_logical_shape(w1, w2)
+
+
+def test_quantized_installed_logical_contract_rejects_invalid_layout_signature():
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+    for weight in (w1, w2):
+        weight._hcu_aiter_moe_logical_shape = (3, 8, 4, 4)
+        weight._hcu_aiter_moe_weight_layout = ("fp8_w8a8",)
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="invalid physical layout signature",
+    ):
+        compressed_tensors_moe_runtime._installed_weight_logical_shape(w1, w2)
+
+
+def test_moe_fp8_installed_layout_rejects_hidden_width_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", MoeQuantType=MoeQuantType),
+    )
+    layer = _fp8_moe_layer()
+    for weight in (layer.w13_weight, layer.w2_weight):
+        weight._hcu_aiter_moe_solution_type = "native"
+        weight._hcu_aiter_moe_logical_shape = (3, 8, 4, 4)
+        weight.is_shuffled = False
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="hidden states do not match logical K",
+    ):
+        compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            SimpleNamespace(moe=object()),
+            layer,
+            torch.ones((2, 5)),
+            torch.ones((2, 2)),
+            torch.zeros((2, 2), dtype=torch.int64),
+            None,
+            None,
+        )
 
 
 def test_moe_fp8_uses_unified_shuffle_cache_and_invalidates_on_weight_change(
