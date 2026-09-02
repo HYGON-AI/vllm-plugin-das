@@ -41,6 +41,15 @@ contiguous high-throughput or masked low-latency DeepEP/DeepGEMM path for each
 forward. PCP+DSpark and prefill/decode disaggregation are intentionally not
 part of these tests.
 
+SlimQuant W4A8 keeps different ownership by topology. Pure TP AITER retains
+the raw packed checkpoint Parameters because its runtime solution may change.
+Only strict DP+EP `deepep_auto` repacks each local expert Parameter once in
+place: contiguous HT uses the registered rank-3 HIPC owner and masked LL uses
+an N32 rank-6 view of the same storage. Fixed Mooncake P/D roles retain only
+the selected handle. The post-load state dict is therefore kernel-format for
+this DP route; it contains the packed registered owner and no separate N32 or
+raw HCU weight copy.
+
 The default checkpoint is
 `/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8`; override it with
 `VLLM_HCU_DEEPSEEK_V4_FLASH_0731_MODEL`. Run the gates in order:

@@ -8,9 +8,9 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
@@ -60,7 +60,7 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
                 QuantizationStrategy.CHANNEL, False, True
             )
             return SlimQuantW4A8Int8LinearMethod(self)
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             return SlimQuantW4A8Int8AiterMoEMethod(self, layer.moe_config)
         return None
 
@@ -217,6 +217,36 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             if not isinstance(parameter, Parameter):
                 raise TypeError(f"SlimQuant W4A8 requires Parameter {name}")
             parameter.requires_grad_(False)
+        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+            slimquant_w4a8_uses_deepep_auto,
+        )
+
+        if slimquant_w4a8_uses_deepep_auto(getattr(self, "moe", None)):
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if self.moe_quant_config is None:
+                raise RuntimeError(
+                    "SlimQuant W4A8 deepep_auto requires its MoE quantization "
+                    "config before weight postprocessing"
+                )
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                make_deepep_auto_deepgemm_w4a8_moe_kernel,
+            )
+
+            self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                routing_tables=layer._expert_routing_tables(),
+            )
+            fused_experts = getattr(self.moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            process = getattr(experts, "process_weights_after_loading", None)
+            if not callable(process):
+                raise RuntimeError(
+                    "SlimQuant W4A8 deepep_auto did not construct modular "
+                    "experts before weight postprocessing"
+                )
+            process(layer)
+            return
         if getattr(self.moe, "moe_backend", "auto") == "triton":
             from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
                 prepare_vllm_w4a8_moe,
@@ -232,7 +262,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -240,9 +270,6 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-
-        # RoutedExperts owns shared-expert execution and combines its result.
-        del shared_experts, shared_experts_input
 
         if x.dim() != 2:
             raise ValueError(
@@ -261,6 +288,59 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 f"token count as x, got x={tuple(x.shape)}, "
                 f"topk_ids={tuple(topk_ids.shape)}"
             )
+        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+            slimquant_w4a8_uses_deepep_auto,
+        )
+
+        moe_kernel = getattr(self, "moe_kernel", None)
+        uses_deepep_auto = moe_kernel is not None
+        if not uses_deepep_auto:
+            uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
+                getattr(self, "moe", None)
+            )
+        if uses_deepep_auto:
+            if moe_kernel is None:
+                raise RuntimeError(
+                    "SlimQuant W4A8 deepep_auto kernel was not initialized; "
+                    "process_weights_after_loading must run before apply"
+                )
+            from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+                resolve_aiter_expert_maps,
+            )
+
+            global_num_experts = getattr(
+                layer,
+                "global_num_experts",
+                getattr(self.moe, "num_experts", -1),
+            )
+            native_expert_map, _ = resolve_aiter_expert_maps(
+                getattr(layer, "expert_map", None),
+                global_num_experts,
+            )
+            return moe_kernel.apply(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=getattr(
+                    layer,
+                    "activation",
+                    getattr(self.moe, "activation", None),
+                ),
+                global_num_experts=global_num_experts,
+                expert_map=native_expert_map,
+                apply_router_weight_on_input=getattr(
+                    layer,
+                    "apply_router_weight_on_input",
+                    False,
+                ),
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+        # Pure TP shared experts remain runner-owned, matching the latest
+        # unified AITER/Triton contract.
+        del shared_experts, shared_experts_input
         from vllm_hcu.model_executor.layers.quantization import (
             compressed_tensors_moe_runtime as moe_runtime,
         )

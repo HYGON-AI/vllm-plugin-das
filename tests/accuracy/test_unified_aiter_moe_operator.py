@@ -20,6 +20,19 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
     aiter_asm_boltops_fp8_quant_context,
     aiter_asm_boltops_int8_quant_context,
 )
+from tests.accuracy.deepseek_v4_dspark_ops_cases import (
+    test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert,
+    test_contiguous_channel_fp8_deepgemm_matches_dequantized_reference,
+    test_contiguous_channel_int8_deepgemm_matches_dequantized_reference,
+    test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference,
+    test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache,
+    test_lightop_fp8_silu_quant_matches_float_reference_for_ht_and_ll,
+    test_lightop_int8_clamped_silu_quant_matches_vllm_for_ht_and_ll,
+    test_masked_channel_fp8_deepgemm_matches_dequantized_reference,
+    test_masked_channel_int8_deepgemm_matches_dequantized_reference,
+)
+
+pytestmark = pytest.mark.hcu
 
 
 pytestmark = pytest.mark.hcu

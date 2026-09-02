@@ -43,6 +43,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+    DeepEPDeepGemmW4A8ContiguousExperts,
+    DeepEPDeepGemmW4A8MaskedExperts,
+)
+
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
 logger = init_logger("vllm.hcu.deepseek_v4_deepep_experts")
@@ -959,10 +964,160 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
 
 
+class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
+    """Own one in-place W4A8 HIPC layout for strict ``deepep_auto``."""
+
+    _LAYOUT_MARKER = "_slimquant_w4a8_deepep_auto_layout"
+    _PACKED_W13 = "_slimquant_w4a8_deepep_auto_packed_w13"
+    _PACKED_W2 = "_slimquant_w4a8_deepep_auto_packed_w2"
+    _PACKING_LAYOUT = "packing"
+    _REPACKING_LAYOUT = "repacking"
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int,
+        num_dispatchers: int,
+        fixed_use_low_latency: bool | None = None,
+    ):
+        self.moe_config = moe_config
+        self.quant_config = quant_config
+        self.max_num_tokens = max_num_tokens
+        self.num_dispatchers = num_dispatchers
+        self._fixed_use_low_latency = fixed_use_low_latency
+        self._use_low_latency_snapshot = False
+        if fixed_use_low_latency is not True:
+            self.ht_experts = DeepEPDeepGemmW4A8ContiguousExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+            )
+        if fixed_use_low_latency is not False:
+            self.ll_experts = DeepEPDeepGemmW4A8MaskedExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+                max_num_tokens=max_num_tokens,
+                num_dispatchers=num_dispatchers,
+            )
+        if fixed_use_low_latency is True:
+            self.ht_experts = self.ll_experts
+        elif fixed_use_low_latency is False:
+            self.ll_experts = self.ht_experts
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm_hcu.model_executor.layers.quantization import (
+            slimquant_w4a8_deepgemm_runtime as runtime,
+        )
+
+        expected_layout = {
+            None: "shared_hipc_auto",
+            False: "shared_hipc_contiguous",
+            True: "shared_hipc_n32",
+        }[self._fixed_use_low_latency]
+        marker = getattr(layer, self._LAYOUT_MARKER, None)
+        owners = (
+            getattr(layer, self._PACKED_W13, None),
+            getattr(layer, self._PACKED_W2, None),
+        )
+        if marker is None and any(owner is not None for owner in owners):
+            self._invalid_marker()
+        if marker is not None and marker != expected_layout:
+            self._invalid_marker()
+        runtime._validate_w4a8_channel_weights(layer)
+        weights = (layer.w13_weight, layer.w2_weight)
+        if marker is not None:
+            if any(
+                not isinstance(owner, torch.Tensor)
+                or owner.dtype != torch.int8
+                or owner.ndim != 3
+                or tuple(owner.shape) != tuple(weight.shape)
+                for owner, weight in zip(owners, weights)
+            ):
+                self._invalid_marker()
+            if all(self._same_storage(a, b) for a, b in zip(owners, weights)):
+                self._bind_packed_owners(runtime, *owners)
+                return
+
+            # v0.25.1 layerwise reload processes temporary raw Parameters and
+            # then restores the original kernel storage. Reuse that storage so
+            # the temporary allocation cannot become a second resident owner.
+            setattr(layer, self._LAYOUT_MARKER, self._REPACKING_LAYOUT)
+            reloaded = self._pack_in_place(runtime, weights)
+            with torch.no_grad():
+                for owner, weight in zip(owners, reloaded):
+                    owner.copy_(weight)
+            replace_parameter(layer, "w13_weight", owners[0])
+            replace_parameter(layer, "w2_weight", owners[1])
+            self._bind_packed_owners(runtime, *owners)
+            setattr(layer, self._LAYOUT_MARKER, expected_layout)
+            return
+
+        # The packer mutates each registered Parameter in sequence. Mark the
+        # transition first so a partial failure can never be retried as raw.
+        setattr(layer, self._LAYOUT_MARKER, self._PACKING_LAYOUT)
+        self._pack_in_place(runtime, weights)
+        owners = tuple(weight.detach() for weight in weights)
+        setattr(layer, self._PACKED_W13, owners[0])
+        setattr(layer, self._PACKED_W2, owners[1])
+        self._bind_packed_owners(runtime, *owners)
+        setattr(layer, self._LAYOUT_MARKER, expected_layout)
+
+    @staticmethod
+    def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+        return (
+            left.untyped_storage().data_ptr()
+            == right.untyped_storage().data_ptr()
+        )
+
+    def _pack_in_place(self, runtime, weights):
+        with torch.no_grad():
+            packed = tuple(
+                runtime.pack_w4a8_moe_hipc_weight(weight).detach()
+                for weight in weights
+            )
+        if any(
+            weight.ndim != 3 or not self._same_storage(weight, source)
+            for weight, source in zip(packed, weights)
+        ):
+            raise RuntimeError(
+                "SlimQuant W4A8 deepep_auto packer must reuse rank-3 "
+                "weight storage"
+            )
+        return packed
+
+    @staticmethod
+    def _invalid_marker() -> None:
+        raise RuntimeError(
+            "invalid SlimQuant W4A8 deepep_auto marker or owner shape state"
+        )
+
+    def _bind_packed_owners(self, runtime, w13, w2) -> None:
+        if self._fixed_use_low_latency is not True:
+            self.ht_experts._deepgemm_w13 = w13
+            self.ht_experts._deepgemm_w2 = w2
+        if self._fixed_use_low_latency is not False:
+            self.ll_experts._deepgemm_w13 = (
+                runtime.view_w4a8_moe_hipc_weight_n32_layout(w13).detach()
+            )
+            self.ll_experts._deepgemm_w2 = (
+                runtime.view_w4a8_moe_hipc_weight_n32_layout(w2).detach()
+            )
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return DeepEPDeepGemmW4A8ContiguousExperts._supports_quant_scheme(
+            weight_key, activation_key
+        )
+
+
 def _make_deepep_auto_deepgemm_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    experts_cls: type[DeepEPAutoDeepGemmExperts] | None = None,
 ) -> mk.FusedMoEKernel:
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
@@ -988,7 +1143,9 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(
         get_current_vllm_config_or_none()
     )
-    experts = DeepEPAutoDeepGemmExperts(
+    if experts_cls is None:
+        experts_cls = DeepEPAutoDeepGemmExperts
+    experts = experts_cls(
         moe_config=moe_config,
         quant_config=moe_quant_config,
         max_num_tokens=max_num_tokens,
@@ -1031,4 +1188,59 @@ def make_deepep_auto_deepgemm_int8_moe_kernel(
         moe_quant_config=moe_quant_config,
         moe_config=moe_config,
         routing_tables=routing_tables,
+    )
+
+
+def make_deepep_auto_deepgemm_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
+
+    if moe_quant_config.weight_quant_dtype != "int4":
+        raise ValueError("SlimQuant auto factory requires INT4 W4A8 quantization")
+    if (
+        moe_quant_config.quant_dtype != torch.int8
+        or not moe_quant_config.is_per_act_token
+        or moe_quant_config.is_block_quantized
+    ):
+        raise ValueError(
+            "SlimQuant auto factory requires dynamic per-token INT8 "
+            "activation quantization"
+        )
+    if (
+        moe_quant_config.per_out_ch_quant
+        or moe_quant_config.w1_scale is None
+        or moe_quant_config.w2_scale is None
+    ):
+        raise ValueError(
+            "SlimQuant auto factory requires symmetric INT4 channel weight "
+            "scales for both MoE GEMMs"
+        )
+    unsupported_metadata = (
+        moe_quant_config.a1_scale,
+        moe_quant_config.a2_scale,
+        moe_quant_config.a1_gscale,
+        moe_quant_config.a2_gscale,
+        moe_quant_config.w1_zp,
+        moe_quant_config.w2_zp,
+        moe_quant_config.g1_alphas,
+        moe_quant_config.g2_alphas,
+        moe_quant_config.w1_bias,
+        moe_quant_config.w2_bias,
+        moe_quant_config.gemm1_alpha,
+        moe_quant_config.gemm1_beta,
+        moe_quant_config.gemm1_clamp_limit,
+    )
+    if any(value is not None for value in unsupported_metadata):
+        raise ValueError(
+            "SlimQuant auto factory requires symmetric W4A8 without "
+            "auxiliary scales, zero points, biases, or clamps"
+        )
+    return _make_deepep_auto_deepgemm_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=moe_config,
+        routing_tables=routing_tables,
+        experts_cls=DeepEPAutoW4A8Experts,
     )
