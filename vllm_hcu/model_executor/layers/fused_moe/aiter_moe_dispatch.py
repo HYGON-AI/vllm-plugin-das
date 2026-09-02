@@ -213,13 +213,15 @@ def _validate_derived_tensor(
 def select_aiter_moe_config(
     problem: AiterMoeProblem,
     cache_owner: object,
+    solution_type: object | None = None,
 ) -> object | None:
     """Ask AITER to route the problem, preserving explicit no-solution status."""
 
     cache = _owner_cache(cache_owner, _SELECTION_CACHE_ATTR)
-    if problem in cache:
-        cache.move_to_end(problem)
-        return cache[problem]
+    cache_key = (problem, _freeze(solution_type))
+    if cache_key in cache:
+        cache.move_to_end(cache_key)
+        return cache[cache_key]
 
     moe_module = import_module("aiter.moe")
     selector = getattr(moe_module, "get_aiter_moe_config", None)
@@ -229,7 +231,11 @@ def select_aiter_moe_config(
             + problem.describe()
         )
 
-    result = selector(
+    # A pinned solution is used when weights have already been converted to
+    # that solution's physical layout.  It must not be silently rerouted.
+    use_shuffle = problem.use_shuffle
+
+    selector_kwargs = dict(
         M=problem.M,
         E=problem.E,
         N1=problem.N1,
@@ -240,8 +246,11 @@ def select_aiter_moe_config(
         dtype=problem.dtype,
         quant_type=problem.quant_type,
         activation=problem.activation,
-        use_shuffle=int(problem.use_shuffle),
+        use_shuffle=int(use_shuffle),
     )
+    if solution_type is not None:
+        selector_kwargs["spec_sol_type"] = solution_type
+    result = selector(**selector_kwargs)
     if not isinstance(result, tuple) or len(result) != 2:
         raise HcuAiterMoeDispatchError(
             "get_aiter_moe_config must return (status, config); "
@@ -260,14 +269,13 @@ def select_aiter_moe_config(
                 "Triton MoE for %s",
                 problem.describe(),
             )
-        _cache_put(cache, problem, None, limit=_SELECTION_CACHE_LIMIT)
+        _cache_put(cache, cache_key, None, limit=_SELECTION_CACHE_LIMIT)
         return None
     if config is None:
         raise HcuAiterMoeDispatchError(
             "get_aiter_moe_config returned status=True without a config; "
             + problem.describe()
         )
-
     solution = _solution_token(config)
     if _mark_route_logged(problem):
         logger.debug(
@@ -275,7 +283,14 @@ def select_aiter_moe_config(
             solution,
             problem.describe(),
         )
-    _cache_put(cache, problem, config, limit=_SELECTION_CACHE_LIMIT)
+    if solution_type is not None and _solution_token(config) != str(
+        getattr(solution_type, "value", solution_type)
+    ).rsplit(".", 1)[-1].upper():
+        raise HcuAiterMoeDispatchError(
+            "AITER ignored the requested MoE solution layout; requested="
+            f"{solution_type!r}, returned={_solution_token(config)}"
+        )
+    _cache_put(cache, cache_key, config, limit=_SELECTION_CACHE_LIMIT)
     return config
 
 
