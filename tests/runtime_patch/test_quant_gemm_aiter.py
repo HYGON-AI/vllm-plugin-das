@@ -2627,6 +2627,10 @@ def test_aiter_w16a16_routes_public_api_with_canonical_weights(
     x = torch.ones(2, 4)
     w1 = torch.ones(3, 8, 4)
     w2 = torch.ones(3, 4, 4)
+    w1.is_shuffled = False
+    w2.is_shuffled = False
+    w1._hcu_aiter_moe_solution_type = "moe_c"
+    w2._hcu_aiter_moe_solution_type = "moe_c"
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
     expected = torch.full_like(x, 7)
@@ -2673,7 +2677,7 @@ def test_aiter_w16a16_routes_public_api_with_canonical_weights(
     assert selector_calls[0]["N2"] == 4
     assert selector_calls[0]["K"] == 4
     assert selector_calls[0]["use_shuffle"] == 1
-    assert "spec_sol_type" not in selector_calls[0]
+    assert selector_calls[0]["spec_sol_type"] == "moe_c"
     assert execute_calls[0]["w1"] is w1
     assert execute_calls[0]["w2"] is w2
     assert execute_calls[0]["activation"] == "gelu_tanh"
@@ -2690,6 +2694,8 @@ def test_aiter_w16a16_reuses_installed_asm_layout_without_reshuffle(
     w2 = torch.ones(3, 4, 4)
     w1.is_shuffled = True
     w2.is_shuffled = True
+    w1._hcu_aiter_moe_solution_type = "asm"
+    w2._hcu_aiter_moe_solution_type = "asm"
     selector_calls: list[dict[str, object]] = []
     execute_calls: list[dict[str, object]] = []
     config = SimpleNamespace(
@@ -2766,6 +2772,137 @@ def test_aiter_w16a16_shuffled_weights_never_fall_back_to_triton(
         )
 
 
+def test_aiter_w16a16_installed_canonical_layout_never_runtime_shuffles(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = False
+        weight._hcu_aiter_moe_solution_type = "triton"
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=True,
+        config={},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **_kwargs: (True, config),
+            aiter_moe_shfl_weight=lambda *_args: pytest.fail(
+                "installed canonical weights must not be shuffled at runtime"
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="layout does not match",
+    ):
+        aiter_runtime.fused_moe_impl(
+            lambda *_args: pytest.fail("must not delegate"),
+            torch.ones(2, 4),
+            w1,
+            w2,
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            activation_method=0,
+        )
+
+
+def test_aiter_w16a16_rejects_runtime_config_for_different_asm_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = True
+        weight._hcu_aiter_moe_solution_type = "asm"
+        weight._hcu_aiter_moe_weight_layout = (
+            "w16a16",
+            "ASM",
+            True,
+            64,
+        )
+    runtime_config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"PADDED_K": 128},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **_kwargs: (True, runtime_config),
+        ),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="physical layout",
+    ):
+        aiter_runtime.fused_moe_impl(
+            lambda *_args: pytest.fail("must not delegate"),
+            torch.ones(2, 4),
+            w1,
+            w2,
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            activation_method=0,
+        )
+
+
+def test_aiter_w16a16_installed_native_fallback_bypasses_selector(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+
+    expected = torch.full((2, 4), 5.0)
+    monkeypatch.setattr(
+        aiter_runtime,
+        "select_aiter_moe_config",
+        lambda *_args, **_kwargs: pytest.fail(
+            "native fallback must not reselect AITER at runtime"
+        ),
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *_args, **_kwargs: expected,
+    )
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = False
+        weight._hcu_aiter_moe_solution_type = "native"
+
+    actual = aiter_runtime.fused_moe_impl(
+        lambda *_args: pytest.fail("must not delegate"),
+        torch.ones(2, 4),
+        w1,
+        w2,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        activation_method=0,
+    )
+
+    assert actual is expected
+
+
 def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2821,7 +2958,7 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
         quant_type="w16a16",
         solution_type="asm",
         need_shuffle=True,
-        config={},
+        config={"PADDED_K": 64},
     )
     monkeypatch.setattr(
         hcu_unquantized,
@@ -2849,6 +2986,20 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
     torch.testing.assert_close(layer.w2_weight, shuffled_w2)
     assert layer.w13_weight.is_shuffled is True
     assert layer.w2_weight.is_shuffled is True
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w13_weight._hcu_aiter_moe_weight_layout == (
+        "w16a16",
+        "ASM",
+        True,
+        64,
+    )
+    assert layer.w2_weight._hcu_aiter_moe_weight_layout == (
+        "w16a16",
+        "ASM",
+        True,
+        64,
+    )
     assert len(kernels) == 1
     assert method.moe_kernel is not None
     assert len(select_calls) == 1
@@ -2871,7 +3022,62 @@ def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
     assert solution_type == "asm"
 
 
-def test_aiter_w16a16_post_load_keeps_canonical_weights_when_shuffle_disabled(
+def test_aiter_w16a16_post_load_locks_canonical_triton_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as hcu_unquantized,
+    )
+
+    w13 = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    layer = SimpleNamespace(w13_weight=w13, w2_weight=w2)
+    method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace(
+        num_experts=2,
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+    )
+    method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = lambda _layer: object()
+    monkeypatch.setattr(hcu_unquantized, "_is_hcu_aiter_moe_requested", lambda *_: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
+    select_calls: list[tuple[AiterMoeProblem, object, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=False,
+        config={},
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "select_aiter_moe_config",
+        lambda problem, cache_owner, solution_type=None: select_calls.append(
+            (problem, cache_owner, solution_type)
+        ) or config,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "make_unquantized_moe_kernel",
+        lambda **_kwargs: object(),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is w13
+    assert layer.w2_weight is w2
+    assert layer.w13_weight.is_shuffled is False
+    assert layer.w2_weight.is_shuffled is False
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "triton"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "triton"
+    assert len(select_calls) == 1
+    assert select_calls[0][1] is w13
+    assert select_calls[0][2] is None
+
+
+def test_aiter_w16a16_post_load_locks_native_fallback_on_m1_miss(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.fused_moe import (
@@ -2896,7 +3102,7 @@ def test_aiter_w16a16_post_load_keeps_canonical_weights_when_shuffle_disabled(
     monkeypatch.setattr(
         hcu_unquantized,
         "select_aiter_moe_config",
-        lambda *_args, **_kwargs: pytest.fail("disabled shuffle must not be selected"),
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         hcu_unquantized,
@@ -2908,6 +3114,10 @@ def test_aiter_w16a16_post_load_keeps_canonical_weights_when_shuffle_disabled(
 
     assert layer.w13_weight is w13
     assert layer.w2_weight is w2
+    assert layer.w13_weight.is_shuffled is False
+    assert layer.w2_weight.is_shuffled is False
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "native"
 
 
 def test_explicit_aiter_backend_uses_public_router_without_auto_env_gate(

@@ -119,7 +119,9 @@ def _solution_token(config: object) -> str:
     return str(solution).rsplit(".", 1)[-1].upper()
 
 
-def _weight_layout_generation(config: object) -> tuple[Any, ...]:
+def aiter_moe_weight_layout_signature(config: object) -> tuple[Any, ...]:
+    """Return the physical weight-layout contract selected by AITER."""
+
     config_values = getattr(config, "config", None)
     padded_k = (
         config_values.get("PADDED_K")
@@ -321,7 +323,7 @@ def prepare_aiter_moe_weights(
     cache_key = (
         _tensor_generation(w1),
         _tensor_generation(w2),
-        _weight_layout_generation(config),
+        aiter_moe_weight_layout_signature(config),
         _freeze(block_shape),
         preserve_inputs,
     )
