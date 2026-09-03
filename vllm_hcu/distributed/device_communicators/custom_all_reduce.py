@@ -3,6 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+from __future__ import annotations
+
 from contextlib import contextmanager
 from typing import cast
 
@@ -45,6 +47,51 @@ def allow_custom_allreduce_for_topology(fully_connected: bool) -> bool:
     if fully_connected:
         return True
     return bool(henvs.VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE)
+
+
+def _normalize_cuda_device(device: int | str | torch.device) -> torch.device:
+    if isinstance(device, int):
+        device = torch.device(f"cuda:{device}")
+    elif isinstance(device, str):
+        device = torch.device(device)
+    assert isinstance(device, torch.device)
+    return device
+
+
+def gather_physical_device_ids(
+    group: ProcessGroup,
+    device: int | str | torch.device,
+) -> list[int]:
+    """Return physical device IDs for every rank in ``group``."""
+    device = _normalize_cuda_device(device)
+    cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+    if cuda_visible_devices:
+        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        device_ids = list(range(current_platform.device_count()))
+    physical_device_id = device_ids[device.index]
+    world_size = dist.get_world_size(group=group)
+    tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
+    gather_list = [
+        torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
+    ]
+    dist.all_gather(gather_list, tensor, group=group)
+    return [item.item() for item in gather_list]
+
+
+def custom_allreduce_topology_decision(
+    group: ProcessGroup,
+    device: int | str | torch.device,
+) -> tuple[bool, bool]:
+    """Return ``(fully_connected, allowed)`` for this communicator group.
+
+    Callers must apply this before constructing either the native or AITER
+    custom-allreduce backend. PCIe/no-XGMI stays fail-closed unless
+    ``VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE=1``.
+    """
+    physical_device_ids = gather_physical_device_ids(group, device)
+    fully_connected = bool(current_platform.is_fully_connected(physical_device_ids))
+    return fully_connected, allow_custom_allreduce_for_topology(fully_connected)
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -137,12 +184,7 @@ class CustomAllreduce:
             )
             return
 
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        # now `device` is a `torch.device` object
-        assert isinstance(device, torch.device)
+        device = _normalize_cuda_device(device)
         self.device = device
         device_capability = current_platform.get_device_capability()
         if (
@@ -156,26 +198,15 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
-        cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
-        else:
-            device_ids = list(range(current_platform.device_count()))
-
-        physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
 
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
-        fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if not allow_custom_allreduce_for_topology(fully_connected):
+        fully_connected, allowed = custom_allreduce_topology_decision(
+            self.group, device
+        )
+        if not allowed:
             # Stricter than upstream vLLM, which still allows TP=2 on PCIe.
             # HCU PCIe CustomAllreduce has hard-locked hosts at TP=2, so this
             # path fails closed to HCCL unless the operator opts in.
