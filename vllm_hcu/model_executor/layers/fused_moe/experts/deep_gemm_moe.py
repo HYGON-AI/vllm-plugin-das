@@ -20,6 +20,9 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
+from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils import (
+    topk_weights_for_unpermute,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
