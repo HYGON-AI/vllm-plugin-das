@@ -40,12 +40,25 @@ def test_hy_v4_accepts_accuracy_safe_kv_cache_dtype(cache_dtype: str) -> None:
 
 
 def test_hy_v4_normalizes_fp8_e4m3_for_sparse_flashmla_selection() -> None:
-    assert _normalize_hy_v4_kv_cache_dtype("fp8_e4m3") == "fp8_ds_mla"
+    assert (
+        _normalize_hy_v4_kv_cache_dtype("fp8_e4m3", use_sparse=True)
+        == "fp8_ds_mla"
+    )
+
+
+def test_hy_v4_preserves_fp8_e4m3_for_dense_flashmla_selection() -> None:
+    assert (
+        _normalize_hy_v4_kv_cache_dtype("fp8_e4m3", use_sparse=False)
+        == "fp8_e4m3"
+    )
 
 
 @pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8_ds_mla"])
 def test_hy_v4_preserves_native_kv_cache_dtype(cache_dtype: str) -> None:
-    assert _normalize_hy_v4_kv_cache_dtype(cache_dtype) == cache_dtype
+    assert (
+        _normalize_hy_v4_kv_cache_dtype(cache_dtype, use_sparse=True)
+        == cache_dtype
+    )
 
 
 def test_full_and_shared_indexer_pattern() -> None:

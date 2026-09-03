@@ -65,10 +65,14 @@ def _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype: str) -> None:
         )
 
 
-def _normalize_hy_v4_kv_cache_dtype(kv_cache_dtype: str) -> str:
+def _normalize_hy_v4_kv_cache_dtype(
+    kv_cache_dtype: str,
+    *,
+    use_sparse: bool,
+) -> str:
     """Normalize HY V4's E4M3 alias to the sparse FlashMLA cache layout."""
     _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype)
-    if kv_cache_dtype == "fp8_e4m3":
+    if use_sparse and kv_cache_dtype == "fp8_e4m3":
         return "fp8_ds_mla"
     return kv_cache_dtype
 
@@ -410,9 +414,17 @@ class HYV4MLAAttention(nn.Module):
 
         # Do not silently degrade sparse layers into dense attention. Probe the
         # sparse MLA backend directly and fail fast with the real error.
-        kv_cache_dtype = cache_config.cache_dtype if cache_config else "auto"
-        kv_cache_dtype = _normalize_hy_v4_kv_cache_dtype(kv_cache_dtype)
-        if cache_config is not None:
+        requested_kv_cache_dtype = (
+            cache_config.cache_dtype if cache_config else "auto"
+        )
+        kv_cache_dtype = _normalize_hy_v4_kv_cache_dtype(
+            requested_kv_cache_dtype,
+            use_sparse=self.is_sparse,
+        )
+        if (
+            cache_config is not None
+            and kv_cache_dtype != requested_kv_cache_dtype
+        ):
             cache_config.cache_dtype = cast(CacheDType, kv_cache_dtype)
         if self.is_sparse:
             try:
