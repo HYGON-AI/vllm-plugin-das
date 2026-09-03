@@ -9,6 +9,7 @@ import builtins
 from collections import defaultdict
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from hcu_ci_preflight import (  # noqa: E402
     _check_environment_lock,
     _check_requirements,
 )
+from run_hcu_ci_job import _export_resolved_resource_environment  # noqa: E402
 from build_hcu_matrix import MatrixError, build_matrix  # noqa: E402
 from compile_changed_python import _compile as compile_python_file  # noqa: E402
 from compile_changed_python import main as compile_changed_python_main  # noqa: E402
@@ -51,6 +53,14 @@ def _config() -> dict:
 def _selected_job_ids(*paths: str) -> set[str]:
     jobs, _, _ = select_jobs(_config(), paths)
     return {job["registry_job"] for job in jobs}
+
+
+def _enabled_registry_jobs() -> set[str]:
+    return {
+        registration.job
+        for registration in parse_registry()
+        if registration.disabled is None
+    }
 
 
 def _contains_pytest_hcu_marker(path: Path) -> bool:
@@ -73,10 +83,10 @@ def test_selector_configuration_is_valid() -> None:
     assert "single-node-topology" in jobs
 
 
-def test_full_matrix_contains_every_configured_job() -> None:
+def test_full_matrix_contains_every_enabled_registered_job() -> None:
     config = _config()
     matrix = build_matrix(config, profile="full")
-    assert {job["registry_job"] for job in matrix} == set(config["jobs"])
+    assert {job["registry_job"] for job in matrix} == _enabled_registry_jobs()
 
 
 def test_static_hcu_registry_covers_every_configured_job() -> None:
@@ -149,11 +159,10 @@ def test_nightly_matrix_explicitly_covers_extended_models_and_topology() -> None
     ids = {job["id"] for job in matrix}
     registry_jobs = {job["registry_job"] for job in matrix}
     assert len(ids) == len(matrix)
-    assert registry_jobs == set(config["jobs"])
+    assert registry_jobs == _enabled_registry_jobs()
     assert {
         "accuracy-gfx938",
         "integration-smoke-gfx938",
-        "mamba-smoke",
         "qwen25-models",
         "qwen3-pooling",
         "qwen3-protocol",
@@ -164,7 +173,8 @@ def test_nightly_matrix_explicitly_covers_extended_models_and_topology() -> None
 def test_every_registered_hcu_test_file_routes_to_one_of_its_jobs() -> None:
     jobs_by_file: dict[str, set[str]] = defaultdict(set)
     for registration in parse_registry():
-        jobs_by_file[registration.test_file].add(registration.job)
+        if registration.disabled is None:
+            jobs_by_file[registration.test_file].add(registration.job)
 
     missing = {
         test_file: sorted(expected_jobs)
@@ -376,6 +386,33 @@ def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
         assert expected in config["jobs"][job_id]["requirements"]
     assert expected not in config["jobs"]["qwen35-smoke"]["requirements"]
 
+
+def test_unavailable_model_tests_are_disabled_without_blocking_related_jobs() -> None:
+    config = _config()
+    full_jobs = {
+        job["registry_job"] for job in build_matrix(config, profile="full")
+    }
+    nightly_jobs = {
+        job["registry_job"] for job in build_matrix(config, profile="nightly")
+    }
+    assert {"mamba-smoke", "glm52-pcp"}.isdisjoint(full_jobs)
+    assert {"mamba-smoke", "glm52-pcp"}.isdisjoint(nightly_jobs)
+
+    pooling_requirements = config["jobs"]["qwen3-pooling"]["requirements"]
+    assert not any(
+        requirement.get("env") == "VLLM_HCU_QWEN3_RERANKER_SEQCLS_06B_MODEL"
+        for requirement in pooling_requirements
+    )
+    disabled_targets = {
+        registration.target
+        for registration in parse_registry()
+        if registration.disabled is not None
+    }
+    assert (
+        "tests/integration/server/test_qwen3_pooling_server.py::"
+        "test_qwen3_reranker_score_and_rerank_server_smoke"
+    ) in disabled_targets
+
     environment_lock = json.loads(
         (
             REPOSITORY
@@ -417,6 +454,47 @@ def test_distribution_requirement_is_checked_on_demand(
     ]
 
 
+def test_model_requirement_searches_additional_model_roots(
+    tmp_path: Path,
+) -> None:
+    primary_root = tmp_path / "public"
+    secondary_root = tmp_path / "parastor"
+    model_path = secondary_root / "qwen3.5" / "Qwen3.5-9B"
+    primary_root.mkdir()
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text("{}\n", encoding="utf-8")
+    requirement = {
+        "kind": "model",
+        "env": "VLLM_HCU_QWEN35_9B_MODEL",
+        "relative": "qwen3.5/Qwen3.5-9B",
+    }
+
+    assert _check_requirements(
+        [requirement],
+        primary_root,
+        (secondary_root,),
+    ) == [
+        {
+            "env": "VLLM_HCU_QWEN35_9B_MODEL",
+            "kind": "model",
+            "path": str(model_path.resolve()),
+        }
+    ]
+
+
+def test_resolved_model_path_is_exported_for_selected_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = "VLLM_HCU_QWEN35_9B_MODEL"
+    monkeypatch.delenv(env_name, raising=False)
+
+    _export_resolved_resource_environment(
+        [{"env": env_name, "kind": "model", "path": "/models/parastor/qwen"}]
+    )
+
+    assert os.environ[env_name] == "/models/parastor/qwen"
+
+
 def test_hcu_container_uses_checked_out_environment_lock() -> None:
     source = (
         REPOSITORY / "scripts/ci/hcu/hcu_ci_start_container.sh"
@@ -425,6 +503,11 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
         "HCU_CI_ENVIRONMENT_LOCK=/vllm-plugin-das/.github/workflows/"
         "configs/hcu-runner-environment.json"
     ) in source
+    assert "/parastor/opendas/DL_DATA/llm-models" in source
+    assert "VLLM_HCU_TEST_MODEL_ROOTS" in source
+    assert "/models/public" in source
+    assert "/models/parastor" in source
+    assert ":/models/llm-models:ro" not in source
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
@@ -561,8 +644,12 @@ def test_release_push_is_independent_from_image_validation() -> None:
     assert "tools/run_patch_tests.py --suite contract" not in release
     assert "HCU_CI_VARIABLE_TOKEN" not in release
 
-    assert "workflow_run:" in validation
-    assert "- docker-image" in validation
+    assert "validate-image:" in release
+    assert "uses: ./.github/workflows/validate-docker-image.yml" in release
+    assert "image: ${{ needs.build.outputs.docker_image }}" in release
+    assert "workflow_call:" in validation
+    assert "image:" in validation
+    assert "required: true" in validation
     assert "actions/download-artifact@v4" not in validation
     assert "vllm:0.25.1-latest" in validation
     assert 'docker pull "$SOURCE_IMAGE"' in validation
@@ -748,12 +835,12 @@ def test_protocol_helper_change_selects_all_server_consumers() -> None:
     assert fallback is False
 
 
-def test_mamba_change_selects_real_mamba_smoke() -> None:
+def test_mamba_change_does_not_select_disabled_model_smoke() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
         ["vllm_hcu/model_executor/layers/mamba_runtime.py"],
     )
-    assert {job["registry_job"] for job in jobs} == {"mamba-smoke"}
+    assert jobs == []
     assert "mamba" in groups
     assert fallback is False
 

@@ -57,7 +57,11 @@ def _distribution_version(name: str) -> str | None:
         return None
 
 
-def _resolve_requirement(item: dict[str, Any], model_root: Path | None) -> Path:
+def _resolve_requirement(
+    item: dict[str, Any],
+    model_root: Path | None,
+    additional_model_roots: tuple[Path, ...] = (),
+) -> Path:
     env_name = item.get("env")
     relative = item.get("relative")
     if not isinstance(env_name, str) or not env_name:
@@ -67,16 +71,25 @@ def _resolve_requirement(item: dict[str, Any], model_root: Path | None) -> Path:
     override = os.environ.get(env_name)
     if override:
         return Path(override).expanduser().resolve()
-    if model_root is None:
+    model_roots = tuple(
+        dict.fromkeys(
+            root.resolve()
+            for root in (model_root, *additional_model_roots)
+            if root is not None
+        )
+    )
+    if not model_roots:
         raise PreflightError(
             f"{env_name} is unset and VLLM_HCU_TEST_MODEL_ROOT is unavailable"
         )
-    return (model_root / relative).resolve()
+    candidates = tuple((root / relative).resolve() for root in model_roots)
+    return next((path for path in candidates if path.exists()), candidates[0])
 
 
 def _check_requirements(
     requirements: list[dict[str, Any]],
     model_root: Path | None,
+    additional_model_roots: tuple[Path, ...] = (),
 ) -> list[dict[str, str]]:
     resolved: list[dict[str, str]] = []
     for item in requirements:
@@ -116,7 +129,7 @@ def _check_requirements(
 
         if kind not in {"model", "path"}:
             raise PreflightError(f"unsupported requirement kind: {kind!r}")
-        path = _resolve_requirement(item, model_root)
+        path = _resolve_requirement(item, model_root, additional_model_roots)
         if not path.exists():
             raise PreflightError(f"required resource is unavailable: {path}")
         if kind == "model":
@@ -301,7 +314,16 @@ def run_preflight(
         if model_root_text
         else None
     )
-    resolved_requirements = _check_requirements(requirements, model_root)
+    additional_model_roots = tuple(
+        Path(value).expanduser().resolve()
+        for value in os.environ.get("VLLM_HCU_TEST_MODEL_ROOTS", "").split(os.pathsep)
+        if value
+    )
+    resolved_requirements = _check_requirements(
+        requirements,
+        model_root,
+        additional_model_roots,
+    )
     versions, torch_hip = _collect_runtime_versions(torch)
     lock_report = (
         _check_environment_lock(

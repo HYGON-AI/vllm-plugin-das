@@ -157,6 +157,10 @@ register_hcu_ci(
         "test_falcon_mamba_tiny_real_prefill_decode_smoke"
     ),
     est_time=1200,
+    disabled=(
+        "required Falcon Mamba model is unavailable in the public and "
+        "parastor CI model roots"
+    ),
 )
 register_hcu_ci(
     job="kv-transfer",
@@ -205,8 +209,23 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="qwen3-pooling",
-    target="tests/integration/server/test_qwen3_pooling_server.py",
+    target=(
+        "tests/integration/server/test_qwen3_pooling_server.py::"
+        "test_qwen3_embedding_06b_openai_embeddings_server_smoke"
+    ),
     est_time=1800,
+)
+register_hcu_ci(
+    job="qwen3-pooling",
+    target=(
+        "tests/integration/server/test_qwen3_pooling_server.py::"
+        "test_qwen3_reranker_score_and_rerank_server_smoke"
+    ),
+    est_time=1800,
+    disabled=(
+        "required sequence-classification reranker model is unavailable in "
+        "the public and parastor CI model roots"
+    ),
 )
 register_hcu_ci(
     job="qwen3-protocol",
@@ -249,11 +268,19 @@ register_hcu_ci(
     job="glm52-pcp",
     target="tests/integration/models/test_glm52_pcp_mrv2.py",
     est_time=14400,
+    disabled=(
+        "required GLM-5.2 model is unavailable in the public and parastor CI "
+        "model roots"
+    ),
 )
 register_hcu_ci(
     job="glm52-pcp",
     target="tests/integration/server/test_evalscope_glm52_pcp_humaneval.py",
     est_time=14400,
+    disabled=(
+        "required GLM-5.2 model is unavailable in the public and parastor CI "
+        "model roots"
+    ),
 )
 register_hcu_ci(
     job="single-node-topology",

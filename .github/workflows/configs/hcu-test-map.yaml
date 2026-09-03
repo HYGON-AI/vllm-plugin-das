@@ -284,7 +284,7 @@
       "suite": "model",
       "pytest_args": [
         "-k",
-        "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke or qwen3_embedding_06b_openai_embeddings_server_smoke or qwen3_reranker_score_and_rerank_server_smoke"
+        "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke or qwen3_embedding_06b_openai_embeddings_server_smoke"
       ],
       "timeout_minutes": 90,
       "partitions": 2,
@@ -298,11 +298,6 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_RERANKER_06B_MODEL",
           "relative": "qwen3/Qwen3-Reranker-0.6B"
-        },
-        {
-          "kind": "model",
-          "env": "VLLM_HCU_QWEN3_RERANKER_SEQCLS_06B_MODEL",
-          "relative": "vllm-optest-models/tomaarsen/Qwen3-Reranker-0.6B-seq-cls"
         }
       ]
     },

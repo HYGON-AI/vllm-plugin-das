@@ -154,6 +154,8 @@ def expand_job_partitions(
         display_id = job["id"]
         registry_job = job.get("registry_job", job["id"])
         enabled = registrations_for_job(registrations, registry_job)
+        if not enabled:
+            continue
         partition_size = job.get("partitions", 1)
         if partition_size > len(enabled):
             raise SelectionError(

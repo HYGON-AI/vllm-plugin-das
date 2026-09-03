@@ -87,39 +87,56 @@ if [[ -d /opt/hyhal ]]; then
   docker_args+=(--volume /opt/hyhal:/opt/hyhal:ro)
 fi
 
-if [[ -z "$model_root" ]]; then
-  for candidate in \
-    /models/llm-models \
-    /public/opendas/DL_DATA/llm-models \
-    /public/opendas/DL_DATA; do
-    echo "checking HCU model root candidate: $candidate"
-    if [[ -d "$candidate" ]]; then
-      model_root="$candidate"
-      break
-    fi
-  done
+if [[ -n "$model_root" && -d "$model_root/llm-models" ]]; then
+  model_root="$model_root/llm-models"
 fi
-if [[ -z "$model_root" && "${HCU_CI_REQUIREMENTS_JSON:-}" == *'"kind": "model"'* ]]; then
-  echo "HCU model requirements were selected, but no model root was found on this runner." >&2
-  echo "Set HCU_CI_MODEL_ROOT to the runner host path or create one of these layouts:" >&2
-  for candidate in \
-    /models/llm-models \
-    /public/opendas/DL_DATA/llm-models \
-    /public/opendas/DL_DATA; do
-    ls -ld "$candidate" "$candidate/qwen3.5" "$candidate/vllm-optest-models" >&2 || true
+model_root_hosts=()
+model_root_containers=()
+
+add_model_root() {
+  local host_root="$1"
+  local container_root="$2"
+  local existing
+  [[ -d "$host_root" ]] || return 0
+  host_root="$(realpath "$host_root")"
+  for existing in "${model_root_hosts[@]:-}"; do
+    [[ "$existing" == "$host_root" ]] && return 0
   done
-  exit 2
-fi
+  model_root_hosts+=("$host_root")
+  model_root_containers+=("$container_root")
+}
+
+add_model_root /public/opendas/DL_DATA/llm-models /models/public
+add_model_root /parastor/opendas/DL_DATA/llm-models /models/parastor
 if [[ -n "$model_root" ]]; then
-  model_root="$(realpath "$model_root")"
   if [[ ! -d "$model_root" ]]; then
     echo "HCU model root does not exist: $model_root" >&2
     exit 2
   fi
-  echo "using HCU model root: $model_root"
+  add_model_root "$model_root" /models/configured
+fi
+
+if [[ "${#model_root_hosts[@]}" -eq 0 \
+    && "${HCU_CI_REQUIREMENTS_JSON:-}" == *'"kind": "model"'* ]]; then
+  echo "HCU model requirements were selected, but no model root was found on this runner." >&2
+  echo "Expected the same model mounts used by daily-test-docker-image.yml:" >&2
+  ls -ld \
+    /public/opendas/DL_DATA/llm-models \
+    /parastor/opendas/DL_DATA/llm-models >&2 || true
+  exit 2
+fi
+
+if [[ "${#model_root_hosts[@]}" -gt 0 ]]; then
+  for index in "${!model_root_hosts[@]}"; do
+    echo "using HCU model root: ${model_root_hosts[$index]} -> ${model_root_containers[$index]}"
+    docker_args+=(
+      --volume "${model_root_hosts[$index]}:${model_root_containers[$index]}:ro"
+    )
+  done
+  model_root_search_path="$(IFS=:; echo "${model_root_containers[*]}")"
   docker_args+=(
-    --volume "$model_root:/models/llm-models:ro"
-    --env VLLM_HCU_TEST_MODEL_ROOT=/models/llm-models
+    --env "VLLM_HCU_TEST_MODEL_ROOT=${model_root_containers[0]}"
+    --env "VLLM_HCU_TEST_MODEL_ROOTS=$model_root_search_path"
   )
 fi
 

@@ -79,6 +79,16 @@ def _tested_git_sha() -> str:
     return result.stdout.strip()
 
 
+def _export_resolved_resource_environment(
+    resources: list[dict[str, str]],
+) -> None:
+    for resource in resources:
+        env_name = resource.get("env")
+        path = resource.get("path")
+        if env_name and path:
+            os.environ[env_name] = path
+
+
 def main() -> int:
     try:
         job_id = _required_environment("HCU_CI_JOB_ID")
@@ -155,6 +165,7 @@ def main() -> int:
                 encoding="utf-8",
             )
             raise
+        _export_resolved_resource_environment(preflight["resources"])
         preflight.update(
             {
                 "job_id": job_id,
