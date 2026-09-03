@@ -347,3 +347,132 @@ def test_sparse_mla_topk_helpers_use_categorized_attention_kernels(
 
     assert len(prefill_calls) == 1
     assert len(decode_calls) == 1
+
+
+def test_fp8_mqa_logits_gfx936_prefers_aiter_over_lightop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    aiter_calls: list[tuple[object, ...]] = []
+    lightop_calls: list[tuple[object, ...]] = []
+    sentinel = object()
+
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx93x", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "mqa_logits_module",
+        lambda: SimpleNamespace(
+            fp8_mqa_logits=lambda *args: (
+                aiter_calls.append(args),
+                sentinel,
+            )[1]
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(
+            mqa_logits=lambda *args: (
+                lightop_calls.append(args),
+                None,
+            )[1]
+        ),
+        raising=False,
+    )
+
+    result = runtime.rocm_fp8_mqa_logits(
+        torch.ones((2, 1, 4)),
+        (torch.ones((3, 4), dtype=torch.bfloat16), torch.ones(3)),
+        torch.ones((2, 1)),
+        torch.zeros(2, dtype=torch.int32),
+        torch.full((2,), 3, dtype=torch.int32),
+    )
+
+    assert result is sentinel
+    assert len(aiter_calls) == 1
+    assert lightop_calls == []
+
+
+def test_fp8_mqa_logits_gfx936_without_aiter_uses_bf16_lightop_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    calls: list[tuple[object, ...]] = []
+    sentinel = object()
+    k_bf16 = torch.full((3, 4), 2.0, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx93x", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "mqa_logits_module", lambda: None)
+
+    def capture_mqa(*args):
+        calls.append(args)
+        return sentinel
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(mqa_logits=capture_mqa),
+        raising=False,
+    )
+
+    result = runtime.rocm_fp8_mqa_logits(
+        torch.ones((2, 1, 4)),
+        (k_bf16, torch.full((3,), float("nan"))),
+        torch.ones((2, 1)),
+        torch.zeros(2, dtype=torch.int32),
+        torch.full((2,), 3, dtype=torch.int32),
+    )
+
+    assert result is sentinel
+    assert len(calls) == 1
+    assert calls[0][0].dtype is torch.bfloat16
+    assert calls[0][1] is k_bf16
+    assert calls[0][5] is None
+
+
+def test_fp8_mqa_logits_gfx938_without_aiter_keeps_lightop_fp8_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    calls: list[tuple[object, ...]] = []
+    sentinel = object()
+    scale = torch.full((3,), 0.5)
+
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx93x", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(
+            mqa_logits=lambda *args: (calls.append(args), sentinel)[1]
+        ),
+        raising=False,
+    )
+
+    q = torch.ones((2, 1, 4))
+    result = runtime.rocm_fp8_mqa_logits(
+        q,
+        (torch.ones((3, 4)), scale),
+        torch.ones((2, 1)),
+        torch.zeros(2, dtype=torch.int32),
+        torch.full((2,), 3, dtype=torch.int32),
+    )
+
+    assert result is sentinel
+    assert len(calls) == 1
+    assert calls[0][0] is q
+    assert calls[0][5] is scale
