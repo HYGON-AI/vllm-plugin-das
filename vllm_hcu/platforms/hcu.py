@@ -162,27 +162,37 @@ def _get_backend_priorities(
 
 
 def register_attention_backends() -> None:
-    # Pre-register all attention backends
-    register_backend(
-        AttentionBackendEnum.TRITON_ATTN,
-        class_path="vllm_hcu.v1.attention.backends.triton_attn.HcuTritonAttentionBackend",
+    # Install HCU defaults without replacing user or third-party overrides.
+    backends = (
+        (
+            AttentionBackendEnum.TRITON_ATTN,
+            "vllm_hcu.v1.attention.backends.triton_attn."
+            "HcuTritonAttentionBackend",
+        ),
+        (
+            AttentionBackendEnum.FLASH_ATTN,
+            "vllm_hcu.v1.attention.backends.flash_attn."
+            "HcuFlashAttentionBackend",
+        ),
+        (
+            AttentionBackendEnum.FLASHMLA_SPARSE,
+            "vllm_hcu.v1.attention.backends.mla.flashmla_sparse."
+            "HcuFlashMLASparseBackend",
+        ),
+        (
+            AttentionBackendEnum.FLASHMLA,
+            "vllm_hcu.v1.attention.backends.mla.flashmla."
+            "HcuFlashMLABackend",
+        ),
+        (
+            AttentionBackendEnum.TRITON_MLA,
+            "vllm_hcu.v1.attention.backends.mla.triton_mla."
+            "HcuTritonMLABackend",
+        ),
     )
-    register_backend(
-        AttentionBackendEnum.FLASH_ATTN,
-        class_path="vllm_hcu.v1.attention.backends.flash_attn.HcuFlashAttentionBackend",
-    )
-    register_backend(
-        AttentionBackendEnum.FLASHMLA_SPARSE,
-        class_path="vllm_hcu.v1.attention.backends.mla.flashmla_sparse.HcuFlashMLASparseBackend",
-    )
-    register_backend(
-        AttentionBackendEnum.FLASHMLA,
-        class_path="vllm_hcu.v1.attention.backends.mla.flashmla.HcuFlashMLABackend",
-    )
-    register_backend(
-        AttentionBackendEnum.TRITON_MLA,
-        class_path="vllm_hcu.v1.attention.backends.mla.triton_mla.HcuTritonMLABackend",
-    )
+    for backend, class_path in backends:
+        if not backend.is_overridden():
+            register_backend(backend, class_path=class_path)
 
 
 class HCUPlatform(Platform):
@@ -285,6 +295,7 @@ class HCUPlatform(Platform):
         assert device_capability is not None
 
         attn_selector_config = attn_selector_config._replace(block_size=None)
+        register_attention_backends()
 
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:

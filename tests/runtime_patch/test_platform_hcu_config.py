@@ -1496,6 +1496,132 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
+@pytest.mark.parametrize(
+    ("backend_name", "expected_path"),
+    [
+        (
+            "FLASH_ATTN",
+            "vllm_hcu.v1.attention.backends.flash_attn."
+            "HcuFlashAttentionBackend",
+        ),
+        (
+            "TRITON_ATTN",
+            "vllm_hcu.v1.attention.backends.triton_attn."
+            "HcuTritonAttentionBackend",
+        ),
+    ],
+)
+def test_explicit_attention_backend_restores_hcu_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+    expected_path: str,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    backend = AttentionBackendEnum[backend_name]
+    was_overridden = backend.is_overridden()
+    previous_path = backend.get_path()
+    # The source worktree does not contain the installed hcu_ops extension.
+    # Keep class validation available while exercising the real registry path.
+    def get_available_hcu_backend(selected_backend):
+        assert selected_backend.get_path() == expected_path
+        return AvailableBackend
+
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        get_available_hcu_backend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=None,
+        block_size=None,
+    )
+
+    try:
+        backend.clear_override()
+        selected_path = HCUPlatform.get_attn_backend_cls(
+            backend,
+            selector_config,
+        )
+    finally:
+        backend.clear_override()
+        if was_overridden:
+            register_backend(backend, previous_path)
+
+    assert selected_path == expected_path
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_attention_selection_preserves_third_party_override(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    backend = AttentionBackendEnum.FLASH_ATTN
+    was_overridden = backend.is_overridden()
+    previous_path = backend.get_path()
+    third_party_path = "third_party.attention.CustomFlashAttentionBackend"
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=None,
+        block_size=None,
+    )
+
+    try:
+        register_backend(backend, third_party_path)
+        selected_path = HCUPlatform.get_attn_backend_cls(
+            backend if explicit else None,
+            selector_config,
+        )
+    finally:
+        backend.clear_override()
+        if was_overridden:
+            register_backend(backend, previous_path)
+
+    assert selected_path == third_party_path
+
+
 def test_cutlass_block_first_mooncake_defers_to_worker_capability_gates() -> None:
     config = _validation_config(HcuFeatureConfig(hcu_flash_attn_mode="cutlass"))
     config.kv_transfer_config = SimpleNamespace(
