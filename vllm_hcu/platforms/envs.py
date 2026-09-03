@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
+    VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -410,6 +411,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Enable request-count-oriented cudagraph capture buckets up to request size 256.
     "VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS":
         lambda: (os.environ.get("VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS", "False").lower() in
+                    ("true", "1")),
+
+    # Opt in to CustomAllreduce on PCIe-only (no XGMI) topologies, including
+    # TP=2. Default is fail-closed to HCCL.
+    "VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE":
+        lambda: (os.environ.get("VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE", "False").lower() in
                     ("true", "1")),
 }
 

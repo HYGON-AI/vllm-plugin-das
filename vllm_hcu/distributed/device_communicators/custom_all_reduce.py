@@ -19,6 +19,7 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm_hcu.platforms import envs as henvs
 
 try:
     torch.ops.hcu_ops.meta_size()
@@ -28,6 +29,22 @@ except Exception:
     custom_ar = False
 
 logger = init_logger(__name__)
+
+# Explicit opt-in for the PCIe (no XGMI) CustomAllreduce kernel. The default
+# is fail-closed to HCCL because that kernel has hard-locked HCU hosts at TP=2.
+PCIE_CUSTOM_ALLREDUCE_ENV = "VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE"
+
+
+def allow_custom_allreduce_for_topology(fully_connected: bool) -> bool:
+    """Return whether CustomAllreduce may initialize for this device topology.
+
+    Fully-connected (XGMI) topologies keep the existing fast path. PCIe-only
+    topologies, including TP=2, fail closed to HCCL unless the operator
+    explicitly opts in with ``VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE=1``.
+    """
+    if fully_connected:
+        return True
+    return bool(henvs.VLLM_HCU_ENABLE_PCIE_CUSTOM_ALLREDUCE)
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -158,12 +175,27 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        if not allow_custom_allreduce_for_topology(fully_connected):
+            # Stricter than upstream vLLM, which still allows TP=2 on PCIe.
+            # HCU PCIe CustomAllreduce has hard-locked hosts at TP=2, so this
+            # path fails closed to HCCL unless the operator opts in.
+            logger.warning(
+                "Custom allreduce is disabled because the devices are not "
+                "fully connected (PCIe, no XGMI). HCCL will be used instead. "
+                "To enable the PCIe custom allreduce kernel anyway, set "
+                "%s=1.",
+                PCIE_CUSTOM_ALLREDUCE_ENV,
+            )
+            return
         if not fully_connected:
             max_size = 32 * 8192 * 2
             logger.warning(
-                "We are using PCIe's custom allreduce."
-                "If the performance is poor, we can add "
-                "--disable-custom-all-reduce in the instruction.")
+                "Custom allreduce is enabled on a PCIe topology because "
+                "%s=1. This path can be unstable on some HCU PCIe systems; "
+                "prefer HCCL (--disable-custom-all-reduce) if you observe "
+                "hangs.",
+                PCIE_CUSTOM_ALLREDUCE_ENV,
+            )
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -245,7 +277,9 @@ class CustomAllreduce:
         if not is_weak_contiguous(inp):
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
+        # little performance improvement over NCCL. world_size == 2 is only
+        # reachable here when init enabled the communicator (XGMI, or an
+        # explicit PCIe opt-in).
         if self.world_size == 2 or self.fully_connected:
             return inp_size < self.max_size
         return False
