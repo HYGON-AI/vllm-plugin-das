@@ -3,28 +3,39 @@
 
 name: test-docker-image-daily
 
+# 由 docker-image (release-docker-image.yml) 构建并推送成功后作为 reusable workflow 被调用,
+# 传入本次构建的镜像名; 也可手动触发, 留空 docker_image 时回落 0.25.1-latest
 on:
+  workflow_call:
+    inputs:
+      docker_image:
+        description: 待测试镜像完整路径, 例如 <site>/<ns>/vllm:0.25.1-ubuntu22.04-dtk2604-py3.10-<时间戳>
+        required: true
+        type: string
   workflow_dispatch:
-  schedule:
-    # 北京时间每天 0 点 (UTC 16:00)
-    - cron: '0 16 * * *'
+    inputs:
+      docker_image:
+        description: 待测试镜像完整路径; 留空使用 vllm:0.25.1-latest
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: docker-image-${{ github.ref }}
+  group: test-docker-image-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   PYPI_URL: ${{ vars.PYPI_URL }}
-  VLLM_VERSION: "0.25.1"
+  TEST_IMAGE: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
 
 jobs:
   citest:
-    runs-on: nmz36
+    runs-on: nmz6
     container:
-      image: ${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:0.25.1-latest
+      image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
       options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
@@ -34,6 +45,9 @@ jobs:
         - /opt/hyhal:/opt/hyhal:ro
     steps:
       - uses: actions/checkout@v4
+
+      - name: 确认测试镜像
+        run: echo "TEST_IMAGE=${{ env.TEST_IMAGE }}"
 
       - name: 安装 CItest
         run: |
@@ -53,7 +67,7 @@ jobs:
         run: |
           CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
                        --json_key docker_image_name \
-                       --json_value "${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:${{ env.VLLM_VERSION }}-latest"
+                       --json_value "${{ env.TEST_IMAGE }}"
           CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
                        --json_key jenkins_url \
                        --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

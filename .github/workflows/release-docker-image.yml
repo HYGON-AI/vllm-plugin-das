@@ -5,6 +5,12 @@ name: docker-image
 
 on:
   workflow_dispatch:
+    inputs:
+      run_test:
+        description: 构建完成并推送后, 自动触发 test-docker-image-daily 对该镜像跑 CItest
+        required: false
+        default: true
+        type: boolean
   schedule:
     # 北京时间每天 22 点 (UTC 14:00)
     - cron: '0 14 * * *'
@@ -30,6 +36,8 @@ jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
     runs-on: bw18
+    outputs:
+      docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:
       - name: Repair self-hosted workspace before checkout
         run: |
@@ -105,11 +113,13 @@ jobs:
           echo "AICC_VERSION=${LATEST_AICC#dtk_llvm_}" >> "$GITHUB_ENV"
 
       - name: 生成镜像 tag
+        id: gen-tag
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
           echo "IMAGE_TAG=vllm:${BASE_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=vllm:${BASE_VERSION}-latest" >> "$GITHUB_ENV"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 登录 Harbor
         uses: docker/login-action@v3
@@ -146,3 +156,20 @@ jobs:
       - name: 清理 workspace
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
+  # 镜像推送成功后, 对本次构建的具体镜像并行跑 CItest 与冒烟校验,
+  # 两个测试 job 只依赖 build, 互不等待互不阻断
+  test-image:
+    if: github.event.inputs.run_test != 'false'
+    needs: build
+    uses: ./.github/workflows/daily-test-docker-image.yml
+    with:
+      docker_image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit
+
+  validate-image:
+    needs: build
+    uses: ./.github/workflows/validate-docker-image.yml
+    with:
+      image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit

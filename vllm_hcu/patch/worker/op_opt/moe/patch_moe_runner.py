@@ -24,6 +24,8 @@ TARGETS = (
     f"{TARGET_MODULE}._moe_forward_fake",
     f"{TARGET_MODULE}._moe_forward_shared",
     f"{TARGET_MODULE}._moe_forward_shared_fake",
+    f"{TARGET_MODULE}._moe_forward_shared_inplace",
+    f"{TARGET_MODULE}._moe_forward_shared_inplace_fake",
     f"{TARGET_MODULE}.MoERunner._maybe_apply_shared_experts",
     f"{TARGET_MODULE}.MoERunner._quant_method_supports_quanted_inputs",
     f"{TARGET_MODULE}.MoERunner._apply_quant_method",
@@ -60,6 +62,16 @@ def apply_to_module(module: ModuleType) -> bool:
             "layer_name", "hidden_dim_unpadded",
         ),
         "_moe_forward_shared_fake": (
+            "hidden_states", "router_logits", "shared_experts_input", "input_ids",
+            "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
+            "layer_name", "hidden_dim_unpadded",
+        ),
+        "_moe_forward_shared_inplace": (
+            "hidden_states", "router_logits", "shared_experts_input", "input_ids",
+            "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
+            "layer_name", "hidden_dim_unpadded",
+        ),
+        "_moe_forward_shared_inplace_fake": (
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
             "layer_name", "hidden_dim_unpadded",

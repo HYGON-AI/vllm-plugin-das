@@ -179,7 +179,7 @@ def _moe_forward_shared(
     hidden_dim_unpadded: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer._forward_impl(
+    shared_output, fused_output = layer._forward_impl(
         hidden_states,
         router_logits,
         shared_experts_input,
@@ -189,6 +189,7 @@ def _moe_forward_shared(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
+    return shared_output, fused_output.clone()
 
 
 def _moe_forward_shared_fake(
@@ -219,6 +220,54 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _moe_forward_shared_inplace(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    quanted_hidden_states: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    shared_output, fused_output = layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        quanted_hidden_states=quanted_hidden_states,
+        scale=scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    if fused_output is not hidden_states:
+        raise RuntimeError(
+            "In-place shared MoE path requires the routed kernel to return "
+            "the hidden_states input"
+        )
+    return shared_output
+
+
+def _moe_forward_shared_inplace_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    quanted_hidden_states: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    if shared_experts_input is not None:
+        return torch.empty_like(shared_experts_input)
+    return torch.empty_like(hidden_states)
+
+
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
@@ -233,7 +282,17 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
+    mutates_args=["hidden_states"],
     fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_inplace",
+    op_func=_moe_forward_shared_inplace,
+    mutates_args=["hidden_states"],
+    fake_impl=_moe_forward_shared_inplace_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -316,7 +375,7 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
-        self._forward_entry = self._select_forward()
+        self._refresh_forward_entry()
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
@@ -326,7 +385,18 @@ class MoERunner(MoERunnerInterface):
     ) -> Iterable[str]:
         return self.routed_experts.load_weights(weights)
 
+    def _refresh_forward_entry(self) -> None:
+        self._forward_uses_mutated_hidden_states = (
+            self._can_use_inplace_shared_output()
+        )
+        self._forward_entry = self._select_forward()
+
     def _select_forward(self) -> Callable:
+        if self._forward_uses_mutated_hidden_states:
+            if current_platform.is_tpu() or current_platform.is_cpu():
+                return _moe_forward_shared_inplace
+            return torch.ops.vllm.moe_forward_shared_inplace
+
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
             # will switch to using the moe_forward custom op.
@@ -337,6 +407,14 @@ class MoERunner(MoERunnerInterface):
             torch.ops.vllm.moe_forward
             if self._shared_experts is None
             else torch.ops.vllm.moe_forward_shared
+        )
+
+    def _can_use_inplace_shared_output(self) -> bool:
+        return bool(
+            self._shared_experts is not None
+            and getattr(self._quant_method, "supports_inplace_output", False)
+            and not self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size == 1
         )
 
     @property
@@ -351,6 +429,7 @@ class MoERunner(MoERunnerInterface):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts._replace_quant_method(quant_method)
         self.__dict__.pop("_supports_quanted_inputs", None)
+        self._refresh_forward_entry()
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
@@ -358,6 +437,7 @@ class MoERunner(MoERunnerInterface):
         self.routed_experts._set_moe_config(new_moe_config)
         if self._shared_experts is not None:
             self._shared_experts._set_moe_config(new_moe_config)
+        self._refresh_forward_entry()
 
     def _maybe_fuse_gate_weights(self):
         """Fuse router and shared expert gate weights on first call.
@@ -828,8 +908,12 @@ class MoERunner(MoERunnerInterface):
         #  - When False: neither output is reduced yet, so we combine
         #    them first and all-reduce the sum in _maybe_reduce_final_output.
 
-        # Extract outputs from result
-        shared_output, fused_output = _unpack(result)
+        # Extract outputs from result. The mutation-only custom op returns
+        # shared output and exposes routed output through hidden_states.
+        if self._forward_uses_mutated_hidden_states:
+            shared_output, fused_output = result, hidden_states
+        else:
+            shared_output, fused_output = _unpack(result)
 
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
