@@ -1539,6 +1539,67 @@ def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
     assert Builder().build(0, common).num_kv_actual_tokens == 5
 
 
+@pytest.mark.parametrize("transpose_logits", [False, True])
+def test_sparse_indexer_torch_topk_respects_ranges_and_relative_indices(
+    transpose_logits,
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    # Out-of-window values must not affect the selected request-local indices.
+    logits = torch.tensor(
+        [
+            [100.0, 2.0, 9.0, 8.0, 7.0, 6.0, 100.0],
+            [100.0, 90.0, 5.0, 4.0, 3.0, 200.0, 100.0],
+        ]
+    )
+    if transpose_logits:
+        logits = logits.transpose(0, 1)
+    actual = sparse._topk_indices_torch(
+        logits,
+        topk_tokens=2,
+        row_starts=torch.tensor([1, 2], dtype=torch.int32),
+        row_ends=torch.tensor([6, 5], dtype=torch.int32),
+    )
+    expected = torch.tensor([[1, 2], [0, 1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sparse_indexer_torch_topk_preserves_short_row_sequence_order():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    logits = torch.tensor(
+        [
+            [99.0, 4.0, 1.0, 88.0, 77.0],
+            [99.0, 98.0, 7.0, 6.0, 5.0],
+        ]
+    )
+    actual = sparse._topk_indices_torch(
+        logits,
+        topk_tokens=4,
+        row_starts=torch.tensor([1, 2], dtype=torch.int32),
+        row_ends=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    expected = torch.tensor(
+        [[0, 1, -1, -1], [0, -1, -1, -1]], dtype=torch.int32
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sparse_indexer_torch_topk_masks_speculative_decode_row_ends():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    row_ends = sparse._decode_row_ends_from_seq_lens(
+        torch.tensor([4, 2], dtype=torch.int32), next_n=2, num_rows=4
+    )
+    torch.testing.assert_close(
+        row_ends, torch.tensor([3, 4, 1, 2], dtype=torch.int32)
+    )
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 100.0]]).expand(4, -1)
+    actual = sparse._topk_indices_torch(logits, topk_tokens=2, row_ends=row_ends)
+    expected = torch.tensor([[2, 1], [3, 2], [0, -1], [0, 1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_mla_forward_slices_kv_with_independent_token_count():
     from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 

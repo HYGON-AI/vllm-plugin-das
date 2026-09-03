@@ -3932,6 +3932,8 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     router.top_k = 1
     router.e_score_correction_bias = torch.ones(4)
     router.routed_scaling_factor = 1.0
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
 
     from vllm_hcu.platforms import envs as henvs
 
@@ -3940,9 +3942,10 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert router._compute_routing(None, logits, torch.int32) == "official"
 
     routed: list[tuple[torch.Tensor, torch.Tensor]] = []
+    lightop_calls: list[tuple[object, ...]] = []
 
     def moe_fused_gate(router_logits, *args):
-        del args
+        lightop_calls.append((router_logits, *args))
         routed.append((router_logits, torch.tensor([[3]], dtype=torch.int64)))
         return torch.ones((1, 1)), routed[-1][1]
 
@@ -3957,6 +3960,19 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert ids.dtype == torch.int32
     assert ids.item() == 3
     assert routed[0][0] is logits
+    assert lightop_calls[-1][-2:] == (1.0, False)
+
+    # FusedMoE normalizes the router factor to 1.0 when MoERunner owns the
+    # scale; otherwise LightOp must apply the effective router factor.
+    router.routed_scaling_factor = 2.827
+    router._compute_routing(None, logits, torch.int32)
+    assert lightop_calls[-1][-2:] == (2.827, True)
+
+    # Do not hard-code the selected backend's capability boundary in vLLM.
+    # This verifies adapter dispatch, not support in a real LightOp kernel.
+    router.scoring_func = "softmax"
+    router.renormalize = False
+    router._compute_routing(None, logits, torch.int32)
 
     lightop = sys.modules["lightop"]
     incomplete_moe = _module("lightop.moe")
@@ -4014,6 +4030,8 @@ router.top_k = 1
 router.num_fused_shared_experts = 0
 router.e_score_correction_bias = torch.ones(4)
 router.routed_scaling_factor = 1.0
+router.scoring_func = "sigmoid"
+router.renormalize = True
 logits = torch.ones((1, 4))
 henvs.VLLM_HCU_USE_CUSTOM_OPS = True
 henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
@@ -4021,6 +4039,13 @@ weights, ids = router._compute_routing(None, logits, torch.int32)
 torch.testing.assert_close(weights, torch.full((1, 1), 0.5))
 assert ids.item() == 2
 assert calls[0][0] is logits
+assert calls[-1][-2:] == (1.0, False)
+router.routed_scaling_factor = 2.827
+router._compute_routing(None, logits, torch.int32)
+assert calls[-1][-2:] == (2.827, True)
+router.scoring_func = "softmax"
+router.renormalize = False
+router._compute_routing(None, logits, torch.int32)
 """
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"

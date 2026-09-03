@@ -33,6 +33,9 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
                 self.top_k,
                 self.num_fused_shared_experts if enable_shared_experts_fusion else 0,
                 self.routed_scaling_factor,
+                # FusedMoE gives the router 1.0 when MoERunner owns output
+                # scaling; otherwise LightOp must scale the routing weights.
+                self.routed_scaling_factor != 1.0,
             )       
             return topk_weights, topk_ids
         else:

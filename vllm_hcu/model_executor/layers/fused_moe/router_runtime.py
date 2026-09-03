@@ -98,6 +98,10 @@ def make_hcu_grouped_topk_router(base_class):
                 self.top_k,
                 0,
                 self.routed_scaling_factor,
+                # FusedMoE passes 1.0 to the router when MoERunner owns
+                # output scaling. Otherwise this is the effective router
+                # scale and LightOp must apply it to the routing weights.
+                self.routed_scaling_factor != 1.0,
             )
             if indices_type is not None and topk_ids.dtype != indices_type:
                 topk_ids = topk_ids.to(indices_type)
