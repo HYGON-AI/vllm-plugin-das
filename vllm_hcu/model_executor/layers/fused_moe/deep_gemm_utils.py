@@ -637,6 +637,20 @@ def deepgemm_moe_permute(
     return aq_out, aq_scale_out, expert_ids, inv_perm, align_used
 
 
+def topk_weights_for_unpermute(
+    topk_weights: torch.Tensor,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    """Return reduction weights for an input-weighted expert computation.
+
+    The modular MoE contract applies router weights either before dispatch or
+    during unpermute/reduce, but never at both stages.
+    """
+    if apply_router_weight_on_input:
+        return torch.ones_like(topk_weights)
+    return topk_weights
+
+
 def deepgemm_unpermute_and_reduce(
     a: torch.Tensor,  # Grouped gemm output
     topk_ids: torch.Tensor,

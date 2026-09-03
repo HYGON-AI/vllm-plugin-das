@@ -141,15 +141,25 @@ def _load_deep_gemm_apply():
             torch.zeros_like(kwargs["topk_ids"], dtype=torch.int32),
             256,
         ),
-        "deepgemm_unpermute_and_reduce": lambda **_kwargs: None,
+        "deepgemm_unpermute_and_reduce": lambda **kwargs: namespace[
+            "reduce_calls"
+        ].append(kwargs),
+        "topk_weights_for_unpermute": lambda weights, apply: (
+            torch.ones_like(weights) if apply else weights
+        ),
         "m_grouped_fp8_gemm_nt_contiguous": lambda *_args, **_kwargs: None,
+        "m_grouped_w8a8_gemm_nt_contig_asm": lambda *_args, **_kwargs: None,
+        "reduce_calls": [],
     }
     exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
     return namespace
 
 
 def _run_w8a8_apply(
-    namespace: dict[str, object], *, packed_weights: bool = False
+    namespace: dict[str, object],
+    *,
+    packed_weights: bool = False,
+    apply_router_weight_on_input: bool = False,
 ) -> None:
     logical_n = 16 if packed_weights else 4
     logical_k = 64 if packed_weights else 4
@@ -187,7 +197,32 @@ def _run_w8a8_apply(
         workspace13=torch.empty(32, dtype=torch.int8),
         workspace2=torch.empty(32),
         expert_tokens_meta=None,
-        apply_router_weight_on_input=False,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+
+
+def test_w8a8_apply_uses_uniform_reduce_weights_after_input_weighting(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant",
+        activation_kernel=lambda tensor, **kwargs: (
+            kwargs["output"],
+            torch.ones((tensor.shape[0], 1)),
+        ),
+        gemm_name="m_grouped_w8a8_gemm_nt_contig_asm",
+        gemm_kernel=lambda *_args: None,
+    )
+    namespace = _load_deep_gemm_apply()
+    namespace["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
+    _run_w8a8_apply(namespace, apply_router_weight_on_input=True)
+
+    reduce_calls = namespace["reduce_calls"]
+    assert len(reduce_calls) == 1
+    torch.testing.assert_close(
+        reduce_calls[0]["topk_weights"],
+        torch.ones((2, 1)),
     )
 
 
@@ -446,8 +481,10 @@ def test_w4a8_contiguous_rejects_invalid_channel_scale_before_packing(
     assert pack_calls == 0
 
 
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     monkeypatch: pytest.MonkeyPatch,
+    apply_router_weight_on_input: bool,
 ):
     """Both GEMM stages must retain scale and expert-map ownership."""
 
@@ -470,7 +507,7 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     hidden_states = torch.arange(8, dtype=torch.int8).reshape(2, 4)
     input_scale = torch.ones((2, 1), dtype=torch.float32)
     topk_ids = torch.tensor([[0], [1]], dtype=torch.int32)
-    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    topk_weights = torch.tensor([[0.25], [0.75]], dtype=torch.float32)
     expert_map = torch.tensor([1, 0], dtype=torch.int32)
     m_indices = torch.tensor([0, 1], dtype=torch.int64)
     inv_perm = torch.tensor([1, 0], dtype=torch.int32)
@@ -540,7 +577,7 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
         workspace13=torch.empty(32, dtype=torch.int8),
         workspace2=torch.empty(32, dtype=torch.bfloat16),
         expert_tokens_meta=expert_tokens_meta,
-        apply_router_weight_on_input=False,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
     assert len(gemm_calls) == 2
@@ -551,6 +588,10 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     assert permute_call["expert_map"] is expert_map
     assert permute_call["expert_tokens_meta"] is expert_tokens_meta
     assert reduce_call["expert_map"] is expert_map
+    expected_weights = (
+        torch.ones_like(topk_weights) if apply_router_weight_on_input else topk_weights
+    )
+    torch.testing.assert_close(reduce_call["topk_weights"], expected_weights)
     torch.testing.assert_close(output, torch.full_like(output, 2))
 
 
