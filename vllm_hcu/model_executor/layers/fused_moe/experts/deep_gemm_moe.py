@@ -498,8 +498,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     **gemm_kwargs,
                 )
 
-        if apply_router_weight_on_input:
-            topk_weights = torch.ones_like(topk_weights)
+        topk_weights = topk_weights_for_unpermute(
+            topk_weights,
+            apply_router_weight_on_input,
+        )
 
         deepgemm_unpermute_and_reduce(
             a=mm2_out,
@@ -722,8 +724,10 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 recipe_b=(1, self._WEIGHT_BLOCK_K),
             )
 
-        if apply_router_weight_on_input:
-            topk_weights = torch.ones_like(topk_weights)
+        topk_weights = topk_weights_for_unpermute(
+            topk_weights,
+            apply_router_weight_on_input,
+        )
 
         deepgemm_unpermute_and_reduce(
             a=mm2_out,
