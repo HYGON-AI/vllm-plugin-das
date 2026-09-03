@@ -1688,7 +1688,7 @@ def test_gfx938_sparse_indexer_prefill_uses_triton_fp8_cache_gather(
     monkeypatch.setattr(
         sparse,
         "_topk_indices_torch",
-        lambda logits, topk: torch.zeros(
+        lambda logits, topk, *args, **kwargs: torch.zeros(
             (logits.shape[0], topk), dtype=torch.int32
         ),
     )
@@ -1716,6 +1716,53 @@ def test_gfx938_sparse_indexer_prefill_uses_triton_fp8_cache_gather(
     assert calls[0][0][4] is chunk.cu_seq_lens
     assert calls[0][1]["token_to_seq"] is chunk.token_to_seq
     torch.testing.assert_close(topk_indices, torch.zeros_like(topk_indices))
+
+
+def test_sparse_indexer_torch_topk_respects_ranges_and_relative_indices():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    # Values outside each request's logical KV window are deliberately larger
+    # than the in-window values. They must not affect the selected positions.
+    logits = torch.tensor(
+        [
+            [100.0, 2.0, 9.0, 8.0, 7.0, 6.0, 100.0],
+            [100.0, 90.0, 5.0, 4.0, 3.0, 200.0, 100.0],
+        ]
+    )
+    row_starts = torch.tensor([1, 2], dtype=torch.int32)
+    row_ends = torch.tensor([6, 5], dtype=torch.int32)
+
+    actual = sparse._topk_indices_torch(
+        logits, topk_tokens=2, row_starts=row_starts, row_ends=row_ends
+    )
+
+    # The native selector returns indices relative to row_start.
+    expected = torch.tensor([[1, 2], [0, 1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sparse_indexer_torch_topk_preserves_short_row_sequence_order():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    logits = torch.tensor(
+        [
+            [99.0, 4.0, 1.0, 88.0, 77.0],
+            [99.0, 98.0, 7.0, 6.0, 5.0],
+        ]
+    )
+    row_starts = torch.tensor([1, 2], dtype=torch.int32)
+    row_ends = torch.tensor([3, 3], dtype=torch.int32)
+
+    actual = sparse._topk_indices_torch(
+        logits, topk_tokens=4, row_starts=row_starts, row_ends=row_ends
+    )
+
+    # When all valid positions fit in topk, native top-k emits local positions
+    # in sequence order and pads the remainder with -1.
+    expected = torch.tensor(
+        [[0, 1, -1, -1], [0, -1, -1, -1]], dtype=torch.int32
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_mla_forward_slices_kv_with_independent_token_count():

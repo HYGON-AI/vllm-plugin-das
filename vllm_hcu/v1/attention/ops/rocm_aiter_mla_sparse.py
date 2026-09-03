@@ -983,9 +983,62 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
-def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
+def _topk_indices_torch(
+    logits: torch.Tensor,
+    topk_tokens: int,
+    row_starts: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Torch fallback matching sparse-MLA top-k range/index semantics.
+
+    The native prefill selector receives [row_start, row_end) and returns
+    positions relative to row_start. LightOp MQA can leave values outside
+    that interval finite when clean_logits is disabled, so mask them before
+    selecting. For rows shorter than topk, the native selector returns all
+    valid positions in sequence order.
+    """
+    if logits.dim() != 2:
+        raise RuntimeError(
+            f"Torch sparse-MLA topk expects 2D logits, got {logits.shape}"
+        )
+
+    if row_ends is None:
+        num_rows = logits.shape[0]
+        starts = torch.zeros(num_rows, dtype=torch.int64, device=logits.device)
+        ends = torch.full(
+            (num_rows,), logits.shape[1], dtype=torch.int64, device=logits.device
+        )
+    else:
+        num_rows = int(row_ends.numel())
+        if logits.shape[0] != num_rows:
+            if logits.shape[1] == num_rows:
+                logits = logits.transpose(0, 1)
+            else:
+                raise RuntimeError(
+                    "Torch sparse-MLA topk logits/query row mismatch: "
+                    f"logits={tuple(logits.shape)}, rows={num_rows}"
+                )
+        starts = (
+            torch.zeros_like(row_ends)
+            if row_starts is None
+            else row_starts
+        )
+        starts = starts.to(device=logits.device, dtype=torch.int64).reshape(-1)
+        ends = row_ends.to(device=logits.device, dtype=torch.int64).reshape(-1)
+        starts = starts[:num_rows].clamp(0, logits.shape[1])
+        ends = ends[:num_rows].clamp(0, logits.shape[1])
+        ends = torch.maximum(ends, starts)
+
+    row_lens = (ends - starts).clamp_min(0)
+    cols = torch.arange(logits.shape[1], device=logits.device)
+    valid = (cols.unsqueeze(0) >= starts.unsqueeze(1)) & (
+        cols.unsqueeze(0) < ends.unsqueeze(1)
+    )
+    masked_logits = logits.masked_fill(~valid, float("-inf"))
+
     k = min(topk_tokens, logits.shape[-1])
-    values, indices = torch.topk(logits, k=k, dim=-1)
+    values, indices = torch.topk(masked_logits, k=k, dim=-1)
+    indices = indices.to(torch.int64) - starts.unsqueeze(1)
     indices = indices.to(torch.int32)
     indices = torch.where(
         values == float("-inf"),
@@ -993,15 +1046,30 @@ def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
         indices,
     )
     if k == topk_tokens:
-        return indices
-    padded = torch.full(
-        (logits.shape[0], topk_tokens),
-        -1,
-        dtype=torch.int32,
-        device=logits.device,
+        selected = indices
+    else:
+        selected = torch.full(
+            (num_rows, topk_tokens),
+            -1,
+            dtype=torch.int32,
+            device=logits.device,
+        )
+        selected[:, :k] = indices
+
+    # When every valid position is requested, preserve the native selector's
+    # deterministic sequence order instead of sorting by score.
+    seq = torch.arange(topk_tokens, device=logits.device, dtype=torch.int32)
+    seq = seq.unsqueeze(0).expand(num_rows, -1)
+    all_valid = torch.where(
+        seq < row_lens.unsqueeze(1),
+        seq,
+        torch.full_like(seq, -1),
     )
-    padded[:, :k] = indices
-    return padded
+    return torch.where(
+        (row_lens <= topk_tokens).unsqueeze(1),
+        all_valid,
+        selected,
+    )
 
 
 def _decode_row_ends_from_seq_lens(
@@ -1290,7 +1358,14 @@ def rocm_aiter_sparse_attn_indexer_native(
                     topk_tokens,
                 )
             else:
-                topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
+                topk_indices.copy_(
+                    _topk_indices_torch(
+                        logits,
+                        topk_tokens,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                    )
+                )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -1339,8 +1414,16 @@ def rocm_aiter_sparse_attn_indexer_native(
                 logits, seq_lens, next_n, topk_indices, topk_tokens
             )
         else:
-            topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-            topk_indices.copy_(_topk_indices_torch(logits, topk_tokens)[:num_decode_tokens]
+            row_ends = _decode_row_ends_from_seq_lens(
+                seq_lens, next_n, logits.shape[0]
+            )
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+            topk_indices.copy_(
+                _topk_indices_torch(
+                    logits,
+                    topk_tokens,
+                    row_ends=row_ends,
+                )
             )
 
         if decode_metadata.requires_padding:

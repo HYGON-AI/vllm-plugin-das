@@ -90,6 +90,14 @@ def make_hcu_grouped_topk_router(base_class):
                     indices_type,
                     input_ids=input_ids,
                 )
+            if self.scoring_func != "sigmoid" or not self.renormalize:
+                raise ValueError(
+                    "HCU LightOp moe_fused_gate supports only sigmoid scoring "
+                    "with renormalize=True; got "
+                    f"scoring_func={self.scoring_func!r}, "
+                    f"renormalize={self.renormalize!r}. "
+                    "Set VLLM_HCU_USE_FUSE_MOE_GATE=0 to use the standard router."
+                )
             try:
                 from lightop import op as lightop
             except (ImportError, AttributeError) as exc:
@@ -105,6 +113,7 @@ def make_hcu_grouped_topk_router(base_class):
                     self.top_k,
                     0,
                     self.routed_scaling_factor,
+                    True,  # Apply the router scale for every expert count.
                 )
             except (TypeError, AttributeError) as exc:
                 raise RuntimeError(

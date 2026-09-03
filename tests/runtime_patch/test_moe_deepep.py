@@ -2984,6 +2984,8 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     router.top_k = 1
     router.e_score_correction_bias = torch.ones(4)
     router.routed_scaling_factor = 1.0
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
 
     from vllm_hcu.platforms import envs as henvs
 
@@ -3004,6 +3006,14 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     weights, ids = router._compute_routing(None, logits, torch.int32)
     assert weights.shape == (1, 1)
     assert ids.dtype == torch.int32
+
+    router.scoring_func = "softmax"
+    with pytest.raises(ValueError, match="supports only sigmoid scoring"):
+        router._compute_routing(None, logits, torch.int32)
+    router.scoring_func = "sigmoid"
+    router.renormalize = False
+    with pytest.raises(ValueError, match="renormalize=True"):
+        router._compute_routing(None, logits, torch.int32)
 
 
 def _fake_deepep_ll_module() -> ModuleType:
