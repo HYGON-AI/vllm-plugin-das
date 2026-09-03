@@ -185,9 +185,41 @@ _CUSTOM_ALLREDUCE_REPLACEMENT = _ReplacementSpec(
     validate_with_adapter=False,
 )
 
+_QWEN4_EXP_HC_MODULE = "vllm.models.qwen4_exp.amd.ops.hc"
+_QWEN4_EXP_PLE_MODULE = "vllm.models.qwen4_exp.amd.ple_layer"
+_QWEN4_EXP_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
+    _ReplacementSpec(
+        adapter=_adapter("op_opt", "patch_qwen4_exp_amd_hc"),
+        patch_id="worker.op_opt.qwen4_exp.amd.ops.hc",
+        target_module=_QWEN4_EXP_HC_MODULE,
+        replacement_module="vllm_hcu.runtime_compat.qwen4_exp_amd_hc",
+        targets=(
+            _QWEN4_EXP_HC_MODULE,
+            f"{_QWEN4_EXP_HC_MODULE}._hc_gate_mix",
+            f"{_QWEN4_EXP_HC_MODULE}._hc_combine",
+            f"{_QWEN4_EXP_HC_MODULE}._hc_combine_norm",
+        ),
+    ),
+    _ReplacementSpec(
+        adapter=_adapter("op_opt", "patch_qwen4_exp_amd_ple"),
+        patch_id="worker.op_opt.qwen4_exp.amd.ple_layer",
+        target_module=_QWEN4_EXP_PLE_MODULE,
+        replacement_module="vllm_hcu.runtime_compat.qwen4_exp_amd_ple_layer",
+        targets=(
+            _QWEN4_EXP_PLE_MODULE,
+            f"{_QWEN4_EXP_PLE_MODULE}.Qwen4ExpNGramEmbedding._forward_impl",
+            f"{_QWEN4_EXP_PLE_MODULE}.Qwen4ExpNGramEmbedding.forward",
+            f"{_QWEN4_EXP_PLE_MODULE}.qwen4_exp_amd_ple_forward",
+            f"{_QWEN4_EXP_PLE_MODULE}.qwen4_exp_amd_mtp_hidden_copy",
+        ),
+    ),
+)
+
+
 _COLD_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
     *_MOE_REPLACEMENTS,
     *_OP_REPLACEMENTS,
+    *_QWEN4_EXP_REPLACEMENTS,
     _CUSTOM_ALLREDUCE_REPLACEMENT,
 )
 
@@ -248,6 +280,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_amd_model")),
     # v0.25 WNA16/AITER adapter retained as pending source evidence only;
     # v0.28 removed its int4_w4a16_moe_quant_config dependency.
 )
