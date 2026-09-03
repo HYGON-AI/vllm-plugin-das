@@ -130,6 +130,12 @@ class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
     def __init_(self, moe: FusedMoEConfig):
         super().__init__(moe)
 
+    @property
+    def supports_inplace_output(self) -> bool:
+        return not self.use_deepep and not _is_hcu_aiter_w8a8_moe_requested(
+            self.moe
+        )
+
     @staticmethod
     def get_moe_method(
         quant_config: "SlimQuantCompressedTensorsMarlinConfig",  # type: ignore # noqa E501

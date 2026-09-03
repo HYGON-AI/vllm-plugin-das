@@ -29,7 +29,11 @@ def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
     register_custom_op = torch_utils.direct_register_custom_op
 
     def register_without_duplicate_moe_ops(op_name, *args, **kwargs):
-        if op_name in {"moe_forward", "moe_forward_shared"}:
+        if op_name in {
+            "moe_forward",
+            "moe_forward_shared",
+            "moe_forward_shared_inplace",
+        }:
             moe_op_registrations[op_name] = kwargs
             return None
         return register_custom_op(op_name, *args, **kwargs)
@@ -45,7 +49,7 @@ def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
     return module
 
 
-def test_moe_forward_shared_satisfies_aot_mutation_and_alias_contract(
+def test_inplace_moe_forward_shared_satisfies_aot_mutation_contract(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
     moe_op_registrations: dict[str, dict],
@@ -62,10 +66,10 @@ def test_moe_forward_shared_satisfies_aot_mutation_and_alias_contract(
         "get_layer_from_name",
         lambda _name: Layer(),
     )
-    registration = moe_op_registrations["moe_forward_shared"]
+    registration = moe_op_registrations["moe_forward_shared_inplace"]
     test_library = torch.library.Library("vllm_hcu_test_moe", "FRAGMENT")
     torch_utils.direct_register_custom_op(
-        op_name="moe_forward_shared",
+        op_name="moe_forward_shared_inplace",
         op_func=registration["op_func"],
         mutates_args=registration["mutates_args"],
         fake_impl=registration["fake_impl"],
@@ -74,7 +78,7 @@ def test_moe_forward_shared_satisfies_aot_mutation_and_alias_contract(
         tags=registration["tags"],
     )
     torch.library.opcheck(
-        torch.ops.vllm_hcu_test_moe.moe_forward_shared.default,
+        torch.ops.vllm_hcu_test_moe.moe_forward_shared_inplace.default,
         (
             torch.zeros((2, 2)),
             None,
@@ -91,7 +95,7 @@ def test_moe_forward_shared_satisfies_aot_mutation_and_alias_contract(
     )
 
     def invoke(hidden_states):
-        return torch.ops.vllm_hcu_test_moe.moe_forward_shared(
+        return torch.ops.vllm_hcu_test_moe.moe_forward_shared_inplace(
             hidden_states,
             None,
             hidden_states,
@@ -112,12 +116,11 @@ def test_moe_forward_shared_satisfies_aot_mutation_and_alias_contract(
             message=r".*moe_forward_shared.*custom operator.*",
             category=UserWarning,
         )
-        shared_output, fused_output = compiled(hidden_states)
+        shared_output = compiled(hidden_states)
 
     torch.testing.assert_close(hidden_states, torch.ones_like(hidden_states))
     torch.testing.assert_close(shared_output, torch.full_like(hidden_states, 7))
-    torch.testing.assert_close(fused_output, hidden_states)
-    assert not torch._C._is_alias_of(fused_output, hidden_states)
+    assert not torch._C._is_alias_of(shared_output, hidden_states)
 
 
 def make_hidden() -> torch.Tensor:
@@ -126,6 +129,43 @@ def make_hidden() -> torch.Tensor:
 
 def make_logits() -> torch.Tensor:
     return torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+
+@pytest.mark.parametrize(
+    ("supports_inplace", "dp_size", "sequence_parallel", "pcp_size", "expected"),
+    [
+        (True, 1, False, 1, True),
+        (False, 1, False, 1, False),
+        (True, 2, False, 1, False),
+        (True, 1, True, 1, False),
+        (True, 1, False, 2, False),
+    ],
+)
+def test_inplace_shared_output_requires_local_inplace_kernel(
+    moe_runner_module: ModuleType,
+    supports_inplace: bool,
+    dp_size: int,
+    sequence_parallel: bool,
+    pcp_size: int,
+    expected: bool,
+) -> None:
+    """Dispatch or an out-of-place kernel must retain the tuple-returning op."""
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner._shared_experts = object()
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            supports_inplace_output=supports_inplace,
+            supports_internal_mk=False,
+        )
+    )
+    runner.moe_config = SimpleNamespace(
+        dp_size=dp_size,
+        is_sequence_parallel=sequence_parallel,
+        pcp_size=pcp_size,
+    )
+
+    assert runner._can_use_inplace_shared_output() is expected
 
 
 class _PCPCollectives:
@@ -219,9 +259,11 @@ def test_pcp_dispatch_requires_router_logits(
         runner._maybe_dispatch(make_hidden(), None)
 
 
+@pytest.mark.parametrize("uses_mutated_output", [False, True])
 def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
+    uses_mutated_output: bool,
 ) -> None:
     """Reordering either local output before the shared+routed add is a bug."""
 
@@ -235,10 +277,21 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     runner.routed_scaling_factor = 1.0
     runner._shared_experts = object()
     runner.router = object()
-    runner.__dict__["_forward_entry"] = lambda *_args: (
-        torch.tensor([[100.0, 101.0], [200.0, 201.0]]),
-        torch.tensor([[10.0, 11.0], [20.0, 21.0]]),
-    )
+    shared_output = torch.tensor([[100.0, 101.0], [200.0, 201.0]])
+    fused_output = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
+    runner._forward_uses_mutated_hidden_states = uses_mutated_output
+    if uses_mutated_output:
+
+        def forward_entry(hidden_states, *_args):
+            hidden_states.copy_(fused_output)
+            return shared_output
+
+        runner.__dict__["_forward_entry"] = forward_entry
+    else:
+        runner.__dict__["_forward_entry"] = lambda *_args: (
+            shared_output,
+            fused_output,
+        )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_pad_hidden_states",
