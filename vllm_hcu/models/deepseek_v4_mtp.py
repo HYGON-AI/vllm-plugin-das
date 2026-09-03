@@ -418,6 +418,7 @@ class DeepSeekV4MTP(nn.Module):
                 ckpt_down_proj_name="w2",
                 ckpt_up_proj_name="w3",
                 num_experts=self.config.n_routed_experts,
+                num_redundant_experts=self.num_redundant_experts,
             )
 
         # FP8 experts register ``..._weight_scale_inv`` (block_quant) while

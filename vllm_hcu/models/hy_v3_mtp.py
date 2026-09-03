@@ -407,6 +407,7 @@ class HYV3MTP(nn.Module, SupportsPP):
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.num_experts,
+                num_redundant_experts=self.num_redundant_experts,
             )
         else:
             expert_params_mapping = {}

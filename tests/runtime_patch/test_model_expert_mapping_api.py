@@ -51,6 +51,7 @@ def _load_method(
     return namespace[method_name]
 
 
+@pytest.mark.parametrize("num_redundant_experts", [0, 1])
 @pytest.mark.parametrize(
     ("relative_path", "class_name", "config", "expert_names"),
     [
@@ -73,6 +74,7 @@ def test_model_expert_mapping_uses_vllm_0251_function_api(
     class_name: str,
     config: SimpleNamespace,
     expert_names: tuple[str, str, str],
+    num_redundant_experts: int,
 ) -> None:
     get_expert_mapping = _load_method(
         relative_path,
@@ -91,13 +93,22 @@ def test_model_expert_mapping_uses_vllm_0251_function_api(
     if class_name == "DeepseekV4Model":
         model.start_layer = 0
         model.end_layer = 1
-        model.layers = [SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))]
+        model.layers = [
+            SimpleNamespace(
+                ffn=SimpleNamespace(
+                    use_mega_moe=False,
+                    n_redundant_experts=num_redundant_experts,
+                )
+            )
+        ]
+    else:
+        model.num_redundant_experts = num_redundant_experts
     model.named_parameters = lambda: []
 
     mapping = get_expert_mapping(model)
 
     gate_name, down_name, up_name = expert_names
-    assert mapping == [
+    expected_mapping = [
         ("experts.routed_experts.w13_", f"experts.0.{gate_name}.", 0, "w1"),
         ("experts.routed_experts.w2_", f"experts.0.{down_name}.", 0, "w2"),
         ("experts.routed_experts.w13_", f"experts.0.{up_name}.", 0, "w3"),
@@ -105,18 +116,46 @@ def test_model_expert_mapping_uses_vllm_0251_function_api(
         ("experts.routed_experts.w2_", f"experts.1.{down_name}.", 1, "w2"),
         ("experts.routed_experts.w13_", f"experts.1.{up_name}.", 1, "w3"),
     ]
+    if num_redundant_experts == 1:
+        expected_mapping.extend(
+            [
+                (
+                    "experts.routed_experts.w13_",
+                    f"experts.0.{gate_name}.",
+                    2,
+                    "w1",
+                ),
+                (
+                    "experts.routed_experts.w2_",
+                    f"experts.0.{down_name}.",
+                    2,
+                    "w2",
+                ),
+                (
+                    "experts.routed_experts.w13_",
+                    f"experts.0.{up_name}.",
+                    2,
+                    "w3",
+                ),
+            ]
+        )
+    assert mapping == expected_mapping
 
 
 def test_hy_v3_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None:
+    mapping_calls: list[dict[str, object]] = []
+
+    def record_expert_mapping(model: object, **kwargs: object):
+        mapping_calls.append(kwargs)
+        return fused_moe.fused_moe_make_expert_params_mapping(model, **kwargs)
+
     load_weights = _load_method(
         "vllm_hcu/models/hy_v3_mtp.py",
         "HYV3MTP",
         "load_weights",
         {
             "FusedMoE": fused_moe.FusedMoE,
-            "fused_moe_make_expert_params_mapping": (
-                fused_moe.fused_moe_make_expert_params_mapping
-            ),
+            "fused_moe_make_expert_params_mapping": record_expert_mapping,
             "_get_cla_factor": lambda _config: 1,
             "_is_moe": lambda _config: True,
             "torch": torch,
@@ -132,23 +171,37 @@ def test_hy_v3_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None:
         ),
         quant_config=None,
         use_pp=False,
+        num_redundant_experts=1,
         named_parameters=lambda: [],
         _split_qkv_weight=lambda value: value,
     )
 
     assert load_weights(model, []) is None
+    assert mapping_calls == [
+        {
+            "ckpt_gate_proj_name": "gate_proj",
+            "ckpt_down_proj_name": "down_proj",
+            "ckpt_up_proj_name": "up_proj",
+            "num_experts": 2,
+            "num_redundant_experts": 1,
+        }
+    ]
 
 
 def test_deepseek_v4_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None:
+    mapping_calls: list[dict[str, object]] = []
+
+    def record_expert_mapping(model: object, **kwargs: object):
+        mapping_calls.append(kwargs)
+        return fused_moe.fused_moe_make_expert_params_mapping(model, **kwargs)
+
     load_weights = _load_method(
         "vllm_hcu/models/deepseek_v4_mtp.py",
         "DeepSeekV4MTP",
         "load_weights",
         {
             "FusedMoE": fused_moe.FusedMoE,
-            "fused_moe_make_expert_params_mapping": (
-                fused_moe.fused_moe_make_expert_params_mapping
-            ),
+            "fused_moe_make_expert_params_mapping": record_expert_mapping,
             "get_tensor_model_parallel_world_size": lambda: 1,
             "get_tensor_model_parallel_rank": lambda: 0,
             "make_deepseek_v4_expert_params_mapping": lambda _count: [],
@@ -163,6 +216,7 @@ def test_deepseek_v4_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None
             expert_dtype="fp8",
         ),
         quant_config=None,
+        num_redundant_experts=1,
         named_parameters=lambda: [],
         model=SimpleNamespace(
             layers={
@@ -179,3 +233,12 @@ def test_deepseek_v4_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None
     )
 
     assert load_weights(model, []) == set()
+    assert mapping_calls == [
+        {
+            "ckpt_gate_proj_name": "w1",
+            "ckpt_down_proj_name": "w2",
+            "ckpt_up_proj_name": "w3",
+            "num_experts": 2,
+            "num_redundant_experts": 1,
+        }
+    ]
