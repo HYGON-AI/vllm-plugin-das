@@ -375,10 +375,7 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
-        self._forward_uses_mutated_hidden_states = (
-            self._can_use_inplace_shared_output()
-        )
-        self._forward_entry = self._select_forward()
+        self._refresh_forward_entry()
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
@@ -387,6 +384,12 @@ class MoERunner(MoERunnerInterface):
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         return self.routed_experts.load_weights(weights)
+
+    def _refresh_forward_entry(self) -> None:
+        self._forward_uses_mutated_hidden_states = (
+            self._can_use_inplace_shared_output()
+        )
+        self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable:
         if self._forward_uses_mutated_hidden_states:
@@ -426,6 +429,7 @@ class MoERunner(MoERunnerInterface):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts._replace_quant_method(quant_method)
         self.__dict__.pop("_supports_quanted_inputs", None)
+        self._refresh_forward_entry()
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
@@ -433,6 +437,7 @@ class MoERunner(MoERunnerInterface):
         self.routed_experts._set_moe_config(new_moe_config)
         if self._shared_experts is not None:
             self._shared_experts._set_moe_config(new_moe_config)
+        self._refresh_forward_entry()
 
     def _maybe_fuse_gate_weights(self):
         """Fuse router and shared expert gate weights on first call.

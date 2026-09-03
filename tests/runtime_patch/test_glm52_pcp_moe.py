@@ -168,6 +168,74 @@ def test_inplace_shared_output_requires_local_inplace_kernel(
     assert runner._can_use_inplace_shared_output() is expected
 
 
+def test_forward_entry_refreshes_after_runtime_reconfiguration(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+) -> None:
+    """Runtime method/config swaps must not retain a stale in-place entry."""
+
+    class RoutedExperts:
+        def __init__(self) -> None:
+            self.quant_method = SimpleNamespace(
+                supports_inplace_output=True,
+                supports_internal_mk=False,
+            )
+
+        def _replace_quant_method(self, quant_method) -> None:
+            self.quant_method = quant_method
+
+        def _set_moe_config(self, _moe_config) -> None:
+            return None
+
+    class SharedExperts:
+        def _set_moe_config(self, _moe_config) -> None:
+            return None
+
+    monkeypatch.setattr(moe_runner_module.current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(moe_runner_module.current_platform, "is_tpu", lambda: False)
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner.routed_experts = RoutedExperts()
+    runner._shared_experts = SharedExperts()
+    runner.moe_config = SimpleNamespace(
+        dp_size=1,
+        is_sequence_parallel=False,
+        pcp_size=1,
+    )
+
+    runner._refresh_forward_entry()
+    assert runner._forward_uses_mutated_hidden_states is True
+    assert runner._forward_entry is moe_runner_module._moe_forward_shared_inplace
+
+    runner._replace_quant_method(
+        SimpleNamespace(
+            supports_inplace_output=False,
+            supports_internal_mk=False,
+        )
+    )
+    assert runner._forward_uses_mutated_hidden_states is False
+    assert runner._forward_entry is moe_runner_module._moe_forward_shared
+
+    runner._replace_quant_method(
+        SimpleNamespace(
+            supports_inplace_output=True,
+            supports_internal_mk=False,
+        )
+    )
+    assert runner._forward_uses_mutated_hidden_states is True
+    assert runner._forward_entry is moe_runner_module._moe_forward_shared_inplace
+
+    runner._set_moe_config(
+        SimpleNamespace(
+            dp_size=1,
+            is_sequence_parallel=False,
+            pcp_size=2,
+        )
+    )
+    assert runner._forward_uses_mutated_hidden_states is False
+    assert runner._forward_entry is moe_runner_module._moe_forward_shared
+
+
 class _PCPCollectives:
     """Two-rank in-memory PCP collective with observable token ordering."""
 
