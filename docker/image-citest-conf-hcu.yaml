@@ -22,6 +22,7 @@ Qwen3.5-35B-A3B-W8A8:
   server_args:
     attention-backend: FLASH_ATTN
     kv-cache-dtype: fp8_e4m3
+    max-model-len: 32768
     max-num-batched-tokens: 16384
     max-num-seqs: 128
     quantization: slimquant_marlin
@@ -57,6 +58,7 @@ Qwen3.6-35B-A3B:
   server_args:
     attention-backend: FLASH_ATTN
     kv-cache-dtype: fp8_e4m3
+    max-model-len: 32768
     max-num-batched-tokens: 10240
     moe-backend: aiter
     speculative-config.method: mtp
