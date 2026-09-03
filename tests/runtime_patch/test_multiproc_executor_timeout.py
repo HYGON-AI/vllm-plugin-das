@@ -53,6 +53,39 @@ def _make_executor(hcu_executor):
     return executor
 
 
+def _make_patch_target_module(patch_multiproc_executor):
+    from vllm.distributed.device_communicators.shm_broadcast import (
+        MessageQueue as UpstreamMessageQueue,
+    )
+    from vllm.v1.executor import multiproc_executor as upstream
+
+    class MessageQueue(UpstreamMessageQueue):
+        pass
+
+    class MultiprocExecutor:
+        def _init_executor(self) -> None:
+            pass
+
+        def collective_rpc(
+            self,
+            method,
+            timeout=None,
+            args=(),
+            kwargs=None,
+            non_block=False,
+            unique_reply_rank=None,
+            kv_output_aggregator=None,
+        ):
+            pass
+
+    module = ModuleType(patch_multiproc_executor.TARGET_MODULE)
+    module.FutureWrapper = upstream.FutureWrapper
+    module.MessageQueue = MessageQueue
+    module.MultiprocExecutor = MultiprocExecutor
+    module.WorkerProc = upstream.WorkerProc
+    return module, MessageQueue
+
+
 def test_hcu_collective_rpc_clamps_stale_deadline(monkeypatch) -> None:
     from vllm_hcu.v1.executor import multiproc_executor as hcu_executor
 
@@ -103,21 +136,9 @@ def test_hcu_collective_rpc_preserves_valid_timeout(
 
 
 def test_multiproc_patch_clamps_negative_zmq_poll_timeout() -> None:
-    from vllm.distributed.device_communicators.shm_broadcast import (
-        MessageQueue as UpstreamMessageQueue,
-    )
     from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
 
-    class MessageQueue(UpstreamMessageQueue):
-        pass
-
-    class MultiprocExecutor:
-        def _init_executor(self) -> None:
-            pass
-
-    module = ModuleType(patch_multiproc_executor.TARGET_MODULE)
-    module.MessageQueue = MessageQueue
-    module.MultiprocExecutor = MultiprocExecutor
+    module, message_queue = _make_patch_target_module(patch_multiproc_executor)
     assert patch_multiproc_executor.apply_to_module(module) is True
     assert patch_multiproc_executor.apply_to_module(module) is False
 
@@ -132,5 +153,121 @@ def test_multiproc_patch_clamps_negative_zmq_poll_timeout() -> None:
     socket = Socket()
     for timeout in (-1.0, None, 0.001, 2.5):
         with pytest.raises(TimeoutError):
-            MessageQueue.recv(socket, timeout)
+            message_queue.recv(socket, timeout)
     assert socket.poll_timeouts == [0, None, 1, 2500]
+
+
+def test_multiproc_patch_rejects_stale_recv_wrapper() -> None:
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+
+    module, message_queue = _make_patch_target_module(patch_multiproc_executor)
+    assert patch_multiproc_executor.apply_to_module(module) is True
+
+    message_queue.recv = staticmethod(lambda socket, timeout: None)
+
+    with pytest.raises(
+        patch_multiproc_executor.PatchCompatibilityError,
+        match="marker.*stale",
+    ):
+        patch_multiproc_executor.apply_to_module(module)
+
+
+def test_multiproc_patch_rejects_orphan_recv_wrapper() -> None:
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+
+    module, message_queue = _make_patch_target_module(patch_multiproc_executor)
+
+    def orphan_recv(socket, timeout):
+        pass
+
+    setattr(orphan_recv, patch_multiproc_executor._RECV_MARKER, True)
+    message_queue.recv = staticmethod(orphan_recv)
+
+    with pytest.raises(
+        patch_multiproc_executor.PatchCompatibilityError,
+        match="wrapped without its owner marker",
+    ):
+        patch_multiproc_executor.apply_to_module(module)
+
+
+def test_multiproc_patch_rejects_collective_rpc_signature_drift() -> None:
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+
+    module, _ = _make_patch_target_module(patch_multiproc_executor)
+
+    def incompatible_collective_rpc(self, operation, timeout=None):
+        pass
+
+    module.MultiprocExecutor.collective_rpc = incompatible_collective_rpc
+
+    with pytest.raises(
+        patch_multiproc_executor.PatchCompatibilityError,
+        match=patch_multiproc_executor.TARGETS[1],
+    ):
+        patch_multiproc_executor.apply_to_module(module)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "target"),
+    [
+        ("FutureWrapper", "vllm.v1.executor.multiproc_executor.FutureWrapper"),
+        ("WorkerProc", "vllm.v1.executor.multiproc_executor.WorkerProc"),
+    ],
+)
+def test_multiproc_patch_rejects_missing_rpc_dependency(
+    attribute: str,
+    target: str,
+) -> None:
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+
+    module, _ = _make_patch_target_module(patch_multiproc_executor)
+    delattr(module, attribute)
+
+    with pytest.raises(
+        patch_multiproc_executor.PatchCompatibilityError,
+        match=target,
+    ):
+        patch_multiproc_executor.apply_to_module(module)
+
+
+def test_multiproc_patch_rejects_future_wrapper_signature_drift() -> None:
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+
+    module, _ = _make_patch_target_module(patch_multiproc_executor)
+
+    class FutureWrapper:
+        def __init__(self, pending):
+            pass
+
+    module.FutureWrapper = FutureWrapper
+
+    with pytest.raises(
+        patch_multiproc_executor.PatchCompatibilityError,
+        match=patch_multiproc_executor.TARGETS[3],
+    ):
+        patch_multiproc_executor.apply_to_module(module)
+
+
+@pytest.mark.parametrize("include_response_status", [False, True])
+def test_multiproc_patch_rejects_incomplete_worker_status_contract(
+    include_response_status: bool,
+) -> None:
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
+
+    module, _ = _make_patch_target_module(patch_multiproc_executor)
+
+    class WorkerProc:
+        pass
+
+    if include_response_status:
+        class ResponseStatus:
+            pass
+
+        WorkerProc.ResponseStatus = ResponseStatus
+    module.WorkerProc = WorkerProc
+
+    with pytest.raises(
+        patch_multiproc_executor.PatchCompatibilityError,
+        match=patch_multiproc_executor.TARGETS[5],
+    ):
+        patch_multiproc_executor.apply_to_module(module)
