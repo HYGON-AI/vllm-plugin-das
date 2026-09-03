@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import warnings
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -19,11 +20,17 @@ from vllm.utils import torch_utils
 
 
 @pytest.fixture(scope="module")
-def moe_runner_module() -> ModuleType:
+def moe_op_registrations() -> dict[str, dict]:
+    return {}
+
+
+@pytest.fixture(scope="module")
+def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
     register_custom_op = torch_utils.direct_register_custom_op
 
     def register_without_duplicate_moe_ops(op_name, *args, **kwargs):
         if op_name in {"moe_forward", "moe_forward_shared"}:
+            moe_op_registrations[op_name] = kwargs
             return None
         return register_custom_op(op_name, *args, **kwargs)
 
@@ -36,6 +43,81 @@ def moe_runner_module() -> ModuleType:
         torch_utils.direct_register_custom_op = register_custom_op
     assert module.MoERunner.__module__.startswith("vllm_hcu.")
     return module
+
+
+def test_moe_forward_shared_satisfies_aot_mutation_and_alias_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+    moe_op_registrations: dict[str, dict],
+) -> None:
+    """AOT must preserve the input mutation without returning an input alias."""
+
+    class Layer:
+        def _forward_impl(self, hidden_states, *_args, **_kwargs):
+            hidden_states.add_(1)
+            return torch.full_like(hidden_states, 7), hidden_states
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "get_layer_from_name",
+        lambda _name: Layer(),
+    )
+    registration = moe_op_registrations["moe_forward_shared"]
+    test_library = torch.library.Library("vllm_hcu_test_moe", "FRAGMENT")
+    torch_utils.direct_register_custom_op(
+        op_name="moe_forward_shared",
+        op_func=registration["op_func"],
+        mutates_args=registration["mutates_args"],
+        fake_impl=registration["fake_impl"],
+        target_lib=test_library,
+        dispatch_key="CPU",
+        tags=registration["tags"],
+    )
+    torch.library.opcheck(
+        torch.ops.vllm_hcu_test_moe.moe_forward_shared.default,
+        (
+            torch.zeros((2, 2)),
+            None,
+            torch.zeros((2, 2)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "test-layer",
+            0,
+        ),
+        test_utils=("test_schema",),
+    )
+
+    def invoke(hidden_states):
+        return torch.ops.vllm_hcu_test_moe.moe_forward_shared(
+            hidden_states,
+            None,
+            hidden_states,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "test-layer",
+            0,
+        )
+
+    compiled = torch.compile(invoke, backend="aot_eager", fullgraph=True)
+    hidden_states = torch.zeros((2, 2))
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "error",
+            message=r".*moe_forward_shared.*custom operator.*",
+            category=UserWarning,
+        )
+        shared_output, fused_output = compiled(hidden_states)
+
+    torch.testing.assert_close(hidden_states, torch.ones_like(hidden_states))
+    torch.testing.assert_close(shared_output, torch.full_like(hidden_states, 7))
+    torch.testing.assert_close(fused_output, hidden_states)
+    assert not torch._C._is_alias_of(fused_output, hidden_states)
 
 
 def make_hidden() -> torch.Tensor:

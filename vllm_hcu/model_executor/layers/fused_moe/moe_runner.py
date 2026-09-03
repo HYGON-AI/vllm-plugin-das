@@ -179,7 +179,7 @@ def _moe_forward_shared(
     hidden_dim_unpadded: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer._forward_impl(
+    shared_output, fused_output = layer._forward_impl(
         hidden_states,
         router_logits,
         shared_experts_input,
@@ -189,6 +189,7 @@ def _moe_forward_shared(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
+    return shared_output, fused_output.clone()
 
 
 def _moe_forward_shared_fake(
@@ -233,6 +234,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
+    mutates_args=["hidden_states"],
     fake_impl=_moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
