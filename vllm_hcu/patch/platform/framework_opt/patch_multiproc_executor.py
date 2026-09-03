@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 from types import ModuleType
 
@@ -13,9 +14,12 @@ TARGET_MODULE = "vllm.v1.executor.multiproc_executor"
 PATCH_ID = "platform.framework_opt.hcu_multiproc_executor"
 TARGETS = (
     f"{TARGET_MODULE}.MultiprocExecutor",
+    f"{TARGET_MODULE}.MessageQueue.recv",
     "vllm_hcu.v1.executor.multiproc_executor.HcuMultiprocExecutor",
 )
 _MARKER = "_vllm_hcu_multiproc_contract_validated"
+_RECV_MARKER = "_vllm_hcu_non_negative_timeout"
+_ORIGINAL_RECV = "_vllm_hcu_original_recv"
 HCU_MULTIPROC_EXECUTOR_PATH = (
     "vllm_hcu.v1.executor.multiproc_executor.HcuMultiprocExecutor"
 )
@@ -41,6 +45,21 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"vLLM MessageQueue lacks required max_chunks parameter: {signature}"
         )
+    original_recv = require_callable(message_queue, "recv", TARGETS[1])
+    require_signature_prefix(
+        original_recv,
+        TARGETS[1],
+        ("socket", "timeout"),
+    )
+
+    @functools.wraps(original_recv)
+    def hcu_recv(socket, timeout):
+        timeout = None if timeout is None else max(0.0, timeout)
+        return original_recv(socket, timeout)
+
+    setattr(hcu_recv, _RECV_MARKER, True)
+    setattr(message_queue, _ORIGINAL_RECV, original_recv)
+    setattr(message_queue, "recv", staticmethod(hcu_recv))
     setattr(target, _MARKER, True)
     return True
 
