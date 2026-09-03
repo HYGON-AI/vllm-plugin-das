@@ -16,6 +16,10 @@ concurrency:
   group: hcu-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  # Repository variables are unavailable to workflows triggered by fork PRs.
+  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE || '10.16.1.152:5000/jenkins/model_test_env/vllm:0.25.1-latest' }}
+
 jobs:
   static-and-select:
     name: Static gate and test selection
@@ -25,8 +29,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       has_jobs: ${{ steps.select.outputs.has_jobs }}
@@ -161,8 +163,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
     permissions:
       contents: read
       issues: read
@@ -257,7 +257,6 @@ jobs:
     with:
       matrix: ${{ needs.static-and-select.outputs.matrix }}
       tested_ref: ${{ github.event.pull_request.merge_commit_sha }}
-      image: ${{ vars.HCU_CI_IMAGE }}
     permissions:
       contents: read
 

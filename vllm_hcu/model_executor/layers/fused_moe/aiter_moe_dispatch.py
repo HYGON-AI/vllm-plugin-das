@@ -119,7 +119,9 @@ def _solution_token(config: object) -> str:
     return str(solution).rsplit(".", 1)[-1].upper()
 
 
-def _weight_layout_generation(config: object) -> tuple[Any, ...]:
+def aiter_moe_weight_layout_signature(config: object) -> tuple[Any, ...]:
+    """Return the physical weight-layout contract selected by AITER."""
+
     config_values = getattr(config, "config", None)
     padded_k = (
         config_values.get("PADDED_K")
@@ -177,7 +179,7 @@ def _validate_derived_tensor(
         )
     compatible_shape = derived.shape == original.shape
     config_values = getattr(config, "config", None)
-    if not compatible_shape and isinstance(config_values, dict):
+    if isinstance(config_values, dict):
         padded_k = config_values.get("PADDED_K")
         original_k = config_values.get("ORIGINAL_K")
         try:
@@ -185,23 +187,23 @@ def _validate_derived_tensor(
             original_k = int(original_k)
         except (TypeError, ValueError):
             padded_k = original_k = -1
-        mismatched_dims = (
-            [
-                index
-                for index, (actual, expected) in enumerate(
-                    zip(derived.shape, original.shape, strict=True)
+        padded_axis = {
+            "w1": 2,
+            "w2": 1,
+            "w1_scale": 2,
+            "w2_scale": 1,
+        }.get(label)
+        if padded_axis is not None and padded_k > original_k > 0:
+            compatible_shape = (
+                derived.ndim == original.ndim == 3
+                and all(
+                    derived.shape[index] == original.shape[index]
+                    for index in range(derived.ndim)
+                    if index != padded_axis
                 )
-                if actual != expected
-            ]
-            if derived.ndim == original.ndim
-            else []
-        )
-        compatible_shape = (
-            len(mismatched_dims) == 1
-            and derived.shape[mismatched_dims[0]] == padded_k
-            and original.shape[mismatched_dims[0]] == original_k
-            and padded_k >= original_k > 0
-        )
+                and derived.shape[padded_axis] == padded_k
+                and original.shape[padded_axis] == original_k
+            )
     if not compatible_shape:
         raise HcuAiterMoeDispatchError(
             f"AITER returned incompatible {label} shape {tuple(derived.shape)} "
@@ -213,13 +215,15 @@ def _validate_derived_tensor(
 def select_aiter_moe_config(
     problem: AiterMoeProblem,
     cache_owner: object,
+    solution_type: object | None = None,
 ) -> object | None:
     """Ask AITER to route the problem, preserving explicit no-solution status."""
 
     cache = _owner_cache(cache_owner, _SELECTION_CACHE_ATTR)
-    if problem in cache:
-        cache.move_to_end(problem)
-        return cache[problem]
+    cache_key = (problem, _freeze(solution_type))
+    if cache_key in cache:
+        cache.move_to_end(cache_key)
+        return cache[cache_key]
 
     moe_module = import_module("aiter.moe")
     selector = getattr(moe_module, "get_aiter_moe_config", None)
@@ -229,7 +233,11 @@ def select_aiter_moe_config(
             + problem.describe()
         )
 
-    result = selector(
+    # A pinned solution is used when weights have already been converted to
+    # that solution's physical layout.  It must not be silently rerouted.
+    use_shuffle = problem.use_shuffle
+
+    selector_kwargs = dict(
         M=problem.M,
         E=problem.E,
         N1=problem.N1,
@@ -240,8 +248,11 @@ def select_aiter_moe_config(
         dtype=problem.dtype,
         quant_type=problem.quant_type,
         activation=problem.activation,
-        use_shuffle=int(problem.use_shuffle),
+        use_shuffle=int(use_shuffle),
     )
+    if solution_type is not None:
+        selector_kwargs["spec_sol_type"] = solution_type
+    result = selector(**selector_kwargs)
     if not isinstance(result, tuple) or len(result) != 2:
         raise HcuAiterMoeDispatchError(
             "get_aiter_moe_config must return (status, config); "
@@ -260,14 +271,13 @@ def select_aiter_moe_config(
                 "Triton MoE for %s",
                 problem.describe(),
             )
-        _cache_put(cache, problem, None, limit=_SELECTION_CACHE_LIMIT)
+        _cache_put(cache, cache_key, None, limit=_SELECTION_CACHE_LIMIT)
         return None
     if config is None:
         raise HcuAiterMoeDispatchError(
             "get_aiter_moe_config returned status=True without a config; "
             + problem.describe()
         )
-
     solution = _solution_token(config)
     if _mark_route_logged(problem):
         logger.debug(
@@ -275,7 +285,14 @@ def select_aiter_moe_config(
             solution,
             problem.describe(),
         )
-    _cache_put(cache, problem, config, limit=_SELECTION_CACHE_LIMIT)
+    if solution_type is not None and _solution_token(config) != str(
+        getattr(solution_type, "value", solution_type)
+    ).rsplit(".", 1)[-1].upper():
+        raise HcuAiterMoeDispatchError(
+            "AITER ignored the requested MoE solution layout; requested="
+            f"{solution_type!r}, returned={_solution_token(config)}"
+        )
+    _cache_put(cache, cache_key, config, limit=_SELECTION_CACHE_LIMIT)
     return config
 
 
@@ -306,7 +323,7 @@ def prepare_aiter_moe_weights(
     cache_key = (
         _tensor_generation(w1),
         _tensor_generation(w2),
-        _weight_layout_generation(config),
+        aiter_moe_weight_layout_signature(config),
         _freeze(block_shape),
         preserve_inputs,
     )

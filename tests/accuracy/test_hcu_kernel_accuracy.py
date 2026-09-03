@@ -506,8 +506,10 @@ def test_lightop_sparse_mqa_matches_fp32_reference() -> None:
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"lightop sparse MQA kernel is unavailable: {exc}")
     from vllm.platforms import current_platform
+    from vllm_hcu.platforms.hcu import on_gfx938
 
-    fp8_dtype = current_platform.fp8_dtype()
+    use_fp8 = on_gfx938()
+    kernel_dtype = current_platform.fp8_dtype() if use_fp8 else torch.bfloat16
     num_queries, num_keys, num_heads, head_dim = 4, 128, 8, 128
     generator = torch.Generator(device=device).manual_seed(20250825)
     query = torch.randn(
@@ -515,13 +517,13 @@ def test_lightop_sparse_mqa_matches_fp32_reference() -> None:
         generator=generator,
         device=device,
         dtype=torch.bfloat16,
-    ).to(fp8_dtype)
+    ).to(kernel_dtype)
     key = torch.randn(
         (num_keys, head_dim),
         generator=generator,
         device=device,
         dtype=torch.bfloat16,
-    ).to(fp8_dtype)
+    ).to(kernel_dtype)
     weights = torch.rand(
         (num_queries, num_heads),
         generator=generator,
@@ -533,6 +535,7 @@ def test_lightop_sparse_mqa_matches_fp32_reference() -> None:
         (num_queries,), num_keys, device=device, dtype=torch.int32
     )
     key_scale = torch.ones((num_keys,), device=device, dtype=torch.float32)
+    kernel_key_scale = key_scale if use_fp8 else None
 
     actual = mqa_logits(
         query,
@@ -540,7 +543,7 @@ def test_lightop_sparse_mqa_matches_fp32_reference() -> None:
         weights,
         row_starts,
         row_ends,
-        key_scale,
+        kernel_key_scale,
     )
     score = (
         torch.einsum(

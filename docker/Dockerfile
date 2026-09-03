@@ -94,6 +94,8 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install flash_mla ${TORCH_TAG} \
     && das-install fastsafetensors ${TORCH_TAG} \
     && das-install flash_kda ${TORCH_TAG} \
+    && das-install vllm-router ${TORCH_TAG} \
+    && das-install nixl ${TORCH_TAG} \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip cache purge
     

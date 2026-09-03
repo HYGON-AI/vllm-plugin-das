@@ -215,6 +215,46 @@ def test_aiter_dispatch_selector_passes_problem_without_forcing_solution(
     assert "device" not in captured
 
 
+def test_aiter_dispatch_can_pin_asm_shuffle_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    expected = SimpleNamespace(solution_type="asm", need_shuffle=True)
+
+    def get_config(**kwargs: object):
+        captured.update(kwargs)
+        return True, expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    problem = AiterMoeProblem(
+        M=1,
+        E=2,
+        N1=8,
+        N2=4,
+        K=4,
+        top_k=2,
+        block_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+        use_shuffle=True,
+    )
+
+    actual = select_aiter_moe_config(
+        problem,
+        cache_owner=torch.empty(1),
+        solution_type="asm",
+    )
+
+    assert actual is expected
+    assert captured["spec_sol_type"] == "asm"
+    assert captured["use_shuffle"] == 1
+
+
 def test_aiter_dispatch_selector_returns_none_only_for_explicit_no_solution(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2623,6 +2663,10 @@ def test_aiter_w16a16_routes_public_api_with_canonical_weights(
     x = torch.ones(2, 4)
     w1 = torch.ones(3, 8, 4)
     w2 = torch.ones(3, 4, 4)
+    w1.is_shuffled = False
+    w2.is_shuffled = False
+    w1._hcu_aiter_moe_solution_type = "moe_c"
+    w2._hcu_aiter_moe_solution_type = "moe_c"
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
     expected = torch.full_like(x, 7)
@@ -2669,14 +2713,287 @@ def test_aiter_w16a16_routes_public_api_with_canonical_weights(
     assert selector_calls[0]["N2"] == 4
     assert selector_calls[0]["K"] == 4
     assert selector_calls[0]["use_shuffle"] == 1
-    assert "spec_sol_type" not in selector_calls[0]
+    assert selector_calls[0]["spec_sol_type"] == "moe_c"
     assert execute_calls[0]["w1"] is w1
     assert execute_calls[0]["w2"] is w2
     assert execute_calls[0]["activation"] == "gelu_tanh"
     assert execute_calls[0]["gemm1_limit"] == 7.5
 
 
-def test_aiter_w16a16_post_load_preserves_canonical_parameters(
+def test_aiter_w16a16_reuses_installed_asm_layout_without_reshuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    w1.is_shuffled = True
+    w2.is_shuffled = True
+    w1._hcu_aiter_moe_solution_type = "asm"
+    w2._hcu_aiter_moe_solution_type = "asm"
+    selector_calls: list[dict[str, object]] = []
+    execute_calls: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={},
+    )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (
+                selector_calls.append(kwargs) or True,
+                config,
+            ),
+            aiter_moe_shfl_weight=lambda *_args, **_kwargs: pytest.fail(
+                "installed ASM weights must not be shuffled again"
+            ),
+            aiter_moe=lambda **kwargs: execute_calls.append(kwargs)
+            or kwargs["hidden_states"].clone(),
+        ),
+    )
+
+    aiter_runtime.fused_moe_impl(
+        lambda *_args: pytest.fail("must not delegate"),
+        torch.ones(2, 4),
+        w1,
+        w2,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        activation_method=0,
+    )
+
+    assert selector_calls[0]["spec_sol_type"] == "asm"
+    assert execute_calls[0]["w1"] is w1
+    assert execute_calls[0]["w2"] is w2
+    assert execute_calls[0]["use_weight_shuffle"] is True
+
+
+def test_aiter_w16a16_shuffled_weights_never_fall_back_to_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    w1.is_shuffled = True
+    w2.is_shuffled = True
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **_kwargs: (False, None),
+        ),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="no ASM solution",
+    ):
+        aiter_runtime.fused_moe_impl(
+            lambda *_args: pytest.fail("must not delegate"),
+            torch.ones(2, 4),
+            w1,
+            w2,
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            activation_method=0,
+        )
+
+
+def test_aiter_w16a16_installed_canonical_layout_never_runtime_shuffles(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = False
+        weight._hcu_aiter_moe_solution_type = "triton"
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=True,
+        config={},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **_kwargs: (True, config),
+            aiter_moe_shfl_weight=lambda *_args: pytest.fail(
+                "installed canonical weights must not be shuffled at runtime"
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="layout does not match",
+    ):
+        aiter_runtime.fused_moe_impl(
+            lambda *_args: pytest.fail("must not delegate"),
+            torch.ones(2, 4),
+            w1,
+            w2,
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            activation_method=0,
+        )
+
+
+def test_aiter_w16a16_rejects_runtime_config_for_different_asm_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = True
+        weight._hcu_aiter_moe_solution_type = "asm"
+        weight._hcu_aiter_moe_weight_layout = (
+            "w16a16",
+            "ASM",
+            True,
+            64,
+        )
+    runtime_config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"PADDED_K": 128},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **_kwargs: (True, runtime_config),
+        ),
+    )
+
+    with pytest.raises(
+        aiter_runtime.HcuAiterRuntimeError,
+        match="physical layout",
+    ):
+        aiter_runtime.fused_moe_impl(
+            lambda *_args: pytest.fail("must not delegate"),
+            torch.ones(2, 4),
+            w1,
+            w2,
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            activation_method=0,
+        )
+
+
+def test_aiter_w16a16_runtime_selects_with_installed_logical_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"ORIGINAL_K": 4, "PADDED_K": 8},
+    )
+    layout = (
+        "w16a16",
+        "ASM",
+        True,
+        8,
+    )
+    w1 = torch.ones(3, 8, 8)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = True
+        weight._hcu_aiter_moe_solution_type = "asm"
+        weight._hcu_aiter_moe_weight_layout = layout
+        weight._hcu_aiter_moe_logical_shape = (3, 8, 4, 4)
+    selector_calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (
+                selector_calls.append(kwargs) or True,
+                config,
+            ),
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"].clone(),
+        ),
+    )
+
+    aiter_runtime.fused_moe_impl(
+        lambda *_args: pytest.fail("must not delegate"),
+        torch.ones(2, 4),
+        w1,
+        w2,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        activation_method=0,
+    )
+
+    assert selector_calls[0]["E"] == 3
+    assert selector_calls[0]["N1"] == 8
+    assert selector_calls[0]["N2"] == 4
+    assert selector_calls[0]["K"] == 4
+
+
+def test_aiter_w16a16_installed_native_fallback_bypasses_selector(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+
+    expected = torch.full((2, 4), 5.0)
+    monkeypatch.setattr(
+        aiter_runtime,
+        "select_aiter_moe_config",
+        lambda *_args, **_kwargs: pytest.fail(
+            "native fallback must not reselect AITER at runtime"
+        ),
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *_args, **_kwargs: expected,
+    )
+    w1 = torch.ones(3, 8, 4)
+    w2 = torch.ones(3, 4, 4)
+    for weight in (w1, w2):
+        weight.is_shuffled = False
+        weight._hcu_aiter_moe_solution_type = "native"
+
+    actual = aiter_runtime.fused_moe_impl(
+        lambda *_args: pytest.fail("must not delegate"),
+        torch.ones(2, 4),
+        w1,
+        w2,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        activation_method=0,
+    )
+
+    assert actual is expected
+
+
+def test_aiter_w16a16_post_load_replaces_parameters_with_asm_layout(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.fused_moe import (
@@ -2717,30 +3034,88 @@ def test_aiter_w16a16_post_load_preserves_canonical_parameters(
         "make_unquantized_moe_kernel",
         lambda **kwargs: kernels.append(kwargs) or object(),
     )
-    prewarm_calls: list[tuple[AiterMoeProblem, object]] = []
     monkeypatch.setattr(
         hcu_unquantized,
-        "prewarm_aiter_moe_config",
-        lambda problem, cache_owner: prewarm_calls.append(
-            (problem, cache_owner)
+        "replace_parameter",
+        lambda owner, name, value, **_kwargs: setattr(
+            owner,
+            name,
+            torch.nn.Parameter(value, requires_grad=False),
         ),
-        raising=False,
     )
+    select_calls: list[tuple[AiterMoeProblem, object, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"PADDED_K": 64, "ORIGINAL_K": 4},
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "select_aiter_moe_config",
+        lambda problem, cache_owner, solution_type=None: select_calls.append(
+            (problem, cache_owner, solution_type)
+        ) or config,
+    )
+    shuffled_w13 = torch.full((2, 8, 64), 13.0)
+    shuffled_w2 = torch.full((2, 64, 4), 2.0)
+    shuffle_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(current_w13, current_w2, _config):
+        shuffle_calls.append((current_w13, current_w2))
+        return shuffled_w13.clone(), shuffled_w2.clone()
+
     monkeypatch.setitem(
         sys.modules,
-        "aiter.moe",
-        _module("aiter.moe"),
+        "aiter.moe", _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
     )
 
     method.process_weights_after_loading(layer)
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight is w13
-    assert layer.w2_weight is w2
-    assert len(kernels) == 1
+    # Upstream layerwise reload restores new canonical Parameters but does not
+    # know about legacy HCU-owned layer markers.
+    layer._hcu_aiter_moe_initialized = True
+    reloaded_w13 = torch.nn.Parameter(torch.full_like(w13, 5), requires_grad=False)
+    reloaded_w2 = torch.nn.Parameter(torch.full_like(w2, 6), requires_grad=False)
+    layer.w13_weight = reloaded_w13
+    layer.w2_weight = reloaded_w2
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is not w13
+    assert layer.w2_weight is not w2
+    torch.testing.assert_close(layer.w13_weight, shuffled_w13)
+    torch.testing.assert_close(layer.w2_weight, shuffled_w2)
+    assert layer.w13_weight.is_shuffled is True
+    assert layer.w2_weight.is_shuffled is True
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w13_weight._hcu_aiter_moe_weight_layout == (
+        "w16a16",
+        "ASM",
+        True,
+        64,
+    )
+    assert layer.w2_weight._hcu_aiter_moe_weight_layout == (
+        "w16a16",
+        "ASM",
+        True,
+        64,
+    )
+    assert layer.w13_weight._hcu_aiter_moe_logical_shape == (2, 8, 4, 4)
+    assert layer.w2_weight._hcu_aiter_moe_logical_shape == (2, 8, 4, 4)
+    assert len(kernels) == 2
     assert method.moe_kernel is not None
-    assert len(prewarm_calls) == 1
-    problem, cache_owner = prewarm_calls[0]
+    assert len(select_calls) == 2
+    assert len(shuffle_calls) == 2
+    assert shuffle_calls[0][0] is w13
+    assert shuffle_calls[0][1] is w2
+    assert shuffle_calls[1][0] is reloaded_w13
+    assert shuffle_calls[1][1] is reloaded_w2
+    problem, cache_owner, solution_type = select_calls[0]
     assert problem == AiterMoeProblem(
         M=1,
         E=2,
@@ -2756,6 +3131,105 @@ def test_aiter_w16a16_post_load_preserves_canonical_parameters(
         use_shuffle=True,
     )
     assert cache_owner is w13
+    assert solution_type == "asm"
+
+
+def test_aiter_w16a16_post_load_locks_canonical_triton_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as hcu_unquantized,
+    )
+
+    w13 = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    layer = SimpleNamespace(w13_weight=w13, w2_weight=w2)
+    method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace(
+        num_experts=2,
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+    )
+    method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = lambda _layer: object()
+    monkeypatch.setattr(hcu_unquantized, "_is_hcu_aiter_moe_requested", lambda *_: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
+    select_calls: list[tuple[AiterMoeProblem, object, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=False,
+        config={},
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "select_aiter_moe_config",
+        lambda problem, cache_owner, solution_type=None: select_calls.append(
+            (problem, cache_owner, solution_type)
+        ) or config,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "make_unquantized_moe_kernel",
+        lambda **_kwargs: object(),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is w13
+    assert layer.w2_weight is w2
+    assert layer.w13_weight.is_shuffled is False
+    assert layer.w2_weight.is_shuffled is False
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "triton"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "triton"
+    assert len(select_calls) == 1
+    assert select_calls[0][1] is w13
+    assert select_calls[0][2] is None
+
+
+def test_aiter_w16a16_post_load_locks_native_fallback_on_m1_miss(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as hcu_unquantized,
+    )
+
+    w13 = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    w2 = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    layer = SimpleNamespace(w13_weight=w13, w2_weight=w2)
+    method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace(
+        num_experts=2,
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+    )
+    method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
+    method.experts_cls = object
+    method.get_fused_moe_quant_config = lambda _layer: object()
+    monkeypatch.setattr(hcu_unquantized, "_is_hcu_aiter_moe_requested", lambda *_: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "select_aiter_moe_config",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "make_unquantized_moe_kernel",
+        lambda **_kwargs: object(),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight is w13
+    assert layer.w2_weight is w2
+    assert layer.w13_weight.is_shuffled is False
+    assert layer.w2_weight.is_shuffled is False
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "native"
 
 
 def test_explicit_aiter_backend_uses_public_router_without_auto_env_gate(
@@ -3999,7 +4473,7 @@ def test_slimquant_w4a8_deepep_routing_fails_closed_before_tp_fallback(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
+def test_slimquant_w4a8_installs_moe_c_layout_at_load(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
@@ -4008,7 +4482,7 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
     selected = SimpleNamespace(
         quant_type="w4a8",
         solution_type="moe_c",
-        need_shuffle=False,
+        need_shuffle=True,
         need_shuffle_scale=False,
     )
 
@@ -4026,6 +4500,10 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
             "aiter.moe",
             MoeQuantType=MoeQuantType,
             get_aiter_moe_config=get_config,
+            aiter_moe_shfl_weight=lambda w1, w2, _config: (
+                w1.clone().add_(1),
+                w2.clone().add_(2),
+            ),
         ),
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
@@ -4051,7 +4529,10 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones(2, 4, 1), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
+    assert method.moe_quant_config is None
 
     method.process_weights_after_loading(layer)
 
@@ -4068,16 +4549,513 @@ def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
             "quant_type": "w4a8",
             "activation": "silu",
             "use_shuffle": 1,
+            "spec_sol_type": "moe_c",
         }
     ]
-    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert layer.w13_weight.is_shuffled is True
+    assert layer.w2_weight.is_shuffled is True
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "moe_c"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "moe_c"
+    assert method.moe_quant_config is not None
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        torch.full_like(method.moe_quant_config.w1_scale, 16.0),
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        torch.full_like(method.moe_quant_config.w2_scale, 16.0),
+    )
+    torch.testing.assert_close(
+        layer.w13_weight_scale, torch.ones_like(layer.w13_weight_scale)
+    )
+    torch.testing.assert_close(
+        layer.w2_weight_scale, torch.ones_like(layer.w2_weight_scale)
+    )
+    torch.testing.assert_close(layer.w13_weight, torch.ones_like(layer.w13_weight))
+    torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 2))
+
+
+def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="asm",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={},
+    )
+
+    class MoeQuantType:
+        W8A8 = "w8a8"
+
+    shuffle_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(w1, w2, _config):
+        shuffle_calls.append((w1, w2))
+        return w1.clone().add_(3), w2.clone().add_(4)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_kwargs: (True, config),
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((3, 8, 4), dtype=torch.int8), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((3, 4, 4), dtype=torch.int8), requires_grad=False
+    )
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        block_shape=None,
+    )
+
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "asm"
+    assert layer.w13_weight._hcu_aiter_moe_weight_layout == (
+        "w8a8",
+        "ASM",
+        True,
+        None,
+    )
+    assert layer.w2_weight._hcu_aiter_moe_weight_layout == (
+        "w8a8",
+        "ASM",
+        True,
+        None,
+    )
+    torch.testing.assert_close(layer.w13_weight, torch.full_like(layer.w13_weight, 3))
+    torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 4))
+    assert len(shuffle_calls) == 1
+
+    reloaded_w13 = torch.nn.Parameter(
+        torch.zeros((3, 8, 4), dtype=torch.int8), requires_grad=False
+    )
+    reloaded_w2 = torch.nn.Parameter(
+        torch.zeros((3, 4, 4), dtype=torch.int8), requires_grad=False
+    )
+    layer.w13_weight = reloaded_w13
+    layer.w2_weight = reloaded_w2
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+
+    assert len(shuffle_calls) == 2
+    assert shuffle_calls[1][0] is reloaded_w13
+    assert shuffle_calls[1][1] is reloaded_w2
+    torch.testing.assert_close(layer.w13_weight, torch.full_like(layer.w13_weight, 3))
+    torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 4))
+
+
+def test_w8a8_padded_layout_keeps_original_logical_problem_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    config_calls: list[dict[str, object]] = []
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    def get_config(**kwargs):
+        config_calls.append(kwargs)
+        return True, config
+
+    def shuffle_weights(w1, w2, _config):
+        return (
+            torch.zeros((w1.shape[0], w1.shape[1], 8), dtype=w1.dtype),
+            torch.zeros((w2.shape[0], 8, w2.shape[2]), dtype=w2.dtype),
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe_shfl_weight=shuffle_weights,
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"],
+        ),
+    )
+    layer = _fp8_moe_layer()
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        block_shape=None,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        a1_scale=None,
+        a2_scale=None,
+    )
+    moe_config = SimpleNamespace(
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+        num_experts=3,
+    )
+
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer, moe_config, quant_config
+    )
+    compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        topk_weights=torch.ones((2, 2), dtype=torch.bfloat16),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+        vllm_moe_config=moe_config,
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=None,
+        quant_config=quant_config,
+    )
+
+    assert layer.w13_weight.shape[2] == 8
+    assert layer.w2_weight.shape[1] == 8
+    assert config_calls[1]["K"] == 4
+    assert config_calls[1]["N1"] == 8
+    assert config_calls[1]["N2"] == 4
+
+
+def test_padded_layout_validation_rejects_wrong_w2_axis(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    w1 = torch.zeros((2, 8, 4))
+    w2 = torch.zeros((2, 4, 4))
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_weight=lambda *_args: (
+                torch.zeros((2, 8, 8)),
+                torch.zeros((2, 4, 8)),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        HcuAiterMoeDispatchError,
+        match="incompatible w2 shape",
+    ):
+        prepare_aiter_moe_weights(
+            w1,
+            w2,
+            config,
+            cache_owner=object(),
+        )
+
+
+def test_padded_scale_layout_accepts_weight_matching_k_axes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    scale1 = torch.ones((2, 8, 4))
+    scale2 = torch.ones((2, 4, 4))
+    expected1 = torch.full((2, 8, 8), 3.0)
+    expected2 = torch.full((2, 8, 4), 4.0)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_scale=lambda *_args: (expected1, expected2),
+        ),
+    )
+
+    actual1, actual2 = prepare_aiter_moe_scales(
+        scale1, scale2, config, cache_owner=object()
+    )
+
+    assert actual1 is expected1
+    assert actual2 is expected2
+
+
+def test_padded_scale_layout_rejects_wrong_w2_axis(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    scale1 = torch.ones((2, 8, 4))
+    scale2 = torch.ones((2, 4, 4))
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            aiter_moe_shfl_scale=lambda *_args: (
+                torch.zeros((2, 8, 8)),
+                torch.zeros((2, 4, 8)),
+            ),
+        ),
+    )
+
+    with pytest.raises(HcuAiterMoeDispatchError, match="incompatible w2_scale shape"):
+        prepare_aiter_moe_scales(scale1, scale2, config, cache_owner=object())
+
+
+def test_w8a8_m1_miss_locks_native_weights_without_runtime_relayout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        W8A8 = "w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_kwargs: (False, None),
+        ),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((3, 8, 4), dtype=torch.int8), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((3, 4, 4), dtype=torch.int8), requires_grad=False
+    )
+
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        SimpleNamespace(
+            use_fp8_w8a8=False,
+            use_int8_w8a8=True,
+            block_shape=None,
+        ),
+    )
+
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w13_weight.is_shuffled is False
+    assert layer.w2_weight.is_shuffled is False
+
+
+def test_quantized_installed_weights_reject_different_physical_layout():
+    w1 = torch.zeros((2, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((2, 4, 4), dtype=torch.int8)
+    installed_layout = ("w8a8", "MOE_C", True, 64)
+    for weight in (w1, w2):
+        weight.is_shuffled = True
+        weight._hcu_aiter_moe_solution_type = "moe_c"
+        weight._hcu_aiter_moe_weight_layout = installed_layout
+    runtime_config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        config={"PADDED_K": 128},
+    )
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="physical layout",
+    ):
+        compressed_tensors_moe_runtime._weights_for_selected_config(
+            w1,
+            w2,
+            runtime_config,
+            installed_solution="moe_c",
+        )
+
+
+def test_w8a8_prewarm_installs_selected_scale_layout_once(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=True,
+        config={},
+    )
+
+    class MoeQuantType:
+        W8A8 = "w8a8"
+
+    scale_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_scales(scale1, scale2, _config):
+        scale_calls.append((scale1, scale2))
+        return scale1.clone().add_(3), scale2.clone().add_(4)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_kwargs: (True, config),
+            aiter_moe_shfl_scale=shuffle_scales,
+        ),
+    )
+    layer = _fp8_moe_layer()
+    original_w1_scale = layer.w13_weight_scale
+    original_w2_scale = layer.w2_weight_scale
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        block_shape=None,
+        w1_scale=original_w1_scale,
+        w2_scale=original_w2_scale,
+    )
+
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+    compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        ),
+        quant_config,
+    )
+
+    assert len(scale_calls) == 1
+    assert layer.w13_weight_scale is not original_w1_scale
+    assert layer.w2_weight_scale is not original_w2_scale
+    assert quant_config.w1_scale is layer.w13_weight_scale
+    assert quant_config.w2_scale is layer.w2_weight_scale
+    assert layer.w13_weight_scale._hcu_aiter_moe_scale_layout == (
+        "w8a8",
+        "MOE_C",
+        True,
+        None,
+        None,
+    )
+    assert layer.w2_weight_scale._hcu_aiter_moe_scale_layout == (
+        "w8a8",
+        "MOE_C",
+        True,
+        None,
+        None,
+    )
+
+
+def test_installed_scale_layout_rejects_different_padded_k(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        W8A8 = "w8a8"
+
+    first_config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+    second_config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="moe_c",
+        need_shuffle_scale=True,
+        config={"PADDED_K": 16, "ORIGINAL_K": 4},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            aiter_moe_shfl_scale=lambda scale1, scale2, _config: (
+                torch.zeros((2, 8, 8), dtype=scale1.dtype),
+                torch.zeros((2, 8, 4), dtype=scale2.dtype),
+            ),
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight_scale=torch.ones((2, 8, 4)),
+        w2_weight_scale=torch.ones((2, 4, 4)),
+    )
+    quant_config = SimpleNamespace(
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+    )
+
+    compressed_tensors_moe_runtime.install_aiter_moe_scale_layout(
+        layer, quant_config, first_config
+    )
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="selected layout",
+    ):
+        compressed_tensors_moe_runtime.install_aiter_moe_scale_layout(
+            layer, quant_config, second_config
+        )
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_tp_aiter_keeps_raw_canonical_owner(
+def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """The DP auto ownership exception must not mutate pure-TP AITER weights."""
+    """The DP auto ownership exception must not transform pure-TP weights."""
 
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -4102,24 +5080,60 @@ def test_slimquant_w4a8_tp_aiter_keeps_raw_canonical_owner(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones((1, 4, 1), dtype=torch.float32), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
     expected_w13 = w13.detach().clone()
     expected_w2 = w2.detach().clone()
+    assert method.moe_quant_config is None
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+        config={},
+    )
     prewarm_calls: list[object] = []
+
+    def prewarm(_method, owner):
+        prewarm_calls.append(owner)
+        return selected
+
     monkeypatch.setattr(
         compressed_tensors_moe_runtime,
         "prewarm_aiter_w4a8_moe",
-        lambda _method, owner: prewarm_calls.append(owner),
+        prewarm,
     )
 
     method.process_weights_after_loading(layer)
 
+    assert method.moe_quant_config is not None
     assert prewarm_calls == [layer]
     assert layer.w13_weight is w13
     assert layer.w2_weight is w2
     torch.testing.assert_close(layer.w13_weight, expected_w13)
     torch.testing.assert_close(layer.w2_weight, expected_w2)
     assert not hasattr(layer, "_slimquant_w4a8_deepep_auto_layout")
+
+    installed_quant_config = method.moe_quant_config
+    method.process_weights_after_loading(layer)
+    assert method.moe_quant_config is installed_quant_config
+    assert prewarm_calls == [layer]
+
+    with torch.no_grad():
+        layer.w13_weight_scale.add_(1.0)
+        layer.w2_weight_scale.add_(2.0)
+    method.process_weights_after_loading(layer)
+    assert method.moe_quant_config is not installed_quant_config
+    assert prewarm_calls == [layer]
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        torch.full((1, 8, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        torch.full((1, 4, 1), 48.0),
+    )
 
 
 @pytest.mark.hcu
@@ -4164,20 +5178,102 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones(1, 4, 1), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
+    assert method.moe_quant_config is None
+    packed_w13 = layer.w13_weight.detach().clone()
+    packed_w2 = layer.w2_weight.detach().clone()
 
     method.process_weights_after_loading(layer)
 
-    fallback_w1, fallback_w2 = (
-        layer.w13_weight._hcu_vllm_w4a8_fallback_weights
-    )
-    assert fallback_w1.shape == (1, 4, 4)
-    assert fallback_w2.shape == (1, 4, 2)
+    assert layer.w13_weight.shape == (1, 4, 4)
+    assert layer.w2_weight.shape == (1, 4, 2)
+    assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
+    assert layer.w2_weight._hcu_vllm_w4a8_unpacked is True
+    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
     assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert method.moe_quant_config is not None
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        layer.w13_weight_scale * 16.0,
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        layer.w2_weight_scale * 16.0,
+    )
+
+    from vllm.model_executor.layers.fused_moe import fused_moe
+
+    kernel_calls: list[dict[str, object]] = []
+
+    def fused_experts_impl(hidden_states, *_args, **kwargs):
+        kernel_calls.append(kwargs)
+        return hidden_states + 1
+
+    monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
+    hidden_states = torch.zeros((2, 4), dtype=torch.float16)
+    result = method.apply(
+        layer,
+        hidden_states,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int64),
+        None,
+        None,
+    )
+
+    torch.testing.assert_close(result, hidden_states + 1)
+    assert kernel_calls[0]["w1_scale"] is method.moe_quant_config.w1_scale
+    assert kernel_calls[0]["w2_scale"] is method.moe_quant_config.w2_scale
+
+    installed_w13 = layer.w13_weight
+    installed_w2 = layer.w2_weight
+    installed_quant_config = method.moe_quant_config
+    method.process_weights_after_loading(layer)
+    assert layer.w13_weight is installed_w13
+    assert layer.w2_weight is installed_w2
+    assert method.moe_quant_config is installed_quant_config
+
+    with torch.no_grad():
+        layer.w13_weight_scale.add_(1.0)
+        layer.w2_weight_scale.add_(2.0)
+    method.process_weights_after_loading(layer)
+    scale_updated_quant_config = method.moe_quant_config
+    assert layer.w13_weight is installed_w13
+    assert layer.w2_weight is installed_w2
+    assert scale_updated_quant_config is not installed_quant_config
+    torch.testing.assert_close(
+        scale_updated_quant_config.w1_scale,
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        scale_updated_quant_config.w2_scale,
+        torch.full((1, 4, 1), 48.0),
+    )
+
+    layer.w13_weight = torch.nn.Parameter(packed_w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(packed_w2, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.full((1, 4, 1), 2.0), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.full((1, 4, 1), 3.0), requires_grad=False
+    )
+    method.process_weights_after_loading(layer)
+
+    assert method.moe_quant_config is not installed_quant_config
+    torch.testing.assert_close(
+        method.moe_quant_config.w1_scale,
+        torch.full((1, 4, 1), 32.0),
+    )
+    torch.testing.assert_close(
+        method.moe_quant_config.w2_scale,
+        torch.full((1, 4, 1), 48.0),
+    )
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_unsupported_m1_does_not_expand_weights_at_load(
+def test_slimquant_w4a8_m1_miss_installs_single_native_triton_layout(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
@@ -4224,16 +5320,23 @@ def test_slimquant_w4a8_unsupported_m1_does_not_expand_weights_at_load(
         w2_weight_scale=torch.nn.Parameter(
             torch.ones(1, 4, 1), requires_grad=False
         ),
+        w13_input_scale=None,
+        w2_input_scale=None,
     )
 
     method.process_weights_after_loading(layer)
 
-    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
-    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
+    assert method.moe_quant_config is not None
+    assert layer.w13_weight.shape == (1, 4, 4)
+    assert layer.w2_weight.shape == (1, 4, 2)
+    assert layer.w13_weight._hcu_vllm_w4a8_unpacked is True
+    assert layer.w2_weight._hcu_vllm_w4a8_unpacked is True
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "native"
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_runtime_rechecks_actual_m_after_m1_miss(
+def test_slimquant_w4a8_legacy_raw_weights_pin_actual_m_to_moe_c(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: dict[str, object] = {}
@@ -4307,6 +5410,7 @@ def test_slimquant_w4a8_runtime_rechecks_actual_m_after_m1_miss(
         "quant_type": "w4a8",
         "activation": "silu",
         "use_shuffle": 1,
+        "spec_sol_type": "moe_c",
     }
     execute = calls["execute"]
     assert execute["moe_config"] is selected
@@ -4939,6 +6043,200 @@ def test_moe_fp8_aiter_route_is_layer_aware_and_cached(
     assert calls[0]["quant_type"] == "fp8_w8a8"
     assert calls[0]["M"] == 2 and calls[0]["top_k"] == 2
     assert calls[0]["use_shuffle"] == 1
+
+
+def test_moe_fp8_padded_layout_routes_with_installed_logical_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={"PADDED_K": 8, "ORIGINAL_K": 4},
+    )
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    def get_config(**kwargs):
+        calls.append(kwargs)
+        return True, config
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"],
+        ),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.zeros((3, 8, 8))
+    layer.w2_weight = torch.zeros((3, 8, 4))
+    logical_shape = (3, 8, 4, 4)
+    layout = ("fp8_w8a8", "MOE_C", True, 8)
+    for weight in (layer.w13_weight, layer.w2_weight):
+        weight._hcu_aiter_moe_solution_type = "moe_c"
+        weight._hcu_aiter_moe_logical_shape = logical_shape
+        weight._hcu_aiter_moe_weight_layout = layout
+        weight.is_shuffled = True
+
+    compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+        SimpleNamespace(moe=object()),
+        layer,
+        torch.ones((2, 4)),
+        torch.ones((2, 2)),
+        torch.zeros((2, 2), dtype=torch.int64),
+        None,
+        None,
+    )
+
+    assert calls[0]["E"] == 3
+    assert calls[0]["N1"] == 8
+    assert calls[0]["N2"] == 4
+    assert calls[0]["K"] == 4
+
+
+def test_quantized_installed_logical_contract_rejects_invalid_dimensions():
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+    w1._hcu_aiter_moe_logical_shape = (3, 8, 4, -1)
+    w2._hcu_aiter_moe_logical_shape = (3, 8, 4, -1)
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="invalid logical dimensions",
+    ):
+        compressed_tensors_moe_runtime._installed_weight_logical_shape(w1, w2)
+
+
+def test_quantized_installed_logical_contract_rejects_invalid_layout_signature():
+    w1 = torch.zeros((3, 8, 4))
+    w2 = torch.zeros((3, 4, 4))
+    for weight in (w1, w2):
+        weight._hcu_aiter_moe_logical_shape = (3, 8, 4, 4)
+        weight._hcu_aiter_moe_weight_layout = ("fp8_w8a8",)
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="invalid physical layout signature",
+    ):
+        compressed_tensors_moe_runtime._installed_weight_logical_shape(w1, w2)
+
+
+def test_moe_fp8_installed_layout_rejects_hidden_width_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", MoeQuantType=MoeQuantType),
+    )
+    layer = _fp8_moe_layer()
+    for weight in (layer.w13_weight, layer.w2_weight):
+        weight._hcu_aiter_moe_solution_type = "native"
+        weight._hcu_aiter_moe_logical_shape = (3, 8, 4, 4)
+        weight.is_shuffled = False
+
+    with pytest.raises(
+        compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
+        match="hidden states do not match logical K",
+    ):
+        compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            SimpleNamespace(moe=object()),
+            layer,
+            torch.ones((2, 5)),
+            torch.ones((2, 2)),
+            torch.zeros((2, 2), dtype=torch.int64),
+            None,
+            None,
+        )
+
+
+@pytest.mark.parametrize("entrypoint", ["generic", "explicit"])
+def test_quantized_native_layout_accepts_non_gated_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", MoeQuantType=MoeQuantType),
+    )
+    expected = torch.ones((2, 4))
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *_args, **_kwargs: expected,
+    )
+    w1 = torch.zeros((2, 6, 4))
+    w2 = torch.zeros((2, 4, 6))
+    for weight in (w1, w2):
+        weight._hcu_aiter_moe_solution_type = "native"
+        weight._hcu_aiter_moe_logical_shape = (2, 6, 4, 4)
+        weight.is_shuffled = False
+    hidden_states = torch.ones((2, 4))
+    topk_weights = torch.ones((2, 1))
+    topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+    if entrypoint == "generic":
+        quant_config = SimpleNamespace(
+            use_fp8_w8a8=True,
+            use_int8_w8a8=False,
+            block_shape=None,
+            w1_scale=torch.ones((2, 6, 1)),
+            w2_scale=torch.ones((2, 4, 1)),
+            a1_scale=None,
+            a2_scale=None,
+        )
+        actual = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            SimpleNamespace(num_experts=2),
+            SimpleNamespace(value="relu2"),
+            False,
+            None,
+            quant_config,
+        )
+    else:
+        layer = SimpleNamespace(
+            activation=SimpleNamespace(value="relu2"),
+            apply_router_weight_on_input=False,
+            w13_weight=w1,
+            w2_weight=w2,
+            w13_weight_scale=torch.ones((2, 6, 1)),
+            w2_weight_scale=torch.ones((2, 4, 1)),
+            w13_input_scale=None,
+            w2_input_scale=None,
+            global_num_experts=2,
+            expert_map=None,
+        )
+        actual = compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            SimpleNamespace(moe=object()),
+            layer,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            None,
+            None,
+        )
+    assert actual is expected
 
 
 def test_moe_fp8_uses_unified_shuffle_cache_and_invalidates_on_weight_change(

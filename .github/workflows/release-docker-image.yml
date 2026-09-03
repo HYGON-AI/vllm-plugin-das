@@ -5,6 +5,12 @@ name: docker-image
 
 on:
   workflow_dispatch:
+    inputs:
+      run_test:
+        description: 构建完成并推送后, 自动触发 test-docker-image-daily 对该镜像跑 CItest
+        required: false
+        default: true
+        type: boolean
   schedule:
     # 北京时间每天 22 点 (UTC 14:00)
     - cron: '0 14 * * *'
@@ -30,6 +36,8 @@ jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
     runs-on: bw18
+    outputs:
+      docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:
       - name: Repair self-hosted workspace before checkout
         run: |
@@ -105,11 +113,13 @@ jobs:
           echo "AICC_VERSION=${LATEST_AICC#dtk_llvm_}" >> "$GITHUB_ENV"
 
       - name: 生成镜像 tag
+        id: gen-tag
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
           echo "IMAGE_TAG=vllm:${BASE_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=vllm:${BASE_VERSION}-latest" >> "$GITHUB_ENV"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 登录 Harbor
         uses: docker/login-action@v3
@@ -142,68 +152,24 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-      - name: 解析 latest digest 并验证镜像
-        run: |
-          FULL_LATEST_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
-          docker pull "${FULL_LATEST_TAG}"
-          DIGEST_IMAGE="$(docker inspect --format='{{index .RepoDigests 0}}' "${FULL_LATEST_TAG}")"
-          if [[ ! "${DIGEST_IMAGE}" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
-            echo "无法解析镜像 digest: ${DIGEST_IMAGE}"
-            exit 1
-          fi
-          echo "HCU_CI_IMAGE=${DIGEST_IMAGE}" >> "$GITHUB_ENV"
-          docker run --rm \
-            --network=host \
-            -v "$PWD:/vllm-plugin-das:ro" \
-            -w /vllm-plugin-das \
-            "${DIGEST_IMAGE}" \
-            bash -lc "
-              set -euo pipefail
-              source /opt/dtk/env.sh
-              /usr/local/bin/python3.10 --version
-              /usr/local/bin/python3.10 .github/scripts/hcu_ci/hcu_ci_preflight.py --check-environment-only
-              /usr/local/bin/python3.10 -c 'import importlib.metadata; import torch; [print(f\"{name}={importlib.metadata.version(name)}\") for name in (\"torch\", \"vllm\", \"vllm-hcu\", \"pytest\")]; print(f\"torch_hip={torch.version.hip}\")'
-              /usr/local/bin/python3.10 tools/run_patch_tests.py --suite contract
-            "
-
-      - name: 更新 HCU_CI_IMAGE 仓库变量
-        env:
-          GITHUB_TOKEN_FOR_VARIABLES: ${{ secrets.HCU_CI_VARIABLE_TOKEN }}
-        run: |
-          if [[ -z "${GITHUB_TOKEN_FOR_VARIABLES}" ]]; then
-            echo "缺少 secrets.HCU_CI_VARIABLE_TOKEN, 无法自动更新 HCU_CI_IMAGE"
-            exit 1
-          fi
-          body="$(printf '{"name":"HCU_CI_IMAGE","value":"%s"}' "${HCU_CI_IMAGE}")"
-          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables"
-          status="$(
-            curl -sS -o /tmp/hcu_ci_variable_response.json -w '%{http_code}' \
-              -X PATCH \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GITHUB_TOKEN_FOR_VARIABLES}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "${api}/HCU_CI_IMAGE" \
-              -d "${body}"
-          )"
-          if [[ "${status}" == "404" ]]; then
-            status="$(
-              curl -sS -o /tmp/hcu_ci_variable_response.json -w '%{http_code}' \
-                -X POST \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GITHUB_TOKEN_FOR_VARIABLES}" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "${api}" \
-                -d "${body}"
-            )"
-          fi
-          if [[ "${status}" != "201" && "${status}" != "204" ]]; then
-            echo "更新 HCU_CI_IMAGE 失败, HTTP ${status}:"
-            cat /tmp/hcu_ci_variable_response.json
-            exit 1
-          fi
-          echo "HCU_CI_IMAGE=${HCU_CI_IMAGE}"
-
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
+  # 镜像推送成功后, 对本次构建的具体镜像并行跑 CItest 与冒烟校验,
+  # 两个测试 job 只依赖 build, 互不等待互不阻断
+  test-image:
+    if: github.event.inputs.run_test != 'false'
+    needs: build
+    uses: ./.github/workflows/daily-test-docker-image.yml
+    with:
+      docker_image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit
+
+  validate-image:
+    needs: build
+    uses: ./.github/workflows/validate-docker-image.yml
+    with:
+      image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit

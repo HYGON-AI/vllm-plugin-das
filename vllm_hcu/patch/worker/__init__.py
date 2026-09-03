@@ -129,6 +129,8 @@ _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             f"{_MOE_RUNNER_MODULE}._moe_forward_fake",
             f"{_MOE_RUNNER_MODULE}._moe_forward_shared",
             f"{_MOE_RUNNER_MODULE}._moe_forward_shared_fake",
+            f"{_MOE_RUNNER_MODULE}._moe_forward_shared_inplace",
+            f"{_MOE_RUNNER_MODULE}._moe_forward_shared_inplace_fake",
             f"{_MOE_RUNNER_MODULE}.MoERunner._maybe_apply_shared_experts",
             f"{_MOE_RUNNER_MODULE}.MoERunner._quant_method_supports_quanted_inputs",
             f"{_MOE_RUNNER_MODULE}.MoERunner._apply_quant_method",

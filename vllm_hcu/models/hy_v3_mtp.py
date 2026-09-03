@@ -34,7 +34,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -399,12 +401,13 @@ class HYV3MTP(nn.Module, SupportsPP):
         ]
 
         if _is_moe(self.config):
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            expert_params_mapping = fused_moe_make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.num_experts,
+                num_redundant_experts=self.num_redundant_experts,
             )
         else:
             expert_params_mapping = {}
@@ -533,24 +536,31 @@ class HYV3MTP(nn.Module, SupportsPP):
             else:
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                is_expert_weight = False
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name, self):
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name_mapped, self):
                         continue
-                    param = params_dict[name]
+                    param = params_dict[name_mapped]
                     weight_loader = param.weight_loader
-                    weight_loader(
+                    success = weight_loader(
                         param,
                         loaded_weight,
-                        name,
+                        name_mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,
+                        return_success=True,
                     )
-                    break
+                    if success:
+                        name = name_mapped
+                        break
                 else:
+                    if is_expert_weight:
+                        continue
                     if is_pp_missing_parameter(name, self):
                         continue
 
