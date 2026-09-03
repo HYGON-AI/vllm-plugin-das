@@ -2993,12 +2993,18 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     logits = torch.ones((1, 4))
     assert router._compute_routing(None, logits, torch.int32) == "official"
 
-    lightop_package = ModuleType("lightop")
-    lightop_package.op = SimpleNamespace(
-        moe_fused_gate=lambda *args: (
+    lightop_calls: list[tuple[object, ...]] = []
+
+    def fake_moe_fused_gate(*args):
+        lightop_calls.append(args)
+        return (
             torch.ones((1, 1)),
             torch.zeros((1, 1), dtype=torch.int64),
         )
+
+    lightop_package = ModuleType("lightop")
+    lightop_package.op = SimpleNamespace(
+        moe_fused_gate=fake_moe_fused_gate,
     )
     monkeypatch.setitem(sys.modules, "lightop", lightop_package)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
@@ -3006,14 +3012,23 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     weights, ids = router._compute_routing(None, logits, torch.int32)
     assert weights.shape == (1, 1)
     assert ids.dtype == torch.int32
+    assert lightop_calls[-1][-1] is False
 
+    # FusedMoE leaves the effective factor on the router when the router owns
+    # scaling.  The LightOp flag follows that normalized value rather than a
+    # hard-coded True.
+    router.routed_scaling_factor = 2.827
+    weights, ids = router._compute_routing(None, logits, torch.int32)
+    assert weights.shape == (1, 1)
+    assert ids.dtype == torch.int32
+    assert lightop_calls[-1][-1] is True
+
+    # Capability checks belong to the selected LightOp implementation.  The
+    # framework adapter must not reject a future scoring/renormalization mode
+    # before LightOp gets a chance to handle it.
     router.scoring_func = "softmax"
-    with pytest.raises(ValueError, match="supports only sigmoid scoring"):
-        router._compute_routing(None, logits, torch.int32)
-    router.scoring_func = "sigmoid"
     router.renormalize = False
-    with pytest.raises(ValueError, match="renormalize=True"):
-        router._compute_routing(None, logits, torch.int32)
+    router._compute_routing(None, logits, torch.int32)
 
 
 def _fake_deepep_ll_module() -> ModuleType:

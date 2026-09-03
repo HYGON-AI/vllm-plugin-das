@@ -26,14 +26,6 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
         condition = self._valid_grouping(router_logits) and self.e_score_correction_bias is not None and henvs.VLLM_HCU_USE_FUSE_MOE_GATE and henvs.VLLM_HCU_USE_CUSTOM_OPS
         enable_shared_experts_fusion = False
         if condition:
-            if self.scoring_func != "sigmoid" or not self.renormalize:
-                raise ValueError(
-                    "HCU LightOp moe_fused_gate supports only sigmoid scoring "
-                    "with renormalize=True; got "
-                    f"scoring_func={self.scoring_func!r}, "
-                    f"renormalize={self.renormalize!r}. "
-                    "Set VLLM_HCU_USE_FUSE_MOE_GATE=0 to use the standard router."
-                )
             topk_weights, topk_ids = op.moe_fused_gate(
                 router_logits,
                 self.e_score_correction_bias,
@@ -42,7 +34,9 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
                 self.top_k,
                 self.num_fused_shared_experts if enable_shared_experts_fusion else 0,
                 self.routed_scaling_factor,
-                True,  # Apply the router scale for every expert count.
+                # FusedMoE gives the router 1.0 when MoERunner owns output
+                # scaling; otherwise LightOp must scale the routing weights.
+                self.routed_scaling_factor != 1.0,
             )       
             return topk_weights, topk_ids
         else:
