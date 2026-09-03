@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from .lightop_routing import lightop_moe_gate_kwargs
+
 
 def eplb_map_to_physical_and_record(
     module,
@@ -90,32 +92,52 @@ def make_hcu_grouped_topk_router(base_class):
                     indices_type,
                     input_ids=input_ids,
                 )
+            # Import the module first so a newer LightOp can advertise extra
+            # scoring/normalization modes without a vLLM condition change.
+            # If the optional backend is unavailable, retain the historical
+            # fail-fast behavior for the legacy mode but let unsupported modes
+            # use the official router.
+            scoring_func = getattr(self, "scoring_func", None)
+            renormalize = getattr(self, "renormalize", None)
             try:
-                from lightop import op as lightop
-            except (ImportError, AttributeError) as exc:
-                raise RuntimeError(
-                    "VLLM_HCU_USE_FUSE_MOE_GATE is enabled, but lightop.op is unavailable"
-                ) from exc
-            try:
-                topk_weights, topk_ids = lightop.moe_fused_gate(
+                import lightop.moe as lightop_moe
+            except ImportError:
+                if scoring_func != "sigmoid" or not bool(renormalize):
+                    return super()._compute_routing(
+                        hidden_states,
+                        router_logits,
+                        indices_type,
+                        input_ids=input_ids,
+                    )
+                raise
+            gate_kwargs = lightop_moe_gate_kwargs(
+                lightop_moe,
+                scoring_func,
+                renormalize,
+            )
+            if gate_kwargs is None:
+                return super()._compute_routing(
+                    hidden_states,
                     router_logits,
-                    self.e_score_correction_bias,
-                    self.num_expert_group,
-                    self.topk_group,
-                    self.top_k,
-                    0,
-                    self.routed_scaling_factor,
-                    # FusedMoE passes 1.0 to the router when
-                    # apply_routed_scale_to_output=True and lets MoERunner
-                    # scale the expert output.  Otherwise this is the
-                    # effective router-side scale and LightOp must apply it
-                    # to the returned routing weights.
-                    self.routed_scaling_factor != 1.0,
+                    indices_type,
+                    input_ids=input_ids,
                 )
-            except (TypeError, AttributeError) as exc:
-                raise RuntimeError(
-                    "installed LightOP lacks the required HCU fused gate API"
-                ) from exc
+            from lightop.moe import moe_fused_gate
+
+            topk_weights, topk_ids = moe_fused_gate(
+                router_logits,
+                self.e_score_correction_bias,
+                self.num_expert_group,
+                self.topk_group,
+                self.top_k,
+                0,
+                self.routed_scaling_factor,
+                # FusedMoE passes 1.0 to the router when MoERunner owns
+                # output scaling. Otherwise this is the effective router
+                # scale and LightOp must apply it to the routing weights.
+                self.routed_scaling_factor != 1.0,
+                **gate_kwargs,
+            )
             if indices_type is not None and topk_ids.dtype != indices_type:
                 topk_ids = topk_ids.to(indices_type)
             return topk_weights, topk_ids

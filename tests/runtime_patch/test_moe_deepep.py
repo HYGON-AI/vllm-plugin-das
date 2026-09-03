@@ -2994,25 +2994,30 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert router._compute_routing(None, logits, torch.int32) == "official"
 
     lightop_calls: list[tuple[object, ...]] = []
+    lightop_gate_kwargs: list[dict[str, object]] = []
 
-    def fake_moe_fused_gate(*args):
+    def fake_moe_fused_gate(*args, **kwargs):
         lightop_calls.append(args)
+        lightop_gate_kwargs.append(kwargs)
         return (
             torch.ones((1, 1)),
             torch.zeros((1, 1), dtype=torch.int64),
         )
 
     lightop_package = ModuleType("lightop")
-    lightop_package.op = SimpleNamespace(
-        moe_fused_gate=fake_moe_fused_gate,
-    )
+    lightop_package.__path__ = []
+    lightop_moe = ModuleType("lightop.moe")
+    lightop_moe.moe_fused_gate = fake_moe_fused_gate
+    lightop_package.moe = lightop_moe
     monkeypatch.setitem(sys.modules, "lightop", lightop_package)
+    monkeypatch.setitem(sys.modules, "lightop.moe", lightop_moe)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
     weights, ids = router._compute_routing(None, logits, torch.int32)
     assert weights.shape == (1, 1)
     assert ids.dtype == torch.int32
     assert lightop_calls[-1][-1] is False
+    assert lightop_gate_kwargs[-1] == {}
 
     # FusedMoE leaves the effective factor on the router when the router owns
     # scaling.  The LightOp flag follows that normalized value rather than a
@@ -3022,13 +3027,36 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert weights.shape == (1, 1)
     assert ids.dtype == torch.int32
     assert lightop_calls[-1][-1] is True
+    assert lightop_gate_kwargs[-1] == {}
 
-    # Capability checks belong to the selected LightOp implementation.  The
-    # framework adapter must not reject a future scoring/renormalization mode
-    # before LightOp gets a chance to handle it.
+    # The current LightOp has no capability hook. Unsupported routing modes
+    # must therefore use the official router and must not invoke the fixed
+    # sigmoid+renormalize kernel.
+    calls_before_fallback = len(lightop_calls)
+    for unsupported_scoring_func, unsupported_renormalize in (
+        ("softmax", False),
+        ("sigmoid", False),
+        ("softmax", True),
+    ):
+        router.scoring_func = unsupported_scoring_func
+        router.renormalize = unsupported_renormalize
+        assert router._compute_routing(None, logits, torch.int32) == "official"
+        assert len(lightop_calls) == calls_before_fallback
+
+    # A future LightOp can opt into a new mode through the capability hook.
     router.scoring_func = "softmax"
     router.renormalize = False
+    lightop_moe.supports_moe_fused_gate_routing = (
+        lambda *, scoring_func, renormalize: (
+            scoring_func == "softmax" and not renormalize
+        )
+    )
     router._compute_routing(None, logits, torch.int32)
+    assert len(lightop_calls) == calls_before_fallback + 1
+    assert lightop_gate_kwargs[-1] == {
+        "scoring_func": "softmax",
+        "renormalize": False,
+    }
 
 
 def _fake_deepep_ll_module() -> ModuleType:
