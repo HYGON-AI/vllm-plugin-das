@@ -50,13 +50,27 @@ _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 def _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype: str) -> None:
     """Reject HY V4 KV-cache formats without verified output parity."""
-    if kv_cache_dtype not in ("auto", "bfloat16"):
+    if kv_cache_dtype not in (
+        "auto",
+        "bfloat16",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+    ):
         raise RuntimeError(
-            "HY V4 accuracy-first inference currently supports only auto or "
-            f"bfloat16 KV cache; got {kv_cache_dtype!r}. "
-            "use --kv-cache-dtype auto until quantized KV-cache parity is "
-            "restored."
+            "HY V4 accuracy-first inference supports auto, bfloat16, "
+            "fp8_e4m3, or fp8_ds_mla KV cache; "
+            f"got {kv_cache_dtype!r}. "
+            "use --kv-cache-dtype fp8_e4m3 or fp8_ds_mla for quantized "
+            "KV cache."
         )
+
+
+def _normalize_hy_v4_kv_cache_dtype(kv_cache_dtype: str) -> str:
+    """Normalize HY V4's E4M3 alias to the sparse FlashMLA cache layout."""
+    _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype)
+    if kv_cache_dtype == "fp8_e4m3":
+        return "fp8_ds_mla"
+    return kv_cache_dtype
 
 
 def require_hyv4_sink_backend(
@@ -397,7 +411,9 @@ class HYV4MLAAttention(nn.Module):
         # Do not silently degrade sparse layers into dense attention. Probe the
         # sparse MLA backend directly and fail fast with the real error.
         kv_cache_dtype = cache_config.cache_dtype if cache_config else "auto"
-        _require_accuracy_safe_kv_cache_dtype(kv_cache_dtype)
+        kv_cache_dtype = _normalize_hy_v4_kv_cache_dtype(kv_cache_dtype)
+        if cache_config is not None:
+            cache_config.cache_dtype = cast(CacheDType, kv_cache_dtype)
         if self.is_sparse:
             try:
                 get_attn_backend(
