@@ -188,6 +188,83 @@ def test_hy_v3_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None:
     ]
 
 
+def test_hy_v3_mtp_loads_local_redundant_expert_weights() -> None:
+    loaded_shards: dict[tuple[int, str], float] = {}
+
+    class ExpertParam:
+        def weight_loader(
+            self,
+            _param: object,
+            loaded_weight: torch.Tensor,
+            _weight_name: str,
+            *,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            if expert_id not in (2, 3):
+                return False if return_success else None
+            loaded_shards[expert_id, shard_id] = loaded_weight.item()
+            return True if return_success else None
+
+    load_weights = _load_method(
+        "vllm_hcu/models/hy_v3_mtp.py",
+        "HYV3MTP",
+        "load_weights",
+        {
+            "fused_moe_make_expert_params_mapping": (
+                fused_moe.fused_moe_make_expert_params_mapping
+            ),
+            "_get_cla_factor": lambda _config: 1,
+            "_is_moe": lambda _config: True,
+            "get_spec_layer_idx_from_weight_name": lambda _config, _name: 1,
+            "is_pp_missing_parameter": lambda _name, _model: False,
+            "torch": torch,
+        },
+    )
+    expert_param = ExpertParam()
+    params = {
+        "model.layers.1.mlp.experts.routed_experts.w13_weight": expert_param,
+        "model.layers.1.mlp.experts.routed_experts.w2_weight": expert_param,
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=8,
+            num_experts=2,
+            num_hidden_layers=1,
+            tie_word_embeddings=False,
+        ),
+        quant_config=None,
+        use_pp=False,
+        num_redundant_experts=2,
+        named_parameters=lambda: params.items(),
+        _split_qkv_weight=lambda value: value,
+        _rewrite_spec_layer_name=lambda _spec_layer, name: name,
+    )
+    weights = [
+        (
+            f"model.layers.1.mlp.experts.{logical_id}.{projection}.weight",
+            torch.tensor(value),
+        )
+        for logical_id, values in enumerate(((10.0, 11.0, 12.0), (20.0, 21.0, 22.0)))
+        for projection, value in zip(
+            ("gate_proj", "down_proj", "up_proj"), values, strict=True
+        )
+    ]
+
+    assert load_weights(model, weights) is None
+    assert loaded_shards == {
+        (2, "w1"): 10.0,
+        (2, "w2"): 11.0,
+        (2, "w3"): 12.0,
+        (3, "w1"): 20.0,
+        (3, "w2"): 21.0,
+        (3, "w3"): 22.0,
+    }
+
+
 def test_deepseek_v4_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None:
     mapping_calls: list[dict[str, object]] = []
 
