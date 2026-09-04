@@ -66,14 +66,19 @@ static inline __device__ float fp8_to_float(uint8_t input) {
 
 // float -> fp8
 static inline __device__ uint8_t float_to_fp8_e4m3(float f) {
-  constexpr uint32_t fp8_max = UINT32_C(1087) << 20;
+  constexpr uint32_t fp8_finite_max = UINT32_C(1086) << 20;
+  constexpr uint32_t fp32_inf = UINT32_C(255) << 23;
   constexpr uint32_t denorm_mask = UINT32_C(141) << 23;
   uint32_t f_bits = c10::detail::fp32_to_bits(f);
   uint8_t result = 0u;
   const uint32_t sign = f_bits & UINT32_C(0x80000000);
   f_bits ^= sign;
-  if (f_bits >= fp8_max) {
+  if (f_bits > fp32_inf) {
     result = 0x7f;
+  } else if (f_bits > fp8_finite_max) {
+    // Match the OCP E4M3 SATFINITE conversion used by upstream vLLM:
+    // all finite overflow (and infinity) saturates, while NaNs remain NaNs.
+    result = 0x7e;
   } else {
     if (f_bits < (UINT32_C(121) << 23)) {
       f_bits =
@@ -562,6 +567,57 @@ __global__ void reshape_and_cache_kernel_hcu(
 }
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void reshape_and_cache_flash_kernel_hcu(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
+    cache_t* __restrict__ key_cache,     // logical [blocks, pages, heads, dim]
+    cache_t* __restrict__ value_cache,   // logical [blocks, pages, heads, dim]
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t block_stride, const int64_t page_stride,
+    const int64_t head_stride, const int64_t key_stride,
+    const int64_t value_stride, const int num_heads, const int head_size,
+    const int block_size, const float* k_scale, const float* v_scale,
+    const int kv_scale_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const int num_elements = num_heads * head_size;
+
+  for (int element = threadIdx.x; element < num_elements;
+       element += blockDim.x) {
+    const int head_idx = element / head_size;
+    const int head_offset = element % head_size;
+    const int64_t cache_idx = block_idx * block_stride +
+                              block_offset * page_stride +
+                              head_idx * head_stride + head_offset;
+    const scalar_t key_value = key[token_idx * key_stride + element];
+    const scalar_t value_value = value[token_idx * value_stride + element];
+
+    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      key_cache[cache_idx] = key_value;
+      value_cache[cache_idx] = value_value;
+    } else if constexpr (kv_dt == Fp8KVCacheDataType::kInt8) {
+      key_cache[cache_idx] =
+          int8::scaled_vec_conversion_int8<cache_t, scalar_t>(
+              key_value, k_scale[head_idx * kv_scale_stride]);
+      value_cache[cache_idx] =
+          int8::scaled_vec_conversion_int8<cache_t, scalar_t>(
+              value_value, v_scale[head_idx * kv_scale_stride]);
+    } else {
+      key_cache[cache_idx] = fp8::scaled_convert<cache_t, scalar_t, kv_dt>(
+          key_value, k_scale[head_idx * kv_scale_stride]);
+      value_cache[cache_idx] = fp8::scaled_convert<cache_t, scalar_t, kv_dt>(
+          value_value, v_scale[head_idx * kv_scale_stride]);
+    }
+  }
+}
+
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
     const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
@@ -722,6 +778,19 @@ __global__ void concat_and_cache_ds_mla_kernel(
           reinterpret_cast<const float*>(k_scale.data_ptr()),              \
           reinterpret_cast<const float*>(v_scale.data_ptr()));
 
+#define CALL_RESHAPE_AND_CACHE_FLASH_HCU(KV_T, CACHE_T, KV_DTYPE)          \
+  reshape_and_cache_flash_kernel_hcu<KV_T, CACHE_T, KV_DTYPE>              \
+      <<<grid, block, 0, stream>>>(                                         \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                          \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                        \
+          reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                 \
+          reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),               \
+          slot_mapping.data_ptr<int64_t>(), block_stride, page_stride,      \
+          head_stride, key_stride, value_stride, num_heads, head_size,      \
+          block_size, reinterpret_cast<const float*>(k_scale.data_ptr()),   \
+          reinterpret_cast<const float*>(v_scale.data_ptr()),               \
+          kv_scale_stride);
+
 #define CALL_CONCAT_AND_CACHE_MLA_HCU(KV_T, CACHE_T, KV_DTYPE)          \
   concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE>                  \
       <<<grid, block, 0, stream>>>(                                     \
@@ -820,6 +889,57 @@ void reshape_and_cache_hcu(
   // 使用 scalar_type() 替代 dtype()
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
       CALL_RESHAPE_AND_CACHE_HCU);
+}
+
+void reshape_and_cache_flash_hcu(
+    torch::Tensor& key,        // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,  // logical [blocks, pages, heads, dim]
+    torch::Tensor& value_cache,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale) {
+  TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+              "key/value must be [num_tokens, num_heads, head_size]");
+  TORCH_CHECK(key.sizes() == value.sizes(),
+              "key and value must have the same shape");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+              "cache must be a logical [blocks, pages, heads, dim] view");
+  TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
+              "key and value cache must have the same shape");
+  TORCH_CHECK(slot_mapping.dim() == 1 &&
+                  slot_mapping.scalar_type() == at::ScalarType::Long,
+              "slot_mapping must be a one-dimensional int64 tensor");
+
+  const int num_tokens = slot_mapping.size(0);
+  const int num_heads = key.size(1);
+  const int head_size = key.size(2);
+  const int block_size = key_cache.size(1);
+  TORCH_CHECK(key_cache.size(2) == num_heads &&
+                  key_cache.size(3) == head_size,
+              "cache head dimensions must match key/value");
+  TORCH_CHECK(key_cache.strides() == value_cache.strides(),
+              "key and value cache must have the same strides");
+  TORCH_CHECK(k_scale.sizes() == v_scale.sizes(),
+              "k_scale and v_scale must have the same shape");
+  TORCH_CHECK(k_scale.numel() == 1 || k_scale.numel() == num_heads,
+              "k_scale and v_scale must contain one or num_heads values");
+
+  const int64_t key_stride = key.stride(0);
+  const int64_t value_stride = value.stride(0);
+  const int64_t block_stride = key_cache.stride(0);
+  const int64_t page_stride = key_cache.stride(1);
+  const int64_t head_stride = key_cache.stride(2);
+  const int kv_scale_stride = k_scale.numel() > 1 ? 1 : 0;
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 256));
+  const at::OptionalDeviceGuard device_guard(device_of(key));
+  hipStream_t stream = at::hip::getCurrentHIPStream();
+
+  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
+      CALL_RESHAPE_AND_CACHE_FLASH_HCU);
 }
 
 void concat_and_cache_mla_hcu(
