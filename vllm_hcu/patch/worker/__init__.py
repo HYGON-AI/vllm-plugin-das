@@ -108,6 +108,8 @@ _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._run_layer",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._disable_shared_experts_overlap",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._determine_shared_experts_order",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.requires_input_preservation",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.allows_inplace_routed_output",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._should_run_shared_in_aux_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts.maybe_sync_shared_experts_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._launch_in_aux_stream",
