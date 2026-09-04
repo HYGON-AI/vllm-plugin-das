@@ -43,7 +43,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "apply_router_weight_on_input", "activation", "enable_eplb",
             "num_redundant_experts", "has_bias", "is_sequence_parallel",
             "reduce_results", "ckpt_names", "is_fused_checkpoint_transposed",
-            "n_shared_experts", "router_logits_dtype",
+            "n_shared_experts", "fuse_shared_experts", "router_logits_dtype",
             "gate", "shared_experts", "shared_expert_gate", "routed_input_transform",
             "routed_output_transform", "apply_routed_scale_to_output",
             "zero_expert_type", "hash_indices_table", "runner_cls", "runner_args",

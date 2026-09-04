@@ -31,7 +31,12 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
 
     original = require_callable(layer_utils, "dispatch_unquantized_gemm", TARGETS[0])
-    require_exact_signature(original, TARGETS[0])
+    require_exact_signature(
+        original,
+        TARGETS[0],
+        positional=("linear_backend",),
+        defaults={"linear_backend": "auto"},
+    )
     default_gemm = require_callable(
         layer_utils,
         "default_unquantized_gemm",
@@ -39,10 +44,10 @@ def apply_to_module(module: ModuleType) -> bool:
     )
 
     @functools.wraps(original)
-    def hcu_dispatch_unquantized_gemm():
+    def hcu_dispatch_unquantized_gemm(*args, **kwargs):
         if layer_utils.current_platform.is_rocm():
             return default_gemm
-        return original()
+        return original(*args, **kwargs)
 
     setattr(hcu_dispatch_unquantized_gemm, _WRAPPER_MARKER, True)
     setattr(layer_utils, "_vllm_hcu_original_dispatch_unquantized_gemm", original)
