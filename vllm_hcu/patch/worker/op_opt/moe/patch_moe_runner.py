@@ -8,6 +8,7 @@ import importlib
 import inspect
 from types import ModuleType
 
+from .._common import require_exact_signature
 from ._common import (
     PatchCompatibilityError,
     require_callable,
@@ -26,6 +27,7 @@ TARGETS = (
     f"{TARGET_MODULE}._moe_forward_shared_fake",
     f"{TARGET_MODULE}._moe_forward_shared_inplace",
     f"{TARGET_MODULE}._moe_forward_shared_inplace_fake",
+    f"{TARGET_MODULE}.MoERunner.apply_routed_input_transform",
     f"{TARGET_MODULE}.MoERunner._maybe_apply_shared_experts",
     f"{TARGET_MODULE}.MoERunner._quant_method_supports_quanted_inputs",
     f"{TARGET_MODULE}.MoERunner._apply_quant_method",
@@ -84,6 +86,16 @@ def apply_to_module(module: ModuleType) -> bool:
                 f"HCU replacement {REPLACEMENT_MODULE}.{name} has incompatible "
                 f"signature {inspect.signature(function)}"
             )
+    input_transform = require_callable(
+        runner,
+        "apply_routed_input_transform",
+        TARGETS[7],
+    )
+    require_exact_signature(
+        input_transform,
+        TARGETS[7],
+        positional=("self", "hidden_states"),
+    )
     if _names(runner.forward) != (
         "self", "hidden_states", "router_logits", "input_ids",
         "quanted_hidden_states", "scale", "topk_weights", "topk_ids",

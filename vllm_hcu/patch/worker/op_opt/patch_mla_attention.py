@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+from dataclasses import replace
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -22,6 +23,7 @@ TARGETS = (
     f"{TARGET_MODULE}.MLACommonMetadata.__init__",
     f"{TARGET_MODULE}.MLACommonMetadataBuilder.build",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
+    f"{TARGET_MODULE}.MLAAttention.get_kv_cache_spec",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -40,6 +42,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (metadata_cls, "__init__", TARGETS[4], _WRAPPER),
         (builder_cls, "build", TARGETS[5], _WRAPPER),
         (mla, "split_decodes_and_prefills", TARGETS[6], _WRAPPER),
+        (cls, "get_kv_cache_spec", TARGETS[7], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -74,6 +77,12 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     process = require_callable(cls, "process_weights_after_loading", TARGETS[3])
     require_exact_signature(process, TARGETS[3], positional=("self", "act_dtype"))
+    get_kv_cache_spec = require_callable(cls, "get_kv_cache_spec", TARGETS[7])
+    require_exact_signature(
+        get_kv_cache_spec,
+        TARGETS[7],
+        positional=("self", "vllm_config"),
+    )
     metadata_init = require_callable(metadata_cls, "__init__", TARGETS[4])
     if "num_actual_tokens" not in inspect.signature(metadata_init).parameters:
         raise PatchCompatibilityError(
@@ -282,6 +291,16 @@ def apply_to_module(module: ModuleType) -> bool:
 
         return mla_process_weights_nn(mla, self, act_dtype)
 
+    @functools.wraps(get_kv_cache_spec)
+    def hcu_get_kv_cache_spec(self, vllm_config):
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+        spec = get_kv_cache_spec(self, vllm_config)
+        return replace(
+            spec,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+        )
+
     @functools.wraps(metadata_init)
     def hcu_metadata_init(self, *args, **kwargs):
         num_kv = kwargs.pop("num_kv_actual_tokens", None)
@@ -329,6 +348,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_full_forward,
         hcu_forward,
         hcu_process,
+        hcu_get_kv_cache_spec,
         hcu_metadata_init,
         hcu_build,
         hcu_split_batch,
@@ -338,6 +358,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "_vllm_hcu_original_forward", original_full_forward)
     setattr(cls, "_vllm_hcu_original_forward_impl", original_forward)
     setattr(cls, "_vllm_hcu_original_process_weights", process)
+    setattr(cls, "_vllm_hcu_original_get_kv_cache_spec", get_kv_cache_spec)
     setattr(metadata_cls, "_vllm_hcu_original_init", metadata_init)
     setattr(builder_cls, "_vllm_hcu_original_build", builder)
     setattr(mla, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
@@ -345,6 +366,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "forward", hcu_full_forward)
     setattr(cls, "forward_impl", hcu_forward)
     setattr(cls, "process_weights_after_loading", hcu_process)
+    setattr(cls, "get_kv_cache_spec", hcu_get_kv_cache_spec)
     setattr(metadata_cls, "__init__", hcu_metadata_init)
     setattr(builder_cls, "build", hcu_build)
     setattr(mla, "split_decodes_and_prefills", hcu_split_batch)
