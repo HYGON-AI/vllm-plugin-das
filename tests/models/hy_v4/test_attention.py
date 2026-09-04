@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 
 from vllm_hcu.models.hy_v4 import hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
+    HYV4MLAAttentionLayer,
     _normalize_hy_v4_kv_cache_dtype,
     _require_accuracy_safe_kv_cache_dtype,
     _require_sparse_mqa_backend,
@@ -59,6 +61,27 @@ def test_hy_v4_preserves_native_kv_cache_dtype(cache_dtype: str) -> None:
         _normalize_hy_v4_kv_cache_dtype(cache_dtype, use_sparse=True)
         == cache_dtype
     )
+
+
+def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.MLAAttention.get_kv_cache_spec",
+        lambda self, vllm_config: spec,
+    )
+    attention = object.__new__(HYV4MLAAttentionLayer)
+    attention.kv_cache_dtype = "fp8_ds_mla"
+
+    resolved = attention.get_kv_cache_spec(SimpleNamespace())
+
+    assert resolved.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert resolved.page_size_bytes == 64 * 656
 
 
 def test_full_and_shared_indexer_pattern() -> None:

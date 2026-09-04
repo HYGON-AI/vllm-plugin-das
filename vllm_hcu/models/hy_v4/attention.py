@@ -7,6 +7,7 @@ sparse backend forwards the per-head learnable sink through both prefill and
 decode without changing backend behavior for other models.
 """
 
+from dataclasses import replace
 from typing import cast
 
 import regex as re
@@ -41,6 +42,7 @@ from vllm.v1.attention.backend import (
     SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
 logger = init_logger(__name__)
 
@@ -344,6 +346,17 @@ class Indexer(nn.Module):
         return hidden_states, q_fp8, k, weights
 
 
+class HYV4MLAAttentionLayer(MLAAttention):
+    """Attach the quantization mode omitted by vLLM 0.25.1 MLA specs."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        return replace(
+            spec,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+        )
+
+
 class HYV4MLAAttention(nn.Module):
     """Multi-head latent attention with optional sparse lightning indexer.
 
@@ -590,7 +603,7 @@ class HYV4MLAAttention(nn.Module):
                 _require_sparse_mqa_backend(sink_backend)
 
         extra_impl_args = {} if sinks is None else {"sinks": sinks}
-        self.mla_attn = MLAAttention(
+        self.mla_attn = HYV4MLAAttentionLayer(
             num_heads=self.num_local_heads,
             scale=self.scaling,
             qk_nope_head_dim=self.qk_nope_head_dim,
