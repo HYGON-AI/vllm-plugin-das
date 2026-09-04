@@ -37,6 +37,16 @@ void reshape_and_cache_hcu(
     torch::Tensor& k_scale,
     torch::Tensor& v_scale);
 
+void reshape_and_cache_flash_hcu(
+    torch::Tensor& key,        // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,  // logical [blocks, pages, heads, dim]
+    torch::Tensor& value_cache,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale);
+
 // mla kvcacheconvert
 void concat_and_cache_mla_hcu(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,

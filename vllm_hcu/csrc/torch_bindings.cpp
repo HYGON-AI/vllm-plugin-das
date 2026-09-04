@@ -43,7 +43,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("open_mem_handle(Tensor mem_handle) -> int", &open_mem_handle);
   ops.def("free_shared_buffer", &free_shared_buffer);
 
-  ops.def("reshape_and_cache", &reshape_and_cache_hcu);
+  ops.def(
+      "reshape_and_cache(Tensor key, Tensor value, Tensor! key_cache, "
+      "Tensor! value_cache, Tensor slot_mapping, str kv_cache_dtype, "
+      "Tensor k_scale, Tensor v_scale) -> ()");
+  ops.impl("reshape_and_cache", torch::kCUDA, &reshape_and_cache_hcu);
+  ops.def(
+      "reshape_and_cache_flash(Tensor key, Tensor value, Tensor! key_cache, "
+      "Tensor! value_cache, Tensor slot_mapping, str kv_cache_dtype, "
+      "Tensor k_scale, Tensor v_scale) -> ()");
+  ops.impl("reshape_and_cache_flash", torch::kCUDA,
+           &reshape_and_cache_flash_hcu);
   ops.def("concat_and_cache_mla", &concat_and_cache_mla_hcu);
   ops.def(
       "deepseek_v4_inv_rope(Tensor! rope, Tensor position_ids, "

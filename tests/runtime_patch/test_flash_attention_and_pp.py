@@ -285,12 +285,18 @@ def test_cutlass_block_first_hnd_stride_contract(
 
 
 @pytest.mark.parametrize(
-    ("layout", "expected_writer"),
-    [("NHD", "aiter"), ("HND", "triton")],
+    ("layout", "kv_cache_dtype", "expected_writer"),
+    [
+        ("NHD", "auto", "aiter"),
+        ("HND", "auto", "triton"),
+        ("NHD", "fp8_e4m3", "hcu"),
+        ("HND", "fp8_e4m3", "hcu"),
+    ],
 )
 def test_flash_cache_writer_dispatches_by_physical_layout(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
+    kv_cache_dtype: str,
     expected_writer: str,
 ) -> None:
     fa_utils = importlib.import_module(
@@ -311,6 +317,12 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
         lambda *args: calls.append(("triton", args))
     )
     monkeypatch.setitem(sys.modules, triton_module_name, triton_module)
+    monkeypatch.setattr(
+        torch.ops.hcu_ops,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(("hcu", args)),
+        raising=False,
+    )
 
     key = torch.zeros(2, 1, 8)
     value = torch.ones_like(key)
@@ -328,7 +340,7 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
         key_cache,
         value_cache,
         slots,
-        "auto",
+        kv_cache_dtype,
         scale,
         scale,
     )
