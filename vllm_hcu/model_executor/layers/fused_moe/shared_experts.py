@@ -173,6 +173,13 @@ class SharedExperts(torch.nn.Module):
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         return SharedExpertsOrder.NO_OVERLAP
 
+    def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:
+        """Return whether routed experts can mutate this input concurrently."""
+        return self._determine_shared_experts_order(hidden_states) in (
+            SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        )
+
     def _should_run_shared_in_aux_stream(
         self,
         hidden_states: torch.Tensor,

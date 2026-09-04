@@ -277,13 +277,19 @@ def test_slimquant_marlin_only_advertises_local_inplace_output(
     assert method.supports_inplace_output is expected
 
 
-def test_inplace_routed_kernel_isolates_shared_expert_input(
+@pytest.mark.parametrize("shared_experts_overlap", [False, True])
+def test_inplace_routed_kernel_clones_only_for_overlapped_shared_experts(
     moe_runner_module: ModuleType,
+    shared_experts_overlap: bool,
 ) -> None:
-    """Shared experts must not race an in-place routed kernel on one tensor."""
+    """Only concurrent shared experts need protection from in-place routing."""
+
+    class SharedExperts:
+        def requires_input_preservation(self, _hidden_states) -> bool:
+            return shared_experts_overlap
 
     runner = object.__new__(moe_runner_module.MoERunner)
-    runner._shared_experts = object()
+    runner._shared_experts = SharedExperts()
     runner.routed_input_transform = None
     runner.routed_experts = SimpleNamespace(
         quant_method=SimpleNamespace(
@@ -302,8 +308,40 @@ def test_inplace_routed_kernel_isolates_shared_expert_input(
 
     assert routed_input is hidden_states
     assert shared_input is not None
-    assert not torch._C._is_alias_of(shared_input, hidden_states)
+    assert torch._C._is_alias_of(shared_input, hidden_states) is (
+        not shared_experts_overlap
+    )
     torch.testing.assert_close(shared_input, hidden_states)
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        ("NO_OVERLAP", False),
+        ("MK_INTERNAL_OVERLAPPED", True),
+        ("MULTI_STREAM_OVERLAPPED", True),
+    ],
+)
+def test_shared_experts_preserve_input_only_while_routed_work_can_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+    expected: bool,
+) -> None:
+    """Every overlapping execution order must retain the pristine input."""
+
+    shared_experts_module = importlib.import_module(
+        "vllm_hcu.model_executor.layers.fused_moe.shared_experts"
+    )
+    shared_experts = object.__new__(shared_experts_module.SharedExperts)
+    monkeypatch.setattr(
+        shared_experts,
+        "_determine_shared_experts_order",
+        lambda _hidden_states: getattr(
+            shared_experts_module.SharedExpertsOrder, order
+        ),
+    )
+
+    assert shared_experts.requires_input_preservation(make_hidden()) is expected
 
 
 def test_forward_entry_refreshes_after_runtime_reconfiguration(
