@@ -4593,6 +4593,93 @@ def test_moe_runner_adapter_rejects_incompatible_input_transform_signature():
         patch_moe_runner.apply_to_module(module)
 
 
+def test_shared_experts_adapter_rejects_incompatible_preservation_signature():
+    module = ModuleType(patch_shared_experts.REPLACEMENT_MODULE)
+
+    class SharedExperts:
+        def requires_input_preservation(self, *, hidden_states):
+            return False
+
+        def maybe_sync_shared_experts_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def _run_in_aux_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def forward(
+            self,
+            shared_experts_input,
+            order,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        @property
+        def output(self):
+            return None
+
+    module.SharedExperts = SharedExperts
+
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="requires_input_preservation",
+    ):
+        patch_shared_experts.apply_to_module(module)
+
+
+def test_shared_experts_adapter_rejects_incompatible_inplace_output_signature():
+    module = ModuleType(patch_shared_experts.REPLACEMENT_MODULE)
+
+    class SharedExperts:
+        def requires_input_preservation(self, hidden_states):
+            return False
+
+        def allows_inplace_routed_output(self, routed_input):
+            return False
+
+        def maybe_sync_shared_experts_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def _run_in_aux_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def forward(
+            self,
+            shared_experts_input,
+            order,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        @property
+        def output(self):
+            return None
+
+    module.SharedExperts = SharedExperts
+
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="allows_inplace_routed_output",
+    ):
+        patch_shared_experts.apply_to_module(module)
+
+
 def test_moe_runner_and_shared_experts_cold_replacement_contract():
     repository = Path(__file__).resolve().parents[2]
     target_vllm = Path(
@@ -4667,6 +4754,11 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             "self", "hidden_states", "router_logits", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
         )
+        assert tuple(
+            inspect.signature(
+                shared_module.SharedExperts.allows_inplace_routed_output
+            ).parameters
+        ) == ("self", "routed_input", "shared_input")
 
         class QuantMethod:
             is_monolithic = False

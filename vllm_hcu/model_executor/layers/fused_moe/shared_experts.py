@@ -173,6 +173,23 @@ class SharedExperts(torch.nn.Module):
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         return SharedExpertsOrder.NO_OVERLAP
 
+    def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:
+        """Return whether routed experts can mutate this input concurrently."""
+        return self._determine_shared_experts_order(hidden_states) in (
+            SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        )
+
+    def allows_inplace_routed_output(
+        self,
+        routed_input: torch.Tensor,
+        shared_input: torch.Tensor,
+    ) -> bool:
+        """Return whether routing may overwrite its input without a data race."""
+        return not torch._C._is_alias_of(
+            routed_input, shared_input
+        ) or not self.requires_input_preservation(shared_input)
+
     def _should_run_shared_in_aux_stream(
         self,
         hidden_states: torch.Tensor,
@@ -194,8 +211,8 @@ class SharedExperts(torch.nn.Module):
         if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             assert self._stream is not None
 
-            # Record that the clone will be used by shared_experts_stream
-            # to avoid gc issue from deallocation of hidden_states_clone
+            # Keep the auxiliary stream's shared input storage alive until it
+            # has finished consuming it.
             # For more details: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501
             # NOTE: We don't need shared_output.record_stream(current_stream())
             # because we synch the streams before using shared_output.
