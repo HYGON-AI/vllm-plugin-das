@@ -231,6 +231,7 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
     }
+    assert result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer is True
     int8_result = module.maybe_make_prepare_finalize(
         moe,
         SimpleNamespace(quant_dtype=torch.int8),
@@ -245,6 +246,7 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
     }
+    assert int8_result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer is True
     assert module.maybe_roundup_layer_hidden_size(
         10, torch.float16, moe.moe_parallel_config
     ) == 13
@@ -3141,8 +3143,17 @@ def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
     )
 
 
-def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
+@pytest.mark.parametrize(
+    ("shared_with_high_throughput", "expected_clean_calls"),
+    [
+        (False, []),
+        (True, [(8, 2048, 1, 128), (8, 2048, 1, 128)]),
+    ],
+)
+def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     monkeypatch: pytest.MonkeyPatch,
+    shared_with_high_throughput: bool,
+    expected_clean_calls: list[tuple[int, int, int, int]],
 ):
     module = _fake_deepep_ll_module()
     module.torch = torch
@@ -3212,6 +3223,10 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
             return expert_x, torch.ones(1, dtype=torch.int32), "handle", None, lambda: None
 
     instance = cls(Buffer(), 8, 1, use_fp8_dispatch=True)
+    if shared_with_high_throughput:
+        instance._vllm_hcu_clean_low_latency_buffer = True
+    else:
+        del instance._vllm_hcu_clean_low_latency_buffer
     instance.handles = [None]
     instance.use_int8_dispatch = False
     instance.use_ue8m0_dispatch = False
@@ -3256,14 +3271,13 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
     assert calls["quant_group_size"] == 128
-    assert calls["clean"] == [
-        (8, 2048, 1, 128),
-        (8, 2048, 1, 128),
-    ]
+    assert calls.get("clean", []) == expected_clean_calls
 
 
+@pytest.mark.parametrize("shared_with_high_throughput", [False, True])
 def test_deepep_ll_hcu_int8_dispatch_contract(
     monkeypatch: pytest.MonkeyPatch,
+    shared_with_high_throughput: bool,
 ):
     module = _fake_deepep_ll_module()
 
@@ -3307,6 +3321,7 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
             return expert_x, expert_counts, "handle", None, lambda: None
 
     instance = cls(Buffer(), 8, 1, use_int8_dispatch=True)
+    instance._vllm_hcu_clean_low_latency_buffer = shared_with_high_throughput
     instance.handles = [None, None]
     instance.use_ue8m0_dispatch = False
     quant_config = SimpleNamespace(
@@ -3355,12 +3370,16 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
         False,
         quant_config,
     )
-    assert calls["order"] == [
-        ("clean", (8, 2048, 1, 0)),
-        ("dispatch", 1),
-        ("clean", (8, 2048, 1, 0)),
-        ("dispatch", 1),
-    ]
+    expected_dispatches = [("dispatch", 1), ("dispatch", 1)]
+    if shared_with_high_throughput:
+        assert calls["order"] == [
+            ("clean", (8, 2048, 1, 0)),
+            expected_dispatches[0],
+            ("clean", (8, 2048, 1, 0)),
+            expected_dispatches[1],
+        ]
+    else:
+        assert calls["order"] == expected_dispatches
 
     fp8_instance = cls(None, 8, 1, use_fp8_dispatch=True)
     fp8_instance.use_int8_dispatch = False
