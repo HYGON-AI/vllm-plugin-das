@@ -838,6 +838,49 @@ def _case_mtp_parity(
     }
 
 
+def _case_hy_v4_kv_cache_parity(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float | None,
+    moe_backend: str,
+    enable_expert_parallel: bool,
+    kv_cache_dtype: str,
+    num_speculative_tokens: int,
+) -> dict[str, Any]:
+    common_kwargs = {
+        "tensor_parallel_size": tensor_parallel_size,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "moe_backend": moe_backend,
+        "enable_expert_parallel": enable_expert_parallel,
+    }
+    baseline = _generate(
+        model_path,
+        enforce_eager=True,
+        **common_kwargs,
+    )
+    quantized = _generate(
+        model_path,
+        enforce_eager=True,
+        **common_kwargs,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    quantized_mtp = _generate(
+        model_path,
+        enforce_eager=True,
+        **common_kwargs,
+        kv_cache_dtype=kv_cache_dtype,
+        spec_method="mtp",
+        spec_tokens=num_speculative_tokens,
+    )
+    return {
+        "baseline": baseline,
+        "quantized": quantized,
+        "quantized_mtp": quantized_mtp,
+        "kv_cache_dtype": kv_cache_dtype,
+    }
+
+
 def _case_kv_transfer_smoke(model_path: Path) -> dict[str, Any]:
     from vllm import LLM
     from vllm.config.kv_transfer import KVTransferConfig
@@ -1622,6 +1665,7 @@ def _main(argv: list[str] | None = None) -> int:
             "reranker-smoke",
             "vl-image-smoke",
             "tp-ep-smoke",
+            "hy-v4-kv-cache-parity",
             "deepseek-v4-dspark-smoke",
         ),
     )
@@ -1635,6 +1679,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all2all-backend", default=None)
     parser.add_argument("--moe-backend", default="auto")
     parser.add_argument("--num-speculative-tokens", type=int, default=1)
+    parser.add_argument("--kv-cache-dtype", default="fp8_e4m3")
     parser.add_argument(
         "--disable-expert-parallel",
         action="store_true",
@@ -1701,6 +1746,16 @@ def _main(argv: list[str] | None = None) -> int:
             all2all_backend=args.all2all_backend,
             moe_backend=args.moe_backend,
             enable_expert_parallel=not args.disable_expert_parallel,
+        )
+    elif args.case == "hy-v4-kv-cache-parity":
+        payload = _case_hy_v4_kv_cache_parity(
+            args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            moe_backend=args.moe_backend,
+            enable_expert_parallel=not args.disable_expert_parallel,
+            kv_cache_dtype=args.kv_cache_dtype,
+            num_speculative_tokens=args.num_speculative_tokens,
         )
     else:
         payload = _case_deepseek_v4_dspark(

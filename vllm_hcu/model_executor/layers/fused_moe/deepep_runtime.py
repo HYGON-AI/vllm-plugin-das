@@ -287,6 +287,7 @@ def ll_init(
         local_expert_global_ids,
     )
     self.use_int8_dispatch = bool(use_int8_dispatch)
+    self._vllm_hcu_clean_low_latency_buffer = False
     self._hcu_low_latency_dispatch_abi = _has_hcu_low_latency_dispatch_abi(buffer)
 
 
@@ -472,17 +473,18 @@ def ll_prepare_async(
             if block_k is None and quant_config.per_act_token_quant
             else module.DEEPEP_QUANT_BLOCK_SIZE
         )
-    cleanup = getattr(self.buffer, "clean_low_latency_buffer", None)
-    if not callable(cleanup):
-        raise RuntimeError(
-            "HCU DeepEP LL buffer does not expose clean_low_latency_buffer"
+    if getattr(self, "_vllm_hcu_clean_low_latency_buffer", False):
+        cleanup = getattr(self.buffer, "clean_low_latency_buffer", None)
+        if not callable(cleanup):
+            raise RuntimeError(
+                "HCU DeepEP LL buffer does not expose clean_low_latency_buffer"
+            )
+        cleanup(
+            self.max_tokens_per_rank,
+            hidden_size,
+            num_experts,
+            quant_group_size,
         )
-    cleanup(
-        self.max_tokens_per_rank,
-        hidden_size,
-        num_experts,
-        quant_group_size,
-    )
     try:
         if use_hcu_api:
             result = self.buffer.low_latency_dispatch(
