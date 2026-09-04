@@ -277,6 +277,35 @@ def test_slimquant_marlin_only_advertises_local_inplace_output(
     assert method.supports_inplace_output is expected
 
 
+def test_inplace_routed_kernel_isolates_shared_expert_input(
+    moe_runner_module: ModuleType,
+) -> None:
+    """Shared experts must not race an in-place routed kernel on one tensor."""
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner._shared_experts = object()
+    runner.routed_input_transform = None
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            supports_inplace_output=True,
+            supports_internal_mk=False,
+        )
+    )
+    runner.moe_config = SimpleNamespace(
+        dp_size=1,
+        is_sequence_parallel=False,
+        pcp_size=1,
+    )
+    hidden_states = make_hidden()
+
+    routed_input, shared_input = runner.apply_routed_input_transform(hidden_states)
+
+    assert routed_input is hidden_states
+    assert shared_input is not None
+    assert not torch._C._is_alias_of(shared_input, hidden_states)
+    torch.testing.assert_close(shared_input, hidden_states)
+
+
 def test_forward_entry_refreshes_after_runtime_reconfiguration(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
