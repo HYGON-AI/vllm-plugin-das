@@ -28,6 +28,8 @@ TARGETS = (
 )
 _CLASS_MARKER = "_vllm_hcu_w8a8_fp8_applied"
 _WRAPPER_MARKER = "_vllm_hcu_w8a8_fp8_wrapper"
+_SUPPORTED_FP8_BACKENDS = frozenset(("lightop", "target-triton"))
+
 
 def apply_to_module(module: ModuleType) -> bool:
     fp8_module = load_exact_module(TARGET_MODULE, module)
@@ -71,11 +73,11 @@ def apply_to_module(module: ModuleType) -> bool:
             if (
                 not getattr(kernel_class, "_hcu_fp8_patch_applied", False)
                 or getattr(kernel_class, "_hcu_fp8_backend", None)
-                != "target-triton"
+                not in _SUPPORTED_FP8_BACKENDS
             ):
                 raise RuntimeError(
-                    "channelwise FP8 requires the reviewed target Triton "
-                    "scaled-mm adapter before weight processing"
+                    "channelwise FP8 requires a reviewed HCU scaled-mm "
+                    "adapter before weight processing"
                 )
 
         original_process(self, layer)
@@ -107,7 +109,7 @@ def apply_to_module(module: ModuleType) -> bool:
         if not supports_quanted_inputs(self):
             raise RuntimeError(
                 "prequantized FP8 inputs are only supported by the reviewed "
-                "Channel-FP8 target Triton route"
+                "HCU Channel-FP8 route"
             )
         return self.fp8_linear.apply_weights(
             layer,
@@ -122,7 +124,7 @@ def apply_to_module(module: ModuleType) -> bool:
             self.strategy == fp8_module.QuantizationStrategy.CHANNEL
             and getattr(kernel_class, "_hcu_fp8_patch_applied", False)
             and getattr(kernel_class, "_hcu_fp8_backend", None)
-            == "target-triton"
+            in _SUPPORTED_FP8_BACKENDS
         )
 
     for function in (hcu_process_weights_after_loading, hcu_apply_weights):

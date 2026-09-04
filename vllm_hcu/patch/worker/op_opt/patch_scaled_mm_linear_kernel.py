@@ -27,6 +27,7 @@ TARGETS = (
 )
 _CLASS_MARKER = "_vllm_hcu_prequantized_input_applied"
 _WRAPPER_MARKER = "_vllm_hcu_prequantized_input_wrapper"
+_SUPPORTED_FP8_BACKENDS = frozenset(("lightop", "target-triton"))
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -67,8 +68,8 @@ def apply_to_module(module: ModuleType) -> bool:
             return original(self, layer, x, bias)
         if not supports_quanted_inputs(self):
             raise RuntimeError(
-                "prequantized FP8 inputs require the reviewed Channel-FP8 "
-                "target Triton route"
+                "prequantized FP8 inputs require a reviewed HCU Channel-FP8 "
+                "route"
             )
         if not isinstance(x_and_scale_quanted, tuple) or len(x_and_scale_quanted) != 2:
             raise ValueError("x_and_scale_quanted must be a (tensor, scale) tuple")
@@ -104,8 +105,8 @@ def apply_to_module(module: ModuleType) -> bool:
         # SymBool.  vLLM's piecewise splitter can then thread the relation into
         # a standalone subgraph as a ``sympy.Equality`` input, which this Torch
         # Inductor does not support.  Preserve the friendly eager error here;
-        # the target-Triton custom-op implementation repeats this contract with
-        # concrete runtime dimensions before launching the backend.
+        # the HCU custom-op implementation repeats this contract with concrete
+        # runtime dimensions before launching the selected backend.
         if not torch.compiler.is_compiling():
             if tuple(x_scale.shape) not in (
                 (),
@@ -144,7 +145,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return bool(
             getattr(kernel_class, "_hcu_fp8_patch_applied", False)
             and getattr(kernel_class, "_hcu_fp8_backend", None)
-            == "target-triton"
+            in _SUPPORTED_FP8_BACKENDS
         )
 
     setattr(hcu_apply_weights, _WRAPPER_MARKER, True)
