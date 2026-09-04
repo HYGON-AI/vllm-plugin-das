@@ -14,6 +14,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
+from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 from vllm_hcu.model_executor.layers import mla_runtime
 
 
@@ -300,6 +302,15 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
         def process_weights_after_loading(self, act_dtype):
             return act_dtype
 
+        def get_kv_cache_spec(self, vllm_config):
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=576,
+                dtype=torch.uint8,
+                cache_dtype_str=self.kv_cache_dtype,
+            )
+
     class MLACommonMetadata:
         def __init__(self, num_actual_tokens):
             self.num_actual_tokens = num_actual_tokens
@@ -427,6 +438,34 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     warmup = SimpleNamespace(is_prefilling=None)
     assert module.split_decodes_and_prefills(warmup, 3, True, True) is True
     assert module.split_calls[-1] == (warmup, 3, True, True)
+
+
+def test_mla_fp8_spec_selects_the_656_byte_sparse_cache_layout():
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    assert adapter.apply_to_module(module) is True
+
+    instance = object.__new__(module.MLAAttention)
+    instance.kv_cache_dtype = "fp8_ds_mla"
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
+
+    cache_spec = instance.get_kv_cache_spec(config)
+    backend_cache_dtype = (
+        "auto"
+        if cache_spec.kv_quant_mode == KVQuantMode.NONE
+        else instance.kv_cache_dtype
+    )
+    shape = FlashMLASparseBackend.get_kv_cache_shape(
+        2,
+        cache_spec.block_size,
+        cache_spec.num_kv_heads,
+        cache_spec.head_size,
+        cache_dtype_str=backend_cache_dtype,
+    )
+
+    assert cache_spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert shape == (2, 64, 656)
+    assert cache_spec.page_size_bytes * 2 == 2 * 64 * 656
 
 
 def test_mla_feature_on_uses_hcu_lightly_cp_delta(monkeypatch):

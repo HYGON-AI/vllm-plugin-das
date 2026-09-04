@@ -477,10 +477,12 @@ class MoERunner(MoERunnerInterface):
                 return result[0], hidden_states
             return result, hidden_states
 
-        return (
-            hidden_states,
-            hidden_states if self._shared_experts is not None else None,
+        shared_experts_input = (
+            hidden_states.clone()
+            if self._can_use_inplace_shared_output()
+            else hidden_states if self._shared_experts is not None else None
         )
+        return hidden_states, shared_experts_input
 
     def apply_routed_output_transform(
         self,

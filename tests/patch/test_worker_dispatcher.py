@@ -172,6 +172,18 @@ def test_cold_replacement_metadata_matches_lazy_adapter_contracts():
             assert spec.validate_with_adapter is True
 
 
+def test_moe_replacement_metadata_owns_input_transform_method():
+    specs = {
+        spec.patch_id: spec
+        for spec in worker_dispatcher._MOE_REPLACEMENTS
+    }
+    runner = specs["worker.op_opt.moe.runner"]
+    assert (
+        f"{runner.target_module}.MoERunner.apply_routed_input_transform"
+        in runner.targets
+    )
+
+
 def test_independent_worker_cold_prepare_installs_inside_atomic_batch(
     monkeypatch: pytest.MonkeyPatch,
 ):

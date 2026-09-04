@@ -4541,6 +4541,58 @@ def test_custom_op_runner_rejects_post_import_callback():
         patch_moe_runner.apply_to_module(official)
 
 
+def test_moe_runner_adapter_rejects_incompatible_input_transform_signature():
+    module = ModuleType(patch_moe_runner.REPLACEMENT_MODULE)
+
+    def moe_forward(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        quanted_hidden_states,
+        scale,
+        topk_weights,
+        topk_ids,
+        layer_name,
+        hidden_dim_unpadded,
+    ):
+        return None
+
+    for name in (
+        "_moe_forward",
+        "_moe_forward_fake",
+        "_moe_forward_shared",
+        "_moe_forward_shared_fake",
+        "_moe_forward_shared_inplace",
+        "_moe_forward_shared_inplace_fake",
+    ):
+        setattr(module, name, moe_forward)
+
+    class MoERunner:
+        def apply_routed_input_transform(self, *, hidden_states):
+            return None
+
+        def forward(
+            self,
+            hidden_states,
+            router_logits,
+            input_ids,
+            quanted_hidden_states,
+            scale,
+            topk_weights,
+            topk_ids,
+        ):
+            return None
+
+    module.MoERunner = MoERunner
+
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="apply_routed_input_transform",
+    ):
+        patch_moe_runner.apply_to_module(module)
+
+
 def test_moe_runner_and_shared_experts_cold_replacement_contract():
     repository = Path(__file__).resolve().parents[2]
     target_vllm = Path(

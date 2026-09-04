@@ -24,9 +24,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported, FusedMoEConfig, RoutedExperts,
     SharedExperts)
 from vllm.model_executor.utils import set_weight_attrs
-from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
-    weight8bit_nt_kpack2_marlin2,
-)
 from vllm.model_executor.layers.fused_moe import config as fused_moe_config
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -37,6 +34,12 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
     FusedMoeWeightScaleSupported,
+)
+from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+    weight8bit_nt_kpack2_marlin2,
+)
+from vllm_hcu.model_executor.layers.quantization.lightop_marlin_moe_compat import (
+    ensure_safe_marlin_moe_alignment,
 )
 logger = init_logger(__name__)
 
@@ -306,6 +309,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             i_s: torch.Tensor | None = None,
     ):
         from lightop.moe import fused_experts_impl_fp8_marlin
+        ensure_safe_marlin_moe_alignment(fused_experts_impl_fp8_marlin)
         return fused_experts_impl_fp8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -609,6 +613,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         # Default Marlin INT8 path
 
         from lightop.moe import fused_experts_impl_int8_marlin
+        ensure_safe_marlin_moe_alignment(fused_experts_impl_int8_marlin)
         return fused_experts_impl_int8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,
