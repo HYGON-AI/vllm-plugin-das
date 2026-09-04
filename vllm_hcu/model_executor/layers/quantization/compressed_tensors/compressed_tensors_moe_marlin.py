@@ -140,6 +140,21 @@ class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
         )
 
     @staticmethod
+    def _allows_inplace_output(
+        x: torch.Tensor,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> bool:
+        return (
+            shared_experts is None
+            or shared_experts_input is None
+            or shared_experts.allows_inplace_routed_output(
+                x,
+                shared_experts_input,
+            )
+        )
+
+    @staticmethod
     def get_moe_method(
         quant_config: "SlimQuantCompressedTensorsMarlinConfig",  # type: ignore # noqa E501
         layer: torch.nn.Module,
@@ -307,6 +322,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             shared_output: Optional[torch.Tensor] = None,
             i_q: torch.Tensor | None = None,
             i_s: torch.Tensor | None = None,
+            inplace: bool = True,
     ):
         from lightop.moe import fused_experts_impl_fp8_marlin
         ensure_safe_marlin_moe_alignment(fused_experts_impl_fp8_marlin)
@@ -316,7 +332,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=inplace,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_fp8_w8a8=True,
@@ -343,9 +359,11 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             i_q: torch.Tensor | None = None,
             i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # HCU's MoERunner executes shared experts on its managed stream and
-        # combines them after the routed kernel returns.
-        del shared_experts, shared_experts_input
+        inplace = self._allows_inplace_output(
+            x,
+            shared_experts,
+            shared_experts_input,
+        )
         return self.fused_experts(
             layer=layer,
             x=x,
@@ -358,7 +376,9 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             routed_scaling_factor=1.0,
             shared_output=None,
             i_q=i_q,
-            i_s=i_s, )
+            i_s=i_s,
+            inplace=inplace,
+        )
 
     @property
     def supports_eplb(self) -> bool:
@@ -569,9 +589,6 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         i_q: torch.Tensor | None = None,
         i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # HCU's MoERunner executes shared experts on its managed stream and
-        # combines them after the routed kernel returns.
-        del shared_experts, shared_experts_input
         # AITER W8A8 MoE fast-path
         if _is_hcu_aiter_w8a8_moe_requested(self.moe):
             if not rocm_aiter_ops.is_fused_moe_enabled():
@@ -614,13 +631,18 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
         from lightop.moe import fused_experts_impl_int8_marlin
         ensure_safe_marlin_moe_alignment(fused_experts_impl_int8_marlin)
+        inplace = self._allows_inplace_output(
+            x,
+            shared_experts,
+            shared_experts_input,
+        )
         return fused_experts_impl_int8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=inplace,
             activation=layer.activation.value,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             use_int8_w8a8=True,

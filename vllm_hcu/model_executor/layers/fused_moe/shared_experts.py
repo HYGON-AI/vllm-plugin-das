@@ -180,6 +180,16 @@ class SharedExperts(torch.nn.Module):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
+    def allows_inplace_routed_output(
+        self,
+        routed_input: torch.Tensor,
+        shared_input: torch.Tensor,
+    ) -> bool:
+        """Return whether routing may overwrite its input without a data race."""
+        return not torch._C._is_alias_of(
+            routed_input, shared_input
+        ) or not self.requires_input_preservation(shared_input)
+
     def _should_run_shared_in_aux_stream(
         self,
         hidden_states: torch.Tensor,

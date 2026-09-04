@@ -200,3 +200,92 @@ def test_int8_marlin_safely_remaps_global_expert_ids(
     )
 
     assert expert_ids.tolist() == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "kernel_name"),
+    [
+        (
+            "CompressedTensorsW8A8FP8MarlinMoEMethod",
+            "fused_experts_impl_fp8_marlin",
+        ),
+        (
+            "CompressedTensorsW8A8Int8MarlinMoEMethod",
+            "fused_experts_impl_int8_marlin",
+        ),
+    ],
+)
+@pytest.mark.parametrize("shared_experts_overlap", [False, True])
+def test_marlin_allocates_routed_output_only_during_shared_input_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    kernel_name: str,
+    shared_experts_overlap: bool,
+) -> None:
+    """Concurrent shared reads require out-of-place routed output, not a copy."""
+
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    def marlin_kernel(**kwargs):
+        hidden_states = kwargs["hidden_states"]
+        if kwargs["inplace"]:
+            hidden_states.fill_(3)
+            return hidden_states
+        return torch.full_like(hidden_states, 3)
+
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []  # type: ignore[attr-defined]
+    moe = ModuleType("lightop.moe")
+    setattr(moe, kernel_name, marlin_kernel)
+    lightop.moe = moe
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.moe", moe)
+    monkeypatch.setattr(
+        marlin,
+        "ensure_safe_marlin_moe_alignment",
+        lambda _kernel: None,
+    )
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe: False,
+    )
+
+    class SharedExperts:
+        def allows_inplace_routed_output(
+            self,
+            routed_input: torch.Tensor,
+            shared_input: torch.Tensor,
+        ) -> bool:
+            return not (
+                torch._C._is_alias_of(routed_input, shared_input)
+                and shared_experts_overlap
+            )
+
+    method = object.__new__(getattr(marlin, method_name))
+    method.moe = object()
+    method.use_deepep = False
+    method.moe_quant_config = None
+    if kernel_name == "fused_experts_impl_fp8_marlin":
+        method.fused_experts = method.fused_moe_forward
+    layer = _moe_layer(global_num_experts=2)
+    hidden_states = torch.ones((1, 4))
+    original_hidden_states = hidden_states.clone()
+
+    output = method.apply(
+        layer,
+        hidden_states,
+        torch.ones((1, 2)),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        SharedExperts(),
+        hidden_states,
+    )
+
+    assert torch._C._is_alias_of(output, hidden_states) is (
+        not shared_experts_overlap
+    )
+    if shared_experts_overlap:
+        torch.testing.assert_close(hidden_states, original_hidden_states)
+    torch.testing.assert_close(output, torch.full_like(hidden_states, 3))
