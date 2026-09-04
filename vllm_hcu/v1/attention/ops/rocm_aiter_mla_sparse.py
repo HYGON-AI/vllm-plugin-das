@@ -43,6 +43,8 @@ except (ImportError, RuntimeError, TypeError) as lightop_import_error:
     gemmopt = _UnavailableLightop(lightop_import_error)
     op = _UnavailableLightop(lightop_import_error)
 
+from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
+
 
 _GLOBAL_LOGITS_BUFFERS = {}
 
@@ -1199,6 +1201,24 @@ def rocm_aiter_sparse_attn_indexer_fake(
     fp8_dtype = current_platform.fp8_dtype()
     _k_fp8 = _flattened_kv[..., :head_dim].view(fp8_dtype).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
+    # Account for the maximum padded Top-K staging allocation during memory
+    # profiling.  The runtime scratch is allocated only for variable-length
+    # decode batches, but its peak size is bounded by max_num_batched_tokens.
+    scratch_device = (
+        topk_indices_buffer.device
+        if topk_indices_buffer is not None
+        else hidden_states.device
+    )
+    scratch_dtype = (
+        topk_indices_buffer.dtype
+        if topk_indices_buffer is not None
+        else torch.int32
+    )
+    _padded_topk = torch.empty(
+        (hidden_states.shape[0], topk_tokens),
+        dtype=scratch_dtype,
+        device=scratch_device,
+    )
     return topk_indices_buffer
 
 
@@ -1408,8 +1428,17 @@ def rocm_aiter_sparse_attn_indexer_native(
             max_model_len=max_model_len,
         )
 
+        # A padded decode batch has more kernel rows than actual decode
+        # tokens.  Do not point those extra rows at the shared output buffer:
+        # rows immediately after num_decode_tokens belong to prefill.
+        topk_indices = get_decode_topk_output_buffer(
+            topk_indices_buffer,
+            num_padded_tokens,
+            topk_tokens,
+            decode_metadata.requires_padding,
+        )
+
         if use_lightop_sparse_mla_topk:
-            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
             _lightop_topk_indices_decode(
                 logits, seq_lens, next_n, topk_indices, topk_tokens
             )
@@ -1417,7 +1446,6 @@ def rocm_aiter_sparse_attn_indexer_native(
             row_ends = _decode_row_ends_from_seq_lens(
                 seq_lens, next_n, logits.shape[0]
             )
-            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
             topk_indices.copy_(
                 _topk_indices_torch(
                     logits,
@@ -1427,8 +1455,9 @@ def rocm_aiter_sparse_attn_indexer_native(
             )
 
         if decode_metadata.requires_padding:
-            # if padded, we need to unpack
-            # the topk indices removing padded tokens
+            # ``topk_indices`` is a disjoint scratch tensor in this case.
+            # Unpack only the actual decode rows into the shared prefix so
+            # the prefill suffix remains untouched.
             topk_indices = unpack_seq_triton(
                 topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
                 decode_lens,

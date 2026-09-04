@@ -41,6 +41,7 @@ from vllm_hcu.model_executor.layers.attention.pcp import (
     effective_pcp_world_size,
     maybe_gather_indexer_k,
 )
+from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 
 logger = init_logger(__name__)
 
@@ -578,7 +579,15 @@ def sparse_attn_indexer(
                 clean_logits=False,
             )
         num_rows = logits.shape[0]
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        # Variable-length decode is computed in a rectangular padded layout.
+        # The extra rows must be staged outside the shared decode/prefill
+        # buffer; prefill starts at num_decode_tokens in that buffer.
+        topk_indices = get_decode_topk_output_buffer(
+            topk_indices_buffer,
+            num_padded_tokens,
+            topk_tokens,
+            decode_metadata.requires_padding,
+        )
 
         use_cooperative_topk = (
             current_platform.is_cuda()
@@ -642,8 +651,9 @@ def sparse_attn_indexer(
             )
 
         if decode_metadata.requires_padding:
-            # if padded, we need to unpack
-            # the topk indices removing padded tokens
+            # ``topk_indices`` is a disjoint scratch tensor in this case.
+            # Unpack only actual decode rows into the shared prefix so the
+            # prefill suffix remains untouched.
             topk_indices = unpack_seq_triton(
                 topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
                 decode_lens,

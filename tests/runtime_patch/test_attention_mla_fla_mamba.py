@@ -1765,6 +1765,247 @@ def test_sparse_indexer_torch_topk_preserves_short_row_sequence_order():
     torch.testing.assert_close(actual, expected)
 
 
+def test_sparse_indexer_torch_topk_masks_speculative_decode_row_ends():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    row_ends = sparse._decode_row_ends_from_seq_lens(
+        torch.tensor([4, 2], dtype=torch.int32), next_n=2, num_rows=4
+    )
+    torch.testing.assert_close(
+        row_ends, torch.tensor([3, 4, 1, 2], dtype=torch.int32)
+    )
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 100.0]]).expand(4, -1)
+    actual = sparse._topk_indices_torch(logits, topk_tokens=2, row_ends=row_ends)
+    expected = torch.tensor([[2, 1], [3, 2], [0, -1], [0, 1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sparse_indexer_padded_decode_scratch_preserves_prefill_row():
+    """Regression test for mixed decode/prefill buffer aliasing.
+
+    ``decode_lens=[1, 2]`` produces four rectangular kernel rows but only
+    three actual decode rows.  The fourth row must be staged separately so it
+    cannot overwrite the first prefill row at the end of the decode prefix.
+    """
+    from vllm_hcu.v1.attention.ops.decode_topk import (
+        get_decode_topk_output_buffer,
+    )
+
+    # The shared buffer contains three decode rows followed by one prefill
+    # row.  Use a distinctive value so an accidental alias is observable.
+    shared = torch.tensor([[0], [2], [3], [1]], dtype=torch.int32)
+    staged = get_decode_topk_output_buffer(
+        shared,
+        num_padded_tokens=4,
+        topk_tokens=1,
+        requires_padding=True,
+    )
+    assert staged.shape == (4, 1)
+    assert staged.data_ptr() != shared.data_ptr()
+    torch.testing.assert_close(staged, torch.full((4, 1), -1, dtype=torch.int32))
+
+    # Simulate the padded Top-K result and the subsequent unpack.  The
+    # padding row (index 1) is discarded; only actual decode rows are copied
+    # back to the shared prefix.
+    staged.copy_(torch.tensor([[0], [99], [2], [3]], dtype=torch.int32))
+    decode_lens = [1, 2]
+    compact = torch.cat(
+        [
+            staged[batch_start : batch_start + length]
+            for batch_start, length in ((0, 1), (2, 2))
+        ]
+    )
+    shared[: sum(decode_lens)] = compact
+
+    torch.testing.assert_close(
+        shared,
+        torch.tensor([[0], [2], [3], [1]], dtype=torch.int32),
+    )
+
+    # Uniform decode keeps the existing fast path and may use the shared
+    # prefix because it has no surplus padded rows.
+    uniform = get_decode_topk_output_buffer(
+        shared,
+        num_padded_tokens=3,
+        topk_tokens=1,
+        requires_padding=False,
+    )
+    assert uniform.data_ptr() == shared.data_ptr()
+
+
+@pytest.mark.parametrize("use_lightop", [False, True])
+def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
+    monkeypatch, use_lightop
+):
+    """Exercise the real native indexer around the shared output buffer.
+
+    Both the LightOp and Torch selectors receive four padded rows, while the
+    shared buffer contains only three decode rows followed by one prefill row.
+    The selector output must be staged independently in either implementation
+    path before ``unpack_seq_triton`` writes the compact decode prefix back.
+    """
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    decode_topk_targets = []
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+    original_get_decode_topk_output_buffer = sparse.get_decode_topk_output_buffer
+
+    def capture_decode_topk_output_buffer(*args, **kwargs):
+        target = original_get_decode_topk_output_buffer(*args, **kwargs)
+        decode_topk_targets.append(target)
+        return target
+
+    monkeypatch.setattr(
+        sparse,
+        "get_decode_topk_output_buffer",
+        capture_decode_topk_output_buffer,
+    )
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.arange(4, dtype=torch.int32),
+                    num_kv_actual_tokens=4,
+                    num_decodes=2,
+                    num_decode_tokens=3,
+                    num_prefills=1,
+                    num_prefill_tokens=1,
+                    prefill=SimpleNamespace(
+                        chunks=[
+                            SimpleNamespace(
+                                total_seq_lens=1,
+                                block_table=torch.zeros((1, 1), dtype=torch.int32),
+                                cu_seq_lens=torch.tensor(
+                                    [0, 1], dtype=torch.int32
+                                ),
+                                cu_seqlen_ks=torch.tensor(
+                                    [0], dtype=torch.int32
+                                ),
+                                cu_seqlen_ke=torch.tensor(
+                                    [1], dtype=torch.int32
+                                ),
+                                token_start=3,
+                                token_end=4,
+                            )
+                        ]
+                    ),
+                    decode=SimpleNamespace(
+                        decode_lens=torch.tensor([1, 2], dtype=torch.int32),
+                        requires_padding=True,
+                        seq_lens=torch.tensor([4, 2], dtype=torch.int32),
+                        block_table=torch.zeros((2, 1), dtype=torch.int32),
+                        schedule_metadata=torch.zeros(1, dtype=torch.int32),
+                    ),
+                )
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "cp_gather_indexer_k_bf16_cache_triton",
+        lambda *args, **kwargs: None,
+    )
+
+    def fake_prefill_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+        del q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+        return torch.zeros((1, 1), dtype=torch.float32)
+
+    def fake_decode_logits(*args, **kwargs):
+        del args, kwargs
+        return torch.zeros((4, 4), dtype=torch.float32)
+
+    monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", fake_prefill_logits)
+    monkeypatch.setattr(
+        sparse, "rocm_fp8_paged_mqa_logits", fake_decode_logits
+    )
+
+    def fake_pack(x, lengths):
+        del x
+        return torch.zeros((2, 2, 1), dtype=torch.float32)
+
+    def fake_unpack(packed, lengths):
+        assert tuple(packed.shape) == (2, 2, 1)
+        assert lengths.tolist() == [1, 2]
+        return torch.cat((packed[0, :1], packed[1, :2]), dim=0)
+
+    monkeypatch.setattr(sparse, "pack_seq_triton", fake_pack)
+    monkeypatch.setattr(sparse, "unpack_seq_triton", fake_unpack)
+    monkeypatch.setattr(
+        sparse, "_use_lightop_sparse_mla_topk", lambda: use_lightop
+    )
+
+    def fake_torch_topk(logits, topk_tokens, row_starts=None, row_ends=None):
+        del topk_tokens, row_starts, row_ends
+        if logits.shape[0] == 1:
+            return torch.tensor([[1]], dtype=torch.int32)
+        return torch.tensor([[0], [99], [2], [3]], dtype=torch.int32)
+
+    def fake_lightop_prefill(
+        logits, row_starts, row_ends, topk_indices, topk_tokens
+    ):
+        del logits, row_starts, row_ends, topk_tokens
+        topk_indices.fill_(1)
+
+    def fake_lightop_decode(logits, seq_lens, next_n, topk_indices, topk_tokens):
+        del logits, seq_lens, next_n, topk_tokens
+        decode_topk_targets.append(topk_indices)
+        topk_indices.copy_(torch.tensor([[0], [99], [2], [3]], dtype=torch.int32))
+
+    monkeypatch.setattr(sparse, "_topk_indices_torch", fake_torch_topk)
+    monkeypatch.setattr(
+        sparse, "_lightop_topk_indices_prefill", fake_lightop_prefill
+    )
+    monkeypatch.setattr(
+        sparse, "_lightop_topk_indices_decode", fake_lightop_decode
+    )
+
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    shared = torch.full((4, 1), -1, dtype=torch.int32)
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((4, 1), dtype=torch.float32),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 2, 1), dtype=torch.float32),
+        q_fp8=torch.zeros((4, 1, 1), dtype=torch.float32),
+        k=torch.zeros((4, 1), dtype=torch.float32),
+        weights=torch.ones((4, 1), dtype=torch.float32),
+        quant_block_size=1,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=1,
+        max_model_len=4,
+        total_seq_lens=1,
+        topk_indices_buffer=shared,
+        skip_k_cache_insert=True,
+    )
+
+    assert decode_topk_targets
+    assert all(
+        target.data_ptr() != shared.data_ptr() for target in decode_topk_targets
+    )
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0], [2], [3], [1]], dtype=torch.int32),
+    )
+
+
 def test_mla_forward_slices_kv_with_independent_token_count():
     from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
