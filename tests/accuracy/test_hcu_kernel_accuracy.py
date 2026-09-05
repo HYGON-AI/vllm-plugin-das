@@ -573,6 +573,80 @@ def test_hcu_indexer_fp8_cache_roundtrip_matches_ue8m0_reference(
     )
 
 
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_lightop_indexer_cache_roundtrip_uses_normal_layout(
+    block_size: int,
+) -> None:
+    device = _hcu_device()
+    from lightop.kvcache import fuse_qk_quant_and_store_index_k_cache
+    from vllm.platforms import current_platform
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        cp_gather_indexer_k_quant_cache_triton,
+    )
+
+    head_dim = 128
+    slots = torch.tensor(
+        [1, block_size + 3], device=device, dtype=torch.int64
+    )
+    source = torch.stack(
+        (
+            torch.arange(head_dim, device=device),
+            torch.arange(head_dim, device=device).flip(0) + 257,
+        )
+    ).to(torch.bfloat16)
+    cache = torch.zeros(
+        (2, block_size, head_dim + 4), device=device, dtype=torch.uint8
+    )
+    query = torch.ones((1, 1, head_dim), device=device, dtype=torch.bfloat16)
+    fuse_qk_quant_and_store_index_k_cache(
+        query,
+        source,
+        cache,
+        slots,
+        block_size,
+        None,
+        1.0,
+        1.0,
+        1e-5,
+        True,
+        not current_platform.is_fp8_fnuz(),
+    )
+
+    gathered = torch.empty(
+        (block_size + 4, head_dim),
+        device=device,
+        dtype=current_platform.fp8_dtype(),
+    )
+    gathered_scale_bytes = torch.empty(
+        (block_size + 4, 4), device=device, dtype=torch.uint8
+    )
+    block_table = torch.tensor([[0, 1]], device=device, dtype=torch.int32)
+    cu_seqlen = torch.tensor(
+        [0, block_size + 4], device=device, dtype=torch.int32
+    )
+    token_to_seq = torch.zeros(
+        block_size + 4, device=device, dtype=torch.int32
+    )
+    cp_gather_indexer_k_quant_cache_triton(
+        cache,
+        gathered,
+        gathered_scale_bytes,
+        block_table,
+        cu_seqlen,
+        token_to_seq,
+        layout="NORMAL",
+    )
+
+    scales = gathered_scale_bytes.view(torch.float32).squeeze(-1)
+    for source_index, gathered_index in enumerate((1, block_size + 3)):
+        torch.testing.assert_close(
+            gathered[gathered_index].float() * scales[gathered_index],
+            source[source_index].float(),
+            rtol=1.25e-1,
+            atol=3e-2,
+        )
+
+
 def test_hcu_mla_query_concat_preserves_noncontiguous_input_bits() -> None:
     device = _hcu_device()
     from vllm_hcu.patch.worker.op_opt.patch_flashmla_sparse import (

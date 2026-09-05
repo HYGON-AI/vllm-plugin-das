@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = True
+    VLLM_HCU_USE_LIGHTOP_HY_V4_INDEXER: bool = True
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
@@ -296,6 +297,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # default. Set to 0/False to use the native fallback.
     "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "True").lower() in
+                 ("true", "1")),
+
+    # Fuse Hy4 indexer LayerNorm+RoPE and Q/K quantization+K-cache insertion
+    # with LightOp. Both stages are controlled together because the fused path
+    # uses a PE-first physical Q/K layout.
+    "VLLM_HCU_USE_LIGHTOP_HY_V4_INDEXER":
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_HY_V4_INDEXER", "True").lower() in
                  ("true", "1")),
 
     # If use fused rmsnorm and quant, please set True

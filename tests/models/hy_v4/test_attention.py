@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +12,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 from vllm_hcu.models.hy_v4 import hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
     HYV4MLAAttentionLayer,
+    Indexer,
     _normalize_hy_v4_kv_cache_dtype,
     _require_accuracy_safe_kv_cache_dtype,
     _require_sparse_mqa_backend,
@@ -20,6 +21,130 @@ from vllm_hcu.models.hy_v4.attention import (
     require_local_indexer_producer,
     require_hyv4_sink_backend,
 )
+
+
+class _LinearResult(torch.nn.Module):
+    def __init__(self, value: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("value", value)
+
+    def forward(self, _input: torch.Tensor):
+        return self.value.clone(), None
+
+
+class _ReturnIndexerQuery(torch.nn.Module):
+    def forward(self, _hidden_states, query, _key, _weights):
+        return query
+
+
+def test_hy_v4_lightop_prepare_reorders_rope_and_norm_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch feeding PTM's PE-last layout to LightOp's PE-first kernel."""
+    assert hasattr(Indexer, "prepare_inputs_lightop"), (
+        "Hy4 Indexer must expose the LightOp preparation path"
+    )
+    indexer = object.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.n_head = 2
+    indexer.head_dim = 4
+    indexer.rope_dim = 2
+    indexer.softmax_scale = 0.5
+    indexer.wq_b = _LinearResult(
+        torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.float32)
+    )
+    indexer.wk_weights_proj = _LinearResult(
+        torch.tensor([[10, 11, 12, 13, 20, 21]], dtype=torch.float32)
+    )
+    indexer.k_norm = torch.nn.LayerNorm(4)
+    indexer.k_norm.weight.data.copy_(torch.tensor([1, 2, 3, 4]))
+    indexer.k_norm.bias.data.copy_(torch.tensor([5, 6, 7, 8]))
+    indexer.register_buffer("_lightop_k_norm_weight", None, persistent=False)
+    indexer.register_buffer("_lightop_k_norm_bias", None, persistent=False)
+
+    def fake_fuse_layernorm_rope(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        is_neox,
+        weight_q,
+        bias_q,
+        weight_k,
+        bias_k,
+        residual_q,
+        residual_k,
+        epsilon,
+    ) -> None:
+        del (
+            positions,
+            head_size,
+            cos_sin_cache,
+            is_neox,
+            weight_q,
+            bias_q,
+            residual_q,
+            residual_k,
+            epsilon,
+        )
+        query.add_(100)
+        key.mul_(weight_k).add_(bias_k)
+
+    monkeypatch.setattr(
+        "lightop.attention.fuse_layernorm_rotary_embedding",
+        fake_fuse_layernorm_rope,
+    )
+    rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(1, 2))
+
+    _, query, key, weights = indexer.prepare_inputs_lightop(
+        torch.zeros(1, 1),
+        torch.zeros(1, 1),
+        torch.tensor([0], dtype=torch.int64),
+        rotary_emb,
+    )
+
+    assert torch.equal(
+        query,
+        torch.tensor([[[102, 103, 100, 101], [106, 107, 104, 105]]]),
+    )
+    assert torch.equal(key, torch.tensor([[43, 60, 15, 28]]))
+    assert torch.allclose(
+        weights,
+        torch.tensor([[20, 21]]) * (0.5 * 2**-0.5),
+    )
+
+
+@pytest.mark.parametrize(
+    ("use_lightop", "expected"),
+    [(True, 2.0), (False, 1.0)],
+)
+def test_hy_v4_indexer_routes_both_lightop_stages_together(
+    use_lightop: bool,
+    expected: float,
+) -> None:
+    """Catch mixing PE-first LightOp preparation with the old cache writer."""
+    indexer = object.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.use_lightop_indexer = use_lightop
+    indexer.indexer_op = _ReturnIndexerQuery()
+
+    def old_prepare(self, hidden_states, qr, positions, rotary_emb):
+        del self, qr, positions, rotary_emb
+        return hidden_states, torch.tensor(1.0), None, None
+
+    def lightop_prepare(self, hidden_states, qr, positions, rotary_emb):
+        del self, qr, positions, rotary_emb
+        return hidden_states, torch.tensor(2.0), None, None
+
+    indexer.prepare_inputs = MethodType(old_prepare, indexer)
+    indexer.prepare_inputs_lightop = MethodType(lightop_prepare, indexer)
+
+    result = indexer.forward(
+        torch.empty(0), torch.empty(0), torch.empty(0), SimpleNamespace()
+    )
+
+    assert result.item() == expected
 from vllm_hcu.models.hy_v4.hcu_sparse import (
     HYV4FlashMLASparseBackend,
     HYV4FlashMLASparseImpl,

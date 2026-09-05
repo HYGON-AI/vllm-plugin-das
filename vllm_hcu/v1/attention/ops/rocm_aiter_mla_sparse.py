@@ -358,6 +358,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     token_to_seq: torch.Tensor,
     block_tile_size: int = 16,
     head_tile_size: int = 16,
+    layout: str | None = None,
 ):
     num_tokens = k_fp8.size(0)
     block_size = k_cache.size(1)
@@ -371,7 +372,10 @@ def cp_gather_indexer_k_quant_cache_triton(
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
-    layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    if layout is None:
+        layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    if layout not in ("NORMAL", "SHUFFLE"):
+        raise ValueError(f"Unsupported indexer cache layout: {layout}")
     _cp_gather_indexer_quant_cache_kernel[grid](
         k_cache_value,
         k_cache_scale,
@@ -1237,6 +1241,7 @@ def rocm_aiter_sparse_attn_indexer_native(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    indexer_cache_layout: str | None = None,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -1342,6 +1347,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                     chunk.block_table,
                     chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
+                    layout=indexer_cache_layout,
                 )
             else:
                 cp_gather_indexer_k_bf16_cache_triton(

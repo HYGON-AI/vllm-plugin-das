@@ -43,6 +43,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
+from vllm_hcu.platforms import envs as hcu_envs
 
 logger = init_logger(__name__)
 
@@ -248,6 +249,11 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.wk_weights_proj",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        # LightOp's fused kernel rotates the leading rope_dim values, while the
+        # PTM checkpoint stores them last. Cache the correspondingly permuted
+        # LayerNorm parameters after weights have been loaded.
+        self.register_buffer("_lightop_k_norm_weight", None, persistent=False)
+        self.register_buffer("_lightop_k_norm_bias", None, persistent=False)
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"
@@ -269,6 +275,7 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        self.use_lightop_indexer = hcu_envs.VLLM_HCU_USE_LIGHTOP_HY_V4_INDEXER
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
             self.quant_block_size,
@@ -279,6 +286,7 @@ class Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
         )
+        self.indexer_op.use_lightop_hy_v4_indexer = self.use_lightop_indexer
 
     def forward(
         self,
@@ -287,7 +295,12 @@ class Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
-        hidden_states, q_quant, k, weights = self.prepare_inputs(
+        prepare = (
+            self.prepare_inputs_lightop
+            if self.use_lightop_indexer
+            else self.prepare_inputs
+        )
+        hidden_states, q_quant, k, weights = prepare(
             hidden_states, qr, positions, rotary_emb
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
@@ -344,6 +357,62 @@ class Indexer(nn.Module):
         weights = weights.squeeze(-1)
 
         return hidden_states, q_fp8, k, weights
+
+    def prepare_inputs_lightop(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build BF16 PE-first inputs for the two-stage LightOp fast path."""
+        from lightop.attention import fuse_layernorm_rotary_embedding
+
+        q, _ = self.wq_b(qr)
+        q = q.view(-1, self.n_head, self.head_dim)
+        q_nope, q_pe = torch.split(
+            q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
+        )
+        q = torch.cat([q_pe, q_nope], dim=-1)
+
+        kw, _ = self.wk_weights_proj(hidden_states)
+        k = kw[:, : self.head_dim]
+        weights = kw[:, self.head_dim :]
+        k_nope, k_pe = torch.split(
+            k, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
+        )
+        k = torch.cat([k_pe, k_nope], dim=-1)
+
+        if self._lightop_k_norm_weight is None:
+            norm_nope, norm_pe = torch.split(
+                self.k_norm.weight,
+                [self.head_dim - self.rope_dim, self.rope_dim],
+            )
+            self._lightop_k_norm_weight = torch.cat([norm_pe, norm_nope])
+            if self.k_norm.bias is not None:
+                bias_nope, bias_pe = torch.split(
+                    self.k_norm.bias,
+                    [self.head_dim - self.rope_dim, self.rope_dim],
+                )
+                self._lightop_k_norm_bias = torch.cat([bias_pe, bias_nope])
+
+        fuse_layernorm_rotary_embedding(
+            positions,
+            q,
+            k,
+            self.head_dim,
+            rotary_emb.cos_sin_cache,
+            False,
+            None,
+            None,
+            self._lightop_k_norm_weight,
+            self._lightop_k_norm_bias,
+            None,
+            None,
+            self.k_norm.eps,
+        )
+        weights = weights * self.softmax_scale * self.n_head**-0.5
+        return hidden_states, q, k, weights
 
 
 class HYV4MLAAttentionLayer(MLAAttention):
