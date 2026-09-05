@@ -102,7 +102,7 @@ def reshape_and_cache_flash(
     NHD and HND storage. Existing non-quantized paths retain their optimized
     layout-specific writers.
     """
-    if kv_cache_dtype in {"fp8", "fp8_e4m3"}:
+    if kv_cache_dtype in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
         torch.ops.hcu_ops.reshape_and_cache_flash(
             key,
             value,

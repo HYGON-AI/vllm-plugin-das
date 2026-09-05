@@ -192,6 +192,89 @@ def test_hcu_reshape_and_cache_flash_fp8_matches_torch_quantization(
     assert torch.count_nonzero(value_cache_fp8[:, 0].float()) == 0
 
 
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_hcu_flash_attention_writer_e5m2_matches_torch_quantization(
+    layout: str,
+) -> None:
+    device = _hcu_device()
+    import vllm_hcu.hcu_ops  # noqa: F401
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        reshape_and_cache_flash,
+    )
+
+    num_blocks, block_size, num_heads, head_size = 2, 4, 2, 16
+    key = torch.linspace(
+        -20,
+        20,
+        3 * num_heads * head_size,
+        device=device,
+        dtype=torch.bfloat16,
+    ).reshape(3, num_heads, head_size)
+    value = -key
+    if layout == "NHD":
+        cache_stride = (
+            block_size * num_heads * head_size,
+            num_heads * head_size,
+            head_size,
+            1,
+        )
+    else:
+        cache_stride = (
+            num_heads * block_size * head_size,
+            head_size,
+            block_size * head_size,
+            1,
+        )
+    key_cache = torch.empty_strided(
+        (num_blocks, block_size, num_heads, head_size),
+        cache_stride,
+        device=device,
+        dtype=torch.uint8,
+    ).zero_()
+    value_cache = torch.empty_strided(
+        key_cache.shape,
+        cache_stride,
+        device=device,
+        dtype=torch.uint8,
+    ).zero_()
+    slot_mapping = torch.tensor([1, 5, -1], device=device, dtype=torch.int64)
+    k_scale = torch.tensor([0.25, 0.5], device=device, dtype=torch.float32)
+    v_scale = torch.tensor([0.5, 0.25], device=device, dtype=torch.float32)
+
+    reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8_e5m2",
+        k_scale,
+        v_scale,
+    )
+    torch.cuda.synchronize(device)
+
+    expected_key = (key[:2] / k_scale.reshape(1, -1, 1)).to(
+        torch.float8_e5m2
+    )
+    expected_value = (value[:2] / v_scale.reshape(1, -1, 1)).to(
+        torch.float8_e5m2
+    )
+    key_cache_fp8 = key_cache.view(torch.float8_e5m2)
+    value_cache_fp8 = value_cache.view(torch.float8_e5m2)
+    torch.testing.assert_close(
+        key_cache_fp8[0, 1].float(), expected_key[0].float()
+    )
+    torch.testing.assert_close(
+        key_cache_fp8[1, 1].float(), expected_key[1].float()
+    )
+    torch.testing.assert_close(
+        value_cache_fp8[0, 1].float(), expected_value[0].float()
+    )
+    torch.testing.assert_close(
+        value_cache_fp8[1, 1].float(), expected_value[1].float()
+    )
+
+
 def test_hcu_reshape_and_cache_flash_replays_in_cuda_graph() -> None:
     device = _hcu_device()
     import vllm_hcu.hcu_ops  # noqa: F401
@@ -248,6 +331,86 @@ def test_hcu_reshape_and_cache_flash_replays_in_cuda_graph() -> None:
     )
     torch.testing.assert_close(
         value_cache[1, 1].float(), replay_value[1].float()
+    )
+
+
+def test_hcu_flash_attention_writer_e5m2_hnd_replays_in_cuda_graph() -> None:
+    device = _hcu_device()
+    import vllm_hcu.hcu_ops  # noqa: F401
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        reshape_and_cache_flash,
+    )
+
+    num_heads, head_size, block_size = 2, 16, 4
+    key = torch.zeros(
+        (2, num_heads, head_size), device=device, dtype=torch.bfloat16
+    )
+    value = torch.zeros_like(key)
+    cache_stride = (
+        num_heads * block_size * head_size,
+        head_size,
+        block_size * head_size,
+        1,
+    )
+    key_cache = torch.empty_strided(
+        (2, block_size, num_heads, head_size),
+        cache_stride,
+        device=device,
+        dtype=torch.uint8,
+    ).zero_()
+    value_cache = torch.empty_strided(
+        key_cache.shape,
+        cache_stride,
+        device=device,
+        dtype=torch.uint8,
+    ).zero_()
+    slot_mapping = torch.tensor([0, 5], device=device, dtype=torch.int64)
+    scale = torch.ones((1,), device=device, dtype=torch.float32)
+
+    def write_cache() -> None:
+        reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "fp8_e5m2",
+            scale,
+            scale,
+        )
+
+    warmup_stream = torch.cuda.Stream(device=device)
+    warmup_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(warmup_stream):
+        write_cache()
+    torch.cuda.current_stream(device).wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        write_cache()
+
+    replay_key = torch.full_like(key, 1.5)
+    replay_value = torch.full_like(value, -2.0)
+    key_cache.zero_()
+    value_cache.zero_()
+    key.copy_(replay_key)
+    value.copy_(replay_value)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    key_cache_fp8 = key_cache.view(torch.float8_e5m2)
+    value_cache_fp8 = value_cache.view(torch.float8_e5m2)
+    torch.testing.assert_close(
+        key_cache_fp8[0, 0].float(), replay_key[0].float()
+    )
+    torch.testing.assert_close(
+        key_cache_fp8[1, 1].float(), replay_key[1].float()
+    )
+    torch.testing.assert_close(
+        value_cache_fp8[0, 0].float(), replay_value[0].float()
+    )
+    torch.testing.assert_close(
+        value_cache_fp8[1, 1].float(), replay_value[1].float()
     )
 
 

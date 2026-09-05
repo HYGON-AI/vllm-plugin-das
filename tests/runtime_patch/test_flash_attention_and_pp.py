@@ -291,6 +291,8 @@ def test_cutlass_block_first_hnd_stride_contract(
         ("HND", "auto", "triton"),
         ("NHD", "fp8_e4m3", "hcu"),
         ("HND", "fp8_e4m3", "hcu"),
+        ("NHD", "fp8_e5m2", "hcu"),
+        ("HND", "fp8_e5m2", "hcu"),
     ],
 )
 def test_flash_cache_writer_dispatches_by_physical_layout(
