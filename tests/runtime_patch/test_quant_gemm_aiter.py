@@ -7631,12 +7631,8 @@ def test_fp8_channel_weight_layout_requires_hcu_kernel(monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize("backend", ["lightop", "target-triton"])
 def test_fp8_channel_backend_preserves_weight_layout(
-    monkeypatch: pytest.MonkeyPatch,
     backend: str,
 ):
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", False)
     module, channel = _fake_fp8_scheme_module()
     patch_compressed_tensors_w8a8_fp8.apply_to_module(module)
 
