@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+from collections.abc import Callable, Sequence
+from functools import partial
 from typing import Any
 
 from vllm.v1.executor import multiproc_executor as _upstream
@@ -76,6 +79,76 @@ class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
     """
 
     _mq_constructor_lock = threading.RLock()
+
+    def collective_rpc(  # type: ignore[override]
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+        kv_output_aggregator: Any | None = None,
+    ) -> Any:
+        """Call every worker without allowing an expired deadline to go negative."""
+        assert self.rpc_broadcast_mq is not None, (
+            "collective_rpc should not be called on follower node"
+        )
+        if self.is_failed:
+            raise RuntimeError("Executor failed.")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        if kv_output_aggregator is not None:
+            output_rank = None
+            aggregate: Callable[[Any], Any] = partial(
+                kv_output_aggregator.aggregate,
+                output_rank=unique_reply_rank or 0,
+            )
+        else:
+            output_rank = unique_reply_rank
+            aggregate = lambda value: value
+
+        if isinstance(method, str):
+            send_method = method
+        else:
+            send_method = _upstream.cloudpickle.dumps(
+                method,
+                protocol=_upstream.pickle.HIGHEST_PROTOCOL,
+            )
+        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+
+        response_mqs: Sequence[_upstream.MessageQueue] = self.response_mqs
+        if output_rank is not None:
+            response_mqs = (response_mqs[output_rank],)
+
+        def get_response() -> Any:
+            responses = []
+            for mq in response_mqs:
+                dequeue_timeout = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    status, result = mq.dequeue(timeout=dequeue_timeout)
+                except TimeoutError as exc:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from exc
+                if status != _upstream.WorkerProc.ResponseStatus.SUCCESS:
+                    raise RuntimeError(
+                        f"Worker failed with error '{result}', please check the"
+                        " stack trace above for the root cause"
+                    )
+                responses.append(result)
+            return responses[0] if output_rank is not None else responses
+
+        future = _upstream.FutureWrapper(
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+        )
+        return future if non_block else future.result()
 
     def _init_executor(self) -> None:
         global _FORK_ORIGINAL_MESSAGE_QUEUE, _FORK_PROXY_MESSAGE_QUEUE
