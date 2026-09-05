@@ -195,11 +195,6 @@ def test_int8_marlin_safely_remaps_global_expert_ids(
         "lightop._lmslim_native.layers.fused_moe.int8_marlin_test",
         "fused_experts_impl_int8_marlin",
     )
-    monkeypatch.setattr(
-        marlin,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda *_args: False,
-    )
     expert_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int32)
     layer = _moe_layer(global_num_experts=4, expert_map=expert_map)
     method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
@@ -261,11 +256,6 @@ def test_marlin_allocates_routed_output_only_during_shared_input_overlap(
         marlin,
         "ensure_safe_marlin_moe_alignment",
         lambda _kernel: None,
-    )
-    monkeypatch.setattr(
-        marlin,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda _moe: False,
     )
 
     class SharedExperts:

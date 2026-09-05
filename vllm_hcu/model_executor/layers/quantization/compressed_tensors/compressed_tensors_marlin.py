@@ -60,5 +60,22 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
         if isinstance(layer, Attention):
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, RoutedExperts):
+            moe_backend = getattr(layer.moe_config, "moe_backend", "auto")
+            from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+                is_aiter_moe_requested,
+            )
+
+            if moe_backend != "auto" or is_aiter_moe_requested(
+                layer.moe_config
+            ):
+                from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (
+                    CompressedTensorsMoEMethod,
+                )
+
+                return CompressedTensorsMoEMethod.get_moe_method(
+                    self,
+                    layer,
+                    prefix,
+                )
             return CompressedTensorsMarlinMoEMethod.get_moe_method(self, layer)
         return None

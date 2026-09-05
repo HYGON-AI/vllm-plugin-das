@@ -140,6 +140,31 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     """Channel-wise SlimQuant W4A8 routed by the shared AITER adapter."""
 
     def __init__(self, quant_config, moe):
+        moe_backend = getattr(moe, "moe_backend", "auto")
+        supported_backends = {"auto", "aiter", "triton", "deep_gemm"}
+        if moe_backend not in supported_backends:
+            raise ValueError(
+                "SlimQuant W4A8 does not support "
+                f"moe_backend={moe_backend!r}; expected one of "
+                f"{sorted(supported_backends)!r}"
+            )
+        if moe_backend == "deep_gemm":
+            parallel_config = getattr(moe, "moe_parallel_config", None)
+            if (
+                parallel_config is None
+                or getattr(parallel_config, "all2all_backend", None)
+                != "deepep_auto"
+                or getattr(
+                    parallel_config,
+                    "use_deepep_auto_kernels",
+                    None,
+                )
+                is False
+            ):
+                raise ValueError(
+                    "SlimQuant W4A8 deep_gemm requires DP+EP with "
+                    "all2all_backend='deepep_auto'"
+                )
         self.moe = moe
         self.quant_config = quant_config
         self.moe_quant_config: FusedMoEQuantConfig | None = None

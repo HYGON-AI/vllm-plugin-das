@@ -2,19 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
-"""HCU compressed-tensors Marlin methods with optional AITER routing.
-
-The AITER INT8 branch keeps canonical weights at load time and delegates
-shape/config selection, derived layouts, public execution, and native Triton
-fallback to ``compressed_tensors_moe_runtime``. The non-AITER branch uses the
-LightOp Marlin layout and execution path.
-"""
+"""HCU compressed-tensors methods owned by the LightOp Marlin backend."""
 import enum
 import torch
 from enum import Enum
 from typing import Optional
 from compressed_tensors.quantization import (QuantizationStrategy)
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from torch.nn.parameter import Parameter
@@ -47,18 +40,6 @@ __all__ = [
     "CompressedTensorsW8A8Int8MarlinMoEMethod",
     "CompressedTensorsW8A8FP8MarlinMoEMethod",
 ]
-# ── AITER W8A8 MoE env guard ────────────────────────────────────────
-
-def _is_hcu_aiter_w8a8_moe_requested(
-    moe_config: object | None = None,
-) -> bool:
-    from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
-        is_aiter_moe_requested,
-    )
-
-    return is_aiter_moe_requested(moe_config)
-
-
 # ── Weight layout helpers (Marlin interleave) ───────────────────────
 
 def get_w8a8_int8_marlin_weights(
@@ -135,9 +116,7 @@ class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
 
     @property
     def supports_inplace_output(self) -> bool:
-        return not self.use_deepep and not _is_hcu_aiter_w8a8_moe_requested(
-            self.moe
-        )
+        return not self.use_deepep
 
     @staticmethod
     def _allows_inplace_output(
@@ -528,32 +507,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # AITER W8A8 MoE fast-path: skip Marlin interleave, defer to AITER
-        if _is_hcu_aiter_w8a8_moe_requested(self.moe):
-            if not rocm_aiter_ops.is_fused_moe_enabled():
-                raise RuntimeError(
-                    "VLLM_ROCM_USE_AITER=1 and VLLM_ROCM_USE_AITER_MOE=1 "
-                    "requested AITER W8A8 MoE, but rocm_aiter_ops fused MoE "
-                    "support is unavailable."
-                )
-            if layer.apply_router_weight_on_input:
-                raise RuntimeError(
-                    "AITER W8A8 MoE does not support "
-                    "apply_router_weight_on_input=True."
-                )
-
-            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-                prewarm_aiter_quantized_moe,
-            )
-
-            prewarm_aiter_quantized_moe(
-                layer,
-                self.moe,
-                self.moe_quant_config,
-            )
-            return
-        # Default Marlin weight interleave path
+        # LightOp Marlin weight interleave path.
         #if not self.use_deepep:
         w1_marlin_list = []
         for ii in range(layer.w13_weight.shape[0]):
@@ -589,46 +543,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         i_q: torch.Tensor | None = None,
         i_s: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # AITER W8A8 MoE fast-path
-        if _is_hcu_aiter_w8a8_moe_requested(self.moe):
-            if not rocm_aiter_ops.is_fused_moe_enabled():
-                raise RuntimeError(
-                    "VLLM_ROCM_USE_AITER=1 and VLLM_ROCM_USE_AITER_MOE=1 "
-                    "requested AITER W8A8 MoE, but rocm_aiter_ops fused MoE "
-                    "support is unavailable."
-                )
-            if layer.apply_router_weight_on_input:
-                raise RuntimeError(
-                    "AITER W8A8 MoE does not support "
-                    "apply_router_weight_on_input=True."
-                )
-
-            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-                apply_aiter_quantized_moe,
-            )
-
-            quant_config = getattr(self, "moe_quant_config", None)
-            if quant_config is None:
-                quant_config = self.get_fused_moe_quant_config(layer)
-                self.moe_quant_config = quant_config
-            return apply_aiter_quantized_moe(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                vllm_moe_config=self.moe,
-                activation=layer.activation,
-                apply_router_weight_on_input=(
-                    layer.apply_router_weight_on_input
-                ),
-                expert_map=layer.expert_map,
-                quant_config=quant_config,
-                output_dtype=x.dtype,
-            )
-
-        # Default Marlin INT8 path
-
+        # LightOp Marlin INT8 path.
         from lightop.moe import fused_experts_impl_int8_marlin
         ensure_safe_marlin_moe_alignment(fused_experts_impl_int8_marlin)
         inplace = self._allows_inplace_output(

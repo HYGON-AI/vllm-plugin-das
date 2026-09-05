@@ -192,6 +192,38 @@ def apply_to_module(module: ModuleType) -> bool:
 
             return hcu_enum.HCU_DEEPGEMM, DeepEPDeepGemmContiguousExperts
         if sidecar.moe_backend != "deep_gemm":
+            from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+                is_aiter_moe_requested,
+            )
+
+            if (
+                getattr(config, "moe_backend", "auto") == "auto"
+                and is_aiter_moe_requested(config)
+            ):
+                activation_format = (
+                    target.mk.FusedMoEActivationFormat.BatchedExperts
+                    if config.moe_parallel_config.use_batched_activation_format
+                    else target.mk.FusedMoEActivationFormat.Standard
+                )
+                reasons = []
+                for kernel_cls in hcu_backend_to_kernel_cls(hcu_enum.AITER):
+                    supported, reason = kernel_cls.is_supported_config(
+                        kernel_cls,
+                        config,
+                        weight_key,
+                        activation_key,
+                        activation_format,
+                    )
+                    if supported:
+                        return hcu_enum.AITER, kernel_cls
+                    reasons.append(
+                        f"{kernel_cls.__name__}: {reason or 'unsupported'}"
+                    )
+                raise ValueError(
+                    "AITER is required by the HCU auto environment but does "
+                    "not support this INT8 MoE configuration: "
+                    + "; ".join(reasons)
+                )
             return select_backend(config, weight_key, activation_key)
         if getattr(config, "moe_backend", "auto") != "deep_gemm":
             raise ValueError(
