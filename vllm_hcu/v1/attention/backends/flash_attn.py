@@ -825,11 +825,9 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        if (
-            henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and _get_flash_attn_mode() == "custom"
-            and self.kv_cache_dtype == "fp8_e5m2"
-        ):
+        # QuantFP8 emits the platform E4M3 dtype. E5M2 cache paths must keep
+        # BF16 queries instead of mixing E4M3 queries with E5M2 K/V pages.
+        if self.kv_cache_dtype == "fp8_e5m2":
             self.supports_quant_query_input = False
         else:
             self.supports_quant_query_input = flash_attn_supports_quant_query_input()

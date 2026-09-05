@@ -541,6 +541,34 @@ def test_hcu_flash_attention_encoder_window_is_symmetric(
     assert impl.sliding_window == (7, 7)
 
 
+@pytest.mark.parametrize("mode", ["classic", "cutlass", "varlen", "custom"])
+def test_hcu_flash_attention_disables_e5m2_query_prequantization(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 2)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        flash_attn,
+        "flash_attn_supports_quant_query_input",
+        lambda: True,
+    )
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
+
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=1,
+        head_size=64,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+
+    assert impl.supports_quant_query_input is False
+
+
 def test_hcu_flash_attention_backend_rejects_pcp_with_dcp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -94,7 +94,10 @@ def apply_to_module(module: ModuleType) -> bool:
         self, query, key, value, output_shape=None, output_dtype=None
     ):
         custom_flash, _ = _feature_flags()
-        if custom_flash or getattr(self, "kv_cache_dtype", None) == "fp8_e5m2":
+        # The HCU-owned forward exists for CUSTOM's split-cache ABI. Standard
+        # backends must retain vLLM's unified KV-update dependency, including
+        # E5M2, so torch.compile and CUDA graphs preserve write-before-read.
+        if custom_flash:
             return attention_runtime.attention_forward(
                 attention,
                 self,

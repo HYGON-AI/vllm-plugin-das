@@ -181,11 +181,15 @@ def test_dense_attention_layer_installs_hcu_runtime_and_preserves_fallback(
     layer.kv_cache_dtype = "fp8_e5m2"
     assert module._init_kv_cache_quant(layer, "quant", "prefix") == "hcu-init"
     instance.kv_cache_dtype = "fp8_e5m2"
+    assert instance.forward("q", "k", "v") == "official-forward"
+
+    monkeypatch.setattr(adapter, "_feature_flags", lambda: (True, False))
     assert instance.forward("q", "k", "v") == "hcu-forward"
     assert [call[0] for call in calls] == [
         "official-init",
         "official-forward",
         "hcu-init",
+        "official-forward",
         "hcu-forward",
     ]
 
