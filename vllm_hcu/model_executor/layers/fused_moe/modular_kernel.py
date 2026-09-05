@@ -1191,7 +1191,9 @@ class FusedMoEKernelModularImpl:
             topk = topk_ids.shape[1]
             if num_dispatchers is not None and global_num_experts > 0:
                 expected_m = (
-                    num_tokens * num_dispatchers * topk + global_num_experts
+                    num_tokens * num_dispatchers * topk
+                    + global_num_experts
+                    - 1
                 ) // global_num_experts
                 self.fused_experts.set_expected_m(expected_m)
 

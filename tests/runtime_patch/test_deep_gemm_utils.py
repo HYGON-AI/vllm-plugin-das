@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -274,6 +275,145 @@ def _load_batched_deep_gemm_apply():
     }
     exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
     return namespace
+
+
+def _load_batched_deep_gemm_expected_m():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/"
+        "batched_deep_gemm_moe.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    experts = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchedDeepGemmExperts"
+    )
+    function = next(
+        node
+        for node in experts.body
+        if isinstance(node, ast.FunctionDef) and node.name == "estimate_expected_m"
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias(name="annotations")],
+                level=0,
+            ),
+            function,
+        ],
+        type_ignores=[],
+    )
+    namespace: dict[str, object] = {
+        "get_forward_context": lambda: None,
+        "is_forward_context_available": lambda: False,
+        "logger": SimpleNamespace(warning_once=lambda *_args, **_kwargs: None),
+        "round_up": lambda value, multiple: (
+            (value + multiple - 1) // multiple * multiple
+        ),
+    }
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    return namespace["estimate_expected_m"]
+
+
+@pytest.mark.parametrize(
+    ("local_expected_m", "expected_m"),
+    [
+        pytest.param(16, 16, id="already-aligned"),
+        pytest.param(3, 16, id="align-small-estimate"),
+    ],
+)
+def test_batched_deep_gemm_uses_local_expected_m_without_dp_metadata(
+    local_expected_m: int,
+    expected_m: int,
+):
+    estimate_expected_m = _load_batched_deep_gemm_expected_m()
+    experts = SimpleNamespace(get_expected_m=lambda: local_expected_m)
+
+    assert estimate_expected_m(
+        experts,
+        global_num_experts=128,
+        max_tokens_per_expert=256,
+        topk=2,
+    ) == expected_m
+
+
+def _load_modular_prepare():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "FusedMoEKernelModularImpl"
+    )
+    function = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_prepare"
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias(name="annotations")],
+                level=0,
+            ),
+            function,
+        ],
+        type_ignores=[],
+    )
+    namespace: dict[str, object] = {
+        "FusedMoEActivationFormat": SimpleNamespace(BatchedExperts="batched"),
+        "envs": SimpleNamespace(VLLM_MOE_SKIP_PADDING=False),
+        "is_forward_context_available": lambda: False,
+        "torch": torch,
+    }
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    return namespace["_prepare"]
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_m"),
+    [
+        pytest.param(128, 16, id="exactly-divisible"),
+        pytest.param(17, 3, id="ceil-non-divisible"),
+    ],
+)
+def test_modular_prepare_computes_ceiled_local_expected_m(
+    num_tokens: int,
+    expected_m: int,
+):
+    prepare = _load_modular_prepare()
+    observed: list[int] = []
+    fused_experts = SimpleNamespace(
+        activation_format=lambda: "batched",
+        max_num_tokens=256,
+        num_dispatchers=8,
+        set_expected_m=observed.append,
+    )
+    kernel = SimpleNamespace(
+        fused_experts=fused_experts,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+        prepare_finalize=SimpleNamespace(),
+    )
+
+    prepare(
+        kernel,
+        hidden_states=torch.empty((num_tokens, 1)),
+        topk_weights=torch.empty((num_tokens, 2)),
+        topk_ids=torch.empty((num_tokens, 2), dtype=torch.int32),
+        global_num_experts=128,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        prequanted_a1_scale=None,
+        prequanted_a1=True,
+    )
+
+    assert observed == [expected_m]
 
 
 def test_w8a8_batched_apply_uses_masked_int8_deepgemm_api(

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -12,6 +13,9 @@ from typing import Any
 
 _DEEPEP_AUTO_REQUEST_PHASE: ContextVar[list[object | None] | None] = ContextVar(
     "vllm_hcu_deepep_auto_request_phase", default=None
+)
+_SKIP_DEEPEP_LL_DP_COORDINATION = (
+    "_vllm_hcu_skip_deepep_ll_dp_coordination"
 )
 
 
@@ -35,6 +39,65 @@ def set_deepep_auto_request_phase(is_prefilling: object) -> None:
 def get_deepep_auto_request_phase() -> object | None:
     phase_holder = _DEEPEP_AUTO_REQUEST_PHASE.get()
     return None if phase_holder is None else phase_holder[0]
+
+
+def _config_value(config: object, name: str, default: object = None) -> object:
+    if isinstance(config, Mapping):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def bind_deepep_ll_dp_coordination_policy(vllm_config: object) -> bool:
+    """Bind one rank-invariant decision after the vLLM config is finalized."""
+
+    parallel_config = _config_value(vllm_config, "parallel_config")
+    compilation_config = _config_value(vllm_config, "compilation_config")
+    if parallel_config is None:
+        return False
+
+    use_ubatching = _config_value(parallel_config, "use_ubatching")
+    if use_ubatching is None:
+        enable_dbo = bool(_config_value(parallel_config, "enable_dbo", False))
+        ubatch_size = int(_config_value(parallel_config, "ubatch_size", 0) or 0)
+        use_ubatching = enable_dbo or ubatch_size > 1
+
+    configured_graph_mode = _config_value(
+        compilation_config,
+        "cudagraph_mode",
+    )
+    graph_mode_value = getattr(
+        configured_graph_mode,
+        "value",
+        configured_graph_mode,
+    )
+    skip = bool(
+        _config_value(parallel_config, "all2all_backend")
+        == "deepep_low_latency"
+        and not _config_value(
+            parallel_config,
+            "_vllm_hcu_deepep_auto",
+            False,
+        )
+        and not use_ubatching
+        and graph_mode_value == 0
+    )
+    if isinstance(parallel_config, dict):
+        parallel_config[_SKIP_DEEPEP_LL_DP_COORDINATION] = skip
+    else:
+        setattr(parallel_config, _SKIP_DEEPEP_LL_DP_COORDINATION, skip)
+    return skip
+
+
+def should_skip_deepep_ll_dp_coordination(parallel_config: object) -> bool:
+    """Read the finalized, rank-invariant direct-LL coordination policy."""
+
+    return bool(
+        _config_value(
+            parallel_config,
+            _SKIP_DEEPEP_LL_DP_COORDINATION,
+            False,
+        )
+    )
 
 
 def attach_hcu_context_fields(
@@ -233,12 +296,11 @@ def set_forward_context(
 
     dp_metadata = None
     parallel_config = vllm_config.parallel_config
-    low_latency = (
-        parallel_config.all2all_backend == "deepep_low_latency"
-        and not getattr(parallel_config, "_vllm_hcu_deepep_auto", False)
+    skip_dp_coordination = should_skip_deepep_ll_dp_coordination(
+        parallel_config,
     )
     if (
-        not low_latency
+        not skip_dp_coordination
         and (
             parallel_config.data_parallel_size > 1
             or parallel_config.use_sequence_parallel_moe

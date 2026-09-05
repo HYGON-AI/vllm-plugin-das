@@ -197,6 +197,9 @@ def _make_eplb_module(
             )
             self.device = torch.device("cpu")
             self.model_states: dict[str, EplbModelState] = {}
+            self.should_record_tensor = torch.tensor(True)
+            self.is_async = True
+            self.official_steps = 0
             self.official_profile_steps = 0
 
         def add_model(self, model, model_config) -> None:
@@ -215,6 +218,7 @@ def _make_eplb_module(
 
         def step(self, is_dummy=False, is_profile=False, log_stats=False):
             del is_dummy, log_stats
+            self.official_steps += 1
             if is_profile:
                 self.official_profile_steps += 1
             return "official-step"
@@ -274,7 +278,7 @@ def test_runtime_patch_records_initial_and_committed_maps(tmp_path: Path) -> Non
     ] == committed.tolist()
 
 
-def test_runtime_patch_loads_map_and_skips_profile_rearrangement(
+def test_runtime_patch_loads_static_map_and_freezes_dynamic_eplb(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "load.json"
@@ -301,7 +305,25 @@ def test_runtime_patch_loads_map_and_skips_profile_rearrangement(
     assert state.model_states["hy4-hash"].physical_to_logical_map.tolist() == [
         [3, 2, 1, 0, 3, 2]
     ]
+    assert state.should_record_tensor.item() is False
+    assert state.is_async is False
 
     assert state.step(is_profile=True) is None
     assert state.official_profile_steps == 0
+    assert state.step(is_profile=False) is None
+    assert state.official_steps == 0
+
+
+def test_runtime_patch_record_mode_preserves_dynamic_eplb_steps(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "record.json"
+    module, _ = _make_eplb_module(record_path=output)
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+
     assert state.step(is_profile=False) == "official-step"
+    assert state.official_steps == 1
+    assert state.should_record_tensor.item() is True
+    assert state.is_async is True

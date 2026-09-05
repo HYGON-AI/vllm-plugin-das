@@ -1709,12 +1709,14 @@ def test_gfx938_sparse_indexer_prefill_uses_triton_fp8_cache_gather(
         total_seq_lens=1,
         topk_indices_buffer=topk_indices,
         skip_k_cache_insert=True,
+        indexer_cache_layout="NORMAL",
     )
 
     assert len(calls) == 1
     assert calls[0][0][3] is chunk.block_table
     assert calls[0][0][4] is chunk.cu_seq_lens
     assert calls[0][1]["token_to_seq"] is chunk.token_to_seq
+    assert calls[0][1]["layout"] == "NORMAL"
     torch.testing.assert_close(topk_indices, torch.zeros_like(topk_indices))
 
 

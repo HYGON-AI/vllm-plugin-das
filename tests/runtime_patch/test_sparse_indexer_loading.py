@@ -12,12 +12,74 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 
 
 REPO = Path(__file__).resolve().parents[2]
 MODEL_SOURCE = (REPO / "vllm_hcu/models/deepseek_v2.py").read_text(
     encoding="utf-8"
 )
+
+
+def test_lightop_qk_quant_returns_platform_fp8_and_fp32_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch losing HCU's FNUZ view or feeding BF16 weights to MQA logits."""
+    quant_and_store = _load_lightop_qk_quant_helper()
+    cache = torch.zeros((2, 2, 8), dtype=torch.uint8)
+    slots = torch.tensor([0, 3], dtype=torch.int64)
+    query = torch.arange(16, dtype=torch.bfloat16).view(2, 2, 4)
+    key = torch.arange(8, dtype=torch.bfloat16).view(2, 4)
+    weights = torch.tensor([[1, 2], [3, 4]], dtype=torch.bfloat16)
+
+    def fake_fuse_qk_quant_and_store(
+        q_input,
+        k_input,
+        k_buf,
+        k_loc,
+        page_size,
+        weights_in,
+        q_scale_factor,
+        k_scale_factor,
+        eps,
+        use_ue8m0,
+        is_e4m3,
+    ):
+        del (
+            k_input,
+            page_size,
+            q_scale_factor,
+            k_scale_factor,
+            eps,
+            use_ue8m0,
+            is_e4m3,
+        )
+        k_buf.view(-1)[k_loc] = 9
+        q_out = q_input.to(torch.float8_e4m3fn)
+        q_scale = torch.ones((*q_input.shape[:-1], 1), dtype=torch.float32)
+        return q_out, q_scale, weights_in.unsqueeze(-1) * 2
+
+    monkeypatch.setattr(
+        "lightop.kvcache.fuse_qk_quant_and_store_index_k_cache",
+        fake_fuse_qk_quant_and_store,
+    )
+
+    q_quant, scaled_weights = quant_and_store(
+        query,
+        key,
+        cache,
+        slots,
+        weights,
+        page_size=2,
+        q_scale_factor=0.25,
+    )
+
+    assert q_quant.dtype == current_platform.fp8_dtype()
+    assert scaled_weights.dtype == torch.float32
+    assert scaled_weights.shape == weights.shape
+    assert torch.equal(scaled_weights, weights.float() * 2)
+    assert cache.view(-1)[0] == 9
+    assert cache.view(-1)[3] == 9
 
 
 def _load_model_helpers():
@@ -71,6 +133,31 @@ def _load_v32_sparse_indexer_contract(**dependencies):
     return namespace["forward_hip"]
 
 
+def _load_sparse_indexer_contract(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_forward_hip", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
 def _load_v32_sparse_indexer_class():
     source = (
         REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
@@ -87,9 +174,31 @@ def _load_v32_sparse_indexer_class():
     class_node.bases = [ast.Name(id="SparseAttnIndexer", ctx=ast.Load())]
     module = ast.Module(body=[class_node], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"torch": torch, "SparseAttnIndexer": object}
+    namespace = {
+        "torch": torch,
+        "current_platform": current_platform,
+        "SparseAttnIndexer": object,
+    }
     exec(compile(module, "v32_sparse_indexer_class", "exec"), namespace)
     return namespace["V32SparseAttnIndexer"]
+
+
+def _load_lightop_qk_quant_helper():
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "lightop_indexer_qk_quant_and_store"
+    )
+    module = ast.Module(body=[function_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"torch": torch, "current_platform": current_platform}
+    exec(compile(module, "lightop_indexer_qk_quant_and_store", "exec"), namespace)
+    return namespace["lightop_indexer_qk_quant_and_store"]
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
@@ -269,6 +378,228 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     assert hcu_args[5] is weights
     assert hcu_args[8] == 2048
     assert hcu_args[-1] is True
+
+
+def test_hy_v4_lightop_qk_fusion_writes_cache_before_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    fp8_dtype = torch.float8_e4m3fn
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([2, 5, -1], dtype=torch.int64),
+        num_kv_actual_tokens=2,
+    )
+    cache = torch.zeros((2, 4, 132), dtype=torch.uint8)
+    q_bf16 = torch.ones((2, 3, 128), dtype=torch.bfloat16)
+    k_bf16 = torch.ones((3, 128), dtype=torch.bfloat16)
+    weights = torch.ones((2, 3), dtype=torch.bfloat16)
+    fused_q = torch.ones((2, 3, 128), dtype=fp8_dtype)
+    fused_weights = torch.full((2, 3), 7.0, dtype=torch.float32)
+
+    def quant_and_store(q, k, kv_cache, slots, weights_in, **kwargs):
+        events.append(("fuse", q, k, kv_cache, slots, weights_in, kwargs))
+        kv_cache.view(-1)[0] = 11
+        return fused_q, fused_weights
+
+    def sparse_topk(*args, **kwargs):
+        events.append(("topk", *args, kwargs))
+        assert cache.view(-1)[0] == 11
+        return args[3]
+
+    monkeypatch.setattr(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse."
+        "rocm_aiter_sparse_attn_indexer_native",
+        sparse_topk,
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        effective_pcp_world_size=lambda _value: 1,
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "single-rank Hy4 unexpectedly gathered PCP inputs"
+        ),
+        lightop_indexer_qk_quant_and_store=quant_and_store,
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_lightop_hy_v4_indexer=True,
+        skip_k_cache_insert=False,
+        pcp_world_size=1,
+        dcp_world_size=1,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=64,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 64), dtype=torch.int32),
+    )
+
+    result = forward_hip(
+        indexer,
+        torch.empty((2, 1)),
+        q_bf16,
+        k_bf16,
+        weights,
+    )
+
+    assert result is fused_q
+    assert [event[0] for event in events] == ["fuse", "topk"]
+    assert torch.equal(events[0][2], k_bf16[:2])
+    assert torch.equal(events[0][4], metadata.slot_mapping[:2])
+    assert events[1][4] is fused_q
+    assert events[1][6] is fused_weights
+    assert events[1][-1]["skip_k_cache_insert"] is True
+    assert events[1][-1]["indexer_cache_layout"] == "NORMAL"
+
+
+def test_hy_v4_lightop_filters_negative_slots_on_idle_dp_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch passing dummy-batch slot -1 to LightOp's native cache writer."""
+    events: list[tuple[torch.Tensor, torch.Tensor]] = []
+    fp8_dtype = torch.float8_e4m3fn
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([-1, 3], dtype=torch.int64),
+        num_kv_actual_tokens=2,
+    )
+    fused_q = torch.ones((2, 3, 128), dtype=fp8_dtype)
+    fused_weights = torch.ones((2, 3), dtype=torch.float32)
+
+    def quant_and_store(q, k, _cache, slots, _weights, **_kwargs):
+        del q
+        events.append((k, slots))
+        return fused_q, fused_weights
+
+    monkeypatch.setattr(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse."
+        "rocm_aiter_sparse_attn_indexer_native",
+        lambda *args, **_kwargs: args[3],
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        effective_pcp_world_size=lambda _value: 1,
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "single-rank Hy4 unexpectedly gathered PCP inputs"
+        ),
+        lightop_indexer_qk_quant_and_store=quant_and_store,
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_lightop_hy_v4_indexer=True,
+        skip_k_cache_insert=False,
+        pcp_world_size=1,
+        dcp_world_size=1,
+        k_cache=SimpleNamespace(
+            prefix="indexer",
+            kv_cache=torch.zeros((1, 4, 132), dtype=torch.uint8),
+        ),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=64,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 64), dtype=torch.int32),
+    )
+    k_bf16 = torch.arange(256, dtype=torch.bfloat16).view(2, 128)
+
+    forward_hip(
+        indexer,
+        torch.empty((2, 1)),
+        torch.ones((2, 3, 128), dtype=torch.bfloat16),
+        k_bf16,
+        torch.ones((2, 3), dtype=torch.bfloat16),
+    )
+
+    assert len(events) == 1
+    assert torch.equal(events[0][0], k_bf16[1:2])
+    assert torch.equal(events[0][1], torch.tensor([3], dtype=torch.int64))
+
+
+def test_hy_v4_lightop_avoids_unsafe_negative_slot_cache_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    fp8_dtype = torch.float8_e4m3fn
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([2, -1], dtype=torch.int64),
+        num_kv_actual_tokens=2,
+    )
+    cache = torch.zeros((1, 4, 132), dtype=torch.uint8)
+    fused_q = torch.ones((2, 3, 128), dtype=fp8_dtype)
+    fused_weights = torch.ones((2, 3), dtype=torch.float32)
+
+    def quant_without_cache(q, k, _cache, slots, _weights, **_kwargs):
+        events.append(("fuse", k, slots))
+        return fused_q, fused_weights
+
+    def safe_cache_writer(k, _cache, slots, _block_size, _scale_fmt):
+        events.append(("safe_cache", k, slots))
+
+    monkeypatch.setattr(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse."
+        "rocm_aiter_sparse_attn_indexer_native",
+        lambda *args, **kwargs: events.append(("topk", kwargs)) or args[3],
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        effective_pcp_world_size=lambda _value: 1,
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "single-rank Hy4 unexpectedly gathered PCP inputs"
+        ),
+        lightop_indexer_qk_quant_and_store=quant_without_cache,
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        ops=SimpleNamespace(indexer_k_quant_and_cache=safe_cache_writer),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_lightop_hy_v4_indexer=True,
+        skip_k_cache_insert=False,
+        pcp_world_size=1,
+        dcp_world_size=2,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=64,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 64), dtype=torch.int32),
+    )
+    k_bf16 = torch.ones((2, 128), dtype=torch.bfloat16)
+
+    forward_hip(
+        indexer,
+        torch.empty((2, 1)),
+        torch.ones((2, 3, 128), dtype=torch.bfloat16),
+        k_bf16,
+        torch.ones((2, 3), dtype=torch.bfloat16),
+    )
+
+    assert [event[0] for event in events] == ["fuse", "safe_cache", "topk"]
+    assert events[0][1].shape == (0, 128)
+    assert events[0][2].numel() == 0
+    assert torch.equal(events[1][1], k_bf16)
+    assert torch.equal(events[1][2], metadata.slot_mapping)
+    assert events[2][1]["indexer_cache_layout"] is None
 
 
 def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
