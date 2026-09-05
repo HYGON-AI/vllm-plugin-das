@@ -174,7 +174,24 @@ def test_all2all_dispatch_selection_contract():
     assert result.use_int8_dispatch is True
 
 
-def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
+@pytest.mark.parametrize(
+    ("fixed_use_low_latency", "expected_cleanup"),
+    [(None, True), (True, False), (False, False)],
+)
+def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_use_low_latency: bool | None,
+    expected_cleanup: bool,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto,
+    )
+
+    monkeypatch.setattr(
+        deepep_auto,
+        "dspark_mooncake_pd_use_low_latency",
+        lambda _vllm_config: fixed_use_low_latency,
+    )
     calls: dict[str, object] = {}
 
     class Manager:
@@ -282,7 +299,11 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
     }
-    assert result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer is True
+    assert result._fixed_use_low_latency is fixed_use_low_latency
+    assert (
+        result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer
+        is expected_cleanup
+    )
     int8_result = module.maybe_make_prepare_finalize(
         moe,
         SimpleNamespace(quant_dtype=torch.int8),
@@ -297,7 +318,11 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
     }
-    assert int8_result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer is True
+    assert int8_result._fixed_use_low_latency is fixed_use_low_latency
+    assert (
+        int8_result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer
+        is expected_cleanup
+    )
     assert module.maybe_roundup_layer_hidden_size(
         10, torch.float16, moe.moe_parallel_config
     ) == 13

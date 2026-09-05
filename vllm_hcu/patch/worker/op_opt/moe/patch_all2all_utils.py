@@ -131,17 +131,20 @@ def apply_to_module(module: ModuleType) -> bool:
                 physical_to_global=physical_to_global,
                 local_expert_global_ids=local_expert_global_ids,
             )
-            ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer = True
             from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
                 deepep_auto,
             )
 
+            fixed_use_low_latency = (
+                deepep_auto.dspark_mooncake_pd_use_low_latency(vllm_config)
+            )
+            ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer = (
+                fixed_use_low_latency is None
+            )
             return deepep_auto.DeepEPAutoPrepareAndFinalize(
                 ht_prepare_finalize,
                 ll_prepare_finalize,
-                fixed_use_low_latency=(
-                    deepep_auto.dspark_mooncake_pd_use_low_latency(vllm_config)
-                ),
+                fixed_use_low_latency=fixed_use_low_latency,
             )
 
         prepare_finalize = original(
