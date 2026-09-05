@@ -198,6 +198,7 @@ def _make_eplb_module(
             self.device = torch.device("cpu")
             self.model_states: dict[str, EplbModelState] = {}
             self.official_profile_steps = 0
+            self.official_rearrangements = 0
 
         def add_model(self, model, model_config) -> None:
             state = EplbModelState()
@@ -217,7 +218,12 @@ def _make_eplb_module(
             del is_dummy, log_stats
             if is_profile:
                 self.official_profile_steps += 1
+            self.rearrange(is_profile=is_profile)
             return "official-step"
+
+        def rearrange(self, is_profile=False, rank_mapping=None):
+            self.official_rearrangements += 1
+            return "official-rearrange"
 
     def rearrange_expert_weights_inplace(
         source_map,
@@ -305,3 +311,49 @@ def test_runtime_patch_loads_map_and_skips_profile_rearrangement(
     assert state.step(is_profile=True) is None
     assert state.official_profile_steps == 0
     assert state.step(is_profile=False) == "official-step"
+    assert state.step(is_dummy=True) == "official-step"
+    assert state.step(log_stats=True) == "official-step"
+    assert state.official_rearrangements == 0
+    assert len(rearrangements) == 1
+    assert not apply_to_module(module)
+    assert state.rearrange(rank_mapping={0: 0}) == "official-rearrange"
+    assert state.official_rearrangements == 1
+
+
+@pytest.mark.parametrize("record", [False, True])
+def test_non_static_eplb_still_rearranges(tmp_path: Path, record: bool) -> None:
+    module, _ = _make_eplb_module(
+        record_path=tmp_path / "record.json" if record else None,
+    )
+    apply_to_module(module)
+    state = module.EplbState()
+    assert state.step() == "official-step"
+    assert state.official_rearrangements == 1
+
+
+@pytest.mark.parametrize("mode", ["record_path", "load_path"])
+def test_offline_eplb_rejects_pp_before_registering_model(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    path = tmp_path / "map.json"
+    module, rearrangements = _make_eplb_module(**{mode: path})
+    apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config.pipeline_parallel_size = 2
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+
+    assert not state.model_states
+    assert not rearrangements
+    assert not path.exists()
+
+
+def test_online_eplb_allows_pp() -> None:
+    module, _ = _make_eplb_module()
+    apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config.pipeline_parallel_size = 2
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    assert state.model_states
