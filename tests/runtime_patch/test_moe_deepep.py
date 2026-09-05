@@ -3932,6 +3932,8 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     router.top_k = 1
     router.e_score_correction_bias = torch.ones(4)
     router.routed_scaling_factor = 1.0
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
 
     from vllm_hcu.platforms import envs as henvs
 
@@ -3940,13 +3942,16 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert router._compute_routing(None, logits, torch.int32) == "official"
 
     routed: list[tuple[torch.Tensor, torch.Tensor]] = []
+    lightop_calls: list[tuple[object, ...]] = []
+    lightop_gate_kwargs: list[dict[str, object]] = []
 
-    def moe_fused_gate(router_logits, *args):
-        del args
+    def moe_fused_gate(router_logits, *args, **kwargs):
+        lightop_calls.append((router_logits, *args))
+        lightop_gate_kwargs.append(kwargs)
         routed.append((router_logits, torch.tensor([[3]], dtype=torch.int64)))
         return torch.ones((1, 1)), routed[-1][1]
 
-    _install_lightop_moe(
+    lightop_moe = _install_lightop_moe(
         monkeypatch,
         moe_fused_gate=moe_fused_gate,
     )
@@ -3957,7 +3962,51 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     assert ids.dtype == torch.int32
     assert ids.item() == 3
     assert routed[0][0] is logits
+    assert lightop_calls[-1][-2:] == (1.0, False)
+    assert lightop_gate_kwargs[-1] == {}
 
+    # FusedMoE normalizes the router factor to 1.0 when MoERunner owns the
+    # scale; otherwise LightOp must apply the effective router factor.
+    router.routed_scaling_factor = 2.827
+    router._compute_routing(None, logits, torch.int32)
+    assert lightop_calls[-1][-2:] == (2.827, True)
+    assert lightop_gate_kwargs[-1] == {}
+
+    # The installed LightOp has no routing-capability hook, so an unsupported
+    # mode must use the official router and must not invoke the fixed
+    # sigmoid+renormalize kernel.
+    calls_before_fallback = len(lightop_calls)
+    for unsupported_scoring_func, unsupported_renormalize in (
+        ("softmax", False),
+        ("sigmoid", False),
+        ("softmax", True),
+    ):
+        router.scoring_func = unsupported_scoring_func
+        router.renormalize = unsupported_renormalize
+        assert router._compute_routing(None, logits, torch.int32) == "official"
+        assert len(lightop_calls) == calls_before_fallback
+
+    # A future LightOp can opt into the mode through the documented hook.  In
+    # that case the adapter forwards the routing options instead of requiring
+    # another vLLM condition change.
+    router.scoring_func = "softmax"
+    router.renormalize = False
+    lightop_moe.supports_moe_fused_gate_routing = (
+        lambda *, scoring_func, renormalize: (
+            scoring_func == "softmax" and not renormalize
+        )
+    )
+    router._compute_routing(None, logits, torch.int32)
+    assert len(lightop_calls) == calls_before_fallback + 1
+    assert lightop_gate_kwargs[-1] == {
+        "scoring_func": "softmax",
+        "renormalize": False,
+    }
+
+    # Restore the legacy mode so the next check exercises the categorized
+    # export ABI itself rather than the intentional routing fallback.
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
     lightop = sys.modules["lightop"]
     incomplete_moe = _module("lightop.moe")
     lightop.moe = incomplete_moe
@@ -3988,8 +4037,10 @@ import torch
 from vllm_hcu.platforms import envs as henvs
 
 calls = []
-def moe_fused_gate(*args):
+gate_kwargs = []
+def moe_fused_gate(*args, **kwargs):
     calls.append(args)
+    gate_kwargs.append(kwargs)
     return torch.full((1, 1), 0.5), torch.tensor([[2]], dtype=torch.int64)
 
 lightop = ModuleType("lightop")
@@ -4007,6 +4058,11 @@ assert spec is not None and spec.loader is not None
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+# Make the inherited official router observable for the fallback assertion.
+module.GroupedTopKRouter._compute_routing = (
+    lambda self, hidden_states, router_logits, indices_type, input_ids=None: "official"
+)
+
 router = object.__new__(module.HcuGroupedTopKRouter)
 router.num_expert_group = 2
 router.topk_group = 1
@@ -4014,6 +4070,8 @@ router.top_k = 1
 router.num_fused_shared_experts = 0
 router.e_score_correction_bias = torch.ones(4)
 router.routed_scaling_factor = 1.0
+router.scoring_func = "sigmoid"
+router.renormalize = True
 logits = torch.ones((1, 4))
 henvs.VLLM_HCU_USE_CUSTOM_OPS = True
 henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True
@@ -4021,6 +4079,35 @@ weights, ids = router._compute_routing(None, logits, torch.int32)
 torch.testing.assert_close(weights, torch.full((1, 1), 0.5))
 assert ids.item() == 2
 assert calls[0][0] is logits
+assert calls[-1][-2:] == (1.0, False)
+assert gate_kwargs[-1] == {{}}
+router.routed_scaling_factor = 2.827
+router._compute_routing(None, logits, torch.int32)
+assert calls[-1][-2:] == (2.827, True)
+assert gate_kwargs[-1] == {{}}
+calls_before_fallback = len(calls)
+for unsupported_scoring_func, unsupported_renormalize in (
+    ("softmax", False),
+    ("sigmoid", False),
+    ("softmax", True),
+):
+    router.scoring_func = unsupported_scoring_func
+    router.renormalize = unsupported_renormalize
+    assert router._compute_routing(None, logits, torch.int32) == "official"
+    assert len(calls) == calls_before_fallback
+router.scoring_func = "softmax"
+router.renormalize = False
+moe.supports_moe_fused_gate_routing = (
+    lambda *, scoring_func, renormalize: (
+        scoring_func == "softmax" and not renormalize
+    )
+)
+router._compute_routing(None, logits, torch.int32)
+assert len(calls) == calls_before_fallback + 1
+assert gate_kwargs[-1] == {{
+    "scoring_func": "softmax",
+    "renormalize": False,
+}}
 """
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
@@ -4074,6 +4161,8 @@ router.top_k = 1
 router.num_fused_shared_experts = 0
 router.e_score_correction_bias = torch.ones(4)
 router.routed_scaling_factor = 1.0
+router.scoring_func = "sigmoid"
+router.renormalize = True
 logits = torch.ones((1, 4))
 henvs.VLLM_HCU_USE_CUSTOM_OPS = True
 henvs.VLLM_HCU_USE_FUSE_MOE_GATE = True

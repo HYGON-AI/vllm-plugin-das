@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from .lightop_routing import lightop_moe_gate_kwargs
+
+
 def eplb_map_to_physical_and_record(
     module,
     original,
@@ -89,7 +92,38 @@ def make_hcu_grouped_topk_router(base_class):
                     indices_type,
                     input_ids=input_ids,
                 )
+            # Import the module first so a newer LightOp can advertise extra
+            # scoring/normalization modes without a vLLM condition change.
+            # If the optional backend is unavailable, retain the historical
+            # fail-fast behavior for the legacy mode but let unsupported modes
+            # use the official router.
+            scoring_func = getattr(self, "scoring_func", None)
+            renormalize = getattr(self, "renormalize", None)
+            try:
+                import lightop.moe as lightop_moe
+            except ImportError:
+                if scoring_func != "sigmoid" or not bool(renormalize):
+                    return super()._compute_routing(
+                        hidden_states,
+                        router_logits,
+                        indices_type,
+                        input_ids=input_ids,
+                    )
+                raise
+            gate_kwargs = lightop_moe_gate_kwargs(
+                lightop_moe,
+                scoring_func,
+                renormalize,
+            )
+            if gate_kwargs is None:
+                return super()._compute_routing(
+                    hidden_states,
+                    router_logits,
+                    indices_type,
+                    input_ids=input_ids,
+                )
             from lightop.moe import moe_fused_gate
+
             topk_weights, topk_ids = moe_fused_gate(
                 router_logits,
                 self.e_score_correction_bias,
@@ -98,6 +132,11 @@ def make_hcu_grouped_topk_router(base_class):
                 self.top_k,
                 0,
                 self.routed_scaling_factor,
+                # FusedMoE passes 1.0 to the router when MoERunner owns
+                # output scaling. Otherwise this is the effective router
+                # scale and LightOp must apply it to the routing weights.
+                self.routed_scaling_factor != 1.0,
+                **gate_kwargs,
             )
             if indices_type is not None and topk_ids.dtype != indices_type:
                 topk_ids = topk_ids.to(indices_type)
