@@ -14,7 +14,7 @@ from flash_attn import (
     vllm_flash_attn_varlen_func,
 )
 from torch import Tensor
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 
 import vllm_hcu.hcu_ops as hcu_ops
 

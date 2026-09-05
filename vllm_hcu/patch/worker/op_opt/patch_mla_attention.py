@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Strict v0.25.1 MLAAttention runtime adapter."""
+"""Strict v0.28 MLAAttention runtime adapter."""
 
 from __future__ import annotations
 
@@ -48,29 +48,37 @@ def apply_to_module(module: ModuleType) -> bool:
         original_init, TARGETS[0],
         positional=("self", "num_heads", "scale", "qk_nope_head_dim", "qk_rope_head_dim",
                     "v_head_dim", "q_lora_rank", "kv_lora_rank", "kv_b_proj",
-                    "cache_config", "quant_config", "prefix", "attn_backend",
-                    "use_sparse", "indexer", "topk_indices_buffer"),
-        defaults={"cache_config": None, "quant_config": None, "prefix": "",
+                    "dcp_q_replicate", "cache_config", "quant_config", "prefix",
+                    "attn_backend", "use_sparse", "indexer", "topk_indices_buffer",
+                    "non_causal_multi_token_decode", "sliding_window",
+                    "prefill_backend_cls"),
+        defaults={"dcp_q_replicate": False, "cache_config": None,
+                  "quant_config": None, "prefix": "",
                   "attn_backend": None, "use_sparse": False, "indexer": None,
-                  "topk_indices_buffer": None},
+                  "topk_indices_buffer": None,
+                  "non_causal_multi_token_decode": False,
+                  "sliding_window": None, "prefill_backend_cls": None},
         var_keyword="extra_impl_args",
     )
     original_full_forward = require_callable(cls, "forward", TARGETS[1])
     require_exact_signature(
         original_full_forward,
         TARGETS[1],
-        positional=("self", "q", "kv_c_normed", "k_pe", "output_shape"),
-        defaults={"output_shape": None},
+        positional=("self", "q", "kv_c_normed", "k_pe", "output_shape",
+                    "q_dcp_replicated"),
+        defaults={"output_shape": None, "q_dcp_replicated": None},
     )
     original_forward = require_callable(cls, "forward_impl", TARGETS[2])
     require_exact_signature(
         original_forward, TARGETS[2],
         positional=("self", "q", "k_c_normed", "k_pe", "kv_cache", "attn_metadata",
                     "output", "output_scale", "output_block_scale", "quant_group_size",
-                    "quant_scale_ue8m0", "quant_col_major", "quant_tma_aligned"),
+                    "quant_scale_ue8m0", "quant_col_major", "quant_tma_aligned",
+                    "q_dcp_replicated"),
         defaults={"output_scale": None, "output_block_scale": None,
                   "quant_group_size": None, "quant_scale_ue8m0": None,
-                  "quant_col_major": None, "quant_tma_aligned": None},
+                  "quant_col_major": None, "quant_tma_aligned": None,
+                  "q_dcp_replicated": None},
     )
     process = require_callable(cls, "process_weights_after_loading", TARGETS[3])
     require_exact_signature(process, TARGETS[3], positional=("self", "act_dtype"))
@@ -160,6 +168,7 @@ def apply_to_module(module: ModuleType) -> bool:
         kv_c_normed,
         k_pe,
         output_shape=None,
+        q_dcp_replicated=None,
     ):
         if not getattr(self, "_hcu_use_pcp", False):
             return original_full_forward(
@@ -168,6 +177,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 kv_c_normed,
                 k_pe,
                 output_shape,
+                q_dcp_replicated,
             )
         from vllm_hcu.model_executor.layers.attention.pcp import (
             in_replicated_mtp_batch,
@@ -180,6 +190,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 kv_c_normed,
                 k_pe,
                 output_shape,
+                q_dcp_replicated,
             )
 
         if self.calculate_kv_scales:
@@ -248,13 +259,15 @@ def apply_to_module(module: ModuleType) -> bool:
             self.kv_cache,
             attn_metadata,
             output=output,
+            q_dcp_replicated=q_dcp_replicated,
         )
         return output
 
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                     output_scale=None, output_block_scale=None, quant_group_size=None,
-                    quant_scale_ue8m0=None, quant_col_major=None, quant_tma_aligned=None):
+                    quant_scale_ue8m0=None, quant_col_major=None,
+                    quant_tma_aligned=None, q_dcp_replicated=None):
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
@@ -263,6 +276,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                 output_scale, output_block_scale, quant_group_size,
                 quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+                q_dcp_replicated,
             )
         from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
@@ -270,6 +284,7 @@ def apply_to_module(module: ModuleType) -> bool:
             mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
             output_scale, output_block_scale, quant_group_size,
             quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            q_dcp_replicated,
         )
 
     @functools.wraps(process)

@@ -103,7 +103,7 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
         ):
             del vllm_config, prefix, topk_indices_buffer, aux_stream_list
 
-        def attn_gemm_parallel_execute(self, hidden_states):
+        def _run_parallel_input_projections(self, hidden_states):
             return hidden_states
 
         def forward(self, positions, hidden_states, llama_4_scaling=None):
@@ -180,7 +180,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
             del prefix, topk_indices_buffer, aux_stream_list
             seen_ignore.append(list(vllm_config.quant_config.ignore))
 
-        def attn_gemm_parallel_execute(self, hidden_states):
+        def _run_parallel_input_projections(self, hidden_states):
             return hidden_states
 
         def forward(self, positions, hidden_states, llama_4_scaling=None):
@@ -474,7 +474,7 @@ def test_load_weights_rejects_stale_patch_marker() -> None:
 
 def test_attention_patch_rejects_incompatible_forward_signature() -> None:
     class DeepseekV4Attention:
-        def attn_gemm_parallel_execute(self):
+        def _run_parallel_input_projections(self):
             return None
 
     module = _module(

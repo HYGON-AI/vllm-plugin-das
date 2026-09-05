@@ -23,7 +23,7 @@ if "MAX_JOBS" not in os.environ:
 # 基础路径
 # =========================================================
 ROOT = Path(__file__).parent.resolve()
-BASE_VERSION = "0.25.1"
+BASE_VERSION = "0.28.0"
 
 ADD_GIT_VERSION = os.environ.get("ADD_GIT_VERSION", "1") == "1"
 

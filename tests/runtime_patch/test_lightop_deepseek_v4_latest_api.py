@@ -148,12 +148,12 @@ def _core_fix_instance(
         ):
             del vllm_config, prefix, topk_indices_buffer, aux_stream_list
 
-        def attn_gemm_parallel_execute(self, hidden_states):
+        def _run_parallel_input_projections(self, hidden_states):
             return hidden_states
 
         def forward(self, positions, hidden_states, llama_4_scaling=None):
             del llama_4_scaling
-            qr_kv, *_ = self.attn_gemm_parallel_execute(hidden_states)
+            qr_kv, *_ = self._run_parallel_input_projections(hidden_states)
             qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
             qr = self.q_norm(qr)
             kv = self.kv_norm(kv)
@@ -235,7 +235,7 @@ def test_core_fix_forward_applies_kv_norm_exactly_once_in_uint8_kernel(
         [[1.0, 2.0, 10.0, 20.0, 30.0, 40.0],
          [3.0, 4.0, 50.0, 60.0, 70.0, 80.0]]
     )
-    instance.attn_gemm_parallel_execute = lambda _hidden: (
+    instance._run_parallel_input_projections = lambda _hidden: (
         raw_qr_kv,
         None,
         None,
@@ -252,10 +252,11 @@ def test_core_fix_forward_applies_kv_norm_exactly_once_in_uint8_kernel(
 
     instance.kv_norm = KvNorm()
 
-    def attention_impl(
+    def prepare_and_attn(
         _hidden_states,
         q,
         kv,
+        _qr_scale,
         _kv_score,
         _indexer_kv_score,
         _indexer_weights,
@@ -267,7 +268,7 @@ def test_core_fix_forward_applies_kv_norm_exactly_once_in_uint8_kernel(
         )
         out.zero_()
 
-    instance.attention_impl = attention_impl
+    instance._prepare_and_attn_fn = prepare_and_attn
     instance._o_proj = lambda out, _positions: out
 
     instance.forward(positions.to(torch.int64), torch.zeros((2, 6)))
@@ -302,7 +303,7 @@ def test_core_fix_forward_normalizes_kv_when_delegating_non_uint8_cache(
             [3.0, 4.0, 50.0, 60.0, 70.0, 80.0],
         ]
     )
-    instance.attn_gemm_parallel_execute = lambda _hidden: (
+    instance._run_parallel_input_projections = lambda _hidden: (
         raw_qr_kv,
         None,
         None,
@@ -320,10 +321,11 @@ def test_core_fix_forward_normalizes_kv_when_delegating_non_uint8_cache(
 
     instance.kv_norm = KvNorm()
 
-    def attention_impl(
+    def prepare_and_attn(
         _hidden_states,
         q,
         kv,
+        _qr_scale,
         _kv_score,
         _indexer_kv_score,
         _indexer_weights,
@@ -335,7 +337,7 @@ def test_core_fix_forward_normalizes_kv_when_delegating_non_uint8_cache(
         )
         out.zero_()
 
-    instance.attention_impl = attention_impl
+    instance._prepare_and_attn_fn = prepare_and_attn
     instance._o_proj = lambda out, _positions: out
 
     instance.forward(positions.to(torch.int64), torch.zeros((2, 6)))

@@ -20,15 +20,20 @@ from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_VLLM_SPEC = importlib.util.find_spec("vllm")
+assert _VLLM_SPEC is not None and _VLLM_SPEC.origin is not None
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
+    os.environ.get(
+        "VLLM_V028_SOURCE_ROOT",
+        Path(_VLLM_SPEC.origin).resolve().parent.parent,
+    )
 ).resolve()
 # Prefer a checkout-local environment when one exists.  Source-only target
 # checkouts use the current interpreter's matching binary-extension view.
 _CHECKOUT_PYTHON = TARGET_VLLM_ROOT / ".venv/bin/python"
 TARGET_PYTHON = Path(
     os.environ.get(
-        "VLLM_V0251_PYTHON",
+        "VLLM_V028_PYTHON",
         _CHECKOUT_PYTHON if _CHECKOUT_PYTHON.is_file() else sys.executable,
     )
 )
@@ -39,7 +44,7 @@ def _adapter(name: str):
     return importlib.import_module(f"vllm_hcu.patch.worker.op_opt.{name}")
 
 
-def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_v028(code: str) -> subprocess.CompletedProcess[str]:
     assert (TARGET_VLLM_ROOT / "vllm/__init__.py").is_file()
     assert TARGET_PYTHON.is_file()
     env = dict(os.environ)
@@ -48,7 +53,7 @@ def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
             "VLLM_PLUGINS": "__disabled__",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "VLLM_V0251_SOURCE_ROOT": str(TARGET_VLLM_ROOT),
+            "VLLM_V028_SOURCE_ROOT": str(TARGET_VLLM_ROOT),
             "VLLM_HCU_SOURCE_ROOT": str(REPO_ROOT),
             "VLLM_USE_NN": "1",
             "VLLM_HCU_USE_CUSTOM_OPS": "0",
@@ -128,6 +133,7 @@ def _causal_update_contract(
     block_idx_last_scheduled_token=None,
     initial_state_idx=None,
     validate_data=False,
+    out=None,
 ):
     del (
         x,
@@ -142,6 +148,7 @@ def _causal_update_contract(
         block_idx_last_scheduled_token,
         initial_state_idx,
         validate_data,
+        out,
     )
     return weight
 
@@ -465,8 +472,8 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
         adapter.apply_to_module(bad_module)
 
 
-def test_real_v0251_cold_import_scopes_gdn_deltas_to_qwen():
-    result = _run_fresh_v0251(
+def test_real_v028_cold_import_scopes_gdn_deltas_to_qwen():
+    result = _run_fresh_v028(
         r'''\
 import importlib
 import json
@@ -479,7 +486,7 @@ import vllm_hcu
 import vllm.platforms as platforms
 from vllm.platforms.interface import UnspecifiedPlatform
 
-source_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+source_root = Path(os.environ["VLLM_V028_SOURCE_ROOT"]).resolve()
 hcu_root = Path(os.environ["VLLM_HCU_SOURCE_ROOT"]).resolve()
 assert Path(vllm.__file__).resolve() == source_root / "vllm/__init__.py"
 assert Path(vllm_hcu.__file__).resolve() == hcu_root / "vllm_hcu/__init__.py"
@@ -510,7 +517,7 @@ prepare_worker_patches()
 qwen = importlib.import_module(qwen_name)
 canonical = importlib.import_module(canonical_name)
 base = importlib.import_module(base_name)
-fla = importlib.import_module("vllm.model_executor.layers.fla.ops")
+fla = importlib.import_module("vllm.third_party.flash_linear_attention.ops")
 
 assert Path(qwen.__file__).resolve() == (
     source_root
@@ -566,12 +573,12 @@ report = patch_report()["patches"]
 statuses = {patch_id: report[patch_id]["status"] for patch_id in ids}
 assert set(statuses.values()) == {"applied"}
 print(json.dumps({
-    "sentinel": "GDN_V0251_OWNERSHIP_OK",
+    "sentinel": "GDN_V028_OWNERSHIP_OK",
     "statuses": statuses,
 }, sort_keys=True))
 '''
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["sentinel"] == "GDN_V0251_OWNERSHIP_OK"
+    assert payload["sentinel"] == "GDN_V028_OWNERSHIP_OK"
     assert set(payload["statuses"].values()) == {"applied"}

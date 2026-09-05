@@ -952,12 +952,12 @@ def test_aiter_and_triton_expert_capability_contract(
                 hidden_states, w1, w2, topk_weights, topk_ids, moe_config,
                 activation=MoEActivation.SILU,
                 apply_router_weight_on_input=False,
-                expert_map=None, quant_config=None, a1q_scale=None,
+                expert_mask=None, quant_config=None, a1q_scale=None,
                 num_local_tokens=None, output_dtype=None,
                 moe_sorting_dispatch_policy=0,
             ):
                 del hidden_states, w1, w2, topk_weights, topk_ids, moe_config
-                del apply_router_weight_on_input, expert_map, quant_config
+                del apply_router_weight_on_input, expert_mask, quant_config
                 del a1q_scale, num_local_tokens, output_dtype
                 del moe_sorting_dispatch_policy
                 if activation == MoEActivation.SILU:
@@ -1495,15 +1495,6 @@ def test_modular_method_dimensions_and_prequant_contract():
             self.moe_kernel = moe_kernel
             self.disable_expert_map = False
 
-        @staticmethod
-        def make(
-            routed_experts,
-            old_quant_method,
-            prepare_finalize,
-        ):
-            del routed_experts, old_quant_method, prepare_finalize
-            return None
-
         def apply(
             self,
             layer,
@@ -1667,9 +1658,11 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "num_expert_group", "topk_group", "quant_config", "tp_size", "dp_size",
         "pcp_size", "prefix", "custom_routing_function", "router", "scoring_func",
         "routed_scaling_factor", "swiglu_limit", "swiglu_alpha", "swiglu_beta",
+        "activation_situ_beta", "activation_situ_linear_beta",
         "e_score_correction_bias", "apply_router_weight_on_input", "activation",
         "enable_eplb", "num_redundant_experts", "has_bias",
-        "is_sequence_parallel", "reduce_results", "ckpt_names", "n_shared_experts",
+        "is_sequence_parallel", "reduce_results", "ckpt_names",
+        "is_fused_checkpoint_transposed", "n_shared_experts", "fuse_shared_experts",
         "router_logits_dtype", "gate", "shared_experts", "shared_expert_gate",
         "routed_input_transform", "routed_output_transform",
         "apply_routed_scale_to_output", "zero_expert_type", "hash_indices_table",
@@ -1725,14 +1718,14 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         Runner=Runner,
     )
     source = (
-        "def FusedMoE("
+        "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
         + "):\n    return Runner()\n"
     )
     exec(source, layer_module.__dict__)
     fused_moe_package = _module(
         "vllm.model_executor.layers.fused_moe",
-        FusedMoE=layer_module.FusedMoE,
+        FusedMoEFactory=layer_module.FusedMoEFactory,
         UnquantizedFusedMoEMethod=UnquantizedFusedMoEMethod,
         RoutedExperts=RoutedExperts,
     )
@@ -1763,7 +1756,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     monkeypatch.setitem(sys.modules, hcu_module_name, hcu_module)
 
     assert patch_layer.apply_to_module(fused_moe_package) is True
-    assert fused_moe_package.FusedMoE is layer_module.FusedMoE
+    assert fused_moe_package.FusedMoEFactory is layer_module.FusedMoEFactory
+    assert fused_moe_package.FusedMoE is fused_moe_package.FusedMoEFactory
     runner = fused_moe_package.FusedMoE()
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
@@ -2249,7 +2243,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         experts_cls,
         fp8_backend,
         routing_tables=None,
-        layer=None,
     ):
         del (
             moe_quant_config,
@@ -2257,7 +2250,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
             experts_cls,
             fp8_backend,
             routing_tables,
-            layer,
         )
         return "official-kernel"
 
@@ -2404,7 +2396,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         SupportedExperts,
         backend,
         "routing",
-        "layer",
     ) == "official-kernel"
     assert explicit_quant._vllm_hcu_channel_fp8_deepgemm is True
 
@@ -2435,7 +2426,6 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         auto_experts,
         auto_backend,
         "routing",
-        "layer",
     ) == "deepep-auto-kernel"
     assert auto_quant._vllm_hcu_channel_fp8_deepgemm is True
     assert auto_kernel_calls == [(auto_quant, auto_config, "routing")]
@@ -3298,6 +3288,7 @@ def test_slimquant_w4a8_auto_reloads_raw_weights_into_existing_owner(
     from vllm.model_executor.model_loader.reload.layerwise import (
         _copy_and_restore_kernel_tensors,
     )
+    from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
 
     pack_calls, _ = _install_in_place_w4a8_packers(monkeypatch)
     layer = _slimquant_w4a8_auto_layer()
@@ -3323,7 +3314,11 @@ def test_slimquant_w4a8_auto_reloads_raw_weights_into_existing_owner(
     replacement.process_weights_after_loading(layer)
     _copy_and_restore_kernel_tensors(
         layer,
-        SimpleNamespace(kernel_tensors=(kernel_parameters, {})),
+        LayerReloadingInfo(
+            restore_metadata=({}, {}),
+            restore_device=torch.device("cpu"),
+            kernel_tensors=(kernel_parameters, {}),
+        ),
     )
 
     assert len(pack_calls) == 4

@@ -14,7 +14,7 @@ def _coordinator_module() -> ModuleType:
             self,
             kv_cache_config,
             max_model_len,
-            max_num_batched_tokens,
+            max_in_flight_tokens,
             use_eagle,
             enable_caching,
             enable_kv_cache_events,
@@ -23,10 +23,11 @@ def _coordinator_module() -> ModuleType:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
+            num_prefill_lookahead=0,
         ):
             del (
                 max_model_len,
-                max_num_batched_tokens,
+                max_in_flight_tokens,
                 enable_caching,
                 enable_kv_cache_events,
                 dcp_world_size,
@@ -35,6 +36,7 @@ def _coordinator_module() -> ModuleType:
                 hash_block_size,
                 metrics_collector,
             )
+            self.num_prefill_lookahead = num_prefill_lookahead
             self.eagle_group_ids = {
                 index
                 for index, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -71,6 +73,7 @@ def _construct(module: ModuleType, config: SimpleNamespace):
         1,
         64,
         64,
+        num_prefill_lookahead=3,
     )
 
 
@@ -82,7 +85,9 @@ def test_mtp_indexer_group_skips_only_unmarked_all_group_eagle_fallback():
     combined = _config(
         (["model.layers.0.self_attn.indexer", "model.layers.61.mtp"], False)
     )
-    assert _construct(module, combined).eagle_group_ids == set()
+    combined_coordinator = _construct(module, combined)
+    assert combined_coordinator.eagle_group_ids == set()
+    assert combined_coordinator.num_prefill_lookahead == 3
 
     generic = _config((["model.layers.0.self_attn"], False))
     assert _construct(module, generic).eagle_group_ids == {0}

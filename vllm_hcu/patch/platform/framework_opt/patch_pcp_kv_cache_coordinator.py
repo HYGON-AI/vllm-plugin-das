@@ -26,7 +26,7 @@ _PARAMETERS = (
     "self",
     "kv_cache_config",
     "max_model_len",
-    "max_num_batched_tokens",
+    "max_in_flight_tokens",
     "use_eagle",
     "enable_caching",
     "enable_kv_cache_events",
@@ -35,6 +35,7 @@ _PARAMETERS = (
     "scheduler_block_size",
     "hash_block_size",
     "metrics_collector",
+    "num_prefill_lookahead",
 )
 
 
@@ -63,9 +64,11 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         or any(
             parameter.default
-            is not (
+            != (
                 None
                 if parameter.name == "metrics_collector"
+                else 0
+                if parameter.name == "num_prefill_lookahead"
                 else inspect.Parameter.empty
             )
             for parameter in parameters
@@ -90,7 +93,7 @@ def apply_to_module(module: ModuleType) -> bool:
         self,
         kv_cache_config,
         max_model_len,
-        max_num_batched_tokens,
+        max_in_flight_tokens,
         use_eagle,
         enable_caching,
         enable_kv_cache_events,
@@ -99,13 +102,14 @@ def apply_to_module(module: ModuleType) -> bool:
         scheduler_block_size,
         hash_block_size,
         metrics_collector=None,
+        num_prefill_lookahead=0,
     ):
         if pcp_world_size == 1:
             return original(
                 self,
                 kv_cache_config,
                 max_model_len,
-                max_num_batched_tokens,
+                max_in_flight_tokens,
                 use_eagle,
                 enable_caching,
                 enable_kv_cache_events,
@@ -114,12 +118,13 @@ def apply_to_module(module: ModuleType) -> bool:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_prefill_lookahead,
             )
 
         super(unitary, self).__init__(
             kv_cache_config,
             max_model_len,
-            max_num_batched_tokens,
+            max_in_flight_tokens,
             use_eagle,
             enable_caching,
             enable_kv_cache_events,
@@ -128,6 +133,7 @@ def apply_to_module(module: ModuleType) -> bool:
             scheduler_block_size,
             hash_block_size,
             metrics_collector,
+            num_prefill_lookahead,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size

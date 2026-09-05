@@ -60,6 +60,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "unique_name",
             "global_ranks",
             "global_world_size",
+            "use_all2all",
         ),
         defaults={
             "device": None,
@@ -67,6 +68,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "unique_name": "",
             "global_ranks": None,
             "global_world_size": None,
+            "use_all2all": False,
         },
     )
     # This method is the stable insertion anchor for the runtime adapter.
@@ -89,6 +91,7 @@ def apply_to_module(module: ModuleType) -> bool:
         unique_name="",
         global_ranks=None,
         global_world_size=None,
+        use_all2all=False,
     ):
         original_init(
             self,
@@ -98,6 +101,7 @@ def apply_to_module(module: ModuleType) -> bool:
             unique_name,
             global_ranks,
             global_world_size,
+            use_all2all,
         )
         from vllm.config import get_current_vllm_config_or_none
 

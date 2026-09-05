@@ -69,6 +69,7 @@ def _vllm_config(
             block_size=block_size,
             enable_prefix_caching=enable_prefix_caching,
             hash_block_size=hash_block_size,
+            prefix_match_unit=None,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp,
@@ -200,6 +201,8 @@ def test_full_attention_hash_lookup_uses_dcp_only(
     cached = [object(), object()]
 
     class BlockPool:
+        hash_block_size = 16
+
         def get_cached_block(self, block_hash, kv_cache_group_ids):
             del kv_cache_group_ids
             return [cached[int(block_hash)]]
@@ -216,7 +219,7 @@ def test_full_attention_hash_lookup_uses_dcp_only(
         pcp_world_size=pcp,
     )
 
-    assert len(hits[0]) == expected_hits
+    assert len(hits[0][0]) == expected_hits
 
 
 @pytest.mark.parametrize(
@@ -227,13 +230,13 @@ def test_unitary_coordinator_block_size_is_dcp_only(
     monkeypatch, patched_cache_modules, dcp, pcp, expected_block_size
 ):
     coordinator_module = patched_cache_modules.coordinator
-    base_calls: list[tuple[int, int]] = []
+    base_calls: list[tuple[int, int, int]] = []
 
     def base_init(
         self,
         kv_cache_config,
         max_model_len,
-        max_num_batched_tokens,
+        max_in_flight_tokens,
         use_eagle,
         enable_caching,
         enable_kv_cache_events,
@@ -242,10 +245,11 @@ def test_unitary_coordinator_block_size_is_dcp_only(
         scheduler_block_size,
         hash_block_size,
         metrics_collector=None,
+        num_prefill_lookahead=0,
     ):
         del (
             max_model_len,
-            max_num_batched_tokens,
+            max_in_flight_tokens,
             use_eagle,
             enable_caching,
             enable_kv_cache_events,
@@ -253,10 +257,18 @@ def test_unitary_coordinator_block_size_is_dcp_only(
             hash_block_size,
             metrics_collector,
         )
-        base_calls.append((dcp_world_size, pcp_world_size))
+        base_calls.append(
+            (dcp_world_size, pcp_world_size, num_prefill_lookahead)
+        )
         self.kv_cache_config = kv_cache_config
         self.eagle_group_ids = set()
-        self.single_type_managers = [SimpleNamespace(use_eagle=False)]
+        self.single_type_managers = [
+            SimpleNamespace(
+                use_eagle=False,
+                dcp_world_size=dcp_world_size,
+                block_size=expected_block_size,
+            )
+        ]
 
     monkeypatch.setattr(coordinator_module.KVCacheCoordinator, "__init__", base_init)
     coordinator = coordinator_module.UnitaryKVCacheCoordinator(
@@ -270,12 +282,13 @@ def test_unitary_coordinator_block_size_is_dcp_only(
         pcp,
         expected_block_size,
         expected_block_size,
+        num_prefill_lookahead=3,
     )
 
     assert coordinator.block_size == expected_block_size
     assert coordinator.dcp_world_size == dcp
     assert coordinator.pcp_world_size == pcp
-    assert base_calls == [(dcp, pcp)]
+    assert base_calls == [(dcp, pcp, 3)]
 
 
 @pytest.mark.parametrize(
@@ -297,12 +310,17 @@ def test_mrv2_block_table_capacity_already_depends_on_dcp_only(
             captured.update(kwargs)
             raise StopAfterBlockTables
 
+    attn_cg_support = SimpleNamespace(
+        min_cg_support=None,
+        min_cg_attn_backend=None,
+    )
+    attn_cg_support.narrow = lambda *args: attn_cg_support
     monkeypatch.setattr(
         model_runner,
         "init_attn_backend",
         lambda *args, **kwargs: (
             [],
-            SimpleNamespace(min_cg_support=None, min_cg_attn_backend=None),
+            attn_cg_support,
             [64],
         ),
     )
@@ -317,11 +335,20 @@ def test_mrv2_block_table_capacity_already_depends_on_dcp_only(
     runner.dcp_size = dcp
     runner.dcp_rank = 0
     runner.cp_interleave = 1
+    runner.speculator = None
+    runner.model_state = SimpleNamespace(
+        get_additional_cg_support=lambda: (),
+        num_new_sampled_tokens_per_step=1,
+    )
+    runner.req_states = object()
+    runner.input_buffers = SimpleNamespace(query_start_loc=object())
+    runner.vocab_size = 1
     runner.parallel_config = SimpleNamespace(
         decode_context_parallel_size=dcp,
         prefill_context_parallel_size=pcp,
+        cp_kv_cache_interleave_size=1,
     )
-    runner.vllm_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(parallel_config=runner.parallel_config)
 
     with pytest.raises(StopAfterBlockTables):
         model_runner.GPUModelRunner.initialize_kv_cache(
@@ -468,6 +495,7 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
             scheduler_block_size,
             dcp_world_size=1,
             pcp_world_size=1,
+            needs_kv_cache_zeroing=False,
             max_admission_blocks_per_request=None,
         ):
             del (
@@ -477,6 +505,7 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
                 kv_cache_group_id,
                 scheduler_block_size,
                 dcp_world_size,
+                needs_kv_cache_zeroing,
                 max_admission_blocks_per_request,
             )
             calls.append(("manager", pcp_world_size))
@@ -527,7 +556,7 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
             self,
             kv_cache_config,
             max_model_len,
-            max_num_batched_tokens,
+            max_in_flight_tokens,
             use_eagle,
             enable_caching,
             enable_kv_cache_events,
@@ -536,12 +565,13 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
+            num_prefill_lookahead=0,
         ):
             del (
                 self,
                 kv_cache_config,
                 max_model_len,
-                max_num_batched_tokens,
+                max_in_flight_tokens,
                 use_eagle,
                 enable_caching,
                 enable_kv_cache_events,
@@ -549,6 +579,7 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_prefill_lookahead,
             )
             calls.append(("coordinator", pcp_world_size))
 

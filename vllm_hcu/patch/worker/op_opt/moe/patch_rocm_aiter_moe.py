@@ -144,7 +144,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (
             "hidden_states", "w1", "w2", "topk_weights", "topk_ids",
             "moe_config", "activation", "apply_router_weight_on_input",
-            "expert_map", "quant_config", "a1q_scale", "num_local_tokens",
+            "expert_mask", "quant_config", "a1q_scale", "num_local_tokens",
             "output_dtype", "moe_sorting_dispatch_policy",
         ),
     )
@@ -237,7 +237,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     apply_router_weight_on_input=arguments[
                         "apply_router_weight_on_input"
                     ],
-                    expert_map=arguments.get("expert_map"),
+                    expert_map=arguments.get("expert_mask"),
                     quant_config=quant_config,
                     a1q_scale=arguments.get("a1q_scale"),
                     num_local_tokens=arguments["num_local_tokens"],

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Extend vLLM's v0.25 INT8 oracle for HCU AITER and DeepGEMM kernels."""
+"""Extend vLLM's v0.28 INT8 oracle for HCU AITER and DeepGEMM kernels."""
 
 from __future__ import annotations
 
@@ -118,7 +118,6 @@ def apply_to_module(module: ModuleType) -> bool:
             "moe_config",
             "experts_cls",
             "routing_tables",
-            "layer",
         ),
     )
 
@@ -299,22 +298,7 @@ def apply_to_module(module: ModuleType) -> bool:
         moe_config,
         experts_cls,
         routing_tables=None,
-        layer=None,
     ):
-        if int8_backend == hcu_enum.AITER:
-            if layer is None:
-                raise RuntimeError(
-                    "AITER INT8 MoE model-load prewarm requires the MoE layer"
-                )
-            from vllm_hcu.model_executor.layers.quantization import (
-                compressed_tensors_moe_runtime as hcu_runtime,
-            )
-
-            hcu_runtime.prewarm_aiter_quantized_moe(
-                layer,
-                moe_config,
-                moe_quant_config,
-            )
         if getattr(
             moe_config.moe_parallel_config,
             "use_deepep_auto_kernels",
@@ -334,15 +318,6 @@ def apply_to_module(module: ModuleType) -> bool:
                 moe_config=moe_config,
                 routing_tables=routing_tables,
             )
-            fused_experts = getattr(moe_kernel, "fused_experts", None)
-            experts = getattr(fused_experts, "experts", fused_experts)
-            process = getattr(experts, "process_weights_after_loading", None)
-            if layer is None or not callable(process):
-                raise RuntimeError(
-                    "deepep_auto HCU DeepGEMM INT8 kernel did not construct "
-                    "modular experts before weight postprocessing"
-                )
-            process(layer)
             return moe_kernel
         return make_kernel(
             int8_backend,
@@ -350,7 +325,6 @@ def apply_to_module(module: ModuleType) -> bool:
             moe_config,
             experts_cls,
             routing_tables,
-            layer,
         )
 
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls

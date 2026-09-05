@@ -67,6 +67,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "non_block",
             "unique_reply_rank",
             "kv_output_aggregator",
+            "ec_output_aggregator",
         ),
     )
     future_wrapper = require_class(target, "FutureWrapper", TARGETS[3])

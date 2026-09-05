@@ -250,6 +250,11 @@ class HCUPlatform(Platform):
             import vllm._rocm_C  # noqa: F401
 
     @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        """Allow the v0.28 runner to bind multiple caches per layer index."""
+        pass
+
+    @classmethod
     def get_valid_backends(
         cls,
         device_capability: DeviceCapability,

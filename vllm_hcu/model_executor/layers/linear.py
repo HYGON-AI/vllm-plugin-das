@@ -16,6 +16,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from typing_extensions import TypeIs
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -26,7 +27,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
-from vllm.model_executor.layers.batch_invariant import (
+from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
 )
 from vllm.model_executor.layers.quantization.base_config import (
@@ -516,10 +517,20 @@ class ColumnParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
     ):
         # Divide the weight matrix along the last dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.tp_rank = (
+            (get_tensor_model_parallel_rank() if tp_rank is None else tp_rank)
+            if not disable_tp
+            else 0
+        )
+        self.tp_size = (
+            (get_tensor_model_parallel_world_size() if tp_size is None else tp_size)
+            if not disable_tp
+            else 1
+        )
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -687,6 +698,33 @@ class ColumnParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", gather_output={self.gather_output}"
         return s
+
+
+class DCPGroupColumnParallelLinear(ColumnParallelLinear):
+    """Column-parallel linear sharded across DCP groups instead of ranks."""
+
+    def __init__(self, *args, **kwargs):
+        dcp_world_size = (
+            get_current_vllm_config().parallel_config.decode_context_parallel_size
+        )
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+        self.group_size = max(dcp_world_size, 1)
+        self.qrep_active = self.group_size > 1
+        self.rank_in_group = rank % self.group_size
+        super().__init__(
+            *args,
+            **kwargs,
+            tp_rank=rank // self.group_size,
+            tp_size=world_size // self.group_size,
+        )
+
+    def _local_view(self, out: torch.Tensor) -> torch.Tensor:
+        if self.group_size == 1:
+            return out
+        n = out.shape[-2] // self.group_size
+        start = self.rank_in_group * n
+        return out[..., start : start + n, :].contiguous()
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):

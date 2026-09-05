@@ -52,10 +52,10 @@ def _install_version(
 @pytest.mark.parametrize(
     "value",
     (
-        "0.25.1",
-        "0.25.9",
-        "0.25.1+das.5bf5c5f.dtk2604",
-        "0.25.1.post2",
+        "0.28.0",
+        "0.28.9",
+        "0.28.0+das.5bf5c5f.dtk2604",
+        "0.28.0.post2",
     ),
 )
 def test_supported_vllm_series_accepts_pep440_variants(
@@ -68,7 +68,7 @@ def test_supported_vllm_series_accepts_pep440_variants(
     result = compatibility.ensure_vllm_compatible()
 
     assert result.compatible
-    assert result.expected == "0.25.x"
+    assert result.expected == "0.28.x"
     assert result.actual_version == value
     assert result.vllm_location == str((tmp_path / "site-packages").resolve())
 
@@ -78,8 +78,8 @@ def test_supported_vllm_series_accepts_pep440_variants(
     (
         "0.20.2",
         "0.22.0",
-        "0.24.1+das.local",
-        "1!0.25.1",
+        "0.25.1+das.local",
+        "1!0.28.0",
         "not a version",
     ),
 )
@@ -94,7 +94,7 @@ def test_unsupported_or_invalid_vllm_metadata_has_actionable_error(
         compatibility.ensure_vllm_compatible()
 
     message = str(raised.value)
-    assert "expected=0.25.x" in message
+    assert "expected=0.28.x" in message
     assert f"actual={value!r}" in message
     assert "vllm_hcu=" in message
     assert "vllm_location=" in message
@@ -122,9 +122,9 @@ def test_runtime_hcu_version_prefers_metadata_with_source_fallback(
     monkeypatch.setattr(
         hcu_version.importlib_metadata,
         "version",
-        lambda name: "0.25.1+das.abcdef0.dtk2604",
+        lambda name: "0.28.0+das.abcdef0.dtk2604",
     )
-    assert hcu_version.get_hcu_version() == "0.25.1+das.abcdef0.dtk2604"
+    assert hcu_version.get_hcu_version() == "0.28.0+das.abcdef0.dtk2604"
 
     def missing(name: str):
         raise hcu_version.importlib_metadata.PackageNotFoundError(name)
@@ -160,7 +160,7 @@ def test_all_plugin_entries_gate_and_platform_probe_latches_compatibility(
 ) -> None:
     _install_version(monkeypatch, tmp_path, "0.24.0")
 
-    # vLLM v0.25.1 probes the platform plugin under a broad exception handler.
+    # vLLM probes the platform plugin under a broad exception handler.
     # Preserve selection once, then surface the exact compatibility class.
     assert plugin.hcu_platform_plugin() == plugin._PLATFORM_CLASS_PATH
     with pytest.raises(

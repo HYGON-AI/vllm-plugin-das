@@ -124,7 +124,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         super().__init__(vllm_config, device)
         self.pcp_manager = None
 
-    def initialize_kv_cache(self, kv_cache_config):
+    def initialize_kv_cache(
+        self,
+        kv_cache_config,
+        is_profiling=False,
+        kv_cache_allocation_context=None,
+    ):
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
@@ -132,7 +137,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
-        super().initialize_kv_cache(kv_cache_config)
+        super().initialize_kv_cache(
+            kv_cache_config,
+            is_profiling=is_profiling,
+            kv_cache_allocation_context=kv_cache_allocation_context,
+        )
         if pcp_size > 1:
             self.pcp_manager = maybe_build_pcp_manager(
                 self.vllm_config,
@@ -141,8 +150,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self.block_tables,
             )
 
-    def prepare_inputs(self, scheduler_output, batch_desc):
-        input_batch = super().prepare_inputs(scheduler_output, batch_desc)
+    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        input_batch = super().prepare_inputs(
+            scheduler_output,
+            batch_req_state,
+            batch_desc,
+        )
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch)
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)

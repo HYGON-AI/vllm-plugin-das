@@ -94,8 +94,9 @@ def mla_forward_impl(
     quant_scale_ue8m0=None,
     quant_col_major=None,
     quant_tma_aligned=None,
+    q_dcp_replicated=None,
 ):
-    """v0.25.1 target MLA forward plus HCU Lightly-CP KV length and CAT support."""
+    """v0.28 target MLA forward plus HCU Lightly-CP KV length and CAT support."""
 
     quant_key = upstream._detect_output_quant_key(
         output, output_scale, output_block_scale, self.num_heads * self.v_head_dim
@@ -125,11 +126,13 @@ def mla_forward_impl(
     output_padded = output
     output = output[:num_actual_toks, ...]
     q = q[:num_actual_toks, ...]
+    if q_dcp_replicated is not None:
+        q_dcp_replicated = q_dcp_replicated[:num_actual_toks, ...]
     k_c_normed = k_c_normed[:num_kv_actual_toks, ...]
     k_pe = k_pe[:num_kv_actual_toks, ...]
     if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
         kv_cache = kv_cache.view(upstream.current_platform.fp8_dtype())
-    is_sparse_impl = isinstance(self.impl, upstream.SparseMLAAttentionImpl)
+    is_sparse_impl = bool(getattr(self.impl, "is_sparse", False))
     if is_sparse_impl:
         num_mqa_tokens, num_mha_tokens = q.size(0), 0
     else:
@@ -147,7 +150,12 @@ def mla_forward_impl(
             output=output[num_mqa_tokens:],
         )
     if num_mqa_tokens > 0:
-        mqa_q = q[:num_mqa_tokens]
+        if q_dcp_replicated is not None:
+            mqa_q = q_dcp_replicated[:num_mqa_tokens]
+            qrep_decode = True
+        else:
+            mqa_q = q[:num_mqa_tokens]
+            qrep_decode = False
         mqa_output_slice = output[:num_mqa_tokens]
         mqa_q_nope, mqa_q_pe = mqa_q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -173,13 +181,16 @@ def mla_forward_impl(
             )
         else:
             N, B, _ = mqa_q_nope.shape
-            L = self.W_UK_T.shape[-1]
+            W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
+            if W_UK_T is None:
+                raise RuntimeError("HCU MLA DCP query-replication weights are missing")
+            L = W_UK_T.shape[-1]
             if self.q_pad_num_heads is not None:
                 mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                 mqa_ql_nope.resize_((N, B, L))
             else:
                 mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-            torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+            torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
             mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
         from vllm_hcu.platforms.hcu import on_gfx938
 

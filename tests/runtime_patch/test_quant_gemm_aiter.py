@@ -1317,7 +1317,6 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         moe_config,
         experts_cls,
         routing_tables=None,
-        layer=None,
     ):
         del (
             int8_backend,
@@ -1325,7 +1324,6 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
             moe_config,
             experts_cls,
             routing_tables,
-            layer,
         )
         return "official-int8-kernel"
 
@@ -1478,13 +1476,6 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     assert quant_config.per_act_token_quant is True
     assert quant_config.a1_scale is None
     assert quant_config.a2_scale is None
-    prewarm_calls: list[tuple[object, object, object]] = []
-    monkeypatch.setattr(
-        compressed_tensors_moe_runtime,
-        "prewarm_aiter_quantized_moe",
-        lambda layer, moe, quant: prewarm_calls.append((layer, moe, quant)),
-    )
-    aiter_layer = _fp8_moe_layer()
     aiter_moe_config = SimpleNamespace(
         experts_per_token=2,
         in_dtype=torch.bfloat16,
@@ -1498,9 +1489,7 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
         quant_config,
         aiter_moe_config,
         AiterExperts,
-        layer=aiter_layer,
     ) == "official-int8-kernel"
-    assert prewarm_calls == [(aiter_layer, aiter_moe_config, quant_config)]
 
     config = SimpleNamespace(
         moe_backend="deep_gemm",
@@ -1555,17 +1544,15 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     assert auto_experts is DeepEPAutoInt8Experts
     config.moe_parallel_config.use_deepep_auto_kernels = True
     auto_quant_config = SimpleNamespace()
-    auto_layer = SimpleNamespace()
     assert target.make_int8_moe_kernel(
         auto_backend,
         auto_quant_config,
         config,
         auto_experts,
         routing_tables="routing",
-        layer=auto_layer,
     ) is auto_kernel
     assert auto_kernel_calls == [(auto_quant_config, config, "routing")]
-    assert auto_processed_layers == [auto_layer]
+    assert auto_processed_layers == []
 
     config._hcu_vllm_config.model_config.architectures = [
         "GlmMoeDsaForCausalLM"
@@ -8314,8 +8301,10 @@ def test_marlin_aiter_moe_config_fault_does_not_fallback(
 def test_unquantized_gemm_dispatch_only_changes_rocm(is_rocm: bool):
     default = lambda *args: "default"
     rocm = lambda *args: "rocm"
+    calls = []
 
-    def dispatch_unquantized_gemm():
+    def dispatch_unquantized_gemm(linear_backend="auto"):
+        calls.append(linear_backend)
         return rocm if is_rocm else "other"
 
     module = _module(
@@ -8325,7 +8314,10 @@ def test_unquantized_gemm_dispatch_only_changes_rocm(is_rocm: bool):
         dispatch_unquantized_gemm=dispatch_unquantized_gemm,
     )
     patch_layers_utils.apply_to_module(module)
-    assert module.dispatch_unquantized_gemm() is (default if is_rocm else "other")
+    assert module.dispatch_unquantized_gemm("flashinfer-cutlass") is (
+        default if is_rocm else "other"
+    )
+    assert calls == ([] if is_rocm else ["flashinfer-cutlass"])
 
 
 def test_tf32_hc_prenorm_cpu_fallback_and_backend_delegation():

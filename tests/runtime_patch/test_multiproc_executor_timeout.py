@@ -75,6 +75,7 @@ def _make_patch_target_module(patch_multiproc_executor):
             non_block=False,
             unique_reply_rank=None,
             kv_output_aggregator=None,
+            ec_output_aggregator=None,
         ):
             pass
 
@@ -103,6 +104,35 @@ def test_hcu_collective_rpc_clamps_stale_deadline(monkeypatch) -> None:
 
     assert future.result() == ["response"]
     assert executor.response_mqs[0].timeouts == [0.0]
+
+
+def test_hcu_collective_rpc_chains_kv_and_ec_aggregators() -> None:
+    from vllm_hcu.v1.executor import multiproc_executor as hcu_executor
+
+    calls: list[tuple[str, int]] = []
+
+    class Aggregator:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def aggregate(self, outputs, output_rank):
+            calls.append((self.name, output_rank))
+            outputs[output_rank] += f":{self.name}"
+            return outputs[output_rank]
+
+    executor = _make_executor(hcu_executor)
+    result = executor.collective_rpc(
+        "execute_model",
+        unique_reply_rank=0,
+        kv_output_aggregator=Aggregator("kv"),
+        ec_output_aggregator=Aggregator("ec"),
+    )
+
+    assert result == "response:kv:ec"
+    assert calls == [("kv", 0), ("ec", 0)]
+    assert executor.rpc_broadcast_mq.requests == [
+        ("execute_model", (), {}, None)
+    ]
 
 
 @pytest.mark.parametrize(

@@ -96,7 +96,9 @@ def _gdn_causal_conv1d_update(
     block_idx_last_scheduled_token=None,
     initial_state_idx=None,
     validate_data=False,
+    out=None,
 ):
+    del out
     return weight
 
 
@@ -1482,16 +1484,9 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
             values.update(kwargs)
             return CommonAttentionMetadata(**values)
 
-    class SparseMLAAttentionImpl:
-        def do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping,
-                               kv_cache_dtype, k_scale):
-            return "official"
-
     module = _module(
         adapter.TARGET_MODULE,
         CommonAttentionMetadata=CommonAttentionMetadata,
-        SparseMLAAttentionImpl=SparseMLAAttentionImpl,
-        torch=torch,
     )
     adapter.apply_to_module(module)
     tensor = torch.arange(4)
@@ -1504,6 +1499,54 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
     assert metadata.replace(max_seq_len=9).num_kv_actual_tokens == 7
     assert metadata.unpadded(2, 1).num_kv_actual_tokens == 2
     assert module.CpCommonAttentionMetadata.__module__.startswith("vllm_hcu")
+
+
+def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
+    adapter = _adapter("patch_sparse_mla_attention")
+    calls = []
+
+    class SparseMLACommonImpl:
+        def do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping,
+                               kv_cache_dtype, k_scale):
+            calls.append(("official", kv_cache_dtype))
+
+    def concat_and_cache_mla(*args):
+        calls.append(args)
+
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(concat_and_cache_mla=concat_and_cache_mla),
+        ),
+    )
+    module = _module(
+        adapter.TARGET_MODULE,
+        SparseMLACommonImpl=SparseMLACommonImpl,
+        torch=fake_torch,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.platforms",
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        hcu_ops=object(),
+    )
+
+    assert adapter.apply_to_module(module)
+    tensor = torch.arange(4).reshape(2, 1, 2)
+    kv_cache = torch.ones(1)
+    slot_mapping = torch.arange(2).reshape(1, 2)
+    SparseMLACommonImpl().do_kv_cache_update(
+        tensor, tensor, kv_cache, slot_mapping, "fp8", torch.ones(1),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].shape == (2, 2)
+    assert calls[0][3].shape == (2,)
+    assert calls[0][4] == "fp8"
+    assert not adapter.apply_to_module(module)
 
 
 def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
@@ -1886,6 +1929,8 @@ def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch)
             quant_config=None,
             prefix="",
             skip_topk=False,
+            non_causal_multi_token_decode=False,
+            allow_short_prefill_indexer_scoring_skip=False,
         ):
             self.skip_topk = skip_topk
 

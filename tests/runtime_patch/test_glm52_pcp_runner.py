@@ -64,14 +64,24 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             self.req_states = object()
             self.execute_model_state = None
 
-        def initialize_kv_cache(self, kv_cache_config):
+        def initialize_kv_cache(
+            self,
+            kv_cache_config,
+            is_profiling=False,
+            kv_cache_allocation_context=None,
+        ):
             events.append("super.initialize_kv_cache")
             self.kv_cache_config = kv_cache_config
+            self.kv_cache_initialize_args = (
+                is_profiling,
+                kv_cache_allocation_context,
+            )
             self.block_tables = FakeBlockTables()
 
-        def prepare_inputs(self, scheduler_output, batch_desc):
+        def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
             events.append("super.prepare_inputs")
             assert scheduler_output == "scheduler-output"
+            assert batch_req_state == "batch-req-state"
             assert batch_desc == "batch-desc"
             return self.global_batch
 
@@ -214,7 +224,9 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
 
     runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     assert runner.pcp_manager is manager
-    prepared = runner.prepare_inputs("scheduler-output", "batch-desc")
+    prepared = runner.prepare_inputs(
+        "scheduler-output", "batch-req-state", "batch-desc"
+    )
     assert prepared is local_batch
     assert runner.prepare_attn(prepared) == ("local-blocks", "gathered-slots")
 
@@ -475,8 +487,19 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     runner.global_batch = global_batch
     events.clear()
 
-    runner.initialize_kv_cache("kv-config")
-    assert runner.prepare_inputs("scheduler-output", "batch-desc") is global_batch
+    allocation_context = object()
+    runner.initialize_kv_cache(
+        "kv-config",
+        is_profiling=True,
+        kv_cache_allocation_context=allocation_context,
+    )
+    assert runner.kv_cache_initialize_args == (True, allocation_context)
+    assert (
+        runner.prepare_inputs(
+            "scheduler-output", "batch-req-state", "batch-desc"
+        )
+        is global_batch
+    )
     assert runner.prepare_attn(global_batch) == (
         ("global-blocks", global_batch),
         "global-slots",
@@ -528,6 +551,7 @@ def _build_attn_metadata(
     seq_lens_cpu_upper_bound=None,
     dcp_local_seq_lens=None,
     positions=None,
+    is_prefilling=None,
     mm_req_doc_ranges=None,
     model_specific_attn_metadata=None,
     for_cudagraph_capture=False,
@@ -550,8 +574,10 @@ def _build_attn_metadata(
         causal,
         rswa_prefix_lens,
     )
-    extra = model_specific_attn_metadata.get_extra_common_attn_kwargs(
-        0, num_reqs
+    extra = (
+        model_specific_attn_metadata.get_extra_common_attn_kwargs(0, num_reqs)
+        if model_specific_attn_metadata is not None
+        else {"is_prefilling": is_prefilling[:num_reqs]}
     )
     common = CommonAttentionMetadata(
         query_start_loc_gpu,
@@ -559,8 +585,10 @@ def _build_attn_metadata(
         **extra,
     )
     builder = attn_groups[0][0].get_metadata_builder(0)
-    attn_extra = model_specific_attn_metadata.get_extra_attn_kwargs(
-        builder, num_reqs
+    attn_extra = (
+        model_specific_attn_metadata.get_extra_attn_kwargs(builder, num_reqs)
+        if model_specific_attn_metadata is not None
+        else {}
     )
     return {
         "mla.layer": builder.build(
@@ -569,52 +597,6 @@ def _build_attn_metadata(
             **attn_extra,
         )
     }
-
-
-def _build_attn_metadata_without_common_hook(
-    attn_groups,
-    num_reqs,
-    num_tokens,
-    query_start_loc_gpu,
-    query_start_loc_cpu,
-    max_query_len,
-    seq_lens,
-    max_seq_len,
-    block_tables,
-    slot_mappings,
-    kv_cache_config,
-    seq_lens_cpu_upper_bound=None,
-    dcp_local_seq_lens=None,
-    positions=None,
-    mm_req_doc_ranges=None,
-    model_specific_attn_metadata=None,
-    for_cudagraph_capture=False,
-    causal=True,
-    rswa_prefix_lens=None,
-):
-    del (
-        attn_groups,
-        num_reqs,
-        num_tokens,
-        max_query_len,
-        seq_lens,
-        max_seq_len,
-        block_tables,
-        slot_mappings,
-        kv_cache_config,
-        seq_lens_cpu_upper_bound,
-        dcp_local_seq_lens,
-        positions,
-        mm_req_doc_ranges,
-        model_specific_attn_metadata,
-        for_cudagraph_capture,
-        causal,
-        rswa_prefix_lens,
-    )
-    return CommonAttentionMetadata(
-        query_start_loc_gpu,
-        query_start_loc_cpu,
-    )
 
 
 build_attn_metadata = _build_attn_metadata
@@ -645,8 +627,13 @@ def _original_prepare_attn(
     else:
         num_reqs = input_batch.num_reqs
         num_tokens = input_batch.num_tokens
-    query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-    max_query_len = input_batch.num_scheduled_tokens.max().item()
+    query_start_loc_cpu = torch.from_numpy(
+        input_batch.query_start_loc_np[: num_reqs + 1]
+    )
+    query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
+    max_query_len = input_batch.max_query_len
+    if max_query_len is None:
+        max_query_len = input_batch.num_scheduled_tokens.max().item()
     seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
     if for_capture:
         max_seq_len = self.max_model_len
@@ -667,7 +654,7 @@ def _original_prepare_attn(
         attn_groups=attn_groups,
         num_reqs=num_reqs,
         num_tokens=num_tokens,
-        query_start_loc_gpu=input_batch.query_start_loc,
+        query_start_loc_gpu=query_start_loc_gpu,
         query_start_loc_cpu=query_start_loc_cpu,
         max_query_len=max_query_len,
         seq_lens=input_batch.seq_lens,
@@ -678,6 +665,7 @@ def _original_prepare_attn(
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
         positions=input_batch.positions,
+        is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
         mm_req_doc_ranges=req_doc_ranges,
         for_cudagraph_capture=for_capture,
         rswa_prefix_lens=input_batch.prompt_lens,
@@ -778,14 +766,8 @@ def _accept_synthetic_model_state_sources(
 ) -> None:
     monkeypatch.setattr(
         adapter,
-        "_V0251_PREPARE_ATTN_SOURCE_SHA256",
+        "_V028_PREPARE_ATTN_SOURCE_SHA256",
         _source_sha256(target.DefaultModelState.prepare_attn),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        adapter,
-        "_V0251_BUILD_ATTN_METADATA_SOURCE_SHA256",
-        _source_sha256(target.build_attn_metadata),
         raising=False,
     )
 
@@ -843,6 +825,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         req_ids=["decode", "prefill"],
         is_prefilling_np=np.array([False, True], dtype=np.bool_),
         prompt_lens=None,
+        max_query_len=2,
         _vllm_hcu_pcp_plan="gqa-plan",
     )
     metadata = state.prepare_attn(
@@ -889,8 +872,8 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_is_prefilling": [False, True],
         "pcp_plan": "gqa-plan",
         "pcp_one_result": {"path": "original"},
-        "pcp_one_query_gpu": [0, 1, 3, 9, 9],
-        "pcp_one_query_cpu": [0, 1, 3, 9, 9],
+        "pcp_one_query_gpu": [0, 1, 3],
+        "pcp_one_query_cpu": [0, 1, 3],
         "pcp_one_has_phase_adapter": False,
     }
 
@@ -902,17 +885,13 @@ def test_pcp_model_state_routes_plan_only_to_flash_attention_builder() -> None:
         "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
     )
     plan = object()
-    request_metadata = adapter._PCPRequestPhaseMetadata(
-        torch.tensor([True]),
-        pcp_plan=plan,
+    flash_metadata = SimpleNamespace(pcp_plan=None)
+    mla_metadata = SimpleNamespace()
+    adapter._attach_pcp_plan(
+        {"flash": flash_metadata, "mla": mla_metadata}, plan
     )
-
-    flash_builder = SimpleNamespace(supports_pcp_plan=True)
-    mla_builder = SimpleNamespace()
-    assert request_metadata.get_extra_attn_kwargs(flash_builder, 1) == {
-        "pcp_plan": plan
-    }
-    assert request_metadata.get_extra_attn_kwargs(mla_builder, 1) == {}
+    assert flash_metadata.pcp_plan is plan
+    assert not hasattr(mla_metadata, "pcp_plan")
 
 
 def test_pcp_default_model_state_rejects_same_signature_behavior_drift(
@@ -943,40 +922,6 @@ def test_pcp_default_model_state_rejects_same_signature_behavior_drift(
     assert "expected sha256=" in message
     assert "actual sha256=" in message
     assert target.DefaultModelState.prepare_attn is drifted
-    assert not hasattr(target.DefaultModelState, "_vllm_hcu_original_prepare_attn")
-    assert not getattr(target, "_vllm_hcu_pcp_model_state_applied", False)
-
-
-def test_pcp_default_model_state_rejects_common_hook_behavior_drift(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A helper that drops model-specific common metadata must fail closed."""
-
-    adapter = importlib.import_module(
-        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
-    )
-    target = _fake_default_model_state_module(adapter)
-    _accept_synthetic_model_state_sources(monkeypatch, adapter, target)
-    original_prepare_attn = target.DefaultModelState.prepare_attn
-    drifted = FunctionType(
-        _build_attn_metadata_without_common_hook.__code__,
-        target.__dict__,
-        name="build_attn_metadata",
-        argdefs=_build_attn_metadata_without_common_hook.__defaults__,
-    )
-    target.build_attn_metadata = drifted
-
-    with pytest.raises(
-        PatchCompatibilityError, match="source fingerprint"
-    ) as error:
-        adapter.apply_to_module(target)
-
-    message = str(error.value)
-    assert adapter.TARGETS[1] in message
-    assert "expected sha256=" in message
-    assert "actual sha256=" in message
-    assert target.build_attn_metadata is drifted
-    assert target.DefaultModelState.prepare_attn is original_prepare_attn
     assert not hasattr(target.DefaultModelState, "_vllm_hcu_original_prepare_attn")
     assert not getattr(target, "_vllm_hcu_pcp_model_state_applied", False)
 

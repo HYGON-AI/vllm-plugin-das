@@ -89,6 +89,7 @@ class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
         non_block: bool = False,
         unique_reply_rank: int | None = None,
         kv_output_aggregator: Any | None = None,
+        ec_output_aggregator: Any | None = None,
     ) -> Any:
         """Call every worker without allowing an expired deadline to go negative."""
         assert self.rpc_broadcast_mq is not None, (
@@ -100,12 +101,20 @@ class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        if kv_output_aggregator is not None:
+        aggregators = [
+            aggregator
+            for aggregator in (kv_output_aggregator, ec_output_aggregator)
+            if aggregator is not None
+        ]
+        if aggregators:
             output_rank = None
-            aggregate: Callable[[Any], Any] = partial(
-                kv_output_aggregator.aggregate,
-                output_rank=unique_reply_rank or 0,
-            )
+
+            def aggregate(outputs: Any) -> Any:
+                rank = unique_reply_rank or 0
+                result = outputs[rank]
+                for aggregator in aggregators:
+                    result = aggregator.aggregate(outputs, output_rank=rank)
+                return result
         else:
             output_rank = unique_reply_rank
             aggregate = lambda value: value

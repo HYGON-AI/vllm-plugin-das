@@ -221,6 +221,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             q_lora_rank,
             kv_lora_rank,
             kv_b_proj,
+            dcp_q_replicate=False,
             cache_config=None,
             quant_config=None,
             prefix="",
@@ -228,6 +229,9 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             use_sparse=False,
             indexer=None,
             topk_indices_buffer=None,
+            non_causal_multi_token_decode=False,
+            sliding_window=None,
+            prefill_backend_cls=None,
             **extra_impl_args,
         ):
             del (
@@ -239,6 +243,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
                 q_lora_rank,
                 kv_lora_rank,
                 kv_b_proj,
+                dcp_q_replicate,
                 cache_config,
                 quant_config,
                 prefix,
@@ -246,6 +251,9 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
                 use_sparse,
                 indexer,
                 topk_indices_buffer,
+                non_causal_multi_token_decode,
+                sliding_window,
+                prefill_backend_cls,
                 extra_impl_args,
             )
             self.use_direct_call = False
@@ -256,8 +264,9 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             kv_c_normed,
             k_pe,
             output_shape=None,
+            q_dcp_replicated=None,
         ):
-            args = (q, kv_c_normed, k_pe, output_shape)
+            args = (q, kv_c_normed, k_pe, output_shape, q_dcp_replicated)
             full_forward_calls.append((self, args))
             if event_log is not None:
                 event_log.append("opaque_forward")
@@ -277,6 +286,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             quant_scale_ue8m0=None,
             quant_col_major=None,
             quant_tma_aligned=None,
+            q_dcp_replicated=None,
         ):
             args = (
                 q,
@@ -291,6 +301,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
                 quant_scale_ue8m0,
                 quant_col_major,
                 quant_tma_aligned,
+                q_dcp_replicated,
             )
             target_calls.append((self, args))
             if event_log is not None:
@@ -337,7 +348,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
 
 
 def _forward_args():
-    return tuple(object() for _ in range(12))
+    return tuple(object() for _ in range(13))
 
 
 @pytest.mark.parametrize("transposed_input", [False, True])
@@ -692,7 +703,7 @@ def test_mla_pcp_one_keeps_target_opaque_full_forward(monkeypatch):
     q, kv, rope = object(), object(), object()
 
     assert instance.forward(q, kv, rope) == "target-opaque-v0.25.1"
-    assert module.full_forward_calls == [(instance, (q, kv, rope, None))]
+    assert module.full_forward_calls == [(instance, (q, kv, rope, None, None))]
     assert events == ["opaque_forward"]
 
 
@@ -726,7 +737,7 @@ def test_replicated_mtp_scope_uses_target_mla_forward(monkeypatch):
         result = instance.forward(q, kv, rope)
 
     assert result == "target-opaque-v0.25.1"
-    assert module.full_forward_calls == [(instance, (q, kv, rope, None))]
+    assert module.full_forward_calls == [(instance, (q, kv, rope, None, None))]
     assert events == ["opaque_forward"]
 
 

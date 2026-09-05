@@ -7,7 +7,13 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
-from ._common import load_exact_module, require_callable, require_class, require_parameter_names
+from ._common import (
+    PatchCompatibilityError,
+    load_exact_module,
+    require_callable,
+    require_class,
+    require_parameter_names,
+)
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.fused_moe_modular_method"
 PATCH_ID = "worker.op_opt.moe.fused_moe_modular_method"
@@ -23,16 +29,16 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(target, _MARKER, False):
         return False
     cls = require_class(target, "FusedMoEModularMethod", TARGETS[0].rsplit(".", 1)[0])
-    make = require_callable(cls, "make", TARGETS[0])
+    if hasattr(cls, "make"):
+        raise PatchCompatibilityError(
+            f"required vLLM 0.28 target {TARGETS[0]} unexpectedly exists"
+        )
+    init = require_callable(cls, "__init__", f"{TARGET_MODULE}.FusedMoEModularMethod.__init__")
     method_apply = require_callable(cls, "apply", TARGETS[1])
     require_parameter_names(
-        make,
-        TARGETS[0],
-        (
-            "routed_experts",
-            "old_quant_method",
-            "prepare_finalize",
-        ),
+        init,
+        f"{TARGET_MODULE}.FusedMoEModularMethod.__init__",
+        ("self", "old_quant_method", "moe_kernel"),
     )
     require_parameter_names(
         method_apply,
@@ -43,7 +49,6 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
     )
 
-    @functools.wraps(make)
     def hcu_make(routed_experts, old_quant_method, prepare_finalize):
         kernel = target.FusedMoEKernel(
             prepare_finalize,
@@ -90,7 +95,6 @@ def apply_to_module(module: ModuleType) -> bool:
 
     del hcu_apply.__wrapped__
 
-    cls._vllm_hcu_original_make = make
     cls.make = staticmethod(hcu_make)
     cls._vllm_hcu_original_apply = method_apply
     cls.apply = hcu_apply

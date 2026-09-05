@@ -32,8 +32,17 @@ def apply_to_module(module: ModuleType) -> bool:
         original_init, TARGETS[0],
         positional=("self", "hidden_size", "num_heads", "scale", "qk_nope_head_dim",
                     "qk_rope_head_dim", "v_head_dim", "q_lora_rank", "kv_lora_rank",
-                    "mla_modules", "cache_config", "quant_config", "prefix", "skip_topk"),
-        defaults={"cache_config": None, "quant_config": None, "prefix": "", "skip_topk": False},
+                    "mla_modules", "cache_config", "quant_config", "prefix", "skip_topk",
+                    "non_causal_multi_token_decode",
+                    "allow_short_prefill_indexer_scoring_skip"),
+        defaults={
+            "cache_config": None,
+            "quant_config": None,
+            "prefix": "",
+            "skip_topk": False,
+            "non_causal_multi_token_decode": False,
+            "allow_short_prefill_indexer_scoring_skip": False,
+        },
     )
     original_forward = require_callable(cls, "forward", TARGETS[1])
     require_exact_signature(
@@ -43,11 +52,11 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     if "skip_topk" not in original_init.__code__.co_names:
         raise PatchCompatibilityError(
-            "clean v0.25.1 target MLA constructor no longer stores skip_topk"
+            "clean v0.28 target MLA constructor no longer stores skip_topk"
         )
     if "skip_topk" not in original_forward.__code__.co_names:
         raise PatchCompatibilityError(
-            "clean v0.25.1 target MLA forward no longer guards skip_topk"
+            "clean v0.28 target MLA forward no longer guards skip_topk"
         )
 
     @functools.wraps(original_init)

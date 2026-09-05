@@ -484,10 +484,11 @@ def _fake_base_communicator_module() -> ModuleType:
             unique_name="",
             global_ranks=None,
             global_world_size=None,
+            use_all2all=False,
         ):
             self.device_group = device_group
             self.is_ep_communicator = unique_name.split(":")[0] == "ep"
-            self.use_all2all = False
+            self.use_all2all = use_all2all
 
         def reduce_scatter(self, input_, dim=-1):
             return input_
@@ -535,8 +536,9 @@ def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obso
             global_ranks=None,
             global_world_size=None,
             tcp_store_group=None,
+            use_all2all=False,
         ):
-            pass
+            self.use_all2all = use_all2all
 
     module = _module(
         patch_cuda_communicator.TARGET_MODULE, CudaCommunicator=CudaCommunicator
@@ -582,10 +584,11 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
             global_ranks=None,
             global_world_size=None,
             tcp_store_group=None,
+            use_all2all=False,
         ):
             del device, device_group, unique_name, global_ranks, global_world_size
             self.cpu_group = cpu_group
-            self.use_all2all = True
+            self.use_all2all = use_all2all
             self.all2all_manager = "normalized-low-latency"
 
     module = _module(
@@ -593,7 +596,9 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
         CudaCommunicator=CudaCommunicator,
     )
     assert patch_cuda_communicator.apply_to_module(module)
-    communicator = module.CudaCommunicator("cpu-group", tcp_store_group="tcp")
+    communicator = module.CudaCommunicator(
+        "cpu-group", tcp_store_group="tcp", use_all2all=True
+    )
     assert isinstance(communicator.all2all_manager, DeepEPAutoAll2AllManager)
     assert created == [("cpu-group", "tcp")]
 
@@ -618,6 +623,7 @@ def test_cuda_communicator_auto_ignores_non_ep_collective_groups(
             global_ranks=None,
             global_world_size=None,
             tcp_store_group=None,
+            use_all2all=False,
         ):
             del (
                 device,
@@ -627,7 +633,7 @@ def test_cuda_communicator_auto_ignores_non_ep_collective_groups(
                 tcp_store_group,
             )
             self.cpu_group = cpu_group
-            self.use_all2all = unique_name.split(":")[0] == "ep"
+            self.use_all2all = use_all2all
             self.all2all_manager = "official-collective"
 
     module = _module(
@@ -1865,7 +1871,7 @@ def test_clean_vllm_modules_import_apply_and_second_apply_is_idempotent():
 import os
 from pathlib import Path
 import vllm
-target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+target_root = Path(os.environ["VLLM_V028_SOURCE_ROOT"]).resolve()
 target_file = Path(vllm.__file__).resolve()
 assert target_file.is_relative_to(target_root), (
     f"vllm resolved outside target root: {target_file} not under {target_root}"
@@ -1902,14 +1908,16 @@ print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
     # plugin discovery settings.
     env["VLLM_PLUGINS"] = "__disabled__"
     repository = Path(__file__).resolve().parents[2]
-    target_vllm = Path(
-        env.get("VLLM_V0251_SOURCE_ROOT", repository.parent / "vllm_0251")
-    ).resolve()
+    import importlib.util
+
+    vllm_spec = importlib.util.find_spec("vllm")
+    assert vllm_spec is not None and vllm_spec.origin is not None
+    target_vllm = Path(vllm_spec.origin).resolve().parent.parent
     if not (target_vllm / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
+            f"VLLM_V028_SOURCE_ROOT does not contain vllm: {target_vllm}"
         )
-    env["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    env["VLLM_V028_SOURCE_ROOT"] = str(target_vllm)
     env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(repository)))
     result = subprocess.run(
         [sys.executable, "-c", script],

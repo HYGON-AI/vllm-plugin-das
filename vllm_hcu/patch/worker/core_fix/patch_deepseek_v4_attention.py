@@ -23,7 +23,9 @@ TARGET_MODULE = "vllm.models.deepseek_v4.attention"
 PATCH_ID = "worker.core_fix.deepseek_v4.attention_compressor_weight_layout"
 _INIT_TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Attention.__init__"
 _FORWARD_TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Attention.forward"
-TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4Attention.attn_gemm_parallel_execute"
+TARGET_SYMBOL = (
+    f"{TARGET_MODULE}.DeepseekV4Attention._run_parallel_input_projections"
+)
 _INSERT_TARGET_SYMBOL = (
     f"{TARGET_MODULE}.DeepseekV4Attention._fused_qnorm_rope_kv_insert"
 )
@@ -56,11 +58,11 @@ def _requires_unquantized_int8_wo_a(vllm_config: object) -> bool:
 def apply_to_module(module: ModuleType) -> bool:
     attention = load_exact_module(TARGET_MODULE, module)
     cls = require_class(attention, "DeepseekV4Attention", TARGET_SYMBOL)
-    original = require_callable(cls, "attn_gemm_parallel_execute", TARGET_SYMBOL)
+    original = require_callable(cls, "_run_parallel_input_projections", TARGET_SYMBOL)
     if getattr(cls, _CLASS_MARKER, False):
         current_init = vars(cls).get("__init__")
         current_forward = vars(cls).get("forward")
-        current = vars(cls).get("attn_gemm_parallel_execute")
+        current = vars(cls).get("_run_parallel_input_projections")
         current_insert = vars(cls).get("_fused_qnorm_rope_kv_insert")
         if not (
             getattr(current_init, _INIT_WRAPPER_MARKER, False)
@@ -172,17 +174,18 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
+            self._run_parallel_input_projections(hidden_states)
         )
         qr, raw_kv = qr_kv.split(
             [self.q_lora_rank, self.head_dim], dim=-1
         )
         qr = self.q_norm(qr)
 
-        self.attention_impl(
+        self._prepare_and_attn_fn(
             hidden_states,
             qr,
             raw_kv,
+            None,
             kv_score,
             indexer_kv_score,
             indexer_weights,
@@ -195,7 +198,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(hcu_attention_forward, _FORWARD_WRAPPER_MARKER, True)
 
     @functools.wraps(original)
-    def hcu_attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+    def hcu_run_parallel_input_projections(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
             assert len(aux_streams) >= 3
@@ -244,7 +247,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
-    setattr(hcu_attn_gemm_parallel_execute, _WRAPPER_MARKER, True)
+    setattr(hcu_run_parallel_input_projections, _WRAPPER_MARKER, True)
 
     @functools.wraps(original_insert)
     def hcu_fused_qnorm_rope_kv_insert(
@@ -300,11 +303,11 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(hcu_fused_qnorm_rope_kv_insert, _INSERT_WRAPPER_MARKER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
     setattr(cls, "_vllm_hcu_original_forward", original_forward)
-    setattr(cls, "_vllm_hcu_original_attn_gemm_parallel_execute", original)
+    setattr(cls, "_vllm_hcu_original_run_parallel_input_projections", original)
     setattr(cls, "_vllm_hcu_original_fused_qnorm_rope_kv_insert", original_insert)
     setattr(cls, "__init__", hcu_attention_init)
     setattr(cls, "forward", hcu_attention_forward)
-    setattr(cls, "attn_gemm_parallel_execute", hcu_attn_gemm_parallel_execute)
+    setattr(cls, "_run_parallel_input_projections", hcu_run_parallel_input_projections)
     setattr(cls, "_fused_qnorm_rope_kv_insert", hcu_fused_qnorm_rope_kv_insert)
     setattr(cls, _CLASS_MARKER, True)
     return True

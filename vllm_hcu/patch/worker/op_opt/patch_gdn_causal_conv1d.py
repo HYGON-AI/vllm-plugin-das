@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Qwen-local NN-layout deltas for vLLM v0.25.1 GDN causal-conv1d."""
+"""Qwen-local NN-layout deltas for vLLM v0.28 GDN causal-conv1d."""
 
 from __future__ import annotations
 
@@ -81,6 +81,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "block_idx_last_scheduled_token",
             "initial_state_idx",
             "validate_data",
+            "out",
         ),
     )
 

@@ -162,6 +162,12 @@ def _child_sidecar(payload: object, queue: multiprocessing.Queue) -> None:
     queue.put(get_hcu_config(payload).to_dict())
 
 
+def test_hcu_platform_supports_multiple_kv_caches_per_layer_index() -> None:
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    assert HCUPlatform.check_runner_kv_caches_multi_layer() is None
+
+
 def test_engine_args_legacy_keywords_are_removed_before_official_init() -> None:
     module = _make_arg_utils_module()
     original_signature = inspect.signature(module.EngineArgs.__init__)

@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
+    ApplyMoEActivationConfig,
     MoEActivation,
     apply_moe_activation,
 )
@@ -475,6 +476,11 @@ class FusedMoEPrepareAndFinalizeMonolithic(FusedMoEPrepareAndFinalize):
 
 # TODO: add supported activations method (return string)
 class FusedMoEExperts(ABC):
+    # Only AITER experts consume the 0/1 expert mask. Keep the vLLM 0.28
+    # capability contract so RoutedExperts.expert_map can safely select the
+    # canonical map for HCU Triton and DeepGEMM experts.
+    consumes_expert_mask: bool = False
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -503,6 +509,9 @@ class FusedMoEExperts(ABC):
 
         self.moe_config = moe_config
         self.quant_config = quant_config
+        self.activation_config = ApplyMoEActivationConfig.from_configs(
+            moe_config, quant_config
+        )
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
         self.expected_m = max_num_tokens
@@ -905,12 +914,18 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         output: torch.Tensor,
         input: torch.Tensor,
         *,
-        clamp_limit: float | None = None,
-        alpha: float = 1.0,
-        beta: float = 0.0,
+        topk_ids: torch.Tensor | None = None,
+        expert_map: torch.Tensor | None = None,
+        valid_rows: torch.Tensor | None = None,
     ) -> None:
         apply_moe_activation(
-            activation, output, input, clamp_limit=clamp_limit, alpha=alpha, beta=beta
+            activation,
+            output,
+            input,
+            activation_config=self.activation_config,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            valid_rows=valid_rows,
         )
 
     @abstractmethod
