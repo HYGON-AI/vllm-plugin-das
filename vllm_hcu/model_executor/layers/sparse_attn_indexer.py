@@ -258,6 +258,39 @@ def fused_indexer_q_rope_quant(
     return q_fp8, weights_out
 
 
+def lightop_indexer_qk_quant_and_store(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    weights: torch.Tensor,
+    page_size: int,
+    q_scale_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize Q/K and write the index K cache in one LightOp launch."""
+    from lightop.kvcache import fuse_qk_quant_and_store_index_k_cache
+
+    q_quant, _q_scale, scaled_weights = (
+        fuse_qk_quant_and_store_index_k_cache(
+            q,
+            k,
+            kv_cache,
+            slot_mapping,
+            page_size,
+            weights,
+            q_scale_factor,
+            1.0,
+            1e-5,
+            True,
+            not current_platform.is_fp8_fnuz(),
+        )
+    )
+    # LightOp allocates the carrier with the FN scalar tag. HCU consumes the
+    # identical bytes as FNUZ when applicable; keep this a zero-copy view.
+    q_quant = q_quant.view(current_platform.fp8_dtype())
+    return q_quant, scaled_weights.squeeze(-1).float()
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -897,9 +930,84 @@ class SparseAttnIndexer(CustomOp):
     ):
         assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
-            "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
+            "HCU sparse_attn_indexer expects a single q_quant tensor"
         )
-        if self.skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
+        skip_k_cache_insert = self.skip_k_cache_insert
+        indexer_cache_layout = None
+        if getattr(self, "use_lightop_hy_v4_indexer", False):
+            assert q_quant.dtype == torch.bfloat16, (
+                "LightOp Hy4 indexer expects BF16 Q/K inputs"
+            )
+            attn_metadata = get_forward_context().attn_metadata
+            if isinstance(attn_metadata, dict):
+                layer_metadata = attn_metadata[self.k_cache.prefix]
+                slot_mapping = layer_metadata.slot_mapping[
+                    : layer_metadata.num_kv_actual_tokens
+                ]
+                cache_k = k[: slot_mapping.shape[0]]
+                pcp_world_size = effective_pcp_world_size(self.pcp_world_size)
+                if pcp_world_size > 1:
+                    metadata_world_size = int(
+                        getattr(layer_metadata, "pcp_world_size", 1)
+                    )
+                    if metadata_world_size != pcp_world_size:
+                        raise RuntimeError(
+                            "PCP sparse-indexer metadata world size mismatch: "
+                            f"indexer={pcp_world_size}, "
+                            f"metadata={metadata_world_size}"
+                        )
+                    cache_k, slot_mapping = maybe_gather_indexer_k(
+                        cache_k,
+                        slot_mapping,
+                        layer_metadata,
+                    )
+                use_safe_cache_writer = self.dcp_world_size > 1
+                lightop_k = cache_k[:0] if use_safe_cache_writer else cache_k
+                lightop_slots = (
+                    slot_mapping[:0]
+                    if use_safe_cache_writer
+                    else slot_mapping
+                )
+                q_quant, weights = lightop_indexer_qk_quant_and_store(
+                    q_quant,
+                    lightop_k,
+                    self.k_cache.kv_cache,
+                    lightop_slots,
+                    weights,
+                    page_size=self.k_cache.kv_cache.shape[1],
+                    q_scale_factor=1.0,
+                )
+                if use_safe_cache_writer:
+                    assert self.scale_fmt is not None
+                    ops.indexer_k_quant_and_cache(
+                        cache_k,
+                        self.k_cache.kv_cache,
+                        slot_mapping,
+                        self.quant_block_size,
+                        self.scale_fmt,
+                    )
+                else:
+                    indexer_cache_layout = "NORMAL"
+            else:
+                # Profiling has no slot mapping. Preserve the fused path's Q
+                # quantization/weight contract without attempting a cache write.
+                from vllm_hcu.model_executor.layers.quantization.group_fp8_runtime import (
+                    per_token_group_quant_fp8,
+                )
+
+                q_shape = q_quant.shape
+                q_quant, q_scale = per_token_group_quant_fp8(
+                    q_quant.reshape(-1, q_shape[-1]),
+                    self.quant_block_size,
+                    column_major_scales=False,
+                    use_ue8m0=self.scale_fmt is not None,
+                )
+                q_quant = q_quant.view(q_shape)
+                q_scale = q_scale.view(*q_shape[:-1], 1)
+                weights = (weights.unsqueeze(-1) * q_scale).squeeze(-1).float()
+            skip_k_cache_insert = True
+
+        if skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
             from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
                 rocm_aiter_sparse_attn_indexer_native,
             )
@@ -918,7 +1026,8 @@ class SparseAttnIndexer(CustomOp):
                 self.max_model_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
-                skip_k_cache_insert=self.skip_k_cache_insert,
+                skip_k_cache_insert=skip_k_cache_insert,
+                indexer_cache_layout=indexer_cache_layout,
             )
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
@@ -935,7 +1044,7 @@ class SparseAttnIndexer(CustomOp):
                 self.max_model_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
-                skip_k_cache_insert=self.skip_k_cache_insert,
+                skip_k_cache_insert=skip_k_cache_insert,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

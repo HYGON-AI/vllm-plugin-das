@@ -102,6 +102,21 @@ def test_lightop_per_token_quant_defaults_enabled_and_allows_opt_out(
     assert hcu_envs.is_set(name) is True
 
 
+def test_lightop_hy_v4_indexer_defaults_enabled_and_allows_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_HY_V4_INDEXER"
+    monkeypatch.delenv(name, raising=False)
+
+    assert getattr(hcu_envs, name) is True
+    assert hcu_envs.is_set(name) is False
+
+    monkeypatch.setenv(name, "0")
+
+    assert getattr(hcu_envs, name) is False
+    assert hcu_envs.is_set(name) is True
+
+
 @pytest.mark.parametrize(
     "name",
     [
