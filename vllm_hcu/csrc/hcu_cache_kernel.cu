@@ -904,27 +904,72 @@ void reshape_and_cache_flash_hcu(
               "key/value must be [num_tokens, num_heads, head_size]");
   TORCH_CHECK(key.sizes() == value.sizes(),
               "key and value must have the same shape");
+  TORCH_CHECK(key.scalar_type() == value.scalar_type(),
+              "key and value must have the same dtype");
   TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
               "cache must be a logical [blocks, pages, heads, dim] view");
   TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
               "key and value cache must have the same shape");
+  TORCH_CHECK(key_cache.scalar_type() == value_cache.scalar_type(),
+              "key and value cache must have the same dtype");
+  const auto cache_dtype = key_cache.scalar_type();
+  if (kv_cache_dtype == "auto") {
+    TORCH_CHECK(cache_dtype == key.scalar_type(),
+                "cache dtype must match key/value for auto KV cache");
+  } else if (kv_cache_dtype == "int8") {
+    TORCH_CHECK(cache_dtype == at::ScalarType::Char,
+                "cache dtype must match int8 KV cache");
+  } else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3" ||
+             kv_cache_dtype == "fp8_ds_mla") {
+    TORCH_CHECK(cache_dtype == at::ScalarType::Byte ||
+                    cache_dtype == at::ScalarType::Float8_e4m3fn,
+                "cache dtype must match fp8_e4m3 KV cache");
+  } else if (kv_cache_dtype == "fp8_e5m2") {
+    TORCH_CHECK(cache_dtype == at::ScalarType::Byte ||
+                    cache_dtype == at::ScalarType::Float8_e5m2,
+                "cache dtype must match fp8_e5m2 KV cache");
+  }
   TORCH_CHECK(slot_mapping.dim() == 1 &&
                   slot_mapping.scalar_type() == at::ScalarType::Long,
               "slot_mapping must be a one-dimensional int64 tensor");
+
+  const auto device = key.device();
+  TORCH_CHECK(key.is_cuda() && value.is_cuda() && key_cache.is_cuda() &&
+                  value_cache.is_cuda() && slot_mapping.is_cuda() &&
+                  k_scale.is_cuda() && v_scale.is_cuda(),
+              "all cache-writer tensors must be CUDA/ROCm tensors");
+  TORCH_CHECK(value.device() == device && key_cache.device() == device &&
+                  value_cache.device() == device &&
+                  slot_mapping.device() == device && k_scale.device() == device &&
+                  v_scale.device() == device,
+              "all cache-writer tensors must be on the same device");
 
   const int num_tokens = slot_mapping.size(0);
   const int num_heads = key.size(1);
   const int head_size = key.size(2);
   const int block_size = key_cache.size(1);
+  TORCH_CHECK(num_tokens <= key.size(0),
+              "slot_mapping cannot contain more tokens than key/value");
+  TORCH_CHECK(key.stride(2) == 1 && key.stride(1) == head_size &&
+                  value.stride(2) == 1 && value.stride(1) == head_size,
+              "key/value head dimensions must be contiguous");
   TORCH_CHECK(key_cache.size(2) == num_heads &&
                   key_cache.size(3) == head_size,
               "cache head dimensions must match key/value");
   TORCH_CHECK(key_cache.strides() == value_cache.strides(),
               "key and value cache must have the same strides");
+  TORCH_CHECK(key_cache.stride(3) == 1,
+              "cache head_size dimension must be contiguous");
+  TORCH_CHECK(slot_mapping.is_contiguous(),
+              "slot_mapping must be contiguous");
   TORCH_CHECK(k_scale.sizes() == v_scale.sizes(),
               "k_scale and v_scale must have the same shape");
   TORCH_CHECK(k_scale.numel() == 1 || k_scale.numel() == num_heads,
               "k_scale and v_scale must contain one or num_heads values");
+  TORCH_CHECK(k_scale.scalar_type() == at::ScalarType::Float &&
+                  v_scale.scalar_type() == at::ScalarType::Float &&
+                  k_scale.is_contiguous() && v_scale.is_contiguous(),
+              "k/v scales must be contiguous float32 tensors");
 
   const int64_t key_stride = key.stride(0);
   const int64_t value_stride = value.stride(0);

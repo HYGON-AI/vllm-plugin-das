@@ -82,8 +82,14 @@ def _hcu_device() -> torch.device:
 
 
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize(
+    "cache_storage_dtype",
+    [torch.float8_e4m3fn, torch.uint8],
+    ids=["float8-view", "uint8-backing"],
+)
 def test_hcu_reshape_and_cache_flash_fp8_matches_torch_quantization(
     layout: str,
+    cache_storage_dtype: torch.dtype,
 ) -> None:
     device = _hcu_device()
     import vllm_hcu.hcu_ops  # noqa: F401
@@ -114,7 +120,7 @@ def test_hcu_reshape_and_cache_flash_fp8_matches_torch_quantization(
             (num_blocks, block_size, num_heads, head_size),
             cache_stride,
             device=device,
-            dtype=torch.float8_e4m3fn,
+            dtype=cache_storage_dtype,
         ).zero_()
         value_cache = torch.empty_strided(
             key_cache.shape,
@@ -133,7 +139,7 @@ def test_hcu_reshape_and_cache_flash_fp8_matches_torch_quantization(
             (num_blocks, block_size, num_heads, head_size),
             cache_stride,
             device=device,
-            dtype=torch.float8_e4m3fn,
+            dtype=cache_storage_dtype,
         ).zero_()
         value_cache = torch.empty_strided(
             key_cache.shape,
@@ -168,16 +174,22 @@ def test_hcu_reshape_and_cache_flash_fp8_matches_torch_quantization(
     expected_value = (value[:2] / v_scale.reshape(1, -1, 1)).to(
         torch.float8_e4m3fn
     )
-    torch.testing.assert_close(key_cache[0, 1].float(), expected_key[0].float())
-    torch.testing.assert_close(key_cache[1, 1].float(), expected_key[1].float())
+    key_cache_fp8 = key_cache.view(torch.float8_e4m3fn)
+    value_cache_fp8 = value_cache.view(torch.float8_e4m3fn)
     torch.testing.assert_close(
-        value_cache[0, 1].float(), expected_value[0].float()
+        key_cache_fp8[0, 1].float(), expected_key[0].float()
     )
     torch.testing.assert_close(
-        value_cache[1, 1].float(), expected_value[1].float()
+        key_cache_fp8[1, 1].float(), expected_key[1].float()
     )
-    assert torch.count_nonzero(key_cache[:, 0].float()) == 0
-    assert torch.count_nonzero(value_cache[:, 0].float()) == 0
+    torch.testing.assert_close(
+        value_cache_fp8[0, 1].float(), expected_value[0].float()
+    )
+    torch.testing.assert_close(
+        value_cache_fp8[1, 1].float(), expected_value[1].float()
+    )
+    assert torch.count_nonzero(key_cache_fp8[:, 0].float()) == 0
+    assert torch.count_nonzero(value_cache_fp8[:, 0].float()) == 0
 
 
 def test_hcu_reshape_and_cache_flash_replays_in_cuda_graph() -> None:
@@ -300,6 +312,55 @@ def test_hcu_reshape_and_cache_flash_saturates_fp8_e4m3_overflow() -> None:
             cache[0, 0].float(),
             expected_values,
             equal_nan=True,
+        )
+
+
+def test_hcu_reshape_and_cache_flash_rejects_non_float_scales() -> None:
+    device = _hcu_device()
+    import vllm_hcu.hcu_ops  # noqa: F401
+
+    key = torch.ones((1, 2, 16), device=device, dtype=torch.bfloat16)
+    value = torch.ones_like(key)
+    key_cache = torch.zeros(
+        (1, 1, 2, 16), device=device, dtype=torch.float8_e4m3fn
+    )
+    value_cache = torch.zeros_like(key_cache)
+    slot_mapping = torch.zeros((1,), device=device, dtype=torch.int64)
+    invalid_scale = torch.ones((2,), device=device, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="scales must be contiguous float32"):
+        torch.ops.hcu_ops.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "fp8_e4m3",
+            invalid_scale,
+            invalid_scale,
+        )
+
+
+def test_hcu_reshape_and_cache_flash_rejects_wrong_cache_dtype() -> None:
+    device = _hcu_device()
+    import vllm_hcu.hcu_ops  # noqa: F401
+
+    key = torch.ones((1, 2, 16), device=device, dtype=torch.bfloat16)
+    value = torch.ones_like(key)
+    invalid_cache = torch.zeros_like(key).unsqueeze(0)
+    slot_mapping = torch.zeros((1,), device=device, dtype=torch.int64)
+    scale = torch.ones((2,), device=device, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="cache dtype must match"):
+        torch.ops.hcu_ops.reshape_and_cache_flash(
+            key,
+            value,
+            invalid_cache,
+            invalid_cache.clone(),
+            slot_mapping,
+            "fp8_e4m3",
+            scale,
+            scale,
         )
 
 
