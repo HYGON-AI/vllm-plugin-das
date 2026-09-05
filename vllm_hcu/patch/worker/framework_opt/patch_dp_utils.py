@@ -7,6 +7,10 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+from vllm_hcu.forward_context_runtime import (
+    should_skip_deepep_ll_dp_coordination,
+)
+
 from ._common import already_applied, load_exact_module, require_callable, require_exact_signature
 
 TARGET_MODULE = "vllm.v1.worker.dp_utils"
@@ -51,11 +55,8 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         if (
             parallel_config.data_parallel_size == 1
-            or (
-                parallel_config.all2all_backend == "deepep_low_latency"
-                and not getattr(
-                    parallel_config, "_vllm_hcu_deepep_auto", False
-                )
+            or should_skip_deepep_ll_dp_coordination(
+                parallel_config,
             )
         ):
             return False, None, cudagraph_mode

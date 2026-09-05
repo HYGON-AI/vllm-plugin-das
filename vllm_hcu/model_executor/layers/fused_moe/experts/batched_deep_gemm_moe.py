@@ -395,6 +395,11 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             else None
         )
         if dp_meta is None:
+            local_expected_m = self.get_expected_m()
+            if local_expected_m is not None:
+                estimate = round_up(int(local_expected_m), 16)
+                estimate = max(estimate, 16)
+                return min(max_tokens_per_expert, estimate)
             logger.warning_once(
                 "DPMetadata unavailable. Defaulting expected_m to "
                 f"{max_tokens_per_expert}.",

@@ -1242,12 +1242,52 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     )
     patch_dp_utils.apply_to_module(module)
     low_latency = SimpleNamespace(
-        data_parallel_size=4, all2all_backend="deepep_low_latency"
+        data_parallel_size=4,
+        all2all_backend="deepep_low_latency",
+        _vllm_hcu_skip_deepep_ll_dp_coordination=True,
     )
     assert module.coordinate_batch_across_dp(4, False, low_latency) == (
         False,
         None,
         0,
+    )
+    # Runtime graph modes are rank-local. Once the finalized global config has
+    # enabled the optimization, every rank must make the same branch decision.
+    assert module.coordinate_batch_across_dp(
+        4,
+        False,
+        low_latency,
+        cudagraph_mode=2,
+    ) == (False, None, 2)
+    unbound_low_latency = SimpleNamespace(
+        data_parallel_size=4,
+        all2all_backend="deepep_low_latency",
+    )
+    assert module.coordinate_batch_across_dp(
+        4,
+        False,
+        unbound_low_latency,
+    ) == (True, "tokens", 2)
+    low_latency_dbo = SimpleNamespace(
+        data_parallel_size=4,
+        all2all_backend="deepep_low_latency",
+        enable_dbo=True,
+    )
+    assert module.coordinate_batch_across_dp(4, False, low_latency_dbo) == (
+        True,
+        "tokens",
+        2,
+    )
+    low_latency_auto = SimpleNamespace(
+        data_parallel_size=4,
+        all2all_backend="deepep_low_latency",
+        enable_dbo=False,
+        _vllm_hcu_deepep_auto=True,
+    )
+    assert module.coordinate_batch_across_dp(4, False, low_latency_auto) == (
+        True,
+        "tokens",
+        2,
     )
     normal = SimpleNamespace(data_parallel_size=4, all2all_backend="naive")
     assert module.coordinate_batch_across_dp(4, False, normal) == (
@@ -1255,7 +1295,130 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
         "tokens",
         2,
     )
-    assert calls == [(4, normal)]
+    assert calls == [
+        (4, unbound_low_latency),
+        (4, low_latency_dbo),
+        (4, low_latency_auto),
+        (4, normal),
+    ]
+
+
+@pytest.mark.parametrize(
+    (
+        "backend",
+        "deepep_auto",
+        "enable_dbo",
+        "ubatch_size",
+        "cudagraph_mode",
+        "expected",
+    ),
+    [
+        pytest.param(
+            "deepep_low_latency", False, False, 0, 0, True, id="direct-eager"
+        ),
+        pytest.param(
+            "deepep_low_latency", False, False, 0, 2, False, id="graph-capable"
+        ),
+        pytest.param(
+            "deepep_low_latency", False, True, 0, 0, False, id="dbo"
+        ),
+        pytest.param(
+            "deepep_low_latency", False, False, 2, 0, False, id="explicit-ubatch"
+        ),
+        pytest.param(
+            "deepep_low_latency", True, False, 0, 0, False, id="deepep-auto"
+        ),
+        pytest.param(
+            "deepep_high_throughput", False, False, 0, 0, False, id="high-throughput"
+        ),
+    ],
+)
+def test_deepep_ll_skip_policy_uses_only_rank_invariant_config(
+    backend: str,
+    deepep_auto: bool,
+    enable_dbo: bool,
+    ubatch_size: int,
+    cudagraph_mode: int,
+    expected: bool,
+):
+    from vllm_hcu import forward_context_runtime
+
+    parallel_config = SimpleNamespace(
+        all2all_backend=backend,
+        enable_dbo=enable_dbo,
+        ubatch_size=ubatch_size,
+        _vllm_hcu_deepep_auto=deepep_auto,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel_config,
+        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
+    )
+
+    assert (
+        forward_context_runtime.bind_deepep_ll_dp_coordination_policy(config)
+        is expected
+    )
+    assert (
+        parallel_config._vllm_hcu_skip_deepep_ll_dp_coordination is expected
+    )
+
+
+def test_forward_context_keeps_dp_metadata_when_low_latency_dbo_is_enabled():
+    from vllm_hcu import forward_context_runtime
+
+    captured: dict[str, object] = {}
+    dp_metadata = object()
+
+    class DPMetadata:
+        @staticmethod
+        def make(parallel_config, num_tokens, num_tokens_across_dp):
+            captured["make"] = (
+                parallel_config,
+                num_tokens,
+                num_tokens_across_dp,
+            )
+            return dp_metadata
+
+    def create_forward_context(*args, **_kwargs):
+        captured["dp_metadata"] = args[2]
+        return SimpleNamespace()
+
+    module = SimpleNamespace(
+        CUDAGraphMode=_Mode,
+        DPMetadata=DPMetadata,
+        batchsize_forward_time={},
+        batchsize_logging_interval=1,
+        create_forward_context=create_forward_context,
+        current_platform=SimpleNamespace(
+            set_additional_forward_context=lambda **_kwargs: {},
+        ),
+        last_logging_time=0,
+        override_forward_context=contextlib.nullcontext,
+        torch=torch,
+        track_batchsize=False,
+    )
+    parallel_config = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        data_parallel_rank=0,
+        data_parallel_size=2,
+        enable_dbo=True,
+        is_moe_model=True,
+        use_sequence_parallel_moe=False,
+    )
+    config = SimpleNamespace(parallel_config=parallel_config)
+    tokens = torch.tensor([4, 4], dtype=torch.int32)
+
+    with forward_context_runtime.set_forward_context(
+        module,
+        attn_metadata=object(),
+        vllm_config=config,
+        num_tokens=4,
+        num_tokens_across_dp=tokens,
+    ):
+        pass
+
+    assert captured["make"] == (parallel_config, 4, tokens)
+    assert captured["dp_metadata"] is dp_metadata
 
 
 class _Buffer:

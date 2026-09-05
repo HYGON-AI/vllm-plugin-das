@@ -803,6 +803,11 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
                     "_vllm_hcu_expert_map_path",
                     config.expert_map_path,
                 )
+            from vllm_hcu.forward_context_runtime import (
+                bind_deepep_ll_dp_coordination_policy,
+            )
+
+            bind_deepep_ll_dp_coordination_policy(vllm_config)
             rebound = _bind_deserialized_hcu_config(vllm_config)
             if rebound != config:
                 raise RuntimeError(

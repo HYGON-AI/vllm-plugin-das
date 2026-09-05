@@ -390,9 +390,20 @@ def test_apply_orders_platform_role_sidecar_prepare_and_feature_binding(
     )
     monkeypatch.setattr(worker_dispatcher, "IMPORT_COORDINATOR", FakeCoordinator())
 
-    config = SimpleNamespace(parallel_config=SimpleNamespace())
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            all2all_backend="deepep_low_latency",
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=0),
+    )
     worker_dispatcher.apply_worker_patches(config)
     assert config.parallel_config._vllm_hcu_deepep_auto is True
+    assert (
+        config.parallel_config._vllm_hcu_skip_deepep_ll_dp_coordination
+        is False
+    )
     assert events == [
         "platform",
         "role:Worker",
