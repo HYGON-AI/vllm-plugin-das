@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
-    VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
+    VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = True
     VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
     VLLM_HCU_USE_GLOBAL_MOE_CACHE: bool = False
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
@@ -312,9 +312,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_EP_SCATTER", "True").lower() in
                  ("true", "1")),
 
-    # If set, use LightOp per-token fp8 quant for dynamic PER_TOKEN QuantFP8.
+    # Use LightOp per-token fp8 quant for dynamic PER_TOKEN QuantFP8 by
+    # default. Set to 0/False to use the native fallback.
     "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8":
-        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "True").lower() in
                  ("true", "1")),
 
     # Optional override for LightOp's fused-MoE chunk size.

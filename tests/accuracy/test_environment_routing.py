@@ -87,6 +87,17 @@ def test_boolean_environment_values_are_lazily_parsed(
     assert hcu_envs.is_set("VLLM_HCU_USE_CUSTOM_OPS") is True
 
 
+def test_lightop_per_token_fp8_route_is_enabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8"
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv(name, raising=False)
+
+    assert patch_input_quant_fp8._lightop_requested() is True
+    assert hcu_envs.is_set(name) is False
+
+
 @pytest.mark.parametrize(
     "name",
     [
