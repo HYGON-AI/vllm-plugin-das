@@ -59,6 +59,10 @@ def _install_lightop_marlin_kernel(
     ):
         del expert_map
         flat_topk_ids = topk_ids.flatten()
+        # Match vLLM's native kernel: every padding slot is initialized to the
+        # numel sentinel before valid routed token ids are written.
+        sorted_token_ids.fill_(topk_ids.numel())
+        expert_ids.fill_(-1)
         write_offset = 0
         block_index = 0
         for expert_id in range(num_experts):
@@ -108,28 +112,35 @@ def _moe_layer(*, global_num_experts: int, expert_map=None):
     )
 
 
-def test_fp8_marlin_prefills_unwritten_alignment_padding(
+def test_fp8_marlin_reuses_native_alignment_initialization_without_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
         compressed_tensors_moe_marlin as marlin,
     )
 
-    _install_lightop_marlin_kernel(
+    kernel = _install_lightop_marlin_kernel(
         monkeypatch,
         "lightop._lmslim_native.layers.fused_moe.fp8_marlin_test",
         "fused_experts_impl_fp8_marlin",
     )
+    marlin.ensure_safe_marlin_moe_alignment(kernel)
     method = object.__new__(marlin.CompressedTensorsW8A8FP8MarlinMoEMethod)
-    sorted_token_ids, _, _ = method.fused_moe_forward(
-        _moe_layer(global_num_experts=2),
-        torch.ones((1, 4)),
-        torch.ones((1, 2)),
-        torch.tensor([[0, 1]], dtype=torch.int32),
-        global_num_experts=2,
-    )
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        sorted_token_ids, _, _ = method.fused_moe_forward(
+            _moe_layer(global_num_experts=2),
+            torch.ones((1, 4)),
+            torch.ones((1, 2)),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            global_num_experts=2,
+        )
 
     assert sorted_token_ids.tolist() == [0, 2, 1, 2]
+    assert not any(
+        event.key == "aten::full" for event in profile.key_averages()
+    )
 
 
 def test_fp8_marlin_patches_public_lightop_runner_module(
@@ -139,11 +150,12 @@ def test_fp8_marlin_patches_public_lightop_runner_module(
         compressed_tensors_moe_marlin as marlin,
     )
 
-    _install_lightop_marlin_kernel(
+    kernel = _install_lightop_marlin_kernel(
         monkeypatch,
         "lightop.moe.fp8_marlin_public_test",
         "fused_experts_impl_fp8_marlin",
     )
+    marlin.ensure_safe_marlin_moe_alignment(kernel)
     method = object.__new__(marlin.CompressedTensorsW8A8FP8MarlinMoEMethod)
     sorted_token_ids, _, _ = method.fused_moe_forward(
         _moe_layer(global_num_experts=2),
@@ -163,11 +175,12 @@ def test_fp8_marlin_uses_stable_vllm_alignment_not_lightop_alignment(
         compressed_tensors_moe_marlin as marlin,
     )
 
-    _install_lightop_marlin_kernel(
+    kernel = _install_lightop_marlin_kernel(
         monkeypatch,
         "lightop._lmslim_native.layers.fused_moe.fp8_marlin_stable_test",
         "fused_experts_impl_fp8_marlin",
     )
+    marlin.ensure_safe_marlin_moe_alignment(kernel)
 
     method = object.__new__(marlin.CompressedTensorsW8A8FP8MarlinMoEMethod)
     sorted_token_ids, expert_ids, num_tokens_post_pad = method.fused_moe_forward(
@@ -190,11 +203,12 @@ def test_int8_marlin_safely_remaps_global_expert_ids(
         compressed_tensors_moe_marlin as marlin,
     )
 
-    _install_lightop_marlin_kernel(
+    kernel = _install_lightop_marlin_kernel(
         monkeypatch,
         "lightop._lmslim_native.layers.fused_moe.int8_marlin_test",
         "fused_experts_impl_int8_marlin",
     )
+    marlin.ensure_safe_marlin_moe_alignment(kernel)
     expert_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int32)
     layer = _moe_layer(global_num_experts=4, expert_map=expert_map)
     method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
@@ -210,6 +224,56 @@ def test_int8_marlin_safely_remaps_global_expert_ids(
     )
 
     assert expert_ids.tolist() == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "kernel_name"),
+    [
+        (
+            "CompressedTensorsW8A8FP8MarlinMoEMethod",
+            "fused_experts_impl_fp8_marlin",
+        ),
+        (
+            "CompressedTensorsW8A8Int8MarlinMoEMethod",
+            "fused_experts_impl_int8_marlin",
+        ),
+    ],
+)
+def test_marlin_installs_alignment_during_weight_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    kernel_name: str,
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    kernel = _install_lightop_marlin_kernel(
+        monkeypatch,
+        f"lightop.moe.{kernel_name}_load_test",
+        kernel_name,
+    )
+    installed = []
+    monkeypatch.setattr(
+        marlin,
+        "ensure_safe_marlin_moe_alignment",
+        installed.append,
+    )
+    monkeypatch.setattr(
+        marlin,
+        "get_w8a8_int8_marlin_weights",
+        lambda weight: weight,
+    )
+    method = object.__new__(getattr(marlin, method_name))
+    method.use_deepep = False
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(torch.ones((1, 1))),
+        w2_weight=torch.nn.Parameter(torch.ones((1, 1))),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert installed == [kernel]
 
 
 @pytest.mark.parametrize(
@@ -252,10 +316,14 @@ def test_marlin_allocates_routed_output_only_during_shared_input_overlap(
     lightop.moe = moe
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.moe", moe)
+
+    def fail_if_installed_during_forward(_kernel) -> None:
+        raise AssertionError("alignment installation escaped weight loading")
+
     monkeypatch.setattr(
         marlin,
         "ensure_safe_marlin_moe_alignment",
-        lambda _kernel: None,
+        fail_if_installed_during_forward,
     )
 
     class SharedExperts:

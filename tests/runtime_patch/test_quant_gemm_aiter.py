@@ -7967,12 +7967,97 @@ def test_lightop_fp8_registration_is_single_owner_and_latched():
     lightop_fp8_runtime._reset_for_tests()
 
 
-def test_lightop_fp8_adapter_has_no_import_time_registration():
+def test_lightop_fp8_adapter_registers_before_forward_compilation():
     lightop_fp8_runtime._reset_for_tests()
     module, _ = _fake_input_quant_module()
     patch_input_quant_fp8.apply_to_module(module)
-    assert lightop_fp8_runtime._REGISTERED is False
+    assert lightop_fp8_runtime._REGISTERED is True
+    assert lightop_fp8_runtime._FP8_DTYPE is torch.float8_e4m3fn
     assert lightop_fp8_runtime._REGISTRATION_ERROR is None
+
+
+def test_lightop_fp8_default_wrapper_compiles_after_initial_registration():
+    """The real wrapper/runtime path must keep registration outside Dynamo."""
+
+    repo = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["VLLM_PLUGINS"] = "__disabled__"
+    env["VLLM_HCU_USE_CUSTOM_OPS"] = "1"
+    env.pop("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", None)
+    env["PYTHONPATH"] = os.pathsep.join((str(repo), env.get("PYTHONPATH", "")))
+    script = r'''
+import sys
+from types import ModuleType
+
+import torch
+
+from vllm_hcu.patch.worker.op_opt import patch_input_quant_fp8
+from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.utils import torch_utils
+
+original_register_custom_op = torch_utils.direct_register_custom_op
+
+def register_cpu_custom_op(*args, **kwargs):
+    kwargs["dispatch_key"] = "CPU"
+    return original_register_custom_op(*args, **kwargs)
+
+torch_utils.direct_register_custom_op = register_cpu_custom_op
+
+
+class QuantFP8:
+    group_shape = GroupShape.PER_TOKEN
+    num_token_padding = None
+
+    def forward_cuda(self, x, scale=None, scale_ub=None, use_triton=False):
+        raise AssertionError("eligible input unexpectedly used official CUDA path")
+
+    def forward_native(self, x, scale=None, scale_ub=None, use_triton=False):
+        raise AssertionError("eligible input unexpectedly used official native path")
+
+
+target = ModuleType(patch_input_quant_fp8.TARGET_MODULE)
+target.GroupShape = GroupShape
+target.QuantFP8 = QuantFP8
+target._FP8_DTYPE = torch.float8_e4m3fn
+sys.modules[target.__name__] = target
+
+lightop = ModuleType("lightop")
+lightop.__path__ = []
+quant = ModuleType("lightop.quant")
+
+def per_token_quant_fp8(x, *, dtype, out_q, out_scale):
+    del x, dtype
+    out_scale.fill_(1)
+    return out_q, out_scale
+
+quant.per_token_quant_fp8 = per_token_quant_fp8
+lightop.quant = quant
+sys.modules["lightop"] = lightop
+sys.modules["lightop.quant"] = quant
+
+patch_input_quant_fp8.apply_to_module(target)
+compiled = torch.compile(
+    target.QuantFP8().forward_cuda,
+    backend="aot_eager",
+    fullgraph=True,
+)
+output, scale = compiled(torch.ones((2, 8)).contiguous())
+assert output.shape == (2, 8)
+assert output.dtype is torch.float8_e4m3fn
+assert scale.shape == (2, 1)
+assert torch.equal(scale, torch.ones_like(scale))
+print("LIGHTOP_FP8_FULLGRAPH_OK")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LIGHTOP_FP8_FULLGRAPH_OK" in result.stdout
 
 
 def _fake_input_quant_module():

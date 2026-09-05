@@ -34,8 +34,9 @@ def ensure_safe_marlin_moe_alignment(fused_experts: Callable[..., object]) -> No
     positions. Its vendored SlimQuant runners allocate ``sorted_ids`` with
     ``torch.empty``, leaving padding positions as arbitrary token ids, and its
     multi-token ordering differs from the order expected by Marlin. Patch the
-    runner-local helper to use vLLM's stable alignment operation and prefill
-    padding with the sentinel expected by the kernels.
+    runner-local helper to use vLLM's stable alignment operation.  The native
+    operation initializes every padding position with the sentinel expected by
+    the kernels, so its output buffer does not need a separate fill.
     """
 
     module_name = getattr(fused_experts, "__module__", "")
@@ -75,9 +76,8 @@ def ensure_safe_marlin_moe_alignment(fused_experts: Callable[..., object]) -> No
                 max_num_tokens_padded,
             )
 
-        sorted_ids = torch.full(
+        sorted_ids = torch.empty(
             (max_num_tokens_padded,),
-            fill_value=topk_ids.numel(),
             dtype=torch.int32,
             device=topk_ids.device,
         )

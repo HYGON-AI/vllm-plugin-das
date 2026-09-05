@@ -68,6 +68,38 @@ def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
         assert not any(fragment in source for fragment in forbidden)
 
 
+def test_glm4_places_routed_scale_after_non_aiter_moe_output():
+    source = Path("vllm_hcu/models/glm4_moe.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+    fused_moe_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "FusedMoE"
+    ]
+
+    assert fused_moe_calls
+    routed_scale_value = next(
+        keyword.value
+        for keyword in fused_moe_calls[0].keywords
+        if keyword.arg == "apply_routed_scale_to_output"
+    )
+    assert isinstance(routed_scale_value, ast.UnaryOp)
+    assert isinstance(routed_scale_value.op, ast.Not)
+    assert isinstance(routed_scale_value.operand, ast.Call)
+    assert isinstance(routed_scale_value.operand.func, ast.Name)
+    assert routed_scale_value.operand.func.id == "is_aiter_moe_requested"
+    assert len(routed_scale_value.operand.args) == 1
+    backend_config = routed_scale_value.operand.args[0]
+    assert isinstance(backend_config, ast.Attribute)
+    assert backend_config.attr == "kernel_config"
+    assert isinstance(backend_config.value, ast.Name)
+    assert backend_config.value.id == "vllm_config"
+
+
 def test_hcu_runner_uses_v0251_routed_experts_contract():
     source = Path("vllm_hcu/v1/hcu_model_runner.py").read_text(
         encoding="utf-8-sig"

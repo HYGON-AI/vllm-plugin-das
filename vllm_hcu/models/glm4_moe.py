@@ -35,7 +35,9 @@ from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
 
 import vllm_hcu.platforms.envs as henvs
-from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+    is_aiter_moe_requested,
+)
 from vllm_hcu.model_executor.layers.sp_utils import (
     configure_hcu_runtime_sp,
     finalize_attention_output_for_sp,
@@ -51,6 +53,7 @@ from vllm_hcu.model_executor.layers.sp_utils import (
     sp_mlp_down_proj_reduce_results,
     use_sp_mlp_token_gather,
 )
+from vllm_hcu.patch.config import get_hcu_config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -260,7 +263,13 @@ class Glm4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func="sigmoid",
             routed_scaling_factor=self.routed_scaling_factor,
-            #apply_routed_scale_to_output=True,
+            # AITER consumes scaled router weights. Other backends follow the
+            # vLLM GLM contract and apply the factor after expert aggregation.
+            # An AITER no-solution fallback remains correct because it receives
+            # those already-scaled weights in the vLLM Triton call.
+            apply_routed_scale_to_output=not is_aiter_moe_requested(
+                vllm_config.kernel_config
+            ),
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,

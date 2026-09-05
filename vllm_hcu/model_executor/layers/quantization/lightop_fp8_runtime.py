@@ -66,6 +66,16 @@ def ensure_registered(
     """Register exactly once; failures are latched for the process lifetime."""
 
     global _FP8_DTYPE, _REGISTERED, _REGISTRATION_ERROR
+    # The forward wrapper is traced by Dynamo.  Registration is completed when
+    # the patch is installed, so the steady-state path must return before the
+    # graph-unsafe Python lock.
+    if _REGISTERED:
+        if _FP8_DTYPE is not fp8_dtype:
+            raise HcuLightOpRegistrationError(
+                f"LightOp per-token FP8 was registered for {_FP8_DTYPE}, "
+                f"not {fp8_dtype}"
+            )
+        return
     with _LOCK:
         if _REGISTRATION_ERROR is not None:
             raise HcuLightOpRegistrationError(

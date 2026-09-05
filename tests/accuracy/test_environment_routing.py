@@ -347,6 +347,7 @@ def test_input_fp8_environment_selects_custom_or_official_wrapper(
     )
     runtime = _module(
         "vllm_hcu.model_executor.layers.quantization.lightop_fp8_runtime",
+        ensure_registered=lambda dtype, register: None,
         quantize=lambda x, dtype, register: (
             calls.append("custom") or ("custom", x, dtype, register)
         ),

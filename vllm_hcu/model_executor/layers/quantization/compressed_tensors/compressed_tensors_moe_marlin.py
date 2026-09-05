@@ -287,6 +287,11 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
 
+        # Install the LightOp compatibility shim once while loading weights,
+        # before model forward can be captured or compiled.
+        from lightop.moe import fused_experts_impl_fp8_marlin
+        ensure_safe_marlin_moe_alignment(fused_experts_impl_fp8_marlin)
+
     def fused_moe_forward(
             self,
             layer: torch.nn.Module,
@@ -304,7 +309,6 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             inplace: bool = True,
     ):
         from lightop.moe import fused_experts_impl_fp8_marlin
-        ensure_safe_marlin_moe_alignment(fused_experts_impl_fp8_marlin)
         return fused_experts_impl_fp8_marlin(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -531,6 +535,12 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
 
+        if not self.use_deepep:
+            # Install once during loading rather than querying and patching
+            # the runner module from every MoE invocation.
+            from lightop.moe import fused_experts_impl_int8_marlin
+            ensure_safe_marlin_moe_alignment(fused_experts_impl_int8_marlin)
+
     # ── apply ───────────────────────────────────────────────────────
     def apply(
         self,
@@ -545,7 +555,6 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     ) -> torch.Tensor:
         # LightOp Marlin INT8 path.
         from lightop.moe import fused_experts_impl_int8_marlin
-        ensure_safe_marlin_moe_alignment(fused_experts_impl_int8_marlin)
         inplace = self._allows_inplace_output(
             x,
             shared_experts,

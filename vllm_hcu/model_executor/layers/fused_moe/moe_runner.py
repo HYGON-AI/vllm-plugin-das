@@ -900,31 +900,13 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        # Alias/overlap policy depends on runtime-only backend state and
-        # torch._C._is_alias_of returns a Python bool that Dynamo cannot trace.
-        # During compilation, use the tuple-returning opaque op; the quant
-        # method evaluates its per-call in-place policy inside that boundary.
+        # Keep runtime alias handling inside the opaque mutation-only op.  In
+        # particular, do not switch compiled calls to the tuple-returning op:
+        # an in-place routed kernel would then need another full output clone.
         forward_uses_mutated_hidden_states = (
             self._forward_uses_mutated_hidden_states
-            and not torch.compiler.is_compiling()
         )
-        if (
-            forward_uses_mutated_hidden_states
-            and self._shared_experts is not None
-            and shared_experts_input is not None
-        ):
-            forward_uses_mutated_hidden_states = (
-                self._shared_experts.allows_inplace_routed_output(
-                    hidden_states,
-                    shared_experts_input,
-                )
-            )
-        forward_entry = (
-            self._forward_entry
-            if forward_uses_mutated_hidden_states
-            == self._forward_uses_mutated_hidden_states
-            else self._select_forward(forward_uses_mutated_hidden_states)
-        )
+        forward_entry = self._forward_entry
 
         result = forward_entry(
             hidden_states,

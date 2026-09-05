@@ -101,6 +101,16 @@ def apply_to_module(module: ModuleType) -> bool:
             f"required HCU patch constants in {TARGET_MODULE} are missing"
         )
 
+    # Register before model forward is handed to Dynamo.  The runtime keeps a
+    # lock-free fast path for this already-registered steady state.
+    from vllm.utils.torch_utils import direct_register_custom_op
+    from vllm_hcu.model_executor.layers.quantization import lightop_fp8_runtime
+
+    lightop_fp8_runtime.ensure_registered(
+        input_quant._FP8_DTYPE,
+        direct_register_custom_op,
+    )
+
     @functools.wraps(original_cuda)
     def hcu_forward_cuda(
         self,

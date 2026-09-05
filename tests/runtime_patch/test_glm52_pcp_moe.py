@@ -405,59 +405,50 @@ def test_shared_input_forwarding_does_not_recompute_inplace_decision(
     torch.testing.assert_close(shared_input, hidden_states)
 
 
-def test_compiled_forward_keeps_overlap_decision_behind_opaque_op(
+def test_compiled_forward_keeps_inplace_entry_without_extra_routed_clone(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
+    moe_op_registrations: dict[str, dict],
 ) -> None:
-    """Fullgraph tracing must not evaluate alias-sensitive Python policy."""
-
-    def fallback_op(
-        hidden_states: torch.Tensor,
-        _router_logits: torch.Tensor | None,
-        _shared_experts_input: torch.Tensor | None,
-        _input_ids: torch.Tensor | None,
-        _quanted_hidden_states: torch.Tensor | None,
-        _scale: torch.Tensor | None,
-        _topk_weights: torch.Tensor | None,
-        _topk_ids: torch.Tensor | None,
-        _layer_name: str,
-        _hidden_dim_unpadded: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.full_like(hidden_states, 7), torch.ones_like(hidden_states)
-
-    def fallback_fake(
-        hidden_states: torch.Tensor,
-        _router_logits: torch.Tensor | None,
-        _shared_experts_input: torch.Tensor | None,
-        _input_ids: torch.Tensor | None,
-        _quanted_hidden_states: torch.Tensor | None,
-        _scale: torch.Tensor | None,
-        _topk_weights: torch.Tensor | None,
-        _topk_ids: torch.Tensor | None,
-        _layer_name: str,
-        _hidden_dim_unpadded: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.empty_like(hidden_states), torch.empty_like(hidden_states)
-
-    test_library = torch.library.Library(
-        "vllm_hcu_test_moe_compiled_forward", "FRAGMENT"
-    )
-    torch_utils.direct_register_custom_op(
-        op_name="moe_forward_shared",
-        op_func=fallback_op,
-        mutates_args=["hidden_states"],
-        fake_impl=fallback_fake,
-        target_lib=test_library,
-        dispatch_key="CPU",
-        tags=(torch.Tag.needs_fixed_stride_order,),
-    )
-    fallback_entry = (
-        torch.ops.vllm_hcu_test_moe_compiled_forward.moe_forward_shared
-    )
+    """No-overlap compiled Marlin must retain the mutation-only entry."""
 
     class SharedExperts:
+        def requires_input_preservation(self, _hidden_states) -> bool:
+            return False
+
         def allows_inplace_routed_output(self, *_args) -> bool:
             raise AssertionError("overlap policy escaped the opaque op")
+
+    class Layer:
+        _shared_experts = SharedExperts()
+
+        def _forward_impl(self, hidden_states, *_args, **_kwargs):
+            hidden_states.add_(1)
+            return torch.full_like(hidden_states, 7), hidden_states
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "get_layer_from_name",
+        lambda _name: Layer(),
+    )
+    test_library = torch.library.Library(
+        "vllm_hcu_test_moe_compiled_inplace", "FRAGMENT"
+    )
+    for op_name in ("moe_forward_shared", "moe_forward_shared_inplace"):
+        registration = moe_op_registrations[op_name]
+        torch_utils.direct_register_custom_op(
+            op_name=op_name,
+            op_func=registration["op_func"],
+            mutates_args=registration["mutates_args"],
+            fake_impl=registration["fake_impl"],
+            target_lib=test_library,
+            dispatch_key="CPU",
+            tags=registration["tags"],
+        )
+    inplace_entry = (
+        torch.ops.vllm_hcu_test_moe_compiled_inplace.moe_forward_shared_inplace
+    )
+    tuple_entry = torch.ops.vllm_hcu_test_moe_compiled_inplace.moe_forward_shared
 
     runner = object.__new__(moe_runner_module.MoERunner)
     torch.nn.Module.__init__(runner)
@@ -471,11 +462,13 @@ def test_compiled_forward_keeps_overlap_decision_behind_opaque_op(
     runner._shared_experts = SharedExperts()
     runner.router = object()
     runner._forward_uses_mutated_hidden_states = True
-    runner.__dict__["_forward_entry"] = fallback_entry
+    runner.__dict__["_forward_entry"] = inplace_entry
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_select_forward",
-        lambda self, _uses_mutated=None: fallback_entry,
+        lambda self, uses_mutated=None: (
+            inplace_entry if uses_mutated else tuple_entry
+        ),
     )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
@@ -504,130 +497,18 @@ def test_compiled_forward_keeps_overlap_decision_behind_opaque_op(
     )
 
     compiled = torch.compile(runner.forward, backend="aot_eager", fullgraph=True)
-    output = compiled(make_hidden(), make_logits())
-
-    torch.testing.assert_close(output, torch.full_like(output, 8))
-
-
-@pytest.mark.parametrize(
-    ("shared_experts_overlap", "expected_path", "input_is_mutated"),
-    [
-        (False, "inplace", True),
-        (True, "out_of_place", False),
-    ],
-)
-def test_forward_uses_out_of_place_routed_output_only_during_shared_overlap(
-    monkeypatch: pytest.MonkeyPatch,
-    moe_runner_module: ModuleType,
-    shared_experts_overlap: bool,
-    expected_path: str,
-    input_is_mutated: bool,
-) -> None:
-    """Only a shared-input race may switch local Marlin out of place."""
-
-    shared_experts_module = importlib.import_module(
-        "vllm_hcu.model_executor.layers.fused_moe.shared_experts"
-    )
-    shared_experts = object.__new__(shared_experts_module.SharedExperts)
-    order = (
-        shared_experts_module.SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
-        if shared_experts_overlap
-        else shared_experts_module.SharedExpertsOrder.NO_OVERLAP
-    )
-    monkeypatch.setattr(
-        shared_experts,
-        "_determine_shared_experts_order",
-        lambda _hidden_states: order,
-    )
-
-    paths: list[str] = []
-    shared_input_aliases: list[bool] = []
-
-    def inplace_forward(hidden_states, _logits, shared_input, *_args):
-        paths.append("inplace")
-        shared_input_aliases.append(
-            torch._C._is_alias_of(shared_input, hidden_states)
-        )
-        shared_output = torch.full_like(hidden_states, 7)
-        hidden_states.fill_(1)
-        return shared_output
-
-    def out_of_place_forward(hidden_states, _logits, shared_input, *_args):
-        paths.append("out_of_place")
-        shared_input_aliases.append(
-            torch._C._is_alias_of(shared_input, hidden_states)
-        )
-        return torch.full_like(hidden_states, 7), torch.ones_like(hidden_states)
-
-    monkeypatch.setattr(
-        moe_runner_module.current_platform, "is_cpu", lambda: True
-    )
-    monkeypatch.setattr(
-        moe_runner_module.current_platform, "is_tpu", lambda: False
-    )
-    monkeypatch.setattr(
-        moe_runner_module, "_moe_forward_shared_inplace", inplace_forward
-    )
-    monkeypatch.setattr(
-        moe_runner_module, "_moe_forward_shared", out_of_place_forward
-    )
-
-    runner = object.__new__(moe_runner_module.MoERunner)
-    torch.nn.Module.__init__(runner)
-    runner.moe_config = SimpleNamespace(
-        dp_size=1,
-        hidden_dim_unpadded=2,
-        is_sequence_parallel=False,
-        pcp_size=1,
-    )
-    runner.routed_experts = SimpleNamespace(
-        quant_method=SimpleNamespace(
-            has_unpadded_output=False,
-            supports_inplace_output=True,
-        ),
-    )
-    runner.routed_input_transform = None
-    runner.routed_output_transform = None
-    runner.routed_scaling_factor = 1.0
-    runner._shared_experts = shared_experts
-    runner.router = object()
-    runner._refresh_forward_entry()
-    monkeypatch.setattr(
-        moe_runner_module.MoERunner,
-        "_maybe_pad_hidden_states",
-        lambda self, shared, hidden: (hidden, None, None),
-    )
-    monkeypatch.setattr(
-        moe_runner_module.MoERunner,
-        "_encode_layer_name",
-        lambda self: "test-layer",
-    )
-    monkeypatch.setattr(
-        moe_runner_module.MoERunner,
-        "_maybe_reduce_shared_expert_output",
-        lambda self, shared: shared,
-    )
-    monkeypatch.setattr(
-        moe_runner_module.MoERunner,
-        "_maybe_reduce_final_output",
-        lambda self, output, _truncate: output,
-    )
-    monkeypatch.setattr(
-        moe_runner_module.MoERunner,
-        "_maybe_add_zero_expert_output",
-        lambda self, output: output,
-    )
+    compiled(make_hidden(), None)
     hidden_states = make_hidden()
-    original_hidden_states = hidden_states.clone()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        output = compiled(hidden_states, None)
 
-    output = runner.forward(hidden_states, make_logits())
-
-    assert paths == [expected_path]
-    assert shared_input_aliases == [True]
-    assert torch.equal(hidden_states, original_hidden_states) is (
-        not input_is_mutated
+    clone_count = sum(
+        event.count for event in profile.key_averages() if event.key == "aten::clone"
     )
-    torch.testing.assert_close(output, torch.full_like(hidden_states, 8))
+    assert clone_count == 1
+    torch.testing.assert_close(output, make_hidden() + 8)
 
 
 @pytest.mark.parametrize(
