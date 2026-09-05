@@ -693,13 +693,17 @@ def test_channelwise_route_preserves_target_per_tensor_weight_scale(
     assert fake_product.triton_calls[0]["scale_b"] is kwargs["Bs"]
 
 
-def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
+@pytest.mark.parametrize("custom_quantization_gemm", ["0", "1"])
+def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph(
+    custom_quantization_gemm: str,
+):
     """Exercise production plumbing with an isolated test dispatch key."""
 
     probe = textwrap.dedent(
         r"""
         from __future__ import annotations
 
+        import os
         import sys
         from types import ModuleType
 
@@ -719,6 +723,9 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
         )
         LIBRARIES = []
         REAL_CALLS = []
+        USE_LIGHTOP = (
+            os.environ["VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM"] == "1"
+        )
 
 
         def package(name):
@@ -795,11 +802,43 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
                 bucket = 128
             else:
                 bucket = 256
-            REAL_CALLS.append((m, bucket))
+            REAL_CALLS.append(("target-triton", m, bucket))
             return torch.zeros(
                 (m, weight.shape[1]),
                 dtype=out_dtype,
                 device=input.device,
+            )
+
+
+        def hipblaslt_w8a8_channelwise_gemm(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            m,
+            n,
+            k,
+            transpose_flag,
+            out_dtype,
+            bias,
+        ):
+            del scale_a, scale_b, bias
+            assert transpose_flag == "NT"
+            assert tuple(a.shape) == (m, k)
+            assert tuple(b.shape) == (n, k)
+            if m <= 32:
+                bucket = 32
+            elif m <= 64:
+                bucket = 64
+            elif m <= 128:
+                bucket = 128
+            else:
+                bucket = 256
+            REAL_CALLS.append(("lightop", m, bucket))
+            return True, torch.zeros(
+                (1, m, n),
+                dtype=out_dtype,
+                device=a.device,
             )
 
 
@@ -809,17 +848,27 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
         )
         triton = ModuleType(TRITON)
         triton.triton_scaled_mm = triton_scaled_mm
+        lightop_gemm_ops = ModuleType("lightop.gemm_ops")
+        lightop_gemm_ops.hipblaslt_w8a8_channelwise_gemm = (
+            hipblaslt_w8a8_channelwise_gemm
+        )
         torch_utils = ModuleType("vllm.utils.torch_utils")
         torch_utils.direct_register_custom_op = direct_register_custom_op
         install_tree(
             {
                 TARGET: target,
                 TRITON: triton,
+                "lightop.gemm_ops": lightop_gemm_ops,
                 "vllm.utils.torch_utils": torch_utils,
             }
         )
 
         scaled_mm.install_fp8_scaled_mm_compat(target)
+        expected_backend = "lightop" if USE_LIGHTOP else "target-triton"
+        assert (
+            ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_backend
+            == expected_backend
+        )
         kernel = ChannelWiseTorchFP8ScaledMMLinearKernel()
         graphs = []
         captured_graphs = []
@@ -853,7 +902,7 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
             fullgraph=True,
             dynamic=True,
         )
-        fp8 = torch.float8_e4m3fnuz
+        fp8 = torch.float8_e4m3fn if USE_LIGHTOP else torch.float8_e4m3fnuz
         B = torch.zeros((5, 4), dtype=fp8).t()
         Bs = torch.ones((5, 1), dtype=torch.float32)
         bias = torch.ones((5,), dtype=torch.bfloat16)
@@ -869,7 +918,12 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
         assert len(graphs) == 1, graphs
         assert len(captured_graphs) == 1, captured_graphs
         assert "hcu_channel_fp8_target_triton_scaled_mm" in graphs[0]
-        assert REAL_CALLS == [(2, 32), (33, 64), (65, 128), (129, 256)]
+        assert REAL_CALLS == [
+            (expected_backend, 2, 32),
+            (expected_backend, 33, 64),
+            (expected_backend, 65, 128),
+            (expected_backend, 129, 256),
+        ]
 
         captured_graph, _ = captured_graphs[0]
         _, split_items = split_graph(captured_graph, ["aten::sigmoid"])
@@ -934,7 +988,7 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
             "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
             "VLLM_PLUGINS": "__disabled__",
-            "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM": "0",
+            "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM": custom_quantization_gemm,
         }
     )
     completed = subprocess.run(
