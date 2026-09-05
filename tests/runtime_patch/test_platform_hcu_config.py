@@ -1102,6 +1102,7 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
             decode_context_parallel_size=1,
             data_parallel_size=1,
             enable_expert_parallel=False,
+            enable_elastic_ep=False,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         speculative_config=None,
@@ -1156,6 +1157,19 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
     with pytest.raises(
         ValueError,
         match="deepep_auto.*EPLB.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_static_offline_eplb_rejects_elastic_ep_before_model_loading() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(expert_map_path="/models/maps/static.json")
+    )
+    config.parallel_config.enable_elastic_ep = True
+
+    with pytest.raises(
+        ValueError,
+        match="static offline EPLB.*elastic EP.*not supported",
     ):
         patch_vllm_config.validate_and_update_hcu_config(config)
 

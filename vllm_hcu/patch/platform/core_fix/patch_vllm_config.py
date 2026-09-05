@@ -242,6 +242,17 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)
 
+    if feature_config.expert_map_path:
+        if parallel_config is None:
+            raise PatchCompatibilityError(
+                "static offline EPLB requires VllmConfig.parallel_config"
+            )
+        if getattr(parallel_config, "enable_elastic_ep", False):
+            raise ValueError(
+                "static offline EPLB with elastic EP is not supported because "
+                "elastic reshuffling would replace the loaded expert map"
+            )
+
     if parallel_config is not None:
         setattr(
             parallel_config,
