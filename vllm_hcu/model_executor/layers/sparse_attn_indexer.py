@@ -962,12 +962,13 @@ class SparseAttnIndexer(CustomOp):
                         layer_metadata,
                     )
                 use_safe_cache_writer = self.dcp_world_size > 1
-                lightop_k = cache_k[:0] if use_safe_cache_writer else cache_k
-                lightop_slots = (
-                    slot_mapping[:0]
-                    if use_safe_cache_writer
-                    else slot_mapping
-                )
+                if use_safe_cache_writer:
+                    lightop_k = cache_k[:0]
+                    lightop_slots = slot_mapping[:0]
+                else:
+                    valid_slots = slot_mapping >= 0
+                    lightop_k = cache_k[valid_slots]
+                    lightop_slots = slot_mapping[valid_slots]
                 q_quant, weights = lightop_indexer_qk_quant_and_store(
                     q_quant,
                     lightop_k,

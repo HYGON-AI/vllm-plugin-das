@@ -459,6 +459,76 @@ def test_hy_v4_lightop_qk_fusion_writes_cache_before_topk(
     assert events[1][-1]["indexer_cache_layout"] == "NORMAL"
 
 
+def test_hy_v4_lightop_filters_negative_slots_on_idle_dp_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch passing dummy-batch slot -1 to LightOp's native cache writer."""
+    events: list[tuple[torch.Tensor, torch.Tensor]] = []
+    fp8_dtype = torch.float8_e4m3fn
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([-1, 3], dtype=torch.int64),
+        num_kv_actual_tokens=2,
+    )
+    fused_q = torch.ones((2, 3, 128), dtype=fp8_dtype)
+    fused_weights = torch.ones((2, 3), dtype=torch.float32)
+
+    def quant_and_store(q, k, _cache, slots, _weights, **_kwargs):
+        del q
+        events.append((k, slots))
+        return fused_q, fused_weights
+
+    monkeypatch.setattr(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse."
+        "rocm_aiter_sparse_attn_indexer_native",
+        lambda *args, **_kwargs: args[3],
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        effective_pcp_world_size=lambda _value: 1,
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "single-rank Hy4 unexpectedly gathered PCP inputs"
+        ),
+        lightop_indexer_qk_quant_and_store=quant_and_store,
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_lightop_hy_v4_indexer=True,
+        skip_k_cache_insert=False,
+        pcp_world_size=1,
+        dcp_world_size=1,
+        k_cache=SimpleNamespace(
+            prefix="indexer",
+            kv_cache=torch.zeros((1, 4, 132), dtype=torch.uint8),
+        ),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=64,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 64), dtype=torch.int32),
+    )
+    k_bf16 = torch.arange(256, dtype=torch.bfloat16).view(2, 128)
+
+    forward_hip(
+        indexer,
+        torch.empty((2, 1)),
+        torch.ones((2, 3, 128), dtype=torch.bfloat16),
+        k_bf16,
+        torch.ones((2, 3), dtype=torch.bfloat16),
+    )
+
+    assert len(events) == 1
+    assert torch.equal(events[0][0], k_bf16[1:2])
+    assert torch.equal(events[0][1], torch.tensor([3], dtype=torch.int64))
+
+
 def test_hy_v4_lightop_avoids_unsafe_negative_slot_cache_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
