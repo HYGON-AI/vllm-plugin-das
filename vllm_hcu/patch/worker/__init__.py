@@ -221,6 +221,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),
 )
 
 

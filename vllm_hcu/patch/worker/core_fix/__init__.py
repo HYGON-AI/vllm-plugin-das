@@ -19,6 +19,7 @@ from . import (
     patch_qwen3_5_mamba_state_dtype,
     patch_qwen3_vl,
     patch_qwen3_vl_moe,
+    patch_qwen4_exp,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "patch_qwen3_5_mamba_state_dtype",
     "patch_qwen3_vl",
     "patch_qwen3_vl_moe",
+    "patch_qwen4_exp",
 ]

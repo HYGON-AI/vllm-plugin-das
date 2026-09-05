@@ -11,6 +11,7 @@ import torch
 from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v32_config,
     patch_gpt_oss_mlp_block,
+    patch_qwen4_exp,
     patch_qwen3_5_mamba_state_dtype,
     patch_qwen3_vl,
     patch_qwen3_vl_moe,
@@ -376,6 +377,94 @@ def _qwen3_vl_moe_module(calls: list[tuple[object, ...]]) -> ModuleType:
     )
 
 
+def _qwen4_exp_module(calls: list[tuple[object, ...]]) -> ModuleType:
+    class Qwen4ExpForCausalLM:
+        def __init__(self, *, vllm_config, prefix=""):
+            config = vllm_config.model_config.hf_config
+            calls.append(
+                ("llm", getattr(config, "tie_word_embeddings", _MISSING))
+            )
+
+    class Qwen4ExpForConditionalGeneration:
+        def __init__(self, *, vllm_config, prefix="model"):
+            config = vllm_config.model_config.hf_config
+            calls.append(
+                (
+                    "vl",
+                    getattr(config, "tie_word_embeddings", _MISSING),
+                    getattr(config.text_config, "tie_word_embeddings", _MISSING),
+                )
+            )
+
+    return _module(
+        patch_qwen4_exp.TARGET_MODULE,
+        Qwen4ExpForCausalLM=Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration=Qwen4ExpForConditionalGeneration,
+    )
+
+
+@pytest.mark.parametrize(
+    ("top_value", "text_value", "expected_text"),
+    [
+        (_MISSING, _MISSING, False),
+        (_MISSING, True, True),
+        (None, True, True),
+        (False, True, False),
+        (True, False, True),
+    ],
+)
+def test_qwen4_exp_two_wrappers_are_atomic_and_preserve_values(
+    top_value: object, text_value: object, expected_text: bool
+):
+    calls: list[tuple[object, ...]] = []
+    module = _qwen4_exp_module(calls)
+    top_config = SimpleNamespace(text_config=SimpleNamespace())
+    if top_value is not _MISSING:
+        top_config.tie_word_embeddings = top_value
+    if text_value is not _MISSING:
+        top_config.text_config.tie_word_embeddings = text_value
+
+    assert patch_qwen4_exp.apply_to_module(module) is True
+    llm_wrapper = module.Qwen4ExpForCausalLM.__init__
+    vl_wrapper = module.Qwen4ExpForConditionalGeneration.__init__
+    assert patch_qwen4_exp.apply_to_module(module) is False
+    assert module.Qwen4ExpForCausalLM.__init__ is llm_wrapper
+    assert module.Qwen4ExpForConditionalGeneration.__init__ is vl_wrapper
+
+    module.Qwen4ExpForConditionalGeneration(
+        vllm_config=_vllm_config(top_config)
+    )
+    module.Qwen4ExpForCausalLM(
+        vllm_config=_vllm_config(top_config.text_config)
+    )
+
+    assert top_config.text_config.tie_word_embeddings is expected_text
+    assert calls[-1] == ("llm", expected_text)
+
+
+def test_qwen4_exp_validation_failure_does_not_partially_patch():
+    class Qwen4ExpForCausalLM:
+        def __init__(self, *, vllm_config, prefix=""):
+            pass
+
+    class Qwen4ExpForConditionalGeneration:
+        def __init__(self, vllm_config, prefix="model"):
+            pass
+
+    llm_original = Qwen4ExpForCausalLM.__init__
+    vl_original = Qwen4ExpForConditionalGeneration.__init__
+    module = _module(
+        patch_qwen4_exp.TARGET_MODULES[0],
+        Qwen4ExpForCausalLM=Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration=Qwen4ExpForConditionalGeneration,
+    )
+
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_qwen4_exp.apply_to_module(module)
+    assert Qwen4ExpForCausalLM.__init__ is llm_original
+    assert Qwen4ExpForConditionalGeneration.__init__ is vl_original
+
+
 @pytest.mark.parametrize(
     ("top_value", "text_value", "expected_text"),
     [
@@ -444,6 +533,7 @@ def test_callbacks_reject_wrong_exact_module():
         patch_deepseek_v32_config,
         patch_gpt_oss_mlp_block,
         patch_qwen3_5_mamba_state_dtype,
+        patch_qwen4_exp,
         patch_qwen3_vl,
         patch_qwen3_vl_moe,
     ):
