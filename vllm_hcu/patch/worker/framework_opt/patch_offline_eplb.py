@@ -29,6 +29,7 @@ TARGETS = (
     f"{TARGET_MODULE}.EplbState.step",
     f"{TARGET_MODULE}._commit_eplb_maps",
     f"{TARGET_MODULE}._move_to_workspace",
+    f"{TARGET_MODULE}.EplbState.rearrange",
 )
 _MARKER = "_vllm_hcu_offline_eplb_patch_applied"
 _WRAPPER_MARKER = "_vllm_hcu_offline_eplb_wrapper"
@@ -204,6 +205,10 @@ def _parallel_offline_paths(parallel_config: object) -> tuple[str | None, str | 
         raise ValueError(
             "expert_map_record_path and expert_map_path are mutually exclusive"
         )
+    if (record_path or load_path) and getattr(
+        parallel_config, "pipeline_parallel_size", 1
+    ) > 1:
+        raise ValueError("Offline EPLB requires pipeline_parallel_size=1")
     return record_path, load_path
 
 
@@ -254,6 +259,7 @@ def apply_to_module(module: ModuleType) -> bool:
             (eplb_state_cls, "step"),
             (eplb_module, "_commit_eplb_maps"),
             (eplb_module, "_move_to_workspace"),
+            (eplb_state_cls, "rearrange"),
         )
         if not all(_wrapped_is_valid(owner, name) for owner, name in wrapped):
             raise PatchCompatibilityError(
@@ -265,6 +271,7 @@ def apply_to_module(module: ModuleType) -> bool:
     original_step = require_callable(eplb_state_cls, "step", TARGETS[1])
     original_commit = require_callable(eplb_module, "_commit_eplb_maps", TARGETS[2])
     original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[3])
+    original_rearrange = require_callable(eplb_state_cls, "rearrange", TARGETS[4])
     rearrange = require_callable(
         eplb_module,
         "rearrange_expert_weights_inplace",
@@ -273,6 +280,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_add_model)
     def hcu_add_model(self, model, model_config) -> None:
+        record_path, load_path = _parallel_offline_paths(self.parallel_config)
         original_add_model(self, model, model_config)
         model_hash = model_config.compute_hash()
         model_state = self.model_states.get(model_hash)
@@ -280,7 +288,6 @@ def apply_to_module(module: ModuleType) -> bool:
             raise PatchCompatibilityError(
                 "vLLM EPLB add_model did not publish the expected model state"
             )
-        record_path, load_path = _parallel_offline_paths(self.parallel_config)
         model_key = model.__class__.__name__
         setattr(model_state, _MODEL_RECORD_PATH_ATTR, record_path)
         setattr(model_state, _MODEL_KEY_ATTR, model_key)
@@ -339,6 +346,18 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_step, _WRAPPER_MARKER, True)
 
+    @functools.wraps(original_rearrange)
+    def hcu_rearrange(self, is_profile=False, rank_mapping=None):
+        _, load_path = _parallel_offline_paths(self.parallel_config)
+        # Keep step statistics and explicit elastic-EP remapping intact.
+        if load_path and rank_mapping is None:
+            return None
+        return original_rearrange(
+            self, is_profile=is_profile, rank_mapping=rank_mapping
+        )
+
+    setattr(hcu_rearrange, _WRAPPER_MARKER, True)
+
     @functools.wraps(original_commit)
     def hcu_commit(model_state, new_physical_to_logical_map) -> None:
         original_commit(
@@ -366,6 +385,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(eplb_state_cls, "_vllm_hcu_original_offline_step", original_step)
     setattr(eplb_state_cls, "add_model", hcu_add_model)
     setattr(eplb_state_cls, "step", hcu_step)
+    eplb_state_cls.rearrange = hcu_rearrange
     setattr(eplb_module, "_vllm_hcu_original_offline_commit", original_commit)
     setattr(eplb_module, "_vllm_hcu_original_offline_move", original_move)
     setattr(eplb_module, "_commit_eplb_maps", hcu_commit)
