@@ -87,17 +87,12 @@ def test_glm4_places_routed_scale_after_non_aiter_moe_output():
         for keyword in fused_moe_calls[0].keywords
         if keyword.arg == "apply_routed_scale_to_output"
     )
-    assert isinstance(routed_scale_value, ast.UnaryOp)
-    assert isinstance(routed_scale_value.op, ast.Not)
-    assert isinstance(routed_scale_value.operand, ast.Call)
-    assert isinstance(routed_scale_value.operand.func, ast.Name)
-    assert routed_scale_value.operand.func.id == "is_aiter_moe_requested"
-    assert len(routed_scale_value.operand.args) == 1
-    backend_config = routed_scale_value.operand.args[0]
-    assert isinstance(backend_config, ast.Attribute)
-    assert backend_config.attr == "kernel_config"
-    assert isinstance(backend_config.value, ast.Name)
-    assert backend_config.value.id == "vllm_config"
+    assert isinstance(routed_scale_value, ast.Call)
+    assert isinstance(routed_scale_value.func, ast.Name)
+    assert routed_scale_value.func.id == "_glm4_apply_routed_scale_to_output"
+    assert len(routed_scale_value.args) == 1
+    assert isinstance(routed_scale_value.args[0], ast.Name)
+    assert routed_scale_value.args[0].id == "vllm_config"
 
 
 def test_hcu_runner_uses_v0251_routed_experts_contract():

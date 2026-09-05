@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import os
 import warnings
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -17,6 +19,37 @@ import torch
 # import would race the coordinator that owns the canonical replacement target.
 os.environ["VLLM_PLUGINS"] = "__disabled__"
 from vllm.utils import torch_utils
+
+
+def _glm4_output_scale_policy(
+    *, dtype: torch.dtype, aiter_requested: bool
+) -> bool:
+    source = Path("vllm_hcu/models/glm4_moe.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_glm4_apply_routed_scale_to_output"
+    )
+    module = ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
+    )
+    namespace = {
+        "VllmConfig": object,
+        "torch": torch,
+        "is_aiter_moe_requested": lambda _config: aiter_requested,
+    }
+    exec(compile(module, "vllm_hcu/models/glm4_moe.py", "exec"), namespace)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=dtype),
+        kernel_config=SimpleNamespace(
+            moe_backend="aiter" if aiter_requested else "triton"
+        ),
+    )
+    return namespace["_glm4_apply_routed_scale_to_output"](config)
 
 
 @pytest.fixture(scope="module")
@@ -47,6 +80,57 @@ def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
         torch_utils.direct_register_custom_op = register_custom_op
     assert module.MoERunner.__module__.startswith("vllm_hcu.")
     return module
+
+
+@pytest.mark.parametrize(
+    ("dtype", "aiter_requested", "expected"),
+    [
+        (torch.float16, False, False),
+        (torch.bfloat16, False, True),
+        (torch.float32, False, True),
+        (torch.float16, True, False),
+        (torch.bfloat16, True, False),
+    ],
+)
+def test_glm4_output_scale_policy_preserves_fp16_router_scaling(
+    dtype: torch.dtype,
+    aiter_requested: bool,
+    expected: bool,
+) -> None:
+    assert (
+        _glm4_output_scale_policy(
+            dtype=dtype,
+            aiter_requested=aiter_requested,
+        )
+        is expected
+    )
+
+
+def test_glm4_fp16_non_aiter_shared_output_keeps_routed_scale(
+    moe_runner_module: ModuleType,
+) -> None:
+    scale = 2.5
+    routed = torch.tensor([[2.0, 4.0]], dtype=torch.float16)
+    shared = torch.tensor([[3.0, 5.0]], dtype=torch.float16)
+    apply_scale_to_output = _glm4_output_scale_policy(
+        dtype=torch.float16,
+        aiter_requested=False,
+    )
+
+    # FusedMoE assigns the factor either to the router or to MoERunner.
+    routed_after_router = routed * (1.0 if apply_scale_to_output else scale)
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner.routed_scaling_factor = scale if apply_scale_to_output else 1.0
+    shared_after_runner, routed_after_runner = (
+        runner._maybe_apply_routed_scale_to_output(
+            shared.clone(), routed_after_router.clone()
+        )
+    )
+
+    assert shared_after_runner is not None
+    actual = shared_after_runner + routed_after_runner
+    expected = shared + scale * routed
+    torch.testing.assert_close(actual, expected)
 
 
 def test_inplace_moe_forward_shared_satisfies_aot_mutation_contract(

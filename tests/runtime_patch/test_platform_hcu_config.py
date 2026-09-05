@@ -1426,6 +1426,20 @@ def test_slimquant_fp8_moe_repack_preserves_fp8_without_widening(
     )
     monkeypatch.setattr(torch, "stack", reject_per_expert_stack)
 
+    # This test covers tensor repacking, not LightOp package initialization.
+    # Keep it deterministic in control containers without a visible HCU.
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []  # type: ignore[attr-defined]
+    lightop_moe = ModuleType("lightop.moe")
+
+    def fused_experts_impl_fp8_marlin(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    lightop_moe.fused_experts_impl_fp8_marlin = fused_experts_impl_fp8_marlin
+    lightop.moe = lightop_moe
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.moe", lightop_moe)
+
     method.process_weights_after_loading(layer)
 
     assert layer.w13_weight.dtype == torch.float8_e4m3fn
