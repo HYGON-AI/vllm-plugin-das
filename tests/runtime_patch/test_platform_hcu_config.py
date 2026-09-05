@@ -1300,6 +1300,86 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
         assert parameters[len(target_prefix) :] == ("i_q", "i_s")
 
 
+@pytest.mark.parametrize(
+    ("moe_backend", "aiter_requested", "expected_owner"),
+    [
+        ("auto", False, "lightop"),
+        ("auto", True, "vllm"),
+        ("aiter", False, "vllm"),
+        ("triton", True, "vllm"),
+        ("deep_gemm", True, "vllm"),
+    ],
+)
+def test_slimquant_marlin_moe_backend_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_backend: str,
+    aiter_requested: bool,
+    expected_owner: str,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (
+        CompressedTensorsMoEMethod,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe import aiter_runtime
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors.compressed_tensors_marlin import (
+        SlimQuantCompressedTensorsMarlinConfig,
+    )
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+        CompressedTensorsMarlinMoEMethod,
+    )
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = SimpleNamespace(moe_backend=moe_backend)
+    config = SlimQuantCompressedTensorsMarlinConfig.from_config(
+        {
+            "config_groups": {},
+            "format": "int-quantized",
+            "ignore": [],
+            "kv_cache_scheme": None,
+            "quant_method": "compressed-tensors",
+        }
+    )
+    prefix = "model.layers.0.mlp.experts"
+    vllm_method = object()
+    lightop_method = object()
+    monkeypatch.setattr(
+        aiter_runtime,
+        "is_aiter_moe_requested",
+        lambda moe_config: moe_config is layer.moe_config and aiter_requested,
+    )
+    monkeypatch.setattr(
+        CompressedTensorsMoEMethod,
+        "get_moe_method",
+        staticmethod(
+            lambda quant_config, routed_layer, layer_name: (
+                vllm_method
+                if quant_config is config
+                and routed_layer is layer
+                and layer_name == prefix
+                else pytest.fail("unexpected vLLM MoE factory arguments")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        CompressedTensorsMarlinMoEMethod,
+        "get_moe_method",
+        staticmethod(
+            lambda quant_config, routed_layer: (
+                lightop_method
+                if quant_config is config and routed_layer is layer
+                else pytest.fail("unexpected LightOp MoE factory arguments")
+            )
+        ),
+    )
+
+    method = config.get_quant_method(layer, prefix)
+
+    assert method is {"vllm": vllm_method, "lightop": lightop_method}[
+        expected_owner
+    ]
+
+
 def test_slimquant_fp8_moe_repack_preserves_fp8_without_widening(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -353,18 +353,14 @@ def test_inplace_shared_output_requires_local_inplace_kernel(
 
 
 @pytest.mark.parametrize(
-    ("use_deepep", "use_aiter", "expected"),
+    ("use_deepep", "expected"),
     [
-        (False, False, True),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
+        (False, True),
+        (True, False),
     ],
 )
 def test_slimquant_marlin_only_advertises_local_inplace_output(
-    monkeypatch: pytest.MonkeyPatch,
     use_deepep: bool,
-    use_aiter: bool,
     expected: bool,
 ) -> None:
     module = importlib.import_module(
@@ -374,11 +370,6 @@ def test_slimquant_marlin_only_advertises_local_inplace_output(
     method = object.__new__(module.CompressedTensorsW8A8FP8MarlinMoEMethod)
     method.moe = object()
     method.use_deepep = use_deepep
-    monkeypatch.setattr(
-        module,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda moe: use_aiter,
-    )
 
     assert method.supports_inplace_output is expected
 
