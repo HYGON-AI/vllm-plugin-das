@@ -48,6 +48,32 @@ def apply_to_module(module: ModuleType) -> bool:
         hash_indices_table=None,
         routed_scaling_factor=1.0,
     ):
+        from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
+            can_use_lightop_sqrtsoftplus,
+            run_lightop_sqrtsoftplus,
+        )
+        from vllm_hcu.platforms import envs as henvs
+
+        use_lightop = bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
+            and can_use_lightop_sqrtsoftplus(
+                gating_output,
+                e_score_correction_bias,
+                topk=topk_indices.shape[-1],
+                input_tokens=input_tokens,
+                hash_indices_table=hash_indices_table,
+            )
+        )
+        if use_lightop:
+            return run_lightop_sqrtsoftplus(
+                gating_output,
+                e_score_correction_bias,
+                topk=topk_indices.shape[-1],
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                indices_dtype=topk_indices.dtype,
+            )
         if hash_indices_table is not None:
             if hash_indices_table.dtype != topk_indices.dtype:
                 hash_indices_table = hash_indices_table.to(dtype=topk_indices.dtype)

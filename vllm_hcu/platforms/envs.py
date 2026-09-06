@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
+    VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
@@ -229,8 +230,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_PP_LAYER_PARTITION_D":
     lambda: os.getenv("VLLM_HCU_PP_LAYER_PARTITION_D", None),
     "VLLM_HCU_USE_FUSE_MOE_GATE":
-    lambda: (os.environ.get("VLLM_HCU_USE_FUSE_MOE_GATE", "True").lower() in
-             ("true", "1")),
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSE_MOE_GATE", "True").lower() in
+                    ("true", "1")),
+
+    # Use LightOp for non-hash DeepSeek V4 sqrt-softplus routing. Hash layers
+    # always retain vLLM's official operator.
+    "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE":
+        lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE", "True"
+        ).lower() in ("true", "1")),
+
     "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", "True").lower() in
              ("true", "1")),

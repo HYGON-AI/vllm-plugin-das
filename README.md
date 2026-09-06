@@ -75,6 +75,12 @@ HCU-only feature settings are stored in
 modified. `patch_report()` reports the process role, target symbols, patch
 status, failure details, and feature activation state.
 
+`VLLM_HCU_USE_CUSTOM_OPS` is the master switch for HCU custom-operator routes.
+For DeepSeek V4, `VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE` controls the
+LightOp sqrt-softplus router and defaults to enabled. The route is limited to
+supported non-hash inputs; setting either switch to `0` keeps vLLM's official
+router, and hash-routing layers always remain on the official implementation.
+
 All three plugin entry points and both patch-application phases share one
 fail-closed compatibility gate. This branch accepts installed vLLM `0.25.x`
 (including local builds such as `0.25.1+das...`) and rejects missing, malformed,
