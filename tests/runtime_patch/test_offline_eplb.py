@@ -17,6 +17,9 @@ from vllm_hcu.patch.worker.framework_opt.patch_offline_eplb import (
     load_offline_expert_map,
     record_offline_expert_map,
 )
+from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    load_static_eplb_plan,
+)
 from vllm_hcu.patch.worker import worker_callback_names
 
 
@@ -149,8 +152,17 @@ def test_load_rejects_invalid_maps(
 
 
 class _FakeDeviceGroup:
+    world_size = 1
+    rank_in_group = 0
+
+    def __init__(self) -> None:
+        self.barrier_calls = 0
+
     def rank(self) -> int:
         return 0
+
+    def barrier(self) -> None:
+        self.barrier_calls += 1
 
 
 class _FakeModelConfig:
@@ -176,11 +188,12 @@ def _make_eplb_module(
     *,
     record_path: Path | None = None,
     load_path: Path | None = None,
-) -> tuple[ModuleType, list[tuple[torch.Tensor, torch.Tensor]]]:
+) -> tuple[ModuleType, list[tuple[torch.Tensor, torch.Tensor]], _FakeDeviceGroup]:
     module = ModuleType(
         "vllm.distributed.eplb.eplb_state"
     )
     rearrangements: list[tuple[torch.Tensor, torch.Tensor]] = []
+    ep_group = _FakeDeviceGroup()
 
     class EplbModelState:
         pass
@@ -251,14 +264,19 @@ def _make_eplb_module(
     module._commit_eplb_maps = commit
     module._commit_eplb_maps_for_layer = commit_layer
     module._move_to_workspace = move_to_workspace
-    module.get_ep_group = lambda: SimpleNamespace(device_group=_FakeDeviceGroup())
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=ep_group,
+        world_size=ep_group.world_size,
+        rank_in_group=ep_group.rank_in_group,
+        barrier=ep_group.barrier,
+    )
     module.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
-    return module, rearrangements
+    return module, rearrangements, ep_group
 
 
 def test_runtime_patch_records_initial_and_committed_maps(tmp_path: Path) -> None:
     output = tmp_path / "record.json"
-    module, _ = _make_eplb_module(record_path=output)
+    module, _, _ = _make_eplb_module(record_path=output)
     assert apply_to_module(module)
     state = module.EplbState()
     model = HYV4ForCausalLM()
@@ -294,14 +312,21 @@ def test_runtime_patch_loads_static_map_and_freezes_dynamic_eplb(
         ),
         encoding="utf-8",
     )
-    module, rearrangements = _make_eplb_module(load_path=source)
+    model = HYV4ForCausalLM()
+    model._vllm_hcu_static_eplb_plan = load_static_eplb_plan(
+        source,
+        model_key="HYV4ForCausalLM",
+        expected_shape=(1, 6),
+        num_logical_experts=4,
+        num_redundant_experts=2,
+    )
+    module, rearrangements, ep_group = _make_eplb_module(load_path=source)
     assert apply_to_module(module)
     state = module.EplbState()
-    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    state.add_model(model, _FakeModelConfig())
 
-    assert len(rearrangements) == 1
-    assert rearrangements[0][0].tolist() == [[0, 1, 2, 3, 0, 1]]
-    assert rearrangements[0][1].tolist() == [[3, 2, 1, 0, 3, 2]]
+    assert rearrangements == []
+    assert ep_group.barrier_calls == 1
     assert state.model_states["hy4-hash"].physical_to_logical_map.tolist() == [
         [3, 2, 1, 0, 3, 2]
     ]
@@ -318,7 +343,7 @@ def test_runtime_patch_record_mode_preserves_dynamic_eplb_steps(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "record.json"
-    module, _ = _make_eplb_module(record_path=output)
+    module, _, _ = _make_eplb_module(record_path=output)
     assert apply_to_module(module)
     state = module.EplbState()
     state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
@@ -327,3 +352,62 @@ def test_runtime_patch_record_mode_preserves_dynamic_eplb_steps(
     assert state.official_steps == 1
     assert state.should_record_tensor.item() is True
     assert state.is_async is True
+
+
+def test_runtime_patch_keeps_compatibility_rearrangement_without_plan(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "load.json"
+    source.write_text(
+        json.dumps({"physical_to_logical_map": [[3, 2, 1, 0, 3, 2]]}),
+        encoding="utf-8",
+    )
+    module, rearrangements, ep_group = _make_eplb_module(load_path=source)
+    assert apply_to_module(module)
+    state = module.EplbState()
+
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+
+    assert len(rearrangements) == 1
+    assert ep_group.barrier_calls == 0
+
+
+def test_runtime_patch_rejects_cross_rank_plan_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "load.json"
+    source.write_text(
+        json.dumps({"physical_to_logical_map": [[3, 2, 1, 0, 3, 2]]}),
+        encoding="utf-8",
+    )
+    model = HYV4ForCausalLM()
+    model._vllm_hcu_static_eplb_plan = load_static_eplb_plan(
+        source,
+        model_key="HYV4ForCausalLM",
+        expected_shape=(1, 6),
+        num_logical_experts=4,
+        num_redundant_experts=2,
+    )
+    module, rearrangements, ep_group = _make_eplb_module(load_path=source)
+    ep_group.world_size = 2
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, group=None: output.__setitem__(slice(None), [value, ("bad",)]),
+    )
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=ep_group,
+        cpu_group=object(),
+        world_size=2,
+        rank_in_group=0,
+        barrier=ep_group.barrier,
+    )
+    assert apply_to_module(module)
+    state = module.EplbState()
+
+    with pytest.raises(RuntimeError, match="fingerprints differ"):
+        state.add_model(model, _FakeModelConfig())
+
+    assert rearrangements == []
+    assert ep_group.barrier_calls == 0
