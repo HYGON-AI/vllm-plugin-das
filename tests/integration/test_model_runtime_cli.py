@@ -3,6 +3,8 @@
 """CPU-safe CLI coverage for the model runtime subprocess harness."""
 
 from pathlib import Path
+import copy
+import json
 import signal
 import sys
 from types import SimpleNamespace
@@ -13,6 +15,331 @@ from tests.integration import model_runtime
 
 
 DEEPSEEK_V4_MODEL = Path("/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8")
+MTP3_SELECTOR_NAMES = (
+    "VLLM_HCU_USE_CUSTOM_OPS",
+    "VLLM_HCU_USE_CUSTOM_AITER_FLA",
+    "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D",
+    "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+    "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP",
+    "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O",
+)
+
+
+@pytest.mark.parametrize("resolved_mode", ["FULL", "FULL_DECODE_ONLY"])
+def test_mtp3_graph_cli_uses_worker_config_and_repeats_sequential_engines(
+    monkeypatch, capsys, resolved_mode,
+):
+    events = []
+    engines = []
+    counter = SimpleNamespace(num_cudagraph_captured=0)
+    for name in MTP3_SELECTOR_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.label = "eager" if kwargs["enforce_eager"] else "graph"
+            self.round = 0
+            engines.append(self)
+            events.append((self.label, "start"))
+            # Deliberately differs from the resolved worker config.
+            self.llm_engine = SimpleNamespace(
+                vllm_config=None,
+                do_log_stats=lambda: events.append((self.label, "flush")),
+            )
+
+        def generate(self, prompts, sampling_params, *, use_tqdm):
+            assert use_tqdm is False
+            self.round += 1
+            events.append((self.label, "generate"))
+            self.prompts = list(prompts)
+            self.sampling = sampling_params
+            wants_logprobs = getattr(sampling_params, "logprobs", None) == 1
+            return [SimpleNamespace(
+                prompt_token_ids=[5, 6],
+                outputs=[SimpleNamespace(
+                    token_ids=list(range(16)), text="sixteen tokens",
+                    finish_reason="length",
+                    cumulative_logprob=-0.5 if wants_logprobs else None,
+                    logprobs=[{i: -0.1} for i in range(16)] if wants_logprobs else None,
+                )],
+            ) for _ in prompts]
+
+        def collective_rpc(self, method, *, timeout):
+            assert timeout == 30
+            mode = "NONE" if self.label == "eager" else resolved_mode
+            counter.num_cudagraph_captured = 0 if self.label == "eager" else 2
+            worker = SimpleNamespace(vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(enforce_eager=self.label == "eager"),
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=2, data_parallel_size=1,
+                    enable_expert_parallel=True,
+                ),
+                speculative_config=SimpleNamespace(
+                    method="mtp", num_speculative_tokens=3,
+                ),
+                compilation_config=SimpleNamespace(
+                    mode=SimpleNamespace(
+                        name="NONE" if self.label == "eager" else "VLLM_COMPILE"
+                    ),
+                    cudagraph_mode=SimpleNamespace(
+                        name=mode,
+                        decode_mode=lambda: SimpleNamespace(
+                            name="NONE" if self.label == "eager" else "FULL"
+                        ),
+                    ),
+                    cudagraph_capture_sizes=[] if self.label == "eager" else [4, 8],
+                ),
+            ))
+            return [method(worker), method(worker)]
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FakeLLM))
+    monkeypatch.setitem(
+        sys.modules, "vllm.sampling_params",
+        SimpleNamespace(SamplingParams=SimpleNamespace),
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.compilation.counter",
+        SimpleNamespace(compilation_counter=counter),
+    )
+    monkeypatch.setattr(
+        model_runtime, "_shutdown_llm",
+        lambda llm: events.append((llm.label, "stop")),
+    )
+    assert model_runtime._main([
+        "qwen35-mtp3-graph-parity", "--model", "/models/fake",
+        "--gpu-memory-utilization", "0.4",
+    ]) == 0
+    log = capsys.readouterr().out
+    result = json.loads(next(
+        line.removeprefix(model_runtime.RESULT_PREFIX)
+        for line in log.splitlines() if line.startswith(model_runtime.RESULT_PREFIX)
+    ))
+    assert events == [
+        (label, event) for label in ("eager", "graph")
+        for event in ("start", "generate", "flush", "generate", "flush", "stop")
+    ]
+    for engine in engines:
+        assert engine.kwargs["speculative_config"] == {
+            "method": "mtp", "num_speculative_tokens": 3,
+        }
+        assert engine.kwargs["tensor_parallel_size"] == 2
+        assert engine.kwargs["enable_expert_parallel"] is True
+        assert engine.kwargs["moe_backend"] == "aiter"
+        assert engine.kwargs["gpu_memory_utilization"] == 0.4
+        assert engine.kwargs["cudagraph_metrics"] is True
+        assert engine.kwargs["disable_log_stats"] is False
+        assert engine.sampling.temperature == 0.0
+        assert engine.sampling.seed == 0
+        assert engine.sampling.max_tokens == 16
+        assert engine.sampling.min_tokens == 16
+        assert engine.sampling.ignore_eos is True
+        assert getattr(engine.sampling, "logprobs", None) == 1
+        workers = result[engine.label]["workers"]
+        assert len(workers) == 2
+        assert all(
+            worker.get("hcu_selectors") == {
+                name: True for name in MTP3_SELECTOR_NAMES
+            }
+            for worker in workers
+        )
+        assert all(
+            w["speculative_config"] == {"method": "mtp", "num_speculative_tokens": 3}
+            for w in workers
+        )
+        assert len(result[engine.label]["rounds"]) == 2
+        for output in result[engine.label]["rounds"]:
+            assert all(record["cumulative_logprob"] == -0.5 for record in output)
+            assert all(record["sample_logprob_count"] == 16 for record in output)
+    assert engines[0].prompts == engines[1].prompts
+    assert engines[0].kwargs.get("compilation_config") is None
+    assert engines[1].kwargs["compilation_config"] == {
+        "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [4, 8],
+    }
+    assert result["graph"]["workers"][0]["compilation_config"] == {
+        "mode": "VLLM_COMPILE", "cudagraph_mode": resolved_mode,
+        "decode_mode": "FULL", "cudagraph_capture_sizes": [4, 8],
+        "num_cudagraph_captured": 2,
+    }
+    for label in ("eager", "graph"):
+        for round_index in range(2):
+            assert f"VLLM_HCU_GENERATE_BEGIN={label}:{round_index}" in log
+            assert f"VLLM_HCU_GENERATE_END={label}:{round_index}" in log
+
+
+def _mtp3_parity_payload():
+    worker = {
+        "enforce_eager": False,
+        "hcu_selectors": {name: True for name in MTP3_SELECTOR_NAMES},
+        "parallel_config": {
+            "tensor_parallel_size": 2, "data_parallel_size": 1,
+            "enable_expert_parallel": True,
+        },
+        "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
+        "compilation_config": {
+            "mode": "VLLM_COMPILE", "cudagraph_mode": "FULL_DECODE_ONLY",
+            "decode_mode": "FULL", "cudagraph_capture_sizes": [4, 8],
+            "num_cudagraph_captured": 2,
+        },
+    }
+    result = {
+        label: {"workers": [copy.deepcopy(worker), copy.deepcopy(worker)],
+                "rounds": [[{
+                    "token_ids": list(range(16)), "cumulative_logprob": -0.5,
+                    "sample_logprob_count": 16,
+                }] for _ in range(2)]}
+        for label in ("eager", "graph")
+    }
+    for entry in result["eager"]["workers"]:
+        entry["enforce_eager"] = True
+        entry["compilation_config"].update(
+            mode="NONE", cudagraph_mode="NONE", decode_mode="NONE",
+            num_cudagraph_captured=0,
+        )
+    return result
+
+
+def _mtp3_parity_log():
+    return "\n".join(
+        f"VLLM_HCU_GENERATE_BEGIN={label}:{i}\n"
+        "SpecDecoding metrics: Accepted: 8 tokens, Drafted: 12 tokens,\n"
+        f"| 8 | 8 | 0 | {'FULL' if label == 'graph' else 'NONE'} | 4 |\n"
+        f"VLLM_HCU_GENERATE_END={label}:{i}"
+        for label in ("eager", "graph") for i in range(2)
+    )
+
+
+def test_mtp3_graph_callable_rpc_opt_in_is_local_and_logged(monkeypatch, tmp_path):
+    from tests.integration.graph import test_qwen35_35b_a3b_mtp3_graph_parity as case
+
+    launched = []
+    opt_in = "VLLM_ALLOW_INSECURE_SERIALIZATION"
+    monkeypatch.delenv(opt_in, raising=False)
+    for name in MTP3_SELECTOR_NAMES:
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setenv("VLLM_HCU_INTEGRATION_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(case, "require_gfx_arch", lambda *args: None)
+    monkeypatch.setattr(
+        case, "require_model_runtime", lambda *args, **kwargs: Path("/models/fake")
+    )
+
+    def fake_popen(command, *, env, stdout, **kwargs):
+        launched.append((dict(env), Path(stdout.name)))
+        stdout.write(_mtp3_parity_log() + "\n")
+        stdout.write(
+            model_runtime.RESULT_PREFIX + json.dumps(_mtp3_parity_payload()) + "\n"
+        )
+        stdout.flush()
+        return SimpleNamespace(wait=lambda timeout: 0)
+
+    monkeypatch.setattr(model_runtime.subprocess, "Popen", fake_popen)
+    with monkeypatch.context() as case_env:
+        case.test_qwen35_35b_a3b_tp2_ep2_mtp3_full_decode_graph_aiter_auto_shuffle(
+            None, case_env,
+        )
+    model_runtime.run_vllm_case("tp-ep-smoke", Path("/models/fake"))
+
+    targeted_env, targeted_log = launched[0]
+    smoke_env, smoke_log = launched[1]
+    targeted_opt_in = targeted_env.get(opt_in)
+    assert targeted_opt_in == "1"
+    environment_header = next(
+        line for line in targeted_log.read_text().splitlines()
+        if line.startswith("environment: ")
+    )
+    assert f"{opt_in}=1" in environment_header
+    assert opt_in not in smoke_env
+    assert opt_in not in smoke_log.read_text()
+    assert opt_in not in model_runtime.os.environ
+    inherited_selectors = set(MTP3_SELECTOR_NAMES) & targeted_env.keys()
+    assert not inherited_selectors
+    assert all(smoke_env[name] == "0" for name in MTP3_SELECTOR_NAMES)
+    assert all(model_runtime.os.environ[name] == "0" for name in MTP3_SELECTOR_NAMES)
+
+
+@pytest.mark.parametrize("selector", MTP3_SELECTOR_NAMES)
+def test_mtp3_graph_rejects_disabled_worker_selector(selector):
+    from tests.integration.graph.test_qwen35_35b_a3b_mtp3_graph_parity import (
+        _assert_mtp3_graph_parity,
+    )
+
+    result = _mtp3_parity_payload()
+    result["graph"]["workers"][1]["hcu_selectors"][selector] = False
+    with pytest.raises(AssertionError):
+        _assert_mtp3_graph_parity(result, _mtp3_parity_log())
+
+
+@pytest.mark.parametrize("graph_logprob", [-0.75, float("nan"), float("inf")])
+def test_mtp3_graph_logprobs_require_finiteness_not_numerical_parity(graph_logprob):
+    from tests.integration.graph.test_qwen35_35b_a3b_mtp3_graph_parity import (
+        _assert_mtp3_graph_parity,
+    )
+
+    result = _mtp3_parity_payload()
+    for output in result["graph"]["rounds"]:
+        output[0]["cumulative_logprob"] = graph_logprob
+    if graph_logprob == -0.75:
+        # The eager cumulative value is -0.5 with the same exact token IDs.
+        _assert_mtp3_graph_parity(result, _mtp3_parity_log())
+    else:
+        with pytest.raises(AssertionError):
+            _assert_mtp3_graph_parity(result, _mtp3_parity_log())
+
+
+@pytest.mark.parametrize("fault", [
+    None, "downgraded", "uncaptured", "empty_capture_sizes", "wrong_mtp",
+    "wrong_draft_count", "wrong_tp", "missing_worker", "empty_round",
+    "short_output", "token_mismatch", "second_round_mismatch", "missing_full_metric",
+    "zero_full_metric", "missing_drafts", "zero_drafts",
+    "missing_logprobs", "short_logprobs",
+])
+def test_mtp3_graph_assertions_reject_false_parity(fault):
+    from tests.integration.graph.test_qwen35_35b_a3b_mtp3_graph_parity import (
+        _assert_mtp3_graph_parity,
+    )
+    result = _mtp3_parity_payload()
+    log = _mtp3_parity_log()
+    worker = result["graph"]["workers"][1]
+    if fault == "downgraded":
+        worker["compilation_config"]["decode_mode"] = "PIECEWISE"
+    elif fault == "uncaptured":
+        worker["compilation_config"]["num_cudagraph_captured"] = 0
+    elif fault == "empty_capture_sizes":
+        worker["compilation_config"]["cudagraph_capture_sizes"] = []
+    elif fault == "wrong_mtp":
+        worker["speculative_config"]["method"] = "eagle"
+    elif fault == "wrong_draft_count":
+        worker["speculative_config"]["num_speculative_tokens"] = 1
+    elif fault == "wrong_tp":
+        worker["parallel_config"]["tensor_parallel_size"] = 1
+    elif fault == "missing_worker":
+        result["graph"]["workers"].pop()
+    elif fault == "empty_round":
+        result["graph"]["rounds"][1] = []
+    elif fault == "short_output":
+        result["graph"]["rounds"][1][0]["token_ids"] = [1]
+    elif fault == "token_mismatch":
+        result["graph"]["rounds"][0][0]["token_ids"][0] = 99
+    elif fault == "second_round_mismatch":
+        for label in ("eager", "graph"):
+            result[label]["rounds"][1][0]["token_ids"][0] = 99
+    elif fault == "missing_full_metric":
+        log = log.replace("| FULL |", "| NONE |")
+    elif fault == "zero_full_metric":
+        log = log.replace("| FULL | 4 |", "| FULL | 0 |")
+    elif fault == "missing_drafts":
+        log = log.replace("SpecDecoding metrics:", "unrelated:")
+    elif fault == "zero_drafts":
+        log = log.replace("Drafted: 12", "Drafted: 0")
+    elif fault == "missing_logprobs":
+        result["graph"]["rounds"][1][0]["cumulative_logprob"] = None
+    elif fault == "short_logprobs":
+        result["graph"]["rounds"][1][0]["sample_logprob_count"] = 15
+    if fault is None:
+        _assert_mtp3_graph_parity(result, log)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_mtp3_graph_parity(result, log)
 
 
 @pytest.mark.parametrize(

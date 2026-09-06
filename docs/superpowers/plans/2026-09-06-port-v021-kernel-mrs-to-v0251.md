@@ -1176,6 +1176,38 @@ newest Qwen log under `/tmp/vllm-hcu-integration/logs/` and fail the task if it
 contains a patch compatibility error, optional-import traceback, or kernel
 launch exception.
 
+- [ ] **Step 4a: Run the targeted Qwen3.5 TP2/EP2 MTP3 graph parity case**
+
+Run the single targeted test with all five routing switches and the master
+custom-op switch unset so their default-enabled contract is exercised. The
+test itself clears these six variables before launching the child, so direct
+pytest invocations also exercise defaults regardless of the caller environment:
+
+```bash
+env -u VLLM_HCU_USE_CUSTOM_OPS \
+    -u VLLM_HCU_USE_CUSTOM_AITER_FLA \
+    -u VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE \
+    -u VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP \
+    -u VLLM_HCU_USE_CHUNK_FWD_KERNEL_O \
+    -u VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D \
+    VLLM_HCU_QWEN35_35B_A3B_MODEL=/models/Qwen3.5-35B-A3B \
+    pytest -q -s \
+      tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py
+```
+
+Expected: eager+MTP3 and graph+MTP3 each complete two identical 16-token
+greedy generations. Acceptance requires exact token-ID parity plus present,
+finite cumulative logprobs and logprobs for all 16 output positions. It does
+not require numerical logprob parity: eager and graph execution may differ
+in floating-point reduction rounding without changing greedy token choices.
+Both workers report the master switch and all five routing switches resolved to
+`True` through `vllm_hcu.platforms.envs`, and MTP with three speculative tokens;
+the graph workers resolve `decode_mode=FULL`, retain non-empty capture sizes,
+and report a positive capture count. Generation logs must contain positive
+MTP draft counts and positive FULL runtime counts. This proves FULL decode
+replay for the model path; it does not claim that the FLA prefill-only chunk
+H/O kernels are captured by `FULL_DECODE_ONLY`.
+
 - [ ] **Step 5: Review the requirement-to-evidence mapping**
 
 Check each spec section against the committed diff and record:

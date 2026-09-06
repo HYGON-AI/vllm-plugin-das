@@ -172,6 +172,26 @@ Verification will include:
    switches left unset to prove their default-enabled behavior. The test must
    load the model, generate non-empty deterministic output, and show no kernel
    or patch compatibility exception in its log.
+5. One targeted Qwen3.5-35B-A3B TP2/EP2 graph acceptance case. It runs
+   eager+MTP3 and graph+MTP3 sequentially with identical greedy requests,
+   repeats each request, and requires exact token parity plus present, finite
+   cumulative logprobs and logprobs for all 16 output positions. Numerical
+   logprob equality is not required because eager and graph execution can
+   round floating-point reductions differently without changing token choices.
+   The test clears inherited overrides for the master custom-op switch and
+   five routing switches (including the existing `VLLM_HCU_USE_CUSTOM_AITER_FLA`
+   gate), and verifies all six resolve to `True` on each
+   worker through `vllm_hcu.platforms.envs`. The graph engine
+   must resolve to FULL decode mode on both workers, capture the bounded
+   MTP3 buckets, report positive FULL runtime counts during generation, and
+   report positive speculative draft activity. This complements rather than
+   replaces the non-MTP eager smoke: MTP metadata deliberately keeps the
+   causal-convolution adapter on the upstream-compatible fallback path.
+
+The graph acceptance claim is deliberately scoped to graph-enabled model
+execution and FULL decode replay. The FLA chunk H/O adapters execute during
+prefill, which is outside `FULL_DECODE_ONLY`; this case does not claim those
+prefill kernels were themselves captured in a graph.
 
 The pre-change focused baseline is 105 passed tests with zero failures when
 `VLLM_V0251_SOURCE_ROOT=/models/vllm_0251` is supplied.
