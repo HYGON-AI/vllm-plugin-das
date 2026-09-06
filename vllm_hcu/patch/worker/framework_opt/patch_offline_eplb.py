@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import functools
 import json
+import os
+import tempfile
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -32,6 +36,8 @@ PATCH_ID = "worker.framework_opt.eplb.offline_expert_map"
 TARGETS = (
     f"{TARGET_MODULE}.EplbState.add_model",
     f"{TARGET_MODULE}.EplbState.step",
+    f"{TARGET_MODULE}.EplbState.rearrange",
+    f"{TARGET_MODULE}.rearrange_expert_weights_inplace",
     f"{TARGET_MODULE}._commit_eplb_maps",
     f"{TARGET_MODULE}._move_to_workspace",
 )
@@ -41,6 +47,10 @@ _RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _LOAD_PATH_ATTR = "_vllm_hcu_expert_map_path"
 _MODEL_RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _MODEL_KEY_ATTR = "_vllm_hcu_expert_map_key"
+_RECORD_ONLY_REARRANGE = ContextVar(
+    "vllm_hcu_record_only_eplb_rearrange",
+    default=False,
+)
 
 
 def load_offline_expert_map(
@@ -101,7 +111,7 @@ def record_offline_expert_map(
     num_logical_experts: int,
     num_redundant_experts: int,
 ) -> None:
-    """Atomically merge one model's committed map into an offline JSON file."""
+    """Atomically merge one model's candidate map into an offline JSON file."""
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,11 +128,24 @@ def record_offline_expert_map(
         "physical_to_logical_map": map_cpu.tolist(),
     }
     with _FILE_LOCK:
-        payload = _merge_record_payload(output_path, model_key, model_payload)
-        tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as destination:
-            json.dump(payload, destination)
-        tmp_path.replace(output_path)
+        lock_path = output_path.with_suffix(output_path.suffix + ".lock")
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            payload = _merge_record_payload(output_path, model_key, model_payload)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+                dir=output_path.parent,
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+                    json.dump(payload, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                temporary_path.replace(output_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
 
 
 def _parallel_offline_paths(parallel_config: object) -> tuple[str | None, str | None]:
@@ -135,7 +158,12 @@ def _parallel_offline_paths(parallel_config: object) -> tuple[str | None, str | 
     return record_path, load_path
 
 
-def _record_model_state(module: ModuleType, model_state: object) -> None:
+def _record_model_state(
+    module: ModuleType,
+    model_state: object,
+    *,
+    physical_to_logical_map: torch.Tensor | None = None,
+) -> None:
     path = getattr(model_state, _MODEL_RECORD_PATH_ATTR, None)
     if not path or module.get_ep_group().device_group.rank() != 0:
         return
@@ -146,7 +174,11 @@ def _record_model_state(module: ModuleType, model_state: object) -> None:
         model_key=model_key,
         model_name=model_state.model_name,
         model_class=model.__class__.__name__,
-        physical_to_logical_map=model_state.physical_to_logical_map,
+        physical_to_logical_map=(
+            model_state.physical_to_logical_map
+            if physical_to_logical_map is None
+            else physical_to_logical_map
+        ),
         num_logical_experts=model.num_logical_experts,
         num_redundant_experts=model.num_redundant_experts,
     )
@@ -252,6 +284,8 @@ def apply_to_module(module: ModuleType) -> bool:
         wrapped = (
             (eplb_state_cls, "add_model"),
             (eplb_state_cls, "step"),
+            (eplb_state_cls, "rearrange"),
+            (eplb_module, "rearrange_expert_weights_inplace"),
             (eplb_module, "_commit_eplb_maps"),
             (eplb_module, "_move_to_workspace"),
         )
@@ -263,13 +297,18 @@ def apply_to_module(module: ModuleType) -> bool:
 
     original_add_model = require_callable(eplb_state_cls, "add_model", TARGETS[0])
     original_step = require_callable(eplb_state_cls, "step", TARGETS[1])
-    original_commit = require_callable(eplb_module, "_commit_eplb_maps", TARGETS[2])
-    original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[3])
-    rearrange = require_callable(
+    original_rearrange = require_callable(
+        eplb_state_cls,
+        "rearrange",
+        TARGETS[2],
+    )
+    original_rearrange_weights = require_callable(
         eplb_module,
         "rearrange_expert_weights_inplace",
-        f"{TARGET_MODULE}.rearrange_expert_weights_inplace",
+        TARGETS[3],
     )
+    original_commit = require_callable(eplb_module, "_commit_eplb_maps", TARGETS[4])
+    original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[5])
 
     @functools.wraps(original_add_model)
     def hcu_add_model(self, model, model_config) -> None:
@@ -284,6 +323,17 @@ def apply_to_module(module: ModuleType) -> bool:
         model_key = model.__class__.__name__
         setattr(model_state, _MODEL_RECORD_PATH_ATTR, record_path)
         setattr(model_state, _MODEL_KEY_ATTR, model_key)
+
+        if record_path:
+            # Recording is an offline planning operation. Running the async
+            # worker would transfer expert weights and block later layer
+            # commits even though the candidate map must not become live.
+            self.is_async = False
+            eplb_module.logger.info(
+                "EPLB expert-map recording for model %s uses plan-only mode; "
+                "online expert rearrangement is disabled.",
+                model_key,
+            )
 
         if load_path:
             direct_plan = _find_static_eplb_plan(model)
@@ -327,7 +377,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     model_config.model,
                     model_key,
                 )
-                rearrange(
+                original_rearrange_weights(
                     model_state.physical_to_logical_map,
                     target_map,
                     model_state.model.expert_weights,
@@ -371,8 +421,54 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_step, _WRAPPER_MARKER, True)
 
+    @functools.wraps(original_rearrange)
+    def hcu_rearrange(
+        self,
+        is_profile: bool = False,
+        rank_mapping: dict[int, int] | None = None,
+    ) -> Any:
+        record_path, _ = _parallel_offline_paths(self.parallel_config)
+        if not record_path or is_profile:
+            return original_rearrange(
+                self,
+                is_profile=is_profile,
+                rank_mapping=rank_mapping,
+            )
+
+        token = _RECORD_ONLY_REARRANGE.set(True)
+        try:
+            result = original_rearrange(
+                self,
+                is_profile=False,
+                rank_mapping=rank_mapping,
+            )
+        finally:
+            _RECORD_ONLY_REARRANGE.reset(token)
+        eplb_module.logger.info(
+            "Recorded candidate EPLB expert maps without transferring weights "
+            "or changing live routing metadata."
+        )
+        return result
+
+    setattr(hcu_rearrange, _WRAPPER_MARKER, True)
+
+    @functools.wraps(original_rearrange_weights)
+    def hcu_rearrange_weights(*args, **kwargs) -> None:
+        if _RECORD_ONLY_REARRANGE.get():
+            return None
+        return original_rearrange_weights(*args, **kwargs)
+
+    setattr(hcu_rearrange_weights, _WRAPPER_MARKER, True)
+
     @functools.wraps(original_commit)
     def hcu_commit(model_state, new_physical_to_logical_map) -> None:
+        if _RECORD_ONLY_REARRANGE.get():
+            _record_model_state(
+                eplb_module,
+                model_state,
+                physical_to_logical_map=new_physical_to_logical_map,
+            )
+            return
         original_commit(
             model_state,
             new_physical_to_logical_map=new_physical_to_logical_map,
@@ -396,10 +492,22 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(eplb_state_cls, "_vllm_hcu_original_offline_add_model", original_add_model)
     setattr(eplb_state_cls, "_vllm_hcu_original_offline_step", original_step)
+    setattr(
+        eplb_state_cls,
+        "_vllm_hcu_original_offline_rearrange",
+        original_rearrange,
+    )
     setattr(eplb_state_cls, "add_model", hcu_add_model)
     setattr(eplb_state_cls, "step", hcu_step)
+    setattr(eplb_state_cls, "rearrange", hcu_rearrange)
+    setattr(
+        eplb_module,
+        "_vllm_hcu_original_offline_rearrange_weights",
+        original_rearrange_weights,
+    )
     setattr(eplb_module, "_vllm_hcu_original_offline_commit", original_commit)
     setattr(eplb_module, "_vllm_hcu_original_offline_move", original_move)
+    setattr(eplb_module, "rearrange_expert_weights_inplace", hcu_rearrange_weights)
     setattr(eplb_module, "_commit_eplb_maps", hcu_commit)
     setattr(eplb_module, "_move_to_workspace", hcu_move_to_workspace)
     setattr(eplb_module, _MARKER, True)

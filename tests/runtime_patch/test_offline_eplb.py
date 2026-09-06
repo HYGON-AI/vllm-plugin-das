@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -21,6 +22,19 @@ from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     load_static_eplb_plan,
 )
 from vllm_hcu.patch.worker import worker_callback_names
+
+
+def _record_map_in_process(output: str, model_index: int, start_event) -> None:
+    start_event.wait()
+    record_offline_expert_map(
+        output,
+        model_key=f"model-{model_index}",
+        model_name=f"/models/model-{model_index}",
+        model_class=f"Model{model_index}",
+        physical_to_logical_map=torch.tensor([[0, 1, 2, 3]]),
+        num_logical_experts=4,
+        num_redundant_experts=0,
+    )
 
 
 def test_record_merges_main_and_mtp_maps_atomically(tmp_path: Path) -> None:
@@ -56,6 +70,28 @@ def test_record_merges_main_and_mtp_maps_atomically(tmp_path: Path) -> None:
     ] == main_map.tolist()
     assert payload["model_maps"]["HYV4MTP"]["physical_to_logical_map"] == mtp_map.tolist()
     assert not output.with_suffix(".json.tmp").exists()
+
+
+def test_record_serializes_writers_across_processes(tmp_path: Path) -> None:
+    output = tmp_path / "shared-eplb.json"
+    context = multiprocessing.get_context("fork")
+    start_event = context.Event()
+    processes = [
+        context.Process(
+            target=_record_map_in_process,
+            args=(str(output), model_index, start_event),
+        )
+        for model_index in range(8)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert sorted(payload["model_maps"]) == [f"model-{index}" for index in range(8)]
 
 
 def test_load_selects_requested_model_and_preserves_dtype(tmp_path: Path) -> None:
@@ -236,6 +272,23 @@ def _make_eplb_module(
                 self.official_profile_steps += 1
             return "official-step"
 
+        def rearrange(self, is_profile=False, rank_mapping=None):
+            model_state = self.model_states["hy4-hash"]
+            candidate = torch.tensor([[3, 2, 1, 0, 3, 2]], dtype=torch.int64)
+            module.rearrange_expert_weights_inplace(
+                model_state.physical_to_logical_map,
+                candidate,
+                model_state.model.expert_weights,
+                model_state.expert_buffer,
+                ep_group,
+                model_state.communicator,
+                is_profile,
+                rank_mapping,
+            )
+            if not is_profile:
+                module._commit_eplb_maps(model_state, candidate)
+            return "official-rearrange"
+
     def rearrange_expert_weights_inplace(
         source_map,
         target_map,
@@ -339,11 +392,11 @@ def test_runtime_patch_loads_static_map_and_freezes_dynamic_eplb(
     assert state.official_steps == 0
 
 
-def test_runtime_patch_record_mode_preserves_dynamic_eplb_steps(
+def test_runtime_patch_record_mode_plans_without_live_rearrangement(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "record.json"
-    module, _, _ = _make_eplb_module(record_path=output)
+    module, rearrangements, _ = _make_eplb_module(record_path=output)
     assert apply_to_module(module)
     state = module.EplbState()
     state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
@@ -351,7 +404,46 @@ def test_runtime_patch_record_mode_preserves_dynamic_eplb_steps(
     assert state.step(is_profile=False) == "official-step"
     assert state.official_steps == 1
     assert state.should_record_tensor.item() is True
+    assert state.is_async is False
+
+    model_state = state.model_states["hy4-hash"]
+    initial_map = model_state.physical_to_logical_map.clone()
+    assert state.rearrange() == "official-rearrange"
+
+    assert rearrangements == []
+    assert torch.equal(model_state.physical_to_logical_map, initial_map)
+    recorded = json.loads(output.read_text(encoding="utf-8"))
+    assert recorded["model_maps"]["HYV4ForCausalLM"][
+        "physical_to_logical_map"
+    ] == [[3, 2, 1, 0, 3, 2]]
+
+
+def test_runtime_patch_record_mode_keeps_profile_rearrangement(
+    tmp_path: Path,
+) -> None:
+    module, rearrangements, _ = _make_eplb_module(
+        record_path=tmp_path / "record.json"
+    )
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+
+    assert state.rearrange(is_profile=True) == "official-rearrange"
+    assert len(rearrangements) == 1
+
+
+def test_runtime_patch_keeps_online_rearrangement_without_offline_paths() -> None:
+    module, rearrangements, _ = _make_eplb_module()
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+
     assert state.is_async is True
+    assert state.rearrange() == "official-rearrange"
+    assert len(rearrangements) == 1
+    assert state.model_states["hy4-hash"].physical_to_logical_map.tolist() == [
+        [3, 2, 1, 0, 3, 2]
+    ]
 
 
 def test_runtime_patch_keeps_compatibility_rearrangement_without_plan(
