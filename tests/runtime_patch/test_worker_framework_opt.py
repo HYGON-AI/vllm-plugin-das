@@ -27,9 +27,11 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_base_device_communicator,
     patch_cuda_communicator,
     patch_dp_utils,
+    patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_eplb_communicator,
     patch_forward_context,
+    patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
     patch_pynccl,
@@ -1258,6 +1260,78 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
+def test_gpu_dp_cg_padding_sync_skip_for_deepep_low_latency():
+    calls: list[object] = []
+
+    def sync_cudagraph_and_dp_padding(
+        cudagraph_manager,
+        desired_batch_desc,
+        num_tokens,
+        num_reqs,
+        uniform_token_count,
+        dp_size,
+        dp_rank,
+        num_active_loras=0,
+    ):
+        calls.append(desired_batch_desc)
+        return "synced", "tokens"
+
+    module = _module(
+        patch_gpu_dp_utils.TARGET_MODULE,
+        sync_cudagraph_and_dp_padding=sync_cudagraph_and_dp_padding,
+    )
+    patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=True)
+    try:
+        assert patch_gpu_dp_utils.apply_to_module(module) is True
+        assert patch_gpu_dp_utils.apply_to_module(module) is False
+        assert module.sync_cudagraph_and_dp_padding(
+            None, "local_desc", 4, 2, None, 32, 0
+        ) == ("local_desc", None)
+        assert calls == []
+        patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=False)
+        assert module.sync_cudagraph_and_dp_padding(
+            None, "local_desc", 4, 2, None, 32, 0
+        ) == ("synced", "tokens")
+        assert calls == ["local_desc"]
+    finally:
+        patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=False)
+
+
+def test_draft_speculator_temperature_seeds_zero_copy():
+    class _IdxMapping:
+        def __getitem__(self, key):
+            return self
+
+        def copy_(self, other):
+            self.copied = other
+
+        def fill_(self, value):
+            self.filled = value
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.temperature = SimpleNamespace(name="buf_t")
+            self.seeds = SimpleNamespace(name="buf_s")
+            self.idx_mapping = _IdxMapping()
+            self.draft_logits = None
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            raise AssertionError("original should be wrapped")
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+    assert patch_draft_speculator_inputs.apply_to_module(module) is False
+    obj = DraftModelSpeculator()
+    temperature = SimpleNamespace(name="caller_t")
+    seeds = SimpleNamespace(name="caller_s")
+    idx = object()
+    obj._copy_request_inputs(2, idx, temperature, seeds)
+    assert obj.temperature is temperature
+    assert obj.seeds is seeds
+    assert obj.idx_mapping.copied is idx
+
+
 class _Buffer:
     def __init__(self, size, **kwargs):
         self.size = size
@@ -1899,14 +1973,16 @@ assert target_file.is_relative_to(target_root), (
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
-    patch_dp_utils, patch_eagle_utils, patch_eplb_communicator,
-    patch_forward_context,
+    patch_dp_utils, patch_draft_speculator_inputs, patch_eagle_utils,
+    patch_eplb_communicator,
+    patch_forward_context, patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_eagle_utils,
+    patch_llm_base_proposer, patch_dp_utils, patch_gpu_dp_utils,
+    patch_draft_speculator_inputs, patch_eagle_utils,
     patch_eplb_communicator,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
