@@ -13,6 +13,7 @@ import torch
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     bind_static_eplb_plan,
+    load_static_logical_expert,
     load_static_eplb_plan,
     maybe_load_static_eplb_plan,
 )
@@ -353,3 +354,111 @@ def test_maybe_load_plan_uses_generic_validation_errors(tmp_path: Path) -> None:
         )
 
     assert "HY V4" not in str(error.value)
+
+
+def test_load_static_logical_expert_fans_out_and_reports_local_success() -> None:
+    calls: list[tuple[int, bool, str]] = []
+    routed_experts = type(
+        "RoutedExperts",
+        (),
+        {
+            "_vllm_hcu_static_eplb_row": (2, 1, 0, 2),
+            "local_physical_ids": {0, 3},
+        },
+    )()
+
+    def original_weight_loader(
+        self,
+        param,
+        loaded_weight,
+        weight_name,
+        shard_id,
+        expert_id,
+        return_success=False,
+    ):
+        assert self is routed_experts
+        assert param == "param"
+        assert loaded_weight == "tensor"
+        assert shard_id == "w1"
+        calls.append((expert_id, return_success, weight_name))
+        loaded = expert_id in self.local_physical_ids
+        return loaded if return_success else None
+
+    assert (
+        load_static_logical_expert(
+            routed_experts,
+            original_weight_loader,
+            param="param",
+            loaded_weight="tensor",
+            weight_name="w13_weight_scale",
+            shard_id="w1",
+            logical_expert_id=2,
+            return_success=True,
+        )
+        is True
+    )
+    assert calls == [
+        (0, True, "w13_weight_scale"),
+        (3, True, "w13_weight_scale"),
+    ]
+
+    calls.clear()
+    routed_experts.local_physical_ids = {1}
+    assert (
+        load_static_logical_expert(
+            routed_experts,
+            original_weight_loader,
+            param="param",
+            loaded_weight="tensor",
+            weight_name="w13_weight",
+            shard_id="w1",
+            logical_expert_id=2,
+            return_success=True,
+        )
+        is False
+    )
+    assert [expert_id for expert_id, _, _ in calls] == [0, 3]
+
+    calls.clear()
+    routed_experts.local_physical_ids = {0, 3}
+    assert (
+        load_static_logical_expert(
+            routed_experts,
+            original_weight_loader,
+            param="param",
+            loaded_weight="tensor",
+            weight_name="w13_weight",
+            shard_id="w1",
+            logical_expert_id=2,
+            return_success=False,
+        )
+        is None
+    )
+    assert [expert_id for expert_id, _, _ in calls] == [0, 3]
+
+
+@pytest.mark.parametrize("logical_expert_id", [-1, 3, True])
+def test_load_static_logical_expert_rejects_invalid_logical_ids_before_copy(
+    logical_expert_id: int,
+) -> None:
+    routed_experts = type(
+        "RoutedExperts",
+        (),
+        {"_vllm_hcu_static_eplb_row": (2, 1, 0, 2)},
+    )()
+
+    def unexpected_loader(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("an invalid logical expert must not copy a tensor")
+
+    with pytest.raises(ValueError, match="logical expert id"):
+        load_static_logical_expert(
+            routed_experts,
+            unexpected_loader,
+            param="param",
+            loaded_weight="tensor",
+            weight_name="w13_weight",
+            shard_id="w1",
+            logical_expert_id=logical_expert_id,
+            return_success=True,
+        )

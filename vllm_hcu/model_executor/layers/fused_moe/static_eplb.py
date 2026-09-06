@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -294,6 +295,49 @@ def bind_static_eplb_plan(
     return plan
 
 
+def load_static_logical_expert(
+    routed_experts: object,
+    original_weight_loader: Callable[..., bool | None],
+    *,
+    param: object,
+    loaded_weight: object,
+    weight_name: str,
+    shard_id: str,
+    logical_expert_id: int,
+    return_success: bool,
+) -> bool | None:
+    """Load one checkpoint expert into every mapped local physical slot."""
+
+    row = getattr(routed_experts, "_vllm_hcu_static_eplb_row")
+    if (
+        isinstance(logical_expert_id, bool)
+        or not isinstance(logical_expert_id, int)
+        or logical_expert_id < 0
+        or logical_expert_id not in row
+    ):
+        raise ValueError(
+            "Static EPLB logical expert id "
+            f"{logical_expert_id!r} is not present in the bound plan row."
+        )
+
+    loaded_any = False
+    for physical_expert_id, mapped_logical_expert_id in enumerate(row):
+        if mapped_logical_expert_id != logical_expert_id:
+            continue
+        loaded = original_weight_loader(
+            routed_experts,
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=physical_expert_id,
+            return_success=True,
+        )
+        loaded_any = bool(loaded) or loaded_any
+
+    return loaded_any if return_success else None
+
+
 def static_eplb_layer_map_for_weight(
     plan: StaticEplbPlan,
     moe_layer_indices: tuple[int, ...],
@@ -356,6 +400,7 @@ __all__ = [
     "StaticEplbPlan",
     "bind_static_eplb_plan",
     "build_expert_params_mapping_for_row",
+    "load_static_logical_expert",
     "load_static_eplb_plan",
     "maybe_load_static_eplb_plan",
     "static_eplb_layer_map_for_weight",
