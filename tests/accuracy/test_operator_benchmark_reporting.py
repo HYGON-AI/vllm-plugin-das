@@ -10,6 +10,7 @@ import pytest
 from tools.benchmark_sglang_operator_candidates import (
     build_comparison_record,
     build_parser,
+    distribution_version,
     speedup_percent,
     summarize_timings,
 )
@@ -65,6 +66,7 @@ def test_speedup_percent_rejects_invalid_timings(
         "w16a16-moe",
         "mla-decode-cat",
         "aiter-tgemm",
+        "aiter-batched-gemm-bf16",
     ),
 )
 def test_cli_exposes_each_screening_candidate(operator: str) -> None:
@@ -90,3 +92,14 @@ def test_comparison_record_applies_five_percent_acceptance_gate() -> None:
     assert record["candidate"]["median_us"] == 8.0
     assert record["speedup_percent"] == pytest.approx(20.0)
     assert record["meets_five_percent_gate"] is True
+
+
+def test_distribution_version_uses_installed_package_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tools.benchmark_sglang_operator_candidates.metadata.version",
+        lambda name: f"installed-{name}",
+    )
+
+    assert distribution_version("aiter") == "installed-aiter"

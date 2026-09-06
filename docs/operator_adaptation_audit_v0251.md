@@ -72,7 +72,7 @@ No row is marked `accepted` in the initial inventory.
 | `topk_softmax`, biased/grouped top-k | MoE routing | `aiter_ops.py`, `aiter_runtime.py`, official router integration | `already-covered` | Plugin handles requested index dtype and routing semantics. |
 | `topk_gating` | New SGLang MoE routing | Symbol absent in installed AITER | `dependency-unavailable` | Revisit only with a dependency upgrade in the same reviewed change. |
 | `greedy_sample` | Sampler fast path | Symbol absent in installed AITER | `dependency-unavailable` | Existing vLLM/LightOp sampling remains authoritative. |
-| `fused_qk_norm_mrope_3d_cache_pts_quant_shuffle` | Qwen multimodal attention | Symbol absent in installed AITER | `dependency-unavailable` | No dormant environment route is added. |
+| `fused_qk_norm_mrope_3d_cache_pts_quant_shuffle` | Qwen multimodal attention | Categorized implementation is installed, but the SGLang root export is absent and vLLM owns a different paged-cache mutation contract | `no-vllm-seam` | Do not bypass vLLM's cache-slot, quantization, and graph-capture ownership with a model-local SGLang mutation. |
 | Flash attention, paged attention, unified attention | Prefill/decode attention | Plugin attention backend and AITER replacement module | `already-covered` | Existing selection includes classic, varlen, unified and custom modes. |
 | MLA prefill/decode and sparse MQA Triton kernels | DeepSeek MLA/DSA | Plugin MLA and sparse attention runtimes | `already-covered` | Plugin already provides version-tolerant AITER module-path fallbacks. |
 | Cache reshape/indexer quant and RoPE kernels | Attention cache update | `fa_utils.py`, AITER runtime, DSv4 paths | `already-covered` | Additional SGLang-only cache index layouts require a canonical vLLM seam. |
@@ -81,7 +81,7 @@ No row is marked `accepted` in the initial inventory.
 | FLA chunk kernels | FLA models | Exact HCU patch adapters | `already-covered` | Both chunk-delta-h and chunk-o adapters are master-gated. |
 | Fused QK/RMSNorm/group quant variants | DeepSeek attention | Plugin `aiter_ops.py` probes old/new ABI | `already-covered` | No duplicate import path is needed. |
 | Tuned BF16 `tgemm` | Router and attention projections | vLLM's exact unquantized GEMM seam currently selects `torch.nn.functional.linear` on gfx938 | `performance-rejected` | All 36 representative BF16 shapes were correct, but none passed the 5% gate; the installed dispatcher selected its default solution and only added overhead. |
-| `batched_gemm_bf16` for DeepSeek V4 WO_A | Decode grouped projection | Plugin has the exact `torch.einsum("tgd,grd->tgr")` seam | `dependency-unavailable` | The SGLang source module `aiter.ops.triton.gemm.batched.batched_gemm_bf16` is absent from the installed AITER build. The existing plugin path remains authoritative. |
+| `batched_gemm_bf16` for DeepSeek V4 WO_A | Decode grouped projection | Plugin has the exact `torch.einsum("tgd,grd->tgr")` seam | `performance-rejected` | The SGLang import path is absent, but the installed replacement path was accuracy-screened with an explicit BW200B tile. All 28 TP/decode shapes were 2.04x--5.24x slower after required layout conversions. |
 | `fused_add_rmsnorm_pad`, `fused_clamp_act_mul`, fused MLA cache kernel | GPT-OSS/DeepSeek specialized forwards | Existing plugin normalization/clamp/cache boundaries differ | `dependency-unavailable` | These SGLang-imported AITER modules are absent from the pinned runtime. No environment switch is registered for an unavailable dependency. Clamp SwiGLU itself remains covered by the existing vLLM `_C` and LightOp MoE paths. |
 | Custom all-reduce | Distributed communication | Plugin whole-module communicator replacement | `already-covered` | Lifecycle and topology behavior are already HCU-owned. |
 | AITER Conv2D for multimodal tower | Kimi vision path | No generic vLLM HCU vision hook in this scope | `no-vllm-seam` | This audit targets general LLM serving operators, not multimodal model rewrites. |
@@ -119,7 +119,7 @@ will be recorded here and summarized in
 | Generic LightOp KV-store fusion | ABI/layout comparison rejected before kernel execution | No identical vLLM seam to benchmark | Existing vLLM attention/cache implementations | `no-vllm-seam` |
 | LightOp MLA decode `ds_cat` | 4/4 live-HCU cases passed exactly, including production strides | 33/33 shapes passed; 8.84% min, 47.03% median, 77.46% max | Master/leaf route; legacy opt-out; ineligible/unavailable uses `torch.cat` | `accepted` |
 | AITER tuned BF16 GEMM | 36/36 benchmark shapes matched (`max_abs=0`) | 0/36 passed; -27.51% min, -0.12% median, 0.46% max | Existing vLLM `torch.nn.functional.linear` | `performance-rejected` |
-| AITER DeepSeek V4 batched BF16 GEMM | Import probe failed | Not runnable | Existing BF16 einsum | `dependency-unavailable` |
+| AITER DeepSeek V4 batched BF16 GEMM | 6/6 live-HCU cases passed against FP32 | 0/28 passed; complete path was 2.04x--5.24x slower | Existing BF16 einsum | `performance-rejected` |
 
 ### LightOp sqrt-softplus evidence
 
@@ -219,9 +219,40 @@ will be recorded here and summarized in
   performance gate. Speedup ranged from -27.51% to 0.46%, with a -0.12%
   median. The gfx938 AITER dispatcher reported its default solution, so
   enabling the generic vLLM tgemm route would only add dispatch overhead.
-- The more specific DeepSeek V4 SGLang route could not be screened because
-  `aiter.ops.triton.gemm.batched.batched_gemm_bf16` is not installed. Raw
-  local tgemm report: `/tmp/vllm-hcu-aiter-tgemm-benchmark.json`.
+- Raw local tgemm report: `/tmp/vllm-hcu-aiter-tgemm-benchmark.json`.
+
+### AITER DeepSeek-V4 WO_A batched GEMM screening evidence
+
+- The SGLang path
+  `aiter.ops.triton.gemm.batched.batched_gemm_bf16` remains absent, while the
+  current AITER 0.1.5 package provides
+  `aiter.ops.triton.batched_gemm_bf16.batched_gemm_bf16`. Its default lookup
+  has no `BW200B-BATCHED_GEMM-A16W16.json`, so the audit used an explicit
+  conservative tile rather than treating importability as support.
+- Six live-HCU accuracy cases passed against an independent FP32 reference at
+  the production `K=4096,N=1024` dimensions, covering `G=8/4/2/1` and decode
+  token counts 1/8/16/64. The test declared `rtol=0.02,atol=0.05` before
+  execution; inputs and weights were unchanged.
+- The repeated benchmark covered all 28 combinations of `G=8/4/2/1` and
+  `M=1/2/4/8/16/32/64`, including input transpose/contiguous, output
+  allocation, kernel execution, and output transpose/contiguous. Zero shapes
+  passed the 5% gate. Candidate latency was 2.04x--5.24x the existing einsum
+  latency (median 4.02x), so no production route or dormant switch is added.
+  Screening used the predeclared `rtol=0.02,atol=0.5`; the largest absolute
+  difference from the independent FP32 result was 0.9863 and remained within
+  the combined tolerance for its output magnitude.
+- Exact benchmark command:
+
+  ```bash
+  HIP_VISIBLE_DEVICES=4 CUDA_VISIBLE_DEVICES=4 \
+    PYTHONPATH=/models/zb/vllm_025/vllm:. \
+    python3 tools/benchmark_sglang_operator_candidates.py \
+      aiter-batched-gemm-bf16 --warmup 20 --iterations 100 --repeats 7 \
+      --json-output /tmp/vllm-hcu-aiter-batched-gemm-bf16.json
+  ```
+
+- Raw local report:
+  `/tmp/vllm-hcu-aiter-batched-gemm-bf16.json`.
 
 ## Source-import coverage notes
 

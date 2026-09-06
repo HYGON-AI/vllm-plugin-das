@@ -9,8 +9,9 @@ This change compares `HYGON-AI/sglang-das` at
 all HCU routes subordinate to `VLLM_HCU_USE_CUSTOM_OPS`.
 
 The test host used BW1100 (`gfx938:sramecc+:xnack-`), PyTorch 2.11.0, vLLM
-0.25.1, LightOp 0.6.0, and the installed HCU AITER package. Raw benchmark JSON
-is written under `/tmp`; it is intentionally not committed.
+0.25.1, LightOp 0.6.0, and AITER
+`0.1.5+das185.dtk2604.torch2110.2608180853.g40a705`. Raw benchmark JSON is
+written under `/tmp`; it is intentionally not committed.
 
 ## Disposition
 
@@ -21,10 +22,11 @@ is written under `/tmp`; it is intentionally not committed.
 | LightOp `ds_cat` mode 0 | Accepted | Replaced the exact FlashMLA decode concatenation seam, with `torch.cat` fallback. |
 | AITER `silu_and_mul` | Performance-rejected | Kept the existing categorized LightOp implementation. |
 | AITER `tgemm` | Performance-rejected | Kept the existing vLLM linear implementation. |
+| AITER `batched_gemm_bf16` | Performance-rejected | Kept the DeepSeek-V4 WO_A einsum; the callable replacement is substantially slower after mandatory layout conversions. |
 | EP `ep_build_m_indices` | Already covered | Existing LightOp `ep_scatter` produces indices and inverse permutation in one launch. |
 | Fused RMS plus dynamic quant | Already covered | Existing public categorized LightOp route has the same contract and avoids private LMSlim APIs. |
 | Generic RMS/RoPE/KV-store fusions | No vLLM seam | Not adapted; SGLang token-pool mutation is not ABI-compatible with vLLM paged KV cache ownership. |
-| Newer AITER fused Qwen/gating symbols | Dependency unavailable | No dormant switch was added for symbols absent from the installed package. |
+| Newer AITER fused Qwen/gating symbols | No compatible seam / dependency unavailable | The fused QK/RMS/RoPE/cache implementation is present only in a categorized module but does not match vLLM paged-cache ownership; absent symbols get no dormant switch. |
 
 The complete symbol-by-symbol audit and Triton alternatives are in
 `docs/operator_adaptation_audit_v0251.md`.
@@ -51,6 +53,7 @@ sent to AITER or Triton, so all rejection happens before weight replacement.
 | FlashMLA decode concat | 4/4 live-HCU cases, including production strides | 33/33 shapes exceeded 5%; speedup 8.84% min, 47.03% median, 77.46% max versus `torch.cat`. |
 | AITER SiLU screening | Accuracy passed | Rejected: 40.58%--96.17% slower than current LightOp and 5.20%--26.18% slower than vLLM native. |
 | AITER `tgemm` screening | 36/36 exact comparisons | Rejected: 0/36 shapes exceeded 5%; speedup -27.51% min, -0.12% median, 0.46% max. |
+| AITER WO_A batched BF16 GEMM | 6/6 live-HCU cases against FP32 (`rtol=0.02,atol=0.05`) | Rejected: 0/28 TP/decode shapes exceeded 5%; complete candidate latency was 2.04x--5.24x the existing einsum. Screening used `rtol=0.02,atol=0.5`, with maximum absolute FP32 difference 0.9863. |
 
 Raw reports:
 
@@ -59,6 +62,7 @@ Raw reports:
 - `/tmp/vllm-hcu-mla-decode-cat-benchmark.json`
 - `/tmp/vllm-hcu-aiter-silu-benchmark.json`
 - `/tmp/vllm-hcu-aiter-tgemm-benchmark.json`
+- `/tmp/vllm-hcu-aiter-batched-gemm-bf16.json`
 
 ## Model-level acceptance
 
@@ -87,6 +91,28 @@ Local results:
   made from that incomplete run; acceptance relies on the 75/75 router
   accuracy matrix, as allowed when a local model run cannot provide clean
   coverage.
+
+## Additional `/models` coverage inventory
+
+The local checkpoint scan found one additional positive-coverage model and
+several useful negative controls:
+
+- `/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8` has the same
+  `DeepseekV4ForCausalLM`, 256-expert sqrt-softplus router and `512+64` MLA
+  geometry as the validated INT8 checkpoint. It can exercise the accepted
+  router and decode-concat routes, and its `G=8,R=1024,K=4096` WO_A dimensions
+  are included in the rejected batched-GEMM operator matrix.
+- `/models/Qwen3.5-35B-A3B-W8A8` has the Qwen `E=256,K=2048,N=512,top-k=8`
+  expert geometry but quantized weights, so it is a fallback/non-activation
+  control rather than positive coverage for the unquantized W16A16 backend.
+- The two HY-V4 checkpoints have `K=6144,N=2048`; Kimi-K2.6 MLA uses
+  `128+64`; Qwen3.6-27B, Qwen3-VL-8B and Gemma4 are dense or different
+  architectures. They do not satisfy the accepted routes' exact eligibility
+  contracts and are therefore useful only for proving non-activation.
+
+No extra large-model run is claimed from this inventory. The user allowed
+operator-level accuracy when model coverage is incomplete, and the exact
+positive operator shapes are already covered by the live-HCU matrices.
 
 ## Reproduction
 

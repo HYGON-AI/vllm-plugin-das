@@ -493,6 +493,7 @@
     "kernel-accuracy-tests": {
       "patterns": [
         "tests/accuracy/test_hcu_kernel_accuracy.py",
+        "tests/accuracy/test_aiter_batched_gemm_bf16.py",
         "tests/accuracy/test_aiter_silu_and_mul.py",
         "tests/accuracy/test_lightop_mla_concat_accuracy.py",
         "tests/accuracy/test_lightop_sqrtsoftplus_gate.py",

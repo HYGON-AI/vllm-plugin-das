@@ -13,6 +13,7 @@ import statistics
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from importlib import metadata
 from pathlib import Path
 
 
@@ -24,6 +25,15 @@ class TimingSummary:
     median_us: float
     minimum_us: float
     maximum_us: float
+
+
+def distribution_version(name: str) -> str:
+    """Return installed distribution metadata without trusting module aliases."""
+
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def _positive_finite(value: float) -> bool:
@@ -181,6 +191,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         nargs="+",
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+    )
+    batched_bf16 = subparsers.add_parser(
+        "aiter-batched-gemm-bf16",
+        help=(
+            "Compare AITER Triton BF16 batched GEMM with the DeepSeek-V4 "
+            "WO_A einsum path."
+        ),
+    )
+    _add_common_arguments(batched_bf16)
+    batched_bf16.add_argument(
+        "--groups", type=int, nargs="+", default=[8, 4, 2, 1]
+    )
+    batched_bf16.add_argument("--input-size", type=int, default=4096)
+    batched_bf16.add_argument("--output-size", type=int, default=1024)
+    batched_bf16.add_argument(
+        "--token-counts",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 64],
     )
     return parser
 
@@ -850,6 +879,124 @@ def _run_aiter_tgemm(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _run_aiter_batched_gemm_bf16(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    import torch
+    import vllm
+    from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
+
+    if args.input_size <= 0 or args.output_size <= 0:
+        raise ValueError("--input-size and --output-size must be positive")
+    if any(groups <= 0 for groups in args.groups):
+        raise ValueError("--groups must contain positive values")
+    if any(tokens <= 0 for tokens in args.token_counts):
+        raise ValueError("--token-counts must contain positive values")
+
+    # The installed AITER package has no BW200B configuration JSON. This
+    # explicit conservative tile makes the callable candidate reproducible;
+    # the transpose/contiguous costs below remain part of every measurement.
+    config = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+    }
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    records = []
+    for groups in args.groups:
+        weight = torch.randn(
+            (groups, args.output_size, args.input_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        ).contiguous()
+        for tokens in args.token_counts:
+            source = torch.randn(
+                (tokens, groups, args.input_size),
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            ).contiguous()
+
+            def baseline_call():
+                return torch.einsum("tgd,grd->tgr", source, weight)
+
+            def candidate_call():
+                batch_major = source.transpose(0, 1).contiguous()
+                output = batched_gemm_bf16(
+                    batch_major,
+                    weight,
+                    dtype=torch.bfloat16,
+                    config=config,
+                )
+                return output.transpose(0, 1).contiguous()
+
+            independent = torch.einsum(
+                "tgd,grd->tgr", source.float(), weight.float()
+            )
+            expected = baseline_call()
+            actual = candidate_call()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                actual.float(), independent, rtol=0.02, atol=0.5
+            )
+            baseline = _measure_cuda(
+                baseline_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            candidate = _measure_cuda(
+                candidate_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            record = build_comparison_record(
+                shape={
+                    "tokens": tokens,
+                    "groups": groups,
+                    "input_size": args.input_size,
+                    "output_size": args.output_size,
+                },
+                baseline_name="deepseek-v4-wo-a-einsum",
+                baseline=baseline,
+                candidate_name="aiter-triton-batched-gemm-bf16",
+                candidate=candidate,
+            )
+            record["maximum_absolute_error_vs_fp32"] = float(
+                (actual.float() - independent).abs().max().item()
+            )
+            record["baseline_maximum_absolute_error_vs_fp32"] = float(
+                (expected.float() - independent).abs().max().item()
+            )
+            records.append(record)
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "operator": "aiter-batched-gemm-bf16",
+        "seed": args.seed,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+        "repeats": args.repeats,
+        "environment": {
+            "device_name": properties.name,
+            "gcn_arch": getattr(properties, "gcnArchName", None),
+            "torch": torch.__version__,
+            "vllm": distribution_version("vllm"),
+            "vllm_source_version": vllm.__version__,
+            "aiter": distribution_version("aiter"),
+            "explicit_config": config,
+        },
+        "records": records,
+    }
+
+
 def main() -> int:
     args = build_parser().parse_args()
     _validate_counts(args)
@@ -863,6 +1010,8 @@ def main() -> int:
         report = _run_mla_decode_cat(args)
     elif args.operator == "aiter-tgemm":
         report = _run_aiter_tgemm(args)
+    elif args.operator == "aiter-batched-gemm-bf16":
+        report = _run_aiter_batched_gemm_bf16(args)
     else:
         raise RuntimeError(
             f"benchmark runner for {args.operator!r} has not passed its "
