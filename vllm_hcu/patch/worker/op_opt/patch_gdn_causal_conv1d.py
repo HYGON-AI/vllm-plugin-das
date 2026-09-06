@@ -26,6 +26,17 @@ _MARKER = "_vllm_hcu_gdn_causal_conv1d_applied"
 _WRAPPER = "_vllm_hcu_gdn_causal_conv1d_wrapper"
 
 
+def _supports_external_update(arguments: dict[str, object]) -> bool:
+    return (
+        arguments["num_accepted_tokens"] is None
+        and arguments["query_start_loc"] is None
+        and arguments["max_query_len"] == -1
+        and arguments["null_block_id"] == 0
+        and arguments["block_idx_last_scheduled_token"] is None
+        and arguments["initial_state_idx"] is None
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     qwen = load_exact_module(TARGET_MODULE, module)
     wrapped = (
@@ -99,16 +110,37 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(causal_update)
     def hcu_causal_update(*args, **kwargs):
-        if not use_nn_layout():
-            return causal_update(*args, **kwargs)
         bound = causal_update_signature.bind(*args, **kwargs)
-        x = bound.arguments["x"]
-        conv_state = bound.arguments["conv_state"]
-        expected_dim = shape_dim(conv_state, -2) or shape_dim(x, 1)
-        bound.arguments["weight"] = normalize_nn_conv_weight(
-            bound.arguments["weight"], expected_dim, TARGETS[1]
+        bound.apply_defaults()
+        if use_nn_layout():
+            x = bound.arguments["x"]
+            conv_state = bound.arguments["conv_state"]
+            expected_dim = shape_dim(conv_state, -2) or shape_dim(x, 1)
+            bound.arguments["weight"] = normalize_nn_conv_weight(
+                bound.arguments["weight"], expected_dim, TARGETS[1]
+            )
+        from vllm_hcu.platforms import envs as henvs
+
+        if not (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D
+            and _supports_external_update(bound.arguments)
+        ):
+            return causal_update(*bound.args, **bound.kwargs)
+        try:
+            from causal_conv1d.causal_conv1d_interface import (
+                causal_conv1d_update as custom_update,
+            )
+        except ImportError:
+            return causal_update(*bound.args, **bound.kwargs)
+        return custom_update(
+            bound.arguments["x"],
+            bound.arguments["conv_state"],
+            bound.arguments["weight"],
+            bound.arguments["bias"],
+            bound.arguments["activation"],
+            conv_state_indices=bound.arguments["conv_state_indices"],
         )
-        return causal_update(*bound.args, **bound.kwargs)
 
     for function in (hcu_causal_conv, hcu_causal_update):
         setattr(function, _WRAPPER, True)

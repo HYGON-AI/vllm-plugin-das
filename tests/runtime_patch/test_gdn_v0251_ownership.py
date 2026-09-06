@@ -274,6 +274,12 @@ def _install_module(monkeypatch: pytest.MonkeyPatch, name: str, **values):
     return module
 
 
+def _install_fake_module(
+    monkeypatch: pytest.MonkeyPatch, name: str, **values
+):
+    return _install_module(monkeypatch, name, **values)
+
+
 def _call_aiter(module, conv_state, weight):
     return module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
         x=torch.empty(1),
@@ -292,6 +298,153 @@ def _call_aiter(module, conv_state, weight):
         conv_state_indices=None,
         validate_data=True,
     )
+
+
+def _causal_route_module(adapter, original_update):
+    original_update.__signature__ = inspect.signature(  # type: ignore[attr-defined]
+        _causal_update_contract
+    )
+    module = ModuleType(adapter.TARGET_MODULE)
+    module.causal_conv1d_fn = _causal_contract
+    module.causal_conv1d_update = original_update
+    return module
+
+
+def test_qwen_causal_update_routes_compatible_decode_to_external(monkeypatch):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = {}
+
+    def original(*args, **kwargs):
+        calls["original"] = (args, kwargs)
+        return "original-update"
+
+    def custom_update(x, conv_state, weight, bias=None, activation=None,
+                      cache_seqlens=None, conv_state_indices=None):
+        calls["custom"] = {
+            "x": x,
+            "conv_state": conv_state,
+            "weight": weight,
+            "bias": bias,
+            "activation": activation,
+            "cache_seqlens": cache_seqlens,
+            "conv_state_indices": conv_state_indices,
+        }
+        return "custom-update"
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=custom_update,
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    x = torch.empty(2, 8)
+    state = torch.empty(1, 8, 3)
+    physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    indices = torch.tensor([0, 1])
+    assert module.causal_conv1d_update(
+        x, state, physical_weight, activation="silu",
+        conv_state_indices=indices, validate_data=True,
+    ) == "custom-update"
+    assert "original" not in calls
+    torch.testing.assert_close(
+        calls["custom"]["weight"], physical_weight.T.contiguous()
+    )
+    assert calls["custom"]["conv_state_indices"] is indices
+
+
+def test_qwen_causal_update_falls_back_for_spec_metadata(monkeypatch):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append(
+            inspect.signature(_causal_update_contract).bind(*args, **kwargs)
+        )
+        return "original-update"
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=lambda *args, **kwargs: pytest.fail(
+            "spec metadata is unsupported by the external kernel"
+        ),
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    accepted = torch.tensor([1])
+    query_start = torch.tensor([0, 1])
+    result = module.causal_conv1d_update(
+        torch.empty(1, 8), torch.empty(1, 8, 3), torch.empty(8, 4),
+        num_accepted_tokens=accepted, query_start_loc=query_start,
+        max_query_len=1,
+    )
+    assert result == "original-update"
+    assert calls[0].arguments["num_accepted_tokens"] is accepted
+    assert calls[0].arguments["query_start_loc"] is query_start
+
+
+def test_qwen_causal_update_falls_back_when_external_module_is_missing(
+    monkeypatch,
+):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "original-update"
+
+    _install_fake_module(
+        monkeypatch, "causal_conv1d.causal_conv1d_interface"
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    assert module.causal_conv1d_update(
+        torch.empty(1, 8), torch.empty(1, 8, 3), torch.empty(8, 4)
+    ) == "original-update"
+    assert len(calls) == 1
+
+
+def test_qwen_causal_update_propagates_selected_kernel_error(monkeypatch):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+
+    def original(*args, **kwargs):
+        return "original-update"
+
+    def failing_custom(*args, **kwargs):
+        raise RuntimeError("causal update launch failed")
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=failing_custom,
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    with pytest.raises(RuntimeError, match="causal update launch failed"):
+        module.causal_conv1d_update(
+            torch.empty(1, 8), torch.empty(1, 8, 3), torch.empty(8, 4)
+        )
 
 
 def test_dispatcher_scopes_all_gdn_callbacks_to_qwen():
@@ -333,6 +486,8 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_USE_NN", use_nn)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", False)
     assert causal_adapter.apply_to_module(module) is True
     assert aiter_adapter.apply_to_module(module) is True
     assert causal_adapter.apply_to_module(module) is False
