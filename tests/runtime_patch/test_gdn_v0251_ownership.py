@@ -609,7 +609,10 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
             unexpected=torch.empty(1),
         )
 
-    bad_module, _, _, _, _ = _fake_qwen(aiter_available=True)
+    bad_module, _, _, _, original_sigmoid = _fake_qwen(aiter_available=True)
+    native_update = (
+        bad_module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token
+    )
 
     def incompatible(x, weight):
         return x, weight
@@ -619,6 +622,17 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
     )
     with pytest.raises(PatchCompatibilityError, match="incompatible parameters"):
         adapter.apply_to_module(bad_module)
+    assert bad_module.fused_sigmoid_gating_delta_rule_update is original_sigmoid
+    assert not hasattr(bad_module, "_vllm_hcu_original_fused_sigmoid")
+    assert not getattr(bad_module, "_vllm_hcu_qwen_gdn_aiter_layout_applied", False)
+
+    bad_module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token = (
+        native_update
+    )
+    assert adapter.apply_to_module(bad_module) is True
+    assert adapter.apply_to_module(bad_module) is False
+    assert bad_module.fused_sigmoid_gating_delta_rule_update is not original_sigmoid
+    assert bad_module._vllm_hcu_original_fused_sigmoid is original_sigmoid
 
 
 def test_real_v0251_cold_import_scopes_gdn_deltas_to_qwen():

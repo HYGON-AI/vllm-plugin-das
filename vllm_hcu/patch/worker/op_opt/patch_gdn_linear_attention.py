@@ -112,10 +112,6 @@ def apply_to_module(module: ModuleType) -> bool:
                 return triton_kernel(*bound.args, **bound.kwargs)
         return official_sigmoid(*bound.args, **bound.kwargs)
 
-    setattr(hcu_sigmoid_update, _SIGMOID_WRAPPER, True)
-    setattr(qwen, "_vllm_hcu_original_fused_sigmoid", official_sigmoid)
-    setattr(qwen, "fused_sigmoid_gating_delta_rule_update", hcu_sigmoid_update)
-
     if aiter_available:
         aiter_update = require_callable(
             qwen,
@@ -151,6 +147,10 @@ def apply_to_module(module: ModuleType) -> bool:
             )
             return aiter_update(*bound.args, **bound.kwargs)
 
+    setattr(hcu_sigmoid_update, _SIGMOID_WRAPPER, True)
+    setattr(qwen, "_vllm_hcu_original_fused_sigmoid", official_sigmoid)
+    setattr(qwen, "fused_sigmoid_gating_delta_rule_update", hcu_sigmoid_update)
+    if aiter_available:
         setattr(hcu_aiter_update, _WRAPPER, True)
         setattr(qwen, "_vllm_hcu_original_gdn_aiter_update", aiter_update)
         setattr(
