@@ -935,36 +935,155 @@ def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
     torch.testing.assert_close(module.chunk_fwd_o(x, x, x, x), original(x, x, x, x))
 
 
-def test_fla_chunk_delta_h_enabled_missing_aiter_fails_clearly(monkeypatch):
-    adapter = _adapter("patch_fla_chunk_delta_h")
-
-    def original(k, w, u, g=None, gk=None, initial_state=None,
-                 output_final_state=False, chunk_size=64, save_new_value=True,
-                 cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
-                 use_exp2=False):
-        return k, u, None
-
-    module = _module(
+def _chunk_delta_module(adapter, original):
+    return _module(
         adapter.TARGET_MODULE,
         FLA_CHUNK_SIZE=64,
         chunk_gated_delta_rule_fwd_h=original,
+        prepare_chunk_indices=lambda seq, size: torch.tensor([[0, 0]]),
+        prepare_chunk_offsets=lambda seq, size: torch.tensor([0]),
+        triton=SimpleNamespace(cdiv=lambda value, divisor: (value + divisor - 1) // divisor),
         torch=torch,
     )
+
+
+def _chunk_delta_original(k, w, u, g=None, gk=None, initial_state=None,
+                          output_final_state=False, chunk_size=64,
+                          save_new_value=True, cu_seqlens=None,
+                          chunk_indices=None, chunk_offsets=None,
+                          use_exp2=False):
+    return "original-h", "original-v", "original-final"
+
+
+def test_fla_chunk_delta_h_prefers_hip_and_preserves_metadata(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_delta_h")
+    calls = []
+
+    def hip(k, w, u, g=None, gk=None, initial_state=None,
+            initial_state_indices=None, output_final_state=True,
+            chunk_size=64, save_new_value=True, cu_seqlens=None,
+            chunk_indices=None, chunk_offsets=None, use_exp2=False,
+            transpose_state_layout=True, kernel_cfg=None):
+        calls.append((chunk_size, output_final_state, save_new_value,
+                      cu_seqlens, chunk_indices, chunk_offsets,
+                      use_exp2, transpose_state_layout, kernel_cfg))
+        return "hip-h", "hip-v", "hip-final"
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_gated_delta_rule_fwd_vllm_hip_blockdim64=hip,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.vllm.chunk_delta_h",
+        launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64=lambda **kwargs: pytest.fail(
+            "HIP must have priority"
+        ),
+    )
+    module = _chunk_delta_module(adapter, _chunk_delta_original)
     adapter.apply_to_module(module)
     from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.ops.triton.fla.vllm.chunk_delta_h",
-        ModuleType("aiter.ops.triton.fla.vllm.chunk_delta_h"),
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP", True
     )
-    with pytest.raises(RuntimeError, match="enabled but unavailable"):
+    cu_seqlens = torch.tensor([0, 2])
+    result = module.chunk_gated_delta_rule_fwd_h(
+        torch.zeros(1, 2, 1, 4),
+        torch.zeros(1, 2, 1, 4),
+        torch.zeros(1, 2, 1, 4),
+        output_final_state=True,
+        chunk_size=32,
+        save_new_value=False,
+        cu_seqlens=cu_seqlens,
+        use_exp2=True,
+    )
+    assert result == ("hip-h", "hip-v", "hip-final")
+    assert calls[0][0:3] == (32, True, False)
+    assert calls[0][3] is cu_seqlens
+    assert calls[0][6:] == (True, True, None)
+
+
+def test_fla_chunk_delta_h_uses_aiter_triton_when_hip_is_unavailable(
+    monkeypatch,
+):
+    adapter = _adapter("patch_fla_chunk_delta_h")
+    calls = []
+    _install_fake_module(monkeypatch, "aiter.ops.fla")
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.vllm.chunk_delta_h",
+        launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64=(
+            lambda **kwargs: calls.append(kwargs)
+        ),
+    )
+    module = _chunk_delta_module(adapter, _chunk_delta_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP", True
+    )
+    module.chunk_gated_delta_rule_fwd_h(
+        torch.zeros(1, 2, 1, 4),
+        torch.zeros(1, 2, 1, 4),
+        torch.zeros(1, 2, 1, 4),
+        chunk_size=32,
+        use_exp2=True,
+    )
+    assert calls[0]["BT"] == 32
+    assert calls[0]["use_exp2"] is True
+    assert calls[0]["transpose_state_layout"] is True
+
+
+def test_fla_chunk_delta_h_uses_original_when_optional_aiter_is_unavailable(
+    monkeypatch,
+):
+    adapter = _adapter("patch_fla_chunk_delta_h")
+    _install_fake_module(monkeypatch, "aiter.ops.fla")
+    _install_fake_module(monkeypatch, "aiter.ops.triton.fla.vllm.chunk_delta_h")
+    module = _chunk_delta_module(adapter, _chunk_delta_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP", True
+    )
+    assert module.chunk_gated_delta_rule_fwd_h(
+        torch.zeros(1, 2, 1, 4),
+        torch.zeros(1, 2, 1, 4),
+        torch.zeros(1, 2, 1, 4),
+    ) == ("original-h", "original-v", "original-final")
+
+
+def test_fla_chunk_delta_h_propagates_selected_hip_runtime_error(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_delta_h")
+
+    def failing_hip(*args, **kwargs):
+        raise RuntimeError("hip delta launch failed")
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_gated_delta_rule_fwd_vllm_hip_blockdim64=failing_hip,
+    )
+    module = _chunk_delta_module(adapter, _chunk_delta_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP", True
+    )
+    with pytest.raises(RuntimeError, match="hip delta launch failed"):
         module.chunk_gated_delta_rule_fwd_h(
-            torch.empty(1, 1, 1, 1),
-            torch.empty(1),
-            torch.empty(1, 1, 1, 1),
+            torch.zeros(1, 2, 1, 4),
+            torch.zeros(1, 2, 1, 4),
+            torch.zeros(1, 2, 1, 4),
         )
 
 

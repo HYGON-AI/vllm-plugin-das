@@ -22,6 +22,16 @@ def _enabled() -> bool:
     return bool(henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA and henvs.VLLM_HCU_USE_CUSTOM_OPS)
 
 
+def _hip_enabled() -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
+    return bool(
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
+        and henvs.VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     chunk = load_exact_module(TARGET_MODULE, module)
     if already_applied(chunk, _MARKER, ((chunk, "chunk_gated_delta_rule_fwd_h", TARGETS[0], _WRAPPER),)):
@@ -54,13 +64,8 @@ def apply_to_module(module: ModuleType) -> bool:
             return original(k, w, u, g, gk, initial_state, output_final_state,
                             chunk_size, save_new_value, cu_seqlens, chunk_indices,
                             chunk_offsets, use_exp2)
-        try:
-            from aiter.ops.triton.fla.vllm.chunk_delta_h import (
-                launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-            )
-        except ImportError as exc:
-            raise RuntimeError("HCU AITER FLA chunk_delta_h is enabled but unavailable") from exc
-
+        original_chunk_indices = chunk_indices
+        original_chunk_offsets = chunk_offsets
         B, T, Hg, K, V = *k.shape, u.shape[-1]
         H, BT = u.shape[-2], chunk_size
         if chunk_indices is None and cu_seqlens is not None:
@@ -71,6 +76,32 @@ def apply_to_module(module: ModuleType) -> bool:
             N, NT = len(cu_seqlens) - 1, len(chunk_indices)
             if chunk_offsets is None:
                 chunk_offsets = chunk.prepare_chunk_offsets(cu_seqlens, BT)
+        if _hip_enabled():
+            try:
+                from aiter.ops.fla import (
+                    chunk_gated_delta_rule_fwd_vllm_hip_blockdim64 as hip_kernel,
+                )
+            except ImportError:
+                hip_kernel = None
+            if hip_kernel is not None:
+                return hip_kernel(
+                    k, w, u, g=g, gk=gk, initial_state=initial_state,
+                    initial_state_indices=None, output_final_state=output_final_state,
+                    chunk_size=chunk_size, save_new_value=save_new_value,
+                    cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                    chunk_offsets=chunk_offsets, use_exp2=use_exp2,
+                    transpose_state_layout=True, kernel_cfg=None,
+                )
+        try:
+            from aiter.ops.triton.fla.vllm.chunk_delta_h import (
+                launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
+            )
+        except ImportError:
+            return original(
+                k, w, u, g, gk, initial_state, output_final_state, chunk_size,
+                save_new_value, cu_seqlens, original_chunk_indices,
+                original_chunk_offsets, use_exp2,
+            )
         if K > 256:
             raise ValueError("HCU AITER FLA does not support head dimension > 256")
         h = k.new_empty(B, NT, H, V, K)
