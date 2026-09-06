@@ -30,6 +30,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_mla_concat.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
     est_time=330,
 )

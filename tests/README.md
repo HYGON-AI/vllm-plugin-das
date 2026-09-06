@@ -62,7 +62,8 @@ changes functional pytest results:
 python tools/benchmark_sglang_operator_candidates.py --help
 ```
 
-The runner exposes `sqrtsoftplus-gate`, `silu-and-mul`, and `w16a16-moe`.
+The runner exposes `sqrtsoftplus-gate`, `silu-and-mul`, `w16a16-moe`,
+`mla-decode-cat`, and `aiter-tgemm`.
 Each executable handler is enabled only after its live-HCU numerical test is
 in place. Recorded commands, shapes and results belong in
 `docs/operator_adaptation_audit_v0251.md`; a symbol being importable is not a

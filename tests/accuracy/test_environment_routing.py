@@ -137,6 +137,25 @@ def test_lightop_w16a16_environment_is_lazy_and_defaults_off(
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
+)
+def test_lightop_mla_decode_cat_environment_is_lazy_and_defaults_on(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert hcu_envs.VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT is expected
+    assert hcu_envs.is_set(name) is (value is not None)
+
+
+@pytest.mark.parametrize(
     "name",
     [
         "VLLM_HCU_LIGHTLY_CP_THRESHOLD",

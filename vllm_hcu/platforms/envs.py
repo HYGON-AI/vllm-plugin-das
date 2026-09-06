@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
+    VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
@@ -245,6 +246,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_W16A16_MOE":
     lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_W16A16_MOE", "False"
+        ).lower() in ("true", "1")),
+    # Use categorized LightOp ds_cat for the validated FlashMLA decode layout.
+    # VLLM_USE_OPT_CAT remains a compatibility opt-out; custom ops master it.
+    "VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT":
+    lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT", "True"
         ).lower() in ("true", "1")),
 
     "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D":

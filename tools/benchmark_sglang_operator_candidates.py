@@ -153,6 +153,35 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
     )
+    mla_cat = subparsers.add_parser(
+        "mla-decode-cat",
+        help="Compare categorized LightOp MLA decode concat with torch.cat.",
+    )
+    _add_common_arguments(mla_cat)
+    mla_cat.add_argument("--heads", type=int, nargs="+", default=[8, 16, 32])
+    mla_cat.add_argument(
+        "--token-counts",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768],
+    )
+    tgemm = subparsers.add_parser(
+        "aiter-tgemm",
+        help="Compare AITER tuned BF16 GEMM with the current torch linear path.",
+    )
+    _add_common_arguments(tgemm)
+    tgemm.add_argument(
+        "--dimensions",
+        nargs="+",
+        default=["4096x4096", "4096x1024", "2048x4096", "2048x512"],
+        help="KxN GEMM dimensions.",
+    )
+    tgemm.add_argument(
+        "--token-counts",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+    )
     return parser
 
 
@@ -511,13 +540,329 @@ def _run_w16a16(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _run_silu_and_mul(args: argparse.Namespace) -> dict[str, object]:
+    import aiter
+    import torch
+    import vllm
+    from lightop import __version__ as lightop_version
+    from lightop.activation import silu_and_mul_opt
+
+    try:
+        import vllm._C_stable_libtorch  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("vLLM silu_and_mul extension is unavailable") from exc
+    vllm_op = getattr(getattr(torch.ops, "_C", None), "silu_and_mul", None)
+    if not callable(vllm_op):
+        raise RuntimeError("vLLM _C.silu_and_mul is unavailable")
+    if not callable(getattr(aiter, "silu_and_mul", None)):
+        raise RuntimeError("AITER silu_and_mul is unavailable")
+
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    records = []
+    for hidden in args.hidden_sizes:
+        if hidden <= 0:
+            raise ValueError("--hidden-sizes must contain positive values")
+        for tokens in args.token_counts:
+            if tokens <= 0:
+                raise ValueError("--token-counts must contain positive values")
+            source = torch.randn(
+                (tokens, 2 * hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            ).contiguous()
+            lightop_output = torch.empty(
+                (tokens, hidden), dtype=source.dtype, device=source.device
+            )
+            aiter_output = torch.empty_like(lightop_output)
+            vllm_output = torch.empty_like(lightop_output)
+
+            def lightop_call():
+                silu_and_mul_opt(lightop_output, source)
+                return lightop_output
+
+            def aiter_call():
+                # The installed HCU AITER schema is (out, input).  Newer
+                # SGLang builds pass an optional clamp-limit as a third
+                # argument, which this pinned runtime does not expose.
+                aiter.silu_and_mul(aiter_output, source)
+                return aiter_output
+
+            def vllm_call():
+                vllm_op(vllm_output, source)
+                return vllm_output
+
+            lightop_call()
+            aiter_call()
+            vllm_call()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                aiter_output, lightop_output, rtol=0.02, atol=0.05
+            )
+            torch.testing.assert_close(
+                aiter_output, vllm_output, rtol=0.02, atol=0.05
+            )
+            max_error_lightop = float(
+                (aiter_output.float() - lightop_output.float()).abs().max().item()
+            )
+            max_error_vllm = float(
+                (aiter_output.float() - vllm_output.float()).abs().max().item()
+            )
+            lightop = _measure_cuda(
+                lightop_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            aiter_summary = _measure_cuda(
+                aiter_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            vllm_summary = _measure_cuda(
+                vllm_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            shape = {"tokens": tokens, "hidden_size": hidden, "dtype": "bf16"}
+            lightop_record = build_comparison_record(
+                shape=shape,
+                baseline_name="current-plugin-lightop",
+                baseline=lightop,
+                candidate_name="aiter",
+                candidate=aiter_summary,
+            )
+            lightop_record["maximum_absolute_error"] = max_error_lightop
+            records.append(lightop_record)
+            vllm_record = build_comparison_record(
+                shape=shape,
+                baseline_name="vllm-native",
+                baseline=vllm_summary,
+                candidate_name="aiter",
+                candidate=aiter_summary,
+            )
+            vllm_record["maximum_absolute_error"] = max_error_vllm
+            records.append(vllm_record)
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "operator": "silu-and-mul",
+        "seed": args.seed,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+        "repeats": args.repeats,
+        "environment": {
+            "device_name": properties.name,
+            "gcn_arch": getattr(properties, "gcnArchName", None),
+            "torch": torch.__version__,
+            "vllm": vllm.__version__,
+            "lightop": lightop_version,
+            "aiter": getattr(aiter, "__version__", "unknown"),
+        },
+        "records": records,
+    }
+
+
+def _run_mla_decode_cat(args: argparse.Namespace) -> dict[str, object]:
+    import torch
+    import vllm
+    from lightop import __version__ as lightop_version
+
+    from vllm_hcu.model_executor.layers.attention.lightop_concat_runtime import (
+        _call_registered_lightop,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    records = []
+    for heads in args.heads:
+        if heads <= 0 or heads % 8:
+            raise ValueError("--heads must contain positive multiples of 8")
+        for tokens in args.token_counts:
+            if tokens <= 0 or tokens >= 1024:
+                raise ValueError("--token-counts must be in the range [1, 1023]")
+
+            # These are the non-contiguous views produced by FlashMLA decode,
+            # rather than easier contiguous stand-ins.
+            left_storage = torch.randn(
+                tokens * heads * 512,
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            )
+            left = torch.as_strided(
+                left_storage,
+                size=(tokens, heads, 512),
+                stride=(512, 512 * tokens, 1),
+            )
+            right_storage = torch.randn(
+                1536 * (heads // 8) * tokens,
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            )
+            right = torch.as_strided(
+                right_storage,
+                size=(tokens, heads, 64),
+                stride=(1536 * (heads // 8), 192, 1),
+            )
+
+            def baseline_call():
+                return torch.cat((left, right), dim=-1)
+
+            def candidate_call():
+                return _call_registered_lightop(left, right)
+
+            expected = baseline_call()
+            actual = candidate_call()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            baseline = _measure_cuda(
+                baseline_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            candidate = _measure_cuda(
+                candidate_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            record = build_comparison_record(
+                shape={"tokens": tokens, "heads": heads},
+                baseline_name="torch-cat",
+                baseline=baseline,
+                candidate_name="lightop-ds-cat-mode-0",
+                candidate=candidate,
+            )
+            record["maximum_absolute_error"] = float(
+                (actual.float() - expected.float()).abs().max().item()
+            )
+            records.append(record)
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "operator": "mla-decode-cat",
+        "seed": args.seed,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+        "repeats": args.repeats,
+        "environment": {
+            "device_name": properties.name,
+            "gcn_arch": getattr(properties, "gcnArchName", None),
+            "torch": torch.__version__,
+            "vllm": vllm.__version__,
+            "lightop": lightop_version,
+        },
+        "records": records,
+    }
+
+
+def _run_aiter_tgemm(args: argparse.Namespace) -> dict[str, object]:
+    import aiter
+    import torch
+    import vllm
+    from aiter.tuned_gemm import tgemm
+
+    dimensions = []
+    for raw in args.dimensions:
+        try:
+            k, n = (int(value) for value in raw.lower().split("x", maxsplit=1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("--dimensions values must use positive KxN syntax") from exc
+        if k <= 0 or n <= 0:
+            raise ValueError("--dimensions values must use positive KxN syntax")
+        dimensions.append((k, n))
+
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    records = []
+    for k, n in dimensions:
+        weight = (
+            torch.randn(
+                (n, k),
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            )
+            * 0.02
+        ).contiguous()
+        for tokens in args.token_counts:
+            if tokens <= 0:
+                raise ValueError("--token-counts must contain positive values")
+            source = torch.randn(
+                (tokens, k),
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            ).contiguous()
+
+            def baseline_call():
+                return torch.nn.functional.linear(source, weight)
+
+            def candidate_call():
+                return tgemm.mm(source, weight, otype=source.dtype)
+
+            expected = baseline_call()
+            actual = candidate_call()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.1)
+            baseline = _measure_cuda(
+                baseline_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            candidate = _measure_cuda(
+                candidate_call,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            )
+            record = build_comparison_record(
+                shape={"tokens": tokens, "input_size": k, "output_size": n},
+                baseline_name="torch-linear",
+                baseline=baseline,
+                candidate_name="aiter-tgemm",
+                candidate=candidate,
+            )
+            record["maximum_absolute_error"] = float(
+                (actual.float() - expected.float()).abs().max().item()
+            )
+            records.append(record)
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "operator": "aiter-tgemm",
+        "seed": args.seed,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+        "repeats": args.repeats,
+        "environment": {
+            "device_name": properties.name,
+            "gcn_arch": getattr(properties, "gcnArchName", None),
+            "torch": torch.__version__,
+            "vllm": vllm.__version__,
+            "aiter": getattr(aiter, "__version__", "unknown"),
+        },
+        "records": records,
+    }
+
+
 def main() -> int:
     args = build_parser().parse_args()
     _validate_counts(args)
     if args.operator == "sqrtsoftplus-gate":
         report = _run_sqrtsoftplus(args)
+    elif args.operator == "silu-and-mul":
+        report = _run_silu_and_mul(args)
     elif args.operator == "w16a16-moe":
         report = _run_w16a16(args)
+    elif args.operator == "mla-decode-cat":
+        report = _run_mla_decode_cat(args)
+    elif args.operator == "aiter-tgemm":
+        report = _run_aiter_tgemm(args)
     else:
         raise RuntimeError(
             f"benchmark runner for {args.operator!r} has not passed its "

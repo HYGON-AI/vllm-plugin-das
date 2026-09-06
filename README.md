@@ -90,6 +90,13 @@ explicit `aiter`/`triton` choice, disabled switch, unsupported topology/shape,
 or missing config keeps the official AITER/Triton backend and canonical
 weights.
 
+`VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT` controls categorized LightOp `ds_cat`
+mode 0 for the validated FlashMLA BF16 query layout (`512+64` channels,
+fewer than 1024 decode rows) and defaults to enabled. It is subordinate to
+`VLLM_HCU_USE_CUSTOM_OPS`; the legacy `VLLM_USE_OPT_CAT=0` remains an opt-out.
+Disabled, unsupported-layout, dtype/device-ineligible, or unavailable-LightOp
+cases use `torch.cat`. Eligible kernel execution errors remain fail-closed.
+
 All three plugin entry points and both patch-application phases share one
 fail-closed compatibility gate. This branch accepts installed vLLM `0.25.x`
 (including local builds such as `0.25.1+das...`) and rejects missing, malformed,

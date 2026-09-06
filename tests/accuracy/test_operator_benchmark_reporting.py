@@ -59,7 +59,13 @@ def test_speedup_percent_rejects_invalid_timings(
 
 @pytest.mark.parametrize(
     "operator",
-    ("sqrtsoftplus-gate", "silu-and-mul", "w16a16-moe"),
+    (
+        "sqrtsoftplus-gate",
+        "silu-and-mul",
+        "w16a16-moe",
+        "mla-decode-cat",
+        "aiter-tgemm",
+    ),
 )
 def test_cli_exposes_each_screening_candidate(operator: str) -> None:
     args = build_parser().parse_args([operator])
