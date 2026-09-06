@@ -13,6 +13,10 @@ from typing import Any
 
 import torch
 
+from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    load_static_eplb_plan,
+)
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -38,29 +42,6 @@ _MODEL_RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _MODEL_KEY_ATTR = "_vllm_hcu_expert_map_key"
 
 
-def _select_model_payload(
-    path: Path,
-    payload: dict,
-    model_key: str,
-) -> dict:
-    model_maps = payload.get("model_maps")
-    if model_maps is None:
-        return payload
-    if not isinstance(model_maps, dict):
-        raise ValueError(f"Offline EPLB map {str(path)!r} has invalid model_maps.")
-    if model_key not in model_maps:
-        raise ValueError(
-            f"Offline EPLB map {str(path)!r} does not contain key "
-            f"{model_key!r}; available keys: {sorted(model_maps)}."
-        )
-    selected = model_maps[model_key]
-    if not isinstance(selected, dict):
-        raise ValueError(
-            f"Offline EPLB map {str(path)!r} key {model_key!r} is invalid."
-        )
-    return selected
-
-
 def load_offline_expert_map(
     path: str | Path,
     *,
@@ -72,68 +53,14 @@ def load_offline_expert_map(
 ) -> torch.Tensor:
     """Load and validate one model's physical-to-logical expert map."""
 
-    input_path = Path(path)
-    with input_path.open(encoding="utf-8") as source:
-        payload = json.load(source)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Offline EPLB map {str(input_path)!r} must be an object.")
-    selected = _select_model_payload(input_path, payload, model_key)
-    raw_map = selected.get(
-        "physical_to_logical_map",
-        selected.get("expert_map"),
+    plan = load_static_eplb_plan(
+        path,
+        model_key=model_key,
+        expected_shape=expected_shape,
+        num_logical_experts=num_logical_experts,
+        num_redundant_experts=expected_shape[1] - num_logical_experts,
     )
-    if raw_map is None:
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} must contain "
-            "physical_to_logical_map."
-        )
-
-    loaded = torch.tensor(raw_map, device="cpu")
-    if (
-        loaded.dtype == torch.bool
-        or loaded.is_floating_point()
-        or loaded.is_complex()
-    ):
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} must contain integer expert ids."
-        )
-    loaded = loaded.to(dtype=dtype)
-    loaded_shape = tuple(loaded.shape)
-    if loaded_shape != expected_shape:
-        if (
-            loaded.ndim == 2
-            and loaded.shape[0] > expected_shape[0]
-            and loaded.shape[1] == expected_shape[1]
-        ):
-            loaded = loaded[-expected_shape[0] :]
-        else:
-            raise ValueError(
-                f"Offline EPLB map {str(input_path)!r} has shape "
-                f"{loaded_shape}, expected {expected_shape}."
-            )
-    if loaded.numel() == 0:
-        raise ValueError(f"Offline EPLB map {str(input_path)!r} is empty.")
-    if loaded.min().item() < 0:
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} contains negative expert ids."
-        )
-    if loaded.max().item() >= num_logical_experts:
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} contains logical expert id "
-            f">= {num_logical_experts}."
-        )
-    for layer_idx, layer_map in enumerate(loaded):
-        counts = torch.bincount(
-            layer_map.to(torch.long),
-            minlength=num_logical_experts,
-        )
-        missing = torch.nonzero(counts[:num_logical_experts] == 0).flatten()
-        if missing.numel() > 0:
-            raise ValueError(
-                f"Offline EPLB map {str(input_path)!r} layer {layer_idx} "
-                f"misses logical experts {missing.tolist()}."
-            )
-    return loaded.to(device=device)
+    return plan.physical_to_logical_map.to(dtype=dtype, device=device)
 
 
 def _merge_record_payload(
