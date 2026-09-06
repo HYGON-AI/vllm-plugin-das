@@ -8,6 +8,7 @@ import math
 import pytest
 
 from tools.benchmark_sglang_operator_candidates import (
+    build_comparison_record,
     build_parser,
     speedup_percent,
     summarize_timings,
@@ -67,3 +68,19 @@ def test_cli_exposes_each_screening_candidate(operator: str) -> None:
     assert args.warmup > 0
     assert args.iterations > 0
     assert args.repeats > 0
+
+
+def test_comparison_record_applies_five_percent_acceptance_gate() -> None:
+    record = build_comparison_record(
+        shape={"tokens": 1, "experts": 256, "top_k": 6},
+        baseline_name="vllm",
+        baseline=summarize_timings([10.0, 11.0, 9.0]),
+        candidate_name="lightop",
+        candidate=summarize_timings([8.0, 8.5, 7.5]),
+    )
+
+    assert record["shape"] == {"tokens": 1, "experts": 256, "top_k": 6}
+    assert record["baseline"]["median_us"] == 10.0
+    assert record["candidate"]["median_us"] == 8.0
+    assert record["speedup_percent"] == pytest.approx(20.0)
+    assert record["meets_five_percent_gate"] is True
