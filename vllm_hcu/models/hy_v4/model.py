@@ -77,12 +77,6 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
-    build_expert_params_mapping_for_row,
-    maybe_load_static_eplb_plan,
-    static_eplb_layer_map_for_weight,
-)
-
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
@@ -533,9 +527,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
         self.num_expert_groups = 1
         self.moe_layers: list[nn.Module] = []
-        self._vllm_hcu_moe_layer_indices: list[int] = []
         example_layer: HYV4MoEFused | None = None
-        for layer_idx, layer in enumerate(self.layers):
+        for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
 
@@ -544,7 +537,6 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 assert isinstance(layer.mlp, HYV4MoEFused)
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
-                self._vllm_hcu_moe_layer_indices.append(layer_idx)
 
         if example_layer is None:
             self.num_moe_layers = 0
@@ -563,16 +555,6 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_shared_experts = config.num_shared_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
-        static_plan = maybe_load_static_eplb_plan(
-            vllm_config,
-            model_key="HYV4ForCausalLM",
-            num_moe_layers=self.num_moe_layers,
-            num_logical_experts=self.num_logical_experts,
-            num_physical_experts=self.num_physical_experts,
-            num_redundant_experts=self.num_redundant_experts,
-        )
-        if static_plan is not None:
-            self._vllm_hcu_static_eplb_plan = static_plan
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -675,17 +657,18 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         shard_id: str,
         num_experts: int,
         num_redundant_experts: int = 0,
-        physical_to_logical: Sequence[int] | None = None,
     ) -> bool:
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        routed_experts = getattr(weight_loader, "__self__", None)
+        num_checkpoint_experts = (
+            num_experts
+            if hasattr(routed_experts, "_vllm_hcu_static_eplb_row")
+            else num_experts + num_redundant_experts
+        )
         loaded_local_expert = False
-        for expert_id in range(num_experts + num_redundant_experts):
-            logical_expert_id = (
-                physical_to_logical[expert_id]
-                if physical_to_logical is not None
-                else expert_id % num_experts
-            )
+        for expert_id in range(num_checkpoint_experts):
+            logical_expert_id = expert_id % num_experts
             curr_expert_weight = loaded_weight[logical_expert_id]
             success = weight_loader(
                 param,
@@ -836,24 +819,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
 
             # Determine per-weight whether this is fused or split format.
             is_fused_expert = _is_fused_expert_weight(name)
-            physical_to_logical = None
-            static_plan = getattr(self, "_vllm_hcu_static_eplb_plan", None)
-            if static_plan is not None and ".experts." in name:
-                physical_to_logical = static_eplb_layer_map_for_weight(
-                    static_plan,
-                    tuple(self._vllm_hcu_moe_layer_indices),
-                    name,
-                )
             if is_fused_expert:
                 expert_params_mapping = fused_expert_params_mapping
-            elif physical_to_logical is not None:
-                expert_params_mapping = build_expert_params_mapping_for_row(
-                    self,
-                    ckpt_gate_proj_name="gate_proj",
-                    ckpt_down_proj_name="down_proj",
-                    ckpt_up_proj_name="up_proj",
-                    physical_to_logical=physical_to_logical,
-                )
             else:
                 expert_params_mapping = split_expert_params_mapping
 
@@ -882,7 +849,6 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                             "w1",
                             num_experts,
                             self.num_redundant_experts,
-                            physical_to_logical,
                         )
                         success_w3 = self.load_fused_expert_weights(
                             name_mapped,
@@ -891,7 +857,6 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                             "w3",
                             num_experts,
                             self.num_redundant_experts,
-                            physical_to_logical,
                         )
                         success = success_w1 and success_w3
                     else:
@@ -902,7 +867,6 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                             shard_id,
                             num_experts,
                             self.num_redundant_experts,
-                            physical_to_logical,
                         )
                     if success:
                         name = name_mapped
@@ -1059,14 +1023,6 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
         self.num_shared_experts = self.model.num_shared_experts
         self.num_redundant_experts = self.model.num_redundant_experts
         self.moe_layers = self.model.moe_layers
-        self._vllm_hcu_moe_layer_indices = getattr(
-            self.model,
-            "_vllm_hcu_moe_layer_indices",
-            list(range(self.num_moe_layers)),
-        )
-        static_plan = getattr(self.model, "_vllm_hcu_static_eplb_plan", None)
-        if static_plan is not None:
-            self._vllm_hcu_static_eplb_plan = static_plan
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

@@ -10,6 +10,10 @@ import pytest
 from torch import nn
 
 from vllm_hcu.models.hy_v4 import mtp as hy_v4_mtp
+from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    StaticEplbPlan,
+    load_static_logical_expert,
+)
 
 
 def test_shared_head_uses_backbone_lm_head_quant_prefix(monkeypatch) -> None:
@@ -382,6 +386,98 @@ def test_fused_expert_scale_loader_targets_scale_parameter() -> None:
     ]
     torch.testing.assert_close(calls[0][0], checkpoint_scale[0, :2])
     torch.testing.assert_close(calls[2][0], checkpoint_scale[0, 2:])
+
+
+def test_mtp_split_expert_loading_passes_logical_id_to_common_loader() -> None:
+    parameter_name = (
+        "model.layers.78.mtp_block.mlp.experts.routed_experts.w13_weight"
+    )
+    checkpoint_name = (
+        "model.layers.78.mtp_block.mlp.experts.3.gate_proj.weight"
+    )
+    checkpoint = torch.tensor([[7.0, 8.0], [9.0, 10.0]])
+    row = (3, 2, 1, 0, 3, 2)
+    parameter = nn.Parameter(
+        torch.full((len(row), *checkpoint.shape), float("nan"))
+    )
+
+    class RoutedExperts:
+        _vllm_hcu_static_eplb_row = row
+
+        @staticmethod
+        def original_weight_loader(
+            routed_experts,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            del routed_experts, weight_name, shard_id
+            with torch.no_grad():
+                param[expert_id].copy_(loaded_weight)
+            return True if return_success else None
+
+        def weight_loader(
+            self,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            return load_static_logical_expert(
+                self,
+                self.original_weight_loader,
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                logical_expert_id=expert_id,
+                return_success=return_success,
+            )
+
+    routed_experts = RoutedExperts()
+    parameter.weight_loader = routed_experts.weight_loader
+    mtp = object.__new__(hy_v4_mtp.HYV4MTP)
+    nn.Module.__init__(mtp)
+    mtp.num_redundant_experts = 2
+    mtp._vllm_hcu_static_eplb_plan = StaticEplbPlan(
+        model_key="HYV4MTP",
+        source_path="/tmp/map.json",
+        source_sha256="a" * 64,
+        _map_values=(row,),
+        num_logical_experts=4,
+        num_physical_experts=6,
+        num_redundant_experts=2,
+    )
+    loaded_params: set[str] = set()
+
+    consumed = mtp._load_expert_weight(
+        checkpoint_name,
+        checkpoint,
+        {parameter_name: parameter},
+        loaded_params,
+        [
+            (
+                "experts.routed_experts.w13_",
+                "experts.3.gate_proj.",
+                3,
+                "w1",
+            )
+        ],
+        {},
+        num_experts=4,
+    )
+
+    assert consumed is True
+    assert loaded_params == {parameter_name}
+    for physical_expert_id in (0, 4):
+        torch.testing.assert_close(parameter[physical_expert_id], checkpoint)
+    assert torch.isnan(parameter[1:4]).all()
+    assert torch.isnan(parameter[5]).all()
 
 
 def test_mtp_load_weights_rewrites_wrapper_weight_and_is_strict(monkeypatch) -> None:

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -247,7 +246,8 @@ def bind_static_eplb_plan(
             )
         counts[name] = value
 
-    moe_layers = tuple(model.moe_layers)
+    model_moe_layers = model.moe_layers
+    moe_layers = tuple(model_moe_layers)
     if len(moe_layers) != counts["num_moe_layers"]:
         raise ValueError(
             "Static EPLB direct load found a MixtureOfExperts.moe_layers "
@@ -284,14 +284,24 @@ def bind_static_eplb_plan(
         )
 
     # Validate the entire model before publishing any plan state.  The routed
-    # expert object is the checkpoint-loader consumer, while the model-level
-    # plan is consumed later by EPLB-state initialization.
+    # expert object is the checkpoint-loader consumer, while model wrappers
+    # and their backing model share the plan used later by EPLB initialization.
     rows = tuple(
         plan.layer_map(layer_idx) for layer_idx in range(len(routed_experts))
     )
+    plan_owners = []
+    inner_model = getattr(model, "model", None)
+    if (
+        inner_model is not None
+        and inner_model is not model
+        and getattr(inner_model, "moe_layers", None) is model_moe_layers
+    ):
+        plan_owners.append(inner_model)
+    plan_owners.append(model)
     for routed_experts_layer, row in zip(routed_experts, rows, strict=True):
         setattr(routed_experts_layer, "_vllm_hcu_static_eplb_row", row)
-    setattr(model, "_vllm_hcu_static_eplb_plan", plan)
+    for owner in plan_owners:
+        setattr(owner, "_vllm_hcu_static_eplb_plan", plan)
     return plan
 
 
@@ -338,70 +348,10 @@ def load_static_logical_expert(
     return loaded_any if return_success else None
 
 
-def static_eplb_layer_map_for_weight(
-    plan: StaticEplbPlan,
-    moe_layer_indices: tuple[int, ...],
-    weight_name: str,
-) -> tuple[int, ...]:
-    """Resolve an absolute checkpoint layer name to its static map row."""
-
-    match = re.search(r"(?:^|\.)layers\.(\d+)\.", weight_name)
-    if match is None:
-        raise ValueError(
-            f"Cannot resolve a HY V4 MoE layer from checkpoint weight {weight_name!r}."
-        )
-    absolute_layer_idx = int(match.group(1))
-    try:
-        moe_layer_idx = moe_layer_indices.index(absolute_layer_idx)
-    except ValueError as error:
-        raise ValueError(
-            f"HY V4 checkpoint layer {absolute_layer_idx} is not an MoE layer "
-            f"in static EPLB order {moe_layer_indices}."
-        ) from error
-    return plan.layer_map(moe_layer_idx)
-
-
-def build_expert_params_mapping_for_row(
-    model: torch.nn.Module,
-    *,
-    ckpt_gate_proj_name: str,
-    ckpt_down_proj_name: str,
-    ckpt_up_proj_name: str,
-    physical_to_logical: tuple[int, ...],
-    routed_experts_prefix: str = "routed_experts",
-) -> list[tuple[str, str, int, str]]:
-    """Build vLLM split-expert mappings from an authoritative map row."""
-
-    has_base_layer = any(".base_layer." in name for name, _ in model.named_parameters())
-    base_layer_prefix = "base_layer." if has_base_layer else ""
-    routed_prefix = f"{routed_experts_prefix}." if routed_experts_prefix else ""
-    w13 = f"experts.{routed_prefix}{base_layer_prefix}w13_"
-    w2 = f"experts.{routed_prefix}{base_layer_prefix}w2_"
-    result: list[tuple[str, str, int, str]] = []
-    for physical_expert_id, logical_expert_id in enumerate(physical_to_logical):
-        for shard_id, weight_name in (
-            ("w1", ckpt_gate_proj_name),
-            ("w2", ckpt_down_proj_name),
-            ("w3", ckpt_up_proj_name),
-        ):
-            param_name = w13 if shard_id in ("w1", "w3") else w2
-            result.append(
-                (
-                    param_name,
-                    f"experts.{logical_expert_id}.{weight_name}.{base_layer_prefix}",
-                    physical_expert_id,
-                    shard_id,
-                )
-            )
-    return result
-
-
 __all__ = [
     "StaticEplbPlan",
     "bind_static_eplb_plan",
-    "build_expert_params_mapping_for_row",
     "load_static_logical_expert",
     "load_static_eplb_plan",
     "maybe_load_static_eplb_plan",
-    "static_eplb_layer_map_for_weight",
 ]

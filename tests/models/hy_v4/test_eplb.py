@@ -13,11 +13,7 @@ from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
 from vllm_hcu.models.hy_v4 import model as hy_v4_model
 from vllm_hcu.models.hy_v4 import mtp as hy_v4_mtp
-from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
-    StaticEplbPlan,
-    build_expert_params_mapping_for_row,
-    static_eplb_layer_map_for_weight,
-)
+from vllm_hcu.model_executor.layers.fused_moe import static_eplb
 
 
 class _FakeMoELayer(nn.Module):
@@ -25,6 +21,7 @@ class _FakeMoELayer(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.arange(8).reshape(2, 4).float())
         self.eplb_state = None
+        self.routed_experts = SimpleNamespace()
 
     def get_expert_weights(self):
         return [self.weight]
@@ -73,14 +70,12 @@ def test_target_registers_expert_weights_and_routing_state() -> None:
 
 def test_target_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     layer = _FakeMoELayer()
-    static_plan = object()
+    static_plan = _static_plan(((3, 2, 1, 0, 3, 2),))
 
     class FakeInnerModel(nn.Module):
         def __init__(self, **kwargs) -> None:
             super().__init__()
             self.make_empty_intermediate_tensors = object()
-            self._vllm_hcu_static_eplb_plan = static_plan
-            self._vllm_hcu_moe_layer_indices = [0]
             _set_moe_metadata(self, layer)
 
         def set_eplb_state(self, *args) -> None:
@@ -112,11 +107,20 @@ def test_target_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None
         model_config=SimpleNamespace(hf_config=config),
         quant_config=None,
         parallel_config=SimpleNamespace(
-            eplb_config=SimpleNamespace(num_redundant_experts=2)
+            eplb_config=SimpleNamespace(num_redundant_experts=2),
+            _vllm_hcu_expert_map_path="fake-map.json",
         ),
+    )
+    monkeypatch.setattr(
+        static_eplb,
+        "maybe_load_static_eplb_plan",
+        lambda *args, **kwargs: static_plan,
     )
 
     model = hy_v4_model.HYV4ForCausalLM(vllm_config=vllm_config)
+    assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+
+    assert static_eplb.bind_static_eplb_plan(vllm_config, model) is static_plan
 
     assert is_mixture_of_experts(model)
     model.update_physical_experts_metadata(8, 2)
@@ -124,6 +128,7 @@ def test_target_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None
     assert model.num_local_physical_experts == 2
     assert model.num_redundant_experts == 4
     assert model._vllm_hcu_static_eplb_plan is static_plan
+    assert model.model._vllm_hcu_static_eplb_plan is static_plan
 
 
 def test_mtp_registers_expert_weights_and_routing_state() -> None:
@@ -149,14 +154,12 @@ def test_mtp_registers_expert_weights_and_routing_state() -> None:
 
 def test_mtp_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     layer = _FakeMoELayer()
-    static_plan = object()
+    static_plan = _static_plan(((3, 2, 1, 0, 3, 2),))
 
     class FakePredictor(nn.Module):
         def __init__(self, **kwargs) -> None:
             super().__init__()
             self.quant_config = None
-            self._vllm_hcu_static_eplb_plan = static_plan
-            self._vllm_hcu_moe_layer_indices = [0]
             _set_moe_metadata(self, layer)
 
         def set_eplb_state(self, *args) -> None:
@@ -177,9 +180,20 @@ def test_mtp_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     config = SimpleNamespace()
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=config),
+        parallel_config=SimpleNamespace(
+            _vllm_hcu_expert_map_path="fake-map.json",
+        ),
+    )
+    monkeypatch.setattr(
+        static_eplb,
+        "maybe_load_static_eplb_plan",
+        lambda *args, **kwargs: static_plan,
     )
 
     model = hy_v4_mtp.HYV4MTP(vllm_config=vllm_config)
+    assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+
+    assert static_eplb.bind_static_eplb_plan(vllm_config, model) is static_plan
 
     assert is_mixture_of_experts(model)
     model.update_physical_experts_metadata(8, 2)
@@ -187,6 +201,7 @@ def test_mtp_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     assert model.num_local_physical_experts == 2
     assert model.num_redundant_experts == 4
     assert model._vllm_hcu_static_eplb_plan is static_plan
+    assert model.model._vllm_hcu_static_eplb_plan is static_plan
 
 
 def test_target_fused_loader_copies_logical_weights_to_redundant_experts() -> None:
@@ -273,8 +288,8 @@ def test_mtp_fused_loader_copies_logical_weights_to_redundant_experts() -> None:
     ]
 
 
-def _static_plan(rows: tuple[tuple[int, ...], ...]) -> StaticEplbPlan:
-    return StaticEplbPlan(
+def _static_plan(rows: tuple[tuple[int, ...], ...]) -> static_eplb.StaticEplbPlan:
+    return static_eplb.StaticEplbPlan(
         model_key="HYV4ForCausalLM",
         source_path="/tmp/map.json",
         source_sha256="a" * 64,
@@ -285,62 +300,73 @@ def _static_plan(rows: tuple[tuple[int, ...], ...]) -> StaticEplbPlan:
     )
 
 
-def test_static_layer_map_uses_absolute_moe_layer_order() -> None:
-    plan = _static_plan(
-        (
-            (0, 1, 2, 3, 0, 1),
-            (3, 2, 1, 0, 3, 2),
-        )
-    )
-
-    assert static_eplb_layer_map_for_weight(
-        plan, (3, 7), "model.layers.7.mlp.experts.gate_up_proj.weight"
-    ) == (3, 2, 1, 0, 3, 2)
-    with pytest.raises(ValueError, match="not an MoE layer"):
-        static_eplb_layer_map_for_weight(
-            plan, (3, 7), "model.layers.5.mlp.experts.0.gate_proj.weight"
-        )
-
-
-def test_static_split_mapping_targets_all_physical_replicas() -> None:
-    model = nn.Module()
-    mapping = build_expert_params_mapping_for_row(
-        model,
-        ckpt_gate_proj_name="gate_proj",
-        ckpt_down_proj_name="down_proj",
-        ckpt_up_proj_name="up_proj",
-        physical_to_logical=(3, 2, 1, 0, 3, 2),
-    )
-
-    gate_logical_three = [
-        item for item in mapping if item[1] == "experts.3.gate_proj."
-    ]
-    assert gate_logical_three == [
-        ("experts.routed_experts.w13_", "experts.3.gate_proj.", 0, "w1"),
-        ("experts.routed_experts.w13_", "experts.3.gate_proj.", 4, "w1"),
-    ]
-
-
 @pytest.mark.parametrize("owner", ["target", "mtp"])
-def test_static_fused_loader_uses_mapped_logical_experts(owner: str) -> None:
-    calls: list[tuple[int, float]] = []
+@pytest.mark.parametrize(
+    ("parameter_name", "checkpoint"),
+    [
+        (
+            "experts.w13_weight",
+            torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3),
+        ),
+        (
+            "experts.w13_weight_scale",
+            torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2, 1),
+        ),
+        ("experts.w13_input_scale", torch.arange(4, dtype=torch.float32)),
+    ],
+)
+def test_static_fused_loader_delegates_logical_rows_to_common_fan_out(
+    owner: str,
+    parameter_name: str,
+    checkpoint: torch.Tensor,
+) -> None:
+    row = (3, 2, 1, 0, 3, 2)
+    destination = torch.full(
+        (len(row), *checkpoint.shape[1:]),
+        float("nan"),
+        dtype=checkpoint.dtype,
+    )
+
+    class RoutedExperts:
+        _vllm_hcu_static_eplb_row = row
+
+        @staticmethod
+        def original_weight_loader(
+            routed_experts,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            del routed_experts, param, weight_name, shard_id
+            destination[expert_id].copy_(loaded_weight)
+            return True if return_success else None
+
+        def weight_loader(
+            self,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            return static_eplb.load_static_logical_expert(
+                self,
+                self.original_weight_loader,
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                logical_expert_id=expert_id,
+                return_success=return_success,
+            )
+
+    routed_experts = RoutedExperts()
     param = nn.Parameter(torch.empty(1))
-
-    def weight_loader(
-        param,
-        loaded_weight,
-        name,
-        shard_id,
-        expert_id,
-        return_success,
-    ) -> bool:
-        del param, name, shard_id
-        assert return_success is True
-        calls.append((expert_id, loaded_weight.item()))
-        return True
-
-    param.weight_loader = weight_loader
-    checkpoint = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
+    param.weight_loader = routed_experts.weight_loader
     model_class = (
         hy_v4_model.HYV4Model if owner == "target" else hy_v4_mtp.HYV4MTP
     )
@@ -353,24 +379,22 @@ def test_static_fused_loader_uses_mapped_logical_experts(owner: str) -> None:
     )
 
     loaded = loader(
-        "experts.w13_weight",
-        {"experts.w13_weight": param},
+        parameter_name,
+        {parameter_name: param},
         checkpoint,
         "w1",
         num_experts=4,
         num_redundant_experts=2,
-        physical_to_logical=(3, 2, 1, 0, 3, 2),
     )
 
     assert loaded is True
-    assert calls == [
-        (0, 40.0),
-        (1, 30.0),
-        (2, 20.0),
-        (3, 10.0),
-        (4, 40.0),
-        (5, 30.0),
-    ]
+    for physical_expert_id, logical_expert_id in enumerate(row):
+        torch.testing.assert_close(
+            destination[physical_expert_id],
+            checkpoint[logical_expert_id],
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_direct_load_is_tensor_equivalent_to_legacy_rearrangement() -> None:
