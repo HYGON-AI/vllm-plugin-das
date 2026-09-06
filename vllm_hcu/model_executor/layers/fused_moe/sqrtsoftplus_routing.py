@@ -8,10 +8,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 
 _SUPPORTED_EXPERT_COUNTS = frozenset((256, 384))
 _MAX_TOPK = 16
+logger = init_logger(__name__)
 
 
 def _is_contiguous(value: Any) -> bool:
@@ -64,18 +66,19 @@ def run_lightop_sqrtsoftplus(
     """Execute the LightOp route and normalize its index dtype for vLLM."""
 
     try:
-        from lightop import moe as lightop_moe
+        from lightop.moe import moe_fused_gate_sqrtsoftplus
     except ImportError as exc:
         raise RuntimeError(
-            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires lightop.moe"
+            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires "
+            "lightop.moe.moe_fused_gate_sqrtsoftplus"
         ) from exc
-    operator = getattr(lightop_moe, "moe_fused_gate_sqrtsoftplus", None)
-    if not callable(operator):
+    if not callable(moe_fused_gate_sqrtsoftplus):
         raise RuntimeError(
             "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires callable "
             "lightop.moe.moe_fused_gate_sqrtsoftplus"
         )
-    topk_weights, topk_ids = operator(
+    logger.warning_once("Using LightOp sqrt-softplus MoE routing.")
+    topk_weights, topk_ids = moe_fused_gate_sqrtsoftplus(
         gating_output,
         correction_bias,
         int(topk),

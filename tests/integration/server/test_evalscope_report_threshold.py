@@ -535,6 +535,34 @@ def test_exact_humaneval_criteria_rejects_partial_artifacts(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.parametrize("records", [31, 33])
+def test_threshold_humaneval_criteria_rejects_non_exact_artifact_counts(
+    tmp_path: Path,
+    records: int,
+) -> None:
+    config = _exact_humaneval_config()
+    config["evalscope"]["pass_criteria"] = {
+        "dataset": "humaneval",
+        "metric": "mean_acc_pass@1",
+        "display_name": "Pass@1",
+        "minimum_score": 0.80,
+        "num_predictions": 32,
+        "num_reviews": 32,
+    }
+    _write_exact_humaneval_artifacts(tmp_path, records=records)
+
+    with pytest.raises(
+        AssertionError,
+        match=f"expected 32 predictions, got {records}",
+    ):
+        _assert_pass_criteria(
+            config,
+            model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+            work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+
 def test_exact_humaneval_criteria_rejects_normalized_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

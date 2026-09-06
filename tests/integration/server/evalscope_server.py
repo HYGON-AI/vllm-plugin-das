@@ -460,9 +460,55 @@ def _assert_pass_criteria(
         dataset=dataset,
         metric=metric,
     )
+    expected_predictions = criteria.get("num_predictions")
+    expected_reviews = criteria.get("num_reviews")
+    artifact_verdict = ""
+    if expected_predictions is not None or expected_reviews is not None:
+        if expected_predictions is None or expected_reviews is None:
+            raise TypeError(
+                "threshold pass criteria must set both num_predictions and "
+                "num_reviews"
+            )
+        expected_predictions = int(expected_predictions)
+        expected_reviews = int(expected_reviews)
+        assert num == expected_predictions, (
+            f"{dataset} {metric} expected {expected_predictions} samples, "
+            f"got {num}; report={report_path}"
+        )
+        model = str(
+            config.get("server", {}).get(
+                "served_model_name",
+                _model_path(config, model_env),
+            )
+        )
+        prediction_count, prediction_path = _artifact_record_count(
+            work_dir,
+            artifact="predictions",
+            model=model,
+            dataset=dataset,
+        )
+        review_count, review_path = _artifact_record_count(
+            work_dir,
+            artifact="reviews",
+            model=model,
+            dataset=dataset,
+        )
+        assert prediction_count == expected_predictions, (
+            f"expected {expected_predictions} predictions, got "
+            f"{prediction_count}; path={prediction_path}"
+        )
+        assert review_count == expected_reviews, (
+            f"expected {expected_reviews} reviews, got {review_count}; "
+            f"path={review_path}"
+        )
+        artifact_verdict = (
+            f"; predictions={prediction_count}, reviews={review_count}, "
+            f"prediction_path={prediction_path}, review_path={review_path}"
+        )
     verdict = (
         f"pass criterion: {dataset} {display_name}={score:.4f}, "
         f"required>={minimum_score:.4f}, samples={num}, report={report_path}"
+        f"{artifact_verdict}"
     )
     with _open_log(eval_log_path) as eval_log:
         eval_log.write((verdict + "\n").encode())
@@ -767,7 +813,18 @@ def run_evalscope_server_test(
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())
-        server_log.write(b"server environment: VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1\n")
+        visible_environment = {
+            name: value
+            for name, value in env.items()
+            if name.startswith(("VLLM_HCU_", "VLLM_ROCM_"))
+        }
+        rendered_environment = " ".join(
+            f"{name}={visible_environment[name]}"
+            for name in sorted(visible_environment)
+        )
+        server_log.write(
+            ("server environment: " + rendered_environment + "\n").encode()
+        )
         server_log.flush()
         proc = subprocess.Popen(
             command,

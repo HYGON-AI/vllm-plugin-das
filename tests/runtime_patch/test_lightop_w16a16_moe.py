@@ -358,6 +358,33 @@ def test_w16a16_converter_packs_only_owned_backend(
     assert getattr(packed2, "_hcu_lightop_w16a16_packed") is True
 
 
+def test_hcu_unquantized_constructor_uses_patched_oracle_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config import VllmConfig
+    from vllm.config.vllm import set_current_vllm_config
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        unquantized_fused_moe_method as method_module,
+    )
+
+    selected = SimpleNamespace(name="HCU_LIGHTOP_W16A16")
+    calls: list[object] = []
+
+    def select(*, moe_config):
+        calls.append(moe_config)
+        return selected, object
+
+    monkeypatch.setattr(
+        method_module, "select_unquantized_moe_backend", select, raising=False
+    )
+    config = _config()
+    with set_current_vllm_config(VllmConfig()):
+        method = method_module.HcuUnquantizedFusedMoEMethod(config)
+
+    assert calls == [config]
+    assert method.unquantized_backend is selected
+
+
 def test_w16a16_weight_lifecycle_installs_one_packed_parameter_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

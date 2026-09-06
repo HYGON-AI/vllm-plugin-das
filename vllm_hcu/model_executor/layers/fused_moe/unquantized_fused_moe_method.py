@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
     make_unquantized_moe_kernel,
+    select_unquantized_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod as _Original,
@@ -105,6 +109,17 @@ def _has_installed_aiter_layout(
 
 class HcuUnquantizedFusedMoEMethod(_Original):
     """Install the AITER ASM layout once instead of caching a second copy."""
+
+    def __init__(self, moe) -> None:
+        # The official implementation imports the selector directly into its
+        # module.  Patching the oracle later cannot update that captured
+        # binding, so calling _Original.__init__ would silently bypass HCU's
+        # opt-in backend.  Initialize the common base and resolve through the
+        # HCU module binding that is armed after the oracle patch instead.
+        FusedMoEMethodBase.__init__(self, moe)
+        self.unquantized_backend, self.experts_cls = (
+            select_unquantized_moe_backend(moe_config=self.moe)
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (

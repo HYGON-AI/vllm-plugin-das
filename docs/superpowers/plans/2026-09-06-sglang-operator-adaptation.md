@@ -252,7 +252,7 @@ git commit -m "test: validate LightOp sqrt-softplus routing"
 - Create: `vllm_hcu/model_executor/layers/fused_moe/lightop_w16a16_runtime.py`
 - Create: `vllm_hcu/patch/worker/op_opt/moe/patch_unquantized_oracle.py`
 - Create: `tests/runtime_patch/test_lightop_w16a16_moe.py`
-- Create: `tests/accuracy/test_lightop_w16a16_moe.py`
+- Create: `tests/accuracy/test_lightop_w16a16_moe_accuracy.py`
 - Modify: `vllm_hcu/platforms/envs.py`
 - Modify: `vllm_hcu/patch/worker/__init__.py`
 - Modify: `vllm_hcu/model_executor/layers/fused_moe/unquantized_fused_moe_method.py`
@@ -339,7 +339,7 @@ weights, repeated experts, empty experts, zeros and extremes. Record explicit
 BF16 tolerances and verify input weights are not modified after packing.
 
 ```bash
-HIP_VISIBLE_DEVICES=0 python3 -m pytest -q -s tests/accuracy/test_lightop_w16a16_moe.py
+HIP_VISIBLE_DEVICES=0 python3 -m pytest -q -s tests/accuracy/test_lightop_w16a16_moe_accuracy.py
 ```
 
 - [ ] **Step 7: Benchmark against AITER and Triton**
@@ -356,7 +356,7 @@ the leaf switch remains opt-in because packing changes weight layout.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add vllm_hcu tests/runtime_patch/test_lightop_w16a16_moe.py tests/accuracy/test_lightop_w16a16_moe.py tools/benchmark_sglang_operator_candidates.py docs/operator_adaptation_audit_v0251.md README.md
+git add vllm_hcu tests/runtime_patch/test_lightop_w16a16_moe.py tests/accuracy/test_lightop_w16a16_moe_accuracy.py tools/benchmark_sglang_operator_candidates.py docs/operator_adaptation_audit_v0251.md README.md
 git commit -m "feat: add LightOp W16A16 MoE backend"
 ```
 

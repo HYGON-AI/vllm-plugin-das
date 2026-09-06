@@ -125,6 +125,7 @@ def concat_mla_decode(
             "LightOp MLA decode concat is unavailable; using torch.cat."
         )
         return torch.cat((left, right), dim=normalized_dim)
+    logger.warning_once("Using LightOp MLA decode concatenation.")
     return _call_registered_lightop(left, right)
 
 

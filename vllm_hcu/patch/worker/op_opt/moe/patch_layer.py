@@ -18,12 +18,15 @@ from ._common import (
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe"
 LAYER_MODULE = f"{TARGET_MODULE}.layer"
+ROUTED_EXPERTS_MODULE = f"{TARGET_MODULE}.routed_experts"
 PATCH_ID = "worker.op_opt.moe.layer"
 TARGETS = (
     f"{TARGET_MODULE}.FusedMoE",
     f"{TARGET_MODULE}.RoutedExperts.get_expert_weights",
     f"{TARGET_MODULE}.RoutedExperts.load_weights",
     f"{TARGET_MODULE}.RoutedExperts.expert_map",
+    f"{TARGET_MODULE}.UnquantizedFusedMoEMethod",
+    f"{ROUTED_EXPERTS_MODULE}.UnquantizedFusedMoEMethod",
 )
 _MARKER = "_vllm_hcu_moe_layer_applied"
 
@@ -59,6 +62,33 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"{TARGET_MODULE}.RoutedExperts does not reference the required "
             f"v0.25.1 {LAYER_MODULE}.RoutedExperts class"
+        )
+    official_unquantized_cls = require_class(
+        target,
+        "UnquantizedFusedMoEMethod",
+        TARGETS[4],
+    )
+    routed_experts_module = load_exact_module(
+        ROUTED_EXPERTS_MODULE,
+        sys.modules.get(ROUTED_EXPERTS_MODULE),
+    )
+    captured_unquantized_cls = require_class(
+        routed_experts_module,
+        "UnquantizedFusedMoEMethod",
+        TARGETS[5],
+    )
+    if captured_unquantized_cls is not official_unquantized_cls:
+        raise PatchCompatibilityError(
+            f"{TARGETS[5]} does not reference the required v0.25.1 "
+            f"{TARGETS[4]} class"
+        )
+    from vllm_hcu.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        HcuUnquantizedFusedMoEMethod,
+    )
+
+    if not issubclass(HcuUnquantizedFusedMoEMethod, official_unquantized_cls):
+        raise PatchCompatibilityError(
+            "HCU unquantized MoE method must extend the audited v0.25.1 class"
         )
     expert_map_property = vars(routed_experts_cls).get("expert_map")
     if not isinstance(expert_map_property, property) or not callable(
@@ -117,16 +147,8 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_factory(*args, **kwargs):
         runner = factory(*args, **kwargs)
         experts = runner.routed_experts
-        official_cls = getattr(target, "UnquantizedFusedMoEMethod", None)
-        if official_cls is None:
-            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-                UnquantizedFusedMoEMethod as official_cls,
-            )
-        if type(experts.quant_method) is not official_cls:
+        if type(experts.quant_method) is not official_unquantized_cls:
             return runner
-        from vllm_hcu.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-            HcuUnquantizedFusedMoEMethod,
-        )
 
         old_method = experts.quant_method
         hcu_method = HcuUnquantizedFusedMoEMethod(experts.moe_config)
@@ -221,6 +243,16 @@ def apply_to_module(module: ModuleType) -> bool:
     routed_experts_cls.get_expert_weights = hcu_get_expert_weights
     routed_experts_cls._vllm_hcu_original_load_weights = load_weights
     routed_experts_cls.load_weights = hcu_load_weights
+    target._vllm_hcu_original_unquantized_fused_moe_method = (
+        official_unquantized_cls
+    )
+    target.UnquantizedFusedMoEMethod = HcuUnquantizedFusedMoEMethod
+    routed_experts_module._vllm_hcu_original_unquantized_fused_moe_method = (
+        captured_unquantized_cls
+    )
+    routed_experts_module.UnquantizedFusedMoEMethod = (
+        HcuUnquantizedFusedMoEMethod
+    )
     setattr(target, _MARKER, True)
     return True
 

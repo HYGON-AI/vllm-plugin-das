@@ -1773,8 +1773,17 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "vllm.model_executor.layers.fused_moe.layer",
         layer_module,
     )
+    routed_experts_module = _module(
+        "vllm.model_executor.layers.fused_moe.routed_experts",
+        UnquantizedFusedMoEMethod=UnquantizedFusedMoEMethod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.routed_experts",
+        routed_experts_module,
+    )
 
-    class HcuUnquantizedFusedMoEMethod:
+    class HcuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         def __init__(self, moe_config):
             self.moe_config = moe_config
             self.moe_quant_config = None
@@ -1790,6 +1799,14 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     monkeypatch.setitem(sys.modules, hcu_module_name, hcu_module)
 
     assert patch_layer.apply_to_module(fused_moe_package) is True
+    assert (
+        routed_experts_module.UnquantizedFusedMoEMethod
+        is HcuUnquantizedFusedMoEMethod
+    )
+    assert (
+        fused_moe_package.UnquantizedFusedMoEMethod
+        is HcuUnquantizedFusedMoEMethod
+    )
     assert fused_moe_package.FusedMoE is layer_module.FusedMoE
     runner = fused_moe_package.FusedMoE()
     experts = runner.routed_experts

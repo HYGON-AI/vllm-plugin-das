@@ -159,6 +159,12 @@ will be recorded here and summarized in
   the HCU oracle selected `HCU_LIGHTOP_W16A16`, installed packed parameter
   shapes `[256,128,16384]` and `[256,32,32768]`, constructed a vLLM modular
   `FusedMoEKernel`, and executed through vLLM's workspace manager.
+- Qwen3.6 model startup exposed that its model module can capture
+  `routed_experts.UnquantizedFusedMoEMethod` before the package-level factory
+  wrapper runs. The final patch validates and replaces that exact captured
+  symbol through the worker patch lifecycle; a regression test covers both
+  package and captured bindings. The real model log then showed the LightOp
+  packing marker and no Triton unquantized-MoE selection.
 - Benchmark: 20 warmups, 100 iterations and 7 repeats for every M in
   1/2/4/8/16/32/64/128/256 at the Qwen3.6 shape. The report compares the same
   LightOp result with both vLLM Triton and the plugin's shuffled ASM AITER

@@ -13,11 +13,22 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 
 _PACKED_MARKER = "_hcu_lightop_w16a16_packed"
 _GENERATION_MARKER = "_hcu_lightop_w16a16_generation"
 _LAYOUT_MARKER = "_hcu_lightop_w16a16_layout"
+logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _LightopW16A16Exports:
+    get_config: Any
+    gemm: Any
+    align: Any
+    activate: Any
+    reduce: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +136,10 @@ def pack_lightop_w16a16_weights(
         packed_w2_shape=tuple(packed2.shape),
     )
     mark_lightop_w16a16_weights(packed13, packed2, layout)
+    # This is emitted while weights are post-processed, before some worker
+    # logging configurations surface INFO records.  Keep one visible marker
+    # so model-level validation can prove that the packed layout was installed.
+    logger.warning_once("Using LightOp W16A16 Marlin MoE backend.")
     return packed13, packed2, layout
 
 
@@ -140,23 +155,36 @@ def lightop_w16a16_layout(
     return layout
 
 
-def _load_lightop_w16a16() -> tuple[Any, Any] | None:
+def _load_lightop_w16a16() -> _LightopW16A16Exports | None:
     try:
-        from lightop import activation as lightop_activation
-        from lightop import moe as lightop_moe
-    except (ImportError, AttributeError):
+        from lightop.activation import fuse_silu_and_mul
+        from lightop.moe import (
+            get_moe_cuda_marlin_config_w16a16,
+            moe_align_block_size_out,
+            moe_gemm_marlin_w16a16,
+            moe_sum,
+        )
+    except ImportError:
         return None
-    required_moe = (
-        "get_moe_cuda_marlin_config_w16a16",
-        "moe_gemm_marlin_w16a16",
-        "moe_align_block_size_out",
-        "moe_sum",
+    exports = _LightopW16A16Exports(
+        get_config=get_moe_cuda_marlin_config_w16a16,
+        gemm=moe_gemm_marlin_w16a16,
+        align=moe_align_block_size_out,
+        activate=fuse_silu_and_mul,
+        reduce=moe_sum,
     )
-    if not all(callable(getattr(lightop_moe, name, None)) for name in required_moe):
+    if not all(
+        callable(operator)
+        for operator in (
+            exports.get_config,
+            exports.gemm,
+            exports.align,
+            exports.activate,
+            exports.reduce,
+        )
+    ):
         return None
-    if not callable(getattr(lightop_activation, "fuse_silu_and_mul", None)):
-        return None
-    return lightop_moe, lightop_activation
+    return exports
 
 
 def is_lightop_w16a16_available() -> bool:
@@ -200,8 +228,7 @@ def select_lightop_w16a16_config(
     index = torch.cuda.current_device() if device.index is None else device.index
     properties = torch.cuda.get_device_properties(index)
     dtype = getattr(moe_config, "in_dtype", None)
-    lightop_moe, _ = exports
-    result = lightop_moe.get_moe_cuda_marlin_config_w16a16(
+    result = exports.get_config(
         experts,
         int(expected_m),
         2 * intermediate,
@@ -288,8 +315,6 @@ def run_lightop_w16a16(
         )
     config1, config2 = config_pair
     block_m = int(config1["BLOCK_SIZE_M"])
-    lightop_moe, lightop_activation = exports
-
     max_padded = topk_ids.numel() + experts * (block_m - 1)
     max_padded = ((max_padded + block_m - 1) // block_m) * block_m
     sorted_ids = torch.full(
@@ -304,7 +329,7 @@ def run_lightop_w16a16(
     num_tokens_post_pad = torch.empty(
         (1,), dtype=torch.int32, device=topk_ids.device
     )
-    lightop_moe.moe_align_block_size_out(
+    exports.align(
         topk_ids,
         experts,
         block_m,
@@ -329,7 +354,7 @@ def run_lightop_w16a16(
         -1, intermediate
     )
     cache3 = workspace13.reshape(-1)[:cache3_elements].view(-1, hidden)
-    lightop_moe.moe_gemm_marlin_w16a16(
+    exports.gemm(
         hidden_states,
         w13,
         cache1,
@@ -340,8 +365,8 @@ def run_lightop_w16a16(
         topk,
         config1,
     )
-    lightop_activation.fuse_silu_and_mul(cache1, cache2)
-    lightop_moe.moe_gemm_marlin_w16a16(
+    exports.activate(cache1, cache2)
+    exports.gemm(
         cache2,
         w2,
         cache3,
@@ -352,7 +377,7 @@ def run_lightop_w16a16(
         1,
         config2,
     )
-    lightop_moe.moe_sum(
+    exports.reduce(
         input=cache3.view(tokens, topk, hidden),
         output=output,
         bias=None,
