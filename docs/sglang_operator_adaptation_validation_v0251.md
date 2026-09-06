@@ -100,14 +100,15 @@ Local results:
   fresh feature-on log contains `Using LightOp sqrt-softplus MoE routing.`
 - Qwen3.6-35B-A3B TP1 completed both profiles with 32 predictions/reviews and
   Pass@1 1.0 after the exact captured-class fix. The final observations were
-  14.93 tok/s off and 16.86 tok/s on. Only the fresh feature-on invocation
+  15.02 tok/s off and 17.29 tok/s on. Only the fresh feature-on invocation
   contains both `Using LightOp W16A16 Marlin MoE backend.` and
   `Using LightOp Qwen gated RMSNorm.`; the paired pytest acceptance completed
-  successfully in 992.45 seconds.
+  successfully in 987.79 seconds.
 - Qwen3.6-27B TP1 completed both profiles with 32 predictions/reviews and
-  Pass@1 0.875. The latest pre-binding observations were 13.23 tok/s off and
-  19.20 tok/s on. As above, these runs establish model accuracy but not the
-  post-fix gated-route marker.
+  Pass@1 0.875 on the final operator code. The observations were 19.35 tok/s
+  off and 19.29 tok/s on under concurrent model load. Only the fresh
+  feature-on invocation contains `Using LightOp Qwen gated RMSNorm.`; the
+  paired pytest acceptance completed successfully in 901.81 seconds.
 - Qwen3.5-35B-A3B-W8A8 TP1 completed both profiles with 32
   predictions/reviews and Pass@1 1.0; observed throughput was 7.14 and 11.05
   tok/s. Its checkpoint stores `linear_attn.norm.weight` as FP32, so both runs
