@@ -11,11 +11,12 @@ import torch.nn.functional as F
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationConfig
-from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.ops import rms_norm_gated
 from vllm_hcu.ops.rms_norm_gated import (
     HcuRMSNormGated,
     _is_qwen_gated_rmsnorm_eligible,
 )
+from vllm_hcu.platforms import envs as henvs
 
 
 pytestmark = pytest.mark.hcu
@@ -129,5 +130,36 @@ def test_qwen_gated_rmsnorm_fp32_weight_uses_vllm_fallback(
         * F.silu(z.float())
     ).to(torch.bfloat16)
     actual = layer.forward_hip(x, z)
+
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)
+
+
+def test_missing_lightop_export_uses_vllm_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(_SEED + 1)
+    x = torch.randn(
+        (32, 128), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    z = torch.randn_like(x, generator=generator)
+    weight = torch.randn(
+        (128,), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    monkeypatch.setattr(
+        rms_norm_gated,
+        "_lightop_layer_norm_fwd_1pass_opt",
+        lambda: None,
+    )
+
+    x_float = x.float()
+    expected = (
+        x_float
+        * torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + 1e-6)
+        * weight.float()
+        * F.silu(z.float())
+    ).to(torch.bfloat16)
+    actual = rms_norm_gated._hcu_lightop_qwen_rmsnorm_gated_impl(
+        x, z, weight, 1e-6
+    )
 
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)

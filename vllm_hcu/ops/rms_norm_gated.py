@@ -63,6 +63,26 @@ def _rows_per_block(rows: int, compute_units: int) -> int:
     return min(1 << (value - 1).bit_length(), 4)
 
 
+def _vllm_qwen_rmsnorm_gated_fallback(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
+
+    return rmsnorm_fn(
+        x,
+        weight,
+        None,
+        z=z,
+        eps=eps,
+        group_size=None,
+        norm_before_gate=True,
+        activation="silu",
+    )
+
+
 def _hcu_lightop_qwen_rmsnorm_gated_impl(
     x: torch.Tensor,
     z: torch.Tensor,
@@ -71,10 +91,7 @@ def _hcu_lightop_qwen_rmsnorm_gated_impl(
 ) -> torch.Tensor:
     layer_norm_fwd_1pass_opt = _lightop_layer_norm_fwd_1pass_opt()
     if layer_norm_fwd_1pass_opt is None:
-        raise RuntimeError(
-            "eligible LightOp Qwen gated RMSNorm route lost its categorized "
-            "layer_norm_fwd_1pass_opt operator"
-        )
+        return _vllm_qwen_rmsnorm_gated_fallback(x, z, weight, eps)
 
     rows, width = x.shape
     output = torch.empty_like(x)
@@ -103,7 +120,7 @@ def _hcu_lightop_qwen_rmsnorm_gated_impl(
             True,
             "silu",
         )
-    logger.info_once("Using LightOp Qwen gated RMSNorm.")
+    logger.warning_once("Using LightOp Qwen gated RMSNorm.")
     return output
 
 
@@ -158,8 +175,6 @@ def _is_qwen_gated_rmsnorm_eligible(
     if not (x.is_contiguous() and z.is_contiguous() and weight.is_contiguous()):
         return False
     if x.device != z.device or x.device != weight.device:
-        return False
-    if _lightop_layer_norm_fwd_1pass_opt() is None:
         return False
     effective_group_size = (
         x.shape[-1] if layer.group_size is None else layer.group_size

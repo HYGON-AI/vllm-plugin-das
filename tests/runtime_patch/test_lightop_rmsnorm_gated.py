@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_hcu.ops import rms_norm_gated
 from vllm_hcu.patch.worker.op_opt import patch_gdn_rms_norm_gated
@@ -41,6 +42,7 @@ def _layer(width: int = 128, **overrides):
     values = {
         "weight": _TensorMetadata((width,)),
         "bias": None,
+        "eps": 1e-6,
         "group_size": None,
         "norm_before_gate": True,
         "activation": "silu",
@@ -165,30 +167,94 @@ def test_qwen_gated_rmsnorm_missing_lightop_package_is_unavailable(
 def test_qwen_gated_rmsnorm_missing_lightop_falls_back_to_vllm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(
-        henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", True
-    )
     monkeypatch.setattr(
         rms_norm_gated,
         "_lightop_layer_norm_fwd_1pass_opt",
         lambda: None,
     )
     sentinel = object()
-    layer = _layer(forward_cuda=lambda x, z: sentinel)
-    result = rms_norm_gated.HcuRMSNormGated.forward_hip(
-        layer,
-        _TensorMetadata((32, 128)),
-        _TensorMetadata((32, 128)),
+    calls = []
+    monkeypatch.setattr(
+        rms_norm_gated,
+        "_vllm_qwen_rmsnorm_gated_fallback",
+        lambda *args: calls.append(args) or sentinel,
+        raising=False,
+    )
+    x = torch.zeros((32, 128), dtype=torch.bfloat16)
+    z = torch.zeros_like(x)
+    weight = torch.ones((128,), dtype=torch.bfloat16)
+
+    result = rms_norm_gated._hcu_lightop_qwen_rmsnorm_gated_impl(
+        x, z, weight, 1e-6
     )
 
     assert result is sentinel
+    assert calls == [(x, z, weight, 1e-6)]
+
+
+def test_qwen_gated_rmsnorm_forward_dispatch_is_fullgraph_compilable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", True
+    )
+    with FakeTensorMode():
+        x = torch.empty((32, 128), device="cuda", dtype=torch.bfloat16)
+        z = torch.empty_like(x)
+        layer = _layer(
+            weight=torch.empty(
+                (128,), device="cuda", dtype=torch.bfloat16
+            )
+        )
+
+        def forward(a, b):
+            return rms_norm_gated.HcuRMSNormGated.forward_hip(layer, a, b)
+
+        result = torch.compile(forward, backend="eager", fullgraph=True)(x, z)
+
+    assert result.shape == x.shape
+    assert result.dtype is torch.bfloat16
+
+
+def test_qwen_gated_rmsnorm_does_not_log_when_operator_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args):
+        raise RuntimeError("operator failed")
+
+    monkeypatch.setattr(
+        rms_norm_gated, "_lightop_layer_norm_fwd_1pass_opt", lambda: fail
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=64),
+    )
+    messages = []
+    monkeypatch.setattr(
+        rms_norm_gated.logger,
+        "warning_once",
+        lambda message, *_args: messages.append(message),
+    )
+
+    with pytest.raises(RuntimeError, match="operator failed"):
+        rms_norm_gated._hcu_lightop_qwen_rmsnorm_gated_impl(
+            torch.zeros((32, 128), dtype=torch.bfloat16),
+            torch.zeros((32, 128), dtype=torch.bfloat16),
+            torch.ones((128,), dtype=torch.bfloat16),
+            1e-6,
+        )
+
+    assert messages == []
 
 
 def test_qwen_gated_rmsnorm_uses_categorized_lightop_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
+    messages = []
 
     def layer_norm_fwd_1pass_opt(*args):
         calls.append(args)
@@ -209,6 +275,11 @@ def test_qwen_gated_rmsnorm_uses_categorized_lightop_api(
         "get_device_properties",
         lambda _device: SimpleNamespace(multi_processor_count=64),
     )
+    monkeypatch.setattr(
+        rms_norm_gated.logger,
+        "warning_once",
+        lambda message, *_args: messages.append(message),
+    )
 
     x = torch.arange(6 * 128, dtype=torch.bfloat16).reshape(6, 128)
     z = torch.ones_like(x)
@@ -226,4 +297,5 @@ def test_qwen_gated_rmsnorm_uses_categorized_lightop_api(
     assert calls[0][5] is None
     assert calls[0][10:13] == (6, 128, 1e-6)
     assert calls[0][15:] == (False, True, True, True, "silu")
+    assert messages == ["Using LightOp Qwen gated RMSNorm."]
     rms_norm_gated._lightop_layer_norm_fwd_1pass_opt.cache_clear()

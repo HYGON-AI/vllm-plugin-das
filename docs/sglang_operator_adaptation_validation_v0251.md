@@ -59,7 +59,7 @@ sent to AITER or Triton, so all rejection happens before weight replacement.
 | sqrt-softplus gate | 75/75 live-HCU cases | 40/40 shapes exceeded 5%; speedup 6.83% min, 22.61% median, 44.92% max versus official vLLM. |
 | W16A16 Marlin MoE | 6/6 live-HCU cases, including the exact Qwen shape | For M=1/2/4/8/16: 31.08%--68.22% faster than Triton and 6.28%--71.35% faster than AITER. M>16 is rejected by the oracle. |
 | FlashMLA decode concat | 4/4 live-HCU cases, including production strides | 33/33 shapes exceeded 5%; speedup 8.84% min, 47.03% median, 77.46% max versus `torch.cat`. |
-| Qwen gated RMSNorm | 40/40 width-128/256 screened shapes; 14/14 live routed cases plus one FP32-weight Triton fallback case | Every screened shape exceeded 5%; width-128 stable median speedup 74.62%--81.06%, width-256 sequential observation 77.45%--85.39%. Exact Qwen3.6-35B M=512 improved 80.43%. |
+| Qwen gated RMSNorm | 40/40 width-128/256 screened shapes; 14/14 live routed cases plus FP32-weight and missing-export Triton fallback cases | Every screened shape exceeded 5%; width-128 stable median speedup 74.62%--81.06%, width-256 sequential observation 77.45%--85.39%. Exact Qwen3.6-35B M=512 improved 80.43%. |
 | AITER SiLU screening | Accuracy passed | Rejected: 40.58%--96.17% slower than current LightOp and 5.20%--26.18% slower than vLLM native. |
 | AITER `tgemm` screening | 36/36 exact comparisons | Rejected: 0/36 shapes exceeded 5%; speedup -27.51% min, -0.12% median, 0.46% max. |
 | AITER WO_A batched BF16 GEMM | 6/6 live-HCU cases against FP32 (`rtol=0.02,atol=0.05`) | Rejected: 0/28 TP/decode shapes exceeded 5%; complete candidate latency was 2.04x--5.24x the existing einsum. Screening used `rtol=0.02,atol=0.5`, with maximum absolute FP32 difference 0.9863. |
@@ -99,10 +99,11 @@ Local results:
   observed output throughput was 7.12 and 7.20 tok/s respectively. Only the
   fresh feature-on log contains `Using LightOp sqrt-softplus MoE routing.`
 - Qwen3.6-35B-A3B TP1 completed both profiles with 32 predictions/reviews and
-  Pass@1 1.0. The latest pre-binding observations were 9.82 tok/s off and
-  17.12 tok/s on; the feature-on log proves the W16A16 route but predates the
-  exact captured-class fix for gated RMSNorm, so it is not claimed as gated
-  route evidence.
+  Pass@1 1.0 after the exact captured-class fix. The final observations were
+  14.93 tok/s off and 16.86 tok/s on. Only the fresh feature-on invocation
+  contains both `Using LightOp W16A16 Marlin MoE backend.` and
+  `Using LightOp Qwen gated RMSNorm.`; the paired pytest acceptance completed
+  successfully in 992.45 seconds.
 - Qwen3.6-27B TP1 completed both profiles with 32 predictions/reviews and
   Pass@1 0.875. The latest pre-binding observations were 13.23 tok/s off and
   19.20 tok/s on. As above, these runs establish model accuracy but not the
@@ -113,11 +114,10 @@ Local results:
   correctly retained the canonical Triton implementation under the strict
   BF16 contract. This is an intentional fallback control.
 
-After the captured-class correction, another unrelated eight-card service
-occupied all local HCUs. It was not interrupted. Consequently the final Qwen
-route evidence is the 14/14 live-HCU class/registered-op accuracy matrix, one
-live FP32-weight fallback case, the 40-shape accuracy/performance matrix, and
-the worker cold-import binding test; no post-fix model marker is claimed. The
+When the HCU was released, the final Qwen3.6-35B-A3B run supplemented the
+14/14 live-HCU class/registered-op accuracy matrix, live FP32-weight and
+missing-export fallback cases, the 40-shape accuracy/performance matrix, and
+the worker cold-import binding test with real-model route evidence. The
 fixed-size Torch fallback used when the pinned vLLM MoE-align ABI is absent
 also completed a live-HCU graph capture and replay test.
 
@@ -139,8 +139,8 @@ several useful negative controls:
   `128+64`, and Qwen3-VL-8B/Gemma4 are different architectures.
 
 The user allowed operator-level accuracy when model coverage is incomplete;
-the exact positive operator shapes are covered by the live-HCU matrices even
-where a post-fix model rerun could not be scheduled safely.
+the exact positive operator shapes are covered by the live-HCU matrices for
+additional checkpoints that were not rerun after the final logging fix.
 
 ## Reproduction
 
