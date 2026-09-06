@@ -82,7 +82,7 @@ def run_lightop_sqrtsoftplus(
         0,
         bool(renormalize),
         float(routed_scaling_factor),
-        False,
+        True,
     )
     if topk_ids.dtype != indices_dtype:
         topk_ids = topk_ids.to(dtype=indices_dtype)

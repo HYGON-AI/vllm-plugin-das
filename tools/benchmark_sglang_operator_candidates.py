@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import statistics
+import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
@@ -50,6 +52,49 @@ def speedup_percent(baseline_us: float, candidate_us: float) -> float:
     if not _positive_finite(baseline) or not _positive_finite(candidate):
         raise ValueError("baseline and candidate timings must be positive finite values")
     return (baseline - candidate) / baseline * 100.0
+
+
+def build_comparison_record(
+    *,
+    shape: dict[str, int | bool | float],
+    baseline_name: str,
+    baseline: TimingSummary,
+    candidate_name: str,
+    candidate: TimingSummary,
+) -> dict[str, object]:
+    """Build one JSON-safe performance comparison record."""
+
+    speedup = speedup_percent(baseline.median_us, candidate.median_us)
+    return {
+        "shape": dict(shape),
+        "baseline": {"name": baseline_name, **asdict(baseline)},
+        "candidate": {"name": candidate_name, **asdict(candidate)},
+        "speedup_percent": speedup,
+        "meets_five_percent_gate": speedup >= 5.0,
+    }
+
+
+def _measure_cuda(
+    function,
+    *,
+    warmup: int,
+    iterations: int,
+    repeats: int,
+) -> TimingSummary:
+    import torch
+
+    samples = []
+    for _ in range(repeats):
+        for _ in range(warmup):
+            function()
+        torch.cuda.synchronize()
+        started = time.perf_counter_ns()
+        for _ in range(iterations):
+            function()
+        torch.cuda.synchronize()
+        elapsed_us = (time.perf_counter_ns() - started) / 1_000.0
+        samples.append(elapsed_us / iterations)
+    return summarize_timings(samples)
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -111,12 +156,145 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_counts(args: argparse.Namespace) -> None:
+    for name in ("warmup", "iterations", "repeats"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+
+
+def _run_sqrtsoftplus(args: argparse.Namespace) -> dict[str, object]:
+    import torch
+    import vllm
+    from lightop import __version__ as lightop_version
+    from vllm.model_executor.layers.fused_moe.router import (
+        fused_topk_bias_router as official_module,
+    )
+
+    from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
+        run_lightop_sqrtsoftplus,
+    )
+
+    official = getattr(
+        official_module,
+        "_vllm_hcu_original_vllm_topk_softplus_sqrt",
+        official_module.vllm_topk_softplus_sqrt,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    records = []
+    for experts in args.experts:
+        for topk in args.top_k:
+            if topk > experts:
+                raise ValueError("--top-k cannot exceed --experts")
+            for tokens in args.token_counts:
+                logits = torch.randn(
+                    (tokens, experts),
+                    dtype=torch.float32,
+                    device="cuda",
+                    generator=generator,
+                ).contiguous()
+                bias = torch.randn(
+                    (experts,),
+                    dtype=torch.float32,
+                    device="cuda",
+                    generator=generator,
+                ).contiguous()
+
+                def baseline_call():
+                    weights = torch.empty(
+                        (tokens, topk), dtype=torch.float32, device="cuda"
+                    )
+                    ids = torch.empty(
+                        (tokens, topk), dtype=torch.int32, device="cuda"
+                    )
+                    token_expert = torch.empty_like(ids)
+                    return official(
+                        weights,
+                        ids,
+                        token_expert,
+                        logits,
+                        True,
+                        bias,
+                        None,
+                        None,
+                        1.5,
+                    )
+
+                def candidate_call():
+                    # vLLM allocates these buffers before entering the patched
+                    # function. Include that cost even though LightOp returns
+                    # its own tensors.
+                    torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
+                    torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+                    torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+                    return run_lightop_sqrtsoftplus(
+                        logits,
+                        bias,
+                        topk=topk,
+                        renormalize=True,
+                        routed_scaling_factor=1.5,
+                        indices_dtype=torch.int32,
+                    )
+
+                baseline = _measure_cuda(
+                    baseline_call,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                    repeats=args.repeats,
+                )
+                candidate = _measure_cuda(
+                    candidate_call,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                    repeats=args.repeats,
+                )
+                records.append(
+                    build_comparison_record(
+                        shape={
+                            "tokens": tokens,
+                            "experts": experts,
+                            "top_k": topk,
+                            "renormalize": True,
+                            "routed_scaling_factor": 1.5,
+                        },
+                        baseline_name="vllm-official",
+                        baseline=baseline,
+                        candidate_name="lightop",
+                        candidate=candidate,
+                    )
+                )
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return {
+        "operator": "sqrtsoftplus-gate",
+        "seed": args.seed,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+        "repeats": args.repeats,
+        "environment": {
+            "device_name": properties.name,
+            "gcn_arch": getattr(properties, "gcnArchName", None),
+            "torch": torch.__version__,
+            "vllm": vllm.__version__,
+            "lightop": lightop_version,
+        },
+        "records": records,
+    }
+
+
 def main() -> int:
     args = build_parser().parse_args()
-    raise RuntimeError(
-        f"benchmark runner for {args.operator!r} has not passed its "
-        "candidate-specific accuracy gate"
-    )
+    _validate_counts(args)
+    if args.operator == "sqrtsoftplus-gate":
+        report = _run_sqrtsoftplus(args)
+    else:
+        raise RuntimeError(
+            f"benchmark runner for {args.operator!r} has not passed its "
+            "candidate-specific accuracy gate"
+        )
+    rendered = json.dumps(report, indent=2, sort_keys=True)
+    if args.json_output is not None:
+        args.json_output.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
+    return 0
 
 
 if __name__ == "__main__":

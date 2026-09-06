@@ -36,7 +36,7 @@ No row is marked `accepted` in the initial inventory.
 | Family / public symbols | SGLang use | Current plugin mapping | Initial disposition | Reason / next evidence |
 |---|---|---|---|---|
 | Biased sigmoid MoE gate: `moe_fused_gate` | Grouped expert routing | `router_runtime.py` and `ops/fuse_moe_gate.py` | `already-covered` | Plugin has capability-aware scoring/renormalization fallback and master/leaf gates. |
-| DeepSeek V4 gate: `moe_fused_gate_sqrtsoftplus` | Non-hash DeepSeek V4 routing | Official `vllm_topk_softplus_sqrt` only | `adapt-candidate` | Installed ABI matches non-hash semantics. Hash-table routing must stay official. Screen E=256/384, top-k 6/8. |
+| DeepSeek V4 gate: `moe_fused_gate_sqrtsoftplus` | Non-hash DeepSeek V4 routing | `sqrtsoftplus_routing.py` through the exact fused-top-k-bias patch | `accepted` | Live HCU accuracy passed 75/75. All 40 benchmark shapes passed the 5% gate. Hash-table routing stays official. |
 | MoE alignment: `moe_align_block_size_out` | Triton/Marlin preparation | `patch_moe_align_block_size.py` | `already-covered` | Exact patch, leaf switch and native fallback already exist. |
 | EP permutation: `ep_scatter`, `ep_gather` | DeepEP high-throughput dispatch/combine | `deep_gemm_utils.py` | `already-covered` | Plugin has LightOp routes plus Triton fallback. |
 | EP m-index construction: `ep_build_m_indices` | Builds padded token-to-expert rows | No standalone plugin call | `adapt-candidate` | Installed symbol exists. Must first prove a vLLM DeepEP stage exposes identical sorted-token/alignment inputs. |
@@ -109,9 +109,33 @@ will be recorded here and summarized in
 
 | Candidate | Accuracy | Benchmark | Route/fallback | Final disposition |
 |---|---|---|---|---|
-| LightOp sqrt-softplus gate | Not run | Not run | Contract pending | `adapt-candidate` |
+| LightOp sqrt-softplus gate | 75/75 passed | 40/40 shapes passed; 6.83% min, 22.61% median, 44.92% max | Master/leaf enabled route; hash and ineligible inputs use official vLLM | `accepted` |
 | LightOp W16A16 Marlin MoE | Not run | Not run | Contract pending | `adapt-candidate` |
 | AITER SiLU-and-multiply | Historical diagnostic only | Not run | Current route is LightOp | `adapt-candidate` |
 | LightOp EP m-indices | Not run | Not run | Seam review pending | `adapt-candidate` |
 | LightOp fused RMS/quant aliases | Not run | Not run | Semantic comparison pending | `adapt-candidate` |
 | Generic LightOp KV-store fusion | Not run | Not run | Seam review pending | `adapt-candidate` |
+
+### LightOp sqrt-softplus evidence
+
+- Device: BW1100, `gfx938:sramecc+:xnack-`.
+- Runtime: PyTorch 2.11.0, vLLM 0.25.1, LightOp 0.6.0.
+- Accuracy seed: 20260906.
+- Accuracy shapes: expert counts 256/384, top-k 6/8/16, token counts
+  1/33/128, renormalization on/off, routed scale 1.0/1.5, plus constant
+  -80/0/80 inputs.
+- Accuracy result: 75 passed. Expert IDs matched exactly after order
+  normalization; weights matched the independent FP32 reference with
+  `rtol=1e-5`, `atol=1e-6`; all outputs were finite and inputs unchanged.
+- The first run exposed that LightOp's
+  `apply_routed_scaling_factor_on_output=False` defers the scale. A direct
+  two-value experiment confirmed that `True` is required to match vLLM's
+  router-weight contract. The final 1.5-scale matrix passed after this single
+  semantic correction; tolerances were not relaxed.
+- Benchmark: 50 warmups, 200 iterations, 7 repeats per shape. Expert counts
+  256/384, top-k 6/8, token counts 1/2/4/8/16/32/64/128/256/1024.
+- All 40 shapes exceeded 5% after including vLLM's three upstream output
+  allocations in the candidate path. Overall speedup was 6.83% minimum,
+  22.61% median and 44.92% maximum. The DeepSeek V4 E=256/top-k=6 family was
+  6.83% minimum, 12.08% median and 43.53% maximum.
+- Raw local report: `/tmp/vllm-hcu-sqrtsoftplus-benchmark.json`.
