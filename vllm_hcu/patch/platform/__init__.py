@@ -28,6 +28,7 @@ from .framework_opt import (
     patch_pcp_kv_cache_interface,
     patch_pcp_kv_cache_utils,
     patch_pcp_single_type_kv_cache_manager,
+    patch_qwen4_exp_mtp_kv_cache_groups,
     patch_scheduler,
 )
 
@@ -49,6 +50,7 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_kv_connector_factory,
     patch_parallel_state,
     patch_pcp_kv_cache_utils,
+    patch_qwen4_exp_mtp_kv_cache_groups,
     patch_pcp_kv_cache_interface,
     patch_pcp_single_type_kv_cache_manager,
     patch_pcp_kv_cache_coordinator,

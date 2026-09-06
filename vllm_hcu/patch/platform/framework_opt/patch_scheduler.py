@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
+from functools import wraps
+from inspect import signature
 from types import ModuleType
+
+from vllm.logger import init_logger
 
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms import envs as henvs
@@ -19,6 +23,7 @@ from ._common import (
 
 TARGET_MODULE = "vllm.v1.core.sched.scheduler"
 PATCH_ID = "platform.framework_opt.hcu_scheduler"
+logger = init_logger(__name__)
 TARGETS = (
     f"{TARGET_MODULE}.Scheduler",
     "vllm_hcu.v1.core.sched.scheduler.HcuScheduler",
@@ -35,10 +40,40 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler._make_cached_request_data",
     f"{TARGET_MODULE}.Scheduler._update_after_schedule",
     f"{TARGET_MODULE}.Scheduler._preempt_request",
+    f"{TARGET_MODULE}.Scheduler.__init__",
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
 HCU_SCHEDULER_PATH = "vllm_hcu.v1.core.sched.scheduler.HcuScheduler"
 UPSTREAM_SCHEDULER_PATH = f"{TARGET_MODULE}.Scheduler"
+
+
+def _mark_qwen4_exp_mtp_groups(vllm_config: object, kv_cache_config: object) -> None:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "qwen4_exp":
+        return
+
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    use_eagle_block_drop = getattr(
+        speculative_config, "use_eagle_block_drop", None
+    )
+    if not callable(use_eagle_block_drop) or not use_eagle_block_drop():
+        return
+
+    marked_group_ids = []
+    for index, group in enumerate(
+        getattr(kv_cache_config, "kv_cache_groups", ())
+    ):
+        layer_names = getattr(group, "layer_names", ())
+        if any("mtp" in layer_name.split(".") for layer_name in layer_names):
+            group.is_eagle_group = True
+            marked_group_ids.append(index)
+    if marked_group_ids:
+        logger.info(
+            "Marked Qwen4Exp MTP KV cache groups as Eagle at scheduler "
+            "boundary: %s",
+            marked_group_ids,
+        )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -82,6 +117,30 @@ def apply_to_module(module: ModuleType) -> bool:
         f"{TARGETS[0]}.update_draft_token_ids_in_output",
         ("self", "draft_token_ids", "scheduler_output"),
     )
+    scheduler_init = require_callable(scheduler, "__init__", TARGETS[-1])
+    require_signature_prefix(
+        scheduler_init,
+        TARGETS[-1],
+        (
+            "self",
+            "vllm_config",
+            "kv_cache_config",
+            "structured_output_manager",
+            "block_size",
+        ),
+    )
+    init_signature = signature(scheduler_init)
+
+    @wraps(scheduler_init)
+    def scheduler_init_with_qwen4_exp_mtp_groups(self, *args, **kwargs):
+        bound = init_signature.bind(self, *args, **kwargs)
+        _mark_qwen4_exp_mtp_groups(
+            bound.arguments["vllm_config"],
+            bound.arguments["kv_cache_config"],
+        )
+        return scheduler_init(self, *args, **kwargs)
+
+    scheduler.__init__ = scheduler_init_with_qwen4_exp_mtp_groups
     setattr(target, _MARKER, True)
     return True
 

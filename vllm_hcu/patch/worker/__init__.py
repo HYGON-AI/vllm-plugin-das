@@ -337,6 +337,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         optional_capability=True,
     ),
     _CallbackSpec(
+        _adapter("framework_opt", "patch_qwen4_exp_qsa_metadata"),
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_llm_base_proposer"),
         feature="proposer",
     ),

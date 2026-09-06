@@ -146,6 +146,23 @@ def test_kv_factory_passes_dp_rank_only_to_supporting_connector(monkeypatch):
 
 def _fake_scheduler_module():
     class Scheduler:
+        observed_eagle_groups = None
+
+        def __init__(
+            self,
+            vllm_config,
+            kv_cache_config,
+            structured_output_manager,
+            block_size,
+            hash_block_size=None,
+            mm_registry=None,
+            include_finished_set=False,
+            log_stats=False,
+        ):
+            type(self).observed_eagle_groups = [
+                group.is_eagle_group for group in kv_cache_config.kv_cache_groups
+            ]
+
         def schedule(self, throttle_prefills=False):
             return "official"
 
@@ -265,6 +282,34 @@ def test_multi_mtp_uses_existing_draft_token_ids_channel():
     assert patch_scheduler.apply_to_module(module) is True
     assert callable(module.Scheduler.update_draft_token_ids)
     assert callable(module.Scheduler.update_draft_token_ids_in_output)
+
+
+def test_qwen4_exp_mtp_group_is_annotated_at_scheduler_boundary():
+    module = _fake_scheduler_module()
+    assert patch_scheduler.apply_to_module(module) is True
+    groups = [
+        SimpleNamespace(
+            layer_names=["model.layers.0.linear_attn"],
+            is_eagle_group=False,
+        ),
+        SimpleNamespace(
+            layer_names=["mtp.layers.48.self_attn"],
+            is_eagle_group=False,
+        ),
+    ]
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="qwen4_exp"),
+        ),
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True),
+    )
+    module.Scheduler(
+        vllm_config,
+        SimpleNamespace(kv_cache_groups=groups),
+        structured_output_manager=None,
+        block_size=16,
+    )
+    assert module.Scheduler.observed_eagle_groups == [False, True]
 
 
 def test_scheduler_logs_decoder_kv_ready_event():

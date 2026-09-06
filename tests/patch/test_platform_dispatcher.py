@@ -110,6 +110,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.v1.core.kv_cache_utils",
         ),
         (
+            "platform.framework_opt.qwen4_exp_mtp_kv_cache_groups",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
             "platform.framework_opt.pcp_kv_cache_interface",
             "vllm.v1.kv_cache_interface",
         ),
@@ -265,9 +269,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 42,
+        "count": 43,
         "replacements": 11,
-        "callbacks": 31,
+        "callbacks": 32,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
