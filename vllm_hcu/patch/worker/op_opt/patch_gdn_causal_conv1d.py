@@ -133,12 +133,15 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         except ImportError:
             return causal_update(*bound.args, **bound.kwargs)
+        activation = bound.arguments["activation"]
+        if isinstance(activation, bool):
+            activation = "silu" if activation else None
         return custom_update(
             bound.arguments["x"],
             bound.arguments["conv_state"],
             bound.arguments["weight"],
             bound.arguments["bias"],
-            bound.arguments["activation"],
+            activation,
             conv_state_indices=bound.arguments["conv_state_indices"],
         )
 

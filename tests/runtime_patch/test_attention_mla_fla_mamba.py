@@ -1485,7 +1485,7 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
         GDN_AITER_TRITON_AVAILABLE=True,
         gdn_aiter_fused_reshape_causal_conv1d_update_single_token=aiter_update,
         fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
+        fused_sigmoid_gating_delta_rule_update=_gdn_sigmoid_update,
         GatedDeltaNetAttention=GatedDeltaNetAttention,
         MambaStateDtypeCalculator=SimpleNamespace(
             gated_delta_net_state_dtype=lambda *a: "calculator"

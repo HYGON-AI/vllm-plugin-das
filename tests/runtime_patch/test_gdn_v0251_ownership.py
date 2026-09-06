@@ -213,6 +213,15 @@ def _recording_callable(contract, name: str, calls: dict[str, object]):
     return target
 
 
+def _sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0, scale=None,
+    initial_state=None, inplace_final_state=True, cu_seqlens=None,
+    ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False,
+):
+    return "target-sigmoid"
+
+
 def _fake_qwen(*, aiter_available: bool = True):
     calls: dict[str, object] = {}
     causal = _recording_callable(_causal_contract, "causal", calls)
@@ -240,6 +249,8 @@ def _fake_qwen(*, aiter_available: bool = True):
     def sigmoid(*args, **kwargs):
         del args, kwargs
         return "target-sigmoid"
+
+    sigmoid.__signature__ = inspect.signature(_sigmoid_contract)
 
     values = {
         "GDN_AITER_TRITON_AVAILABLE": aiter_available,
@@ -310,7 +321,13 @@ def _causal_route_module(adapter, original_update):
     return module
 
 
-def test_qwen_causal_update_routes_compatible_decode_to_external(monkeypatch):
+@pytest.mark.parametrize(
+    ("activation", "expected_activation"),
+    [(True, "silu"), (False, None), ("silu", "silu"), ("swish", "swish"), (None, None)],
+)
+def test_qwen_causal_update_routes_compatible_decode_to_external(
+    monkeypatch, activation, expected_activation,
+):
     adapter = _adapter("patch_gdn_causal_conv1d")
     calls = {}
 
@@ -320,6 +337,8 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(monkeypatch):
 
     def custom_update(x, conv_state, weight, bias=None, activation=None,
                       cache_seqlens=None, conv_state_indices=None):
+        if activation not in [None, "silu", "swish"]:
+            raise NotImplementedError("Only silu activation is supported")
         calls["custom"] = {
             "x": x,
             "conv_state": conv_state,
@@ -348,7 +367,7 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(monkeypatch):
     physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
     indices = torch.tensor([0, 1])
     assert module.causal_conv1d_update(
-        x, state, physical_weight, activation="silu",
+        x, state, physical_weight, activation=activation,
         conv_state_indices=indices, validate_data=True,
     ) == "custom-update"
     assert "original" not in calls
@@ -356,6 +375,8 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(monkeypatch):
         calls["custom"]["weight"], physical_weight.T.contiguous()
     )
     assert calls["custom"]["conv_state_indices"] is indices
+    assert calls["custom"]["activation"] == expected_activation
+    assert calls["custom"]["cache_seqlens"] is None
 
 
 def test_qwen_causal_update_falls_back_for_spec_metadata(monkeypatch):
@@ -592,6 +613,68 @@ def test_native_aiter_unavailable_is_idempotent_and_does_not_require_symbol():
         module,
         "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
     )
+
+
+@pytest.mark.parametrize("aiter_available", [False, True])
+@pytest.mark.parametrize("saved_state", [False, True])
+@pytest.mark.parametrize(
+    "incompatibility",
+    [
+        "missing", "reordered", "keyword_only", "variadic",
+        "beta", "threshold", "scale", "initial_state", "inplace_final_state",
+        "cu_seqlens", "ssm_state_indices", "num_accepted_tokens",
+        "use_qk_l2norm_in_kernel", "is_kda",
+    ],
+)
+def test_sigmoid_incompatible_signature_leaves_module_unchanged_and_retryable(
+    aiter_available, saved_state, incompatibility,
+):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, official_sigmoid = _fake_qwen(
+        aiter_available=aiter_available
+    )
+    parameters = list(inspect.signature(_sigmoid_contract).parameters.values())
+    if incompatibility == "missing":
+        signature = inspect.signature(lambda x: x)
+    elif incompatibility == "variadic":
+        signature = inspect.signature(lambda *args, **kwargs: None)
+    else:
+        if incompatibility == "reordered":
+            parameters[0], parameters[1] = parameters[1], parameters[0]
+        elif incompatibility == "keyword_only":
+            parameters[-1] = parameters[-1].replace(
+                kind=inspect.Parameter.KEYWORD_ONLY
+            )
+        else:
+            index = next(
+                i for i, parameter in enumerate(parameters)
+                if parameter.name == incompatibility
+            )
+            parameters[index] = parameters[index].replace(default="incompatible")
+        signature = inspect.Signature(parameters)
+
+    def incompatible(*args, **kwargs):
+        pytest.fail("incompatible sigmoid must never be invoked")
+
+    incompatible.__signature__ = signature
+    module.fused_sigmoid_gating_delta_rule_update = incompatible
+    if saved_state:
+        module._vllm_hcu_original_fused_sigmoid = object()
+        module._vllm_hcu_original_gdn_aiter_update = object()
+        module._vllm_hcu_qwen_gdn_aiter_layout_applied = False
+    before = dict(vars(module))
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        adapter.apply_to_module(module)
+    assert vars(module) == before
+
+    module.fused_sigmoid_gating_delta_rule_update = official_sigmoid
+    assert adapter.apply_to_module(module) is True
+    assert adapter.apply_to_module(module) is False
+    assert module._vllm_hcu_original_fused_sigmoid is official_sigmoid
+    if aiter_available:
+        assert module._vllm_hcu_original_gdn_aiter_update is before[
+            "gdn_aiter_fused_reshape_causal_conv1d_update_single_token"
+        ]
 
 
 def test_native_aiter_signature_and_keyword_calls_fail_closed(

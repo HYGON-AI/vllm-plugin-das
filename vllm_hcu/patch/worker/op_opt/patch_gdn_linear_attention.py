@@ -13,6 +13,7 @@ from ._common import (
     already_applied,
     load_exact_module,
     require_callable,
+    require_exact_signature,
 )
 from ._gdn_common import (
     normalize_nn_conv_weight,
@@ -85,6 +86,28 @@ def apply_to_module(module: ModuleType) -> bool:
         qwen,
         "fused_sigmoid_gating_delta_rule_update",
         TARGETS[1],
+    )
+    require_exact_signature(
+        official_sigmoid,
+        TARGETS[1],
+        positional=(
+            "A_log", "a", "b", "dt_bias", "q", "k", "v", "beta", "threshold",
+            "scale", "initial_state", "inplace_final_state", "cu_seqlens",
+            "ssm_state_indices", "num_accepted_tokens", "use_qk_l2norm_in_kernel",
+            "is_kda",
+        ),
+        defaults={
+            "beta": 1.0,
+            "threshold": 20.0,
+            "scale": None,
+            "initial_state": None,
+            "inplace_final_state": True,
+            "cu_seqlens": None,
+            "ssm_state_indices": None,
+            "num_accepted_tokens": None,
+            "use_qk_l2norm_in_kernel": False,
+            "is_kda": False,
+        },
     )
     sigmoid_signature = inspect.signature(official_sigmoid)
 
