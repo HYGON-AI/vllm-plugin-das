@@ -43,7 +43,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    build_expert_params_mapping_for_row,
     maybe_load_static_eplb_plan,
+    static_eplb_layer_map_for_weight,
 )
 
 from .model import (
@@ -398,12 +400,16 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
         self.num_expert_groups = 1
         self.moe_layers: list[nn.Module] = []
+        self._vllm_hcu_moe_layer_indices: list[int] = []
         example_layer = None
-        for layer in self.layers.values():
+        for absolute_layer_idx, layer in (
+            (int(key), value) for key, value in self.layers.items()
+        ):
             mtp_block = layer.mtp_block
             if mtp_block.block_type == "moe":
                 example_layer = mtp_block.mlp
                 self.moe_layers.append(mtp_block.mlp.experts)
+                self._vllm_hcu_moe_layer_indices.append(absolute_layer_idx)
 
         if example_layer is None:
             self.num_moe_layers = 0
@@ -542,6 +548,11 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
         self.num_shared_experts = self.model.num_shared_experts
         self.num_redundant_experts = self.model.num_redundant_experts
         self.moe_layers = self.model.moe_layers
+        self._vllm_hcu_moe_layer_indices = getattr(
+            self.model,
+            "_vllm_hcu_moe_layer_indices",
+            list(range(self.num_moe_layers)),
+        )
         static_plan = getattr(self.model, "_vllm_hcu_static_eplb_plan", None)
         if static_plan is not None:
             self._vllm_hcu_static_eplb_plan = static_plan
@@ -643,6 +654,7 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
         shard_id: str,
         num_experts: int,
         num_redundant_experts: int = 0,
+        physical_to_logical: Sequence[int] | None = None,
     ) -> bool:
         if name not in params_dict:
             return False
@@ -650,9 +662,14 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
         loaded_local_expert = False
         for expert_id in range(num_experts + num_redundant_experts):
+            logical_expert_id = (
+                physical_to_logical[expert_id]
+                if physical_to_logical is not None
+                else expert_id % num_experts
+            )
             success = weight_loader(
                 param,
-                loaded_weight[expert_id % num_experts],
+                loaded_weight[logical_expert_id],
                 name,
                 shard_id,
                 expert_id,
@@ -673,6 +690,14 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
         num_experts: int,
     ) -> bool:
         num_redundant_experts = getattr(self, "num_redundant_experts", 0)
+        physical_to_logical = None
+        static_plan = getattr(self, "_vllm_hcu_static_eplb_plan", None)
+        if static_plan is not None:
+            physical_to_logical = static_eplb_layer_map_for_weight(
+                static_plan,
+                tuple(self._vllm_hcu_moe_layer_indices),
+                name,
+            )
         base = name.split(".experts.")[0]
         for checkpoint_projection, parameter_tag in (
             (".experts.gate_up_proj", "w13_weight"),
@@ -699,6 +724,7 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
                     "w1",
                     num_experts,
                     num_redundant_experts,
+                    physical_to_logical,
                 ) and self._load_fused_expert_weights(
                     target,
                     params_dict,
@@ -706,6 +732,7 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
                     "w3",
                     num_experts,
                     num_redundant_experts,
+                    physical_to_logical,
                 )
             else:
                 loaded = self._load_fused_expert_weights(
@@ -715,15 +742,22 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
                     "w2",
                     num_experts,
                     num_redundant_experts,
+                    physical_to_logical,
                 )
             if loaded:
                 loaded_params.add(target)
             return True
 
+        if physical_to_logical is not None:
+            split_expert_params_mapping = build_expert_params_mapping_for_row(
+                self,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                physical_to_logical=physical_to_logical,
+            )
         consumed = False
-        for param_name, weight_name, expert_id, shard_id in (
-            split_expert_params_mapping
-        ):
+        for param_name, weight_name, expert_id, shard_id in split_expert_params_mapping:
             if weight_name not in name:
                 continue
             consumed = True
