@@ -204,6 +204,7 @@ _COLD_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
 _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_config")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_utils")),
+    _CallbackSpec(_adapter("op_opt.moe", "patch_unquantized_oracle")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_int8_oracle")),
     _CallbackSpec(
         _adapter("op_opt.moe", "patch_fp8_oracle"),

@@ -40,11 +40,11 @@ No row is marked `accepted` in the initial inventory.
 | MoE alignment: `moe_align_block_size_out` | Triton/Marlin preparation | `patch_moe_align_block_size.py` | `already-covered` | Exact patch, leaf switch and native fallback already exist. |
 | EP permutation: `ep_scatter`, `ep_gather` | DeepEP high-throughput dispatch/combine | `deep_gemm_utils.py` | `already-covered` | Plugin has LightOp routes plus Triton fallback. |
 | EP m-index construction: `ep_build_m_indices` | Builds padded token-to-expert rows | No standalone plugin call | `adapt-candidate` | Installed symbol exists. Must first prove a vLLM DeepEP stage exposes identical sorted-token/alignment inputs. |
-| W16A16 Marlin MoE: `get_moe_cuda_marlin_config_w16a16`, `moe_gemm_marlin_w16a16`, `moe_sum` | BF16 Qwen/HCU MoE | AITER or Triton unquantized MoE | `adapt-candidate` | Installed ABI exists. Selection must occur before destructive packing; compare Qwen3.6 E=256/K=2048/N=512/top-k=8 against AITER/Triton. |
+| W16A16 Marlin MoE: `get_moe_cuda_marlin_config_w16a16`, `moe_gemm_marlin_w16a16`, `moe_sum` | BF16 Qwen/HCU MoE | Exact unquantized oracle adapter with AITER/Triton pre-pack fallback | `accepted` | Opt-in only for the measured Qwen3.6 shape and `max_num_tokens<=16`; larger batches remain on AITER/Triton because the layouts cannot be mixed safely. |
 | Quantized Marlin MoE: `fused_experts_impl_fp8_marlin`, `fused_experts_impl_int8_marlin` | W8A8/FP8 expert execution | `compressed_tensors_moe_marlin.py` | `already-covered` | Plugin owns LightOp quantized Marlin routes and alignment compatibility. |
 | W8A8/FP8 MoE GEMMs: `m_grouped_w8a8_gemm_*` and fused activation/quant variants | DeepEP and channel-quant MoE | `deep_gemm_moe.py`, `batched_deep_gemm_moe.py`, `dpsk_v4_deep_gemm_moe.py` | `already-covered` | Plugin has contiguous/masked and DeepSeek V4 routes. |
 | W4A8 helpers and Marlin repack | SlimQuant expert execution | Plugin SlimQuant/DeepGEMM and AITER W4A8 paths | `already-covered` | Existing plugin code owns the vLLM quantization lifecycle; importing LightOp private `_lmslim_native` is not allowed. |
-| Activation: `silu_and_mul_opt`, `fuse_silu_and_mul` | Dense MLP and W16A16 MoE | `ops/silu_and_mul.py`; W16 candidate needs output-buffer ABI | `already-covered` for dense, `adapt-candidate` inside W16 | Dense LightOp route already exists. The W16 runtime may call the output-buffer form after numerical validation. |
+| Activation: `silu_and_mul_opt`, `fuse_silu_and_mul` | Dense MLP and W16A16 MoE | `ops/silu_and_mul.py` and the accepted W16 expert runtime | `already-covered` | Dense LightOp routing already existed; the W16 backend now uses the output-buffer form inside its validated fused pipeline. |
 | Fused activation+quant: `lm_fuse_silu_mul_quant`, `fuse_silu_mul_fp8_quant`, EP variants | Quantized linear/MoE handoff | `ops/fuse_silu_mul_quant.py` and DeepGEMM experts | `already-covered` | Existing plugin routes cover general and EP channel-quant use. |
 | RMSNorm: `rmsnorm_forward_autograd`, `fused_add_rms_norm`, Gemma RMSNorm | Transformer normalization | `ops/rms_norm.py`, `ops/gemma_rms_norm.py` | `already-covered` | Master/leaf switches and vLLM OOT registration already exist. |
 | Fused RMS+dynamic quant: `lm_faster_rmsquant`, `rms_norm_per_token_fp8_quant` | Linear/communicator handoff | `ops/fuse_rms_norm_quant.py` uses `rms_norm_dynamic_per_token_quant`; AITER fused variants also exist | `adapt-candidate` | Compare exact residual mutation, scale layout and dtype contracts. Classify as already covered if only an ABI alias. |
@@ -110,7 +110,7 @@ will be recorded here and summarized in
 | Candidate | Accuracy | Benchmark | Route/fallback | Final disposition |
 |---|---|---|---|---|
 | LightOp sqrt-softplus gate | 75/75 passed | 40/40 shapes passed; 6.83% min, 22.61% median, 44.92% max | Master/leaf enabled route; hash and ineligible inputs use official vLLM | `accepted` |
-| LightOp W16A16 Marlin MoE | Not run | Not run | Contract pending | `adapt-candidate` |
+| LightOp W16A16 Marlin MoE | 6/6 passed, including Qwen3.6 expert shape | Accepted M=1/2/4/8/16: 6.28% min vs fastest fallback; larger M rejected | Opt-in master/leaf route; shape/range/config failures delegate before packing | `accepted` |
 | AITER SiLU-and-multiply | Historical diagnostic only | Not run | Current route is LightOp | `adapt-candidate` |
 | LightOp EP m-indices | Not run | Not run | Seam review pending | `adapt-candidate` |
 | LightOp fused RMS/quant aliases | Not run | Not run | Semantic comparison pending | `adapt-candidate` |
@@ -139,3 +139,30 @@ will be recorded here and summarized in
   22.61% median and 44.92% maximum. The DeepSeek V4 E=256/top-k=6 family was
   6.83% minimum, 12.08% median and 43.53% maximum.
 - Raw local report: `/tmp/vllm-hcu-sqrtsoftplus-benchmark.json`.
+
+### LightOp W16A16 Marlin MoE evidence
+
+- Device/runtime: BW1100 (`gfx938:sramecc+:xnack-`), PyTorch 2.11.0,
+  vLLM 0.25.1, LightOp 0.6.0 and the installed HCU AITER build.
+- Accuracy seed: 20260906. Six live-HCU cases passed: M=1/7/33/128 with
+  eight experts, an exact Qwen3.6 expert shape
+  `E=256,K=2048,N=512,top-k=8,M=4`, and a zero-input case. Results matched
+  an independent FP32 per-token/per-expert PyTorch reference at
+  `rtol=0.03`, `atol=0.03`; outputs were finite and sampled canonical source
+  weights were unchanged after packing.
+- The real plugin lifecycle was also exercised in import-coordinator order:
+  the HCU oracle selected `HCU_LIGHTOP_W16A16`, installed packed parameter
+  shapes `[256,128,16384]` and `[256,32,32768]`, constructed a vLLM modular
+  `FusedMoEKernel`, and executed through vLLM's workspace manager.
+- Benchmark: 20 warmups, 100 iterations and 7 repeats for every M in
+  1/2/4/8/16/32/64/128/256 at the Qwen3.6 shape. The report compares the same
+  LightOp result with both vLLM Triton and the plugin's shuffled ASM AITER
+  route and checks BF16 output agreement before timing.
+- For M=1/2/4/8/16, LightOp was 31.08%--68.22% faster than Triton and
+  6.28%--71.35% faster than AITER. At M=32/64/128 the AITER advantage reduced
+  the LightOp gain below 5%; at M=256 LightOp was 7.51% slower than AITER.
+  Since these backends require incompatible permanent weight layouts, the
+  accepted oracle profile is deliberately limited to
+  `E=256,K=2048,N=512,top-k=8,max_num_tokens<=16`. Every other configuration
+  delegates to AITER/Triton before parameter replacement.
+- Raw local report: `/tmp/vllm-hcu-w16a16-benchmark.json`.

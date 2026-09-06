@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
+    VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
@@ -236,8 +237,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Use LightOp for non-hash DeepSeek V4 sqrt-softplus routing. Hash layers
     # always retain vLLM's official operator.
     "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE":
-        lambda: (os.environ.get(
+    lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE", "True"
+        ).lower() in ("true", "1")),
+    # Opt-in because this backend installs a LightOp-specific packed weight
+    # layout during process_weights_after_loading().
+    "VLLM_HCU_USE_LIGHTOP_W16A16_MOE":
+    lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_W16A16_MOE", "False"
         ).lower() in ("true", "1")),
 
     "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D":
