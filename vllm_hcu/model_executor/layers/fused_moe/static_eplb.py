@@ -174,4 +174,45 @@ def load_static_eplb_plan(
     )
 
 
-__all__ = ["StaticEplbPlan", "load_static_eplb_plan"]
+def maybe_load_static_eplb_plan(
+    vllm_config: object,
+    *,
+    model_key: str,
+    num_moe_layers: int,
+    num_logical_experts: int,
+    num_physical_experts: int,
+    num_redundant_experts: int,
+) -> StaticEplbPlan | None:
+    """Build a static plan from the worker-propagated parallel config."""
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    path = getattr(parallel_config, "_vllm_hcu_expert_map_path", None)
+    if not path:
+        return None
+    if not getattr(parallel_config, "enable_expert_parallel", False):
+        raise ValueError("HY V4 static EPLB direct load requires expert parallel.")
+    if not getattr(parallel_config, "enable_eplb", False):
+        raise ValueError("HY V4 static EPLB direct load requires EPLB.")
+    if getattr(parallel_config, "enable_ep_weight_filter", False):
+        raise ValueError(
+            "HY V4 static EPLB direct load does not support upstream EP weight "
+            "filtering because the filter cannot express per-layer offline maps."
+        )
+    if num_moe_layers <= 0:
+        raise ValueError(
+            f"HY V4 static EPLB direct load found no MoE layers for {model_key}."
+        )
+    return load_static_eplb_plan(
+        path,
+        model_key=model_key,
+        expected_shape=(num_moe_layers, num_physical_experts),
+        num_logical_experts=num_logical_experts,
+        num_redundant_experts=num_redundant_experts,
+    )
+
+
+__all__ = [
+    "StaticEplbPlan",
+    "load_static_eplb_plan",
+    "maybe_load_static_eplb_plan",
+]

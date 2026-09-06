@@ -77,6 +77,10 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    maybe_load_static_eplb_plan,
+)
+
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
@@ -555,6 +559,16 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_shared_experts = config.num_shared_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
+        static_plan = maybe_load_static_eplb_plan(
+            vllm_config,
+            model_key="HYV4ForCausalLM",
+            num_moe_layers=self.num_moe_layers,
+            num_logical_experts=self.num_logical_experts,
+            num_physical_experts=self.num_physical_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+        if static_plan is not None:
+            self._vllm_hcu_static_eplb_plan = static_plan
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1017,6 +1031,9 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
         self.num_shared_experts = self.model.num_shared_experts
         self.num_redundant_experts = self.model.num_redundant_experts
         self.moe_layers = self.model.moe_layers
+        static_plan = getattr(self.model, "_vllm_hcu_static_eplb_plan", None)
+        if static_plan is not None:
+            self._vllm_hcu_static_eplb_plan = static_plan
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

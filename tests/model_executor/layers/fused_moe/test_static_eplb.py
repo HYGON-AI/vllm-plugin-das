@@ -13,6 +13,7 @@ import torch
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     load_static_eplb_plan,
+    maybe_load_static_eplb_plan,
 )
 
 
@@ -160,3 +161,73 @@ def test_legacy_mtp_plan_selects_final_rows(tmp_path: Path) -> None:
     )
 
     assert plan.layer_map(0) == (3, 2, 1, 0, 3, 2)
+
+
+def _config_for_path(path: Path | None, **overrides):
+    values = {
+        "_vllm_hcu_expert_map_path": str(path) if path else None,
+        "enable_expert_parallel": True,
+        "enable_eplb": True,
+        "enable_ep_weight_filter": False,
+    }
+    values.update(overrides)
+    return type(
+        "Config",
+        (),
+        {"parallel_config": type("Parallel", (), values)()},
+    )()
+
+
+def test_maybe_load_plan_uses_parallel_config_before_weight_load(tmp_path: Path) -> None:
+    path = tmp_path / "maps.json"
+    _write_map(path, [[3, 2, 1, 0, 3, 2]])
+
+    plan = maybe_load_static_eplb_plan(
+        _config_for_path(path),
+        model_key="HYV4ForCausalLM",
+        num_moe_layers=1,
+        num_logical_experts=4,
+        num_physical_experts=6,
+        num_redundant_experts=2,
+    )
+
+    assert plan is not None
+    assert plan.layer_map(0) == (3, 2, 1, 0, 3, 2)
+    assert (
+        maybe_load_static_eplb_plan(
+            _config_for_path(None),
+            model_key="HYV4ForCausalLM",
+            num_moe_layers=1,
+            num_logical_experts=4,
+            num_physical_experts=6,
+            num_redundant_experts=2,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"enable_expert_parallel": False}, "expert parallel"),
+        ({"enable_eplb": False}, "EPLB"),
+        ({"enable_ep_weight_filter": True}, "EP weight filtering"),
+    ],
+)
+def test_maybe_load_plan_rejects_unsupported_parallel_modes(
+    tmp_path: Path,
+    override: dict,
+    message: str,
+) -> None:
+    path = tmp_path / "maps.json"
+    _write_map(path, [[0, 1, 2, 3, 0, 1]])
+
+    with pytest.raises(ValueError, match=message):
+        maybe_load_static_eplb_plan(
+            _config_for_path(path, **override),
+            model_key="HYV4ForCausalLM",
+            num_moe_layers=1,
+            num_logical_experts=4,
+            num_physical_experts=6,
+            num_redundant_experts=2,
+        )

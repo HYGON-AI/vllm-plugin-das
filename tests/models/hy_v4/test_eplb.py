@@ -67,11 +67,13 @@ def test_target_registers_expert_weights_and_routing_state() -> None:
 
 def test_target_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     layer = _FakeMoELayer()
+    static_plan = object()
 
     class FakeInnerModel(nn.Module):
         def __init__(self, **kwargs) -> None:
             super().__init__()
             self.make_empty_intermediate_tensors = object()
+            self._vllm_hcu_static_eplb_plan = static_plan
             _set_moe_metadata(self, layer)
 
         def set_eplb_state(self, *args) -> None:
@@ -114,6 +116,7 @@ def test_target_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None
     assert model.num_physical_experts == 8
     assert model.num_local_physical_experts == 2
     assert model.num_redundant_experts == 4
+    assert model._vllm_hcu_static_eplb_plan is static_plan
 
 
 def test_mtp_registers_expert_weights_and_routing_state() -> None:
@@ -139,11 +142,13 @@ def test_mtp_registers_expert_weights_and_routing_state() -> None:
 
 def test_mtp_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     layer = _FakeMoELayer()
+    static_plan = object()
 
     class FakePredictor(nn.Module):
         def __init__(self, **kwargs) -> None:
             super().__init__()
             self.quant_config = None
+            self._vllm_hcu_static_eplb_plan = static_plan
             _set_moe_metadata(self, layer)
 
         def set_eplb_state(self, *args) -> None:
@@ -173,6 +178,7 @@ def test_mtp_wrapper_exposes_mixture_of_experts_contract(monkeypatch) -> None:
     assert model.num_physical_experts == 8
     assert model.num_local_physical_experts == 2
     assert model.num_redundant_experts == 4
+    assert model._vllm_hcu_static_eplb_plan is static_plan
 
 
 def test_target_fused_loader_copies_logical_weights_to_redundant_experts() -> None:
