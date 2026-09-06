@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    bind_static_eplb_plan,
     load_static_eplb_plan,
     maybe_load_static_eplb_plan,
 )
@@ -231,3 +232,124 @@ def test_maybe_load_plan_rejects_unsupported_parallel_modes(
             num_physical_experts=6,
             num_redundant_experts=2,
         )
+
+
+class _FakeMoERunner:
+    def __init__(self) -> None:
+        self.routed_experts = type("RoutedExperts", (), {})()
+
+
+class _FakeMoEModel:
+    def __init__(self, *, runners: list[object] | None = None) -> None:
+        self.expert_weights = []
+        self.num_moe_layers = 2
+        self.num_expert_groups = 1
+        self.num_logical_experts = 3
+        self.num_physical_experts = 4
+        self.num_local_physical_experts = 4
+        self.num_routed_experts = 3
+        self.num_shared_experts = 0
+        self.num_redundant_experts = 1
+        self.moe_layers = (
+            [_FakeMoERunner(), _FakeMoERunner()] if runners is None else runners
+        )
+
+    def set_eplb_state(self, *args: object) -> None:
+        del args
+
+    def update_physical_experts_metadata(self, *args: object) -> None:
+        del args
+
+
+def _write_binder_map(path: Path) -> None:
+    _write_map(
+        path,
+        [[2, 1, 0, 2], [1, 0, 2, 1]],
+        key="_FakeMoEModel",
+    )
+
+
+def test_bind_plan_publishes_each_row_to_routed_experts(tmp_path: Path) -> None:
+    path = tmp_path / "maps.json"
+    _write_binder_map(path)
+    config = _config_for_path(path)
+    model = _FakeMoEModel()
+
+    plan = bind_static_eplb_plan(config, model)
+
+    assert model._vllm_hcu_static_eplb_plan is plan
+    assert model.moe_layers[0].routed_experts._vllm_hcu_static_eplb_row == (
+        2,
+        1,
+        0,
+        2,
+    )
+    assert model.moe_layers[1].routed_experts._vllm_hcu_static_eplb_row == (
+        1,
+        0,
+        2,
+        1,
+    )
+
+
+def test_bind_plan_returns_none_without_a_configured_path() -> None:
+    assert bind_static_eplb_plan(_config_for_path(None), object()) is None
+
+
+def test_bind_plan_rejects_a_non_moe_model_without_hyv4_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "maps.json"
+    _write_binder_map(path)
+
+    with pytest.raises(ValueError, match="MixtureOfExperts") as error:
+        bind_static_eplb_plan(_config_for_path(path), object())
+
+    assert "HY V4" not in str(error.value)
+
+
+def test_bind_plan_rejects_layer_count_mismatch_before_publishing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "maps.json"
+    _write_binder_map(path)
+    model = _FakeMoEModel(runners=[_FakeMoERunner()])
+
+    with pytest.raises(ValueError, match="moe_layers"):
+        bind_static_eplb_plan(_config_for_path(path), model)
+
+    assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+    assert not hasattr(
+        model.moe_layers[0].routed_experts,
+        "_vllm_hcu_static_eplb_row",
+    )
+
+
+def test_bind_plan_rejects_missing_routed_experts_before_publishing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "maps.json"
+    _write_binder_map(path)
+    first = _FakeMoERunner()
+    model = _FakeMoEModel(runners=[first, object()])
+
+    with pytest.raises(ValueError, match="routed_experts"):
+        bind_static_eplb_plan(_config_for_path(path), model)
+
+    assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+    assert not hasattr(first.routed_experts, "_vllm_hcu_static_eplb_row")
+
+
+def test_maybe_load_plan_uses_generic_validation_errors(tmp_path: Path) -> None:
+    path = tmp_path / "maps.json"
+    _write_binder_map(path)
+
+    with pytest.raises(ValueError, match="expert parallel") as error:
+        maybe_load_static_eplb_plan(
+            _config_for_path(path, enable_expert_parallel=False),
+            model_key="_FakeMoEModel",
+            num_moe_layers=2,
+            num_logical_experts=3,
+            num_physical_experts=4,
+            num_redundant_experts=1,
+        )
+
+    assert "HY V4" not in str(error.value)

@@ -208,6 +208,14 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 )
 
 
+# Model construction is the last common boundary before the loader can invoke
+# ``model.load_weights``. Arm this callback before any model-specific adapter
+# can import a model module.
+_MODEL_LOADER_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb")),
+)
+
+
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
@@ -373,6 +381,7 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 
 _ALL_CALLBACK_GROUPS: tuple[tuple[_CallbackSpec, ...], ...] = (
+    _MODEL_LOADER_CALLBACKS,
     _MOE_FOUNDATION_CALLBACKS,
     _CORE_CALLBACKS,
     _OP_CALLBACKS,

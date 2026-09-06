@@ -97,6 +97,7 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.op_opt.attention.fused_qkv_public_export"
     ]
     framework_order = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",

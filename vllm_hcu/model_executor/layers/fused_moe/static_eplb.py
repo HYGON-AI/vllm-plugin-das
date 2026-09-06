@@ -191,17 +191,17 @@ def maybe_load_static_eplb_plan(
     if not path:
         return None
     if not getattr(parallel_config, "enable_expert_parallel", False):
-        raise ValueError("HY V4 static EPLB direct load requires expert parallel.")
+        raise ValueError("Static EPLB direct load requires expert parallel.")
     if not getattr(parallel_config, "enable_eplb", False):
-        raise ValueError("HY V4 static EPLB direct load requires EPLB.")
+        raise ValueError("Static EPLB direct load requires EPLB.")
     if getattr(parallel_config, "enable_ep_weight_filter", False):
         raise ValueError(
-            "HY V4 static EPLB direct load does not support upstream EP weight "
+            "Static EPLB direct load does not support upstream EP weight "
             "filtering because the filter cannot express per-layer offline maps."
         )
     if num_moe_layers <= 0:
         raise ValueError(
-            f"HY V4 static EPLB direct load found no MoE layers for {model_key}."
+            f"Static EPLB direct load found no MoE layers for {model_key}."
         )
     return load_static_eplb_plan(
         path,
@@ -210,6 +210,88 @@ def maybe_load_static_eplb_plan(
         num_logical_experts=num_logical_experts,
         num_redundant_experts=num_redundant_experts,
     )
+
+
+def bind_static_eplb_plan(
+    vllm_config: object,
+    model: object,
+) -> StaticEplbPlan | None:
+    """Validate and bind a static EPLB plan before checkpoint loading."""
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if not getattr(parallel_config, "_vllm_hcu_expert_map_path", None):
+        return None
+
+    from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
+    model_key = model.__class__.__name__
+    if not is_mixture_of_experts(model):
+        raise ValueError(
+            "Static EPLB direct load requires a MixtureOfExperts model with "
+            f"MoE layers; got {model_key}."
+        )
+
+    counts: dict[str, int] = {}
+    for name in (
+        "num_moe_layers",
+        "num_logical_experts",
+        "num_physical_experts",
+        "num_redundant_experts",
+    ):
+        value = getattr(model, name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                "Static EPLB direct load requires "
+                f"MixtureOfExperts.{name} to be an integer for {model_key}."
+            )
+        counts[name] = value
+
+    moe_layers = tuple(model.moe_layers)
+    if len(moe_layers) != counts["num_moe_layers"]:
+        raise ValueError(
+            "Static EPLB direct load found a MixtureOfExperts.moe_layers "
+            f"count of {len(moe_layers)} for {model_key}; expected "
+            f"{counts['num_moe_layers']}."
+        )
+
+    plan = maybe_load_static_eplb_plan(
+        vllm_config,
+        model_key=model_key,
+        num_moe_layers=counts["num_moe_layers"],
+        num_logical_experts=counts["num_logical_experts"],
+        num_physical_experts=counts["num_physical_experts"],
+        num_redundant_experts=counts["num_redundant_experts"],
+    )
+    if plan is None:
+        return None
+
+    routed_experts = []
+    for layer_idx, moe_layer in enumerate(moe_layers):
+        runner_routed_experts = getattr(moe_layer, "routed_experts", None)
+        if runner_routed_experts is None:
+            raise ValueError(
+                "Static EPLB direct load requires "
+                "MixtureOfExperts.moe_layers to expose routed_experts; "
+                f"layer {layer_idx} of {model_key} does not."
+            )
+        routed_experts.append(runner_routed_experts)
+
+    if len(plan._map_values) != len(routed_experts):
+        raise ValueError(
+            "Static EPLB direct-load plan row count does not match "
+            f"MixtureOfExperts.moe_layers for {model_key}."
+        )
+
+    # Validate the entire model before publishing any plan state.  The routed
+    # expert object is the checkpoint-loader consumer, while the model-level
+    # plan is consumed later by EPLB-state initialization.
+    rows = tuple(
+        plan.layer_map(layer_idx) for layer_idx in range(len(routed_experts))
+    )
+    for routed_experts_layer, row in zip(routed_experts, rows, strict=True):
+        setattr(routed_experts_layer, "_vllm_hcu_static_eplb_row", row)
+    setattr(model, "_vllm_hcu_static_eplb_plan", plan)
+    return plan
 
 
 def static_eplb_layer_map_for_weight(
@@ -272,6 +354,7 @@ def build_expert_params_mapping_for_row(
 
 __all__ = [
     "StaticEplbPlan",
+    "bind_static_eplb_plan",
     "build_expert_params_mapping_for_row",
     "load_static_eplb_plan",
     "maybe_load_static_eplb_plan",
