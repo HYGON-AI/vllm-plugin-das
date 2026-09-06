@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Target-native Triton compatibility for channel-wise FP8 scaled MM."""
+"""HCU backend selection for channel-wise FP8 scaled MM."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
+from functools import cache
 from inspect import signature
 from math import prod
 from threading import RLock
@@ -18,11 +20,140 @@ _TRITON_MODULE = (
     "vllm.model_executor.layers.quantization.compressed_tensors."
     "triton_scaled_mm"
 )
+# Keep the established dispatcher name so persisted vLLM compile artifacts do
+# not lose their registered operator when the selected backend is LightOp.
 _CUSTOM_OP_NAME = "hcu_channel_fp8_target_triton_scaled_mm"
 _CUSTOM_OP_LOCK = RLock()
 _CUSTOM_OP: Callable[..., torch.Tensor] | None = None
 _CUSTOM_OP_BACKEND: Callable[..., torch.Tensor] | None = None
 _CUSTOM_OP_REGISTRATION_ERROR: str | None = None
+_LOGGER = logging.getLogger(__name__)
+
+
+def _custom_quantization_gemm_enabled() -> bool:
+    try:
+        from vllm_hcu.platforms import envs as henvs
+
+        return bool(henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM)
+    except (AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            "required HCU flag VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM "
+            "is unavailable"
+        ) from exc
+
+
+@cache
+def _make_lightop_scaled_mm(
+    lightop_gemm: Callable[..., tuple[bool, torch.Tensor]],
+) -> Callable[..., torch.Tensor]:
+    if not callable(lightop_gemm):
+        raise TypeError("LightOp channel-wise GEMM backend must be callable")
+
+    def lightop_scaled_mm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            input.dtype != torch.float8_e4m3fn
+            or weight.dtype != torch.float8_e4m3fn
+        ):
+            raise ValueError(
+                "LightOp channel-wise GEMM requires float8_e4m3fn operands"
+            )
+        if scale_a.dtype != torch.float32 or scale_b.dtype != torch.float32:
+            raise ValueError(
+                "LightOp channel-wise GEMM requires float32 scales"
+            )
+        if out_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "LightOp channel-wise GEMM output must be float16 or bfloat16"
+            )
+        if bias is not None and bias.dtype != out_dtype:
+            raise ValueError(
+                "LightOp channel-wise GEMM bias dtype must match its output"
+            )
+        m, k = input.shape
+        n = weight.shape[1]
+        status, output = lightop_gemm(
+            input,
+            weight.t(),
+            scale_a,
+            scale_b,
+            m,
+            n,
+            k,
+            "NT",
+            out_dtype,
+            bias,
+        )
+        if status is not True:
+            raise RuntimeError("LightOp channel-wise GEMM reported failure")
+        if not isinstance(output, torch.Tensor):
+            raise RuntimeError("LightOp channel-wise GEMM did not return a tensor")
+        if tuple(output.shape) not in ((m, n), (1, m, n)):
+            raise RuntimeError(
+                "LightOp channel-wise GEMM returned an incompatible output"
+            )
+        return output.view(m, n)
+
+    return lightop_scaled_mm
+
+
+def _resolve_scaled_mm_backend() -> tuple[str, Callable[..., torch.Tensor]]:
+    if _custom_quantization_gemm_enabled():
+        try:
+            from lightop.gemm_ops import hipblaslt_w8a8_channelwise_gemm
+        except (AttributeError, ImportError) as exc:
+            raise RuntimeError(
+                "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM requires LightOp "
+                "hipblaslt_w8a8_channelwise_gemm"
+            ) from exc
+
+        lightop_parameters = tuple(
+            signature(hipblaslt_w8a8_channelwise_gemm).parameters
+        )
+        if lightop_parameters[:10] != (
+            "a",
+            "b",
+            "scale_a",
+            "scale_b",
+            "m",
+            "n",
+            "k",
+            "transpose_flag",
+            "out_dtype",
+            "bias",
+        ):
+            raise RuntimeError(
+                "LightOp channel-wise GEMM signature drifted from the "
+                "reviewed 0.6.0 contract"
+            )
+        return "lightop", _make_lightop_scaled_mm(
+            hipblaslt_w8a8_channelwise_gemm
+        )
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+        triton_scaled_mm,
+    )
+
+    triton_parameters = tuple(signature(triton_scaled_mm).parameters)
+    if triton_parameters[:6] != (
+        "input",
+        "weight",
+        "scale_a",
+        "scale_b",
+        "out_dtype",
+        "bias",
+    ):
+        raise RuntimeError(
+            "vLLM target triton_scaled_mm signature drifted from the reviewed "
+            "v0.25.1 contract"
+        )
+    return "target-triton", triton_scaled_mm
 
 
 def _eager_shape_check(condition, message: str) -> None:
@@ -82,14 +213,18 @@ def _validate_target_output(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     if not isinstance(output, torch.Tensor):
-        raise RuntimeError("target triton_scaled_mm did not return a tensor")
+        raise RuntimeError(
+            "selected Channel-FP8 backend did not return a tensor"
+        )
     if (
         output.ndim != 2
         or tuple(output.shape) != (A.shape[0], B.shape[1])
         or output.device != A.device
         or output.dtype != out_dtype
     ):
-        raise RuntimeError("target triton_scaled_mm returned an incompatible output")
+        raise RuntimeError(
+            "selected Channel-FP8 backend returned an incompatible output"
+        )
     return output
 
 
@@ -103,7 +238,7 @@ def _channel_fp8_target_triton_impl(
 ) -> torch.Tensor:
     backend = _CUSTOM_OP_BACKEND
     if backend is None:
-        raise RuntimeError("Channel-FP8 target Triton backend is not initialized")
+        raise RuntimeError("selected Channel-FP8 backend is not initialized")
     # The dispatcher calls this real implementation outside Dynamo capture, so
     # these relations use concrete runtime dimensions and cannot become
     # piecewise graph inputs.  Repeat them here because the fake implementation
@@ -158,35 +293,34 @@ def _register_channel_fp8_custom_op() -> Callable[..., torch.Tensor]:
 
 
 def _ensure_channel_fp8_custom_op(
-    triton_scaled_mm: Callable[..., torch.Tensor],
+    backend: Callable[..., torch.Tensor],
 ) -> Callable[..., torch.Tensor]:
     global _CUSTOM_OP, _CUSTOM_OP_BACKEND, _CUSTOM_OP_REGISTRATION_ERROR
 
-    if not callable(triton_scaled_mm):
-        raise TypeError("target triton_scaled_mm backend must be callable")
+    if not callable(backend):
+        raise TypeError("Channel-FP8 backend must be callable")
     with _CUSTOM_OP_LOCK:
         if _CUSTOM_OP_REGISTRATION_ERROR is not None:
             raise RuntimeError(
-                "Channel-FP8 target Triton custom-op registration previously "
+                "Channel-FP8 custom-op registration previously "
                 f"failed: {_CUSTOM_OP_REGISTRATION_ERROR}"
             )
         if _CUSTOM_OP is not None:
-            if _CUSTOM_OP_BACKEND is not triton_scaled_mm:
+            if _CUSTOM_OP_BACKEND is not backend:
                 raise RuntimeError(
-                    "Channel-FP8 target Triton custom op is already bound to a "
+                    "Channel-FP8 custom op is already bound to a "
                     "different backend"
                 )
             return _CUSTOM_OP
 
-        _CUSTOM_OP_BACKEND = triton_scaled_mm
+        _CUSTOM_OP_BACKEND = backend
         try:
             custom_op = _register_channel_fp8_custom_op()
         except Exception as exc:
             _CUSTOM_OP_BACKEND = None
             _CUSTOM_OP_REGISTRATION_ERROR = f"{type(exc).__name__}: {exc}"
             raise RuntimeError(
-                "failed to register the HCU-owned Channel-FP8 target Triton "
-                "custom op"
+                "failed to register the HCU-owned Channel-FP8 custom op"
             ) from exc
         _CUSTOM_OP = custom_op
         return custom_op
@@ -233,7 +367,7 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
                 "_hcu_fp8_backend",
                 None,
             )
-            == "target-triton"
+            in {"lightop", "target-triton"}
             and getattr(
                 ChannelWiseTorchFP8ScaledMMLinearKernel.get_output_padding,
                 "_hcu_fp8_target_triton_wrapper",
@@ -248,28 +382,11 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
             return
         raise RuntimeError(
             "channelwise FP8 scaled-mm adapter marker exists without the "
-            "reviewed target Triton wrapper ownership"
+            "reviewed HCU wrapper ownership"
         )
 
-    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
-        triton_scaled_mm,
-    )
-
-    triton_parameters = tuple(signature(triton_scaled_mm).parameters)
-    if triton_parameters[:6] != (
-        "input",
-        "weight",
-        "scale_a",
-        "scale_b",
-        "out_dtype",
-        "bias",
-    ):
-        raise RuntimeError(
-            "vLLM target triton_scaled_mm signature drifted from the reviewed "
-            "v0.25.1 contract"
-        )
-
-    channel_fp8_custom_op = _ensure_channel_fp8_custom_op(triton_scaled_mm)
+    backend_name, scaled_mm_backend = _resolve_scaled_mm_backend()
+    channel_fp8_custom_op = _ensure_channel_fp8_custom_op(scaled_mm_backend)
 
     original_get_output_padding = (
         ChannelWiseTorchFP8ScaledMMLinearKernel.get_output_padding
@@ -330,8 +447,8 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
         # across subgraphs.  The target Torch Inductor does not accept a
         # ``sympy.Equality`` graph input.  Keep the friendly validation for
         # concrete eager calls; the custom-op implementation delegates to the
-        # target v0.25.1 Triton backend and repeats the HCU/target scale contract
-        # with concrete runtime dimensions.
+        # selected backend and repeats the HCU scale contract with concrete
+        # runtime dimensions.
         if not torch.compiler.is_compiling():
             _validate_scale_shapes(As, Bs, m, n)
         if (
@@ -377,20 +494,23 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
             bias,
         )
         if not isinstance(output, torch.Tensor):
-            raise RuntimeError("target triton_scaled_mm did not return a tensor")
+            raise RuntimeError(
+                "selected Channel-FP8 backend did not return a tensor"
+            )
         if (
             output.ndim != 2
             or output.device != A.device
             or output.dtype != out_dtype
         ):
             raise RuntimeError(
-                "target triton_scaled_mm returned an incompatible output"
+                "selected Channel-FP8 backend returned an incompatible output"
             )
         if not torch.compiler.is_compiling():
             try:
                 _eager_shape_check(
                     (output.shape[0] == m) & (output.shape[1] == n),
-                    "target triton_scaled_mm returned an incompatible output",
+                    "selected Channel-FP8 backend returned an incompatible "
+                    "output",
                 )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
@@ -400,10 +520,11 @@ def install_fp8_scaled_mm_compat(module: ModuleType | None = None) -> None:
 
     ChannelWiseTorchFP8ScaledMMLinearKernel.apply_scaled_mm = new_apply_scaled_mm
     ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_patch_applied = True
-    ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_backend = "target-triton"
+    ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_backend = backend_name
     ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_original_get_output_padding = (
         original_get_output_padding
     )
     ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_original_apply_scaled_mm = (
         original_apply_scaled_mm
     )
+    _LOGGER.info("Channel-wise FP8 scaled MM backend: %s", backend_name)

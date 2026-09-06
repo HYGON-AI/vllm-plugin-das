@@ -2493,12 +2493,13 @@ def test_aiter_topk_supports_old_and_new_abi(
     assert len(calls[0]) == (7 if extended else 5)
 
 
-def test_scaled_mm_prequantized_input_bypasses_quantizer():
+@pytest.mark.parametrize("backend", ["lightop", "target-triton"])
+def test_scaled_mm_prequantized_input_bypasses_quantizer(backend: str):
     calls: list[tuple[object, ...]] = []
 
     class FP8ScaledMMLinearKernel:
         _hcu_fp8_patch_applied = True
-        _hcu_fp8_backend = "target-triton"
+        _hcu_fp8_backend = backend
 
         def apply_weights(self, layer, x, bias=None):
             calls.append(("original", layer, x, bias))
@@ -5535,12 +5536,14 @@ def test_fp8_channel_weight_layout_requires_hcu_kernel(monkeypatch: pytest.Monke
     scheme = module.CompressedTensorsW8A8Fp8()
     scheme.strategy = channel
     scheme.fp8_linear = object()
-    with pytest.raises(RuntimeError, match="target Triton scaled-mm adapter"):
+    with pytest.raises(RuntimeError, match="HCU scaled-mm adapter"):
         scheme.process_weights_after_loading(SimpleNamespace(weight=torch.ones(2, 3)))
 
 
-def test_fp8_target_triton_route_is_independent_of_general_custom_gemm_flag(
+@pytest.mark.parametrize("backend", ["lightop", "target-triton"])
+def test_fp8_channel_backend_preserves_weight_layout(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ):
     from vllm_hcu.platforms import envs as henvs
 
@@ -5550,7 +5553,7 @@ def test_fp8_target_triton_route_is_independent_of_general_custom_gemm_flag(
 
     class Kernel:
         _hcu_fp8_patch_applied = True
-        _hcu_fp8_backend = "target-triton"
+        _hcu_fp8_backend = backend
 
     scheme = module.CompressedTensorsW8A8Fp8()
     scheme.strategy = channel
@@ -5561,14 +5564,18 @@ def test_fp8_target_triton_route_is_independent_of_general_custom_gemm_flag(
     assert layer.weight.stride() == (1, 3)
 
 
-def test_fp8_scheme_forwards_prequantized_input(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("backend", ["lightop", "target-triton"])
+def test_fp8_scheme_forwards_prequantized_input(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+):
     module, channel = _fake_fp8_scheme_module()
     patch_compressed_tensors_w8a8_fp8.apply_to_module(module)
     calls: list[tuple[object, ...]] = []
 
     class Kernel:
         _hcu_fp8_patch_applied = True
-        _hcu_fp8_backend = "target-triton"
+        _hcu_fp8_backend = backend
 
         def supports_quanted_inputs(self):
             return True

@@ -13,6 +13,105 @@ from tests.integration import model_runtime
 
 
 DEEPSEEK_V4_MODEL = Path("/models/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8")
+HY_V4_MODEL = Path("/models/Hy4-preview-FP8-Testing")
+
+
+def test_hy_v4_kv_cache_parity_exercises_baseline_quantized_and_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_generate(model_path: Path, **kwargs):
+        calls.append({"model_path": model_path, **kwargs})
+        return [{"token_ids": [len(calls)]}]
+
+    monkeypatch.setattr(model_runtime, "_generate", fake_generate)
+
+    result = model_runtime._case_hy_v4_kv_cache_parity(
+        HY_V4_MODEL,
+        tensor_parallel_size=8,
+        gpu_memory_utilization=0.95,
+        moe_backend="triton",
+        enable_expert_parallel=False,
+        kv_cache_dtype="fp8_e4m3",
+        num_speculative_tokens=3,
+    )
+
+    common = {
+        "model_path": HY_V4_MODEL,
+        "enforce_eager": True,
+        "tensor_parallel_size": 8,
+        "gpu_memory_utilization": 0.95,
+        "moe_backend": "triton",
+        "enable_expert_parallel": False,
+    }
+    assert calls == [
+        common,
+        {**common, "kv_cache_dtype": "fp8_e4m3"},
+        {
+            **common,
+            "kv_cache_dtype": "fp8_e4m3",
+            "spec_method": "mtp",
+            "spec_tokens": 3,
+        },
+    ]
+    assert result == {
+        "baseline": [{"token_ids": [1]}],
+        "quantized": [{"token_ids": [2]}],
+        "quantized_mtp": [{"token_ids": [3]}],
+        "kv_cache_dtype": "fp8_e4m3",
+    }
+
+
+def test_hy_v4_kv_cache_parity_cli_forwards_runtime_options(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_case(model_path: Path, **kwargs):
+        captured["model_path"] = model_path
+        captured.update(kwargs)
+        return {"baseline": [], "quantized": [], "quantized_mtp": []}
+
+    monkeypatch.setattr(
+        model_runtime,
+        "_case_hy_v4_kv_cache_parity",
+        fake_case,
+        raising=False,
+    )
+
+    assert (
+        model_runtime._main(
+            [
+                "hy-v4-kv-cache-parity",
+                "--model",
+                str(HY_V4_MODEL),
+                "--tensor-parallel-size",
+                "8",
+                "--gpu-memory-utilization",
+                "0.95",
+                "--moe-backend",
+                "triton",
+                "--disable-expert-parallel",
+                "--kv-cache-dtype",
+                "fp8_e4m3",
+                "--num-speculative-tokens",
+                "3",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "model_path": HY_V4_MODEL,
+        "tensor_parallel_size": 8,
+        "gpu_memory_utilization": 0.95,
+        "moe_backend": "triton",
+        "enable_expert_parallel": False,
+        "kv_cache_dtype": "fp8_e4m3",
+        "num_speculative_tokens": 3,
+    }
+    assert "VLLM_HCU_RESULT=" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

@@ -113,3 +113,54 @@ def test_hy_v4_blockwise_pure_tp8_mtp_three_token_parity(
     assert all(speculative_tokens)
     for record in [*result["baseline"], *result["speculative"]]:
         _assert_completion(record)
+
+
+def test_hy_v4_fp8_e4m3_kv_cache_prefill_decode_and_mtp_parity(
+    hcu_test_resources: HcuTestResources,
+) -> None:
+    model_path = require_model_runtime(
+        hcu_test_resources,
+        env_name="VLLM_HCU_HY_V4_MODEL",
+        relative_path=HY_V4_MODEL,
+        label="HY V4 FP8 E4M3 KV-cache parity",
+        hcu_count=8,
+    )
+
+    result = run_vllm_case(
+        "hy-v4-kv-cache-parity",
+        model_path,
+        timeout_s=7200,
+        gpu_memory_utilization=0.95,
+        log_label="hy-v4-fp8-e4m3-kv-cache-parity",
+        extra_env={
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": "0",
+        },
+        extra_args=[
+            "--tensor-parallel-size",
+            "8",
+            "--disable-expert-parallel",
+            "--moe-backend",
+            "triton",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--num-speculative-tokens",
+            "3",
+        ],
+    )
+
+    baseline_tokens = [record["token_ids"] for record in result["baseline"]]
+    quantized_tokens = [record["token_ids"] for record in result["quantized"]]
+    quantized_mtp_tokens = [
+        record["token_ids"] for record in result["quantized_mtp"]
+    ]
+    assert result["kv_cache_dtype"] == "fp8_e4m3"
+    assert quantized_tokens == baseline_tokens
+    assert quantized_mtp_tokens == baseline_tokens
+    assert all(baseline_tokens)
+    for record in [
+        *result["baseline"],
+        *result["quantized"],
+        *result["quantized_mtp"],
+    ]:
+        _assert_completion(record)
