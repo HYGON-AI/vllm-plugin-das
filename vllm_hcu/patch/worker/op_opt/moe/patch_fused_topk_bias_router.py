@@ -50,6 +50,7 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
             can_use_lightop_sqrtsoftplus,
+            is_lightop_sqrtsoftplus_available,
             run_lightop_sqrtsoftplus,
         )
         from vllm_hcu.platforms import envs as henvs
@@ -57,6 +58,7 @@ def apply_to_module(module: ModuleType) -> bool:
         use_lightop = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
+            and is_lightop_sqrtsoftplus_available()
             and can_use_lightop_sqrtsoftplus(
                 gating_output,
                 e_score_correction_bias,

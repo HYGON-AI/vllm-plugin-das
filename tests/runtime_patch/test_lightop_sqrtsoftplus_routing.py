@@ -236,10 +236,17 @@ def test_hash_routing_never_calls_lightop(
     ) is official_result
 
 
-def test_enabled_sqrtsoftplus_requires_installed_lightop_symbol(
+@pytest.mark.parametrize("missing_export", (None, object()))
+def test_enabled_sqrtsoftplus_missing_operator_uses_official_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    missing_export: object,
 ) -> None:
-    _install_lightop_moe(monkeypatch)
+    exports = (
+        {}
+        if missing_export is None
+        else {"moe_fused_gate_sqrtsoftplus": missing_export}
+    )
+    _install_lightop_moe(monkeypatch, **exports)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(
         henvs,
@@ -247,12 +254,12 @@ def test_enabled_sqrtsoftplus_requires_installed_lightop_symbol(
         True,
         raising=False,
     )
-    module = _target_module(object())
+    official_result = object()
+    module = _target_module(official_result)
     patch_fused_topk_bias_router.apply_to_module(module)
 
-    with pytest.raises(RuntimeError, match="moe_fused_gate_sqrtsoftplus"):
-        _call_patched(
-            module,
-            gating_output=_CudaTensorMetadata((2, 256), torch.float32),
-            correction_bias=_CudaTensorMetadata((256,), torch.float32),
-        )
+    assert _call_patched(
+        module,
+        gating_output=_CudaTensorMetadata((2, 256), torch.float32),
+        correction_bias=_CudaTensorMetadata((256,), torch.float32),
+    ) is official_result

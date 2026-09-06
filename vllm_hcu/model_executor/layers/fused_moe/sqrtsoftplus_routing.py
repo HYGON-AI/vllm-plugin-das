@@ -21,6 +21,22 @@ def _is_contiguous(value: Any) -> bool:
     return bool(callable(check) and check())
 
 
+def _load_lightop_sqrtsoftplus() -> Any | None:
+    try:
+        from lightop.moe import moe_fused_gate_sqrtsoftplus
+    except ImportError:
+        return None
+    if not callable(moe_fused_gate_sqrtsoftplus):
+        return None
+    return moe_fused_gate_sqrtsoftplus
+
+
+def is_lightop_sqrtsoftplus_available() -> bool:
+    """Return whether the optional categorized LightOp export is usable."""
+
+    return _load_lightop_sqrtsoftplus() is not None
+
+
 def can_use_lightop_sqrtsoftplus(
     gating_output: Any,
     correction_bias: Any,
@@ -65,20 +81,14 @@ def run_lightop_sqrtsoftplus(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute the LightOp route and normalize its index dtype for vLLM."""
 
-    try:
-        from lightop.moe import moe_fused_gate_sqrtsoftplus
-    except ImportError as exc:
-        raise RuntimeError(
-            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires "
-            "lightop.moe.moe_fused_gate_sqrtsoftplus"
-        ) from exc
-    if not callable(moe_fused_gate_sqrtsoftplus):
+    operator = _load_lightop_sqrtsoftplus()
+    if operator is None:
         raise RuntimeError(
             "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires callable "
             "lightop.moe.moe_fused_gate_sqrtsoftplus"
         )
     logger.warning_once("Using LightOp sqrt-softplus MoE routing.")
-    topk_weights, topk_ids = moe_fused_gate_sqrtsoftplus(
+    topk_weights, topk_ids = operator(
         gating_output,
         correction_bias,
         int(topk),
@@ -94,5 +104,6 @@ def run_lightop_sqrtsoftplus(
 
 __all__ = [
     "can_use_lightop_sqrtsoftplus",
+    "is_lightop_sqrtsoftplus_available",
     "run_lightop_sqrtsoftplus",
 ]
