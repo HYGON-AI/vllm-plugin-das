@@ -20,6 +20,7 @@ import torch
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     StaticEplbPlan,
     load_static_eplb_plan,
+    resolve_offline_eplb_model_key,
 )
 
 from ._common import (
@@ -313,6 +314,35 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_add_model)
     def hcu_add_model(self, model, model_config) -> None:
+        record_path, load_path = _parallel_offline_paths(self.parallel_config)
+        model_key = (
+            resolve_offline_eplb_model_key(model, self.parallel_config)
+            if record_path or load_path
+            else model.__class__.__name__
+        )
+        direct_plan = _find_static_eplb_plan(model) if load_path else None
+        if load_path and direct_plan is None:
+            raise PatchCompatibilityError(
+                f"Static EPLB path {load_path!r} for model key {model_key!r} "
+                "requires a direct-load plan for expert counts "
+                f"logical={model.num_logical_experts}, "
+                f"physical={model.num_physical_experts}, "
+                f"redundant={model.num_redundant_experts}; "
+                "model._vllm_hcu_static_eplb_plan must be bound before "
+                "checkpoint loading."
+            )
+
+        if record_path or load_path:
+            local_num_moe_layers = len(tuple(model.moe_layers))
+            if local_num_moe_layers <= 0:
+                raise PatchCompatibilityError(
+                    f"Offline EPLB found no PP-local MoE layers for {model_key!r}."
+                )
+            # Upstream sizes every EPLB state tensor from this public count.
+            # DeepSeek V2 and GLM expose a global count while ``moe_layers`` is
+            # PP-local, so offline modes must align it before upstream allocates.
+            model.num_moe_layers = local_num_moe_layers
+
         original_add_model(self, model, model_config)
         model_hash = model_config.compute_hash()
         model_state = self.model_states.get(model_hash)
@@ -320,8 +350,6 @@ def apply_to_module(module: ModuleType) -> bool:
             raise PatchCompatibilityError(
                 "vLLM EPLB add_model did not publish the expected model state"
             )
-        record_path, load_path = _parallel_offline_paths(self.parallel_config)
-        model_key = model.__class__.__name__
         setattr(model_state, _MODEL_RECORD_PATH_ATTR, record_path)
         setattr(model_state, _MODEL_KEY_ATTR, model_key)
 
@@ -337,17 +365,7 @@ def apply_to_module(module: ModuleType) -> bool:
             )
 
         if load_path:
-            direct_plan = _find_static_eplb_plan(model)
-            if direct_plan is None:
-                raise PatchCompatibilityError(
-                    f"Static EPLB path {load_path!r} for model key {model_key!r} "
-                    "requires a direct-load plan for expert counts "
-                    f"logical={model.num_logical_experts}, "
-                    f"physical={model.num_physical_experts}, "
-                    f"redundant={model.num_redundant_experts}; "
-                    "model._vllm_hcu_static_eplb_plan must be bound before "
-                    "checkpoint loading."
-                )
+            assert direct_plan is not None
             _validate_direct_load_plan(
                 direct_plan,
                 load_path=load_path,

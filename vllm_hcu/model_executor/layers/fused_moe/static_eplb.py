@@ -15,6 +15,9 @@ from typing import Any
 import torch
 
 
+_OFFLINE_MODEL_KEY_ATTR = "_vllm_hcu_offline_eplb_model_key"
+
+
 @dataclass(frozen=True)
 class StaticEplbPlan:
     """A checkpoint-loading layout that cannot be mutated by its consumers."""
@@ -69,10 +72,10 @@ def _select_model_payload(
     path: str,
     payload: dict[str, Any],
     model_key: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     model_maps = payload.get("model_maps")
     if model_maps is None:
-        return payload
+        return payload, False
     if not isinstance(model_maps, dict):
         raise ValueError(f"Offline EPLB map {path!r} has invalid model_maps.")
     if model_key not in model_maps:
@@ -83,7 +86,60 @@ def _select_model_payload(
     selected = model_maps[model_key]
     if not isinstance(selected, dict):
         raise ValueError(f"Offline EPLB map {path!r} key {model_key!r} is invalid.")
-    return selected
+    return selected, True
+
+
+def _pipeline_parallel_stage(parallel_config: object) -> int | None:
+    pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+    if (
+        isinstance(pipeline_parallel_size, bool)
+        or not isinstance(pipeline_parallel_size, int)
+        or pipeline_parallel_size <= 0
+    ):
+        raise ValueError(
+            "Static EPLB requires pipeline_parallel_size to be a positive integer."
+        )
+    if pipeline_parallel_size == 1:
+        return None
+
+    pipeline_parallel_rank = getattr(
+        parallel_config,
+        "pipeline_parallel_rank",
+        None,
+    )
+    if pipeline_parallel_rank is None:
+        from vllm.distributed import get_pp_group
+
+        pipeline_parallel_rank = get_pp_group().rank_in_group
+    if (
+        isinstance(pipeline_parallel_rank, bool)
+        or not isinstance(pipeline_parallel_rank, int)
+        or not 0 <= pipeline_parallel_rank < pipeline_parallel_size
+    ):
+        raise ValueError(
+            "Static EPLB requires a valid pipeline-parallel rank; "
+            f"got rank={pipeline_parallel_rank!r}, size={pipeline_parallel_size}."
+        )
+    return pipeline_parallel_rank
+
+
+def resolve_offline_eplb_model_key(
+    model: object,
+    parallel_config: object,
+) -> str:
+    """Resolve the public model owner and PP stage used by record and load."""
+
+    bound_key = getattr(model, _OFFLINE_MODEL_KEY_ATTR, None)
+    if bound_key is not None:
+        if not isinstance(bound_key, str) or not bound_key:
+            raise ValueError("Static EPLB model published an invalid offline key.")
+        return bound_key
+
+    model_key = model.__class__.__name__
+    pipeline_parallel_rank = _pipeline_parallel_stage(parallel_config)
+    if pipeline_parallel_rank is not None:
+        model_key = f"{model_key}#pp_rank={pipeline_parallel_rank}"
+    return model_key
 
 
 def _validate_raw_map(path: str, raw_map: Any) -> list[list[int]]:
@@ -116,7 +172,11 @@ def load_static_eplb_plan(
 
     canonical_path = str(Path(path).expanduser().resolve(strict=True))
     payload, digest = _read_json(canonical_path, _file_identity(Path(canonical_path)))
-    selected = _select_model_payload(canonical_path, payload, model_key)
+    selected, is_keyed_map = _select_model_payload(
+        canonical_path,
+        payload,
+        model_key,
+    )
     raw_map = selected.get("physical_to_logical_map", selected.get("expert_map"))
     if raw_map is None:
         raise ValueError(
@@ -129,7 +189,12 @@ def load_static_eplb_plan(
     if any(len(row) != loaded_shape[1] for row in rows):
         raise ValueError(f"Offline EPLB map {canonical_path!r} has ragged rows.")
     if loaded_shape != expected_shape:
-        if loaded_shape[0] > expected_shape[0] and loaded_shape[1] == expected_shape[1]:
+        if (
+            not is_keyed_map
+            and model_key == "HYV4MTP"
+            and loaded_shape[0] > expected_shape[0]
+            and loaded_shape[1] == expected_shape[1]
+        ):
             rows = rows[-expected_shape[0] :]
             loaded_shape = expected_shape
         else:
@@ -224,7 +289,7 @@ def bind_static_eplb_plan(
 
     from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
-    model_key = model.__class__.__name__
+    model_key = resolve_offline_eplb_model_key(model, parallel_config)
     if not is_mixture_of_experts(model):
         raise ValueError(
             "Static EPLB direct load requires a MixtureOfExperts model with "
@@ -248,17 +313,21 @@ def bind_static_eplb_plan(
 
     model_moe_layers = model.moe_layers
     moe_layers = tuple(model_moe_layers)
-    if len(moe_layers) != counts["num_moe_layers"]:
+    local_num_moe_layers = len(moe_layers)
+    if (
+        getattr(parallel_config, "pipeline_parallel_size", 1) == 1
+        and local_num_moe_layers != counts["num_moe_layers"]
+    ):
         raise ValueError(
             "Static EPLB direct load found a MixtureOfExperts.moe_layers "
-            f"count of {len(moe_layers)} for {model_key}; expected "
+            f"count of {local_num_moe_layers} for {model_key}; expected "
             f"{counts['num_moe_layers']}."
         )
 
     plan = maybe_load_static_eplb_plan(
         vllm_config,
         model_key=model_key,
-        num_moe_layers=counts["num_moe_layers"],
+        num_moe_layers=local_num_moe_layers,
         num_logical_experts=counts["num_logical_experts"],
         num_physical_experts=counts["num_physical_experts"],
         num_redundant_experts=counts["num_redundant_experts"],
@@ -289,19 +358,22 @@ def bind_static_eplb_plan(
     rows = tuple(
         plan.layer_map(layer_idx) for layer_idx in range(len(routed_experts))
     )
-    plan_owners = []
-    inner_model = getattr(model, "model", None)
-    if (
-        inner_model is not None
-        and inner_model is not model
-        and getattr(inner_model, "moe_layers", None) is model_moe_layers
-    ):
-        plan_owners.append(inner_model)
+    plan_owners: list[object] = []
+    for attribute in ("model", "language_model"):
+        inner_model = getattr(model, attribute, None)
+        if (
+            inner_model is not None
+            and inner_model is not model
+            and getattr(inner_model, "moe_layers", None) is model_moe_layers
+            and inner_model not in plan_owners
+        ):
+            plan_owners.append(inner_model)
     plan_owners.append(model)
     for routed_experts_layer, row in zip(routed_experts, rows, strict=True):
         setattr(routed_experts_layer, "_vllm_hcu_static_eplb_row", row)
     for owner in plan_owners:
         setattr(owner, "_vllm_hcu_static_eplb_plan", plan)
+        setattr(owner, _OFFLINE_MODEL_KEY_ATTR, model_key)
     return plan
 
 
@@ -354,4 +426,5 @@ __all__ = [
     "load_static_logical_expert",
     "load_static_eplb_plan",
     "maybe_load_static_eplb_plan",
+    "resolve_offline_eplb_model_key",
 ]

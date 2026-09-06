@@ -212,7 +212,11 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 # ``model.load_weights``. Arm this callback before any model-specific adapter
 # can import a model module.
 _MODEL_LOADER_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb_gate")
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb")),
+    _CallbackSpec(_adapter("framework_opt", "patch_llama4_static_eplb")),
 )
 
 

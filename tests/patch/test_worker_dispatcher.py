@@ -145,6 +145,49 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert "os.walk(" not in source
 
 
+def test_static_eplb_callbacks_apply_during_cold_model_loader_import():
+    result = _run_fresh(
+        """
+import json
+
+from vllm_hcu.patch.worker import prepare_worker_patches
+
+prepare_worker_patches()
+import vllm.model_executor.model_loader as model_loader
+from vllm.model_executor.model_loader import base_loader, utils
+from vllm.model_executor.models import llama4
+
+print(json.dumps({
+    "initializer_wrapped": bool(getattr(
+        utils.initialize_model,
+        "_vllm_hcu_static_eplb_model_loader_wrapper",
+        False,
+    )),
+    "base_alias_current": base_loader.initialize_model is utils.initialize_model,
+    "entrypoint_wrapped": bool(getattr(
+        model_loader.get_model_loader,
+        "_vllm_hcu_static_eplb_loader_gate_wrapper",
+        False,
+    )),
+    "llama4_fused_wrapped": bool(getattr(
+        llama4.Llama4Model.load_moe_expert_weights,
+        "_vllm_hcu_llama4_static_eplb_fused_wrapper",
+        False,
+    )),
+}))
+""",
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "initializer_wrapped": True,
+        "base_alias_current": True,
+        "entrypoint_wrapped": True,
+        "llama4_fused_wrapped": True,
+    }
+
+
 def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
     patch_id = "worker.framework_opt.pcp.default_model_state_metadata"
     assert (

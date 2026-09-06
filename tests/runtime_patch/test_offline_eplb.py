@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    bind_static_eplb_plan,
     load_static_eplb_plan,
 )
 from vllm_hcu.patch.worker import worker_callback_names
@@ -214,11 +215,49 @@ class HYV4ForCausalLM:
     num_redundant_experts = 2
     num_physical_experts = 6
     num_moe_layers = 1
+    moe_layers = [SimpleNamespace()]
     expert_weights = [[torch.zeros(1)]]
 
 
 class GenericMoEForCausalLM(HYV4ForCausalLM):
     pass
+
+
+class _StageMoERunner:
+    def __init__(self) -> None:
+        self.routed_experts = SimpleNamespace()
+
+    def get_expert_weights(self) -> list[torch.Tensor]:
+        return [torch.zeros(1)]
+
+    def set_eplb_state(self, **kwargs: object) -> None:
+        del kwargs
+
+
+class PipelineMoEForCausalLM(HYV4ForCausalLM):
+    def __init__(self, local_moe_layers: int) -> None:
+        self.num_moe_layers = 3
+        self.num_expert_groups = 1
+        self.num_local_physical_experts = 6
+        self.num_routed_experts = 4
+        self.num_shared_experts = 0
+        self.moe_layers = [_StageMoERunner() for _ in range(local_moe_layers)]
+        self.expert_weights = [[torch.zeros(1)] for _ in self.moe_layers]
+
+    def set_eplb_state(self, *args: object) -> None:
+        del args
+
+    def update_physical_experts_metadata(self, *args: object) -> None:
+        del args
+
+
+class Llama4ForConditionalGeneration(PipelineMoEForCausalLM):
+    def __init__(self) -> None:
+        super().__init__(local_moe_layers=1)
+        self.num_moe_layers = 1
+        self.language_model = PipelineMoEForCausalLM(local_moe_layers=1)
+        self.language_model.num_moe_layers = 1
+        self.language_model.moe_layers = self.moe_layers
 
 
 def test_offline_eplb_patch_is_registered_in_worker_inventory() -> None:
@@ -229,6 +268,8 @@ def _make_eplb_module(
     *,
     record_path: Path | None = None,
     load_path: Path | None = None,
+    pipeline_parallel_size: int = 1,
+    pipeline_parallel_rank: int = 0,
 ) -> tuple[ModuleType, list[tuple[torch.Tensor, torch.Tensor]], _FakeDeviceGroup]:
     module = ModuleType(
         "vllm.distributed.eplb.eplb_state"
@@ -248,6 +289,8 @@ def _make_eplb_module(
                 _vllm_hcu_expert_map_path=(
                     str(load_path) if load_path is not None else None
                 ),
+                pipeline_parallel_size=pipeline_parallel_size,
+                pipeline_parallel_rank=pipeline_parallel_rank,
             )
             self.device = torch.device("cpu")
             self.model_states: dict[str, EplbModelState] = {}
@@ -258,8 +301,11 @@ def _make_eplb_module(
 
         def add_model(self, model, model_config) -> None:
             state = EplbModelState()
-            state.physical_to_logical_map = torch.tensor(
-                [[0, 1, 2, 3, 0, 1]], dtype=torch.int64
+            state.physical_to_logical_map = (
+                torch.tensor([0, 1, 2, 3, 0, 1], dtype=torch.int64)
+                .unsqueeze(0)
+                .expand(model.num_moe_layers, -1)
+                .clone()
             )
             state.logical_to_physical_map = torch.empty(0)
             state.logical_replica_count = torch.empty(0)
@@ -279,7 +325,12 @@ def _make_eplb_module(
 
         def rearrange(self, is_profile=False, rank_mapping=None):
             model_state = self.model_states["hy4-hash"]
-            candidate = torch.tensor([[3, 2, 1, 0, 3, 2]], dtype=torch.int64)
+            candidate = (
+                torch.tensor([3, 2, 1, 0, 3, 2], dtype=torch.int64)
+                .unsqueeze(0)
+                .expand_as(model_state.physical_to_logical_map)
+                .clone()
+            )
             module.rearrange_expert_weights_inplace(
                 model_state.physical_to_logical_map,
                 candidate,
@@ -352,6 +403,131 @@ def test_runtime_patch_records_initial_and_committed_maps(tmp_path: Path) -> Non
     assert recorded["model_maps"]["HYV4ForCausalLM"][
         "physical_to_logical_map"
     ] == committed.tolist()
+
+
+def test_two_pp_stages_record_and_load_independent_local_maps(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "pipeline.json"
+    stage_maps = (
+        torch.tensor(
+            [
+                [3, 2, 1, 0, 3, 2],
+                [2, 3, 0, 1, 2, 3],
+            ],
+            dtype=torch.int64,
+        ),
+        torch.tensor([[1, 0, 3, 2, 1, 0]], dtype=torch.int64),
+    )
+
+    for pp_rank, stage_map in enumerate(stage_maps):
+        module, rearrangements, _ = _make_eplb_module(
+            record_path=output,
+            pipeline_parallel_size=2,
+            pipeline_parallel_rank=pp_rank,
+        )
+        assert apply_to_module(module)
+        state = module.EplbState()
+        model = PipelineMoEForCausalLM(local_moe_layers=stage_map.shape[0])
+        state.add_model(model, _FakeModelConfig())
+        model_state = state.model_states["hy4-hash"]
+
+        assert model.num_moe_layers == stage_map.shape[0]
+        assert model_state.physical_to_logical_map.shape == stage_map.shape
+        module._commit_eplb_maps(model_state, stage_map)
+        assert rearrangements == []
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert set(payload["model_maps"]) == {
+        "PipelineMoEForCausalLM#pp_rank=0",
+        "PipelineMoEForCausalLM#pp_rank=1",
+    }
+    for pp_rank, stage_map in enumerate(stage_maps):
+        key = f"PipelineMoEForCausalLM#pp_rank={pp_rank}"
+        assert payload["model_maps"][key]["physical_to_logical_map"] == (
+            stage_map.tolist()
+        )
+
+        model = PipelineMoEForCausalLM(local_moe_layers=stage_map.shape[0])
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                _vllm_hcu_expert_map_path=str(output),
+                enable_expert_parallel=True,
+                enable_eplb=True,
+                enable_ep_weight_filter=False,
+                pipeline_parallel_size=2,
+                pipeline_parallel_rank=pp_rank,
+            )
+        )
+        plan = bind_static_eplb_plan(config, model)
+        assert plan is not None
+        assert plan.model_key == key
+        assert plan.physical_to_logical_map.tolist() == stage_map.tolist()
+
+        load_module, rearrangements, _ = _make_eplb_module(
+            load_path=output,
+            pipeline_parallel_size=2,
+            pipeline_parallel_rank=pp_rank,
+        )
+        assert apply_to_module(load_module)
+        load_state = load_module.EplbState()
+        load_state.add_model(model, _FakeModelConfig())
+        assert rearrangements == []
+        assert load_state.model_states[
+            "hy4-hash"
+        ].physical_to_logical_map.tolist() == stage_map.tolist()
+
+
+def test_dynamic_eplb_keeps_the_models_declared_global_layer_count() -> None:
+    module, _, _ = _make_eplb_module()
+    assert apply_to_module(module)
+    state = module.EplbState()
+    model = PipelineMoEForCausalLM(local_moe_layers=1)
+
+    state.add_model(model, _FakeModelConfig())
+
+    assert model.num_moe_layers == 3
+    assert state.model_states["hy4-hash"].physical_to_logical_map.shape == (3, 6)
+
+
+def test_nested_mllama_record_is_loadable_under_the_same_public_key(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "mllama.json"
+    record_module, _, _ = _make_eplb_module(record_path=output)
+    assert apply_to_module(record_module)
+    record_state = record_module.EplbState()
+    record_state.add_model(Llama4ForConditionalGeneration(), _FakeModelConfig())
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert set(payload["model_maps"]) == {"Llama4ForConditionalGeneration"}
+
+    model = Llama4ForConditionalGeneration()
+    plan = bind_static_eplb_plan(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                _vllm_hcu_expert_map_path=str(output),
+                enable_expert_parallel=True,
+                enable_eplb=True,
+                enable_ep_weight_filter=False,
+                pipeline_parallel_size=1,
+            )
+        ),
+        model,
+    )
+    assert plan is not None
+    assert plan.model_key == "Llama4ForConditionalGeneration"
+    assert model.language_model._vllm_hcu_static_eplb_plan is plan
+
+    load_module, rearrangements, _ = _make_eplb_module(load_path=output)
+    assert apply_to_module(load_module)
+    load_state = load_module.EplbState()
+    load_state.add_model(model, _FakeModelConfig())
+
+    assert rearrangements == []
+    assert load_state.model_states[
+        "hy4-hash"
+    ].physical_to_logical_map.tolist() == [[0, 1, 2, 3, 0, 1]]
 
 
 def test_runtime_patch_commits_generic_static_plan_without_rearrangement(

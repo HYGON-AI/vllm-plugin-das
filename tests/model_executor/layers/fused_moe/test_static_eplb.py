@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -165,12 +166,60 @@ def test_legacy_mtp_plan_selects_final_rows(tmp_path: Path) -> None:
     assert plan.layer_map(0) == (3, 2, 1, 0, 3, 2)
 
 
+def test_keyed_v2_plan_rejects_oversized_rows_instead_of_taking_a_suffix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "keyed-v2.json"
+    _write_map(
+        path,
+        [
+            [0, 1, 2, 3, 0, 1],
+            [3, 2, 1, 0, 3, 2],
+        ],
+        key="HYV4MTP",
+    )
+
+    with pytest.raises(ValueError, match=r"shape \(2, 6\).+expected \(1, 6\)"):
+        load_static_eplb_plan(
+            path,
+            model_key="HYV4MTP",
+            expected_shape=(1, 6),
+            num_logical_experts=4,
+            num_redundant_experts=2,
+        )
+
+
+def test_legacy_non_mtp_plan_rejects_oversized_rows(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-main.json"
+    path.write_text(
+        json.dumps(
+            {
+                "physical_to_logical_map": [
+                    [0, 1, 2, 3, 0, 1],
+                    [3, 2, 1, 0, 3, 2],
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"shape \(2, 6\).+expected \(1, 6\)"):
+        load_static_eplb_plan(
+            path,
+            model_key="HYV4ForCausalLM",
+            expected_shape=(1, 6),
+            num_logical_experts=4,
+            num_redundant_experts=2,
+        )
+
+
 def _config_for_path(path: Path | None, **overrides):
     values = {
         "_vllm_hcu_expert_map_path": str(path) if path else None,
         "enable_expert_parallel": True,
         "enable_eplb": True,
         "enable_ep_weight_filter": False,
+        "pipeline_parallel_size": 1,
     }
     values.update(overrides)
     return type(
@@ -262,6 +311,21 @@ class _FakeMoEModel:
         del args
 
 
+class _FakePipelineMoEModel(_FakeMoEModel):
+    def __init__(self, *, runners: list[object]) -> None:
+        super().__init__(runners=runners)
+        # DeepSeek V2 and GLM expose a global count even though this sequence
+        # contains only the current PP stage's MoE layers.
+        self.num_moe_layers = 3
+
+
+class Llama4ForConditionalGeneration(_FakeMoEModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = _FakeMoEModel(runners=self.moe_layers)
+        self.language_model.moe_layers = self.moe_layers
+
+
 def _write_binder_map(path: Path) -> None:
     _write_map(
         path,
@@ -291,6 +355,106 @@ def test_bind_plan_publishes_each_row_to_routed_experts(tmp_path: Path) -> None:
         2,
         1,
     )
+
+
+def test_bind_plan_selects_pp_local_rows_by_stage_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "pipeline-maps.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "model_maps": {
+                    "_FakePipelineMoEModel#pp_rank=0": {
+                        "physical_to_logical_map": [
+                            [2, 1, 0, 2],
+                            [1, 0, 2, 1],
+                        ]
+                    },
+                    "_FakePipelineMoEModel#pp_rank=1": {
+                        "physical_to_logical_map": [[0, 2, 1, 0]]
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_zero = _FakePipelineMoEModel(
+        runners=[_FakeMoERunner(), _FakeMoERunner()]
+    )
+    stage_one = _FakePipelineMoEModel(runners=[_FakeMoERunner()])
+    current_pp_rank = [0]
+    monkeypatch.setattr(
+        "vllm.distributed.get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=current_pp_rank[0]),
+    )
+
+    stage_zero_plan = bind_static_eplb_plan(
+        _config_for_path(
+            path,
+            pipeline_parallel_size=2,
+        ),
+        stage_zero,
+    )
+    current_pp_rank[0] = 1
+    stage_one_plan = bind_static_eplb_plan(
+        _config_for_path(
+            path,
+            pipeline_parallel_size=2,
+        ),
+        stage_one,
+    )
+
+    assert stage_zero_plan is not None
+    assert stage_zero_plan.model_key == "_FakePipelineMoEModel#pp_rank=0"
+    assert stage_zero_plan._map_values == ((2, 1, 0, 2), (1, 0, 2, 1))
+    assert stage_one_plan is not None
+    assert stage_one_plan.model_key == "_FakePipelineMoEModel#pp_rank=1"
+    assert stage_one_plan._map_values == ((0, 2, 1, 0),)
+    assert stage_zero.num_moe_layers == 3
+    assert stage_one.num_moe_layers == 3
+
+
+def test_bind_plan_cannot_fall_back_to_another_pp_stage_key(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "stage-zero-only.json"
+    _write_map(
+        path,
+        [[2, 1, 0, 2], [1, 0, 2, 1]],
+        key="_FakePipelineMoEModel#pp_rank=0",
+    )
+
+    with pytest.raises(ValueError, match=r"_FakePipelineMoEModel#pp_rank=1"):
+        bind_static_eplb_plan(
+            _config_for_path(
+                path,
+                pipeline_parallel_size=2,
+                pipeline_parallel_rank=1,
+            ),
+            _FakePipelineMoEModel(runners=[_FakeMoERunner()]),
+        )
+
+
+def test_bind_plan_uses_the_public_mllama_owner_for_nested_language_model(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mllama-map.json"
+    _write_map(
+        path,
+        [[2, 1, 0, 2], [1, 0, 2, 1]],
+        key="Llama4ForConditionalGeneration",
+    )
+    model = Llama4ForConditionalGeneration()
+
+    plan = bind_static_eplb_plan(_config_for_path(path), model)
+
+    assert plan is not None
+    assert plan.model_key == "Llama4ForConditionalGeneration"
+    assert model._vllm_hcu_static_eplb_plan is plan
+    assert model.language_model._vllm_hcu_static_eplb_plan is plan
 
 
 def test_bind_plan_returns_none_without_a_configured_path() -> None:
