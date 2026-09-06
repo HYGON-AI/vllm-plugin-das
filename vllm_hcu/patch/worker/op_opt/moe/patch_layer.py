@@ -155,6 +155,33 @@ def apply_to_module(module: ModuleType) -> bool:
                 return_success=return_success,
             )
 
+        row = self._vllm_hcu_static_eplb_row
+        num_logical_experts = self.moe_config.num_logical_experts
+        num_fused_shared_experts = (
+            self.expert_map_manager.num_fused_shared_experts
+        )
+        if (
+            not isinstance(expert_id, bool)
+            and isinstance(expert_id, int)
+            and num_logical_experts
+            <= expert_id
+            < num_logical_experts + num_fused_shared_experts
+        ):
+            # Shared experts are appended after all routed physical slots and
+            # remain fixed while EPLB remaps only routed logical experts.
+            shared_physical_expert_id = len(row) + (
+                expert_id - num_logical_experts
+            )
+            return weight_loader(
+                self,
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                shared_physical_expert_id,
+                return_success=return_success,
+            )
+
         from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
             load_static_logical_expert,
         )

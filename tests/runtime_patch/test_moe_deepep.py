@@ -1775,6 +1775,27 @@ def test_moe_layer_patch_forward_and_repacked_weight_contract(
         [4.0, 5.0],
     ]
 
+    static_experts.expert_map_manager.num_fused_shared_experts = 1
+    shared_mapping = static_experts.get_expert_mapping()
+    assert len(shared_mapping) == 12
+    assert [entry[2] for entry in shared_mapping[::3]] == [0, 1, 2, 3]
+
+    static_experts.weight_loader_calls.clear()
+    static_experts.local_physical_ids = {4}
+    assert (
+        static_experts.parameter_weight_loader(
+            param,
+            tensor,
+            "w13_weight",
+            "w1",
+            3,
+            return_success=True,
+        )
+        is True
+    )
+    assert [call[4] for call in static_experts.weight_loader_calls] == [4]
+    static_experts.expert_map_manager.num_fused_shared_experts = 0
+
     static_model = SimpleNamespace(
         named_parameters=lambda: iter(()),
         modules=lambda: iter((static_experts,)),
