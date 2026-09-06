@@ -323,6 +323,10 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         feature="deepep_low_latency",
     ),
     _CallbackSpec(
+        _adapter("framework_opt", "patch_gpu_dp_utils"),
+        feature="deepep_low_latency",
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_forward_context"),
         feature="forward_context",
     ),
@@ -347,6 +351,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_eagle_utils"),
         feature="multi_layers_mtp",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
@@ -810,6 +817,14 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         states = _feature_states(vllm_config, config)
         for patch_id, feature in _patch_features().items():
             IMPORT_COORDINATOR.set_feature_enabled(patch_id, states[feature])
+        from vllm_hcu.patch.worker.framework_opt import patch_gpu_dp_utils
+
+        patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(
+            enabled=(
+                _parallel_backend(vllm_config) == "deepep_low_latency"
+                and not config.deepep_auto
+            )
+        )
         _raise_latched_or_required_failures(IMPORT_COORDINATOR)
 
 
