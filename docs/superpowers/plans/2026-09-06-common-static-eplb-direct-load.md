@@ -31,7 +31,7 @@
 - Modify: `vllm_hcu/patch/worker/framework_opt/__init__.py`
 - Modify: `vllm_hcu/patch/worker/__init__.py`
 - Create: `tests/runtime_patch/test_model_loader_static_eplb.py`
-- Modify: `tests/runtime_patch/test_worker_dispatcher.py`
+- Modify: `tests/patch/test_worker_dispatcher.py`
 
 **Interfaces:**
 
@@ -98,13 +98,13 @@ worker dispatcher before model-specific modules are imported.
 Run:
 
 ```bash
-pytest -q tests/model_executor/layers/fused_moe/test_static_eplb.py tests/runtime_patch/test_model_loader_static_eplb.py tests/runtime_patch/test_worker_dispatcher.py
+pytest -q tests/model_executor/layers/fused_moe/test_static_eplb.py tests/runtime_patch/test_model_loader_static_eplb.py tests/patch/test_worker_dispatcher.py
 ```
 
 Expected: all tests pass.  Commit:
 
 ```bash
-git add vllm_hcu/model_executor/layers/fused_moe/static_eplb.py vllm_hcu/patch/worker/framework_opt/patch_model_loader_static_eplb.py vllm_hcu/patch/worker/framework_opt/__init__.py vllm_hcu/patch/worker/__init__.py tests/runtime_patch/test_model_loader_static_eplb.py tests/runtime_patch/test_worker_dispatcher.py
+git add vllm_hcu/model_executor/layers/fused_moe/static_eplb.py vllm_hcu/patch/worker/framework_opt/patch_model_loader_static_eplb.py vllm_hcu/patch/worker/framework_opt/__init__.py vllm_hcu/patch/worker/__init__.py tests/runtime_patch/test_model_loader_static_eplb.py tests/patch/test_worker_dispatcher.py
 git commit -m "feat(eplb): bind static plans before common model loading"
 ```
 
@@ -379,7 +379,7 @@ pytest -q \
   tests/runtime_patch/test_moe_deepep.py \
   tests/runtime_patch/test_offline_eplb.py \
   tests/runtime_patch/test_platform_hcu_config.py \
-  tests/runtime_patch/test_worker_dispatcher.py
+  tests/patch/test_worker_dispatcher.py
 python -m compileall -q vllm_hcu
 git diff --check feat/hy-v4-mtp-blockwise-v0251..HEAD
 ```
