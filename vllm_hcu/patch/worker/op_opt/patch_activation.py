@@ -80,15 +80,14 @@ def apply_to_module(module: ModuleType) -> bool:
         self.alpha = float(alpha)
         self.beta = float(beta)
         platform = activation.current_platform
-        if platform.is_rocm() or platform.is_cuda_alike() or platform.is_xpu():
+        if platform.is_rocm():
             try:
                 self.op = activation.torch.ops._C.silu_and_mul_with_clamp
-            except AttributeError as exc:
-                raise RuntimeError(
-                    "HCU clamp SwiGLU is required, but "
-                    "torch.ops._C.silu_and_mul_with_clamp is unavailable"
-                ) from exc
-        elif platform.is_cpu():
+            except AttributeError:
+                self._forward_method = self.forward_native
+        elif platform.is_cuda_alike():
+            self.op = activation.torch.ops._C.silu_and_mul_with_clamp
+        elif platform.is_xpu() or platform.is_cpu():
             self._forward_method = self.forward_native
 
     setattr(hcu_init, _WRAPPER_MARKER, True)

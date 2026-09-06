@@ -45,6 +45,16 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_rmsnorm_gated.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_moe_align_fallback_graph.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_lightop_w16a16_moe_accuracy.py",
     est_time=180,
 )

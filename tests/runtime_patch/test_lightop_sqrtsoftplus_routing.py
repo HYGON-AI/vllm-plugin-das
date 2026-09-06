@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -234,6 +234,73 @@ def test_hash_routing_never_calls_lightop(
         input_tokens=torch.tensor([1, 2], dtype=torch.int64),
         hash_indices_table=torch.tensor([[1], [2], [3]], dtype=torch.int64),
     ) is official_result
+
+
+def test_hash_routing_uses_official_torch_fallback_when_compiled_op_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_lightop_moe(
+        monkeypatch,
+        moe_fused_gate_sqrtsoftplus=lambda *args, **kwargs: pytest.fail(
+            "hash routing must not execute LightOp"
+        ),
+    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE",
+        True,
+        raising=False,
+    )
+    native_result = object()
+    native_calls: list[tuple[object, ...]] = []
+
+    def unavailable_original(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        renormalize=False,
+        e_score_correction_bias=None,
+        input_tokens=None,
+        hash_indices_table=None,
+        routed_scaling_factor=1.0,
+    ):
+        del (
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            e_score_correction_bias,
+            input_tokens,
+            hash_indices_table,
+            routed_scaling_factor,
+        )
+        pytest.fail("missing compiled operator must not be invoked")
+
+    def native_fallback(*args):
+        native_calls.append(args)
+        return native_result
+
+    module = _module(
+        patch_fused_topk_bias_router.TARGET_MODULE,
+        vllm_topk_softplus_sqrt=unavailable_original,
+        _topk_softplus_sqrt_torch=native_fallback,
+        torch=SimpleNamespace(ops=SimpleNamespace(_moe_C=SimpleNamespace())),
+    )
+    patch_fused_topk_bias_router.apply_to_module(module)
+
+    assert _call_patched(
+        module,
+        gating_output=_CudaTensorMetadata((2, 256), torch.float32),
+        correction_bias=_CudaTensorMetadata((256,), torch.float32),
+        input_tokens=torch.tensor([1, 2], dtype=torch.int64),
+        hash_indices_table=torch.tensor([[1], [2], [3]], dtype=torch.int64),
+    ) is native_result
+    assert len(native_calls) == 1
+    assert native_calls[0][6].dtype is torch.int64
+    assert native_calls[0][7].dtype is torch.int64
 
 
 @pytest.mark.parametrize("missing_export", (None, object()))

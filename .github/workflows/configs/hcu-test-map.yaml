@@ -496,8 +496,10 @@
         "tests/accuracy/test_aiter_batched_gemm_bf16.py",
         "tests/accuracy/test_aiter_silu_and_mul.py",
         "tests/accuracy/test_lightop_mla_concat_accuracy.py",
+        "tests/accuracy/test_lightop_rmsnorm_gated.py",
         "tests/accuracy/test_lightop_sqrtsoftplus_gate.py",
         "tests/accuracy/test_lightop_w16a16_moe_accuracy.py",
+        "tests/accuracy/test_moe_align_fallback_graph.py",
         "tests/accuracy/test_unified_aiter_moe_operator.py"
       ],
       "jobs": [

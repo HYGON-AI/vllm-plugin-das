@@ -38,3 +38,9 @@ Available local configurations:
   profiles for the local Qwen3.6-35B-A3B checkpoint, with a 16-token scheduler
   bound matching the accepted LightOp W16A16 range and exact HumanEval-32
   artifact checks.
+- `qwen36_27b_humaneval_evalscope.yaml`: TP1 feature-off/feature-on profiles
+  for the local Qwen3.6-27B checkpoint and strict gated-RMSNorm HumanEval-32
+  acceptance.
+- `qwen35_35b_a3b_w8a8_humaneval_evalscope.yaml`: TP1 feature-off/feature-on
+  profiles for the quantized Qwen3.5 checkpoint. Its FP32 gated-norm weight
+  makes this an explicit strict-BF16 fallback and accuracy control.

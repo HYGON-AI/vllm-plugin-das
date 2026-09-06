@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-name: qwen36_35b_a3b_operator_adaptation_humaneval
-model: /models/Qwen3.6-35B-A3B
+name: qwen35_35b_a3b_w8a8_gated_rmsnorm_humaneval
+model: /models/Qwen3.5-35B-A3B-W8A8
 
 server:
   host: 127.0.0.1
-  startup_timeout_s: 7200
+  startup_timeout_s: 3600
   shutdown_timeout_s: 120
-  served_model_name: Qwen3.6-35B-A3B
+  served_model_name: Qwen3.5-35B-A3B-W8A8
   args:
     - --trust-remote-code
     - --language-model-only
@@ -56,20 +56,18 @@ evalscope:
 profiles:
   feature_off:
     server:
-      port: 10144
+      port: 10148
       environment:
         VLLM_HCU_USE_CUSTOM_OPS: "1"
-        VLLM_HCU_USE_LIGHTOP_W16A16_MOE: "0"
         VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: "0"
     evalscope:
-      work_dir: /tmp/vllm-hcu-evalscope/qwen36_35b_a3b_operator_adaptation_off
+      work_dir: /tmp/vllm-hcu-evalscope/qwen35_35b_a3b_w8a8_gated_rmsnorm_off
 
   feature_on:
     server:
-      port: 10145
+      port: 10149
       environment:
         VLLM_HCU_USE_CUSTOM_OPS: "1"
-        VLLM_HCU_USE_LIGHTOP_W16A16_MOE: "1"
         VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: "1"
     evalscope:
-      work_dir: /tmp/vllm-hcu-evalscope/qwen36_35b_a3b_operator_adaptation_on
+      work_dir: /tmp/vllm-hcu-evalscope/qwen35_35b_a3b_w8a8_gated_rmsnorm_on

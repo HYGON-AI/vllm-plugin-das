@@ -1,6 +1,6 @@
 # LightOp/AITER Operator Adaptation Audit for vLLM 0.25.1
 
-Date: 2026-09-06
+Date: 2026-09-07
 
 ## Purpose
 
@@ -11,11 +11,12 @@ live-HCU numerical test and a same-shape performance comparison.
 
 The audit baseline is:
 
-- vLLM HCU plugin `origin/v0.25.1` at `88f8a07`;
-- vLLM source `/models/zb/vllm_025/vllm`;
+- vLLM HCU plugin branch baseline `6925ca37`;
+- vLLM source `/models/zb/vllm_025/vllm` at `7b108ad1`;
 - `sglang-das` main at `0457572`;
-- installed LightOp 0.6.0; and
-- the AITER package installed with the current HCU runner image.
+- installed LightOp distribution `0.6.0+das.dtk2604`; and
+- installed AITER
+  `0.1.5+das185.dtk2604.torch2110.2608180853.g40a705`.
 
 ## Dispositions
 
@@ -27,9 +28,14 @@ The audit baseline is:
 | `no-vllm-seam` | The operator depends on SGLang-only state/layout or vLLM has no equivalent boundary. |
 | `accuracy-rejected` | Live-HCU output does not meet the independent reference contract. |
 | `performance-rejected` | Correct output was observed but target-shape speedup was below 5%. |
+| `performance-evidence-insufficient` | The measured path omitted a mandatory cost or did not match the consumer semantics. |
 | `accepted` | Accuracy, route, fallback and performance gates passed. |
 
-No row is marked `accepted` in the initial inventory.
+The production-source inventory contains 603 records: 183 AITER imports, 243
+AITER calls, two dynamic AITER references, 71 LightOp imports and 103 LightOp
+calls. The corresponding all-Python inventory contains 667 records. The raw
+manifests are `/tmp/sglang-das-lightop-aiter-production-0457572.tsv` and
+`/tmp/sglang-das-lightop-aiter-all-python-0457572.tsv`.
 
 ## LightOp audit
 
@@ -37,7 +43,7 @@ No row is marked `accepted` in the initial inventory.
 |---|---|---|---|---|
 | Biased sigmoid MoE gate: `moe_fused_gate` | Grouped expert routing | `router_runtime.py` and `ops/fuse_moe_gate.py` | `already-covered` | Plugin has capability-aware scoring/renormalization fallback and master/leaf gates. |
 | DeepSeek V4 gate: `moe_fused_gate_sqrtsoftplus` | Non-hash DeepSeek V4 routing | `sqrtsoftplus_routing.py` through the exact fused-top-k-bias patch | `accepted` | Live HCU accuracy passed 75/75. All 40 benchmark shapes passed the 5% gate. Hash-table routing stays official. |
-| MoE alignment: `moe_align_block_size_out` | Triton/Marlin preparation | `patch_moe_align_block_size.py` | `already-covered` | Exact patch, leaf switch and native fallback already exist. |
+| MoE alignment: `moe_align_block_size_out` | Triton/Marlin preparation | `patch_moe_align_block_size.py` | `already-covered` | Exact patch and leaf switch already exist. When the pinned vLLM `_moe_C` symbol is absent, the fixed-size Torch fallback is graph-capture tested on live HCU. |
 | EP permutation: `ep_scatter`, `ep_gather` | DeepEP high-throughput dispatch/combine | `deep_gemm_utils.py` | `already-covered` | Plugin has LightOp routes plus Triton fallback. |
 | EP m-index construction: `ep_build_m_indices` | Builds padded token-to-expert rows | `deep_gemm_utils.ep_scatter` already fills `m_indices` and inverse permutation together | `already-covered` | The only equivalent vLLM DeepEP stage needs both results. Its existing LightOp `ep_scatter` performs both writes in one launch; adding the standalone builder would duplicate the m-index work. The same function retains two Triton kernels when the route is disabled. |
 | W16A16 Marlin MoE: `get_moe_cuda_marlin_config_w16a16`, `moe_gemm_marlin_w16a16`, `moe_sum` | BF16 Qwen/HCU MoE | Exact unquantized oracle adapter with AITER/Triton pre-pack fallback | `accepted` | Opt-in only for the measured Qwen3.6 shape and `max_num_tokens<=16`; larger batches remain on AITER/Triton because the layouts cannot be mixed safely. |
@@ -47,6 +53,10 @@ No row is marked `accepted` in the initial inventory.
 | Activation: `silu_and_mul_opt`, `fuse_silu_and_mul` | Dense MLP and W16A16 MoE | `ops/silu_and_mul.py` and the accepted W16 expert runtime | `already-covered` | Dense LightOp routing already existed; the W16 backend now uses the output-buffer form inside its validated fused pipeline. |
 | Fused activation+quant: `lm_fuse_silu_mul_quant`, `fuse_silu_mul_fp8_quant`, EP variants | Quantized linear/MoE handoff | `ops/fuse_silu_mul_quant.py` and DeepGEMM experts | `already-covered` | Existing plugin routes cover general and EP channel-quant use. |
 | RMSNorm: `rmsnorm_forward_autograd`, `fused_add_rms_norm`, Gemma RMSNorm | Transformer normalization | `ops/rms_norm.py`, `ops/gemma_rms_norm.py` | `already-covered` | Master/leaf switches and vLLM OOT registration already exist. |
+| Gated RMSNorm: `lightop.norm.layer_norm_fwd_1pass_opt` | Qwen GDN output normalization and gating | Registered HCU custom op plus a worker-owned exact Qwen captured-class binding | `accepted` | Strict BF16 contiguous width-128/256 SiLU route only. All other dtypes, layouts, groups, activations, unmeasured row counts, and missing categorized exports retain vLLM Triton. |
+| Generic MoE top-k: `lightop.moe.topk_softmax` | Softmax top-k routing | No production route | `dependency-unavailable` | The installed binary requires UInt64 IDs at one ABI layer but the following PyTorch layer requires Long. Int32/int64 abort in native code and uint64 raises, so no safe callable dtype exists. |
+| EPLB postprocess: `topk_ids_postprocess` | SGLang logical-to-physical expert mapping | vLLM `BaseRouter` owns mapping and load recording | `no-vllm-seam` | The three-argument LightOp ABI cannot replace vLLM replica selection, atomic load recording, ubatch and EPLB lifecycle. |
+| `fused_rms_norm_contiguous` | MiniMax Q/K RMSNorm | Existing RMSNorm/MiniMax TP implementations | `performance-evidence-insufficient` | Initial screening accidentally used Gemma `(1+weight)` semantics and excluded the mandatory derived-weight cost. It is not accepted as MiniMax evidence or added as a route. |
 | Fused RMS+dynamic quant: `lm_faster_rmsquant`, `rms_norm_per_token_fp8_quant` | Linear/communicator handoff | `ops/fuse_rms_norm_quant.py` uses categorized `rms_norm_dynamic_per_token_quant`; AITER fused variants also exist | `already-covered` | Installed `lm_faster_rmsquant` is an allocation wrapper around the private LMSlim dynamic-per-token operator with the same input/residual/update/scale contract. The plugin deliberately uses the public categorized LightOp wrapper and already has live INT8 accuracy plus AITER/vLLM INT8/FP8 fallbacks. |
 | Per-token quant: `per_token_quant_int8`, `per_token_quant_fp8`, `per_token_group_quant_fp8` | Dense and MoE inputs | `int8_runtime.py`, `lightop_fp8_runtime.py`, AITER group quant paths | `already-covered` | Plugin has dynamic INT8/FP8 and per-group coverage. |
 | Dense W8A8 GEMM: `hipblaslt_w8a8_gemm`, channelwise GEMM | Compressed-tensor linear | `int8_runtime.py`, `runtime_compat/scaled_mm.py` | `already-covered` | Existing code validates required LightOp symbols and scale semantics. |
@@ -65,6 +75,7 @@ No row is marked `accepted` in the initial inventory.
 |---|---|---|---|---|
 | `silu_and_mul` / Triton MoE activation | Dense and MoE activation | Current dense route is LightOp; diagnostic AITER accuracy test exists | `performance-rejected` | Installed two-argument AITER ABI passed BF16 accuracy but was slower than both the current plugin LightOp route and vLLM native across every screened shape. |
 | `rmsnorm2d_fwd`, `rmsnorm2d_fwd_with_add`, fused RMS quant | Normalization and quant handoff | `aiter_ops.py` and LightOp norm routes | `already-covered` | vLLM AITER replacement already exposes fused dynamic quant and residual variants. |
+| `layernorm2d_fwd` | Generic LayerNorm | vLLM `LayerNorm` | `accuracy-rejected` | vLLM uses BF16 activation with FP32 weight/bias; installed AITER produced NaN/Inf or extreme values for all 80 screened cases and only worked when parameter dtype matched activation dtype. |
 | `per_token_quant_hip`, per-group quant, dynamic quant | FP8/INT8 inputs | `aiter_ops.py`, `aiter_runtime.py`, LightOp quant routes | `already-covered` | Current plugin selects by quantization contract and installed ABI. |
 | `gemm_a8w8_*`, preshuffle GEMM, blockscale GEMM | Quantized dense layers | `aiter_runtime.py`, `aiter_ops.py` | `already-covered` | Includes tuned config discovery and Triton alternatives. |
 | `aiter_moe`, `fused_moe`, W16/W8/W4 solutions | MoE execution | Unified AITER dispatch and quantized runtimes | `already-covered` | Plugin owns selection, layout generation, shuffle, scale conversion, caching and fail-closed execution. |
@@ -77,6 +88,8 @@ No row is marked `accepted` in the initial inventory.
 | MLA prefill/decode and sparse MQA Triton kernels | DeepSeek MLA/DSA | Plugin MLA and sparse attention runtimes | `already-covered` | Plugin already provides version-tolerant AITER module-path fallbacks. |
 | Cache reshape/indexer quant and RoPE kernels | Attention cache update | `fa_utils.py`, AITER runtime, DSv4 paths | `already-covered` | Additional SGLang-only cache index layouts require a canonical vLLM seam. |
 | GDN and causal-conv update | Linear attention | Plugin GDN patch and AITER replacement | `already-covered` | Qwen3.5/3.6 linear-attention support already routes these operators. |
+| `fused_recurrent_gated_delta_rule_packed_decode` | Qwen GDN decode | Exact vLLM FLA seam | `performance-rejected` | Positive 1-based indices passed 12/12 FP32 comparisons, but vLLM treats state index 0 as invalid while AITER mutates slot 0. The required index remap made all 12 shapes slower; no route was restored. |
+| `gemm_afp4wfp4_pre_quant` and batched variant | MXFP4 dense/MLA GEMM | Quark/MXFP4 seams | `dependency-unavailable` | gfx938 maps to BW200B but the package has no BW200B prequant configs. Explicit MI350 configs fail Triton lowering with `Unsupported DotScaleOp`; neither kernel executed. |
 | MHC pre/post/fused post-pre | DeepSeek V4 MHC | Plugin MHC runtime and TileLang/AITER routes | `already-covered` | Existing environment switches retain the current fallback chain. |
 | FLA chunk kernels | FLA models | Exact HCU patch adapters | `already-covered` | Both chunk-delta-h and chunk-o adapters are master-gated. |
 | Fused QK/RMSNorm/group quant variants | DeepSeek attention | Plugin `aiter_ops.py` probes old/new ABI | `already-covered` | No duplicate import path is needed. |
@@ -98,6 +111,8 @@ The accepted route never removes the existing alternative:
   disabled;
 - EP scatter/gather/m-index work retains the plugin's existing Triton kernels;
 - fused norm/quant retains current vLLM/AITER paths when LightOp is ineligible;
+- Qwen gated RMSNorm retains vLLM's canonical Triton implementation for every
+  disabled or ineligible call;
   and
 - sparse attention retains the existing AITER Triton kernels where LightOp is
   unavailable.
@@ -113,6 +128,11 @@ will be recorded here and summarized in
 |---|---|---|---|---|
 | LightOp sqrt-softplus gate | 75/75 passed | 40/40 shapes passed; 6.83% min, 22.61% median, 44.92% max | Master/leaf enabled route; hash and ineligible inputs use official vLLM | `accepted` |
 | LightOp W16A16 Marlin MoE | 6/6 passed, including Qwen3.6 expert shape | Accepted M=1/2/4/8/16: 6.28% min vs fastest fallback; larger M rejected | Opt-in master/leaf route; shape/range/config failures delegate before packing | `accepted` |
+| LightOp Qwen gated RMSNorm | 40/40 BF16 width-128/256 shapes passed against FP32 and vLLM; 14 live routed cases plus one FP32 fallback case | Every screened shape passed; width-128 median speedup 74.62%--81.06%; width-256 observed speedup 77.45%--85.39% | Master/leaf route with exact dependency/device/dtype/layout/group/activation/row guards; Qwen-only captured-class binding; vLLM Triton fallback | `accepted` |
+| LightOp generic top-k | No executable output-index dtype in installed ABI | Not timed after ABI gate failed | Existing vLLM/AITER/Torch routing | `dependency-unavailable` |
+| AITER LayerNorm2D | 0/80 for vLLM's BF16-input/FP32-parameter contract | Not timed after accuracy gate failed | Existing vLLM LayerNorm | `accuracy-rejected` |
+| AITER fused recurrent packed decode | 12/12 positive-index cases passed; index 0 violates vLLM state ABI | ABI-safe route passed 0/12 performance shapes | Existing vLLM FLA Triton kernel | `performance-rejected` |
+| AITER MXFP4 prequant GEMMs | Kernel never compiled on gfx938 | Not timed | Existing Quark/Triton paths | `dependency-unavailable` |
 | AITER SiLU-and-multiply | 3/3 existing live-HCU cases passed; benchmark outputs within `rtol=0.02,atol=0.05` | 20/20 shapes slower than current LightOp by 40.58%--96.17% | Current LightOp and vLLM native routes unchanged | `performance-rejected` |
 | LightOp EP m-indices | Existing combined `ep_scatter` tests cover the produced indices | Standalone timing not applicable because it duplicates work | Master/leaf LightOp `ep_scatter`; two-stage Triton fallback | `already-covered` |
 | LightOp fused RMS/quant aliases | Existing live INT8 RMS+quant cases 2/2 passed | Alias adds no new kernel route | Public categorized LightOp; AITER/vLLM fallback | `already-covered` |
@@ -177,6 +197,54 @@ will be recorded here and summarized in
   `E=256,K=2048,N=512,top-k=8,max_num_tokens<=16`. Every other configuration
   delegates to AITER/Triton before parameter replacement.
 - Raw local report: `/tmp/vllm-hcu-w16a16-benchmark.json`.
+
+### LightOp Qwen gated RMSNorm evidence
+
+- The accepted seam is `RMSNormGated.forward_cuda`, before vLLM makes
+  non-contiguous inputs contiguous. The Qwen GDN module imports that class by
+  value, so an exact worker import callback first validates the canonical
+  captured class and then rebinds only that local symbol to the HCU subclass
+  before model construction. Other RMSNormGated consumers remain canonical.
+  The implementation imports only the categorized
+  `lightop.norm.layer_norm_fwd_1pass_opt` callable.
+- The route requires BF16 contiguous `x`, `z`, and weight; two-dimensional
+  `[M,128]` or `[M,256]` inputs; no bias; effective group size equal to the
+  last dimension; gate after RMSNorm; SiLU; and one of the 20 measured row
+  counts. The master switch and
+  `VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED` must both be enabled.
+- Across both verified widths and the Qwen3.6 token-head geometries, all 40
+  shapes passed an independent FP32 reference at `rtol=0.02,atol=0.05`;
+  inputs and parameters were unchanged. Width 256 was bit-identical to vLLM
+  on 19/20 shapes and had maximum absolute difference 0.03125 at M=1024.
+- The width-128 stable runs used 20 warmups, 100 iterations and seven paired
+  alternating repeats, including allocations, device context, pybind dispatch
+  and launch. Every case passed the 5% gate. The Qwen3.6-35B prefill geometry
+  M=512 improved from 65.930 us to 12.887 us median (80.434%). The width-256
+  confirmation used the same warmup/iteration/repeat counts but sequential
+  baseline/candidate timing and persisted aggregate medians rather than raw
+  samples; its 77.45%--85.39% range is reported as observational evidence.
+- Raw reports:
+  `/tmp/vllm-hcu-norm-candidates-hcu5.json`,
+  `/tmp/lightop-layer-norm-fwd-qwen-exact-hcu4.json`, and
+  `/tmp/lightop-layer-norm-fwd-qwen-token-heads-hcu4.json`, and
+  `/tmp/lightop-layer-norm-fwd-qwen-width256-hcu3.json`.
+
+### Rejected symbol-level candidates
+
+- AITER recurrent decode: `/tmp/fused_recurrent_aiter_hcu4_0457572.json`.
+  AITER treats only negative state indices as invalid, while vLLM also treats
+  zero as `NULL_BLOCK_ID`. A safe `where(index > 0, index, -1)` remap made the
+  candidate 2.90%--28.25% slower and no shape passed the gate.
+- LightOp top-k:
+  `/tmp/vllm-hcu-lightop-topk-softmax-screening.json`. The binary's UInt64
+  assertion conflicts with its downstream Long requirement; eligible calls
+  can terminate the process and therefore cannot be wrapped with fallback.
+- AITER LayerNorm:
+  `/tmp/vllm-hcu-norm-candidates-hcu5.json`. Mixed BF16 activation and FP32
+  affine parameters produced non-finite/extreme output in all 80 cases.
+- AITER MXFP4 prequant:
+  `/tmp/vllm-hcu-aiter-mxfp4-hcu7.json`. Default BW200B configs are absent;
+  explicit MI350 configs fail at `DotScaleOp` lowering on gfx938.
 
 ### AITER SiLU screening evidence
 
@@ -267,9 +335,12 @@ addition to the rows above:
   indexer-cache quantization, RoPE, GDN/FLA, MHC and custom all-reduce imports
   map to existing HCU-owned attention, linear-attention and communicator
   replacements, each retaining its current fallback.
-- Sampling and top-k imports map to the existing HCU sampler/router paths;
-  the installed AITER build lacks the newer `topk_gating`, `greedy_sample`,
-  and fused multimodal QK symbol.
+- Sampling and most top-k imports map to existing HCU sampler/router paths.
+  LightOp `topk_softmax` is separately dependency-rejected, and
+  `topk_ids_postprocess` has no vLLM EPLB ownership seam. The installed AITER
+  build lacks `topk_gating` and `greedy_sample`. The categorized multimodal QK
+  callable is installed, but its root export is absent and its cache mutation
+  contract still has no vLLM seam.
 - AITER GroupNorm/Conv2D and the separate SGLang diffusion Triton kernels
   belong to SGLang's diffusion/VAE runtime, for which this vLLM LLM-serving
   plugin has no module or lifecycle seam. They are classified `no-vllm-seam`,

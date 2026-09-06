@@ -22,10 +22,16 @@ from tests.integration.server.evalscope_server import (
 ROOT = Path(__file__).resolve().parents[3]
 DEEPSEEK_CONFIG = ROOT / "tests/models/deepseek_v4_int8_humaneval_evalscope.yaml"
 QWEN_CONFIG = ROOT / "tests/models/qwen36_35b_a3b_humaneval_evalscope.yaml"
+QWEN_27B_CONFIG = ROOT / "tests/models/qwen36_27b_humaneval_evalscope.yaml"
+QWEN_35_W8A8_CONFIG = (
+    ROOT / "tests/models/qwen35_35b_a3b_w8a8_humaneval_evalscope.yaml"
+)
 DEEPSEEK_CONFIG_ENV = "VLLM_HCU_OPERATOR_ADAPTATION_DEEPSEEK_CONFIG"
 QWEN_CONFIG_ENV = "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_CONFIG"
 DEEPSEEK_MODEL_ENV = "VLLM_HCU_OPERATOR_ADAPTATION_DEEPSEEK_MODEL"
 QWEN_MODEL_ENV = "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_MODEL"
+QWEN_27B_MODEL_ENV = "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_27B_MODEL"
+QWEN_35_W8A8_MODEL_ENV = "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_35_W8A8_MODEL"
 
 
 def _option_value(command: list[str], option: str) -> str:
@@ -49,7 +55,26 @@ def _option_value(command: list[str], option: str) -> str:
             QWEN_MODEL_ENV,
             "/models/Qwen3.6-35B-A3B",
             "1",
-            "VLLM_HCU_USE_LIGHTOP_W16A16_MOE",
+            (
+                "VLLM_HCU_USE_LIGHTOP_W16A16_MOE",
+                "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED",
+            ),
+        ),
+        (
+            QWEN_27B_CONFIG,
+            "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_27B_CONFIG",
+            QWEN_27B_MODEL_ENV,
+            "/models/Qwen3.6-27B",
+            "1",
+            "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED",
+        ),
+        (
+            QWEN_35_W8A8_CONFIG,
+            "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_35_W8A8_CONFIG",
+            QWEN_35_W8A8_MODEL_ENV,
+            "/models/Qwen3.5-35B-A3B-W8A8",
+            "1",
+            "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED",
         ),
     ],
 )
@@ -61,7 +86,7 @@ def test_operator_adaptation_humaneval_config_contract(
     model_env: str,
     model_path: str,
     tp: str,
-    leaf: str,
+    leaf: str | tuple[str, ...],
     profile: str,
     enabled: str,
 ) -> None:
@@ -77,7 +102,8 @@ def test_operator_adaptation_humaneval_config_contract(
     assert port > 0
     assert _option_value(command, "--tensor-parallel-size") == tp
     assert environment["VLLM_HCU_USE_CUSTOM_OPS"] == "1"
-    assert environment[leaf] == enabled
+    leaves = (leaf,) if isinstance(leaf, str) else leaf
+    assert all(environment[name] == enabled for name in leaves)
     assert evaluation["limit"] == 32
     assert evaluation["eval_batch_size"] == 1
     assert evaluation["datasets"] == ["humaneval"]
@@ -137,7 +163,8 @@ def _assert_feature_pair(
     model_env: str,
     model_label: str,
     required_hcu_count: int,
-    route_message: str,
+    route_messages: str | tuple[str, ...],
+    expect_feature_on_route: bool = True,
 ) -> None:
     results = {}
     for profile in ("feature_off", "feature_on"):
@@ -150,10 +177,19 @@ def _assert_feature_pair(
         )
     off_score, off_tps, off_report, off_log, off_invocation = results["feature_off"]
     on_score, on_tps, on_report, on_log, on_invocation = results["feature_on"]
-    assert route_message not in off_invocation
-    assert route_message in on_invocation, (
-        f"feature-on did not execute the requested HCU route; log={on_log}"
+    expected_messages = (
+        (route_messages,) if isinstance(route_messages, str) else route_messages
     )
+    for route_message in expected_messages:
+        assert route_message not in off_invocation
+        if expect_feature_on_route:
+            assert route_message in on_invocation, (
+                f"feature-on did not execute the requested HCU route; log={on_log}"
+            )
+        else:
+            assert route_message not in on_invocation, (
+                f"ineligible model unexpectedly executed HCU route; log={on_log}"
+            )
     assert on_score >= off_score, (
         f"feature-on Pass@1 {on_score:.4f} regressed below feature-off "
         f"{off_score:.4f}; reports={off_report},{on_report}"
@@ -178,7 +214,7 @@ def test_deepseek_v4_int8_operator_adaptation_humaneval32() -> None:
         model_env=DEEPSEEK_MODEL_ENV,
         model_label="DeepSeek-V4-Flash INT8 TP4",
         required_hcu_count=4,
-        route_message="Using LightOp sqrt-softplus MoE routing.",
+        route_messages="Using LightOp sqrt-softplus MoE routing.",
     )
 
 
@@ -194,5 +230,41 @@ def test_qwen36_35b_a3b_operator_adaptation_humaneval32() -> None:
         model_env=QWEN_MODEL_ENV,
         model_label="Qwen3.6-35B-A3B TP1",
         required_hcu_count=1,
-        route_message="Using LightOp W16A16 Marlin MoE backend.",
+        route_messages=(
+            "Using LightOp W16A16 Marlin MoE backend.",
+            "Using LightOp Qwen gated RMSNorm.",
+        ),
+    )
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.hcu_count(1)
+@pytest.mark.slow
+@pytest.mark.external_service("evalscope")
+def test_qwen36_27b_gated_rmsnorm_humaneval32() -> None:
+    _assert_feature_pair(
+        QWEN_27B_CONFIG,
+        "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_27B_CONFIG",
+        model_env=QWEN_27B_MODEL_ENV,
+        model_label="Qwen3.6-27B TP1",
+        required_hcu_count=1,
+        route_messages="Using LightOp Qwen gated RMSNorm.",
+    )
+
+
+@pytest.mark.hcu
+@pytest.mark.model
+@pytest.mark.hcu_count(1)
+@pytest.mark.slow
+@pytest.mark.external_service("evalscope")
+def test_qwen35_35b_a3b_w8a8_gated_rmsnorm_fallback_humaneval32() -> None:
+    _assert_feature_pair(
+        QWEN_35_W8A8_CONFIG,
+        "VLLM_HCU_OPERATOR_ADAPTATION_QWEN_35_W8A8_CONFIG",
+        model_env=QWEN_35_W8A8_MODEL_ENV,
+        model_label="Qwen3.5-35B-A3B-W8A8 TP1",
+        required_hcu_count=1,
+        route_messages="Using LightOp Qwen gated RMSNorm.",
+        expect_feature_on_route=False,
     )

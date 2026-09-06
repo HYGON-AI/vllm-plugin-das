@@ -81,6 +81,23 @@ def apply_to_module(module: ModuleType) -> bool:
                 hash_indices_table = hash_indices_table.to(dtype=topk_indices.dtype)
             if input_tokens is not None and input_tokens.dtype != topk_indices.dtype:
                 input_tokens = input_tokens.to(dtype=topk_indices.dtype)
+        native_fallback = getattr(target, "_topk_softplus_sqrt_torch", None)
+        torch_module = getattr(target, "torch", None)
+        torch_ops = getattr(torch_module, "ops", None)
+        moe_ops = getattr(torch_ops, "_moe_C", None)
+        compiled_op = getattr(moe_ops, "topk_softplus_sqrt", None)
+        if callable(native_fallback) and not callable(compiled_op):
+            return native_fallback(
+                topk_weights,
+                topk_indices,
+                token_expert_indices,
+                gating_output,
+                renormalize,
+                e_score_correction_bias,
+                input_tokens,
+                hash_indices_table,
+                routed_scaling_factor,
+            )
         return original(
             topk_weights,
             topk_indices,

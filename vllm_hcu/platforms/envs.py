@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
     VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
+    VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: bool = True
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
@@ -240,6 +241,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE":
     lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE", "True"
+        ).lower() in ("true", "1")),
+    # Strict BF16 width-128/256 Qwen gated RMSNorm route. Unsupported layouts,
+    # activations and row geometries retain vLLM's Triton implementation.
+    "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED":
+    lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", "True"
         ).lower() in ("true", "1")),
     # Opt-in because this backend installs a LightOp-specific packed weight
     # layout during process_weights_after_loading().
