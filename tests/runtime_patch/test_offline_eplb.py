@@ -11,6 +11,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    load_static_eplb_plan,
+)
+from vllm_hcu.patch.worker import worker_callback_names
+from vllm_hcu.patch.worker.framework_opt._common import PatchCompatibilityError
 from vllm_hcu.patch.worker.framework_opt.patch_offline_eplb import (
     PATCH_ID,
     TARGET_MODULE,
@@ -18,10 +23,6 @@ from vllm_hcu.patch.worker.framework_opt.patch_offline_eplb import (
     load_offline_expert_map,
     record_offline_expert_map,
 )
-from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
-    load_static_eplb_plan,
-)
-from vllm_hcu.patch.worker import worker_callback_names
 
 
 def _record_map_in_process(output: str, model_index: int, start_event) -> None:
@@ -216,6 +217,10 @@ class HYV4ForCausalLM:
     expert_weights = [[torch.zeros(1)]]
 
 
+class GenericMoEForCausalLM(HYV4ForCausalLM):
+    pass
+
+
 def test_offline_eplb_patch_is_registered_in_worker_inventory() -> None:
     assert (PATCH_ID, TARGET_MODULE) in worker_callback_names()
 
@@ -349,15 +354,16 @@ def test_runtime_patch_records_initial_and_committed_maps(tmp_path: Path) -> Non
     ] == committed.tolist()
 
 
-def test_runtime_patch_loads_static_map_and_freezes_dynamic_eplb(
+def test_runtime_patch_commits_generic_static_plan_without_rearrangement(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "load.json"
     source.write_text(
         json.dumps(
             {
                 "model_maps": {
-                    "HYV4ForCausalLM": {
+                    "GenericMoEForCausalLM": {
                         "physical_to_logical_map": [[3, 2, 1, 0, 3, 2]],
                     }
                 }
@@ -365,20 +371,38 @@ def test_runtime_patch_loads_static_map_and_freezes_dynamic_eplb(
         ),
         encoding="utf-8",
     )
-    model = HYV4ForCausalLM()
+    model = GenericMoEForCausalLM()
     model._vllm_hcu_static_eplb_plan = load_static_eplb_plan(
         source,
-        model_key="HYV4ForCausalLM",
+        model_key="GenericMoEForCausalLM",
         expected_shape=(1, 6),
         num_logical_experts=4,
         num_redundant_experts=2,
     )
     module, rearrangements, ep_group = _make_eplb_module(load_path=source)
+    ep_group.world_size = 2
+    fingerprint_checks: list[tuple[object, object]] = []
+
+    def gather_fingerprints(output, value, group=None) -> None:
+        fingerprint_checks.append((value, group))
+        output[:] = [value, value]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_fingerprints)
+    cpu_group = object()
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=ep_group,
+        cpu_group=cpu_group,
+        world_size=2,
+        rank_in_group=0,
+        barrier=ep_group.barrier,
+    )
     assert apply_to_module(module)
     state = module.EplbState()
     state.add_model(model, _FakeModelConfig())
 
     assert rearrangements == []
+    expected_fingerprint = model._vllm_hcu_static_eplb_plan.fingerprint()
+    assert fingerprint_checks == [(expected_fingerprint, cpu_group)]
     assert ep_group.barrier_calls == 1
     assert state.model_states["hy4-hash"].physical_to_logical_map.tolist() == [
         [3, 2, 1, 0, 3, 2]
@@ -446,7 +470,7 @@ def test_runtime_patch_keeps_online_rearrangement_without_offline_paths() -> Non
     ]
 
 
-def test_runtime_patch_keeps_compatibility_rearrangement_without_plan(
+def test_runtime_patch_rejects_configured_static_map_without_plan(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "load.json"
@@ -457,10 +481,12 @@ def test_runtime_patch_keeps_compatibility_rearrangement_without_plan(
     module, rearrangements, ep_group = _make_eplb_module(load_path=source)
     assert apply_to_module(module)
     state = module.EplbState()
+    model = GenericMoEForCausalLM()
 
-    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    with pytest.raises(PatchCompatibilityError, match="before checkpoint loading"):
+        state.add_model(model, _FakeModelConfig())
 
-    assert len(rearrangements) == 1
+    assert rearrangements == []
     assert ep_group.barrier_calls == 0
 
 

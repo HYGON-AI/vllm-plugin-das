@@ -458,7 +458,17 @@ print("legacy-backend-normalized")
     assert "legacy-backend-normalized" in result.stdout
 
 
-def test_real_v0251_cli_extracts_offline_eplb_path_before_validation() -> None:
+@pytest.mark.parametrize(
+    ("path_key", "path_value"),
+    [
+        ("expert_map_record_path", "/models/maps/hy4-record.json"),
+        ("expert_map_path", "/models/maps/hy4-load.json"),
+    ],
+)
+def test_real_v0251_cli_extracts_offline_eplb_path_before_validation(
+    path_key: str,
+    path_value: str,
+) -> None:
     result = _run_fresh_v0251(
         r'''
 import argparse
@@ -472,25 +482,55 @@ arg_utils.current_platform.device_type = "cpu"
 patch_engine_args.apply_to_module(arg_utils)
 parser = argparse.ArgumentParser()
 arg_utils.EngineArgs.add_cli_args(parser)
+path_key = PATH_KEY
+path_value = PATH_VALUE
 namespace = parser.parse_args([
     "--eplb-config",
-    json.dumps({
-        "window_size": 8,
-        "step_interval": 16,
-        "expert_map_record_path": "/models/maps/hy4.json",
-    }),
+    json.dumps({"window_size": 2, path_key: path_value}),
 ])
 args = arg_utils.EngineArgs.from_cli_args(namespace)
-feature = get_hcu_config(args)
-assert args.eplb_config.window_size == 8
-assert args.eplb_config.step_interval == 16
-assert feature.expert_map_record_path == "/models/maps/hy4.json"
-assert feature.expert_map_path is None
+config = args.create_engine_config()
+assert args.eplb_config.window_size == 2
+assert not hasattr(args.eplb_config, path_key)
+assert getattr(get_hcu_config(config), path_key) == path_value
 print("offline-eplb-cli-normalized")
-'''
+'''.replace("PATH_KEY", repr(path_key)).replace("PATH_VALUE", repr(path_value))
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "offline-eplb-cli-normalized" in result.stdout
+
+
+def test_real_v0251_cli_rejects_conflicting_offline_eplb_paths() -> None:
+    result = _run_fresh_v0251(
+        r'''
+import argparse
+import json
+
+from vllm.engine import arg_utils
+from vllm_hcu.patch.platform.core_fix import patch_engine_args
+
+arg_utils.current_platform.device_type = "cpu"
+patch_engine_args.apply_to_module(arg_utils)
+parser = argparse.ArgumentParser()
+arg_utils.EngineArgs.add_cli_args(parser)
+namespace = parser.parse_args([
+    "--eplb-config",
+    json.dumps({
+        "expert_map_record_path": "/models/maps/record.json",
+        "expert_map_path": "/models/maps/load.json",
+    }),
+])
+try:
+    arg_utils.EngineArgs.from_cli_args(namespace)
+except ValueError as error:
+    assert "mutually exclusive" in str(error)
+else:
+    raise AssertionError("conflicting offline EPLB paths were accepted")
+print("offline-eplb-cli-conflict-rejected")
+'''
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "offline-eplb-cli-conflict-rejected" in result.stdout
 
 
 def test_nested_speculative_multi_mtp_is_extracted_before_official_config() -> None:

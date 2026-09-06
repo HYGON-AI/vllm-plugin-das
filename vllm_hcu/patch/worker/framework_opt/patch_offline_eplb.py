@@ -201,7 +201,8 @@ def _find_static_eplb_plan(model: object) -> StaticEplbPlan | None:
         plan = getattr(inner_model, "_vllm_hcu_static_eplb_plan", None)
     if plan is not None and not isinstance(plan, StaticEplbPlan):
         raise PatchCompatibilityError(
-            "HY V4 static EPLB model published an invalid direct-load plan."
+            "Static EPLB model published an invalid direct-load plan: "
+            f"model_key={model.__class__.__name__!r}."
         )
     return plan
 
@@ -217,12 +218,12 @@ def _validate_direct_load_plan(
     configured_path = str(Path(load_path).expanduser().resolve(strict=True))
     if plan.source_path != configured_path:
         raise PatchCompatibilityError(
-            "HY V4 static EPLB direct-load plan path does not match the runtime "
+            "Static EPLB direct-load plan path does not match the runtime "
             f"configuration: plan={plan.source_path!r}, configured={configured_path!r}."
         )
     if plan.model_key != model_key:
         raise PatchCompatibilityError(
-            "HY V4 static EPLB direct-load model key mismatch: "
+            "Static EPLB direct-load model key mismatch: "
             f"plan={plan.model_key!r}, runtime={model_key!r}."
         )
     observed = (
@@ -237,7 +238,7 @@ def _validate_direct_load_plan(
     )
     if observed != expected or tuple(plan.physical_to_logical_map.shape) != expected_shape:
         raise PatchCompatibilityError(
-            "HY V4 static EPLB direct-load plan metadata does not match EPLB state: "
+            "Static EPLB direct-load plan metadata does not match EPLB state: "
             f"plan_counts={observed}, model_counts={expected}, "
             f"plan_shape={tuple(plan.physical_to_logical_map.shape)}, "
             f"state_shape={expected_shape}."
@@ -337,60 +338,39 @@ def apply_to_module(module: ModuleType) -> bool:
 
         if load_path:
             direct_plan = _find_static_eplb_plan(model)
-            if direct_plan is not None:
-                _validate_direct_load_plan(
-                    direct_plan,
-                    load_path=load_path,
-                    model_key=model_key,
-                    model=model,
-                    expected_shape=tuple(model_state.physical_to_logical_map.shape),
+            if direct_plan is None:
+                raise PatchCompatibilityError(
+                    f"Static EPLB path {load_path!r} for model key {model_key!r} "
+                    "requires a direct-load plan for expert counts "
+                    f"logical={model.num_logical_experts}, "
+                    f"physical={model.num_physical_experts}, "
+                    f"redundant={model.num_redundant_experts}; "
+                    "model._vllm_hcu_static_eplb_plan must be bound before "
+                    "checkpoint loading."
                 )
-                _verify_static_plan_across_ep_ranks(eplb_module, direct_plan)
-                target_map = direct_plan.physical_to_logical_map.to(
-                    dtype=model_state.physical_to_logical_map.dtype,
-                    device="cpu",
-                )
-                original_commit(
-                    model_state,
-                    new_physical_to_logical_map=target_map,
-                )
-                eplb_module.get_ep_group().barrier()
-                eplb_module.logger.info(
-                    "Static EPLB direct-loaded model %s with map SHA-256 %s; "
-                    "committed routing metadata with zero expert rearrangement.",
-                    model_key,
-                    direct_plan.source_sha256,
-                )
-            else:
-                target_map = load_offline_expert_map(
-                    load_path,
-                    model_key=model_key,
-                    expected_shape=tuple(model_state.physical_to_logical_map.shape),
-                    num_logical_experts=model.num_logical_experts,
-                    dtype=model_state.physical_to_logical_map.dtype,
-                    device=torch.device("cpu"),
-                )
-                eplb_module.logger.info(
-                    "Loading offline EPLB expert map from %s for model %s "
-                    "with key %s through the compatibility rearrangement path.",
-                    load_path,
-                    model_config.model,
-                    model_key,
-                )
-                original_rearrange_weights(
-                    model_state.physical_to_logical_map,
-                    target_map,
-                    model_state.model.expert_weights,
-                    model_state.expert_buffer,
-                    eplb_module.get_ep_group().device_group,
-                    model_state.communicator,
-                    False,
-                    None,
-                )
-                original_commit(
-                    model_state,
-                    new_physical_to_logical_map=target_map,
-                )
+            _validate_direct_load_plan(
+                direct_plan,
+                load_path=load_path,
+                model_key=model_key,
+                model=model,
+                expected_shape=tuple(model_state.physical_to_logical_map.shape),
+            )
+            _verify_static_plan_across_ep_ranks(eplb_module, direct_plan)
+            target_map = direct_plan.physical_to_logical_map.to(
+                dtype=model_state.physical_to_logical_map.dtype,
+                device="cpu",
+            )
+            original_commit(
+                model_state,
+                new_physical_to_logical_map=target_map,
+            )
+            eplb_module.get_ep_group().barrier()
+            eplb_module.logger.info(
+                "Static EPLB direct-loaded model %s with map SHA-256 %s; "
+                "committed routing metadata with zero expert rearrangement.",
+                model_key,
+                direct_plan.source_sha256,
+            )
             should_record = getattr(self, "should_record_tensor", None)
             if should_record is not None:
                 should_record.fill_(False)
