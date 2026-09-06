@@ -1542,7 +1542,71 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     )
 
 
-def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
+def _gdn_sigmoid_update(
+    A_log,
+    a,
+    b,
+    dt_bias,
+    q,
+    k,
+    v,
+    beta=1.0,
+    threshold=20.0,
+    scale=None,
+    initial_state=None,
+    inplace_final_state=True,
+    cu_seqlens=None,
+    ssm_state_indices=None,
+    num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False,
+    is_kda=False,
+):
+    del (
+        A_log,
+        a,
+        b,
+        dt_bias,
+        q,
+        k,
+        v,
+        beta,
+        threshold,
+        scale,
+        initial_state,
+        inplace_final_state,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+        use_qk_l2norm_in_kernel,
+        is_kda,
+    )
+    return "official-sigmoid"
+
+
+def _sigmoid_module(adapter, official=_gdn_sigmoid_update):
+    return _module(
+        adapter.TARGET_MODULE,
+        GDN_AITER_TRITON_AVAILABLE=False,
+        fused_recurrent_gated_delta_rule_packed_decode=(
+            lambda *args, **kwargs: "official-recurrent"
+        ),
+        fused_sigmoid_gating_delta_rule_update=official,
+    )
+
+
+def _sigmoid_arguments(dtype):
+    return {
+        "A_log": torch.zeros(1, dtype=torch.float32),
+        "a": torch.zeros(1, dtype=dtype),
+        "b": torch.zeros(1, dtype=dtype),
+        "dt_bias": torch.zeros(1, dtype=torch.float32),
+        "q": torch.zeros(1, dtype=dtype),
+        "k": torch.zeros(1, dtype=dtype),
+        "v": torch.zeros(1, dtype=dtype),
+    }
+
+
+def test_qwen_recurrent_remains_target_owned(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
 
     _install_fake_module(
@@ -1552,36 +1616,165 @@ def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
             "retired HCU recurrent path must not be imported"
         ),
     )
-    _install_fake_module(
-        monkeypatch,
-        "aiter.ops.triton.fla.fused_sigmoid_gating",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: pytest.fail(
-            "retired HCU sigmoid path must not be imported"
-        ),
-    )
 
     def recurrent(*args, **kwargs):
         del args, kwargs
         return "official-recurrent"
 
-    def sigmoid(*args, **kwargs):
-        del args, kwargs
-        return "official-sigmoid"
-
     module = _module(
         adapter.TARGET_MODULE,
         GDN_AITER_TRITON_AVAILABLE=False,
         fused_recurrent_gated_delta_rule_packed_decode=recurrent,
-        fused_sigmoid_gating_delta_rule_update=sigmoid,
+        fused_sigmoid_gating_delta_rule_update=_gdn_sigmoid_update,
     )
     adapter.apply_to_module(module)
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
-    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
     assert module.fused_recurrent_gated_delta_rule_packed_decode() == "official-recurrent"
-    assert module.fused_sigmoid_gating_delta_rule_update() == "official-sigmoid"
+
+
+def test_gdn_qwen_sigmoid_prefers_aiter_hip_for_matching_dtype(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    _install_fake_module(
+        monkeypatch,
+        "aiter",
+        vllm_fused_sigmoid_gating_delta_rule_update=(
+            lambda *args, **kwargs: "hip-sigmoid"
+        ),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.fused_sigmoid_gating",
+        fused_sigmoid_gating_delta_rule_update=lambda *args, **kwargs: pytest.fail(
+            "matching dtype must prefer HIP"
+        ),
+    )
+    module = _sigmoid_module(adapter)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+        True,
+    )
+    assert module.fused_sigmoid_gating_delta_rule_update(
+        **_sigmoid_arguments(torch.float32)
+    ) == "hip-sigmoid"
+
+
+def test_gdn_qwen_sigmoid_uses_aiter_triton_for_mixed_a_log_dtype(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    _install_fake_module(
+        monkeypatch,
+        "aiter",
+        vllm_fused_sigmoid_gating_delta_rule_update=lambda *args, **kwargs: pytest.fail(
+            "mixed A_log dtype must skip HIP"
+        ),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.fused_sigmoid_gating",
+        fused_sigmoid_gating_delta_rule_update=(
+            lambda *args, **kwargs: "triton-sigmoid"
+        ),
+    )
+    module = _sigmoid_module(adapter)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+        True,
+    )
+    assert module.fused_sigmoid_gating_delta_rule_update(
+        **_sigmoid_arguments(torch.bfloat16)
+    ) == "triton-sigmoid"
+
+
+@pytest.mark.parametrize("mode", ["disabled", "missing"])
+def test_gdn_qwen_sigmoid_uses_official_when_disabled_or_aiter_missing(
+    monkeypatch,
+    mode,
+):
+    adapter = _adapter("patch_gdn_linear_attention")
+    if mode == "disabled":
+        _install_fake_module(
+            monkeypatch,
+            "aiter",
+            vllm_fused_sigmoid_gating_delta_rule_update=(
+                lambda *args, **kwargs: pytest.fail("selector is disabled")
+            ),
+        )
+        _install_fake_module(
+            monkeypatch,
+            "aiter.ops.triton.fla.fused_sigmoid_gating",
+            fused_sigmoid_gating_delta_rule_update=(
+                lambda *args, **kwargs: pytest.fail("selector is disabled")
+            ),
+        )
+    else:
+        _install_fake_module(monkeypatch, "aiter")
+        _install_fake_module(
+            monkeypatch, "aiter.ops.triton.fla.fused_sigmoid_gating"
+        )
+    module = _sigmoid_module(adapter)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+        mode != "disabled",
+    )
+    assert module.fused_sigmoid_gating_delta_rule_update(
+        **_sigmoid_arguments(torch.bfloat16)
+    ) == "official-sigmoid"
+
+
+def test_gdn_qwen_sigmoid_wrapper_is_qwen_local_and_idempotent(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    canonical = _gdn_sigmoid_update
+    module = _sigmoid_module(adapter, canonical)
+    recurrent = module.fused_recurrent_gated_delta_rule_packed_decode
+    assert adapter.apply_to_module(module) is True
+    assert adapter.apply_to_module(module) is False
+    assert module.fused_sigmoid_gating_delta_rule_update is not canonical
+    assert module._vllm_hcu_original_fused_sigmoid is canonical
+    assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
+
+
+def test_gdn_qwen_sigmoid_propagates_selected_kernel_error(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+
+    def failing_hip(*args, **kwargs):
+        raise RuntimeError("sigmoid update launch failed")
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter",
+        vllm_fused_sigmoid_gating_delta_rule_update=failing_hip,
+    )
+    module = _sigmoid_module(adapter)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+        True,
+    )
+    with pytest.raises(RuntimeError, match="sigmoid update launch failed"):
+        module.fused_sigmoid_gating_delta_rule_update(
+            **_sigmoid_arguments(torch.float32)
+        )
 
 
 def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):

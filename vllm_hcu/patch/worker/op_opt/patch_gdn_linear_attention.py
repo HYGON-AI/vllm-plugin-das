@@ -27,9 +27,11 @@ TARGET_MODULE = (
 PATCH_ID = "worker.op_opt.mamba.gdn.qwen_kernel_bindings"
 TARGETS = (
     f"{TARGET_MODULE}.gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
+    f"{TARGET_MODULE}.fused_sigmoid_gating_delta_rule_update",
 )
 _MARKER = "_vllm_hcu_qwen_gdn_aiter_layout_applied"
 _WRAPPER = "_vllm_hcu_qwen_gdn_aiter_layout_wrapper"
+_SIGMOID_WRAPPER = "_vllm_hcu_qwen_gdn_sigmoid_wrapper"
 
 # This is the audited vLLM v0.25.1 AITER launcher contract.  Binding by name is
 # intentional: the old HCU adapter rewrote args[10], which could silently
@@ -63,59 +65,110 @@ _AITER_UPDATE_PARAMETERS = (
 def apply_to_module(module: ModuleType) -> bool:
     qwen = load_exact_module(TARGET_MODULE, module)
     aiter_available = bool(getattr(qwen, "GDN_AITER_TRITON_AVAILABLE", False))
-    wrapped = (
-        (qwen, TARGETS[0].rsplit(".", 1)[-1], TARGETS[0], _WRAPPER),
-    ) if aiter_available else ()
+    wrapped = [
+        (
+            qwen,
+            TARGETS[1].rsplit(".", 1)[-1],
+            TARGETS[1],
+            _SIGMOID_WRAPPER,
+        ),
+    ]
+    if aiter_available:
+        wrapped.insert(
+            0,
+            (qwen, TARGETS[0].rsplit(".", 1)[-1], TARGETS[0], _WRAPPER),
+        )
     if already_applied(qwen, _MARKER, wrapped):
         return False
 
-    if not aiter_available:
-        setattr(qwen, _MARKER, True)
-        return True
-
-    aiter_update = require_callable(
+    official_sigmoid = require_callable(
         qwen,
-        "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
-        TARGETS[0],
+        "fused_sigmoid_gating_delta_rule_update",
+        TARGETS[1],
     )
-    require_parameter_names(
-        aiter_update,
-        TARGETS[0],
-        _AITER_UPDATE_PARAMETERS,
-    )
-    aiter_signature = inspect.signature(aiter_update)
+    sigmoid_signature = inspect.signature(official_sigmoid)
 
-    @functools.wraps(aiter_update)
-    def hcu_aiter_update(*args, **kwargs):
-        if not use_nn_layout():
-            return aiter_update(*args, **kwargs)
-        try:
-            bound = aiter_signature.bind(*args, **kwargs)
-        except TypeError as exc:
-            raise PatchCompatibilityError(
-                f"required HCU call for {TARGETS[0]} does not match the "
-                f"audited vLLM v0.25.1 AITER contract {aiter_signature}"
-            ) from exc
-        conv_state = bound.arguments.get("conv_state")
-        if conv_state is None or "weight" not in bound.arguments:
-            raise PatchCompatibilityError(
-                f"required HCU call for {TARGETS[0]} is missing conv_state or weight"
-            )
-        expected_dim = shape_dim(conv_state, -2)
-        bound.arguments["weight"] = normalize_nn_conv_weight(
-            bound.arguments["weight"], expected_dim, TARGETS[0]
+    @functools.wraps(official_sigmoid)
+    def hcu_sigmoid_update(*args, **kwargs):
+        bound = sigmoid_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        if _sigmoid_enabled():
+            if bound.arguments["A_log"].dtype == bound.arguments["q"].dtype:
+                try:
+                    from aiter import (
+                        vllm_fused_sigmoid_gating_delta_rule_update as hip_kernel,
+                    )
+                except ImportError:
+                    pass
+                else:
+                    return hip_kernel(*bound.args, **bound.kwargs)
+            try:
+                from aiter.ops.triton.fla.fused_sigmoid_gating import (
+                    fused_sigmoid_gating_delta_rule_update as triton_kernel,
+                )
+            except ImportError:
+                pass
+            else:
+                return triton_kernel(*bound.args, **bound.kwargs)
+        return official_sigmoid(*bound.args, **bound.kwargs)
+
+    setattr(hcu_sigmoid_update, _SIGMOID_WRAPPER, True)
+    setattr(qwen, "_vllm_hcu_original_fused_sigmoid", official_sigmoid)
+    setattr(qwen, "fused_sigmoid_gating_delta_rule_update", hcu_sigmoid_update)
+
+    if aiter_available:
+        aiter_update = require_callable(
+            qwen,
+            "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
+            TARGETS[0],
         )
-        return aiter_update(*bound.args, **bound.kwargs)
+        require_parameter_names(
+            aiter_update,
+            TARGETS[0],
+            _AITER_UPDATE_PARAMETERS,
+        )
+        aiter_signature = inspect.signature(aiter_update)
 
-    setattr(hcu_aiter_update, _WRAPPER, True)
-    setattr(qwen, "_vllm_hcu_original_gdn_aiter_update", aiter_update)
-    setattr(
-        qwen,
-        "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
-        hcu_aiter_update,
-    )
+        @functools.wraps(aiter_update)
+        def hcu_aiter_update(*args, **kwargs):
+            if not use_nn_layout():
+                return aiter_update(*args, **kwargs)
+            try:
+                bound = aiter_signature.bind(*args, **kwargs)
+            except TypeError as exc:
+                raise PatchCompatibilityError(
+                    f"required HCU call for {TARGETS[0]} does not match the "
+                    f"audited vLLM v0.25.1 AITER contract {aiter_signature}"
+                ) from exc
+            conv_state = bound.arguments.get("conv_state")
+            if conv_state is None or "weight" not in bound.arguments:
+                raise PatchCompatibilityError(
+                    f"required HCU call for {TARGETS[0]} is missing conv_state or weight"
+                )
+            expected_dim = shape_dim(conv_state, -2)
+            bound.arguments["weight"] = normalize_nn_conv_weight(
+                bound.arguments["weight"], expected_dim, TARGETS[0]
+            )
+            return aiter_update(*bound.args, **bound.kwargs)
+
+        setattr(hcu_aiter_update, _WRAPPER, True)
+        setattr(qwen, "_vllm_hcu_original_gdn_aiter_update", aiter_update)
+        setattr(
+            qwen,
+            "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
+            hcu_aiter_update,
+        )
     setattr(qwen, _MARKER, True)
     return True
+
+
+def _sigmoid_enabled() -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
+    return bool(
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE
+    )
 
 
 def apply(module: ModuleType | None = None) -> bool:

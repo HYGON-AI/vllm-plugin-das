@@ -498,9 +498,9 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
     assert module.causal_conv1d_fn is not canonical.causal_conv1d_fn
     assert module.causal_conv1d_update is not canonical.causal_conv1d_update
     assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
-    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
+    assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
     assert not hasattr(module, "_vllm_hcu_original_fused_recurrent")
-    assert not hasattr(module, "_vllm_hcu_original_fused_sigmoid")
+    assert module._vllm_hcu_original_fused_sigmoid is sigmoid
 
     conv_state = torch.empty(1, 8, 3)
     x_fn = torch.empty(8, 2)
@@ -586,7 +586,8 @@ def test_native_aiter_unavailable_is_idempotent_and_does_not_require_symbol():
     assert adapter.apply_to_module(module) is True
     assert adapter.apply_to_module(module) is False
     assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
-    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
+    assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
+    assert module._vllm_hcu_original_fused_sigmoid is sigmoid
     assert not hasattr(
         module,
         "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
@@ -691,10 +692,13 @@ assert (
 )
 assert (
     qwen.fused_sigmoid_gating_delta_rule_update
-    is fla.fused_sigmoid_gating_delta_rule_update
+    is not fla.fused_sigmoid_gating_delta_rule_update
 )
 assert not hasattr(qwen, "_vllm_hcu_original_fused_recurrent")
-assert not hasattr(qwen, "_vllm_hcu_original_fused_sigmoid")
+assert (
+    qwen._vllm_hcu_original_fused_sigmoid
+    is fla.fused_sigmoid_gating_delta_rule_update
+)
 assert not bool(qwen.GDN_AITER_TRITON_AVAILABLE)
 assert getattr(qwen, "_vllm_hcu_qwen_gdn_aiter_layout_applied", False)
 
