@@ -931,8 +931,148 @@ def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", False)
     x = torch.arange(4, dtype=torch.float32)
     torch.testing.assert_close(module.chunk_fwd_o(x, x, x, x), original(x, x, x, x))
+
+
+def _chunk_o_module(adapter, original):
+    return _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_fwd_o=original,
+        prepare_chunk_indices=lambda seq, size: torch.tensor([[0, 0]]),
+        triton=SimpleNamespace(cdiv=lambda value, divisor: (value + divisor - 1) // divisor),
+        torch=torch,
+    )
+
+
+def _chunk_o_original(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+                      chunk_indices=None, chunk_size=64,
+                      core_attn_out=None):
+    return "original-output"
+
+
+def test_fla_chunk_o_prefers_hip_and_preserves_call_contract(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+    calls = []
+
+    def hip(**kwargs):
+        calls.append(kwargs)
+        return torch.ones_like(kwargs["v"])
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_fwd_o_vllm_hip_blockdim64=hip,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.vllm.chunk_o",
+        launch_chunk_fwd_kernel_o=lambda **kwargs: pytest.fail(
+            "HIP must have priority"
+        ),
+    )
+    module = _chunk_o_module(adapter, _chunk_o_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", True)
+    cu_seqlens = torch.tensor([0, 2])
+    indices = torch.tensor([[0, 0]])
+    tensor = torch.zeros(1, 2, 1, 4)
+    module.chunk_fwd_o(
+        tensor, tensor, tensor, tensor, scale=0.25,
+        cu_seqlens=cu_seqlens, chunk_indices=indices, chunk_size=32,
+    )
+    assert calls[0]["scale"] == 0.25
+    assert calls[0]["cu_seqlens"] is cu_seqlens
+    assert calls[0]["chunk_indices"] is indices
+    assert calls[0]["chunk_size"] == 32
+    assert calls[0]["transpose_state_layout"] is True
+
+
+def test_fla_chunk_o_copies_hip_result_into_core_output(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+    hip_result = torch.arange(8, dtype=torch.float32).reshape(1, 2, 1, 4)
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_fwd_o_vllm_hip_blockdim64=lambda **kwargs: hip_result,
+    )
+    module = _chunk_o_module(adapter, _chunk_o_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", True)
+    core = torch.full((16,), -1.0)
+    tensor = torch.zeros(1, 2, 1, 4)
+    result = module.chunk_fwd_o(
+        tensor, tensor, tensor, tensor, core_attn_out=core
+    )
+    assert result.data_ptr() == core.data_ptr()
+    torch.testing.assert_close(result, hip_result)
+
+
+def test_fla_chunk_o_uses_aiter_triton_when_hip_is_unavailable(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+    calls = []
+    _install_fake_module(monkeypatch, "aiter.ops.fla")
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.vllm.chunk_o",
+        launch_chunk_fwd_kernel_o=lambda **kwargs: calls.append(kwargs),
+    )
+    module = _chunk_o_module(adapter, _chunk_o_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", True)
+    tensor = torch.zeros(1, 2, 1, 4)
+    module.chunk_fwd_o(tensor, tensor, tensor, tensor, chunk_size=32)
+    assert calls[0]["BT"] == 32
+    assert calls[0]["transpose_state_layout"] is True
+
+
+def test_fla_chunk_o_uses_original_when_optional_aiter_is_unavailable(
+    monkeypatch,
+):
+    adapter = _adapter("patch_fla_chunk_o")
+    _install_fake_module(monkeypatch, "aiter.ops.fla")
+    _install_fake_module(monkeypatch, "aiter.ops.triton.fla.vllm.chunk_o")
+    module = _chunk_o_module(adapter, _chunk_o_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", True)
+    tensor = torch.zeros(1, 2, 1, 4)
+    assert module.chunk_fwd_o(tensor, tensor, tensor, tensor) == (
+        "original-output"
+    )
+
+
+def test_fla_chunk_o_propagates_selected_hip_runtime_error(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+
+    def failing_hip(**kwargs):
+        raise RuntimeError("hip output launch failed")
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_fwd_o_vllm_hip_blockdim64=failing_hip,
+    )
+    module = _chunk_o_module(adapter, _chunk_o_original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", True)
+    tensor = torch.zeros(1, 2, 1, 4)
+    with pytest.raises(RuntimeError, match="hip output launch failed"):
+        module.chunk_fwd_o(tensor, tensor, tensor, tensor)
 
 
 def _chunk_delta_module(adapter, original):

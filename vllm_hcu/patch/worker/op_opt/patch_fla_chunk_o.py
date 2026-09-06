@@ -22,6 +22,15 @@ def _enabled() -> bool:
     return bool(henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA and henvs.VLLM_HCU_USE_CUSTOM_OPS)
 
 
+def _hip_enabled() -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
+    return bool(
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_CHUNK_FWD_KERNEL_O
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     chunk = load_exact_module(TARGET_MODULE, module)
     if already_applied(chunk, _MARKER, ((chunk, "chunk_fwd_o", TARGETS[0], _WRAPPER),)):
@@ -39,13 +48,36 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_chunk_o(q, k, v, h, g=None, scale=None, cu_seqlens=None,
                     chunk_indices=None, chunk_size=chunk.FLA_CHUNK_SIZE,
                     core_attn_out=None):
+        if _hip_enabled():
+            try:
+                from aiter.ops.fla import (
+                    chunk_fwd_o_vllm_hip_blockdim64 as hip_kernel,
+                )
+            except ImportError:
+                hip_kernel = None
+            if hip_kernel is not None:
+                hip_output = hip_kernel(
+                    q=q, k=k, v=v, h=h, g=g, g_gamma=None, scale=scale,
+                    cu_seqlens=cu_seqlens, chunk_size=chunk_size,
+                    chunk_indices=chunk_indices, use_exp2=False,
+                    transpose_state_layout=True, kernel_cfg=None,
+                )
+                if core_attn_out is None:
+                    return hip_output
+                if core_attn_out.numel() < v.numel():
+                    raise ValueError("core_attn_out is too small for HCU FLA chunk_o")
+                out = core_attn_out[:v.numel()].view(*v.shape)
+                out.copy_(hip_output)
+                return out
+
         if not _enabled():
             return original(q, k, v, h, g, scale, cu_seqlens, chunk_indices,
                             chunk_size, core_attn_out)
         try:
             from aiter.ops.triton.fla.vllm.chunk_o import launch_chunk_fwd_kernel_o
-        except ImportError as exc:
-            raise RuntimeError("HCU AITER FLA chunk_o is enabled but unavailable") from exc
+        except ImportError:
+            return original(q, k, v, h, g, scale, cu_seqlens, chunk_indices,
+                            chunk_size, core_attn_out)
         B, T, Hg, K, V = *q.shape, v.shape[-1]
         H, BT = v.shape[-2], chunk_size
         if chunk_indices is None and cu_seqlens is not None:
