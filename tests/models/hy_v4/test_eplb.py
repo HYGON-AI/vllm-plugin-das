@@ -9,6 +9,9 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.distributed.eplb.rebalance_execute import (
+    rearrange_expert_weights_inplace,
+)
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
 from vllm_hcu.models.hy_v4 import model as hy_v4_model
@@ -401,13 +404,125 @@ def test_direct_load_is_tensor_equivalent_to_legacy_rearrangement() -> None:
     checkpoint = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
     source_map = (0, 1, 2, 3, 0, 1)
     target_map = (3, 2, 1, 0, 3, 2)
-    legacy_loaded = torch.stack([checkpoint[logical] for logical in source_map])
-    legacy_rearranged = torch.stack(
-        [
-            legacy_loaded[source_map.index(logical)]
-            for logical in target_map
-        ]
-    )
-    direct_loaded = torch.stack([checkpoint[logical] for logical in target_map])
 
-    torch.testing.assert_close(direct_loaded, legacy_rearranged, rtol=0, atol=0)
+    class RoutedExperts:
+        @staticmethod
+        def original_weight_loader(
+            routed_experts,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            del routed_experts, weight_name, shard_id
+            with torch.no_grad():
+                param[expert_id].copy_(loaded_weight)
+            return True if return_success else None
+
+        def weight_loader(
+            self,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            if hasattr(self, "_vllm_hcu_static_eplb_row"):
+                return static_eplb.load_static_logical_expert(
+                    self,
+                    self.original_weight_loader,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    logical_expert_id=expert_id,
+                    return_success=return_success,
+                )
+            return self.original_weight_loader(
+                self,
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success,
+            )
+
+    model = object.__new__(hy_v4_model.HYV4Model)
+    nn.Module.__init__(model)
+    parameter_name = "experts.w2_weight"
+
+    direct_loaded = nn.Parameter(
+        torch.full((6, 3), float("nan")),
+        requires_grad=False,
+    )
+    direct_experts = RoutedExperts()
+    direct_experts._vllm_hcu_static_eplb_row = target_map
+    direct_loaded.weight_loader = direct_experts.weight_loader
+    assert model.load_fused_expert_weights(
+        parameter_name,
+        {parameter_name: direct_loaded},
+        checkpoint,
+        "w2",
+        num_experts=4,
+        num_redundant_experts=2,
+    )
+
+    legacy_rearranged = nn.Parameter(
+        torch.full((6, 3), float("nan")),
+        requires_grad=False,
+    )
+    legacy_experts = RoutedExperts()
+    legacy_rearranged.weight_loader = legacy_experts.weight_loader
+    assert model.load_fused_expert_weights(
+        parameter_name,
+        {parameter_name: legacy_rearranged},
+        checkpoint,
+        "w2",
+        num_experts=4,
+        num_redundant_experts=2,
+    )
+
+    class SingleRankGroup:
+        @staticmethod
+        def size() -> int:
+            return 1
+
+        @staticmethod
+        def rank() -> int:
+            return 0
+
+    class NoRemoteTransfers:
+        needs_profile_buffer_reservation = False
+
+        @staticmethod
+        def set_transfer_context(*args) -> None:
+            del args
+
+        @staticmethod
+        def add_send(*args, **kwargs) -> None:
+            del args, kwargs
+            pytest.fail("single-rank rearrangement must not send expert weights")
+
+        @staticmethod
+        def add_recv(*args, **kwargs) -> None:
+            del args, kwargs
+            pytest.fail("single-rank rearrangement must not receive expert weights")
+
+        @staticmethod
+        def execute() -> None:
+            return None
+
+    rearrange_expert_weights_inplace(
+        torch.tensor([source_map]),
+        torch.tensor([target_map]),
+        [[legacy_rearranged]],
+        [torch.empty_like(legacy_rearranged)],
+        SingleRankGroup(),
+        NoRemoteTransfers(),
+    )
+
+    assert torch.equal(direct_loaded, legacy_rearranged)

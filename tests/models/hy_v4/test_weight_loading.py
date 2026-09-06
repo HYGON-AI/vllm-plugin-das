@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParamet
 from vllm.model_executor.layers import vocab_parallel_embedding as vocab_module
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from tests.models.static_eplb_test_utils import apply_real_moe_layer_patch
 from vllm_hcu.models.hy_v4 import model as hy_v4_model
 from vllm_hcu.models.hy_v4.model import (
     HYV4ForCausalLM,
@@ -26,7 +27,6 @@ from vllm_hcu.models.hy_v4.model import (
     _try_load_fp8_router_gate,
 )
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
-    StaticEplbPlan,
     load_static_logical_expert,
 )
 from vllm_hcu.patch.platform.core_fix import patch_logits_processor_head_dtype
@@ -302,6 +302,7 @@ def test_load_weights_maps_router_correction_bias_before_unknown_bias_filter(
 def test_split_expert_loading_passes_logical_id_to_common_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    apply_real_moe_layer_patch(monkeypatch)
     parameter_name = "layers.7.mlp.experts.routed_experts.w13_weight"
     checkpoint_name = "layers.7.mlp.experts.3.gate_proj.weight"
     checkpoint = torch.tensor([[7.0, 8.0], [9.0, 10.0]])
@@ -358,30 +359,13 @@ def test_split_expert_loading_passes_logical_id_to_common_loader(
             num_attention_heads=8,
         )
         num_redundant_experts = 2
-        _vllm_hcu_static_eplb_plan = StaticEplbPlan(
-            model_key="HYV4ForCausalLM",
-            source_path="/tmp/map.json",
-            source_sha256="a" * 64,
-            _map_values=(row,),
-            num_logical_experts=4,
-            num_physical_experts=6,
-            num_redundant_experts=2,
-        )
+        _vllm_hcu_static_eplb_plan = object()
 
         @staticmethod
         def named_parameters():
             return [(parameter_name, parameter)]
 
-        @staticmethod
-        def get_expert_mapping():
-            return [
-                (
-                    "experts.routed_experts.w13_",
-                    "experts.3.gate_proj.",
-                    3,
-                    "w1",
-                )
-            ]
+        get_expert_mapping = HYV4Model.get_expert_mapping
 
     monkeypatch.setattr(
         hy_v4_model, "get_pp_missing_layer_names", lambda model: set()
@@ -395,8 +379,11 @@ def test_split_expert_loading_passes_logical_id_to_common_loader(
     )
     monkeypatch.setattr(hy_v4_model, "get_tensor_model_parallel_rank", lambda: 0)
 
+    model = MinimalModel()
+    assert sorted({entry[2] for entry in model.get_expert_mapping()}) == [0, 1, 2, 3]
+
     loaded = HYV4Model.load_weights(
-        MinimalModel(),
+        model,
         [(checkpoint_name, checkpoint)],
     )
 

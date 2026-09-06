@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.models.static_eplb_test_utils import apply_real_moe_layer_patch
 from vllm_hcu.model_executor.layers.fused_moe import static_eplb
 
 
@@ -112,7 +113,7 @@ def _config() -> SimpleNamespace:
     )
 
 
-def test_deepseek_style_standard_loader_fans_out_a_logical_mapping(
+def test_patched_standard_mapping_feeds_logical_id_to_common_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     routed_experts = _RoutedExperts(local_physical_ids={3})
@@ -126,7 +127,23 @@ def test_deepseek_style_standard_loader_fans_out_a_logical_mapping(
 
     assert static_eplb.bind_static_eplb_plan(_config(), model) is plan
 
-    # This is the terminal call shape shared by the audited DeepSeek V2/V4,
+    make_expert_mapping = apply_real_moe_layer_patch(monkeypatch)
+    mapping = make_expert_mapping(
+        model,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=3,
+        num_redundant_experts=1,
+    )
+    assert sorted({entry[2] for entry in mapping}) == [0, 1, 2]
+    parameter_name, checkpoint_prefix, expert_id, shard_id = next(
+        entry
+        for entry in mapping
+        if entry[1] == "experts.2.down_proj."
+    )
+
+    # This mapping-to-loader handoff is shared by the audited DeepSeek V2/V4,
     # HY V3, GLM4 MoE, and ordinary MTP split-expert loaders.
     parameter = nn.Parameter(torch.empty(1))
     parameter.weight_loader = routed_experts.parameter_weight_loader
@@ -134,12 +151,13 @@ def test_deepseek_style_standard_loader_fans_out_a_logical_mapping(
     loaded = parameter.weight_loader(
         parameter,
         checkpoint_expert,
-        "model.layers.1.mlp.experts.routed_experts.w2_weight",
-        shard_id="w2",
-        expert_id=2,
+        f"model.layers.1.mlp.{parameter_name}weight",
+        shard_id=shard_id,
+        expert_id=expert_id,
         return_success=True,
     )
 
+    assert checkpoint_prefix == "experts.2.down_proj."
     assert loaded is True
     assert routed_experts.attempted_physical_ids == [0, 3]
     assert set(routed_experts.loaded) == {3}
