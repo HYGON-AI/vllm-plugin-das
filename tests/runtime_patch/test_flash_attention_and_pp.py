@@ -282,14 +282,26 @@ def test_cutlass_block_first_hnd_stride_contract(
     assert backend.get_kv_cache_stride_order(True) == (1, 4, 0, 2, 3, 5)
 
 
-@pytest.mark.parametrize(
-    ("layout", "expected_writer"),
-    [("NHD", "aiter"), ("HND", "triton")],
-)
+def test_flash_attention_splits_legacy_and_official_main_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+
+    legacy = torch.arange(3 * 2 * 4 * 5 * 8).reshape(3, 2, 4, 5, 8)
+    legacy_key, legacy_value = flash_attn._split_kv_cache(legacy, 8)
+    assert torch.equal(legacy_key, legacy[:, 0])
+    assert torch.equal(legacy_value, legacy[:, 1])
+
+    official = torch.arange(3 * 5 * 4 * 16).reshape(3, 5, 4, 16)
+    official_key, official_value = flash_attn._split_kv_cache(official, 8)
+    assert torch.equal(official_key, official.transpose(1, 2)[..., :8])
+    assert torch.equal(official_value, official.transpose(1, 2)[..., 8:])
+
+
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
 def test_flash_cache_writer_dispatches_by_physical_layout(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
-    expected_writer: str,
 ) -> None:
     fa_utils = importlib.import_module(
         "vllm_hcu.v1.attention.backends.fa_utils"
@@ -309,6 +321,12 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
         lambda *args: calls.append(("triton", args))
     )
     monkeypatch.setitem(sys.modules, triton_module_name, triton_module)
+    monkeypatch.setattr(
+        torch.ops.hcu_ops,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(("hcu", args)),
+        raising=False,
+    )
 
     key = torch.zeros(2, 1, 8)
     value = torch.ones_like(key)
@@ -332,7 +350,7 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
     )
 
     assert len(calls) == 1
-    assert calls[0][0] == expected_writer
+    assert calls[0][0] == "hcu"
     assert calls[0][1][:5] == (key, value, key_cache, value_cache, slots)
 
 
@@ -936,7 +954,7 @@ def test_hcu_varlen_dcp_requests_lse_from_paged_and_nonpaged_calls(
     assert len(merge_calls) == 1
 
 
-def test_block_first_kv_update_passes_axis_one_views_to_aiter(
+def test_block_first_kv_update_passes_axis_one_views_to_hcu_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)

@@ -7,6 +7,7 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
+import torch
 from flash_attn import (
     flash_attn_varlen_func as _flash_attn_varlen_func,
     hg_flash_attn_varlen_func as _hg_flash_attn_varlen_func,
@@ -96,36 +97,11 @@ def reshape_and_cache_flash(
 ) -> None:
     """Write FlashAttention KV pages using the active physical layout.
 
-    AITER's writer assumes token-major NHD storage inside each page.  The
-    target vLLM Mooncake contract selects HND for heterogeneous-TP transfer,
-    where the logical ``[B, N, H, D]`` view has head-major physical strides.
-    vLLM's Triton writer consumes the real tensor strides and therefore
-    handles both the HND slot/head order and a padded physical block stride.
+    The native HCU writer follows vLLM's stride-aware cache contract for every
+    supported cache dtype and both NHD and HND storage. Keep cache writes
+    independent of the vendor AITER package; AITER is an MoE backend here.
     """
-    # Logical cache views remain [block, token, head, dim] in both layouts.
-    # HND is distinguishable by a token stride smaller than the head stride.
-    # If either dimension is one, selecting NHD is also address-equivalent.
-    if key_cache.ndim == 4 and key_cache.stride(1) < key_cache.stride(2):
-        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-            triton_reshape_and_cache_flash,
-        )
-
-        triton_reshape_and_cache_flash(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-        )
-        return
-    from aiter.ops.cache import (
-        reshape_and_cache_flash as aiter_reshape_and_cache_flash,
-    )
-
-    aiter_reshape_and_cache_flash(
+    torch.ops.hcu_ops.reshape_and_cache_flash(
         key,
         value,
         key_cache,

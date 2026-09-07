@@ -75,6 +75,30 @@ import vllm.envs as envs
 
 logger = init_logger(__name__)
 
+
+def _split_kv_cache(
+    kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose K/V views for legacy HCU and official-main cache tensors."""
+    if isinstance(kv_cache, tuple):
+        return kv_cache
+    if kv_cache.ndim == 5:
+        if kv_cache.shape[1] != 2:
+            raise ValueError(
+                "Legacy HCU KV cache must have a two-entry K/V axis at dim 1, "
+                f"got shape {tuple(kv_cache.shape)}"
+            )
+        return kv_cache.unbind(1)
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[-1] != 2 * head_size:
+            raise ValueError(
+                "Official fused KV cache must have 2 * head_size channels, "
+                f"got shape {tuple(kv_cache.shape)} and head_size {head_size}"
+            )
+        return kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    raise ValueError(f"Unsupported KV cache shape {tuple(kv_cache.shape)}")
+
 if TYPE_CHECKING:
     from vllm_hcu.v1.pcp_manager import PCPPlan
 
@@ -930,10 +954,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = kv_cache
-        else:
-            key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = _split_kv_cache(kv_cache, key.shape[-1])
 
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
         # FA3/4 on H100+ uses TMA, which requires ≥16-byte stride alignment.
@@ -1136,10 +1157,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = kv_cache
-        else:
-            key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = _split_kv_cache(kv_cache, key.shape[-1])
 
         if (
             getattr(self, "use_pcp", False)
