@@ -206,7 +206,17 @@ def _reset_evalscope_artifacts(work_dir: Path) -> None:
         raise ValueError(f"EvalScope ownership marker must not be a symlink: {marker}")
     if not marker.exists():
         owned_root = EVALSCOPE_OWNED_ROOT.resolve()
-        if root.parent != owned_root:
+        ci_job_root_value = os.environ.get("HCU_CI_JOB_ROOT")
+        ci_job_root = (
+            Path(ci_job_root_value).resolve() if ci_job_root_value else None
+        )
+        ci_work_dir = (
+            ci_job_root / "evalscope"
+            if ci_job_root is not None
+            and ci_job_root != Path(ci_job_root.anchor)
+            else None
+        )
+        if root.parent != owned_root and root != ci_work_dir:
             raise ValueError(
                 "refusing to reset EvalScope artifacts without an ownership "
                 f"marker under {root}"

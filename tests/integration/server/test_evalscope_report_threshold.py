@@ -110,6 +110,22 @@ def test_reset_evalscope_artifacts_rejects_unowned_broad_path(
     assert report.read_text(encoding="utf-8") == "keep"
 
 
+def test_reset_evalscope_artifacts_claims_exact_ci_job_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "evalscope"
+    stale = work_dir / "reports/stale.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale", encoding="utf-8")
+    monkeypatch.setenv("HCU_CI_JOB_ROOT", str(tmp_path))
+
+    evalscope_server._reset_evalscope_artifacts(work_dir)
+
+    assert not stale.exists()
+    assert (work_dir / evalscope_server.EVALSCOPE_OWNER_MARKER).is_file()
+
+
 def test_reset_evalscope_artifacts_rejects_symlinked_work_dir(
     tmp_path: Path,
 ) -> None:
