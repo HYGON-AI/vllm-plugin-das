@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-"""Live-HCU accuracy for the strict LightOp Qwen gated RMSNorm route."""
+"""Live-HCU accuracy and fallback checks for Qwen gated RMSNorm."""
 
 from __future__ import annotations
 

@@ -65,4 +65,8 @@ never invent a model-level claim.
 
 Register tests in HCU CI, run repository contract/coverage/boundary checks,
 review the complete base-to-head diff, and keep the requested work in one PR.
+Before pushing, run the repository's exact CI contract command over all test
+directories; selected pytest files are not a substitute because cross-directory
+collection failures are otherwise invisible. Keep test module basenames unique
+across non-package test directories.
 Never place access tokens in commands, remotes, logs, reports, or commits.

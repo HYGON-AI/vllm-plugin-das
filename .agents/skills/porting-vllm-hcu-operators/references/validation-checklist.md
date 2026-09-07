@@ -94,7 +94,12 @@ records, and compare with the backend that production actually uses. An
 operator that wins only when setup costs are excluded is rejected or gets a
 predicate that excludes those shapes.
 
-Typical commands (adjust paths after verifying them):
+The repository-wide contract command is a mandatory pre-push CI-parity gate;
+targeted pytest runs supplement it but never replace it. Before running it,
+confirm that test basenames are unique across non-package directories such as
+`tests/runtime_patch` and `tests/accuracy`.
+
+Required commands (adjust paths after verifying them):
 
 ```bash
 python3 tools/run_patch_tests.py --suite contract \
@@ -155,5 +160,7 @@ must say the model result is incomplete.
 - Packed weights make cross-backend fallback unsafe after conversion.
 - Early worker INFO messages may not reach model validation logs; use an
   appropriate one-time visible marker without logging per token.
+- Identically named test modules in non-package directories can pass targeted
+  runs but fail the CI-wide pytest collection with `import file mismatch`.
 - Appended log files and old EvalScope artifacts can create false route or
   HumanEval passes unless the invocation owns and resets them.

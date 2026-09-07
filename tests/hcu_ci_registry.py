@@ -45,7 +45,7 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
-    target="tests/accuracy/test_lightop_rmsnorm_gated.py",
+    target="tests/accuracy/test_lightop_qwen_rmsnorm_gated_accuracy.py",
     est_time=120,
 )
 register_hcu_ci(
