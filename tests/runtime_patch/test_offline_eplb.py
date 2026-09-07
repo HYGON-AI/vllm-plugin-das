@@ -317,11 +317,37 @@ def _make_eplb_module(
             self.model_states[model_config.compute_hash()] = state
 
         def step(self, is_dummy=False, is_profile=False, log_stats=False):
-            del is_dummy, log_stats
             self.official_steps += 1
             if is_profile:
                 self.official_profile_steps += 1
+            if getattr(self, "simulate_official_window_step", False):
+                if not is_dummy and self._should_record_current_step(
+                    log_stats=log_stats
+                ):
+                    for model_state in self.model_states.values():
+                        model_state.expert_load_window[
+                            self.expert_load_window_step
+                        ].copy_(model_state.expert_load_pass)
+                        model_state.expert_load_pass.zero_()
+                    self.expert_load_window_step = (
+                        self.expert_load_window_step + 1
+                    ) % self.expert_load_window_size
+                self._update_layer_should_record(log_stats=log_stats)
             return "official-step"
+
+        def _sync_load_pass(self):
+            return [
+                model_state.expert_load_pass.clone()
+                for model_state in self.model_states.values()
+            ]
+
+        def _should_record_current_step(self, log_stats=False):
+            return log_stats
+
+        def _update_layer_should_record(self, log_stats=False):
+            self.should_record_tensor.fill_(
+                self._should_record_current_step(log_stats=log_stats)
+            )
 
         def rearrange(self, is_profile=False, rank_mapping=None):
             model_state = self.model_states["hy4-hash"]
@@ -616,6 +642,101 @@ def test_runtime_patch_record_mode_plans_without_live_rearrangement(
     assert recorded["model_maps"]["HYV4ForCausalLM"][
         "physical_to_logical_map"
     ] == [[3, 2, 1, 0, 3, 2]]
+
+
+def test_runtime_patch_logs_balancedness_across_ep_ranks_per_layer() -> None:
+    module, _, _ = _make_eplb_module()
+    log_calls: list[tuple[object, ...]] = []
+    module.logger.info = lambda _message, *args: log_calls.append(args)
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+    )
+    assert apply_to_module(module)
+
+    state = module.EplbState()
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    model_state = state.model_states["hy4-hash"]
+    # Both layers put 8 tokens on rank 0 and 2 on rank 1. The correct
+    # aggregate is avg=(5 + 5)=10, max=(8 + 8)=16, ratio=0.625.
+    model_state.expert_load_pass = torch.tensor([[8, 2], [8, 2]])
+    model_state.expert_load_window = torch.zeros((1, 2, 2), dtype=torch.int64)
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 100
+    state.expert_load_window_step = 0
+    state.expert_load_window_size = 1
+    state.parallel_config.eplb_config = SimpleNamespace(
+        log_balancedness_interval=1,
+    )
+    state._sync_load_pass = lambda: [model_state.expert_load_pass.clone()]
+    state._should_record_current_step = lambda log_stats=False: log_stats
+    state._update_layer_should_record = lambda log_stats=False: None
+
+    assert state.step(log_stats=True) == "official-step"
+
+    assert len(log_calls) == 1
+    _, model_name, avg_tokens, max_tokens, balancedness, _ = log_calls[0]
+    assert model_name == "/models/Hy4-preview-Channel-FP8-w8a8-v2"
+    assert avg_tokens == 10.0
+    assert max_tokens == 16.0
+    assert balancedness == 0.625
+    assert model_state.expert_load_window.tolist() == [[[8, 2], [8, 2]]]
+    assert model_state.expert_load_pass.tolist() == [[0, 0], [0, 0]]
+
+
+def test_runtime_patch_does_not_double_record_near_rearrangement() -> None:
+    module, _, _ = _make_eplb_module()
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+    )
+    assert apply_to_module(module)
+
+    state = module.EplbState()
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    model_state = state.model_states["hy4-hash"]
+    model_state.expert_load_pass = torch.tensor([[8, 2]])
+    model_state.expert_load_window = torch.zeros((2, 1, 2), dtype=torch.int64)
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 1
+    state.expert_load_window_step = 0
+    state.expert_load_window_size = 2
+    state.parallel_config.eplb_config = SimpleNamespace(
+        log_balancedness_interval=1,
+    )
+    state.simulate_official_window_step = True
+
+    sync_calls = 0
+    original_sync = state._sync_load_pass
+
+    def sync_load_pass():
+        nonlocal sync_calls
+        sync_calls += 1
+        return original_sync()
+
+    should_record_calls: list[bool] = []
+    update_calls: list[bool] = []
+    state._sync_load_pass = sync_load_pass
+    state._should_record_current_step = lambda log_stats=False: (
+        should_record_calls.append(log_stats) or True
+    )
+
+    def update_layer_should_record(log_stats=False):
+        update_calls.append(log_stats)
+        state.should_record_tensor.fill_(log_stats)
+
+    state._update_layer_should_record = update_layer_should_record
+
+    assert state.step(log_stats=True) == "official-step"
+
+    assert sync_calls == 1
+    assert model_state.expert_load_window.tolist() == [
+        [[8, 2]],
+        [[0, 0]],
+    ]
+    assert model_state.expert_load_pass.tolist() == [[0, 0]]
+    assert state.expert_load_window_step == 1
+    assert should_record_calls == [False, False]
+    assert update_calls == [False, True]
+    assert state.should_record_tensor.item() is True
 
 
 def test_runtime_patch_record_mode_keeps_profile_rearrangement(

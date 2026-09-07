@@ -54,6 +54,49 @@ _RECORD_ONLY_REARRANGE = ContextVar(
 )
 
 
+def _compute_eplb_load_stats(
+    num_tokens_per_rank: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backport vLLM #51813's per-layer EP load reduction."""
+    avg_tokens = num_tokens_per_rank.mean(dim=1).sum()
+    max_tokens = num_tokens_per_rank.max(dim=1).values.sum()
+    return avg_tokens, max_tokens
+
+
+def _log_corrected_eplb_balancedness(eplb_module: ModuleType, state) -> None:
+    expert_load_pass_list = state._sync_load_pass()
+    ep_group = eplb_module.get_ep_group().device_group
+    for expert_load_pass, model_state in zip(
+        expert_load_pass_list,
+        state.model_states.values(),
+    ):
+        num_tokens_per_rank = (
+            expert_load_pass.reshape(
+                expert_load_pass.shape[0],
+                ep_group.size(),
+                -1,
+            )
+            .sum(dim=-1)
+            .float()
+        )
+        avg_tensor, max_tensor = _compute_eplb_load_stats(num_tokens_per_rank)
+        avg_tokens, max_tokens = torch.stack([avg_tensor, max_tensor]).tolist()
+        balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
+        if ep_group.rank() == 0:
+            eplb_module.logger.info(
+                "EPLB step: %d for model %s: avg_tokens=%.2f, "
+                "max_tokens=%d, balancedness=%.4f, "
+                "steps until the next rearrangement: %d",
+                state.expert_rearrangement_step,
+                model_state.model_name,
+                avg_tokens,
+                max_tokens,
+                balancedness,
+                state.expert_rearrangement_step_interval
+                - state.expert_rearrangement_step,
+            )
+
+
 def load_offline_expert_map(
     path: str | Path,
     *,
@@ -299,6 +342,21 @@ def apply_to_module(module: ModuleType) -> bool:
 
     original_add_model = require_callable(eplb_state_cls, "add_model", TARGETS[0])
     original_step = require_callable(eplb_state_cls, "step", TARGETS[1])
+    require_callable(
+        eplb_state_cls,
+        "_sync_load_pass",
+        f"{TARGET_MODULE}.EplbState._sync_load_pass",
+    )
+    require_callable(
+        eplb_state_cls,
+        "_should_record_current_step",
+        f"{TARGET_MODULE}.EplbState._should_record_current_step",
+    )
+    require_callable(
+        eplb_state_cls,
+        "_update_layer_should_record",
+        f"{TARGET_MODULE}.EplbState._update_layer_should_record",
+    )
     original_rearrange = require_callable(
         eplb_state_cls,
         "rearrange",
@@ -410,12 +468,50 @@ def apply_to_module(module: ModuleType) -> bool:
         _, load_path = _parallel_offline_paths(self.parallel_config)
         if load_path:
             return None
-        return original_step(
+
+        should_log = False
+        if log_stats and not is_profile:
+            log_interval = (
+                self.parallel_config.eplb_config.log_balancedness_interval
+            )
+            should_log = self.expert_rearrangement_step % log_interval == 0
+        if not should_log:
+            return original_step(
+                self,
+                is_dummy=is_dummy,
+                is_profile=is_profile,
+                log_stats=log_stats,
+            )
+
+        # vLLM before #51813 reduces the layer/rank axes in the wrong order,
+        # which reports 1.0 when every layer has the same hot EP rank. Log the
+        # corrected values here, then let upstream perform every state change.
+        if is_dummy:
+            for model_state in self.model_states.values():
+                model_state.expert_load_pass.zero_()
+        _log_corrected_eplb_balancedness(eplb_module, self)
+
+        # Calling upstream with log_stats=False suppresses only its incorrect
+        # log block. Preserve the load-window update that log_stats=True would
+        # have requested when rearrangement proximity would not request it.
+        if not is_dummy and not self._should_record_current_step(log_stats=False):
+            for model_state in self.model_states.values():
+                model_state.expert_load_window[self.expert_load_window_step].copy_(
+                    model_state.expert_load_pass
+                )
+                model_state.expert_load_pass.zero_()
+            self.expert_load_window_step += 1
+            if self.expert_load_window_step >= self.expert_load_window_size:
+                self.expert_load_window_step = 0
+
+        result = original_step(
             self,
             is_dummy=is_dummy,
             is_profile=is_profile,
-            log_stats=log_stats,
+            log_stats=False,
         )
+        self._update_layer_should_record(log_stats=True)
+        return result
 
     setattr(hcu_step, _WRAPPER_MARKER, True)
 
