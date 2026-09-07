@@ -34,7 +34,8 @@ def apply_to_module(module: ModuleType) -> bool:
                     "qk_rope_head_dim", "v_head_dim", "q_lora_rank", "kv_lora_rank",
                     "mla_modules", "cache_config", "quant_config", "prefix", "skip_topk",
                     "non_causal_multi_token_decode",
-                    "allow_short_prefill_indexer_scoring_skip"),
+                    "allow_short_prefill_indexer_scoring_skip",
+                    "fuse_qkv_rmsnorm"),
         defaults={
             "cache_config": None,
             "quant_config": None,
@@ -42,6 +43,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "skip_topk": False,
             "non_causal_multi_token_decode": False,
             "allow_short_prefill_indexer_scoring_skip": False,
+            "fuse_qkv_rmsnorm": False,
         },
     )
     original_forward = require_callable(cls, "forward", TARGETS[1])

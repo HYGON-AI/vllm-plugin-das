@@ -557,6 +557,7 @@ def _build_attn_metadata(
     for_cudagraph_capture=False,
     causal=True,
     rswa_prefix_lens=None,
+    ubatch_idx=0,
 ):
     del (
         num_tokens,
@@ -573,6 +574,7 @@ def _build_attn_metadata(
         for_cudagraph_capture,
         causal,
         rswa_prefix_lens,
+        ubatch_idx,
     )
     extra = (
         model_specific_attn_metadata.get_extra_common_attn_kwargs(0, num_reqs)
@@ -620,6 +622,7 @@ def _original_prepare_attn(
     attn_groups,
     kv_cache_config,
     for_capture=False,
+    ubatch_idx=0,
 ):
     if cudagraph_mode == CUDAGraphMode.FULL:
         num_reqs = input_batch.num_reqs_after_padding
@@ -669,6 +672,7 @@ def _original_prepare_attn(
         mm_req_doc_ranges=req_doc_ranges,
         for_cudagraph_capture=for_capture,
         rswa_prefix_lens=input_batch.prompt_lens,
+        ubatch_idx=ubatch_idx,
     )
 
 
@@ -681,6 +685,7 @@ def _prepare_attn_with_request_sizing_drift(
     attn_groups,
     kv_cache_config,
     for_capture=False,
+    ubatch_idx=0,
 ):
     if cudagraph_mode == CUDAGraphMode.FULL:
         num_reqs = input_batch.num_reqs_after_padding
@@ -725,6 +730,7 @@ def _prepare_attn_with_request_sizing_drift(
         mm_req_doc_ranges=req_doc_ranges,
         for_cudagraph_capture=for_capture,
         rswa_prefix_lens=input_batch.prompt_lens,
+        ubatch_idx=ubatch_idx,
     )
 
 
@@ -853,6 +859,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         torch.zeros((1, 3), dtype=torch.int64),
         [[Group()]],
         SimpleNamespace(kv_cache_groups=[object()]),
+        ubatch_idx=3,
     )
     payload = {
         "pcp_query_gpu": common.query_start_loc.tolist(),
@@ -865,6 +872,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_one_has_phase_adapter": (
             "model_specific_attn_metadata" in captured
         ),
+        "pcp_one_ubatch_idx": captured["ubatch_idx"],
     }
     assert payload == {
         "pcp_query_gpu": [0, 1, 3],
@@ -875,6 +883,7 @@ def test_pcp_default_model_state_slices_metadata_and_propagates_phase(
         "pcp_one_query_gpu": [0, 1, 3],
         "pcp_one_query_cpu": [0, 1, 3],
         "pcp_one_has_phase_adapter": False,
+        "pcp_one_ubatch_idx": 3,
     }
 
 

@@ -28,7 +28,7 @@ TARGETS = (
 _MARKER = "_vllm_hcu_pcp_model_state_applied"
 _WRAPPER = "_vllm_hcu_pcp_model_state_wrapper"
 _V028_PREPARE_ATTN_SOURCE_SHA256 = (
-    "eff5cf447236a900df70ef1f91a5868f6a676124d6220cbc9a041e582df0e728"
+    "10d3722dbbed9652003fbc634b5183d344d5b9464bef8e2bcf35a615cae324c6"
 )
 
 
@@ -89,8 +89,9 @@ def apply_to_module(module: ModuleType) -> bool:
             "attn_groups",
             "kv_cache_config",
             "for_capture",
+            "ubatch_idx",
         ),
-        defaults={"for_capture": False},
+        defaults={"for_capture": False, "ubatch_idx": 0},
     )
     _require_source_fingerprint(
         original_prepare_attn,
@@ -125,6 +126,7 @@ def apply_to_module(module: ModuleType) -> bool:
         attn_groups,
         kv_cache_config,
         for_capture=False,
+        ubatch_idx=0,
     ):
         attn_metadata = original_prepare_attn(
             self,
@@ -135,6 +137,7 @@ def apply_to_module(module: ModuleType) -> bool:
             attn_groups,
             kv_cache_config,
             for_capture,
+            ubatch_idx,
         )
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size

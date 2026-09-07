@@ -1931,8 +1931,10 @@ def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch)
             skip_topk=False,
             non_causal_multi_token_decode=False,
             allow_short_prefill_indexer_scoring_skip=False,
+            fuse_qkv_rmsnorm=False,
         ):
             self.skip_topk = skip_topk
+            self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
 
         def forward(self, positions, hidden_states, llama_4_scaling=None):
             return (
@@ -1954,9 +1956,11 @@ def test_mla_upstream_skip_topk_contract_and_feature_off_delegation(monkeypatch)
     )
     assert adapter.apply_to_module(module) is True
     instance = MultiHeadLatentAttentionWrapper(
-        16, 2, 0.5, 4, 4, 8, 4, 4, object(), skip_topk=True
+        16, 2, 0.5, 4, 4, 8, 4, 4, object(), skip_topk=True,
+        fuse_qkv_rmsnorm=True,
     )
     assert instance.skip_topk is True
+    assert instance.fuse_qkv_rmsnorm is True
     assert instance.forward("positions", "hidden") == (
         "official",
         True,

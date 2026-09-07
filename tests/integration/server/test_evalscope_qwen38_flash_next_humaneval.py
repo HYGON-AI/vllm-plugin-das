@@ -52,9 +52,15 @@ def test_qwen38_flash_next_humaneval_command_contract(
         "serve",
         "/models/Qwen3.8-Flash-Next-FP8-Channelwise",
     ]
-    assert _option_value(server, "--tensor-parallel-size") == "8"
-    assert "--enable-expert-parallel" in server
-    assert _option_value(server, "--moe-backend") == "triton"
+    assert _option_value(server, "--tensor-parallel-size") == "4"
+    assert "--enforce-eager" not in server
+    assert _option_value(server, "--attention-backend") == "FLASH_ATTN"
+    assert _option_value(server, "--moe-backend") == "aiter"
+    assert _option_value(server, "--spec-method") == "mtp"
+    assert _option_value(server, "--spec-tokens") == "3"
+    assert "--enable-prefix-caching" in server
+    assert _option_value(server, "--max-num-seqs") == "4"
+    assert _option_value(server, "--max-model-len") == "40960"
     assert json.loads(
         _option_value(server, "--default-chat-template-kwargs")
     ) == {"enable_thinking": False}
@@ -70,7 +76,7 @@ def test_qwen38_flash_next_humaneval_command_contract(
 @pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
-@pytest.mark.hcu_count(8)
+@pytest.mark.hcu_count(4)
 @pytest.mark.slow
 @pytest.mark.nightly
 @pytest.mark.external_service("evalscope")
@@ -79,6 +85,6 @@ def test_qwen38_flash_next_humaneval_evalscope_server() -> None:
     run_evalscope_server_test(
         config,
         model_env=MODEL_ENV,
-        model_label="Qwen3.8 Flash Next TP8+EP",
-        required_hcu_count=8,
+        model_label="Qwen3.8 Flash Next TP4+AITER+MTP3",
+        required_hcu_count=4,
     )

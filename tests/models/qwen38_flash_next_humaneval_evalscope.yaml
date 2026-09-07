@@ -13,13 +13,20 @@ server:
   args:
     - --trust-remote-code
     - --tensor-parallel-size
-    - "8"
-    - --enable-expert-parallel
-    - --enforce-eager
+    - "4"
+    - --attention-backend
+    - FLASH_ATTN
     - --moe-backend
-    - triton
+    - aiter
+    - --spec-method
+    - mtp
+    - --spec-tokens
+    - "3"
+    - --enable-prefix-caching
+    - --max-num-seqs
+    - "4"
     - --max-model-len
-    - "32768"
+    - "40960"
     - --default-chat-template-kwargs
     - '{"enable_thinking":false}'
 
