@@ -49,5 +49,6 @@ evalscope:
     dataset: gsm8k
     metric: mean_acc
     display_name: Pass@1
-    minimum_score: 0.95
+    # This PR smoke test evaluates 10 samples, so allow one model miss.
+    minimum_score: 0.90
   no_timestamp: true
