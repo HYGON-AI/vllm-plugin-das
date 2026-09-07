@@ -87,6 +87,35 @@ def test_boolean_environment_values_are_lazily_parsed(
     assert hcu_envs.is_set("VLLM_HCU_USE_CUSTOM_OPS") is True
 
 
+MIGRATED_KERNEL_FLAGS = (
+    "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+    "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP",
+    "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O",
+)
+
+
+@pytest.mark.parametrize("name", MIGRATED_KERNEL_FLAGS)
+def test_migrated_kernel_flags_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(hcu_envs, name) is True
+    assert hcu_envs.is_set(name) is False
+
+
+@pytest.mark.parametrize("name", MIGRATED_KERNEL_FLAGS)
+@pytest.mark.parametrize("value", ["0", "false", "FALSE"])
+def test_migrated_kernel_flags_allow_explicit_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+    assert getattr(hcu_envs, name) is False
+    assert hcu_envs.is_set(name) is True
+
+
 def test_lightop_per_token_fp8_route_is_enabled_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

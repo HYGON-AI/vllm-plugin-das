@@ -39,6 +39,14 @@ DEFAULT_MODEL_ROOT = Path("/models/llm-models")
 DEFAULT_LOG_DIR = Path("/tmp/vllm-hcu-integration/logs")
 RESULT_PREFIX = "VLLM_HCU_RESULT="
 UNIFIED_ATTENTION_HEAD_DIMS = {128, 192, 256, 512}
+QWEN35_MTP3_SELECTOR_NAMES = (
+    "VLLM_HCU_USE_CUSTOM_OPS",
+    "VLLM_HCU_USE_CUSTOM_AITER_FLA",
+    "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D",
+    "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
+    "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP",
+    "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O",
+)
 DEEPSEEK_V4_DSPARK_SPECULATIVE_CONFIG = {
     "method": "dspark",
     "num_speculative_tokens": 7,
@@ -1290,6 +1298,101 @@ def _case_deepseek_v4_dspark_rank(
     }
 
 
+def _mtp3_worker_config_summary(worker: Any) -> dict[str, Any]:
+    """Read post-initialization config in each worker, where graph mode resolves."""
+    from vllm.compilation.counter import compilation_counter
+    from vllm_hcu.platforms import envs as henvs
+
+    config = worker.vllm_config
+    parallel = config.parallel_config
+    speculative = config.speculative_config
+    compilation = config.compilation_config
+    return {
+        "enforce_eager": config.model_config.enforce_eager,
+        "hcu_selectors": {
+            name: getattr(henvs, name) for name in QWEN35_MTP3_SELECTOR_NAMES
+        },
+        "parallel_config": {
+            "tensor_parallel_size": parallel.tensor_parallel_size,
+            "data_parallel_size": parallel.data_parallel_size,
+            "enable_expert_parallel": parallel.enable_expert_parallel,
+        },
+        "speculative_config": {
+            "method": speculative.method,
+            "num_speculative_tokens": speculative.num_speculative_tokens,
+        },
+        "cache_config": {
+            "mamba_cache_dtype": config.cache_config.mamba_cache_dtype,
+        },
+        "compilation_config": {
+            "mode": compilation.mode.name,
+            "cudagraph_mode": compilation.cudagraph_mode.name,
+            "decode_mode": compilation.cudagraph_mode.decode_mode().name,
+            "cudagraph_capture_sizes": list(compilation.cudagraph_capture_sizes or []),
+            "num_cudagraph_captured": compilation_counter.num_cudagraph_captured,
+        },
+    }
+
+
+def _case_qwen35_mtp3_graph_parity(
+    model_path: Path, *, gpu_memory_utilization: float,
+) -> dict[str, Any]:
+    """Targeted TP2/EP2 MTP3 parity; separate from the eager-only TP/EP smoke."""
+    from vllm import LLM
+    from vllm.sampling_params import SamplingParams
+
+    prompts = [
+        "Explain why deterministic parallel inference is useful in three sentences.",
+        "Describe how a compiler translates a program in three sentences.",
+    ]
+    result = {}
+    for label, enforce_eager in (("eager", True), ("graph", False)):
+        graph_kwargs = {} if enforce_eager else {
+            "compilation_config": {
+                # v0.25.1 decode_mode() returns FULL for this mode. Two
+                # requests with MTP3 verify up to 2 * (1 + 3) tokens per step.
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [4, 8],
+            },
+        }
+        llm = LLM(**_llm_kwargs(
+            model_path,
+            enforce_eager=enforce_eager,
+            tensor_parallel_size=2,
+            enable_expert_parallel=True,
+            moe_backend="aiter",
+            max_num_seqs=2,
+            gpu_memory_utilization=gpu_memory_utilization,
+            speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+            mamba_cache_dtype="float32",
+            cudagraph_metrics=True,
+            disable_log_stats=False,
+            **graph_kwargs,
+        ))
+        try:
+            rounds = []
+            for round_index in range(2):
+                print(f"VLLM_HCU_GENERATE_BEGIN={label}:{round_index}", flush=True)
+                outputs = llm.generate(
+                    prompts,
+                    SamplingParams(
+                        temperature=0.0, seed=0, min_tokens=16, max_tokens=16,
+                        ignore_eos=True, logprobs=1,
+                    ),
+                    use_tqdm=False,
+                )
+                rounds.append([_single_completion(record) for record in outputs])
+                llm.llm_engine.do_log_stats()
+                print(f"VLLM_HCU_GENERATE_END={label}:{round_index}", flush=True)
+            result[label] = {
+                "rounds": rounds,
+                "workers": llm.collective_rpc(_mtp3_worker_config_summary, timeout=30),
+            }
+        finally:
+            _shutdown_llm(llm)
+    return result
+
+
 def _case_tp_ep_smoke(
     model_path: Path,
     *,
@@ -1599,6 +1702,7 @@ def _main(argv: list[str] | None = None) -> int:
             "reranker-smoke",
             "vl-image-smoke",
             "tp-ep-smoke",
+            "qwen35-mtp3-graph-parity",
             "deepseek-v4-dspark-smoke",
         ),
     )
@@ -1652,6 +1756,11 @@ def _main(argv: list[str] | None = None) -> int:
         payload = _case_reranker_smoke(args.model)
     elif args.case == "vl-image-smoke":
         payload = _case_vl_image_smoke(args.model)
+    elif args.case == "qwen35-mtp3-graph-parity":
+        payload = _case_qwen35_mtp3_graph_parity(
+            args.model,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
     elif args.case == "tp-ep-smoke":
         payload = _case_tp_ep_smoke(
             args.model,

@@ -213,6 +213,15 @@ def _recording_callable(contract, name: str, calls: dict[str, object]):
     return target
 
 
+def _sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0, scale=None,
+    initial_state=None, inplace_final_state=True, cu_seqlens=None,
+    ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False,
+):
+    return "target-sigmoid"
+
+
 def _fake_qwen(*, aiter_available: bool = True):
     calls: dict[str, object] = {}
     causal = _recording_callable(_causal_contract, "causal", calls)
@@ -240,6 +249,8 @@ def _fake_qwen(*, aiter_available: bool = True):
     def sigmoid(*args, **kwargs):
         del args, kwargs
         return "target-sigmoid"
+
+    sigmoid.__signature__ = inspect.signature(_sigmoid_contract)
 
     values = {
         "GDN_AITER_TRITON_AVAILABLE": aiter_available,
@@ -274,6 +285,12 @@ def _install_module(monkeypatch: pytest.MonkeyPatch, name: str, **values):
     return module
 
 
+def _install_fake_module(
+    monkeypatch: pytest.MonkeyPatch, name: str, **values
+):
+    return _install_module(monkeypatch, name, **values)
+
+
 def _call_aiter(module, conv_state, weight):
     return module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
         x=torch.empty(1),
@@ -292,6 +309,207 @@ def _call_aiter(module, conv_state, weight):
         conv_state_indices=None,
         validate_data=True,
     )
+
+
+def _causal_route_module(adapter, original_update):
+    original_update.__signature__ = inspect.signature(  # type: ignore[attr-defined]
+        _causal_update_contract
+    )
+    module = ModuleType(adapter.TARGET_MODULE)
+    module.causal_conv1d_fn = _causal_contract
+    module.causal_conv1d_update = original_update
+    return module
+
+
+@pytest.mark.parametrize(
+    ("activation", "expected_activation"),
+    [(True, "silu"), (False, None), ("silu", "silu"), ("swish", "swish"), (None, None)],
+)
+def test_qwen_causal_update_routes_compatible_decode_to_external(
+    monkeypatch, activation, expected_activation,
+):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = {}
+
+    def original(*args, **kwargs):
+        calls["original"] = (args, kwargs)
+        return "original-update"
+
+    def custom_update(x, conv_state, weight, bias=None, activation=None,
+                      cache_seqlens=None, conv_state_indices=None):
+        if activation not in [None, "silu", "swish"]:
+            raise NotImplementedError("Only silu activation is supported")
+        calls["custom"] = {
+            "x": x,
+            "conv_state": conv_state,
+            "weight": weight,
+            "bias": bias,
+            "activation": activation,
+            "cache_seqlens": cache_seqlens,
+            "conv_state_indices": conv_state_indices,
+        }
+        return torch.full_like(x, 7)
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=custom_update,
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    x = torch.empty(2, 8)
+    state = torch.empty(1, 8, 3)
+    physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    indices = torch.tensor([0, 1])
+    result = module.causal_conv1d_update(
+        x, state, physical_weight, activation=activation,
+        conv_state_indices=indices, validate_data=True,
+    )
+    torch.testing.assert_close(result, torch.full_like(x, 7))
+    assert "original" not in calls
+    torch.testing.assert_close(
+        calls["custom"]["weight"], physical_weight.T.contiguous()
+    )
+    assert calls["custom"]["conv_state_indices"] is indices
+    assert calls["custom"]["activation"] == expected_activation
+    assert calls["custom"]["cache_seqlens"] is None
+
+
+def test_qwen_causal_update_preserves_vllm_mixed_cache_dtype_contract(
+    monkeypatch,
+):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = {}
+
+    def original(*args, **kwargs):
+        pytest.fail("compatible decode must use the selected external kernel")
+
+    def custom_update(x, conv_state, weight, bias=None, activation=None,
+                      cache_seqlens=None, conv_state_indices=None):
+        assert x.dtype == conv_state.dtype
+        calls["x_dtype"] = x.dtype
+        calls["indices"] = conv_state_indices
+        return x + 1
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=custom_update,
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    state = torch.zeros(2, 8, 3, dtype=torch.float32)
+    weight = torch.zeros(8, 4, dtype=torch.float32)
+    indices = torch.tensor([0, 1], dtype=torch.int32)
+
+    result = module.causal_conv1d_update(
+        x, state, weight, conv_state_indices=indices
+    )
+
+    assert calls["x_dtype"] == state.dtype
+    assert calls["indices"] is indices
+    assert result.dtype == x.dtype
+    torch.testing.assert_close(result, torch.ones_like(x))
+
+
+def test_qwen_causal_update_falls_back_for_spec_metadata(monkeypatch):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append(
+            inspect.signature(_causal_update_contract).bind(*args, **kwargs)
+        )
+        return "original-update"
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=lambda *args, **kwargs: pytest.fail(
+            "spec metadata is unsupported by the external kernel"
+        ),
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    accepted = torch.tensor([1])
+    query_start = torch.tensor([0, 1])
+    result = module.causal_conv1d_update(
+        torch.empty(1, 8), torch.empty(1, 8, 3), torch.empty(8, 4),
+        num_accepted_tokens=accepted, query_start_loc=query_start,
+        max_query_len=1,
+    )
+    assert result == "original-update"
+    assert calls[0].arguments["num_accepted_tokens"] is accepted
+    assert calls[0].arguments["query_start_loc"] is query_start
+
+
+def test_qwen_causal_update_falls_back_when_external_module_is_missing(
+    monkeypatch,
+):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "original-update"
+
+    _install_fake_module(
+        monkeypatch, "causal_conv1d.causal_conv1d_interface"
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    assert module.causal_conv1d_update(
+        torch.empty(1, 8), torch.empty(1, 8, 3), torch.empty(8, 4)
+    ) == "original-update"
+    assert len(calls) == 1
+
+
+def test_qwen_causal_update_propagates_selected_kernel_error(monkeypatch):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+
+    def original(*args, **kwargs):
+        return "original-update"
+
+    def failing_custom(*args, **kwargs):
+        raise RuntimeError("causal update launch failed")
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=failing_custom,
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    with pytest.raises(RuntimeError, match="causal update launch failed"):
+        module.causal_conv1d_update(
+            torch.empty(1, 8), torch.empty(1, 8, 3), torch.empty(8, 4)
+        )
 
 
 def test_dispatcher_scopes_all_gdn_callbacks_to_qwen():
@@ -333,6 +551,8 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_USE_NN", use_nn)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", False)
     assert causal_adapter.apply_to_module(module) is True
     assert aiter_adapter.apply_to_module(module) is True
     assert causal_adapter.apply_to_module(module) is False
@@ -343,9 +563,9 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
     assert module.causal_conv1d_fn is not canonical.causal_conv1d_fn
     assert module.causal_conv1d_update is not canonical.causal_conv1d_update
     assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
-    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
+    assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
     assert not hasattr(module, "_vllm_hcu_original_fused_recurrent")
-    assert not hasattr(module, "_vllm_hcu_original_fused_sigmoid")
+    assert module._vllm_hcu_original_fused_sigmoid is sigmoid
 
     conv_state = torch.empty(1, 8, 3)
     x_fn = torch.empty(8, 2)
@@ -431,11 +651,74 @@ def test_native_aiter_unavailable_is_idempotent_and_does_not_require_symbol():
     assert adapter.apply_to_module(module) is True
     assert adapter.apply_to_module(module) is False
     assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
-    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
+    assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
+    assert module._vllm_hcu_original_fused_sigmoid is sigmoid
     assert not hasattr(
         module,
         "gdn_aiter_fused_reshape_causal_conv1d_update_single_token",
     )
+
+
+@pytest.mark.parametrize("aiter_available", [False, True])
+@pytest.mark.parametrize("saved_state", [False, True])
+@pytest.mark.parametrize(
+    "incompatibility",
+    [
+        "missing", "reordered", "keyword_only", "variadic",
+        "beta", "threshold", "scale", "initial_state", "inplace_final_state",
+        "cu_seqlens", "ssm_state_indices", "num_accepted_tokens",
+        "use_qk_l2norm_in_kernel", "is_kda",
+    ],
+)
+def test_sigmoid_incompatible_signature_leaves_module_unchanged_and_retryable(
+    aiter_available, saved_state, incompatibility,
+):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, official_sigmoid = _fake_qwen(
+        aiter_available=aiter_available
+    )
+    parameters = list(inspect.signature(_sigmoid_contract).parameters.values())
+    if incompatibility == "missing":
+        signature = inspect.signature(lambda x: x)
+    elif incompatibility == "variadic":
+        signature = inspect.signature(lambda *args, **kwargs: None)
+    else:
+        if incompatibility == "reordered":
+            parameters[0], parameters[1] = parameters[1], parameters[0]
+        elif incompatibility == "keyword_only":
+            parameters[-1] = parameters[-1].replace(
+                kind=inspect.Parameter.KEYWORD_ONLY
+            )
+        else:
+            index = next(
+                i for i, parameter in enumerate(parameters)
+                if parameter.name == incompatibility
+            )
+            parameters[index] = parameters[index].replace(default="incompatible")
+        signature = inspect.Signature(parameters)
+
+    def incompatible(*args, **kwargs):
+        pytest.fail("incompatible sigmoid must never be invoked")
+
+    incompatible.__signature__ = signature
+    module.fused_sigmoid_gating_delta_rule_update = incompatible
+    if saved_state:
+        module._vllm_hcu_original_fused_sigmoid = object()
+        module._vllm_hcu_original_gdn_aiter_update = object()
+        module._vllm_hcu_qwen_gdn_aiter_layout_applied = False
+    before = dict(vars(module))
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        adapter.apply_to_module(module)
+    assert vars(module) == before
+
+    module.fused_sigmoid_gating_delta_rule_update = official_sigmoid
+    assert adapter.apply_to_module(module) is True
+    assert adapter.apply_to_module(module) is False
+    assert module._vllm_hcu_original_fused_sigmoid is official_sigmoid
+    if aiter_available:
+        assert module._vllm_hcu_original_gdn_aiter_update is before[
+            "gdn_aiter_fused_reshape_causal_conv1d_update_single_token"
+        ]
 
 
 def test_native_aiter_signature_and_keyword_calls_fail_closed(
@@ -453,7 +736,10 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
             unexpected=torch.empty(1),
         )
 
-    bad_module, _, _, _, _ = _fake_qwen(aiter_available=True)
+    bad_module, _, _, _, original_sigmoid = _fake_qwen(aiter_available=True)
+    native_update = (
+        bad_module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token
+    )
 
     def incompatible(x, weight):
         return x, weight
@@ -463,6 +749,17 @@ def test_native_aiter_signature_and_keyword_calls_fail_closed(
     )
     with pytest.raises(PatchCompatibilityError, match="incompatible parameters"):
         adapter.apply_to_module(bad_module)
+    assert bad_module.fused_sigmoid_gating_delta_rule_update is original_sigmoid
+    assert not hasattr(bad_module, "_vllm_hcu_original_fused_sigmoid")
+    assert not getattr(bad_module, "_vllm_hcu_qwen_gdn_aiter_layout_applied", False)
+
+    bad_module.gdn_aiter_fused_reshape_causal_conv1d_update_single_token = (
+        native_update
+    )
+    assert adapter.apply_to_module(bad_module) is True
+    assert adapter.apply_to_module(bad_module) is False
+    assert bad_module.fused_sigmoid_gating_delta_rule_update is not original_sigmoid
+    assert bad_module._vllm_hcu_original_fused_sigmoid is original_sigmoid
 
 
 def test_real_v0251_cold_import_scopes_gdn_deltas_to_qwen():
@@ -537,10 +834,13 @@ assert (
 )
 assert (
     qwen.fused_sigmoid_gating_delta_rule_update
-    is fla.fused_sigmoid_gating_delta_rule_update
+    is not fla.fused_sigmoid_gating_delta_rule_update
 )
 assert not hasattr(qwen, "_vllm_hcu_original_fused_recurrent")
-assert not hasattr(qwen, "_vllm_hcu_original_fused_sigmoid")
+assert (
+    qwen._vllm_hcu_original_fused_sigmoid
+    is fla.fused_sigmoid_gating_delta_rule_update
+)
 assert not bool(qwen.GDN_AITER_TRITON_AVAILABLE)
 assert getattr(qwen, "_vllm_hcu_qwen_gdn_aiter_layout_applied", False)
 from vllm_hcu.ops.rms_norm_gated import HcuRMSNormGated

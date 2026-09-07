@@ -209,6 +209,14 @@ register_hcu_ci(
     est_time=7200,
 )
 register_hcu_ci(
+    job="qwen35-tp-ep",
+    target=(
+        "tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py::"
+        "test_qwen35_35b_a3b_tp2_ep2_mtp3_full_decode_graph_aiter_auto_shuffle"
+    ),
+    est_time=1200,
+)
+register_hcu_ci(
     job="deepseek-tp-ep",
     target=(
         "tests/integration/parallel/test_tp_ep_models.py::"
