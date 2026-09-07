@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_PD_SPLIT: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
+    VLLM_HCU_MOE_ROUTING_SIMULATION_BALANCEDNESS: float = 1.0
     VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
@@ -347,6 +348,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD":
         lambda: (os.environ.get("VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", "False").lower() in
                     ("true", "1")),
+
+    # Target mean/max EP-rank load ratio for the HCU EPLB routing simulator.
+    "VLLM_HCU_MOE_ROUTING_SIMULATION_BALANCEDNESS":
+        lambda: float(os.environ.get(
+            "VLLM_HCU_MOE_ROUTING_SIMULATION_BALANCEDNESS", "1.0"
+        )),
 
     # If use shuffle for AITER W16A16 MoE, please set True (default True)
     "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE":
