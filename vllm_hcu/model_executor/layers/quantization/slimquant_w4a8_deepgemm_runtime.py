@@ -20,6 +20,9 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
+from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils import (
+    topk_weights_for_unpermute,
+)
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -236,9 +239,13 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ) -> None:
-        del global_num_experts, a2_scale, apply_router_weight_on_input
+        del global_num_experts, a2_scale
         if hidden_states.size(0) == 0:
             return
+        topk_weights = topk_weights_for_unpermute(
+            topk_weights,
+            apply_router_weight_on_input,
+        )
         if activation != MoEActivation.SILU:
             raise NotImplementedError(
                 "SlimQuant W4A8 DeepGEMM supports only SiLU activation"

@@ -27,6 +27,9 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
+from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils import (
+    topk_weights_for_unpermute,
+)
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
@@ -341,7 +344,6 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        del apply_router_weight_on_input
         if activation != MoEActivation.SILU:
             raise NotImplementedError(
                 "DeepEP DeepGEMM HT path currently mirrors SGLang's silu-only "
@@ -435,6 +437,10 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             m_indices,
         )
 
+        topk_weights = topk_weights_for_unpermute(
+            topk_weights,
+            apply_router_weight_on_input,
+        )
         deepgemm_unpermute_and_reduce(
             a=down_output,
             topk_ids=topk_ids,
