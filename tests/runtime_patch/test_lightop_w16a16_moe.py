@@ -40,6 +40,9 @@ def _config(
         is_act_and_mul=True,
         is_lora_enabled=False,
         has_bias=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
         routing_method=RoutingMethodType.Default,
         router_logits_dtype=torch.bfloat16,
         moe_parallel_config=SimpleNamespace(
@@ -152,6 +155,111 @@ def test_w16a16_packing_is_exact_non_mutating_and_idempotent() -> None:
     assert repeated_layout == layout
 
 
+def _run_mocked_w16a16_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_stage: str | None = None,
+) -> list[str]:
+    from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
+
+    layout = lightop_w16a16_runtime.LightopW16A16Layout(
+        logical_w13_shape=(2, 32, 32),
+        logical_w2_shape=(2, 32, 16),
+        packed_w13_shape=(2, 2, 16),
+        packed_w2_shape=(2, 1, 16),
+    )
+    w13 = torch.empty(layout.packed_w13_shape, dtype=torch.bfloat16)
+    w2 = torch.empty(layout.packed_w2_shape, dtype=torch.bfloat16)
+    lightop_w16a16_runtime.mark_lightop_w16a16_weights(w13, w2, layout)
+    messages: list[str] = []
+
+    def stage(name: str):
+        def operator(*_args, **_kwargs) -> None:
+            if fail_stage == name:
+                raise RuntimeError(f"{name} failed")
+
+        return operator
+
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "_load_lightop_w16a16",
+        lambda: SimpleNamespace(
+            get_config=object(),
+            align=stage("align"),
+            gemm=stage("gemm"),
+            activate=stage("activate"),
+            reduce=stage("reduce"),
+        ),
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "select_lightop_w16a16_config",
+        lambda *_args, **_kwargs: (
+            {"BLOCK_SIZE_M": 1},
+            {"BLOCK_SIZE_M": 1},
+        ),
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "logger",
+        SimpleNamespace(warning_once=messages.append),
+    )
+
+    def call() -> None:
+        lightop_w16a16_runtime.run_lightop_w16a16(
+            output=torch.empty((1, 32), dtype=torch.bfloat16),
+            hidden_states=torch.empty((1, 32), dtype=torch.bfloat16),
+            w13=w13,
+            w2=w2,
+            topk_weights=torch.ones((1, 1), dtype=torch.float32),
+            topk_ids=torch.zeros((1, 1), dtype=torch.int32),
+            workspace13=torch.empty((1, 32), dtype=torch.bfloat16),
+            workspace2=torch.empty((1, 16), dtype=torch.bfloat16),
+            global_num_experts=2,
+        )
+    if fail_stage is None:
+        call()
+    else:
+        with pytest.raises(RuntimeError, match=f"{fail_stage} failed"):
+            call()
+    return messages
+
+
+def test_w16a16_success_marker_requires_complete_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _run_mocked_w16a16_pipeline(monkeypatch) == [
+        "Using LightOp W16A16 Marlin MoE backend."
+    ]
+
+
+@pytest.mark.parametrize("fail_stage", ("align", "gemm", "activate", "reduce"))
+def test_w16a16_failed_pipeline_does_not_emit_success_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    fail_stage: str,
+) -> None:
+    assert _run_mocked_w16a16_pipeline(monkeypatch, fail_stage=fail_stage) == []
+
+
+def test_w16a16_packing_does_not_emit_backend_success_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
+
+    messages: list[str] = []
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "logger",
+        SimpleNamespace(warning_once=messages.append),
+    )
+    lightop_w16a16_runtime.pack_lightop_w16a16_weights(
+        torch.empty((2, 32, 32), dtype=torch.bfloat16),
+        torch.empty((2, 32, 16), dtype=torch.bfloat16),
+    )
+
+    assert "Using LightOp W16A16 Marlin MoE backend." not in messages
+
+
 @pytest.mark.parametrize(
     "w13_shape,w2_shape",
     (
@@ -206,6 +314,29 @@ def test_w16a16_auto_selects_lightop_only_when_master_and_leaf_enabled(
     assert backend.name == "HCU_LIGHTOP_W16A16"
     assert experts is LightopW16A16Experts
     assert not [call for call in calls if call[0] == "select"]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        "UnquantizedMoeBackend",
+        "backend_to_kernel_cls",
+        "map_unquantized_backend",
+        "select_unquantized_moe_backend",
+        "convert_to_unquantized_kernel_format",
+        "make_unquantized_moe_kernel",
+    ),
+)
+def test_w16a16_oracle_rejects_stale_applied_binding(binding: str) -> None:
+    from vllm_hcu.patch.worker.op_opt.moe import patch_unquantized_oracle
+    from vllm_hcu.patch.worker.op_opt.moe._common import PatchCompatibilityError
+
+    module, _ = _target_module()
+    assert patch_unquantized_oracle.apply_to_module(module) is True
+    setattr(module, binding, lambda: None)
+
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_unquantized_oracle.apply_to_module(module)
 
 
 @pytest.mark.parametrize(
@@ -286,6 +417,51 @@ def test_w16a16_no_config_preserves_original_selector_and_weights(
     assert [call for call in calls if call[0] == "convert"]
 
 
+def test_w16a16_selection_requires_configs_for_every_reachable_token_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import lightop_w16a16_runtime
+    from vllm_hcu.model_executor.layers.fused_moe.experts.lightop_w16a16_moe import (
+        LightopW16A16Experts,
+    )
+    from vllm_hcu.patch.worker.op_opt.moe import patch_unquantized_oracle
+
+    module, calls = _target_module()
+    probed: list[int] = []
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_W16A16_MOE", True, raising=False
+    )
+    monkeypatch.setattr(
+        LightopW16A16Experts,
+        "is_supported_config",
+        staticmethod(lambda *args: (True, None)),
+    )
+
+    def select_config(_config, expected_m, device):
+        del device
+        probed.append(expected_m)
+        if expected_m == 3:
+            return None
+        return {"BLOCK_SIZE_M": 16}, {"BLOCK_SIZE_M": 16}
+
+    monkeypatch.setattr(
+        lightop_w16a16_runtime,
+        "select_lightop_w16a16_config",
+        select_config,
+    )
+    patch_unquantized_oracle.apply_to_module(module)
+
+    backend, experts = module.select_unquantized_moe_backend(
+        _config(max_num_tokens=4)
+    )
+
+    assert backend.name == "AITER"
+    assert experts == "official-experts"
+    assert probed == [1, 2, 3]
+    assert [call for call in calls if call[0] == "select"]
+
+
 def test_w16a16_unverified_token_range_preserves_official_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -322,6 +498,119 @@ def test_w16a16_unverified_token_range_preserves_official_backend(
     )
     assert supported is False
     assert "max_num_tokens" in str(reason)
+
+
+def test_w16a16_ineligible_config_does_not_probe_lightop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        lightop_w16a16_moe,
+    )
+
+    config = _config()
+    config.in_dtype = torch.float16
+    monkeypatch.setattr(
+        lightop_w16a16_moe.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_moe,
+        "is_lightop_w16a16_available",
+        lambda: pytest.fail("ineligible config must not probe LightOp"),
+    )
+
+    supported, reason = lightop_w16a16_moe.LightopW16A16Experts.is_supported_config(
+        lightop_w16a16_moe.LightopW16A16Experts,
+        config,
+        None,
+        None,
+        FusedMoEActivationFormat.Standard,
+    )
+
+    assert supported is False
+    assert "BF16" in str(reason)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (
+        ("swiglu_limit", 7.0),
+        ("swiglu_alpha", 1.25),
+        ("swiglu_beta", 0.5),
+    ),
+)
+def test_w16a16_modified_swiglu_is_rejected_before_lightop_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    value: float,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        lightop_w16a16_moe,
+    )
+
+    config = _config()
+    setattr(config, attribute, value)
+    monkeypatch.setattr(
+        lightop_w16a16_moe.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_moe,
+        "is_lightop_w16a16_available",
+        lambda: pytest.fail("modified SwiGLU must be rejected before LightOp probe"),
+    )
+
+    supported, reason = lightop_w16a16_moe.LightopW16A16Experts.is_supported_config(
+        lightop_w16a16_moe.LightopW16A16Experts,
+        config,
+        None,
+        None,
+        FusedMoEActivationFormat.Standard,
+    )
+
+    assert supported is False
+    assert "SwiGLU" in str(reason)
+
+
+def test_w16a16_missing_lightop_preserves_official_backend_and_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        lightop_w16a16_moe,
+    )
+    from vllm_hcu.patch.worker.op_opt.moe import patch_unquantized_oracle
+
+    module, calls = _target_module()
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_W16A16_MOE", True, raising=False
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_moe,
+        "is_lightop_w16a16_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        lightop_w16a16_moe.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    patch_unquantized_oracle.apply_to_module(module)
+    w13 = torch.empty((2, 64, 32))
+    w2 = torch.empty((2, 32, 32))
+
+    backend, experts = module.select_unquantized_moe_backend(_config())
+    converted = module.convert_to_unquantized_kernel_format(
+        backend, _config(), w13, w2
+    )
+
+    assert backend.name == "AITER"
+    assert experts == "official-experts"
+    assert converted == (w13, w2)
+    assert [call for call in calls if call[0] == "select"]
+    assert [call for call in calls if call[0] == "convert"]
 
 
 def test_w16a16_converter_packs_only_owned_backend(
@@ -445,8 +734,12 @@ def test_w16a16_weight_lifecycle_installs_one_packed_parameter_pair(
 
     assert tuple(installed13.shape) == (2, 2, 1024)
     assert tuple(installed2.shape) == (2, 2, 512)
-    assert installed13.weight_loader == "w13-loader"
-    assert installed2.weight_loader == "w2-loader"
+    assert callable(installed13.weight_loader)
+    assert callable(installed2.weight_loader)
+    with pytest.raises(RuntimeError, match="cannot reload"):
+        installed13.weight_loader(param=installed13, loaded_weight=torch.empty(1))
+    with pytest.raises(RuntimeError, match="cannot reload"):
+        installed2.weight_loader(param=installed2, loaded_weight=torch.empty(1))
     assert getattr(installed13, "_hcu_lightop_w16a16_packed") is True
     assert getattr(installed2, "_hcu_lightop_w16a16_packed") is True
     assert len(built) == 1

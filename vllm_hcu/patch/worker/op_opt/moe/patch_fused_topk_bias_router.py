@@ -7,17 +7,27 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
-from ._common import load_exact_module, require_callable, require_parameter_names
+from ._common import (
+    check_module_marker,
+    load_exact_module,
+    require_callable,
+    require_parameter_names,
+)
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router"
 PATCH_ID = "worker.op_opt.moe.router.fused_topk_bias"
 TARGETS = (f"{TARGET_MODULE}.vllm_topk_softplus_sqrt",)
 _MARKER = "_vllm_hcu_hash_router_dtype_applied"
+_WRAPPER_MARKER = "_vllm_hcu_hash_router_dtype_wrapper"
 
 
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
-    if getattr(target, _MARKER, False):
+    if check_module_marker(
+        target,
+        _MARKER,
+        ((target, "vllm_topk_softplus_sqrt", _WRAPPER_MARKER),),
+    ):
         return False
     original = require_callable(target, "vllm_topk_softplus_sqrt", TARGETS[0])
     require_parameter_names(
@@ -58,7 +68,6 @@ def apply_to_module(module: ModuleType) -> bool:
         use_lightop = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
-            and is_lightop_sqrtsoftplus_available()
             and can_use_lightop_sqrtsoftplus(
                 gating_output,
                 e_score_correction_bias,
@@ -66,6 +75,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 input_tokens=input_tokens,
                 hash_indices_table=hash_indices_table,
             )
+            and is_lightop_sqrtsoftplus_available()
         )
         if use_lightop:
             return run_lightop_sqrtsoftplus(
@@ -110,6 +120,7 @@ def apply_to_module(module: ModuleType) -> bool:
             routed_scaling_factor,
         )
 
+    setattr(hcu_topk_softplus_sqrt, _WRAPPER_MARKER, True)
     target._vllm_hcu_original_vllm_topk_softplus_sqrt = original
     target.vllm_topk_softplus_sqrt = hcu_topk_softplus_sqrt
     setattr(target, _MARKER, True)

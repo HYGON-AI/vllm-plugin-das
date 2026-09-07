@@ -29,6 +29,16 @@ EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
 EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
 EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
 EVALSCOPE_PROCESS_OWNER_ENV = "VLLM_HCU_EVAL_PROCESS_OWNER"
+SERVER_LOG_ENV_ALLOWLIST = frozenset(
+    {
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT",
+        "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED",
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE",
+        "VLLM_HCU_USE_LIGHTOP_W16A16_MOE",
+        "VLLM_USE_OPT_CAT",
+    }
+)
 _DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
@@ -352,6 +362,15 @@ def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
     env["NO_PROXY"] = no_proxy
     env["no_proxy"] = no_proxy
     return env
+
+
+def _server_log_environment(env: dict[str, str]) -> dict[str, str]:
+    """Return only non-sensitive route controls needed as test evidence."""
+
+    return {
+        name: env[name]
+        for name in sorted(SERVER_LOG_ENV_ALLOWLIST.intersection(env))
+    }
 
 
 def _report_metric(
@@ -823,11 +842,7 @@ def run_evalscope_server_test(
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())
-        visible_environment = {
-            name: value
-            for name, value in env.items()
-            if name.startswith(("VLLM_HCU_", "VLLM_ROCM_"))
-        }
+        visible_environment = _server_log_environment(env)
         rendered_environment = " ".join(
             f"{name}={visible_environment[name]}"
             for name in sorted(visible_environment)

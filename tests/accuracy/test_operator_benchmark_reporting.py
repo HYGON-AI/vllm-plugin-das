@@ -78,6 +78,43 @@ def test_cli_exposes_each_screening_candidate(operator: str) -> None:
     assert args.repeats > 0
 
 
+def test_mla_default_benchmark_grid_filters_to_production_shapes() -> None:
+    from vllm_hcu.model_executor.layers.attention.lightop_concat_runtime import (
+        is_lightop_mla_decode_concat_shape_supported,
+    )
+
+    args = build_parser().parse_args(["mla-decode-cat"])
+    accepted = {
+        (tokens, heads)
+        for heads in args.heads
+        for tokens in args.token_counts
+        if is_lightop_mla_decode_concat_shape_supported(tokens, heads)
+    }
+
+    assert len(accepted) == 12
+    assert len(accepted) < len(args.heads) * len(args.token_counts)
+
+
+def test_sqrtsoftplus_default_benchmark_grid_filters_to_production_shapes() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
+        is_lightop_sqrtsoftplus_shape_supported,
+    )
+
+    args = build_parser().parse_args(["sqrtsoftplus-gate"])
+    accepted = {
+        (experts, topk, tokens)
+        for experts in args.experts
+        for topk in args.top_k
+        for tokens in args.token_counts
+        if is_lightop_sqrtsoftplus_shape_supported(tokens, experts, topk)
+    }
+
+    assert len(accepted) == 6
+    assert len(accepted) < (
+        len(args.experts) * len(args.top_k) * len(args.token_counts)
+    )
+
+
 def test_comparison_record_applies_five_percent_acceptance_gate() -> None:
     record = build_comparison_record(
         shape={"tokens": 1, "experts": 256, "top_k": 6},

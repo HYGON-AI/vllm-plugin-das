@@ -39,11 +39,6 @@ Current coverage:
   checkpoints. It starts and stops only its own P, D, and proxy process trees,
   runs HumanEval-32 through the proxy, and requires positive Mooncake transfer,
   DeepEP/DeepGEMM HT+LL, and DSpark metrics evidence.
-- `test_evalscope_operator_adaptation_humaneval.py` runs deterministic
-  HumanEval-32 feature pairs for the local DeepSeek-V4 Channel-INT8 and
-  Qwen3.6-35B-A3B checkpoints. It verifies exact prediction/review counts,
-  non-regressing Pass@1, and fresh per-invocation server-log evidence that the
-  enabled LightOp route actually executed.
 
 The Qwen3-8B smoke test needs one local HCU device, the checkpoint at
 `/models/llm-models/qwen3/Qwen3-8B`, `vllm`, and `evalscope`. Select it with
@@ -92,10 +87,3 @@ shared YAML with `VLLM_HCU_DEEPSEEK_V4_DSPARK_MOONCAKE_PD_CONFIG` and point
 Mooncake proxy. See
 `docs/deepseek_v4_flash_0731_dspark_mooncake_pd_validation.md` for the exact P,
 D, proxy, curl, and pytest commands.
-
-The operator-adaptation profiles default to
-`/models/DeepSeek-V4-Flash-Channel-INT8-w8a8` and
-`/models/Qwen3.6-35B-A3B`. Override them with
-`VLLM_HCU_OPERATOR_ADAPTATION_DEEPSEEK_MODEL` and
-`VLLM_HCU_OPERATOR_ADAPTATION_QWEN_MODEL`; override the YAML files with the
-matching `VLLM_HCU_OPERATOR_ADAPTATION_{DEEPSEEK,QWEN}_CONFIG` variables.

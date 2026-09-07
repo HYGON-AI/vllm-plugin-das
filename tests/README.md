@@ -55,20 +55,6 @@ python tools/run_patch_tests.py --suite model --collect-only
 python tools/check_patch_test_coverage.py --json
 ```
 
-Candidate operator benchmarks use a separate runner so timing variance never
-changes functional pytest results:
-
-```bash
-python tools/benchmark_sglang_operator_candidates.py --help
-```
-
-The runner exposes `sqrtsoftplus-gate`, `silu-and-mul`, `w16a16-moe`,
-`mla-decode-cat`, `aiter-tgemm`, and `aiter-batched-gemm-bf16`.
-Each executable handler is enabled only after its live-HCU numerical test is
-in place. Recorded commands, shapes and results belong in
-`docs/operator_adaptation_audit_v0251.md`; a symbol being importable is not a
-performance or correctness result.
-
 `tools/check_patch_test_coverage.py` is a pytest-independent preflight. It
 fails when a new `patch_*.py` module lacks the standard adapter contract or a
 direct test reference.

@@ -8,12 +8,18 @@ import functools
 import sys
 from types import ModuleType
 
-from ._common import load_exact_module, require_callable, require_parameter_names
+from ._common import (
+    check_module_marker,
+    load_exact_module,
+    require_callable,
+    require_parameter_names,
+)
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.moe_align_block_size"
 PATCH_ID = "worker.op_opt.moe.align_block_size"
 TARGETS = (f"{TARGET_MODULE}.moe_align_block_size",)
 _MARKER = "_vllm_hcu_moe_align_applied"
+_WRAPPER_MARKER = "_vllm_hcu_moe_align_wrapper"
 _CAPTURED_BINDING_MODULES = (
     "vllm.model_executor.layers.fused_moe.fused_moe",
     "vllm.model_executor.layers.quantization.compressed_tensors."
@@ -180,9 +186,18 @@ def _torch_moe_align_block_size(
 
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
-    if getattr(target, _MARKER, False):
+    if check_module_marker(
+        target,
+        _MARKER,
+        ((target, "moe_align_block_size", _WRAPPER_MARKER),),
+    ):
+        original = require_callable(
+            target,
+            "_vllm_hcu_original_moe_align_block_size",
+            TARGETS[0],
+        )
         _rebind_loaded_consumers(
-            target._vllm_hcu_original_moe_align_block_size,
+            original,
             target.moe_align_block_size,
         )
         return False
@@ -315,6 +330,7 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         return sorted_ids, expert_ids, num_tokens_post_pad
 
+    setattr(hcu_moe_align_block_size, _WRAPPER_MARKER, True)
     target._vllm_hcu_original_moe_align_block_size = original
     target.moe_align_block_size = hcu_moe_align_block_size
     _rebind_loaded_consumers(original, hcu_moe_align_block_size)

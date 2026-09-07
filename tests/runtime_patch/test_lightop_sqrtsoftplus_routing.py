@@ -13,6 +13,7 @@ from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
     can_use_lightop_sqrtsoftplus,
 )
 from vllm_hcu.patch.worker.op_opt.moe import patch_fused_topk_bias_router
+from vllm_hcu.patch.worker.op_opt.moe._common import PatchCompatibilityError
 from vllm_hcu.platforms import envs as henvs
 
 
@@ -101,7 +102,7 @@ def _call_patched(
 
 
 def test_sqrtsoftplus_eligibility_accepts_supported_non_hash_metadata() -> None:
-    logits = _CudaTensorMetadata((2, 256), torch.float32)
+    logits = _CudaTensorMetadata((1024, 256), torch.float32)
     bias = _CudaTensorMetadata((256,), torch.float32)
 
     assert can_use_lightop_sqrtsoftplus(
@@ -117,7 +118,11 @@ def test_sqrtsoftplus_eligibility_accepts_supported_non_hash_metadata() -> None:
     "logit_shape, bias_shape, topk, input_tokens, hash_table",
     (
         ((2, 128), (128,), 6, None, None),
+        ((0, 256), (256,), 6, None, None),
+        ((2, 256), (256,), 6, None, None),
+        ((256, 256), (256,), 6, None, None),
         ((2, 256), (256,), 17, None, None),
+        ((1024, 256), (256,), 16, None, None),
         ((2, 256), (255,), 6, None, None),
         ((2, 256), (256,), 6, torch.tensor([1]), torch.tensor([[1]])),
     ),
@@ -168,13 +173,52 @@ def test_non_hash_sqrtsoftplus_uses_lightop_when_both_switches_are_enabled(
 
     actual_weights, actual_ids = _call_patched(
         module,
-        gating_output=_CudaTensorMetadata((2, 256), torch.float32),
+        gating_output=_CudaTensorMetadata((1024, 256), torch.float32),
         correction_bias=_CudaTensorMetadata((256,), torch.float32),
     )
 
     assert actual_weights is expected_weights
     assert torch.equal(actual_ids, expected_ids.to(torch.int64))
     assert actual_ids.dtype is torch.int64
+
+
+def test_sqrtsoftplus_patch_rejects_stale_wrapper() -> None:
+    module = _target_module(object())
+    assert patch_fused_topk_bias_router.apply_to_module(module)
+    module.vllm_topk_softplus_sqrt = lambda *_args, **_kwargs: None
+
+    with pytest.raises(PatchCompatibilityError, match="stale HCU MoE marker"):
+        patch_fused_topk_bias_router.apply_to_module(module)
+
+
+def test_sqrtsoftplus_kernel_failure_does_not_emit_success_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import sqrtsoftplus_routing
+
+    messages: list[str] = []
+    _install_lightop_moe(
+        monkeypatch,
+        moe_fused_gate_sqrtsoftplus=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("kernel failed")
+        ),
+    )
+    monkeypatch.setattr(
+        sqrtsoftplus_routing,
+        "logger",
+        SimpleNamespace(warning_once=messages.append),
+    )
+
+    with pytest.raises(RuntimeError, match="kernel failed"):
+        sqrtsoftplus_routing.run_lightop_sqrtsoftplus(
+            torch.empty((2, 256), dtype=torch.float32),
+            torch.empty((256,), dtype=torch.float32),
+            topk=6,
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            indices_dtype=torch.int32,
+        )
+    assert messages == []
 
 
 @pytest.mark.parametrize("master, leaf", ((False, True), (True, False)))
@@ -222,6 +266,36 @@ def test_hash_routing_never_calls_lightop(
         "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE",
         True,
         raising=False,
+    )
+    official_result = object()
+    module = _target_module(official_result)
+    patch_fused_topk_bias_router.apply_to_module(module)
+
+    assert _call_patched(
+        module,
+        gating_output=_CudaTensorMetadata((2, 256), torch.float32),
+        correction_bias=_CudaTensorMetadata((256,), torch.float32),
+        input_tokens=torch.tensor([1, 2], dtype=torch.int64),
+        hash_indices_table=torch.tensor([[1], [2], [3]], dtype=torch.int64),
+    ) is official_result
+
+
+def test_ineligible_hash_route_does_not_probe_optional_lightop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import sqrtsoftplus_routing
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sqrtsoftplus_routing,
+        "is_lightop_sqrtsoftplus_available",
+        lambda: pytest.fail("ineligible input must not probe LightOp"),
     )
     official_result = object()
     module = _target_module(official_result)

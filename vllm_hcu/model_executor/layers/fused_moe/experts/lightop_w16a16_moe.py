@@ -30,7 +30,9 @@ class LightopW16A16Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cuda_alike() and is_lightop_w16a16_available()
+        # Keep optional-package probing out of the generic modular-kernel
+        # checks.  Strict local eligibility is evaluated first below.
+        return current_platform.is_cuda_alike()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -88,6 +90,15 @@ class LightopW16A16Experts(mk.FusedMoEExpertsModular):
             return False, "kernel does not support expert bias"
         if bool(getattr(moe_config, "aiter_fmoe_shared_expert_enabled", False)):
             return False, "kernel does not support AITER fused shared experts"
+        swiglu_limit = getattr(moe_config, "swiglu_limit", None)
+        swiglu_alpha = getattr(moe_config, "swiglu_alpha", None)
+        swiglu_beta = getattr(moe_config, "swiglu_beta", None)
+        if (
+            swiglu_limit is not None
+            or swiglu_alpha not in (None, 1.0)
+            or swiglu_beta not in (None, 0.0)
+        ):
+            return False, "kernel supports only unmodified SwiGLU activation"
         intermediate = int(
             getattr(moe_config, "intermediate_size_per_partition", -1)
         )
@@ -112,6 +123,8 @@ class LightopW16A16Experts(mk.FusedMoEExpertsModular):
             return False, (
                 "kernel performance requires 1 <= max_num_tokens <= 16"
             )
+        if not is_lightop_w16a16_available():
+            return False, "required categorized LightOp W16A16 exports are unavailable"
         return True, None
 
     def moe_problem_size(

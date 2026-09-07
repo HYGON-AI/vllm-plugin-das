@@ -75,28 +75,6 @@ HCU-only feature settings are stored in
 modified. `patch_report()` reports the process role, target symbols, patch
 status, failure details, and feature activation state.
 
-`VLLM_HCU_USE_CUSTOM_OPS` is the master switch for HCU custom-operator routes.
-For DeepSeek V4, `VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE` controls the
-LightOp sqrt-softplus router and defaults to enabled. The route is limited to
-supported non-hash inputs; setting either switch to `0` keeps vLLM's official
-router, and hash-routing layers always remain on the official implementation.
-
-`VLLM_HCU_USE_LIGHTOP_W16A16_MOE` enables the LightOp BF16 Marlin MoE backend
-and defaults to `0`. It is subordinate to `VLLM_HCU_USE_CUSTOM_OPS` and is
-selected only for the measured TP-only profile
-`E=256,K=2048,N=512,top-k=8,max_num_tokens<=16`. Selection and LightOp config
-validation happen before the one-time backend-specific weight packing; an
-explicit `aiter`/`triton` choice, disabled switch, unsupported topology/shape,
-or missing config keeps the official AITER/Triton backend and canonical
-weights.
-
-`VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT` controls categorized LightOp `ds_cat`
-mode 0 for the validated FlashMLA BF16 query layout (`512+64` channels,
-fewer than 1024 decode rows) and defaults to enabled. It is subordinate to
-`VLLM_HCU_USE_CUSTOM_OPS`; the legacy `VLLM_USE_OPT_CAT=0` remains an opt-out.
-Disabled, unsupported-layout, dtype/device-ineligible, or unavailable-LightOp
-cases use `torch.cat`. Eligible kernel execution errors remain fail-closed.
-
 All three plugin entry points and both patch-application phases share one
 fail-closed compatibility gate. This branch accepts installed vLLM `0.25.x`
 (including local builds such as `0.25.1+das...`) and rejects missing, malformed,

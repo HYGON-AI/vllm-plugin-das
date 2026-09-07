@@ -32,6 +32,13 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
 from vllm_hcu.platforms import envs as henvs
 
 
+def _reject_lightop_w16a16_weight_reload(*_args, **_kwargs) -> None:
+    raise RuntimeError(
+        "cannot reload canonical MoE weights after installing the LightOp "
+        "W16A16 packed layout; recreate the model instance"
+    )
+
+
 def _is_hcu_aiter_moe_requested(method: object | None = None) -> bool:
     from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
         is_aiter_moe_requested,
@@ -157,6 +164,7 @@ class HcuUnquantizedFusedMoEMethod(_Original):
                 for name, value in attributes.items():
                     if not hasattr(weight, name):
                         setattr(weight, name, value)
+                weight.weight_loader = _reject_lightop_w16a16_weight_reload
             lightop_w16a16_runtime.mark_lightop_w16a16_weights(
                 layer.w13_weight, layer.w2_weight, layout
             )

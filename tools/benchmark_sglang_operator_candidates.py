@@ -161,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-counts",
         type=int,
         nargs="+",
-        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        default=list(range(1, 17)),
     )
     mla_cat = subparsers.add_parser(
         "mla-decode-cat",
@@ -229,21 +229,49 @@ def _run_sqrtsoftplus(args: argparse.Namespace) -> dict[str, object]:
     )
 
     from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
-        run_lightop_sqrtsoftplus,
+        can_use_lightop_sqrtsoftplus,
+        is_lightop_sqrtsoftplus_available,
+        is_lightop_sqrtsoftplus_shape_supported,
     )
+    from vllm_hcu.patch.worker.op_opt.moe import patch_fused_topk_bias_router
+    from vllm_hcu.platforms import envs as henvs
 
+    patch_fused_topk_bias_router.apply_to_module(official_module)
     official = getattr(
         official_module,
         "_vllm_hcu_original_vllm_topk_softplus_sqrt",
         official_module.vllm_topk_softplus_sqrt,
     )
+    production_route = official_module.vllm_topk_softplus_sqrt
+    if production_route is official:
+        raise RuntimeError("sqrt-softplus HCU production wrapper is not installed")
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
+    ):
+        raise RuntimeError("sqrt-softplus production route switches must be enabled")
+    if not is_lightop_sqrtsoftplus_available():
+        raise RuntimeError("categorized LightOp sqrt-softplus operator is unavailable")
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     records = []
+    skipped_shapes = []
     for experts in args.experts:
         for topk in args.top_k:
             if topk > experts:
                 raise ValueError("--top-k cannot exceed --experts")
             for tokens in args.token_counts:
+                shape = {
+                    "tokens": tokens,
+                    "experts": experts,
+                    "top_k": topk,
+                    "renormalize": True,
+                    "routed_scaling_factor": 1.5,
+                }
+                if not is_lightop_sqrtsoftplus_shape_supported(
+                    tokens, experts, topk
+                ):
+                    skipped_shapes.append(shape)
+                    continue
                 logits = torch.randn(
                     (tokens, experts),
                     dtype=torch.float32,
@@ -256,6 +284,16 @@ def _run_sqrtsoftplus(args: argparse.Namespace) -> dict[str, object]:
                     device="cuda",
                     generator=generator,
                 ).contiguous()
+                if not can_use_lightop_sqrtsoftplus(
+                    logits,
+                    bias,
+                    topk=topk,
+                    input_tokens=None,
+                    hash_indices_table=None,
+                ):
+                    raise RuntimeError(
+                        "accepted benchmark shape is ineligible for production route"
+                    )
 
                 def baseline_call():
                     weights = torch.empty(
@@ -278,21 +316,39 @@ def _run_sqrtsoftplus(args: argparse.Namespace) -> dict[str, object]:
                     )
 
                 def candidate_call():
-                    # vLLM allocates these buffers before entering the patched
-                    # function. Include that cost even though LightOp returns
-                    # its own tensors.
-                    torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
-                    torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
-                    torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
-                    return run_lightop_sqrtsoftplus(
+                    weights = torch.empty(
+                        (tokens, topk), dtype=torch.float32, device="cuda"
+                    )
+                    ids = torch.empty(
+                        (tokens, topk), dtype=torch.int32, device="cuda"
+                    )
+                    token_expert = torch.empty_like(ids)
+                    return production_route(
+                        weights,
+                        ids,
+                        token_expert,
                         logits,
+                        True,
                         bias,
-                        topk=topk,
-                        renormalize=True,
-                        routed_scaling_factor=1.5,
-                        indices_dtype=torch.int32,
+                        None,
+                        None,
+                        1.5,
                     )
 
+                expected_weights, expected_ids = baseline_call()
+                actual_weights, actual_ids = candidate_call()
+                torch.cuda.synchronize()
+                expected_ids, expected_order = expected_ids.sort(dim=-1)
+                actual_ids, actual_order = actual_ids.sort(dim=-1)
+                expected_weights = expected_weights.gather(1, expected_order)
+                actual_weights = actual_weights.gather(1, actual_order)
+                torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    actual_weights,
+                    expected_weights,
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
                 baseline = _measure_cuda(
                     baseline_call,
                     warmup=args.warmup,
@@ -305,21 +361,17 @@ def _run_sqrtsoftplus(args: argparse.Namespace) -> dict[str, object]:
                     iterations=args.iterations,
                     repeats=args.repeats,
                 )
-                records.append(
-                    build_comparison_record(
-                        shape={
-                            "tokens": tokens,
-                            "experts": experts,
-                            "top_k": topk,
-                            "renormalize": True,
-                            "routed_scaling_factor": 1.5,
-                        },
+                record = build_comparison_record(
+                        shape=shape,
                         baseline_name="vllm-official",
                         baseline=baseline,
-                        candidate_name="lightop",
+                        candidate_name="lightop-production-route",
                         candidate=candidate,
                     )
+                record["maximum_absolute_error"] = float(
+                    (actual_weights - expected_weights).abs().max().item()
                 )
+                records.append(record)
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     return {
         "operator": "sqrtsoftplus-gate",
@@ -335,6 +387,7 @@ def _run_sqrtsoftplus(args: argparse.Namespace) -> dict[str, object]:
             "lightop": lightop_version,
         },
         "records": records,
+        "skipped_shapes": skipped_shapes,
     }
 
 
@@ -344,9 +397,12 @@ def _run_w16a16(args: argparse.Namespace) -> dict[str, object]:
     from lightop import __version__ as lightop_version
     from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_module
 
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts.lightop_w16a16_moe import (
+        LightopW16A16Experts,
+    )
     from vllm_hcu.model_executor.layers.fused_moe.lightop_w16a16_runtime import (
         pack_lightop_w16a16_weights,
-        run_lightop_w16a16,
     )
     from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
         AiterMoeProblem,
@@ -385,6 +441,7 @@ def _run_w16a16(args: argparse.Namespace) -> dict[str, object]:
         * 0.02
     ).contiguous()
     packed13, packed2, _ = pack_lightop_w16a16_weights(w13, w2)
+    production_experts = object.__new__(LightopW16A16Experts)
     official_triton = getattr(
         fused_moe_module,
         "_vllm_hcu_original_fused_experts_impl",
@@ -463,16 +520,22 @@ def _run_w16a16(args: argparse.Namespace) -> dict[str, object]:
             )
 
         def candidate_call():
-            run_lightop_w16a16(
+            production_experts.apply(
                 output=output,
                 hidden_states=hidden_states,
-                w13=packed13,
+                w1=packed13,
                 w2=packed2,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=args.experts,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
                 workspace13=workspace13,
                 workspace2=workspace2,
-                global_num_experts=args.experts,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
             )
             return output
 
@@ -519,7 +582,7 @@ def _run_w16a16(args: argparse.Namespace) -> dict[str, object]:
             },
             baseline_name="vllm-triton",
             baseline=baseline,
-            candidate_name="lightop-w16a16-marlin",
+            candidate_name="lightop-w16a16-production-apply",
             candidate=candidate,
         )
         record["maximum_absolute_error_vs_triton"] = maximum_absolute_error
@@ -699,18 +762,36 @@ def _run_mla_decode_cat(args: argparse.Namespace) -> dict[str, object]:
     import vllm
     from lightop import __version__ as lightop_version
 
+    from lightop.tensor import ds_cat
     from vllm_hcu.model_executor.layers.attention.lightop_concat_runtime import (
-        _call_registered_lightop,
+        concat_mla_decode,
+        is_lightop_mla_decode_concat_eligible,
+        is_lightop_mla_decode_concat_shape_supported,
     )
+    from vllm_hcu.platforms import envs as henvs
+
+    if not callable(ds_cat):
+        raise RuntimeError("lightop.tensor.ds_cat must be callable")
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT
+        and henvs.VLLM_USE_OPT_CAT
+    ):
+        raise RuntimeError("MLA decode concat production route switches must be enabled")
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     records = []
+    skipped_shapes = []
     for heads in args.heads:
         if heads <= 0 or heads % 8:
             raise ValueError("--heads must contain positive multiples of 8")
         for tokens in args.token_counts:
             if tokens <= 0 or tokens >= 1024:
                 raise ValueError("--token-counts must be in the range [1, 1023]")
+            shape = {"tokens": tokens, "heads": heads}
+            if not is_lightop_mla_decode_concat_shape_supported(tokens, heads):
+                skipped_shapes.append(shape)
+                continue
 
             # These are the non-contiguous views produced by FlashMLA decode,
             # rather than easier contiguous stand-ins.
@@ -741,7 +822,12 @@ def _run_mla_decode_cat(args: argparse.Namespace) -> dict[str, object]:
                 return torch.cat((left, right), dim=-1)
 
             def candidate_call():
-                return _call_registered_lightop(left, right)
+                return concat_mla_decode(left, right, dim=-1)
+
+            if not is_lightop_mla_decode_concat_eligible(left, right):
+                raise RuntimeError(
+                    "accepted benchmark shape is ineligible for production route"
+                )
 
             expected = baseline_call()
             actual = candidate_call()
@@ -760,10 +846,10 @@ def _run_mla_decode_cat(args: argparse.Namespace) -> dict[str, object]:
                 repeats=args.repeats,
             )
             record = build_comparison_record(
-                shape={"tokens": tokens, "heads": heads},
+                shape=shape,
                 baseline_name="torch-cat",
                 baseline=baseline,
-                candidate_name="lightop-ds-cat-mode-0",
+                candidate_name="lightop-ds-cat-production-route",
                 candidate=candidate,
             )
             record["maximum_absolute_error"] = float(
@@ -786,6 +872,7 @@ def _run_mla_decode_cat(args: argparse.Namespace) -> dict[str, object]:
             "lightop": lightop_version,
         },
         "records": records,
+        "skipped_shapes": skipped_shapes,
     }
 
 

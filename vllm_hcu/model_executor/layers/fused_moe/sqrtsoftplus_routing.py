@@ -11,8 +11,16 @@ import torch
 from vllm.logger import init_logger
 
 
-_SUPPORTED_EXPERT_COUNTS = frozenset((256, 384))
-_MAX_TOPK = 16
+_SUPPORTED_ROUTE_SHAPES = frozenset(
+    {
+        (256, 6, 1024),
+        (256, 8, 256),
+        (256, 8, 1024),
+        (384, 6, 1024),
+        (384, 8, 256),
+        (384, 8, 1024),
+    }
+)
 logger = init_logger(__name__)
 
 
@@ -37,6 +45,16 @@ def is_lightop_sqrtsoftplus_available() -> bool:
     return _load_lightop_sqrtsoftplus() is not None
 
 
+def is_lightop_sqrtsoftplus_shape_supported(
+    tokens: int,
+    experts: int,
+    topk: int,
+) -> bool:
+    """Return whether production-route performance passed for this shape."""
+
+    return (int(experts), int(topk), int(tokens)) in _SUPPORTED_ROUTE_SHAPES
+
+
 def can_use_lightop_sqrtsoftplus(
     gating_output: Any,
     correction_bias: Any,
@@ -56,6 +74,7 @@ def can_use_lightop_sqrtsoftplus(
         return False
     if len(logits_shape) != 2 or len(bias_shape) != 1:
         return False
+    num_tokens = int(logits_shape[0])
     num_experts = int(logits_shape[-1])
     return bool(
         getattr(logits_device, "type", None) == "cuda"
@@ -65,8 +84,9 @@ def can_use_lightop_sqrtsoftplus(
         and _is_contiguous(gating_output)
         and _is_contiguous(correction_bias)
         and int(bias_shape[0]) == num_experts
-        and num_experts in _SUPPORTED_EXPERT_COUNTS
-        and 0 < int(topk) <= _MAX_TOPK
+        and is_lightop_sqrtsoftplus_shape_supported(
+            num_tokens, num_experts, topk
+        )
     )
 
 
@@ -87,7 +107,6 @@ def run_lightop_sqrtsoftplus(
             "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires callable "
             "lightop.moe.moe_fused_gate_sqrtsoftplus"
         )
-    logger.warning_once("Using LightOp sqrt-softplus MoE routing.")
     topk_weights, topk_ids = operator(
         gating_output,
         correction_bias,
@@ -99,11 +118,13 @@ def run_lightop_sqrtsoftplus(
     )
     if topk_ids.dtype != indices_dtype:
         topk_ids = topk_ids.to(dtype=indices_dtype)
+    logger.warning_once("Using LightOp sqrt-softplus MoE routing.")
     return topk_weights, topk_ids
 
 
 __all__ = [
     "can_use_lightop_sqrtsoftplus",
     "is_lightop_sqrtsoftplus_available",
+    "is_lightop_sqrtsoftplus_shape_supported",
     "run_lightop_sqrtsoftplus",
 ]

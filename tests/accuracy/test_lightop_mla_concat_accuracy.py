@@ -52,12 +52,12 @@ def test_lightop_mla_decode_concat_matches_torch(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(left, left_before, rtol=0, atol=0)
     torch.testing.assert_close(right, right_before, rtol=0, atol=0)
-    assert is_lightop_mla_decode_concat_eligible(left, right)
+    assert not is_lightop_mla_decode_concat_eligible(left, right)
 
 
 def test_lightop_mla_decode_concat_matches_flashmla_strides() -> None:
     _require_hcu()
-    tokens, heads = 32, 16
+    tokens, heads = 128, 16
     left_data = torch.randn(
         tokens * heads * 512,
         dtype=torch.bfloat16,

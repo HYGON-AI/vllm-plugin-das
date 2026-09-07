@@ -72,6 +72,23 @@ def test_server_environment_bypasses_proxy_for_local_eval_client(
     assert environment["no_proxy"] == environment["NO_PROXY"]
 
 
+def test_server_log_environment_allowlists_route_switches() -> None:
+    visible = evalscope_server._server_log_environment(
+        {
+            "VLLM_HCU_USE_CUSTOM_OPS": "1",
+            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE": "1",
+            "VLLM_HCU_ACCESS_TOKEN": "must-not-be-logged",
+            "VLLM_ROCM_SECRET_KEY": "must-not-be-logged",
+            evalscope_server.EVALSCOPE_PROCESS_OWNER_ENV: "owner-secret",
+        }
+    )
+
+    assert visible == {
+        "VLLM_HCU_USE_CUSTOM_OPS": "1",
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE": "1",
+    }
+
+
 def test_reset_evalscope_artifacts_removes_stale_outputs_only(
     tmp_path: Path,
 ) -> None:

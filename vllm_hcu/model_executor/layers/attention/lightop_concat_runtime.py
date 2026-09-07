@@ -15,6 +15,23 @@ import vllm_hcu.platforms.envs as henvs
 
 logger = init_logger(__name__)
 
+_SUPPORTED_ROUTE_SHAPES = frozenset(
+    {
+        (256, 8),
+        (512, 8),
+        (768, 8),
+        (128, 16),
+        (256, 16),
+        (512, 16),
+        (768, 16),
+        (64, 32),
+        (128, 32),
+        (256, 32),
+        (512, 32),
+        (768, 32),
+    }
+)
+
 
 class LightOpMlaConcatUnavailable(RuntimeError):
     """Raised when the selected LightOp package lacks categorized ``ds_cat``."""
@@ -27,6 +44,10 @@ def _load_lightop_ds_cat() -> Callable[..., torch.Tensor]:
         raise LightOpMlaConcatUnavailable(
             "lightop.tensor.ds_cat is unavailable"
         ) from exc
+    if not callable(ds_cat):
+        raise LightOpMlaConcatUnavailable(
+            "lightop.tensor.ds_cat is unavailable"
+        )
     return ds_cat
 
 
@@ -36,12 +57,20 @@ def lightop_mla_decode_concat_impl(
 ) -> torch.Tensor:
     """Execute categorized LightOp ``ds_cat`` mode 0 for MLA decode."""
 
+    try:
+        ds_cat = _load_lightop_ds_cat()
+    except LightOpMlaConcatUnavailable:
+        logger.warning_once(
+            "LightOp MLA decode concat is unavailable; using torch.cat."
+        )
+        return torch.cat((left, right), dim=-1)
     output = torch.empty(
         (*left.shape[:-1], left.shape[-1] + right.shape[-1]),
         dtype=left.dtype,
         device=left.device,
     )
-    _load_lightop_ds_cat()(left, right, output, 0)
+    ds_cat(left, right, output, 0)
+    logger.warning_once("Using LightOp MLA decode concatenation.")
     return output
 
 
@@ -66,13 +95,19 @@ direct_register_custom_op(
 )
 
 
+def is_lightop_mla_decode_concat_shape_supported(tokens: int, heads: int) -> bool:
+    """Return whether production-route performance passed for this shape."""
+
+    return (int(tokens), int(heads)) in _SUPPORTED_ROUTE_SHAPES
+
+
 def is_lightop_mla_decode_concat_eligible(
     left: torch.Tensor,
     right: torch.Tensor,
 ) -> bool:
     """Match the BW1100 MLA decode layout validated for LightOp mode 0."""
 
-    return (
+    if (
         left.device.type == "cuda"
         and right.device == left.device
         and left.dtype == torch.bfloat16
@@ -82,11 +117,17 @@ def is_lightop_mla_decode_concat_eligible(
         and left.shape[:-1] == right.shape[:-1]
         and left.shape[-1] == 512
         and right.shape[-1] == 64
-        and 0 < left.shape[0] < 1024
-        and left.shape[1] > 0
-        and left.stride(-1) == 1
-        and right.stride(-1) == 1
-    )
+    ):
+        tokens = int(left.shape[0])
+        heads = int(left.shape[1])
+        return bool(
+            is_lightop_mla_decode_concat_shape_supported(tokens, heads)
+            and tuple(left.stride(index) for index in range(3))
+            == (512, 512 * tokens, 1)
+            and tuple(right.stride(index) for index in range(3))
+            == (1536 * (heads // 8), 192, 1)
+        )
+    return False
 
 
 def _call_registered_lightop(
@@ -118,14 +159,6 @@ def concat_mla_decode(
     if not enabled or not is_lightop_mla_decode_concat_eligible(left, right):
         return torch.cat((left, right), dim=normalized_dim)
 
-    try:
-        _load_lightop_ds_cat()
-    except LightOpMlaConcatUnavailable:
-        logger.warning_once(
-            "LightOp MLA decode concat is unavailable; using torch.cat."
-        )
-        return torch.cat((left, right), dim=normalized_dim)
-    logger.warning_once("Using LightOp MLA decode concatenation.")
     return _call_registered_lightop(left, right)
 
 
@@ -133,6 +166,7 @@ __all__ = [
     "LightOpMlaConcatUnavailable",
     "concat_mla_decode",
     "is_lightop_mla_decode_concat_eligible",
+    "is_lightop_mla_decode_concat_shape_supported",
     "lightop_mla_decode_concat_fake",
     "lightop_mla_decode_concat_impl",
 ]

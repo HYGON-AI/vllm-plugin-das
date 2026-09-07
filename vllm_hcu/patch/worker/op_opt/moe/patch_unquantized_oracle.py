@@ -9,6 +9,7 @@ from types import ModuleType
 
 from vllm_hcu.patch.worker.op_opt.moe._common import (
     PatchCompatibilityError,
+    check_module_marker,
     load_exact_module,
     require_callable,
     require_class,
@@ -26,6 +27,7 @@ TARGETS = (
     f"{TARGET_MODULE}.make_unquantized_moe_kernel",
 )
 _MARKER = "_vllm_hcu_lightop_w16a16_oracle_applied"
+_BINDING_MARKER = "_vllm_hcu_lightop_w16a16_oracle_binding"
 
 
 def _normalize_backend(backend, old_enum, new_enum):
@@ -36,7 +38,18 @@ def _normalize_backend(backend, old_enum, new_enum):
 
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
-    if getattr(target, _MARKER, False):
+    bindings = tuple(
+        (target, name, _BINDING_MARKER)
+        for name in (
+            "UnquantizedMoeBackend",
+            "backend_to_kernel_cls",
+            "map_unquantized_backend",
+            "select_unquantized_moe_backend",
+            "convert_to_unquantized_kernel_format",
+            "make_unquantized_moe_kernel",
+        )
+    )
+    if check_module_marker(target, _MARKER, bindings):
         return False
 
     old_enum = require_class(target, "UnquantizedMoeBackend", TARGETS[0])
@@ -120,10 +133,15 @@ def apply_to_module(module: ModuleType) -> bool:
                 # Backend selection precedes layout mutation.  A missing M=1
                 # decode config therefore delegates while weights are still
                 # canonical and safe for official Triton/AITER paths.
-                configs = lightop_w16a16_runtime.select_lightop_w16a16_config(
-                    moe_config, expected_m=1, device="cuda"
+                max_tokens = int(getattr(moe_config, "max_num_tokens", 0))
+                configs_available = all(
+                    lightop_w16a16_runtime.select_lightop_w16a16_config(
+                        moe_config, expected_m=tokens, device="cuda"
+                    )
+                    is not None
+                    for tokens in range(1, max_tokens + 1)
                 )
-                if configs is not None:
+                if configs_available:
                     return hcu_enum.HCU_LIGHTOP_W16A16, experts_cls
 
         backend, experts = select_backend(moe_config)
@@ -170,6 +188,15 @@ def apply_to_module(module: ModuleType) -> bool:
             routing_tables,
         )
 
+    for replacement in (
+        hcu_enum,
+        hcu_backend_to_kernel_cls,
+        hcu_map_unquantized_backend,
+        hcu_select_unquantized_moe_backend,
+        hcu_convert_to_unquantized_kernel_format,
+        hcu_make_unquantized_moe_kernel,
+    ):
+        setattr(replacement, _BINDING_MARKER, True)
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls
     target.map_unquantized_backend = hcu_map_unquantized_backend
     target.select_unquantized_moe_backend = hcu_select_unquantized_moe_backend

@@ -1717,7 +1717,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.moe_quant_config = "official-config"
 
     class RoutedExperts:
-        def __init__(self):
+        def __init__(self, apply_router_weight_on_input=False):
             self.moe_config = "moe-config"
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
@@ -1727,6 +1727,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.official_loads = []
             self._expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
             self.expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+            self.apply_router_weight_on_input = apply_router_weight_on_input
 
         @property
         def expert_map(self):
@@ -1747,8 +1748,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             yield "official-load"
 
     class Runner:
-        def __init__(self):
-            self.routed_experts = RoutedExperts()
+        def __init__(self, apply_router_weight_on_input=False):
+            self.routed_experts = RoutedExperts(apply_router_weight_on_input)
             self.replaced = None
 
         def _replace_quant_method(self, method):
@@ -1763,7 +1764,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     source = (
         "def FusedMoE("
         + ", ".join(f"{name}=None" for name in factory_names)
-        + "):\n    return Runner()\n"
+        + "):\n    return Runner(apply_router_weight_on_input)\n"
     )
     exec(source, layer_module.__dict__)
     fused_moe_package = _module(
@@ -1822,6 +1823,13 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+    router_weight_runner = fused_moe_package.FusedMoE(
+        apply_router_weight_on_input=True
+    )
+    assert type(router_weight_runner.routed_experts.quant_method) is (
+        UnquantizedFusedMoEMethod
+    )
+    assert router_weight_runner.replaced is None
     assert experts.expert_map is experts.expert_mask
     assert (
         experts.expert_mask._vllm_hcu_native_expert_map is experts._expert_map
@@ -1896,6 +1904,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert list(experts.load_weights([("experts.down_proj", down_scale)])) == [
         "official-load"
     ]
+
+    routed_experts_module.UnquantizedFusedMoEMethod = UnquantizedFusedMoEMethod
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_layer.apply_to_module(fused_moe_package)
 
 
 def test_moe_align_feature_off_and_lightop_contract(
@@ -2093,6 +2105,9 @@ def test_moe_align_rebinds_preimported_fused_moe_consumer(
     assert patch_moe_align_block_size.apply_to_module(module) is True
 
     assert consumer.moe_align_block_size is module.moe_align_block_size
+    module.moe_align_block_size = official
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_moe_align_block_size.apply_to_module(module)
 
 
 def test_moe_align_requires_categorized_out_api(

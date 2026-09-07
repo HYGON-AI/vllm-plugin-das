@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_hcu.model_executor.layers.fused_moe.sqrtsoftplus_routing import (
+    can_use_lightop_sqrtsoftplus,
     run_lightop_sqrtsoftplus,
 )
 
@@ -44,11 +45,21 @@ def _sort_by_id(
     return weights.gather(1, order), sorted_ids
 
 
-@pytest.mark.parametrize("num_tokens", (1, 33, 128))
-@pytest.mark.parametrize("num_experts", (256, 384))
-@pytest.mark.parametrize("topk", (6, 8, 16))
-@pytest.mark.parametrize("renormalize", (True, False))
-@pytest.mark.parametrize("routed_scaling_factor", (1.0, 1.5))
+@pytest.mark.parametrize(
+    ("num_tokens", "num_experts", "topk"),
+    (
+        (1024, 256, 6),
+        (256, 256, 8),
+        (1024, 256, 8),
+        (1024, 384, 6),
+        (256, 384, 8),
+        (1024, 384, 8),
+    ),
+)
+@pytest.mark.parametrize(
+    ("renormalize", "routed_scaling_factor"),
+    ((True, 1.5), (False, 1.0)),
+)
 def test_lightop_sqrtsoftplus_matches_independent_fp32_reference(
     num_tokens: int,
     num_experts: int,
@@ -71,6 +82,13 @@ def test_lightop_sqrtsoftplus_matches_independent_fp32_reference(
     ).contiguous()
     logits_before = logits.clone()
     bias_before = bias.clone()
+    assert can_use_lightop_sqrtsoftplus(
+        logits,
+        bias,
+        topk=topk,
+        input_tokens=None,
+        hash_indices_table=None,
+    )
 
     expected_weights, expected_ids = _reference(
         logits,

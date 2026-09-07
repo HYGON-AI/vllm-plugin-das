@@ -208,6 +208,10 @@ def _assert_feature_pair(
 @pytest.mark.slow
 @pytest.mark.external_service("evalscope")
 def test_deepseek_v4_int8_operator_adaptation_humaneval32() -> None:
+    # HumanEval's request-by-request M values do not hit the six isolated
+    # sqrt-softplus shapes that passed the final performance gate.  Keep this
+    # model as an accuracy/fallback control instead of widening production
+    # eligibility to unprofitable shapes merely to manufacture route coverage.
     _assert_feature_pair(
         DEEPSEEK_CONFIG,
         DEEPSEEK_CONFIG_ENV,
@@ -215,6 +219,7 @@ def test_deepseek_v4_int8_operator_adaptation_humaneval32() -> None:
         model_label="DeepSeek-V4-Flash INT8 TP4",
         required_hcu_count=4,
         route_messages="Using LightOp sqrt-softplus MoE routing.",
+        expect_feature_on_route=False,
     )
 
 

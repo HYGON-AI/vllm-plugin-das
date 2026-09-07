@@ -136,10 +136,6 @@ def pack_lightop_w16a16_weights(
         packed_w2_shape=tuple(packed2.shape),
     )
     mark_lightop_w16a16_weights(packed13, packed2, layout)
-    # This is emitted while weights are post-processed, before some worker
-    # logging configurations surface INFO records.  Keep one visible marker
-    # so model-level validation can prove that the packed layout was installed.
-    logger.warning_once("Using LightOp W16A16 Marlin MoE backend.")
     return packed13, packed2, layout
 
 
@@ -385,6 +381,7 @@ def run_lightop_w16a16(
         num_local_tokens=None,
         factor=1.0,
     )
+    logger.warning_once("Using LightOp W16A16 Marlin MoE backend.")
 
 
 @dataclass(frozen=True, slots=True)
