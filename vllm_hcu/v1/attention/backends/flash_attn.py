@@ -200,6 +200,11 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
+        mode = _get_flash_attn_mode()
+        if mode in ("varlen", "cutlass"):
+            return max(default_block_size, 64)
+        if mode == "classic":
+            return max(default_block_size, 128)
         if current_platform.is_xpu():
             return max(default_block_size, 64)
         return super().get_preferred_block_size(default_block_size)

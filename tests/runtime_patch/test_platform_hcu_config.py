@@ -1469,6 +1469,9 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.v1.attention.backends.flash_attn import (
+        HcuFlashAttentionBackend,
+    )
     from vllm_hcu.platforms import envs as hcu_envs
     from vllm_hcu.platforms.hcu import HCUPlatform
 
@@ -1492,13 +1495,20 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     config.parallel_config.worker_cls = "auto"
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
-        block_size=None,
+        block_size=16,
+        kv_cache_dtype_skip_layers=[],
     )
     config.attention_config = SimpleNamespace(
         backend=AttentionBackendEnum.FLASH_ATTN
     )
+    config.model_config.is_hybrid = False
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: HcuFlashAttentionBackend),
+    )
 
-    HCUPlatform.check_and_update_config(config)
+    HCUPlatform.update_block_size_for_backend(config)
 
     assert config.cache_config.block_size == 64
 

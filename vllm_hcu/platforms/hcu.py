@@ -655,9 +655,7 @@ class HCUPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        # TODO: ROCm still sets block_size in check_and_update_config.
-        # Move that logic here so block_size is chosen by the backend.
-        pass
+        super().update_block_size_for_backend(vllm_config)
 
 
     @classmethod

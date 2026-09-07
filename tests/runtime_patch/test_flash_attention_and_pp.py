@@ -267,6 +267,32 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
     assert backend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4, 5)
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_block_size"),
+    [
+        ("varlen", 64),
+        ("cutlass", 64),
+        ("classic", 128),
+    ],
+)
+def test_flash_attention_prefers_vendor_kernel_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_block_size: int,
+) -> None:
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
+    monkeypatch.setattr(
+        backend,
+        "get_supported_kernel_block_sizes",
+        staticmethod(lambda: [16]),
+    )
+
+    assert backend.get_preferred_block_size(16) == expected_block_size
+
+
 def test_cutlass_block_first_hnd_stride_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
