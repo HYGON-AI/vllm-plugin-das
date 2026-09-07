@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -31,20 +32,27 @@ from vllm_hcu.patch.runtime_state import (
 
 
 REPO = Path(__file__).resolve().parents[2]
-TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
-).resolve()
+_target_root_override = os.environ.get("VLLM_TARGET_ROOT")
+if _target_root_override:
+    TARGET_VLLM_ROOT = Path(_target_root_override).resolve()
+else:
+    _vllm_spec = importlib.util.find_spec("vllm")
+    if _vllm_spec is None or _vllm_spec.origin is None:
+        raise RuntimeError(
+            "VLLM_TARGET_ROOT is unset and the vllm package is not discoverable"
+        )
+    TARGET_VLLM_ROOT = Path(_vllm_spec.origin).resolve().parents[1]
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
-_TARGET_SOURCE_ASSERTION = r'''
+_TARGET_INSTALL_ASSERTION = r'''
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_TARGET_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
@@ -64,23 +72,23 @@ def _fresh_python(
     code: str,
     *,
     plugins: str = "__disabled__",
-    assert_target_source: bool = True,
+    assert_target_install: bool = True,
     assert_target_first: bool = True,
     no_site: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = plugins
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
-    if no_site or not assert_target_source:
+    if no_site or not assert_target_install:
         # The dependency-light plugin probe intentionally runs without
         # site-packages; importing vLLM for the source assertion would require
         # torch and invalidate the probe itself.
         child_code = code
     elif assert_target_first:
-        child_code = _TARGET_SOURCE_ASSERTION + code
+        child_code = _TARGET_INSTALL_ASSERTION + code
     else:
-        child_code = code + _TARGET_SOURCE_ASSERTION
+        child_code = code + _TARGET_INSTALL_ASSERTION
     command = [sys.executable]
     if no_site:
         command.append("-S")
@@ -251,7 +259,7 @@ def test_pcp_kv_cache_callbacks_precede_mtp_coordinator_deterministically():
             "vllm.v1.core.kv_cache_coordinator",
         )
     )
-    assert inventory[mtp_index - 4 : mtp_index] == (
+    pcp_callbacks = (
         (
             "platform.framework_opt.pcp_kv_cache_utils",
             "vllm.v1.core.kv_cache_utils",
@@ -269,6 +277,7 @@ def test_pcp_kv_cache_callbacks_precede_mtp_coordinator_deterministically():
             "vllm.v1.core.kv_cache_coordinator",
         ),
     )
+    assert all(inventory.index(callback) < mtp_index for callback in pcp_callbacks)
 
 
 def test_platform_probe_failure_is_exposed_on_vllm_second_invocation(monkeypatch):
@@ -319,7 +328,7 @@ print(
     )
 )
 ''',
-        assert_target_source=False,
+        assert_target_install=False,
         no_site=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -412,6 +421,59 @@ def test_engine_core_first_import_does_not_patch_partial_modules_or_fallback():
         "engine_core": "applied",
         "parallel_state": "applied",
     }
+
+
+@pytest.mark.hcu
+def test_frozen_main_core_imports_apply_without_failed_callbacks():
+    result = _fresh_python(
+        r'''
+import importlib
+import json
+import os
+from pathlib import Path
+
+import vllm_hcu
+
+vllm_hcu.hcu_platform_plugin()
+module_names = (
+    "vllm.v1.core.kv_cache_utils",
+    "vllm.v1.core.kv_cache_coordinator",
+    "vllm.v1.engine.core",
+    "vllm.v1.worker.gpu.model_runner",
+    "vllm.v1.attention.selector",
+    "vllm.model_executor.layers.fused_moe.layer",
+)
+target_root = Path(os.environ["VLLM_TARGET_ROOT"]).resolve()
+module_files = {
+    name: str(Path(importlib.import_module(name).__file__).resolve())
+    for name in module_names
+}
+from vllm_hcu.patch import patch_report
+
+report = patch_report()["patches"]
+print(json.dumps({
+    "outside_target": {
+        name: path
+        for name, path in module_files.items()
+        if not Path(path).is_relative_to(target_root)
+    },
+    "failed": {
+        patch_id: record["failure_reason"]
+        for patch_id, record in report.items()
+        if record["status"] == "failed"
+    },
+    "applied_count": sum(
+        record["status"] == "applied" for record in report.values()
+    ),
+}))
+''',
+        plugins="hcu",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["outside_target"] == {}
+    assert payload["failed"] == {}
+    assert payload["applied_count"] >= 30
 
 
 @pytest.mark.hcu
@@ -595,11 +657,11 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
         def __init__(self, vllm_config, device):
             self.upstream_init = (vllm_config, device)
 
-        def prepare_inputs(self, scheduler_output, batch_desc):
+        def prepare_inputs(self, scheduler_output, batch_desc, batch_req_state):
             return SimpleNamespace(is_prefilling_np=[False, False])
 
         def execute_model(self):
-            self.prepare_inputs(None, None)
+            self.prepare_inputs(None, None, None)
             from vllm_hcu.forward_context_runtime import (
                 get_deepep_auto_request_phase,
             )

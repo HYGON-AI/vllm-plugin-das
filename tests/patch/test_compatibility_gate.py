@@ -49,26 +49,17 @@ def _install_version(
     )
 
 
-@pytest.mark.parametrize(
-    "value",
-    (
-        "0.28.0",
-        "0.28.9",
-        "0.28.0+das.5bf5c5f.dtk2604",
-        "0.28.0.post2",
-    ),
-)
-def test_supported_vllm_series_accepts_pep440_variants(
+def test_frozen_opendas_vllm_wheel_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    value: str,
 ) -> None:
+    value = "0.28.1rc1.dev489+g4574da606.das.4574da6.dtk2604"
     _install_version(monkeypatch, tmp_path, value)
 
     result = compatibility.ensure_vllm_compatible()
 
     assert result.compatible
-    assert result.expected == "0.28.x"
+    assert result.expected == value
     assert result.actual_version == value
     assert result.vllm_location == str((tmp_path / "site-packages").resolve())
 
@@ -79,7 +70,11 @@ def test_supported_vllm_series_accepts_pep440_variants(
         "0.20.2",
         "0.22.0",
         "0.25.1+das.local",
-        "1!0.28.0",
+        "0.28.0",
+        "0.28.9",
+        "0.28.1rc1.dev489+g58ad1f3b",
+        "0.28.1rc1.dev489+g4574da606.das.other.dtk2604",
+        "1!0.28.1rc1.dev489+g4574da606.das.4574da6.dtk2604",
         "not a version",
     ),
 )
@@ -94,8 +89,13 @@ def test_unsupported_or_invalid_vllm_metadata_has_actionable_error(
         compatibility.ensure_vllm_compatible()
 
     message = str(raised.value)
-    assert "expected=0.28.x" in message
+    assert (
+        "expected=0.28.1rc1.dev489+g4574da606.das.4574da6.dtk2604"
+        in message
+    )
     assert f"actual={value!r}" in message
+    assert "upstream_sha=58ad1f3b8973b23943107b51230d594050b42ec3" in message
+    assert "opendas_sha=4574da606553cad5c22448d498f144630a23641e" in message
     assert "vllm_hcu=" in message
     assert "vllm_location=" in message
     assert "vllm_hcu_location=" in message
@@ -122,9 +122,12 @@ def test_runtime_hcu_version_prefers_metadata_with_source_fallback(
     monkeypatch.setattr(
         hcu_version.importlib_metadata,
         "version",
-        lambda name: "0.28.0+das.abcdef0.dtk2604",
+        lambda name: "0.28.1rc1.dev489+das.abcdef0.dtk2604",
     )
-    assert hcu_version.get_hcu_version() == "0.28.0+das.abcdef0.dtk2604"
+    assert (
+        hcu_version.get_hcu_version()
+        == "0.28.1rc1.dev489+das.abcdef0.dtk2604"
+    )
 
     def missing(name: str):
         raise hcu_version.importlib_metadata.PackageNotFoundError(name)
