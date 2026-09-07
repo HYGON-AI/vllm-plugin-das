@@ -292,10 +292,22 @@ def test_flash_attention_splits_legacy_and_official_main_kv_cache(
     assert torch.equal(legacy_key, legacy[:, 0])
     assert torch.equal(legacy_value, legacy[:, 1])
 
-    official = torch.arange(3 * 5 * 4 * 16).reshape(3, 5, 4, 16)
-    official_key, official_value = flash_attn._split_kv_cache(official, 8)
-    assert torch.equal(official_key, official.transpose(1, 2)[..., :8])
-    assert torch.equal(official_value, official.transpose(1, 2)[..., 8:])
+    nhd_storage = torch.arange(3 * 5 * 4 * 16).reshape(3, 5, 4, 16)
+    official_nhd = nhd_storage.transpose(1, 2)
+    nhd_key, nhd_value = flash_attn._split_kv_cache(official_nhd, 8)
+    nhd_flat = nhd_storage.view(-1)
+    nhd_half = nhd_flat.numel() // 2
+    assert torch.equal(nhd_key, nhd_flat[:nhd_half].view(3, 5, 4, 8))
+    assert torch.equal(nhd_value, nhd_flat[nhd_half:].view(3, 5, 4, 8))
+    assert nhd_key.is_contiguous() and nhd_value.is_contiguous()
+
+    official_hnd = torch.arange(3 * 4 * 5 * 16).reshape(3, 4, 5, 16)
+    hnd_key, hnd_value = flash_attn._split_kv_cache(official_hnd, 8)
+    hnd_flat = official_hnd.view(-1)
+    hnd_half = hnd_flat.numel() // 2
+    assert torch.equal(hnd_key, hnd_flat[:hnd_half].view(3, 4, 5, 8))
+    assert torch.equal(hnd_value, hnd_flat[hnd_half:].view(3, 4, 5, 8))
+    assert hnd_key.is_contiguous() and hnd_value.is_contiguous()
 
 
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
