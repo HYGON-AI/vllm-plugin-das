@@ -993,6 +993,58 @@ def test_fla_chunk_o_prefers_hip_and_preserves_call_contract(monkeypatch):
     assert calls[0]["transpose_state_layout"] is True
 
 
+def test_fla_chunk_o_normalizes_varlen_inputs_before_hip(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+    calls = {}
+    prepared_indices = torch.tensor([[0, 0], [0, 1]], dtype=torch.int32)
+
+    def prepare_chunk_indices(cu_seqlens, chunk_size):
+        calls["prepare"] = (cu_seqlens, chunk_size)
+        return prepared_indices
+
+    def reference(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+                  chunk_indices=None, chunk_size=64, core_attn_out=None):
+        if chunk_indices is None and cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+        if scale is None:
+            scale = k.shape[-1] ** -0.5
+        return v + scale
+
+    def hip(**kwargs):
+        calls["hip"] = kwargs
+        return kwargs["v"] + kwargs["scale"]
+
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_fwd_o_vllm_hip_blockdim64=hip,
+    )
+    module = _chunk_o_module(adapter, reference)
+    module.prepare_chunk_indices = prepare_chunk_indices
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CHUNK_FWD_KERNEL_O", True)
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    tensor = torch.zeros(1, 2, 1, 4)
+    expected = reference(
+        tensor, tensor, tensor, tensor,
+        cu_seqlens=cu_seqlens, chunk_size=32,
+    )
+    calls.pop("prepare")
+
+    result = module.chunk_fwd_o(
+        tensor, tensor, tensor, tensor,
+        cu_seqlens=cu_seqlens, chunk_size=32,
+    )
+
+    assert calls["prepare"] == (cu_seqlens, 32)
+    assert calls["hip"]["chunk_indices"] is prepared_indices
+    assert calls["hip"]["scale"] == tensor.shape[-1] ** -0.5
+    torch.testing.assert_close(result, expected)
+
+
 def test_fla_chunk_o_copies_hip_result_into_core_output(monkeypatch):
     adapter = _adapter("patch_fla_chunk_o")
     hip_result = torch.arange(8, dtype=torch.float32).reshape(1, 2, 1, 4)

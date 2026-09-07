@@ -78,6 +78,7 @@ def test_mtp3_graph_cli_uses_worker_config_and_repeats_sequential_engines(
                 speculative_config=SimpleNamespace(
                     method="mtp", num_speculative_tokens=3,
                 ),
+                cache_config=SimpleNamespace(mamba_cache_dtype="float32"),
                 compilation_config=SimpleNamespace(
                     mode=SimpleNamespace(
                         name="NONE" if self.label == "eager" else "VLLM_COMPILE"
@@ -123,6 +124,7 @@ def test_mtp3_graph_cli_uses_worker_config_and_repeats_sequential_engines(
         assert engine.kwargs["speculative_config"] == {
             "method": "mtp", "num_speculative_tokens": 3,
         }
+        assert engine.kwargs["mamba_cache_dtype"] == "float32"
         assert engine.kwargs["tensor_parallel_size"] == 2
         assert engine.kwargs["enable_expert_parallel"] is True
         assert engine.kwargs["moe_backend"] == "aiter"
@@ -176,6 +178,7 @@ def _mtp3_parity_payload():
             "enable_expert_parallel": True,
         },
         "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
+        "cache_config": {"mamba_cache_dtype": "float32"},
         "compilation_config": {
             "mode": "VLLM_COMPILE", "cudagraph_mode": "FULL_DECODE_ONLY",
             "decode_mode": "FULL", "cudagraph_capture_sizes": [4, 8],

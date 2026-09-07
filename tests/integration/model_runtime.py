@@ -1321,6 +1321,9 @@ def _mtp3_worker_config_summary(worker: Any) -> dict[str, Any]:
             "method": speculative.method,
             "num_speculative_tokens": speculative.num_speculative_tokens,
         },
+        "cache_config": {
+            "mamba_cache_dtype": config.cache_config.mamba_cache_dtype,
+        },
         "compilation_config": {
             "mode": compilation.mode.name,
             "cudagraph_mode": compilation.cudagraph_mode.name,
@@ -1361,6 +1364,7 @@ def _case_qwen35_mtp3_graph_parity(
             max_num_seqs=2,
             gpu_memory_utilization=gpu_memory_utilization,
             speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+            mamba_cache_dtype="float32",
             cudagraph_metrics=True,
             disable_log_stats=False,
             **graph_kwargs,

@@ -43,6 +43,9 @@ def _assert_mtp3_graph_parity(result: dict[str, Any], log: str) -> None:
             assert worker["speculative_config"] == {
                 "method": "mtp", "num_speculative_tokens": 3,
             }, worker
+            assert worker["cache_config"] == {
+                "mamba_cache_dtype": "float32",
+            }, worker
             compilation = worker["compilation_config"]
             if label == "graph":
                 # This is the target enum's decode_mode(), not a substring

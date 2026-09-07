@@ -348,7 +348,7 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(
             "cache_seqlens": cache_seqlens,
             "conv_state_indices": conv_state_indices,
         }
-        return "custom-update"
+        return torch.full_like(x, 7)
 
     _install_fake_module(
         monkeypatch,
@@ -366,10 +366,11 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(
     state = torch.empty(1, 8, 3)
     physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
     indices = torch.tensor([0, 1])
-    assert module.causal_conv1d_update(
+    result = module.causal_conv1d_update(
         x, state, physical_weight, activation=activation,
         conv_state_indices=indices, validate_data=True,
-    ) == "custom-update"
+    )
+    torch.testing.assert_close(result, torch.full_like(x, 7))
     assert "original" not in calls
     torch.testing.assert_close(
         calls["custom"]["weight"], physical_weight.T.contiguous()
@@ -377,6 +378,49 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(
     assert calls["custom"]["conv_state_indices"] is indices
     assert calls["custom"]["activation"] == expected_activation
     assert calls["custom"]["cache_seqlens"] is None
+
+
+def test_qwen_causal_update_preserves_vllm_mixed_cache_dtype_contract(
+    monkeypatch,
+):
+    adapter = _adapter("patch_gdn_causal_conv1d")
+    calls = {}
+
+    def original(*args, **kwargs):
+        pytest.fail("compatible decode must use the selected external kernel")
+
+    def custom_update(x, conv_state, weight, bias=None, activation=None,
+                      cache_seqlens=None, conv_state_indices=None):
+        assert x.dtype == conv_state.dtype
+        calls["x_dtype"] = x.dtype
+        calls["indices"] = conv_state_indices
+        return x + 1
+
+    _install_fake_module(
+        monkeypatch,
+        "causal_conv1d.causal_conv1d_interface",
+        causal_conv1d_update=custom_update,
+    )
+    module = _causal_route_module(adapter, original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    state = torch.zeros(2, 8, 3, dtype=torch.float32)
+    weight = torch.zeros(8, 4, dtype=torch.float32)
+    indices = torch.tensor([0, 1], dtype=torch.int32)
+
+    result = module.causal_conv1d_update(
+        x, state, weight, conv_state_indices=indices
+    )
+
+    assert calls["x_dtype"] == state.dtype
+    assert calls["indices"] is indices
+    assert result.dtype == x.dtype
+    torch.testing.assert_close(result, torch.ones_like(x))
 
 
 def test_qwen_causal_update_falls_back_for_spec_metadata(monkeypatch):

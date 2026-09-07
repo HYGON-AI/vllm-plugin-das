@@ -136,14 +136,18 @@ def apply_to_module(module: ModuleType) -> bool:
         activation = bound.arguments["activation"]
         if isinstance(activation, bool):
             activation = "silu" if activation else None
-        return custom_update(
-            bound.arguments["x"],
+        x = bound.arguments["x"]
+        original_x_dtype = x.dtype
+        x_for_kernel = x.to(bound.arguments["conv_state"].dtype)
+        out = custom_update(
+            x_for_kernel,
             bound.arguments["conv_state"],
             bound.arguments["weight"],
             bound.arguments["bias"],
             activation,
             conv_state_indices=bound.arguments["conv_state_indices"],
         )
+        return out.to(original_x_dtype)
 
     for function in (hcu_causal_conv, hcu_causal_update):
         setattr(function, _WRAPPER, True)
