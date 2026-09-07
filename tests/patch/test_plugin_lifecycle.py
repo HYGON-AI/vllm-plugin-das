@@ -32,6 +32,7 @@ from vllm_hcu.patch.runtime_state import (
 
 
 REPO = Path(__file__).resolve().parents[2]
+TARGET_PLUGIN_ROOT = Path(plugin.__file__).resolve().parents[1]
 _target_root_override = os.environ.get("VLLM_TARGET_ROOT")
 if _target_root_override:
     TARGET_VLLM_ROOT = Path(_target_root_override).resolve()
@@ -79,7 +80,10 @@ def _fresh_python(
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = plugins
     env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_PLUGIN_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(TARGET_VLLM_ROOT), str(TARGET_PLUGIN_ROOT))
+    )
     if no_site or not assert_target_install:
         # The dependency-light plugin probe intentionally runs without
         # site-packages; importing vLLM for the source assertion would require
@@ -339,7 +343,9 @@ print(
             if line.startswith("{")
         )
     )
-    assert Path(payload.pop("plugin_file")).resolve().is_relative_to(REPO)
+    assert Path(payload.pop("plugin_file")).resolve().is_relative_to(
+        TARGET_PLUGIN_ROOT
+    )
     assert payload == {
         "path": "vllm_hcu.platforms.hcu.HCUPlatform",
         "builtins_same": True,

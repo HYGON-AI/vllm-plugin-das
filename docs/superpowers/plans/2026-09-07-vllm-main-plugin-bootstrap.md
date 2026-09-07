@@ -28,8 +28,8 @@
 - Modify: `tests/patch/test_plugin_lifecycle.py`
 
 **Interfaces:**
-- Consumes: `VLLM_TARGET_ROOT`, or the root containing the discoverable `vllm` package.
-- Produces: `_fresh_python()` subprocesses with the selected target first on `PYTHONPATH`.
+- Consumes: `VLLM_TARGET_ROOT`, plus the root containing the loaded `vllm_hcu` package.
+- Produces: `_fresh_python()` subprocesses with both selected install targets on `PYTHONPATH`.
 
 - [ ] **Step 1: Preserve the observed RED evidence**
 
@@ -38,6 +38,11 @@ The old-source run already reproduced three independent debts: fixed callback ad
 - [ ] **Step 2: Replace the old source-root contract**
 
 Rename the `VLLM_V0251_SOURCE_ROOT` contract to `VLLM_TARGET_ROOT`. Resolve the default from `importlib.util.find_spec("vllm").origin`, validate `vllm/__init__.py`, and put the target before the plugin repository in child `PYTHONPATH`.
+
+Resolve the plugin target independently from `vllm_hcu.__file__`, export it as
+`VLLM_HCU_TARGET_ROOT`, and put it after the vLLM target in child `PYTHONPATH`.
+Do not substitute the repository root: an installed parent pytest process can
+otherwise launch source-plugin children and report a false artifact pass.
 
 - [ ] **Step 3: Assert callback dependency order**
 
