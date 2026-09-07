@@ -1648,7 +1648,16 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
     assert torch.equal(loads, torch.tensor([1, 0, 1]))
 
 
-def test_hash_router_normalizes_index_dtypes():
+def test_hash_router_normalizes_index_dtypes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import sqrtsoftplus_routing
+
+    monkeypatch.setattr(
+        sqrtsoftplus_routing,
+        "_load_lightop_sqrtsoftplus",
+        lambda: None,
+    )
     captured = {}
 
     def original(

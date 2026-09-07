@@ -299,6 +299,11 @@ def test_w16a16_unverified_token_range_preserves_official_backend(
     monkeypatch.setattr(
         henvs, "VLLM_HCU_USE_LIGHTOP_W16A16_MOE", True, raising=False
     )
+    monkeypatch.setattr(
+        LightopW16A16Experts,
+        "_supports_current_device",
+        staticmethod(lambda: True),
+    )
     patch_unquantized_oracle.apply_to_module(module)
 
     backend, experts = module.select_unquantized_moe_backend(
@@ -361,7 +366,7 @@ def test_w16a16_converter_packs_only_owned_backend(
 def test_hcu_unquantized_constructor_uses_patched_oracle_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm.config import VllmConfig
+    from vllm.config import DeviceConfig, VllmConfig
     from vllm.config.vllm import set_current_vllm_config
     from vllm_hcu.model_executor.layers.fused_moe import (
         unquantized_fused_moe_method as method_module,
@@ -378,7 +383,9 @@ def test_hcu_unquantized_constructor_uses_patched_oracle_binding(
         method_module, "select_unquantized_moe_backend", select, raising=False
     )
     config = _config()
-    with set_current_vllm_config(VllmConfig()):
+    with set_current_vllm_config(
+        VllmConfig(device_config=DeviceConfig(device="cuda"))
+    ):
         method = method_module.HcuUnquantizedFusedMoEMethod(config)
 
     assert calls == [config]

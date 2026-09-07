@@ -51,6 +51,11 @@ def test_mla_concat_obeys_master_leaf_and_legacy_switches(
         "is_lightop_mla_decode_concat_eligible",
         lambda *_args, **_kwargs: True,
     )
+    monkeypatch.setattr(
+        lightop_concat_runtime,
+        "_load_lightop_ds_cat",
+        lambda: object(),
+    )
 
     def lightop_call(
         actual_left: torch.Tensor, actual_right: torch.Tensor
@@ -81,6 +86,11 @@ def test_mla_concat_accepts_last_dimension(monkeypatch: pytest.MonkeyPatch, dim:
         lightop_concat_runtime,
         "is_lightop_mla_decode_concat_eligible",
         lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        lightop_concat_runtime,
+        "_load_lightop_ds_cat",
+        lambda: object(),
     )
     monkeypatch.setattr(
         lightop_concat_runtime,
