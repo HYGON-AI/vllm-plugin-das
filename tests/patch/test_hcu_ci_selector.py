@@ -45,6 +45,7 @@ from hcu_ci_register import (  # noqa: E402
     partition_registrations,
     validate_registrations,
 )
+from tests.integration.server.evalscope_server import evalscope_command  # noqa: E402
 
 
 def _config() -> dict:
@@ -571,6 +572,79 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
     assert "/models/public" in source
     assert "/models/parastor" in source
     assert ":/models/llm-models:ro" not in source
+    assert "/public/opendas/DL_DATA/ci_datasets" in source
+    assert '"$dataset_root:/datasets:ro"' in source
+
+
+def test_evalscope_resolves_named_datasets_from_shared_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("gsm8k", "humaneval", "MMMU"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    config = {
+        "model": "/models/test",
+        "evalscope": {
+            "generation_config": {"temperature": 0},
+            "eval_batch_size": 1,
+            "timeout": 60,
+            "limit": 1,
+            "datasets": ["gsm8k", "humaneval", "mmmu"],
+            "dataset_args": {"mmmu": {"subset_list": ["Art"]}},
+        },
+    }
+
+    command = evalscope_command(
+        config,
+        model_env="VLLM_HCU_TEST_MODEL",
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path / "output",
+    )
+    option_index = command.index("--dataset-args")
+    dataset_args = json.loads(command[option_index + 1])
+
+    assert dataset_args["gsm8k"]["local_path"] == str(
+        (tmp_path / "gsm8k").resolve()
+    )
+    assert dataset_args["humaneval"]["local_path"] == str(
+        (tmp_path / "humaneval").resolve()
+    )
+    assert dataset_args["mmmu"] == {
+        "subset_list": ["Art"],
+        "local_path": str((tmp_path / "MMMU").resolve()),
+    }
+
+
+def test_evalscope_fails_before_network_fallback_when_dataset_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    config = {
+        "model": "/models/test",
+        "evalscope": {
+            "generation_config": {},
+            "eval_batch_size": 1,
+            "timeout": 60,
+            "limit": 1,
+            "datasets": ["gsm8k"],
+            "dataset_args": {},
+        },
+    }
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="local dataset 'gsm8k' is unavailable",
+    ):
+        evalscope_command(
+            config,
+            model_env="VLLM_HCU_TEST_MODEL",
+            host="127.0.0.1",
+            port=10128,
+            work_dir=tmp_path / "output",
+        )
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:

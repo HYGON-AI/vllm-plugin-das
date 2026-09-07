@@ -144,6 +144,56 @@ def server_command(
     return ["vllm", "serve", model, *args], host, port
 
 
+def _local_dataset_path(dataset_root: Path, dataset_name: str) -> Path:
+    exact = dataset_root / dataset_name
+    if exact.is_dir():
+        return exact.resolve()
+
+    matches = sorted(
+        path.resolve()
+        for path in dataset_root.iterdir()
+        if path.is_dir() and path.name.casefold() == dataset_name.casefold()
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"ambiguous local dataset {dataset_name!r} under {dataset_root}: "
+            + ", ".join(str(path) for path in matches)
+        )
+    raise FileNotFoundError(
+        f"local dataset {dataset_name!r} is unavailable under {dataset_root}"
+    )
+
+
+def _evalscope_dataset_args(evalscope: dict[str, Any]) -> dict[str, Any]:
+    dataset_args = copy.deepcopy(evalscope.get("dataset_args", {}))
+    if not isinstance(dataset_args, dict):
+        raise TypeError("evalscope dataset_args must be a mapping")
+
+    dataset_root_text = os.environ.get("VLLM_HCU_TEST_DATASET_ROOT")
+    if not dataset_root_text:
+        return dataset_args
+    dataset_root = Path(dataset_root_text).expanduser().resolve()
+    if not dataset_root.is_dir():
+        raise FileNotFoundError(
+            f"local EvalScope dataset root is unavailable: {dataset_root}"
+        )
+
+    for raw_name in evalscope["datasets"]:
+        dataset_name = str(raw_name)
+        args = dataset_args.setdefault(dataset_name, {})
+        if not isinstance(args, dict):
+            raise TypeError(
+                f"evalscope dataset_args[{dataset_name!r}] must be a mapping"
+            )
+        if not args.get("local_path"):
+            args["local_path"] = str(
+                _local_dataset_path(dataset_root, dataset_name)
+            )
+    return dataset_args
+
+
 def evalscope_command(
     config: dict[str, Any],
     *,
@@ -160,7 +210,9 @@ def evalscope_command(
         )
     )
     generation = evalscope["generation_config"]
-    dataset_args = json.dumps(evalscope["dataset_args"], separators=(",", ":"))
+    dataset_args = json.dumps(
+        _evalscope_dataset_args(evalscope), separators=(",", ":")
+    )
     command = [
         "evalscope",
         "eval",

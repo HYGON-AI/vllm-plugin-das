@@ -10,6 +10,7 @@ workspace="${GITHUB_WORKSPACE:-$(pwd)}"
 artifact_root="${HCU_CI_HOST_JOB_ROOT:-}"
 model_root="${HCU_CI_MODEL_ROOT:-${VLLM_HCU_TEST_MODEL_ROOT:-}}"
 dataset_root="${HCU_CI_DATASET_ROOT:-${VLLM_HCU_TEST_DATASET_ROOT:-}}"
+default_dataset_root=/public/opendas/DL_DATA/ci_datasets
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -140,12 +141,17 @@ if [[ "${#model_root_hosts[@]}" -gt 0 ]]; then
   )
 fi
 
+if [[ -z "$dataset_root" && -d "$default_dataset_root" ]]; then
+  dataset_root="$default_dataset_root"
+fi
+
 if [[ -n "$dataset_root" ]]; then
   dataset_root="$(realpath "$dataset_root")"
   if [[ ! -d "$dataset_root" ]]; then
     echo "HCU dataset root does not exist: $dataset_root" >&2
     exit 2
   fi
+  echo "using HCU dataset root: $dataset_root -> /datasets"
   docker_args+=(
     --volume "$dataset_root:/datasets:ro"
     --env VLLM_HCU_TEST_DATASET_ROOT=/datasets
