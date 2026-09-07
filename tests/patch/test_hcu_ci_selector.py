@@ -45,7 +45,12 @@ from hcu_ci_register import (  # noqa: E402
     partition_registrations,
     validate_registrations,
 )
-from tests.integration.server.evalscope_server import evalscope_command  # noqa: E402
+from tests.integration.server.evalscope_server import (  # noqa: E402
+    EVALSCOPE_OWNER_MARKER,
+    EVALSCOPE_OWNER_SIGNATURE,
+    _reset_evalscope_artifacts,
+    evalscope_command,
+)
 
 
 def _config() -> dict:
@@ -645,6 +650,25 @@ def test_evalscope_fails_before_network_fallback_when_dataset_is_missing(
             port=10128,
             work_dir=tmp_path / "output",
         )
+
+
+def test_evalscope_accepts_ci_owned_artifact_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_root = tmp_path / "hcu-ci-artifacts"
+    work_dir = job_root / "evalscope"
+    stale_report = work_dir / "reports" / "stale.json"
+    stale_report.parent.mkdir(parents=True)
+    stale_report.write_text("stale", encoding="utf-8")
+    monkeypatch.setenv("HCU_CI_JOB_ROOT", str(job_root))
+
+    _reset_evalscope_artifacts(work_dir)
+
+    assert not stale_report.exists()
+    assert (work_dir / EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == EVALSCOPE_OWNER_SIGNATURE
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
