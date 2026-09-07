@@ -618,6 +618,7 @@ def test_sparse_replacements_preserve_v0251_definition_surface_and_signatures(
     if replacement_relative.endswith("sparse_attn_indexer.py"):
         assert hcu_owned_definitions == {
             "V32SparseAttnIndexer",
+            "_hcu_indexer_k_quant_and_cache",
             "lightop_indexer_qk_quant_and_store",
         }
     else:

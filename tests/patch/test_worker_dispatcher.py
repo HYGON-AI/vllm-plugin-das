@@ -17,6 +17,7 @@ import pytest
 import vllm_hcu.patch.worker as worker_dispatcher
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import LatchedPatchError, PatchRegistry, PatchStatus
+from vllm_hcu.patch.worker.framework_opt import patch_model_loader_static_eplb_gate
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -195,6 +196,13 @@ def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
         "vllm.v1.worker.gpu.model_states.default",
     ) in worker_dispatcher.worker_callback_names()
     assert worker_dispatcher._patch_features()[patch_id] == "always"
+
+
+def test_static_eplb_loader_gate_has_auditable_dispatch_metadata():
+    assert (
+        patch_model_loader_static_eplb_gate.PATCH_ID,
+        patch_model_loader_static_eplb_gate.TARGET_MODULE,
+    ) in worker_dispatcher.worker_callback_names()
 
 
 def test_cold_replacement_metadata_matches_lazy_adapter_contracts():
