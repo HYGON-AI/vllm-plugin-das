@@ -51,6 +51,27 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
+def _hcu_indexer_k_quant_and_cache(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str,
+) -> None:
+    """Write HCU indexer cache with fixed-shape, negative-slot handling."""
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        indexer_k_quant_and_cache_triton,
+    )
+
+    indexer_k_quant_and_cache_triton(
+        k,
+        kv_cache,
+        slot_mapping,
+        quant_block_size,
+        scale_fmt,
+    )
+
+
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -971,7 +992,15 @@ class SparseAttnIndexer(CustomOp):
                         slot_mapping,
                         layer_metadata,
                     )
-                use_safe_cache_writer = self.dcp_world_size > 1
+                # Boolean compaction (``cache_k[slot_mapping >= 0]``) creates a
+                # dynamic-shaped tensor and is forbidden during HIP graph
+                # capture. Keep the captured launch fixed-shape and let the HCU
+                # cache writer suppress dummy ``-1`` slots on-device. DCP uses
+                # the same path because each rank can receive dummy tokens.
+                use_safe_cache_writer = (
+                    self.dcp_world_size > 1
+                    or torch.cuda.is_current_stream_capturing()
+                )
                 if use_safe_cache_writer:
                     lightop_k = cache_k[:0]
                     lightop_slots = slot_mapping[:0]
@@ -990,7 +1019,7 @@ class SparseAttnIndexer(CustomOp):
                 )
                 if use_safe_cache_writer:
                     assert self.scale_fmt is not None
-                    ops.indexer_k_quant_and_cache(
+                    _hcu_indexer_k_quant_and_cache(
                         cache_k,
                         self.k_cache.kv_cache,
                         slot_mapping,
