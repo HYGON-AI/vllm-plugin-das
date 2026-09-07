@@ -26,6 +26,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
+HCU_CI_ARTIFACT_ROOT = Path("/hcu-ci-artifacts")
 EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
 EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
 EVALSCOPE_PROCESS_OWNER_ENV = "VLLM_HCU_EVAL_PROCESS_OWNER"
@@ -272,13 +273,10 @@ def _reset_evalscope_artifacts(work_dir: Path) -> None:
         ci_job_root = (
             Path(ci_job_root_value).resolve() if ci_job_root_value else None
         )
-        ci_work_dir = (
-            ci_job_root / "evalscope"
-            if ci_job_root is not None
-            and ci_job_root != Path(ci_job_root.anchor)
-            else None
-        )
-        if root.parent != owned_root and root != ci_work_dir:
+        ci_evalscope_roots = {HCU_CI_ARTIFACT_ROOT.resolve() / "evalscope"}
+        if ci_job_root is not None and ci_job_root != Path(ci_job_root.anchor):
+            ci_evalscope_roots.add(ci_job_root / "evalscope")
+        if root.parent != owned_root and root not in ci_evalscope_roots:
             raise ValueError(
                 "refusing to reset EvalScope artifacts without an ownership "
                 f"marker under {root}"

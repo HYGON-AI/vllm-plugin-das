@@ -35,6 +35,7 @@ jobs:
       groups: ${{ steps.select.outputs.groups }}
       docs_only: ${{ steps.select.outputs.docs_only }}
       fallback: ${{ steps.select.outputs.fallback }}
+      tested_ref: ${{ steps.tested-ref.outputs.sha }}
     steps:
       - name: Repair self-hosted workspace before checkout
         run: |
@@ -89,6 +90,10 @@ jobs:
         with:
           clean: true
           fetch-depth: 0
+
+      - name: Record tested revision
+        id: tested-ref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Fetch PR diff endpoints
         env:
@@ -256,7 +261,7 @@ jobs:
     uses: ./.github/workflows/_selected-hcu-tests.yml
     with:
       matrix: ${{ needs.static-and-select.outputs.matrix }}
-      tested_ref: ${{ github.event.pull_request.merge_commit_sha }}
+      tested_ref: ${{ needs.static-and-select.outputs.tested_ref }}
     permissions:
       contents: read
 

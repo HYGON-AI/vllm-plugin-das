@@ -45,6 +45,7 @@ from hcu_ci_register import (  # noqa: E402
     partition_registrations,
     validate_registrations,
 )
+from tests.integration.server import evalscope_server as evalscope_server_module  # noqa: E402
 from tests.integration.server.evalscope_server import (  # noqa: E402
     EVALSCOPE_OWNER_MARKER,
     EVALSCOPE_OWNER_SIGNATURE,
@@ -671,6 +672,22 @@ def test_evalscope_accepts_ci_owned_artifact_directory(
     ) == EVALSCOPE_OWNER_SIGNATURE
 
 
+def test_evalscope_accepts_standard_ci_artifact_directory_without_job_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_root = tmp_path / "hcu-ci-artifacts"
+    work_dir = job_root / "evalscope"
+    monkeypatch.delenv("HCU_CI_JOB_ROOT", raising=False)
+    monkeypatch.setattr(evalscope_server_module, "HCU_CI_ARTIFACT_ROOT", job_root)
+
+    _reset_evalscope_artifacts(work_dir)
+
+    assert (work_dir / EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == EVALSCOPE_OWNER_SIGNATURE
+
+
 def test_hcu_control_container_uses_runner_identity() -> None:
     source = (
         REPOSITORY / "scripts/ci/hcu/hcu_ci_run_control_container.sh"
@@ -764,6 +781,21 @@ def test_selected_hcu_workflow_pins_mutable_image_before_matrix() -> None:
     assert "Using immutable HCU CI image" in source
     assert "needs: resolve-image" in source
     assert "HCU_CI_IMAGE: ${{ needs.resolve-image.outputs.image }}" in source
+
+
+def test_pr_hardware_jobs_reuse_the_static_gate_revision() -> None:
+    pr_workflow = (
+        REPOSITORY / ".github/workflows/hcu-pr-ci.yml"
+    ).read_text(encoding="utf-8")
+    selected_workflow = (
+        REPOSITORY / ".github/workflows/_selected-hcu-tests.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "tested_ref: ${{ steps.tested-ref.outputs.sha }}" in pr_workflow
+    assert "tested_ref: ${{ needs.static-and-select.outputs.tested_ref }}" in pr_workflow
+    assert "github.event.pull_request.merge_commit_sha" not in pr_workflow
+    assert "actual_ref=\"$(git rev-parse HEAD)\"" in selected_workflow
+    assert '"$actual_ref" != "$EXPECTED_TESTED_REF"' in selected_workflow
 
 
 def test_fork_pr_uses_non_secret_hcu_image_fallback() -> None:
