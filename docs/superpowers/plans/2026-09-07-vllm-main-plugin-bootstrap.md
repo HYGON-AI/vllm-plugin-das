@@ -180,3 +180,19 @@ Update the plan and upgrade skill with observed results. Bootstrap success advan
 git add docs/superpowers/plans/2026-09-07-vllm-main-plugin-bootstrap.md
 git commit -m "docs: record frozen main plugin bootstrap evidence"
 ```
+
+## Bootstrap Evidence
+
+- Source commit: `1c3bd240578f745bf119f69144d156c404b7b1ab`.
+- Wheel: `vllm_hcu-0.28.1rc1.dev489+das.1c3bd24.dtk2604-cp310-cp310-linux_x86_64.whl`.
+- Wheel SHA256: `cfcf410ce65cc4fd353e2905c03247a13ee528fdf195b434ec5416988193b6db`.
+- Install root: `/models/.installs/vllm-plugin-das-main-58ad1f3-1c3bd24`.
+- Native extension: `vllm_hcu/hcu_ops.cpython-310-x86_64-linux-gnu.so` loaded from the install root.
+- Platform discovery: `vllm_hcu.platforms.hcu.HCUPlatform` activated.
+- Main import probe: 30 callbacks applied and zero failed callbacks.
+- Installed-artifact bootstrap suite: 54 passed, 14 PyTorch deprecation warnings, 114.58 seconds.
+- The earlier `2fe4c45` wheel is retained under the artifact `trial/` directory and is not a release or validation input.
+
+This closes only the plugin packaging/API bootstrap portion of Gate 2. Kernel
+data flow, AITER routing, quantization, CUDA Graph, MTP3, model correctness,
+and HumanEval remain open.
