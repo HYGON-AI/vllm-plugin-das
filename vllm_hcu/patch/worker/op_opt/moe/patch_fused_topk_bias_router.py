@@ -33,6 +33,8 @@ def apply_to_module(module: ModuleType) -> bool:
             "input_tokens",
             "hash_indices_table",
             "routed_scaling_factor",
+            "bias_vl",
+            "image_sentinel_lo",
         ),
     )
 
@@ -47,6 +49,8 @@ def apply_to_module(module: ModuleType) -> bool:
         input_tokens=None,
         hash_indices_table=None,
         routed_scaling_factor=1.0,
+        bias_vl=None,
+        image_sentinel_lo=0,
     ):
         if hash_indices_table is not None:
             if hash_indices_table.dtype != topk_indices.dtype:
@@ -63,6 +67,8 @@ def apply_to_module(module: ModuleType) -> bool:
             input_tokens,
             hash_indices_table,
             routed_scaling_factor,
+            bias_vl,
+            image_sentinel_lo,
         )
 
     target._vllm_hcu_original_vllm_topk_softplus_sqrt = original

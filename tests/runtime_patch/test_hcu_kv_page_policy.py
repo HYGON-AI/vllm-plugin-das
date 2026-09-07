@@ -10,8 +10,12 @@ import pytest
 import torch
 
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
-from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheTensor,
+    create_kv_cache_views,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm_hcu.model_executor.layers.kv_cache_utils import (
     has_mixed_kv_cache_block_dims,
 )
@@ -62,26 +66,20 @@ def test_uniform_kv_block_dim_detection_is_false() -> None:
 
 
 def test_target_kv_page_policy_uses_backend_capability_for_padding() -> None:
-    def spec(block_size: int, *, indexes: bool) -> AttentionSpec:
+    def spec(block_size: int) -> AttentionSpec:
         return AttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=1,
             dtype=torch.float16,
-            indexes_kv_by_block_stride=indexes,
         )
 
     padded = unify_kv_cache_spec_page_size(
-        {"small": spec(3, indexes=True), "large": spec(5, indexes=True)}
+        {"small": spec(3), "large": spec(5)}
     )
     assert padded["small"].block_size == 3
     assert padded["small"].page_size_padded == 20
     assert padded["large"].page_size_bytes == 20
-
-    with pytest.raises(NotImplementedError, match="cannot be padded"):
-        unify_kv_cache_spec_page_size(
-            {"small": spec(3, indexes=False), "large": spec(5, indexes=True)}
-        )
 
 
 def test_target_padded_attention_view_uses_physical_page_stride() -> None:
@@ -91,21 +89,23 @@ def test_target_padded_attention_view_uses_physical_page_stride() -> None:
         head_size=2,
         dtype=torch.float16,
         page_size_padded=32,
-        indexes_kv_by_block_stride=True,
     )
     raw = torch.zeros(64, dtype=torch.int8)
-    shape = (2, 2, 2, 1, 2)
-
-    cache = _reshape_attention_kv_cache(
+    cache = create_kv_cache_views(
         raw,
         spec,
-        shape,
-        (0, 1, 2, 3, 4),
         2,
-        None,
-    )
+        KVCacheLayout.LBHNC,
+        KVCacheTensor(
+            size=64,
+            layers=["layer"],
+            offset=0,
+            layer_stride=64,
+            block_stride=32,
+        ),
+    )[0]
 
-    assert cache.shape == shape
+    assert cache.shape == (2, 1, 2, 4)
     assert cache.stride(0) == 16
     cache[1].fill_(7)
     assert torch.count_nonzero(raw[:32]) == 0
@@ -120,4 +120,3 @@ def test_hcu_flashmla_declares_block_stride_indexing_contract() -> None:
     assert HcuFlashMLABackend.get_kv_cache_stride_order(
         include_num_layers_dimension=True
     ) == (1, 0, 2, 3)
-    assert HcuFlashMLABackend.indexes_kv_by_block_stride() is True

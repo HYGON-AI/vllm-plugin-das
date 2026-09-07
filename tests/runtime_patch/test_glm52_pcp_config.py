@@ -433,15 +433,9 @@ def test_forced_v1_pcp_is_rejected_during_platform_config_lifecycle(
         "get_device_properties",
         lambda device: SimpleNamespace(gcnArchName="gfx936"),
     )
-    from vllm_hcu.patch.platform.framework_opt import (
-        patch_multiproc_executor,
-        patch_scheduler,
-    )
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
     from vllm_hcu.platforms.hcu import HCUPlatform
 
-    monkeypatch.setattr(
-        patch_scheduler, "select_hcu_scheduler", lambda config: False
-    )
     monkeypatch.setattr(
         patch_multiproc_executor, "select_hcu_multiproc_executor", lambda config: False
     )

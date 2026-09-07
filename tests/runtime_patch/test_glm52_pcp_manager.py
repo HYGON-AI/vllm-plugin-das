@@ -209,7 +209,7 @@ def _make_batch(
         is_prefilling_np=np.asarray(
             [is_prefilling for _, _, _, is_prefilling in requests], dtype=np.bool_
         ),
-        max_seq_len_np=None,
+        has_prefill=any(is_prefilling for _, _, _, is_prefilling in requests),
         input_ids=input_ids,
         positions=positions,
         is_padding=is_padding,

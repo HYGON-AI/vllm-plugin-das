@@ -109,10 +109,10 @@ def deep_gemm_has_sms_api(module: object) -> bool:
     )
 
 
-def create_sm_control_context_without_compute(module: object, vllm_config: object):
+def create_sm_control_context_without_compute(module: object, parallel_config: object):
     comm_sms = int(module.envs.VLLM_DBO_COMM_SMS)
     set_comm_sms = lambda sms: None
-    if vllm_config.parallel_config.enable_expert_parallel:
+    if parallel_config.enable_expert_parallel:
         ep_group = module.get_ep_group()
         device_communicator = ep_group.device_communicator
         all2all_manager = (

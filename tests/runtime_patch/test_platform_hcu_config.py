@@ -44,11 +44,14 @@ from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 
 REPO = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
+    os.environ.get(
+        "VLLM_HCU_TARGET_ROOT",
+        Path(sys.modules["vllm"].__file__).resolve().parents[1],
+    )
 ).resolve()
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_HCU_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
 _TARGET_SOURCE_ASSERTION = r'''
@@ -56,7 +59,7 @@ import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_HCU_TARGET_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
@@ -65,7 +68,7 @@ assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
 '''
 
 
-def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
+def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     for name in (
         "VLLM_DP_RANK",
@@ -76,7 +79,7 @@ def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     ):
         env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
@@ -429,7 +432,7 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
 
 
 def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
-    result = _run_fresh_v0251(
+    result = _run_fresh_target(
         r'''
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
@@ -939,7 +942,7 @@ def test_request_cudagraph_buckets_and_feature_off_equivalence(
 
 
 def test_real_v0251_set_cudagraph_binds_custom_sp_before_first_adjustment() -> None:
-    result = _run_fresh_v0251(
+    result = _run_fresh_target(
         "import json; from types import SimpleNamespace; "
         "import vllm.config.compilation as compilation_module; "
         "import vllm.config.vllm as vllm_module; "
@@ -1450,7 +1453,6 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
         "VLLM_HCU_USE_FLASH_ATTN",
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
         "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
-        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in environment.items():
@@ -1475,7 +1477,6 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
         def has_full_cudagraphs() -> bool:
             return False
 
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_PD_SPLIT", False)
     monkeypatch.setattr(
         hcu_envs,
         "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE",

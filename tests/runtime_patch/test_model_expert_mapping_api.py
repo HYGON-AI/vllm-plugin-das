@@ -81,7 +81,6 @@ def test_model_expert_mapping_uses_vllm_0251_function_api(
         class_name,
         "get_expert_mapping",
         {
-            "FusedMoE": fused_moe.FusedMoE,
             "fused_moe_make_expert_params_mapping": (
                 fused_moe.fused_moe_make_expert_params_mapping
             ),
@@ -154,7 +153,6 @@ def test_hy_v3_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None:
         "HYV3MTP",
         "load_weights",
         {
-            "FusedMoE": fused_moe.FusedMoE,
             "fused_moe_make_expert_params_mapping": record_expert_mapping,
             "_get_cla_factor": lambda _config: 1,
             "_is_moe": lambda _config: True,
@@ -277,7 +275,6 @@ def test_deepseek_v4_mtp_precomputes_expert_mapping_with_vllm_0251_api() -> None
         "DeepSeekV4MTP",
         "load_weights",
         {
-            "FusedMoE": fused_moe.FusedMoE,
             "fused_moe_make_expert_params_mapping": record_expert_mapping,
             "get_tensor_model_parallel_world_size": lambda: 1,
             "get_tensor_model_parallel_rank": lambda: 0,

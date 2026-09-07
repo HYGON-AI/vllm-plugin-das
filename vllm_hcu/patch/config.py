@@ -31,7 +31,7 @@ _DEEP_GEMM_BACKEND = "deep_gemm"
 _legacy_backend_warning_emitted = False
 _legacy_backend_warning_lock = threading.Lock()
 _SUPPORTED_FLASH_ATTN_MODES = frozenset(
-    {"classic", "cutlass", "custom", "varlen"}
+    {"classic", "cutlass", "varlen"}
 )
 
 

@@ -37,7 +37,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "routed_scaling_factor", "e_score_correction_bias",
             "custom_routing_function",
             "eplb_state", "zero_expert_type", "num_logical_experts",
-            "hash_indices_table",
+            "hash_indices_table", "bias_vl", "image_sentinel_lo",
         ),
     )
     hcu_class = make_hcu_grouped_topk_router(base)

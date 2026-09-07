@@ -63,10 +63,10 @@ def _load_hcu_fa_utils_module(
 ):
     """Load the real HCU FA boundary against observable kernel doubles."""
 
-    from vllm.v1.attention.backends import utils as attention_utils
+    from vllm_hcu.v1.attention import kv_cache_layout as hcu_kv_cache_layout
 
     monkeypatch.setattr(
-        attention_utils,
+        hcu_kv_cache_layout,
         "get_kv_cache_layout",
         lambda: kv_cache_layout,
     )
@@ -195,7 +195,6 @@ def test_flash_attention_mode_legacy_priority_and_default(
         "VLLM_HCU_USE_FLASH_ATTN",
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
         "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
-        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
     ):
         monkeypatch.delenv(variable, raising=False)
     if name is not None:
@@ -214,6 +213,7 @@ def test_explicit_flash_attention_mode_wins_over_legacy_environment(
     ("payload", "error"),
     [
         ({"hcu_flash_attn_mode": 1}, TypeError),
+        ({"hcu_flash_attn_mode": "custom"}, ValueError),
         ({"hcu_flash_attn_mode": "future"}, ValueError),
     ],
 )
@@ -263,7 +263,6 @@ def test_flash_attention_kv_cache_contract_follows_resolved_mode(
 
     assert backend.get_kv_cache_shape(3, 64, 4, 128) == expected_shape
     assert backend.get_kv_cache_block_dim(64, 4, 128) == expected_block_dim
-    assert backend.indexes_kv_by_block_stride() is True
     assert backend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
     assert backend.get_kv_cache_stride_order(True) == (1, 0, 2, 3, 4, 5)
 
@@ -281,7 +280,6 @@ def test_cutlass_block_first_hnd_stride_contract(
     assert backend.get_kv_cache_block_dim(64, 4, 128) == 0
     assert backend.get_kv_cache_stride_order() == (0, 1, 3, 2, 4)
     assert backend.get_kv_cache_stride_order(True) == (1, 4, 0, 2, 3, 5)
-    assert backend.indexes_kv_by_block_stride() is True
 
 
 @pytest.mark.parametrize(

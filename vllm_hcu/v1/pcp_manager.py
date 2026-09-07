@@ -683,11 +683,7 @@ class HcuPCPManager:
             prefill_len_np=local_prefill_len,
             num_computed_prefill_tokens_np=local_num_computed_prefill,
             is_prefilling_np=local_is_prefilling,
-            max_seq_len_np=(
-                input_batch.max_seq_len_np[global_req_indices].copy()
-                if input_batch.max_seq_len_np is not None
-                else None
-            ),
+            has_prefill=bool(local_is_prefilling.any()),
             input_ids=input_ids,
             positions=positions,
             is_padding=is_padding,

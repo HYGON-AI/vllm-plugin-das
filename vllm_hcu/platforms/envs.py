@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
-    VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = False
@@ -55,7 +54,6 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
-    VLLM_HCU_USE_PD_SPLIT: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
@@ -122,7 +120,6 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
             "classic": "classic",
             "cutlass": "cutlass",
             "varlen": "varlen",
-            "custom": "custom",
         }
         if normalized not in aliases:
             raise ValueError(
@@ -130,10 +127,6 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
             )
         return aliases[normalized]
 
-    if os.environ.get(
-        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False"
-    ).lower() in ("true", "1"):
-        return "custom"
     if os.environ.get(
         "VLLM_HCU_USE_FLASH_ATTN_VARLEN", "False"
     ).lower() in ("true", "1"):
@@ -171,10 +164,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # legacy paths.
     "VLLM_HCU_USE_FLASH_ATTN_VARLEN":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN_VARLEN", "True").lower() in
-             ("true", "1")),
-    # vLLM will use custom FlashAttention (convert kv cache) Backend on hcu,  not office attention layerout blocksize 64 
-    "VLLM_HCU_USE_CUSTOM_FLASH_ATTN":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "False").lower() in
              ("true", "1")),
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
@@ -357,11 +346,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_MAMBA_SSM_CACHE_DTYPE":
     lambda: (os.environ.get("VLLM_HCU_MAMBA_SSM_CACHE_DTYPE", "False").lower() in
              ("true", "1")),
-
-    # vLLM will split prefill and decode, not mix up
-    "VLLM_HCU_USE_PD_SPLIT":
-        lambda: (os.environ.get("VLLM_HCU_USE_PD_SPLIT", "False").lower() in
-                 ("true", "1")),
 
     # If use custom AITER_W4A16_MOE impl, please set True
     "VLLM_HCU_USE_AITER_W4A16_MOE":

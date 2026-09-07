@@ -188,94 +188,6 @@ def _fake_scheduler_module():
     return _module(patch_scheduler.TARGET_MODULE, Scheduler=Scheduler)
 
 
-def test_scheduler_feature_off_keeps_official_class(monkeypatch):
-    monkeypatch.setattr(patch_scheduler, "apply", lambda module=None: True)
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", False)
-    config = SimpleNamespace(
-        additional_config={"hcu": {}},
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(
-            scheduler_cls=None,
-            async_scheduling=False,
-        ),
-    )
-    assert patch_scheduler.select_hcu_scheduler(config) is False
-    assert config.scheduler_config.scheduler_cls is None
-    from vllm_hcu.v1.core.sched.scheduler import HcuScheduler
-
-    observed: list[bool] = []
-
-    def official_schedule(self, throttle_prefills: bool = False):
-        observed.append(throttle_prefills)
-        return "official"
-
-    monkeypatch.setattr(HcuScheduler.__mro__[1], "schedule", official_schedule)
-    scheduler = object.__new__(HcuScheduler)
-    assert HcuScheduler.schedule(scheduler) == "official"
-    assert HcuScheduler.schedule(scheduler, throttle_prefills=True) == "official"
-    assert observed == [False, True]
-
-
-def test_scheduler_selects_hcu_class_through_scheduler_cls(monkeypatch):
-    monkeypatch.setattr(
-        patch_scheduler,
-        "apply",
-        lambda module=None: pytest.fail("selector eagerly validated scheduler module"),
-    )
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", True)
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    config = SimpleNamespace(
-        additional_config={"hcu": {}},
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(
-            scheduler_cls=None,
-            async_scheduling=False,
-        ),
-    )
-    assert patch_scheduler.select_hcu_scheduler(config) is True
-    assert config.scheduler_config.scheduler_cls == patch_scheduler.HCU_SCHEDULER_PATH
-    assert patch_scheduler.select_hcu_scheduler(config) is False
-    config.scheduler_config.scheduler_cls = None
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
-    with pytest.raises(RuntimeError, match="requires VLLM_HCU_USE_CUSTOM_OPS"):
-        patch_scheduler.select_hcu_scheduler(config)
-
-
-def test_scheduler_rejects_split_pd_with_async_scheduling(monkeypatch):
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", True)
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    config = SimpleNamespace(
-        additional_config={"hcu": {}},
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(
-            scheduler_cls=None,
-            async_scheduling=True,
-        ),
-    )
-    with pytest.raises(RuntimeError, match="--no-async-scheduling"):
-        patch_scheduler.select_hcu_scheduler(config)
-    assert config.scheduler_config.scheduler_cls is None
-
-
-def test_hcu_split_pd_scheduler_is_waiting_first_and_lora_safe():
-    from vllm_hcu.v1.core.sched.scheduler import HcuScheduler, PauseState
-
-    scheduler = object.__new__(HcuScheduler)
-    scheduler.lora_config = object()
-    scheduler.running = [
-        SimpleNamespace(lora_request=SimpleNamespace(lora_int_id=2)),
-        SimpleNamespace(lora_request=None),
-    ]
-    assert scheduler._hcu_initial_scheduled_loras() == {2}
-    scheduler.waiting = [object()]
-    scheduler.skipped_waiting = []
-    scheduler._pause_state = PauseState.PAUSED_NEW
-    assert scheduler._hcu_can_schedule_waiting(1) is False
-    scheduler._pause_state = PauseState.UNPAUSED
-    assert scheduler._hcu_can_schedule_waiting(1) is True
-    assert scheduler._hcu_can_schedule_waiting(0) is False
-    assert HcuScheduler.schedule_split_pd is not HcuScheduler.__mro__[1].schedule
-
 
 def test_multi_mtp_uses_existing_draft_token_ids_channel():
     module = _fake_scheduler_module()
@@ -311,11 +223,6 @@ def test_qwen4_exp_mtp_group_is_annotated_at_scheduler_boundary():
     )
     assert module.Scheduler.observed_eagle_groups == [False, True]
 
-
-def test_scheduler_logs_decoder_kv_ready_event():
-    from vllm_hcu.v1.core.sched.scheduler import HcuScheduler
-
-    assert "log_ttft_event" in HcuScheduler._update_waiting_for_remote_kv.__code__.co_names
 
 
 def _fake_engine_core_module(calls):
@@ -733,97 +640,6 @@ def test_outputs_keep_model_runner_ipc_stable_and_use_draft_channel():
     assert DraftTokenIds(["r"], [[1]]).draft_token_ids == [[1]]
     assert patch_outputs.apply_to_module(module) is False
 
-
-def test_clean_v0251_model_runner_output_and_hcu_draft_method_contract():
-    repo = Path(__file__).resolve().parents[2]
-    clean_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
-    )
-    script = r'''
-import ast
-import os
-from dataclasses import fields
-from pathlib import Path
-from types import SimpleNamespace
-
-import vllm
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-
-assert "spec_token_ids" not in {field.name for field in fields(ModelRunnerOutput)}
-output = ModelRunnerOutput(
-    req_ids=["r1"],
-    req_id_to_index={"r1": 0},
-    sampled_token_ids=[[7]],
-)
-assert output.sampled_token_ids == [[7]]
-try:
-    ModelRunnerOutput(
-        req_ids=["r1"],
-        req_id_to_index={"r1": 0},
-        spec_token_ids=[[11, 12]],
-    )
-except TypeError:
-    pass
-else:
-    raise AssertionError("clean ModelRunnerOutput accepted retired IPC field")
-
-runner_source = Path(os.environ["HCU_RUNNER_SOURCE"])
-tree = ast.parse(runner_source.read_text(encoding="utf-8"))
-runner_class = next(
-    node
-    for node in tree.body
-    if isinstance(node, ast.ClassDef) and node.name == "GPUModelRunner"
-)
-take_method = next(
-    node
-    for node in runner_class.body
-    if isinstance(node, ast.FunctionDef) and node.name == "take_draft_token_ids"
-)
-module = ast.Module(body=[take_method], type_ignores=[])
-ast.fix_missing_locations(module)
-namespace = {"DraftTokenIds": DraftTokenIds}
-exec(compile(module, str(runner_source), "exec"), namespace)
-
-runner = SimpleNamespace(
-    num_spec_tokens=2,
-    _draft_token_req_ids=["r1"],
-    _get_draft_token_ids_cpu=lambda: ([[11, 12]], ["r1"]),
-)
-draft = namespace["take_draft_token_ids"](runner)
-assert draft == DraftTokenIds(req_ids=["r1"], draft_token_ids=[[11, 12]])
-runner.num_spec_tokens = 0
-assert namespace["take_draft_token_ids"](runner) is None
-
-bad_keywords = [
-    keyword.arg
-    for node in ast.walk(tree)
-    if isinstance(node, ast.Call)
-    and isinstance(node.func, ast.Name)
-    and node.func.id == "ModelRunnerOutput"
-    for keyword in node.keywords
-    if keyword.arg == "spec_token_ids"
-]
-assert bad_keywords == []
-assert "output_spec_token_ids" not in {
-    node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-}
-print("CLEAN_OUTPUT_DRAFT_CHANNEL_OK", vllm.__file__)
-'''
-    env = os.environ.copy()
-    env["VLLM_PLUGINS"] = "__disabled__"
-    env["HCU_RUNNER_SOURCE"] = str(repo / "vllm_hcu/v1/hcu_model_runner.py")
-    env["PYTHONPATH"] = os.pathsep.join((str(clean_vllm), str(repo)))
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=90,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "CLEAN_OUTPUT_DRAFT_CHANNEL_OK" in result.stdout
-    assert str(clean_vllm / "vllm/__init__.py") in result.stdout
 
 
 def _run_clean_vllm_real_factory_and_runtime_contract_smoke():

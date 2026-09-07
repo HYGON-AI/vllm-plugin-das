@@ -29,19 +29,18 @@ def _create_model_runner(
     *,
     use_v2_model_runner: bool,
 ):
-    if use_v2_model_runner:
-        from vllm_hcu.v1.hcu_model_runner_v2 import (
-            HcuGPUModelRunnerV2,
-            install_fixed_width_pp_sample_broadcast,
+    if not use_v2_model_runner:
+        raise RuntimeError(
+            "vllm-plugin-das for vLLM main supports only Model Runner V2"
         )
+    from vllm_hcu.v1.hcu_model_runner_v2 import (
+        HcuGPUModelRunnerV2,
+        install_fixed_width_pp_sample_broadcast,
+    )
 
-        runner = HcuGPUModelRunnerV2(vllm_config, device)
-        install_fixed_width_pp_sample_broadcast(runner)
-        return runner
-
-    from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
-
-    return GPUModelRunner(vllm_config, device)
+    runner = HcuGPUModelRunnerV2(vllm_config, device)
+    install_fixed_width_pp_sample_broadcast(runner)
+    return runner
 
 
 class HcuGPUWorker(Worker):

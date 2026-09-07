@@ -551,17 +551,12 @@ class HCUPlatform(Platform):
         IMPORT_COORDINATOR.drain_ready_callbacks()
         feature_config = validate_and_update_hcu_config(vllm_config)
 
-        # Use vLLM's public qualified-class configuration hooks.  Both
-        # selectors only assign strings and therefore keep the official and
-        # HCU Scheduler/Executor implementations lazy until engine startup.
+        # Use vLLM's public qualified-class configuration hook for the HCU
+        # executor. Scheduling remains fully owned by upstream vLLM.
         from vllm_hcu.patch.platform.framework_opt.patch_multiproc_executor import (
             select_hcu_multiproc_executor,
         )
-        from vllm_hcu.patch.platform.framework_opt.patch_scheduler import (
-            select_hcu_scheduler,
-        )
 
-        select_hcu_scheduler(vllm_config)
         select_hcu_multiproc_executor(vllm_config)
 
         cache_config = vllm_config.cache_config
@@ -618,12 +613,7 @@ class HCUPlatform(Platform):
                 mode = henvs.resolve_hcu_flash_attn_mode(
                     feature_config.hcu_flash_attn_mode
                 )
-                if mode == "custom":
-                    cache_config.block_size = 64
-                    logger.warning(
-                        "[HCU FLASH_ATTN:custom]: Setting kv cache block size to 64."
-                    )
-                elif mode == "varlen":
+                if mode == "varlen":
                     cache_config.block_size = 64
                     logger.warning(
                         "[HCU FLASH_ATTN:varlen]: Setting kv cache block size to 64."

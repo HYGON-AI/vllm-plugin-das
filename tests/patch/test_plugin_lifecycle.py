@@ -313,7 +313,6 @@ heavy = [
     "vllm.v1.attention.backends.registry",
     "vllm._aiter_ops",
     "vllm_hcu.ops",
-    "vllm_hcu.v1.core.sched.scheduler",
     "vllm_hcu.v1.executor.multiproc_executor",
 ]
 old_import = builtins.__import__
@@ -616,7 +615,6 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     ("use_v2", "expected_module", "expected_class"),
     [
         (True, "vllm_hcu.v1.hcu_model_runner_v2", "HcuGPUModelRunnerV2"),
-        (False, "vllm_hcu.v1.hcu_model_runner", "GPUModelRunner"),
     ],
 )
 def test_worker_selects_plugin_owned_model_runner(
@@ -864,7 +862,7 @@ def test_platform_defaults_prearm_worker_before_aiter_import(monkeypatch):
     assert events == ["prepare", "fused_moe", "linear", "shared"]
 
 
-def test_platform_check_uses_lazy_scheduler_and_executor_selectors(monkeypatch):
+def test_platform_check_uses_lazy_executor_selector(monkeypatch):
     import torch
 
     monkeypatch.setattr(
@@ -873,10 +871,7 @@ def test_platform_check_uses_lazy_scheduler_and_executor_selectors(monkeypatch):
         lambda device: SimpleNamespace(gcnArchName="gfx936"),
     )
     from vllm_hcu.patch.platform.core_fix import patch_vllm_config
-    from vllm_hcu.patch.platform.framework_opt import (
-        patch_multiproc_executor,
-        patch_scheduler,
-    )
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
     from vllm_hcu.platforms.hcu import HCUPlatform
 
     events: list[str] = []
@@ -884,11 +879,6 @@ def test_platform_check_uses_lazy_scheduler_and_executor_selectors(monkeypatch):
         patch_vllm_config,
         "validate_and_update_hcu_config",
         lambda config: events.append("validate"),
-    )
-    monkeypatch.setattr(
-        patch_scheduler,
-        "select_hcu_scheduler",
-        lambda config: events.append("scheduler") or False,
     )
     monkeypatch.setattr(
         patch_multiproc_executor,
@@ -904,7 +894,7 @@ def test_platform_check_uses_lazy_scheduler_and_executor_selectors(monkeypatch):
         parallel_config=SimpleNamespace(worker_cls="auto"),
     )
     HCUPlatform.check_and_update_config(config)
-    assert events == ["validate", "scheduler", "executor"]
+    assert events == ["validate", "executor"]
     assert config.parallel_config.worker_cls == "vllm_hcu.v1.worker.HcuGPUWorker"
 
 
@@ -917,10 +907,7 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
         lambda device: SimpleNamespace(gcnArchName="gfx936"),
     )
     from vllm_hcu.patch.platform.core_fix import patch_vllm_config
-    from vllm_hcu.patch.platform.framework_opt import (
-        patch_multiproc_executor,
-        patch_scheduler,
-    )
+    from vllm_hcu.patch.platform.framework_opt import patch_multiproc_executor
     from vllm_hcu.platforms.hcu import HCUPlatform
 
     events: list[tuple[str, bool]] = []
@@ -930,14 +917,6 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
         lambda config: events.append(
             ("validate", config.cache_config.enable_prefix_caching)
         ),
-    )
-    monkeypatch.setattr(
-        patch_scheduler,
-        "select_hcu_scheduler",
-        lambda config: events.append(
-            ("scheduler", config.cache_config.enable_prefix_caching)
-        )
-        or False,
     )
     monkeypatch.setattr(
         patch_multiproc_executor,
@@ -963,48 +942,10 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
 
     assert events == [
         ("validate", True),
-        ("scheduler", True),
         ("executor", True),
     ]
     assert config.cache_config.enable_prefix_caching is True
 
-
-def test_scheduler_selector_matrix_is_lazy_and_conflict_safe(monkeypatch):
-    from vllm_hcu.patch.platform.framework_opt import patch_scheduler
-
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", False)
-    config = SimpleNamespace(
-        additional_config={"hcu": {}},
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(
-            scheduler_cls="custom.Scheduler",
-            async_scheduling=False,
-        ),
-    )
-    assert patch_scheduler.select_hcu_scheduler(config) is False
-    assert config.scheduler_config.scheduler_cls == "custom.Scheduler"
-
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_PD_SPLIT", True)
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    for initial in (None, patch_scheduler.UPSTREAM_SCHEDULER_PATH):
-        config.scheduler_config.scheduler_cls = initial
-        assert patch_scheduler.select_hcu_scheduler(config) is True
-        assert config.scheduler_config.scheduler_cls == patch_scheduler.HCU_SCHEDULER_PATH
-        assert patch_scheduler.select_hcu_scheduler(config) is False
-
-    config.scheduler_config.scheduler_cls = "custom.Scheduler"
-    with pytest.raises(RuntimeError, match="another scheduler_cls"):
-        patch_scheduler.select_hcu_scheduler(config)
-
-    config.scheduler_config.scheduler_cls = None
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
-    with pytest.raises(RuntimeError, match="requires VLLM_HCU_USE_CUSTOM_OPS"):
-        patch_scheduler.select_hcu_scheduler(config)
-
-    monkeypatch.setattr(patch_scheduler.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    config.scheduler_config.async_scheduling = True
-    with pytest.raises(RuntimeError, match="--no-async-scheduling"):
-        patch_scheduler.select_hcu_scheduler(config)
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_hcu.model_executor.layers import linear
+from vllm.model_executor.layers import linear
 
 
 def test_dcp_group_column_parallel_linear_uses_group_shard(

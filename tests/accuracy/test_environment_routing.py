@@ -226,15 +226,6 @@ def test_nn_layout_environment_reaches_mamba_path_selector(
             },
             "cutlass",
         ),
-        (
-            {
-                "VLLM_HCU_USE_FLASH_ATTN": "1",
-                "VLLM_HCU_USE_FLASH_ATTN_UNIFIED": "1",
-                "VLLM_HCU_USE_FLASH_ATTN_VARLEN": "1",
-                "VLLM_HCU_USE_CUSTOM_FLASH_ATTN": "1",
-            },
-            "custom",
-        ),
     ],
 )
 def test_flash_attention_environment_priority_routes_expected_backend(
@@ -246,7 +237,6 @@ def test_flash_attention_environment_priority_routes_expected_backend(
         "VLLM_HCU_USE_FLASH_ATTN",
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
         "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
-        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -273,7 +263,6 @@ def test_flash_attention_lazy_environment_defaults_select_varlen(
         ("unified", "cutlass"),
         ("cutlass", "cutlass"),
         ("varlen", "varlen"),
-        ("custom", "custom"),
     ],
 )
 def test_explicit_flash_attention_mode_overrides_environment(
@@ -281,7 +270,6 @@ def test_explicit_flash_attention_mode_overrides_environment(
     explicit: str,
     expected: str,
 ) -> None:
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "1")
     monkeypatch.setenv("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", "1")
     monkeypatch.setenv("VLLM_HCU_USE_FLASH_ATTN", "1")
 

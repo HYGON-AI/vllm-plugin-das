@@ -16,13 +16,18 @@ import torch
 
 os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
 
+import vllm
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
+    os.environ.get(
+        "VLLM_HCU_TARGET_ROOT",
+        Path(vllm.__file__).resolve().parents[1],
+    )
 ).resolve()
 if not (TARGET_VLLM_ROOT / "vllm/__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_HCU_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 if str(TARGET_VLLM_ROOT) not in sys.path:
     sys.path.insert(0, str(TARGET_VLLM_ROOT))

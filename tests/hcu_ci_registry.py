@@ -71,11 +71,6 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
-    target="tests/runtime_patch/test_hcu_model_runner_packed_kv_contract.py",
-    est_time=180,
-)
-register_hcu_ci(
-    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_lightop_categorized_api.py",
     est_time=60,
 )

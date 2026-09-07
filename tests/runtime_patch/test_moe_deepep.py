@@ -955,11 +955,15 @@ def test_aiter_and_triton_expert_capability_contract(
                 expert_mask=None, quant_config=None, a1q_scale=None,
                 num_local_tokens=None, output_dtype=None,
                 moe_sorting_dispatch_policy=0,
+                shared_w1=None, shared_w2=None, shared_w1_scale=None,
+                shared_w2_scale=None, shared_expert_id=-1,
             ):
                 del hidden_states, w1, w2, topk_weights, topk_ids, moe_config
                 del apply_router_weight_on_input, expert_mask, quant_config
                 del a1q_scale, num_local_tokens, output_dtype
                 del moe_sorting_dispatch_policy
+                del shared_w1, shared_w2, shared_w1_scale, shared_w2_scale
+                del shared_expert_id
                 if activation == MoEActivation.SILU:
                     return ActivationMethod.SILU
                 if activation == MoEActivation.GELU:
@@ -1625,9 +1629,12 @@ def test_hash_router_normalizes_index_dtypes():
         input_tokens=None,
         hash_indices_table=None,
         routed_scaling_factor=1.0,
+        bias_vl=None,
+        image_sentinel_lo=0,
     ):
         del topk_weights, token_expert_indices, gating_output, renormalize
         del e_score_correction_bias, routed_scaling_factor
+        del bias_vl, image_sentinel_lo
         captured["input"] = input_tokens.dtype
         captured["hash"] = hash_indices_table.dtype
         return topk_indices, topk_indices
@@ -1666,7 +1673,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "router_logits_dtype", "gate", "shared_experts", "shared_expert_gate",
         "routed_input_transform", "routed_output_transform",
         "apply_routed_scale_to_output", "zero_expert_type", "hash_indices_table",
-        "runner_cls", "runner_args", "routed_experts_cls", "routed_experts_args",
+        "bias_vl", "image_sentinel_lo", "runner_cls", "runner_args",
+        "routed_experts_cls", "routed_experts_args",
     )
 
     class UnquantizedFusedMoEMethod:
@@ -3911,7 +3919,7 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
         "routed_scaling_factor", "e_score_correction_bias",
         "custom_routing_function",
         "eplb_state", "zero_expert_type", "num_logical_experts",
-        "hash_indices_table",
+        "hash_indices_table", "bias_vl", "image_sentinel_lo",
     )
     exec(
         "def create_fused_moe_router("
@@ -4537,13 +4545,18 @@ def test_custom_op_runner_rejects_post_import_callback():
 
 
 def test_moe_runner_and_shared_experts_cold_replacement_contract():
+    import vllm
+
     repository = Path(__file__).resolve().parents[2]
     target_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repository.parent / "vllm_0251")
+        os.environ.get(
+            "VLLM_HCU_TARGET_ROOT",
+            Path(vllm.__file__).resolve().parents[1],
+        )
     ).resolve()
     if not (target_vllm / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
+            f"VLLM_HCU_TARGET_ROOT does not contain vllm: {target_vllm}"
         )
     python_path = [str(target_vllm), str(repository)]
     existing = os.environ.get("PYTHONPATH")
@@ -4561,7 +4574,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         import torch
         import vllm
 
-        target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+        target_root = Path(os.environ["VLLM_HCU_TARGET_ROOT"]).resolve()
         target_file = Path(vllm.__file__).resolve()
         assert target_file.is_relative_to(target_root), (
             f"vllm resolved outside target root: {target_file} not under {target_root}"
@@ -4748,7 +4761,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
     )
     environment = os.environ.copy()
     environment["VLLM_PLUGINS"] = "__disabled__"
-    environment["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    environment["VLLM_HCU_TARGET_ROOT"] = str(target_vllm)
     environment["PYTHONPATH"] = os.pathsep.join(python_path)
     result = subprocess.run(
         [sys.executable, "-c", script],

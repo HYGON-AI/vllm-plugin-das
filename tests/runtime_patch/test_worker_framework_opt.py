@@ -1583,14 +1583,12 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
 def test_ubatch_sms_guard_disables_only_missing_compute_control(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    class UBatchWrapper:
-        @staticmethod
-        def _create_sm_control_context(vllm_config):
-            return "official"
+    def create_sm_control_context(parallel_config):
+        return "official"
 
     module = _module(
         patch_gpu_ubatch_wrapper.TARGET_MODULE,
-        UBatchWrapper=UBatchWrapper,
+        create_sm_control_context=create_sm_control_context,
         deep_gemm_set_num_sms=lambda value: None,
     )
     monkeypatch.setattr(
@@ -1602,7 +1600,7 @@ def test_ubatch_sms_guard_disables_only_missing_compute_control(
         lambda target, config: "hcu-no-compute-sms",
     )
     patch_gpu_ubatch_wrapper.apply_to_module(module)
-    assert UBatchWrapper._create_sm_control_context(object()) == "hcu-no-compute-sms"
+    assert module.create_sm_control_context(object()) == "hcu-no-compute-sms"
 
 
 def test_split_group_compat_drops_removed_backend_keyword() -> None:

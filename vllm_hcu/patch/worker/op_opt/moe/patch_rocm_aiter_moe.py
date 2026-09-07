@@ -146,6 +146,8 @@ def apply_to_module(module: ModuleType) -> bool:
             "moe_config", "activation", "apply_router_weight_on_input",
             "expert_mask", "quant_config", "a1q_scale", "num_local_tokens",
             "output_dtype", "moe_sorting_dispatch_policy",
+            "shared_w1", "shared_w2", "shared_w1_scale", "shared_w2_scale",
+            "shared_expert_id",
         ),
     )
     require_parameter_names(supports, TARGETS[2], ("activation",))
@@ -222,6 +224,16 @@ def apply_to_module(module: ModuleType) -> bool:
             if bool(getattr(quant_config, "use_fp8_w8a8", False)) or bool(
                 getattr(quant_config, "use_int8_w8a8", False)
             ):
+                shared_args = (
+                    arguments.get("shared_w1"),
+                    arguments.get("shared_w2"),
+                    arguments.get("shared_w1_scale"),
+                    arguments.get("shared_w2_scale"),
+                )
+                if any(value is not None for value in shared_args) or (
+                    arguments.get("shared_expert_id", -1) != -1
+                ):
+                    return normal_impl(*args, **kwargs)
                 from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
                     apply_aiter_quantized_moe,
                 )
