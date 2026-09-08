@@ -333,6 +333,14 @@ def _make_eplb_module(
                         self.expert_load_window_step + 1
                     ) % self.expert_load_window_size
                 self._update_layer_should_record(log_stats=log_stats)
+            if getattr(self, "simulate_official_rearrange_step", False):
+                self.expert_rearrangement_step += 1
+                if (
+                    self.expert_rearrangement_step
+                    >= self.expert_rearrangement_step_interval
+                ):
+                    self.expert_rearrangement_step = 0
+                    self.rearrange()
             return "official-step"
 
         def _sync_load_pass(self):
@@ -765,6 +773,42 @@ def test_runtime_patch_keeps_online_rearrangement_without_offline_paths() -> Non
     assert state.model_states["hy4-hash"].physical_to_logical_map.tolist() == [
         [3, 2, 1, 0, 3, 2]
     ]
+
+
+def test_runtime_patch_logs_load_but_skips_disabled_dynamic_rearrangement() -> None:
+    module, rearrangements, _ = _make_eplb_module()
+    log_calls: list[tuple[object, ...]] = []
+    module.logger.info = lambda _message, *args: log_calls.append(args)
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+    )
+    assert apply_to_module(module)
+
+    state = module.EplbState()
+    state.parallel_config._vllm_hcu_eplb_disable_rearrange = True
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    assert state.is_async is False
+    model_state = state.model_states["hy4-hash"]
+    model_state.expert_load_pass = torch.tensor([[8, 2]])
+    model_state.expert_load_window = torch.zeros((1, 1, 2), dtype=torch.int64)
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 1
+    state.expert_load_window_step = 0
+    state.expert_load_window_size = 1
+    state.parallel_config.eplb_config = SimpleNamespace(
+        log_balancedness_interval=1,
+    )
+    state.simulate_official_rearrange_step = True
+
+    assert state.step(log_stats=True) == "official-step"
+
+    assert state.official_steps == 1
+    assert state.expert_rearrangement_step == 0
+    assert rearrangements == []
+    assert any(args[4] == 0.625 for args in log_calls if len(args) == 6)
+
+    assert state.rearrange(is_profile=True) == "official-rearrange"
+    assert len(rearrangements) == 1
 
 
 def test_runtime_patch_rejects_configured_static_map_without_plan(

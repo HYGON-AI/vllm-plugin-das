@@ -46,6 +46,7 @@ _MARKER = "_vllm_hcu_offline_eplb_patch_applied"
 _WRAPPER_MARKER = "_vllm_hcu_offline_eplb_wrapper"
 _RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _LOAD_PATH_ATTR = "_vllm_hcu_expert_map_path"
+_DISABLE_REARRANGE_ATTR = "_vllm_hcu_eplb_disable_rearrange"
 _MODEL_RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _MODEL_KEY_ATTR = "_vllm_hcu_expert_map_key"
 _RECORD_ONLY_REARRANGE = ContextVar(
@@ -422,6 +423,16 @@ def apply_to_module(module: ModuleType) -> bool:
                 model_key,
             )
 
+        if getattr(self.parallel_config, _DISABLE_REARRANGE_ATTR, False):
+            # No rearrangement will publish work to the async worker. Avoid
+            # starting an idle background loop while retaining load recording.
+            self.is_async = False
+            eplb_module.logger.info(
+                "EPLB load logging remains enabled for model %s; dynamic "
+                "expert rearrangement is disabled.",
+                model_key,
+            )
+
         if load_path:
             assert direct_plan is not None
             _validate_direct_load_plan(
@@ -521,6 +532,16 @@ def apply_to_module(module: ModuleType) -> bool:
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
     ) -> Any:
+        if (
+            not is_profile
+            and getattr(self.parallel_config, _DISABLE_REARRANGE_ATTR, False)
+        ):
+            eplb_module.logger.info(
+                "Skipping dynamic EPLB expert rearrangement because "
+                "disable_rearrange=true."
+            )
+            return None
+
         record_path, _ = _parallel_offline_paths(self.parallel_config)
         if not record_path or is_profile:
             return original_rearrange(

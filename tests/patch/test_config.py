@@ -57,6 +57,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "hcu_flash_attn_mode": None,
                 "expert_map_record_path": None,
                 "expert_map_path": None,
+                "eplb_disable_rearrange": False,
             }
         }
     }
@@ -129,6 +130,14 @@ def test_legacy_deep_gemm_sidecar_is_normalized_with_one_warning(
             ValueError,
         ),
         ({"expert_map_record_path": 7}, TypeError),
+        ({"eplb_disable_rearrange": 1}, TypeError),
+        (
+            {
+                "expert_map_record_path": "/tmp/record.json",
+                "eplb_disable_rearrange": True,
+            },
+            ValueError,
+        ),
     ],
 )
 def test_invalid_values_are_rejected(payload: dict[str, object], error: type[Exception]) -> None:
@@ -147,3 +156,10 @@ def test_offline_eplb_paths_round_trip_through_sidecar() -> None:
 
     assert HcuFeatureConfig.from_mapping(record.to_dict()) == record
     assert pickle.loads(pickle.dumps(load)) == load
+
+
+def test_disable_eplb_rearrange_round_trips_through_sidecar() -> None:
+    config = HcuFeatureConfig.from_mapping({"eplb_disable_rearrange": True})
+
+    assert config.eplb_disable_rearrange is True
+    assert HcuFeatureConfig.from_mapping(config.to_dict()) == config

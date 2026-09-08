@@ -25,8 +25,16 @@ _FEATURE_FIELDS = (
     "hcu_flash_attn_mode",
     "expert_map_record_path",
     "expert_map_path",
+    "eplb_disable_rearrange",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
+_BOOLEAN_FIELDS = (
+    "enable_lightly_cp",
+    "enable_lightly_cplb",
+    "enable_custom_sp",
+    "enable_multi_layers_mtp",
+    "deepep_auto",
+    "eplb_disable_rearrange",
+)
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -73,6 +81,7 @@ class HcuFeatureConfig:
     hcu_flash_attn_mode: str | None = None
     expert_map_record_path: str | None = None
     expert_map_path: str | None = None
+    eplb_disable_rearrange: bool = False
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -117,6 +126,10 @@ class HcuFeatureConfig:
         if self.expert_map_record_path and self.expert_map_path:
             raise ValueError(
                 "expert_map_record_path and expert_map_path are mutually exclusive"
+            )
+        if self.expert_map_record_path and self.eplb_disable_rearrange:
+            raise ValueError(
+                "expert_map_record_path and disable_rearrange are mutually exclusive"
             )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")

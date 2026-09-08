@@ -253,6 +253,16 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "elastic reshuffling would replace the loaded expert map"
             )
 
+    if (
+        feature_config.eplb_disable_rearrange
+        and parallel_config is not None
+        and getattr(parallel_config, "enable_elastic_ep", False)
+    ):
+        raise ValueError(
+            "EPLB disable_rearrange with elastic EP is not supported because "
+            "elastic scaling requires expert rearrangement"
+        )
+
     if parallel_config is not None:
         setattr(
             parallel_config,
