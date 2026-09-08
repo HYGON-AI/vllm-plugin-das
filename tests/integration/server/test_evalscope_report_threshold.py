@@ -30,6 +30,46 @@ from tests.integration.server.evalscope_server import (
 ROOT = Path(__file__).resolve().parents[3]
 
 
+@pytest.mark.parametrize(
+    ("config_name", "batch_size", "minimum_score", "minimum_correct"),
+    [
+        ("qwen35_9b_gsm8k_evalscope.yaml", 1, 0.90, 9),
+        ("qwen3_8b_gsm8k_evalscope.yaml", 1, 0.80, 8),
+        ("qwen3_vl_8b_mmmu_evalscope.yaml", 1, 0.50, 5),
+        ("deepseek_r1_gsm8k_evalscope.yaml", 32, 0.95, 95),
+        ("glm52_pcp_humaneval_evalscope.yaml", 1, 0.90, 29),
+    ],
+)
+def test_evalscope_accuracy_configs_pin_generation_and_explicit_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+    config_name: str,
+    batch_size: int,
+    minimum_score: float,
+    minimum_correct: int,
+) -> None:
+    config_env = "VLLM_HCU_TEST_UNUSED_ACCURACY_CONFIG"
+    monkeypatch.delenv(config_env, raising=False)
+    config = load_config(ROOT / "tests/models" / config_name, config_env)
+    generation = config["evalscope"]["generation_config"]
+    server_args = config["server"]["args"]
+    seed_index = server_args.index("--seed")
+
+    assert server_args[seed_index + 1] == "0"
+    assert generation["temperature"] == 0
+    assert generation["do_sample"] is False
+    assert generation["seed"] == 0
+    assert config["evalscope"]["eval_batch_size"] == batch_size
+    assert config["evalscope"]["pass_criteria"]["minimum_score"] == (
+        minimum_score
+    )
+    assert (
+        config["evalscope"]["limit"] * minimum_score
+    ) <= minimum_correct
+    assert (
+        (minimum_correct - 1) / config["evalscope"]["limit"]
+    ) < minimum_score
+
+
 def test_log_tail_reads_only_the_requested_suffix(tmp_path: Path) -> None:
     log_path = tmp_path / "evalscope.log"
     log_path.write_bytes(b"discard-this\nroot cause\n")

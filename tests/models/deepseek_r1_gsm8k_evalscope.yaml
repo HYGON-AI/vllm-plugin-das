@@ -17,6 +17,8 @@ server:
     - "10240"
     - --quantization
     - slimquant_marlin
+    - --seed
+    - "0"
 
 evalscope:
   work_dir: /tmp/vllm-hcu-evalscope/deepseek_r1_gsm8k
@@ -24,6 +26,8 @@ evalscope:
   eval_type: openai_api
   generation_config:
     temperature: 0
+    do_sample: false
+    seed: 0
     max_tokens: 32768
     top_p: 0.95
   stream: true

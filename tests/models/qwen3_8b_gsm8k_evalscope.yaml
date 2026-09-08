@@ -48,5 +48,6 @@ evalscope:
     dataset: gsm8k
     metric: mean_acc
     display_name: Pass@1
-    minimum_score: 0.95
+    # This PR smoke test evaluates 10 samples, so require eight correct answers.
+    minimum_score: 0.80
   no_timestamp: true

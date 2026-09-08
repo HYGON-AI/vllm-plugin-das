@@ -74,6 +74,7 @@ def test_deepseek_v4_int8_dspark_humaneval_server_contract(
     assert json.loads(_option_value(command, "--speculative-config")) == (
         DSPARK_CONFIG
     )
+    assert _option_value(command, "--seed") == "0"
     assert config["evalscope"]["limit"] == 32
     assert config["evalscope"]["pass_criteria"]["mean_acc"] == 1.0
     assert config["evalscope"]["pass_criteria"]["mean_acc_pass@1"] == 1.0
@@ -123,6 +124,7 @@ def test_deepseek_v4_dspark_humaneval_common_server_contract(
     assert json.loads(_option_value(command, "--speculative-config")) == (
         DSPARK_CONFIG
     )
+    assert _option_value(command, "--seed") == "0"
     assert "--enforce-eager" not in command
     forbidden_fragments = (
         "prefill-context-parallel",
@@ -227,6 +229,7 @@ def test_deepseek_v4_dspark_humaneval_request_is_deterministic(
     assert generation == {
         "temperature": 0,
         "do_sample": False,
+        "seed": 0,
         "max_tokens": 2048,
         "extra_body": {"chat_template_kwargs": {"thinking": False}},
     }

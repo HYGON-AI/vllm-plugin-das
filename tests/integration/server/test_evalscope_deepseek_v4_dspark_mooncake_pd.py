@@ -126,6 +126,7 @@ def test_deepseek_v4_dspark_mooncake_pd_command_contract(
         assert json.loads(_option_value(command, "--speculative-config")) == (
             DSPARK_CONFIG
         )
+        assert _option_value(command, "--seed") == "0"
         assert "--moe-backend" not in command
         assert not any(
             fragment in item
@@ -174,6 +175,13 @@ def test_deepseek_v4_dspark_mooncake_pd_requires_exact_humaneval_32(
 
     assert config["evalscope"]["limit"] == 32
     assert config["evalscope"]["eval_batch_size"] == 1
+    assert config["evalscope"]["generation_config"] == {
+        "temperature": 0,
+        "do_sample": False,
+        "seed": 0,
+        "max_tokens": 2048,
+        "extra_body": {"chat_template_kwargs": {"thinking": False}},
+    }
     assert config["evalscope"]["pass_criteria"] == {
         "dataset": "humaneval",
         "num_predictions": 32,
