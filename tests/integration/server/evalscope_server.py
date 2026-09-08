@@ -27,6 +27,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
 HCU_CI_ARTIFACT_ROOT = Path("/hcu-ci-artifacts")
+EVALSCOPE_DATASET_VIEW_ROOT = Path("/tmp/vllm-hcu-evalscope-datasets")
 EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
 EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
 EVALSCOPE_PROCESS_OWNER_ENV = "VLLM_HCU_EVAL_PROCESS_OWNER"
@@ -148,7 +149,7 @@ def server_command(
 def _local_dataset_path(dataset_root: Path, dataset_name: str) -> Path:
     exact = dataset_root / dataset_name
     if exact.is_dir():
-        return exact.resolve()
+        return _local_dataset_view(exact.resolve())
 
     matches = sorted(
         path.resolve()
@@ -156,7 +157,7 @@ def _local_dataset_path(dataset_root: Path, dataset_name: str) -> Path:
         if path.is_dir() and path.name.casefold() == dataset_name.casefold()
     )
     if len(matches) == 1:
-        return matches[0]
+        return _local_dataset_view(matches[0])
     if len(matches) > 1:
         raise ValueError(
             f"ambiguous local dataset {dataset_name!r} under {dataset_root}: "
@@ -165,6 +166,35 @@ def _local_dataset_path(dataset_root: Path, dataset_name: str) -> Path:
     raise FileNotFoundError(
         f"local dataset {dataset_name!r} is unavailable under {dataset_root}"
     )
+
+
+def _local_dataset_view(dataset_path: Path) -> Path:
+    """Keep EvalScope metadata cleanup away from read-only shared datasets."""
+
+    if not (dataset_path / "dataset_infos.json").exists():
+        return dataset_path
+
+    view_root = Path(
+        os.environ.get(
+            "VLLM_HCU_EVAL_DATASET_VIEW_ROOT",
+            str(EVALSCOPE_DATASET_VIEW_ROOT),
+        )
+    ).expanduser().resolve()
+    view_path = view_root / dataset_path.name
+    if view_path.is_symlink() or view_path.is_file():
+        view_path.unlink()
+    elif view_path.is_dir():
+        shutil.rmtree(view_path)
+    view_path.mkdir(parents=True)
+
+    for source in dataset_path.iterdir():
+        if source.name == "dataset_infos.json":
+            continue
+        (view_path / source.name).symlink_to(
+            source.resolve(),
+            target_is_directory=source.is_dir(),
+        )
+    return view_path
 
 
 def _evalscope_dataset_args(evalscope: dict[str, Any]) -> dict[str, Any]:

@@ -623,6 +623,51 @@ def test_evalscope_resolves_named_datasets_from_shared_root(
     }
 
 
+def test_evalscope_uses_writable_view_for_read_only_dataset_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_root = tmp_path / "datasets"
+    dataset = dataset_root / "MMMU"
+    dataset.mkdir(parents=True)
+    metadata = dataset / "dataset_infos.json"
+    metadata.write_text("{}", encoding="utf-8")
+    data_file = dataset / "validation.jsonl"
+    data_file.write_text('{"id": 1}\n', encoding="utf-8")
+    view_root = tmp_path / "views"
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(dataset_root))
+    monkeypatch.setenv("VLLM_HCU_EVAL_DATASET_VIEW_ROOT", str(view_root))
+    config = {
+        "model": "/models/test",
+        "evalscope": {
+            "generation_config": {},
+            "eval_batch_size": 1,
+            "timeout": 60,
+            "limit": 1,
+            "datasets": ["mmmu"],
+            "dataset_args": {},
+        },
+    }
+
+    command = evalscope_command(
+        config,
+        model_env="VLLM_HCU_TEST_MODEL",
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path / "output",
+    )
+    dataset_args = json.loads(command[command.index("--dataset-args") + 1])
+    local_path = Path(dataset_args["mmmu"]["local_path"])
+
+    assert local_path == view_root / "MMMU"
+    assert not (local_path / "dataset_infos.json").exists()
+    assert (local_path / "validation.jsonl").read_text(encoding="utf-8") == (
+        '{"id": 1}\n'
+    )
+    assert (local_path / "validation.jsonl").is_symlink()
+    assert metadata.exists()
+
+
 def test_evalscope_fails_before_network_fallback_when_dataset_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
