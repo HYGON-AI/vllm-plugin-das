@@ -12,6 +12,7 @@ import pytest
 from vllm_hcu import doctor
 from vllm_hcu import compatibility
 from vllm_hcu.post_install import apply_post_install_patches
+from vllm_hcu.version import __vllm_target_version__
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -71,7 +72,10 @@ def test_doctor_reuses_runtime_compatibility_check_name_and_detail(
         name for name in checks if name.startswith("vllm_")
     } == {"vllm_installed", "vllm_compatible"}
     assert not checks["vllm_compatible"].ok
-    assert "expected=0.28.x" in checks["vllm_compatible"].detail
+    assert (
+        f"expected={__vllm_target_version__}"
+        in checks["vllm_compatible"].detail
+    )
     assert "actual='0.22.0'" in checks["vllm_compatible"].detail
 
 

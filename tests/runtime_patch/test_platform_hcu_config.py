@@ -1551,6 +1551,64 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
+def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class _NoFullGraphs:
+        @staticmethod
+        def has_full_cudagraphs() -> bool:
+            return False
+
+    config = _validation_config(HcuFeatureConfig())
+    config.compilation_config.cudagraph_mode = _NoFullGraphs()
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.distributed_executor_backend = "uni"
+    config.parallel_config.worker_cls = "auto"
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=False,
+        block_size=16,
+        kv_cache_dtype_skip_layers=[],
+    )
+    config.attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASHMLA_SPARSE
+    )
+    config.model_config.is_hybrid = False
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda vllm_config: HcuFeatureConfig(),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.cache_config.block_size == 64
+
+    config.cache_config.block_size = 16
+
+    class IndexerBackend:
+        @staticmethod
+        def get_preferred_block_size(_default):
+            return 16
+
+        @staticmethod
+        def get_name():
+            return "DEEPSEEK_V32_INDEXER"
+
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: IndexerBackend),
+    )
+    HCUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 64
+
+
 @pytest.mark.parametrize(
     ("backend_name", "expected_path"),
     [

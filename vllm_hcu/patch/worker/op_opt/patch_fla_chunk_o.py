@@ -9,7 +9,7 @@ from types import ModuleType
 
 from ._common import already_applied, load_exact_module, require_callable, require_exact_signature
 
-TARGET_MODULE = "vllm.model_executor.layers.fla.ops.chunk_o"
+TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk_o"
 PATCH_ID = "worker.op_opt.fla.chunk_o.aiter"
 TARGETS = (f"{TARGET_MODULE}.chunk_fwd_o",)
 _MARKER = "_vllm_hcu_chunk_o_applied"

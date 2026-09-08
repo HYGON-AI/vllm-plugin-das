@@ -13,6 +13,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import vllm
 
 import vllm_hcu.patch.import_coordinator as coordinator_module
 from vllm_hcu.patch.import_coordinator import (
@@ -30,7 +31,10 @@ from vllm_hcu.patch.runtime_state import PatchRegistry, PatchStatus
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
+    os.environ.get(
+        "VLLM_SOURCE_ROOT",
+        Path(vllm.__file__).resolve().parents[1],
+    )
 ).resolve()
 
 

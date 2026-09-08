@@ -11,7 +11,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -307,7 +307,7 @@ def sparse_attn_indexer(
     kv_cache: torch.Tensor,
     q_quant: torch.Tensor,
     q_scale: torch.Tensor | None,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -317,6 +317,8 @@ def sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
+    use_pcp: bool,
+    dense_mha_metadata_layer_name: LayerNameType,
     use_fp4_cache: bool = False,
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
@@ -363,6 +365,8 @@ def sparse_attn_indexer(
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert,
+            use_pcp,
+            dense_mha_metadata_layer_name,
             use_fp4_cache,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
@@ -383,10 +387,13 @@ def sparse_attn_indexer(
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
     num_tokens = slot_mapping.shape[0]
+    if use_pcp:
+        num_tokens //= get_pcp_group().world_size
     if k is not None:
         k = k[:num_tokens]
 
     if not skip_k_cache_insert:
+        assert k is not None
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
@@ -671,7 +678,7 @@ def sparse_attn_indexer_fake(
     kv_cache: torch.Tensor,
     q_quant: torch.Tensor,
     q_scale: torch.Tensor | None,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -681,6 +688,8 @@ def sparse_attn_indexer_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
+    use_pcp: bool,
+    dense_mha_metadata_layer_name: LayerNameType,
     use_fp4_cache: bool = False,
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
@@ -810,6 +819,7 @@ class SparseAttnIndexer(CustomOp):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        compress_ratio: int = 1,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -822,13 +832,16 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.compress_ratio = compress_ratio
+        self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         parallel_config = get_current_vllm_config().parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
-        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self._parallel_config = parallel_config
+        self._cp_kv_cache_interleave_size: int | None = None
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         if current_platform.is_cuda() and not has_deep_gemm():
@@ -837,11 +850,20 @@ class SparseAttnIndexer(CustomOp):
                 "the current vLLM environment."
             )
 
+    @property
+    def cp_kv_cache_interleave_size(self) -> int:
+        if self._cp_kv_cache_interleave_size is None:
+            value = self._parallel_config.cp_kv_cache_interleave_size
+            if isinstance(get_forward_context().attn_metadata, dict):
+                self._cp_kv_cache_interleave_size = value
+            return value
+        return self._cp_kv_cache_interleave_size
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
@@ -858,7 +880,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
@@ -883,6 +905,8 @@ class SparseAttnIndexer(CustomOp):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
+            self.use_pcp,
+            _encode_layer_name(self.dense_mha_metadata_layer_name),
             self.use_fp4_cache,
             self.dcp_rank,
             self.dcp_world_size,
@@ -893,7 +917,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         return self.forward_cuda(hidden_states, q_fp8, k, weights)
@@ -902,7 +926,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"

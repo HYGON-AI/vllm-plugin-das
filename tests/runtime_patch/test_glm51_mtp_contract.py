@@ -58,6 +58,27 @@ def _uninitialized(module_type: type[nn.Module]) -> nn.Module:
     return instance
 
 
+def test_main_v32_mtp_architecture_uses_hcu_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_hcu.models as models
+
+    registrations: dict[str, str] = {}
+    monkeypatch.setattr(
+        models.ModelRegistry,
+        "register_model",
+        lambda architecture, implementation: registrations.__setitem__(
+            architecture, implementation
+        ),
+    )
+
+    models.register_model()
+
+    assert registrations["DeepseekV32MTPModel"] == (
+        "vllm_hcu.models.deepseek_mtp:DeepSeekMTP"
+    )
+
+
 def test_mtp_layer_returns_pre_norm_logits_and_post_norm_recycle_states(
     mtp_module: ModuleType,
 ) -> None:

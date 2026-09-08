@@ -1590,6 +1590,7 @@ class rocm_aiter_ops:
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+    _MOE_SITUV2_A8W4 = envs.VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
     # Lazily probed: whether aiter.topk_softmax supports the
@@ -1618,6 +1619,7 @@ class rocm_aiter_ops:
         cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        cls._MOE_SITUV2_A8W4 = envs.VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @staticmethod
@@ -1894,7 +1896,6 @@ class rocm_aiter_ops:
         return "gate_mode" in inspect.signature(fused_moe).parameters
 
     @staticmethod
-    @if_aiter_supported
     def register_ops_once() -> None:
         global _OPS_REGISTERED
         if not _OPS_REGISTERED:
@@ -2620,9 +2621,15 @@ class rocm_aiter_ops:
     def group_fp8_quant(
         input_2d: torch.Tensor,
         group_size: int = 128,
+        transpose_scale: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert group_size == 128, "Group size must be 128"
-        return torch.ops.vllm.rocm_aiter_group_fp8_quant(input_2d, group_size)
+        output, scale = torch.ops.vllm.rocm_aiter_group_fp8_quant(
+            input_2d, group_size
+        )
+        if transpose_scale:
+            scale = scale.transpose(-2, -1).contiguous()
+        return output, scale
 
     @staticmethod
     def is_triton_gemm_w8a8_tuned(n: int, k: int) -> bool:
@@ -2919,6 +2926,182 @@ class rocm_aiter_ops:
             kv_cache_dtype=kv_cache_dtype,
         )
 
+    @classmethod
+    @if_aiter_supported
+    def is_fused_moe_situv2_a8w4_enabled(cls) -> bool:
+        return False
+
+    @classmethod
+    @if_aiter_supported
+    @functools.cache
+    def fused_moe_supports_heterogeneous_shared_expert(
+        cls, num_tokens: int
+    ) -> bool:
+        del num_tokens
+        return False
+
+    @staticmethod
+    def fused_qk_rmsnorm_group_quant(
+        q: torch.Tensor,
+        q_weight: torch.Tensor,
+        q_epsilon: float,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        kv_epsilon: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.fused_mla_dual_rms_norm_group_quant(
+            q,
+            q_weight,
+            kv,
+            kv_weight,
+            q_epsilon,
+            kv_epsilon,
+            group_size,
+            transpose_scale,
+        )
+
+    @staticmethod
+    def rms_norm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> torch.Tensor:
+        import aiter
+
+        return aiter.rms_norm(x, weight, epsilon)
+
+    @staticmethod
+    def rms_norm2d_with_add(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import aiter
+
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
+        aiter.rmsnorm2d_fwd_with_add(
+            out, x, residual, residual_out, weight, epsilon, 0
+        )
+        return out, residual_out
+
+    @staticmethod
+    def gemm_a8w8_blockscale_bpreshuffle(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        output_dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "HCU self-developed AITER does not provide blockscale "
+            "B-preshuffle GEMM"
+        )
+
+    @staticmethod
+    def mla_decode_fwd_lse(
+        q: torch.Tensor,
+        kv_buffer: torch.Tensor,
+        o: torch.Tensor,
+        sm_scale: float,
+        qo_indptr: torch.Tensor,
+        max_seqlen_qo: int,
+        kv_indptr: torch.Tensor | None = None,
+        kv_indices: torch.Tensor | None = None,
+        kv_last_page_lens: torch.Tensor | None = None,
+        logit_cap: float = 0.0,
+        q_scale: torch.Tensor | None = None,
+        kv_scale: torch.Tensor | None = None,
+    ):
+        raise NotImplementedError(
+            "HCU self-developed AITER MLA decode does not return LSE"
+        )
+
+    @staticmethod
+    def fused_qk_norm_rope_and_cache(
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+        num_heads_q: int,
+        num_heads_k: int,
+        num_heads_v: int,
+        head_dim: int,
+        is_neox: bool,
+        rms_norm_eps: float,
+        q_out: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        k_out: torch.Tensor | None,
+        v_out: torch.Tensor | None,
+        return_kv: bool,
+        use_shuffle_layout: bool,
+        block_size: int,
+        x: int,
+        rotary_dim: int = 0,
+    ):
+        raise NotImplementedError(
+            "HCU uses official attention and the HIPC KV-cache writer"
+        )
+
+    @staticmethod
+    def do_qk_norm_rope_kvcache_update(
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+        num_heads_q: int,
+        num_heads_k: int,
+        head_dim: int,
+        is_neox: bool,
+        rms_norm_eps: float,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        kv_cache_dtype: str,
+        use_shuffle_layout: bool,
+    ):
+        raise NotImplementedError(
+            "HCU uses official attention and the HIPC KV-cache writer"
+        )
+
+    @staticmethod
+    def shuffle_scale(tensor: torch.Tensor) -> torch.Tensor:
+        from aiter.ops.shuffle import shuffle_scale
+
+        return shuffle_scale(tensor)
+
+    @staticmethod
+    def fp8_attn_wrapper(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_descale: torch.Tensor,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+        batch_size: int,
+        output_dtype: torch.dtype,
+        scale: float | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+    ):
+        raise NotImplementedError(
+            "HCU self-developed AITER does not provide the official FP8 "
+            "attention wrapper"
+        )
+
     @staticmethod
     def mhc_pre(
         residual: torch.Tensor,
@@ -2930,6 +3113,8 @@ class rocm_aiter_ops:
         hc_sinkhorn_eps: float,
         hc_post_mult_value: float,
         sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for mHC pre block.
@@ -3002,7 +3187,7 @@ class rocm_aiter_ops:
         # AITER's Python wrapper allocates intermediate/output tensors without
         # explicit device arguments, so run it under the residual tensor's device.
         with torch.device(residual_flat.device):
-            post_mix, comb_mix, layer_input = mhc_pre(
+            args = (
                 residual_flat,
                 fn,
                 hc_scale,
@@ -3013,6 +3198,12 @@ class rocm_aiter_ops:
                 hc_post_mult_value,
                 sinkhorn_repeat,
             )
+            if norm_weight is None:
+                post_mix, comb_mix, layer_input = mhc_pre(*args)
+            else:
+                post_mix, comb_mix, layer_input = mhc_pre(
+                    *args, norm_weight, norm_eps
+                )
         return (
             post_mix.view(*outer_shape, hc_mult, 1),
             comb_mix.view(*outer_shape, hc_mult, hc_mult),
@@ -3096,6 +3287,44 @@ class rocm_aiter_ops:
             comb_res_mix.view(num_tokens, hc_mult, hc_mult),
         )
         return out.view_as(residual)
+
+    @staticmethod
+    def mhc_fused_post_pre(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        next_residual = rocm_aiter_ops.mhc_post(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+        )
+        post_mix, comb_mix, layer_input = rocm_aiter_ops.mhc_pre(
+            next_residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+        return next_residual, post_mix, comb_mix, layer_input
 
 
 # ---------------------------------------------------------------------------

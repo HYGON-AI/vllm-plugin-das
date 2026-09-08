@@ -391,6 +391,30 @@
         }
       ]
     },
+    "qwen38-flash-next-humaneval": {
+      "runner": "nmz36",
+      "arch": "gfx938",
+      "cards": 4,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen38_flash_next_humaneval_evalscope_server"
+      ],
+      "timeout_minutes": 180,
+      "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN38_FLASH_NEXT_MODEL",
+          "relative": "Qwen3.8-Flash-Next-FP8-Channelwise"
+        }
+      ]
+    },
     "deepseek-gsm8k": {
       "runner": "hcu-linux-gfx938-8",
       "arch": "gfx938",
@@ -469,6 +493,7 @@
     {"job": "qwen35-gsm8k", "timeout_minutes": 120},
     {"job": "qwen3-vl-mmmu", "timeout_minutes": 150},
     {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
+    {"job": "qwen38-flash-next-humaneval", "timeout_minutes": 210},
     {"job": "deepseek-gsm8k", "timeout_minutes": 360},
     {"job": "glm52-pcp", "timeout_minutes": 360},
     {"job": "single-node-topology", "timeout_minutes": 30}
@@ -728,6 +753,15 @@
         "qwen3-8b-gsm8k"
       ]
     },
+    "qwen38-flash-next-evalscope": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_qwen38_flash_next_humaneval.py",
+        "tests/models/qwen38_flash_next_humaneval_evalscope.yaml"
+      ],
+      "jobs": [
+        "qwen38-flash-next-humaneval"
+      ]
+    },
     "qwen3-vl-evalscope": {
       "patterns": [
         "tests/integration/server/test_evalscope_qwen3_vl_8b_mmmu.py",
@@ -744,6 +778,7 @@
       "jobs": [
         "qwen35-gsm8k",
         "qwen3-8b-gsm8k",
+        "qwen38-flash-next-humaneval",
         "qwen3-vl-mmmu",
         "deepseek-gsm8k"
       ]

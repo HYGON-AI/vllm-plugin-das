@@ -20,6 +20,7 @@ TARGET_MODULE = (
     "vllm.model_executor.layers.quantization.compressed_tensors."
     "compressed_tensors_moe.compressed_tensors_moe_wna16"
 )
+QUANT_CONFIG_MODULE = "vllm.model_executor.layers.fused_moe.config"
 PATCH_ID = "worker.op_opt.compressed_tensors.moe_wna16"
 TARGETS = (
     f"{TARGET_MODULE}.CompressedTensorsWNA16MoEMethod.create_weights",
@@ -48,6 +49,18 @@ def _aiter_requested(layer: object | None = None) -> bool:
         raise PatchCompatibilityError(
             "required HCU AITER W4A16 MoE flags are unavailable"
         ) from exc
+
+
+def _resolve_config_builder(wna16_module: ModuleType):
+    config_module = load_exact_module(QUANT_CONFIG_MODULE, None)
+    builder = getattr(config_module, "int4_w4a16_moe_quant_config", None)
+    if callable(builder):
+        return builder
+    return require_callable(
+        wna16_module,
+        "int4_w4a16_moe_quant_config",
+        f"{TARGET_MODULE}.int4_w4a16_moe_quant_config",
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -96,11 +109,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "set_weight_attrs",
         f"{TARGET_MODULE}.set_weight_attrs",
     )
-    config_builder = require_callable(
-        wna16_module,
-        "int4_w4a16_moe_quant_config",
-        f"{TARGET_MODULE}.int4_w4a16_moe_quant_config",
-    )
+    config_builder = _resolve_config_builder(wna16_module)
 
     from vllm_hcu.model_executor.layers.quantization import (
         compressed_tensors_moe_runtime as hcu_runtime,

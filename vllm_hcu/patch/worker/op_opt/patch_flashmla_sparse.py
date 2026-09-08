@@ -4,9 +4,8 @@
 
 from __future__ import annotations
 
-import dis
 import functools
-from types import FunctionType, ModuleType
+from types import ModuleType
 
 from ._common import (
     PatchCompatibilityError,
@@ -23,7 +22,6 @@ TARGETS = (
     f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder.build",
     f"{TARGET_MODULE}.FlashMLASparseImpl._fp8_flash_mla_kernel",
     f"{TARGET_MODULE}.FlashMLASparseImpl._bf16_flash_mla_kernel",
-    f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode",
 )
 _MARKER = "_vllm_hcu_flashmla_sparse_applied"
@@ -61,54 +59,18 @@ def apply_to_module(module: ModuleType) -> bool:
             "kv_c_and_k_pe_cache",
             "topk_indices",
             "topk_length",
+            "actual_num_heads",
         ),
-        defaults={"topk_length": None},
-    )
-    split_decodes_and_prefills = require_callable(
-        flash, "split_decodes_and_prefills", TARGETS[3]
-    )
-    require_exact_signature(
-        split_decodes_and_prefills,
-        TARGETS[3],
-        positional=(
-            "common_attn_metadata",
-            "decode_threshold",
-            "require_uniform",
-            "treat_short_extends_as_decodes",
-        ),
-        defaults={
-            "decode_threshold": 1,
-            "require_uniform": False,
-            "treat_short_extends_as_decodes": True,
-        },
+        defaults={"topk_length": None, "actual_num_heads": None},
     )
     build_fp8_separate_prefill_decode = require_callable(
-        builder_cls, "_build_fp8_separate_prefill_decode", TARGETS[4]
+        builder_cls, "_build_fp8_separate_prefill_decode", TARGETS[3]
     )
     require_exact_signature(
         build_fp8_separate_prefill_decode,
-        TARGETS[4],
-        positional=("self", "common_attn_metadata"),
+        TARGETS[3],
+        positional=("self", "common_attn_metadata", "metadata"),
     )
-    if not isinstance(build_fp8_separate_prefill_decode, FunctionType):
-        raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[4]} must be a Python function"
-        )
-    if build_fp8_separate_prefill_decode.__globals__ is not flash.__dict__:
-        raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[4]} globals must be the "
-            "target module namespace"
-        )
-    directly_loads_splitter = any(
-        instruction.opname == "LOAD_GLOBAL"
-        and instruction.argval == "split_decodes_and_prefills"
-        for instruction in dis.Bytecode(build_fp8_separate_prefill_decode)
-    )
-    if not directly_loads_splitter:
-        raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[4]} must use direct LOAD_GLOBAL "
-            "split_decodes_and_prefills"
-        )
 
     # Validate and collect every replacement before mutating the target module.
     from vllm_hcu.v1.attention.ops import flashmla as hcu_flashmla
@@ -127,38 +89,6 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         hcu_bindings[name] = value
 
-    def pcp_split_decodes_and_prefills(
-        common_attn_metadata,
-        decode_threshold=1,
-        require_uniform=False,
-        treat_short_extends_as_decodes=True,
-    ):
-        del treat_short_extends_as_decodes
-        return split_decodes_and_prefills(
-            common_attn_metadata,
-            decode_threshold=decode_threshold,
-            require_uniform=require_uniform,
-            treat_short_extends_as_decodes=False,
-        )
-
-    # Execute the audited v0.25.1 helper bytecode with only its phase splitter
-    # rebound. This preserves its shape, workspace, and chunk construction
-    # without mutating module globals or copying that implementation here.
-    pcp_separate_globals = dict(build_fp8_separate_prefill_decode.__globals__)
-    pcp_separate_globals.update(hcu_bindings)
-    pcp_separate_globals["split_decodes_and_prefills"] = (
-        pcp_split_decodes_and_prefills
-    )
-    pcp_build_fp8_separate_prefill_decode = FunctionType(
-        build_fp8_separate_prefill_decode.__code__,
-        pcp_separate_globals,
-        build_fp8_separate_prefill_decode.__name__,
-        build_fp8_separate_prefill_decode.__defaults__,
-        build_fp8_separate_prefill_decode.__closure__,
-    )
-    pcp_build_fp8_separate_prefill_decode.__kwdefaults__ = (
-        build_fp8_separate_prefill_decode.__kwdefaults__
-    )
     @functools.wraps(build)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         result = build(self, common_prefix_len, common_attn_metadata, fast_build)
@@ -205,24 +135,11 @@ def apply_to_module(module: ModuleType) -> bool:
             cp_kv_cache_interleave_size = int(cp_kv_cache_interleave_size)
         pcp_world_size = effective_pcp_world_size(pcp_world_size)
         if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
-            has_fp8_metadata = (
-                getattr(result, "fp8_extra_metadata", None) is not None
-            )
-            if pcp_world_size > 1 and (
-                getattr(result, "fp8_use_mixed_batch", False)
-                or has_fp8_metadata
-            ):
-                result.fp8_extra_metadata = (
-                    pcp_build_fp8_separate_prefill_decode(
-                        self, common_attn_metadata
-                    )
-                )
-                result.fp8_use_mixed_batch = False
-            elif getattr(result, "fp8_use_mixed_batch", False):
-                result.fp8_extra_metadata = (
-                    self._build_fp8_separate_prefill_decode(
-                        common_attn_metadata
-                    )
+            if getattr(result, "fp8_use_mixed_batch", False):
+                result.fp8_extra_metadata = build_fp8_separate_prefill_decode(
+                    self,
+                    common_attn_metadata,
+                    result,
                 )
                 result.fp8_use_mixed_batch = False
         result.num_kv_actual_tokens = getattr(
@@ -232,21 +149,6 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         result.pcp_world_size = pcp_world_size
         result.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
-        if result.pcp_world_size > 1:
-            (
-                result.num_decodes,
-                result.num_prefills,
-                result.num_decode_tokens,
-                _,
-            ) = split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=getattr(
-                    self, "reorder_batch_threshold", None
-                )
-                or 1,
-                require_uniform=True,
-                treat_short_extends_as_decodes=False,
-            )
         return result
 
     @functools.wraps(fp8)
@@ -273,6 +175,7 @@ def apply_to_module(module: ModuleType) -> bool:
         kv_c_and_k_pe_cache,
         topk_indices,
         topk_length=None,
+        actual_num_heads=None,
     ):
         if not flash.current_platform.is_rocm():
             return bf16(
@@ -281,17 +184,21 @@ def apply_to_module(module: ModuleType) -> bool:
                 kv_c_and_k_pe_cache,
                 topk_indices,
                 topk_length,
+                actual_num_heads,
             )
+        if actual_num_heads is None:
+            actual_num_heads = q.shape[1]
         num_tokens = q.shape[0]
         cache = kv_c_and_k_pe_cache.view(-1, 1, kv_c_and_k_pe_cache.shape[-1])
         indices = topk_indices.view(num_tokens, 1, -1)
-        return flash.flash_mla_sparse_fwd(
+        output, _, lse = flash.flash_mla_sparse_fwd(
             q,
             cache,
             indices,
             self.softmax_scale,
             topk_length=topk_length,
-        )[0][:, :self.num_heads, :]
+        )
+        return output[:, :actual_num_heads, :], lse[:, :actual_num_heads]
 
     for function in (hcu_build, hcu_fp8, hcu_bf16):
         setattr(function, _WRAPPER, True)

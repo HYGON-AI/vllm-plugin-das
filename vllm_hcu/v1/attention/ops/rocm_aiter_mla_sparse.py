@@ -737,8 +737,9 @@ def rocm_fp8_paged_mqa_logits(
     Args:
         q_fp8: Query tensor of shape [B, next_n, H, D]. Casted to
             `torch.float8_e4m3fn` by caller.
-        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
-            [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. The last
+        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout. The first two
+            dimensions are [num_blocks, block_size]; backend layout views may
+            add singleton dimensions before the packed D+4 dimension. The last
             4 bytes per (block,pos) store the `float` dequant scale.
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
         context_lens: Tensor of shape [B], dtype int32; effective context length
@@ -757,8 +758,22 @@ def rocm_fp8_paged_mqa_logits(
 
     aiter_paged_mqa_logits_module = None
     # if rocm_aiter_ops.is_enabled():
-    batch_size, next_n, heads, head_dim = q_fp8.shape
-    num_blocks, block_size, _, _ = kv_cache_fp8.shape
+    batch_size, next_n = q_fp8.shape[:2]
+    if kv_cache_fp8.ndim == 5:
+        if kv_cache_fp8.shape[-2] != 1:
+            raise ValueError(
+                "HCU paged-MQA expects a singleton KV-head view, got "
+                f"shape {tuple(kv_cache_fp8.shape)}"
+            )
+        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
+    if kv_cache_fp8.ndim != 4:
+        raise ValueError(
+            "HCU paged-MQA expects a 4D kernel view, got "
+            f"shape {tuple(kv_cache_fp8.shape)}"
+        )
+    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
+        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    block_size = kv_cache_fp8.shape[1]
 
     if rocm_aiter_ops.is_enabled():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()

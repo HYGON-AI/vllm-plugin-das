@@ -27,12 +27,23 @@ TARGETS = (
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
+_GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 _REQUEST_CAPTURE_SIZES = (
     *range(1, 9),
     *range(10, 33, 2),
     *range(40, 65, 4),
     *range(72, 257, 8),
 )
+
+
+def _normalize_hcu_model_runner(model_config: object) -> None:
+    """Keep HCU-supported GLM DSA on the plugin's MRV2-only worker."""
+    architectures = getattr(model_config, "architectures", ()) or ()
+    if (
+        _GLM_DSA_ARCHITECTURE in architectures
+        and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
+    ):
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
 
 def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any:
@@ -209,6 +220,7 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
+    _normalize_hcu_model_runner(vllm_config.model_config)
     """Validate cross-config invariants and bind the compilation adapter."""
 
     _validate_hcu_pcp_scope(vllm_config)

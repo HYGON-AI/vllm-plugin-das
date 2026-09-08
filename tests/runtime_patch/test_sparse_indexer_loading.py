@@ -468,8 +468,17 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
     assert metadata.decode.schedule_metadata is upstream_schedule
 
 
+@pytest.mark.parametrize(
+    "kv_cache_shape",
+    (
+        (1, 64, 1, 132),
+        (1, 64, 1, 1, 132),
+        (1, 1, 64, 1, 132),
+    ),
+)
 def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     monkeypatch: pytest.MonkeyPatch,
+    kv_cache_shape: tuple[int, ...],
 ) -> None:
     """Paged LightOp keeps cleanup disabled while skipping metadata precompute."""
 
@@ -531,7 +540,7 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
 
     result = runtime.rocm_fp8_paged_mqa_logits(
         torch.empty((2, 1, 8, 128)),
-        torch.empty((1, 64, 1, 132), dtype=torch.uint8),
+        torch.empty(kv_cache_shape, dtype=torch.uint8),
         weights,
         torch.ones((2, 1), dtype=torch.int32),
         torch.zeros((2, 1), dtype=torch.int32),
@@ -543,6 +552,7 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     assert len(calls) == 1
     assert calls[0][5] is None
     assert calls[0][-1] is False
+    assert calls[0][1].shape == (1, 64, 1, 132)
     assert calls[0][2].dtype is torch.float32
     assert calls[0][2].is_contiguous()
     assert torch.equal(calls[0][2], weights.float().contiguous())

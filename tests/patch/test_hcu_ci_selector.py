@@ -373,6 +373,7 @@ def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
         "qwen35-gsm8k",
         "qwen3-vl-mmmu",
         "qwen3-8b-gsm8k",
+        "qwen38-flash-next-humaneval",
         "deepseek-gsm8k",
         "glm52-pcp",
     }

@@ -19,6 +19,14 @@ def register_model():
         "DeepSeekMTPModel", "vllm_hcu.models.deepseek_mtp:DeepSeekMTP"
     )
 
+    # Official main selects this architecture for DeepSeek-V3.2 and
+    # GLM-MoE-DSA MTP drafts.  Keep the official architecture contract while
+    # routing execution through the HCU implementation used by the paired
+    # v0.25.1 stack.
+    ModelRegistry.register_model(
+        "DeepseekV32MTPModel", "vllm_hcu.models.deepseek_mtp:DeepSeekMTP"
+    )
+
     ModelRegistry.register_model(
         "GlmMoeDsaForCausalLM", "vllm_hcu.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )

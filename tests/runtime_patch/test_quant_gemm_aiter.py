@@ -7482,6 +7482,33 @@ def _wna16_method(module, *, gated: bool, num_bits: int = 4):
     return method
 
 
+def test_moe_wna16_resolves_main_quant_config_builder(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    wna16_module, _, _ = _fake_moe_wna16_module()
+    delattr(wna16_module, "int4_w4a16_moe_quant_config")
+
+    def main_builder(*args, **kwargs):
+        return args, kwargs
+
+    config_module = _module(
+        patch_compressed_tensors_moe_wna16.QUANT_CONFIG_MODULE,
+        int4_w4a16_moe_quant_config=main_builder,
+    )
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_wna16,
+        "load_exact_module",
+        lambda name, module: config_module,
+    )
+
+    assert (
+        patch_compressed_tensors_moe_wna16._resolve_config_builder(
+            wna16_module
+        )
+        is main_builder
+    )
+
+
 def test_moe_wna16_feature_off_delegates_exactly(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -7537,6 +7564,11 @@ def test_moe_wna16_quant_config_requires_registered_qzeros(
     monkeypatch: pytest.MonkeyPatch,
 ):
     module, _, config_calls = _fake_moe_wna16_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_wna16,
+        "_resolve_config_builder",
+        lambda target: target.int4_w4a16_moe_quant_config,
+    )
     monkeypatch.setattr(
         patch_compressed_tensors_moe_wna16,
         "_aiter_requested",
@@ -7604,7 +7636,7 @@ def test_fp8_channel_weight_layout_requires_hcu_kernel(monkeypatch: pytest.Monke
     scheme = module.CompressedTensorsW8A8Fp8()
     scheme.strategy = channel
     scheme.fp8_linear = object()
-    with pytest.raises(RuntimeError, match="target Triton scaled-mm adapter"):
+    with pytest.raises(RuntimeError, match="reviewed HCU scaled-mm adapter"):
         scheme.process_weights_after_loading(SimpleNamespace(weight=torch.ones(2, 3)))
 
 
@@ -7944,11 +7976,11 @@ def test_lightop_fp8_registration_is_single_owner_and_latched():
     lightop_fp8_runtime._reset_for_tests()
 
 
-def test_lightop_fp8_adapter_has_no_import_time_registration():
+def test_lightop_fp8_adapter_registers_before_model_forward():
     lightop_fp8_runtime._reset_for_tests()
     module, _ = _fake_input_quant_module()
     patch_input_quant_fp8.apply_to_module(module)
-    assert lightop_fp8_runtime._REGISTERED is False
+    assert lightop_fp8_runtime._REGISTERED is True
     assert lightop_fp8_runtime._REGISTRATION_ERROR is None
 
 

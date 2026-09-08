@@ -161,6 +161,14 @@ class HcuMultiprocExecutor(_upstream.MultiprocExecutor):
 
     def _init_executor(self) -> None:
         global _FORK_ORIGINAL_MESSAGE_QUEUE, _FORK_PROXY_MESSAGE_QUEUE
+        # Upstream finalizes backend block size inside each WorkerProc after
+        # model loading. That worker-local mutation cannot update EngineCore's
+        # KV manager config, so run the same platform hook once before fork.
+        if getattr(self.vllm_config, "cache_config", None) is not None:
+            _upstream.current_platform.update_block_size_for_backend(
+                self.vllm_config
+            )
+
         original_message_queue = _upstream.MessageQueue
         max_chunks = max(10, 4 * self.vllm_config.max_concurrent_batches)
         hcu_message_queue = _MessageQueueConstructorProxy(

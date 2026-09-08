@@ -505,14 +505,34 @@ def test_hcu_multiproc_executor_sizes_message_queue_from_v0251_config(monkeypatc
 
     monkeypatch.setattr(hcu_executor._upstream, "MessageQueue", FakeMessageQueue)
     monkeypatch.setattr(
+        hcu_executor._upstream,
+        "current_platform",
+        SimpleNamespace(
+            update_block_size_for_backend=lambda config: records.append(
+                ("block_size", config)
+            )
+        ),
+    )
+    monkeypatch.setattr(
         hcu_executor._upstream.MultiprocExecutor,
         "_init_executor",
         fake_parent_init,
     )
     executor = object.__new__(hcu_executor.HcuMultiprocExecutor)
-    executor.vllm_config = SimpleNamespace(max_concurrent_batches=3)
+    executor.vllm_config = SimpleNamespace(
+        max_concurrent_batches=3,
+        cache_config=SimpleNamespace(),
+    )
     executor._init_executor()
-    assert records == [12, 12, 20, 10, ("handle", "response", 0), 10]
+    assert records == [
+        ("block_size", executor.vllm_config),
+        12,
+        12,
+        20,
+        10,
+        ("handle", "response", 0),
+        10,
+    ]
     assert hcu_executor._upstream.MessageQueue is FakeMessageQueue
     monkeypatch.setattr(patch_multiproc_executor, "apply", lambda module=None: True)
     config = SimpleNamespace(

@@ -599,7 +599,11 @@ class HCUPlatform(Platform):
                 )
             elif (
                 henvs.VLLM_HCU_USE_FLASHMLA
-                or backend == AttentionBackendEnum.FLASHMLA
+                or backend
+                in (
+                    AttentionBackendEnum.FLASHMLA,
+                    AttentionBackendEnum.FLASHMLA_SPARSE,
+                )
             ):
                 cache_config.block_size = 64
                 logger.warning(
@@ -655,7 +659,31 @@ class HCUPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        # Preserve upstream backend/hybrid alignment first. Sparse MLA models
+        # also contain an indexer attention layer, which upstream can discover
+        # before the configured MLA backend and therefore reset the page size
+        # to 16. Apply the configured HCU kernel's hard page-size constraint
+        # last so both the pre-fork config and worker-local config stay aligned.
         super().update_block_size_for_backend(vllm_config)
+
+        cache_config = getattr(vllm_config, "cache_config", None)
+        attention_config = getattr(vllm_config, "attention_config", None)
+        backend = getattr(attention_config, "backend", None)
+        if (
+            cache_config is not None
+            and not cache_config.user_specified_block_size
+            and backend
+            in (
+                AttentionBackendEnum.FLASHMLA,
+                AttentionBackendEnum.FLASHMLA_SPARSE,
+            )
+            and cache_config.block_size != 64
+        ):
+            cache_config.block_size = 64
+            logger.info(
+                "Setting kv cache block size to 64 for HCU %s backend.",
+                backend.name,
+            )
 
 
     @classmethod

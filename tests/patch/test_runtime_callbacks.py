@@ -129,6 +129,12 @@ def test_fp8_callback_invokes_implementation_only_after_exact_target(
         calls.append("fp8")
         ChannelWise._hcu_fp8_patch_applied = True
 
+        def is_supported(*args, **kwargs):
+            return True
+
+        is_supported._hcu_fp8_support_wrapper = True
+        ChannelWise.is_supported = classmethod(is_supported)
+
     loaded: list[tuple[str, str]] = []
 
     def load(module_name: str, function_name: str):
@@ -432,6 +438,12 @@ def test_loaded_target_callback_is_applied_and_reported(
     def patch(target):
         assert target is module
         ChannelWise._hcu_fp8_patch_applied = True
+
+        def is_supported(*args, **kwargs):
+            return True
+
+        is_supported._hcu_fp8_support_wrapper = True
+        ChannelWise.is_supported = classmethod(is_supported)
 
     monkeypatch.setattr(
         runtime_callbacks,

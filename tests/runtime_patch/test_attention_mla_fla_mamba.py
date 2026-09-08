@@ -17,29 +17,19 @@ import torch
 def _install_flashmla_sparse_separate_builder(
     module,
     builder_cls,
-    *,
-    indirect_split=False,
 ):
     module.SimpleNamespace = SimpleNamespace
-    split_expression = (
-        "utils.split_decodes_and_prefills"
-        if indirect_split
-        else "split_decodes_and_prefills"
-    )
     exec(
-        f"""
-def _build_fp8_separate_prefill_decode(self, common_attn_metadata):
-    counts = {split_expression}(
-        common_attn_metadata,
-        decode_threshold=self.reorder_batch_threshold or 1,
-        require_uniform=True,
-    )
+        """
+def _build_fp8_separate_prefill_decode(
+    self, common_attn_metadata, metadata
+):
+    del self, common_attn_metadata
     return SimpleNamespace(
-        num_decodes=counts[0],
-        num_prefills=counts[1],
-        num_decode_tokens=counts[2],
-        num_prefill_tokens=counts[3],
-        decode_metadata=(get_mla_metadata() if counts[0] else None),
+        num_decodes=metadata.num_decodes,
+        num_prefills=metadata.num_prefills,
+        num_decode_tokens=metadata.num_decode_tokens,
+        decode_metadata=get_mla_metadata(),
     )
 """,
         module.__dict__,
@@ -257,15 +247,27 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
             kv_c_and_k_pe_cache,
             topk_indices,
             topk_length=None,
+            actual_num_heads=None,
         ):
             calls.append(
-                ("official", q, kv_c_and_k_pe_cache, topk_indices, topk_length)
+                (
+                    "official",
+                    q,
+                    kv_c_and_k_pe_cache,
+                    topk_indices,
+                    topk_length,
+                    actual_num_heads,
+                )
             )
             return "official-bf16"
 
     def sparse_fwd(q, cache, indices, softmax_scale, *, topk_length=None):
         calls.append(("hcu", q, cache, indices, softmax_scale, topk_length))
-        return torch.ones(q.shape[0], 4, q.shape[-1]), None
+        return (
+            torch.ones(q.shape[0], 4, q.shape[-1]),
+            None,
+            torch.ones(q.shape[0], 4),
+        )
 
     def split_decodes_and_prefills(
         common_attn_metadata,
@@ -316,53 +318,56 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     cache = torch.ones(2, 4)
     indices = torch.zeros(2, 3, dtype=torch.int64)
     topk_length = torch.tensor([1, 2])
-    output = impl._bf16_flash_mla_kernel(
+    output, lse = impl._bf16_flash_mla_kernel(
         q,
         cache,
         indices,
         topk_length,
+        actual_num_heads=1,
     )
-    assert output.shape == (2, 2, 4)
+    assert output.shape == (2, 1, 4)
+    assert lse.shape == (2, 1)
     assert calls[-1][-1] is topk_length
 
     platform.is_rocm = lambda: False
     assert (
-        impl._bf16_flash_mla_kernel(q, cache, indices, topk_length)
+        impl._bf16_flash_mla_kernel(q, cache, indices, topk_length, 1)
         == "official-bf16"
     )
-    assert calls[-1][-1] is topk_length
+    assert calls[-1][-2] is topk_length
+    assert calls[-1][-1] == 1
 
 
-def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
-    """PCP cache gathers need phase counts even in mixed FP8 mode."""
-
+def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     adapter = _adapter("patch_flashmla_sparse")
-    split_calls: list[tuple[object, ...]] = []
+    helper_calls = []
 
     class FlashMLASparseMetadataBuilder:
-        reorder_batch_threshold = 7
-
-        def build(
-            self,
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build=False,
-        ):
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             del self, common_prefix_len, common_attn_metadata, fast_build
             return SimpleNamespace(
                 fp8_use_mixed_batch=True,
                 fp8_extra_metadata=SimpleNamespace(),
+                num_decodes=1,
+                num_prefills=3,
+                num_decode_tokens=1,
+            )
+
+        def _build_fp8_separate_prefill_decode(
+            self, common_attn_metadata, metadata
+        ):
+            helper_calls.append((self, common_attn_metadata, metadata))
+            return SimpleNamespace(
+                num_decodes=metadata.num_decodes,
+                num_prefills=metadata.num_prefills,
+                num_decode_tokens=metadata.num_decode_tokens,
             )
 
     class FlashMLASparseImpl:
         def _fp8_flash_mla_kernel(
-            self,
-            q,
-            kv_c_and_k_pe_cache,
-            topk_indices,
-            kernel_metadata,
+            self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
         ):
-            del self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
+            return q
 
         def _bf16_flash_mla_kernel(
             self,
@@ -370,24 +375,9 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
             kv_c_and_k_pe_cache,
             topk_indices,
             topk_length=None,
+            actual_num_heads=None,
         ):
-            del self, q, kv_c_and_k_pe_cache, topk_indices, topk_length
-
-    def split_decodes_and_prefills(
-        common_attn_metadata,
-        decode_threshold=1,
-        require_uniform=False,
-        treat_short_extends_as_decodes=True,
-    ):
-        split_calls.append(
-            (
-                common_attn_metadata,
-                decode_threshold,
-                require_uniform,
-                treat_short_extends_as_decodes,
-            )
-        )
-        return 3, 2, 3, 5
+            return q
 
     import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
     from vllm_hcu.platforms import envs as henvs
@@ -395,34 +385,20 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
     monkeypatch.setattr(hcu_flashmla, "FlashMLASchedMeta", object)
     monkeypatch.setattr(hcu_flashmla, "flash_mla_sparse_fwd", lambda *a, **k: None)
     monkeypatch.setattr(
-        hcu_flashmla,
-        "flash_mla_with_kvcache",
-        lambda **kwargs: (kwargs, None),
+        hcu_flashmla, "flash_mla_with_kvcache", lambda **kwargs: (kwargs, None)
     )
+    monkeypatch.setattr(hcu_flashmla, "get_mla_metadata", lambda *a, **k: None)
     monkeypatch.setattr(
-        hcu_flashmla,
-        "get_mla_metadata",
-        lambda *a, **k: pytest.fail(
-            "mixed FP8 metadata built separate decode metadata"
-        ),
-    )
-    monkeypatch.setattr(
-        henvs,
-        "VLLM_HCU_USE_FP8_MIXED_BATCH",
-        True,
-        raising=False,
+        henvs, "VLLM_HCU_USE_FP8_MIXED_BATCH", False, raising=False
     )
     module = _module(
         adapter.TARGET_MODULE,
         FlashMLASparseMetadataBuilder=FlashMLASparseMetadataBuilder,
         FlashMLASparseImpl=FlashMLASparseImpl,
         current_platform=SimpleNamespace(is_rocm=lambda: False),
-        split_decodes_and_prefills=split_decodes_and_prefills,
         torch=torch,
     )
-    _install_flashmla_sparse_separate_builder(
-        module, FlashMLASparseMetadataBuilder
-    )
+
     assert adapter.apply_to_module(module)
     builder = FlashMLASparseMetadataBuilder()
     builder.vllm_config = SimpleNamespace(
@@ -431,52 +407,30 @@ def test_flashmla_sparse_mixed_metadata_exposes_pcp_cache_phase(monkeypatch):
             cp_kv_cache_interleave_size=1,
         )
     )
-    common = SimpleNamespace(num_actual_tokens=8)
-
+    common = SimpleNamespace(num_actual_tokens=4)
     metadata = builder.build(0, common)
 
-    assert metadata.fp8_use_mixed_batch is True
-    assert metadata.num_decodes == 3
-    assert metadata.num_prefills == 2
-    assert metadata.num_decode_tokens == 3
-    assert split_calls == [(common, 7, True, False)]
+    assert metadata.fp8_use_mixed_batch is False
+    assert helper_calls == [(builder, common, metadata)]
+    assert metadata.fp8_extra_metadata.num_decodes == 1
+    assert metadata.fp8_extra_metadata.num_prefills == 3
 
 
-def _make_flashmla_sparse_separate_metadata_module(
-    adapter,
-    split_calls,
-    *,
-    get_mla_metadata=lambda: None,
-    indirect_split=False,
-):
-    from vllm.v1.attention.backends.utils import (
-        split_decodes_and_prefills as upstream_split_decodes_and_prefills,
-    )
+def test_flashmla_sparse_rejects_old_separate_metadata_signature(monkeypatch):
+    adapter = _adapter("patch_flashmla_sparse")
 
-    class FlashMLASparseMetadataBuilder:
-        reorder_batch_threshold = 1
+    class Builder:
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return SimpleNamespace()
 
-        def build(
-            self,
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build=False,
-        ):
-            del self, common_prefix_len, common_attn_metadata, fast_build
-            return SimpleNamespace(
-                fp8_use_mixed_batch=True,
-                fp8_extra_metadata=None,
-            )
+        def _build_fp8_separate_prefill_decode(self, common_attn_metadata):
+            return SimpleNamespace()
 
-    class FlashMLASparseImpl:
+    class Impl:
         def _fp8_flash_mla_kernel(
-            self,
-            q,
-            kv_c_and_k_pe_cache,
-            topk_indices,
-            kernel_metadata,
+            self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
         ):
-            del self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
+            return q
 
         def _bf16_flash_mla_kernel(
             self,
@@ -484,259 +438,18 @@ def _make_flashmla_sparse_separate_metadata_module(
             kv_c_and_k_pe_cache,
             topk_indices,
             topk_length=None,
+            actual_num_heads=None,
         ):
-            del self, q, kv_c_and_k_pe_cache, topk_indices, topk_length
-
-    def split_decodes_and_prefills(
-        common_attn_metadata,
-        decode_threshold=1,
-        require_uniform=False,
-        treat_short_extends_as_decodes=True,
-    ):
-        split_calls.append(treat_short_extends_as_decodes)
-        return upstream_split_decodes_and_prefills(
-            common_attn_metadata,
-            decode_threshold=decode_threshold,
-            require_uniform=require_uniform,
-            treat_short_extends_as_decodes=treat_short_extends_as_decodes,
-        )
+            return q
 
     module = _module(
         adapter.TARGET_MODULE,
-        FlashMLASparseMetadataBuilder=FlashMLASparseMetadataBuilder,
-        FlashMLASparseImpl=FlashMLASparseImpl,
-        current_platform=SimpleNamespace(is_rocm=lambda: False),
-        split_decodes_and_prefills=split_decodes_and_prefills,
-        get_mla_metadata=get_mla_metadata,
-        torch=torch,
-    )
-    if indirect_split:
-        module.utils = SimpleNamespace(
-            split_decodes_and_prefills=split_decodes_and_prefills
-        )
-    _install_flashmla_sparse_separate_builder(
-        module,
-        FlashMLASparseMetadataBuilder,
-        indirect_split=indirect_split,
-    )
-    return module, FlashMLASparseMetadataBuilder
-
-
-def test_flashmla_sparse_rejects_separate_builder_splitter_drift():
-    adapter = _adapter("patch_flashmla_sparse")
-    module, builder_cls = _make_flashmla_sparse_separate_metadata_module(
-        adapter, []
+        FlashMLASparseMetadataBuilder=Builder,
+        FlashMLASparseImpl=Impl,
     )
 
-    exec(
-        """
-def incompatible_helper(self, common_attn_metadata):
-    return SimpleNamespace()
-""",
-        module.__dict__,
-    )
-    builder_cls._build_fp8_separate_prefill_decode = module.incompatible_helper
-
-    with pytest.raises(
-        adapter.PatchCompatibilityError,
-        match="_build_fp8_separate_prefill_decode.*split_decodes_and_prefills",
-    ):
+    with pytest.raises(adapter.PatchCompatibilityError, match="metadata"):
         adapter.apply_to_module(module)
-
-
-def test_flashmla_sparse_rejects_indirect_splitter_before_mutation():
-    adapter = _adapter("patch_flashmla_sparse")
-    module, builder_cls = _make_flashmla_sparse_separate_metadata_module(
-        adapter,
-        [],
-        indirect_split=True,
-    )
-    original_build = builder_cls.build
-    original_get_mla_metadata = module.get_mla_metadata
-
-    with pytest.raises(
-        adapter.PatchCompatibilityError,
-        match="direct LOAD_GLOBAL.*split_decodes_and_prefills",
-    ):
-        adapter.apply_to_module(module)
-
-    assert builder_cls.build is original_build
-    assert module.get_mla_metadata is original_get_mla_metadata
-    assert not hasattr(module, adapter._MARKER)
-
-
-def test_flashmla_sparse_rejects_helper_from_different_module_globals():
-    adapter = _adapter("patch_flashmla_sparse")
-    module, builder_cls = _make_flashmla_sparse_separate_metadata_module(
-        adapter, []
-    )
-    decoy_module = _module(
-        "decoy_flashmla_sparse",
-        split_decodes_and_prefills=module.split_decodes_and_prefills,
-        get_mla_metadata=module.get_mla_metadata,
-    )
-    _install_flashmla_sparse_separate_builder(decoy_module, builder_cls)
-    original_build = builder_cls.build
-    original_get_mla_metadata = module.get_mla_metadata
-
-    with pytest.raises(
-        adapter.PatchCompatibilityError,
-        match="globals.*target module",
-    ):
-        adapter.apply_to_module(module)
-
-    assert builder_cls.build is original_build
-    assert module.get_mla_metadata is original_get_mla_metadata
-    assert not hasattr(module, adapter._MARKER)
-
-
-def test_flashmla_sparse_pcp_separate_metadata_keeps_short_extend_as_prefill(
-    monkeypatch,
-):
-    """Nested FP8 metadata must use the same PCP phase split as its parent."""
-
-    adapter = _adapter("patch_flashmla_sparse")
-    split_calls: list[bool] = []
-    metadata_calls: list[str] = []
-
-    def cuda_get_mla_metadata():
-        metadata_calls.append("cuda")
-        return "cuda-metadata"
-
-    def hcu_get_mla_metadata():
-        metadata_calls.append("hcu")
-        return "hcu-metadata"
-
-    module, builder_cls = _make_flashmla_sparse_separate_metadata_module(
-        adapter,
-        split_calls,
-        get_mla_metadata=cuda_get_mla_metadata,
-    )
-    import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(hcu_flashmla, "FlashMLASchedMeta", object)
-    monkeypatch.setattr(hcu_flashmla, "flash_mla_sparse_fwd", lambda *a, **k: None)
-    monkeypatch.setattr(
-        hcu_flashmla,
-        "flash_mla_with_kvcache",
-        lambda **kwargs: (kwargs, None),
-    )
-    monkeypatch.setattr(
-        hcu_flashmla, "get_mla_metadata", hcu_get_mla_metadata
-    )
-    monkeypatch.setattr(
-        henvs,
-        "VLLM_HCU_USE_FP8_MIXED_BATCH",
-        False,
-        raising=False,
-    )
-    assert adapter.apply_to_module(module)
-    builder = builder_cls()
-    builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=2,
-            cp_kv_cache_interleave_size=1,
-        )
-    )
-    common = SimpleNamespace(
-        num_actual_tokens=4,
-        num_reqs=4,
-        max_query_len=2,
-        query_start_loc_cpu=torch.tensor([0, 1, 2, 4, 4]),
-        is_prefilling=torch.tensor([False, True, True, False]),
-    )
-
-    metadata = builder.build(0, common)
-    nested = metadata.fp8_extra_metadata
-
-    assert metadata.fp8_use_mixed_batch is False
-    assert (
-        metadata.num_decodes,
-        metadata.num_prefills,
-        metadata.num_decode_tokens,
-    ) == (nested.num_decodes, nested.num_prefills, nested.num_decode_tokens)
-    assert (
-        nested.num_decodes,
-        nested.num_prefills,
-        nested.num_decode_tokens,
-        nested.num_prefill_tokens,
-    ) == (1, 3, 1, 3)
-    assert nested.decode_metadata == "hcu-metadata"
-    assert metadata_calls == ["hcu"]
-    assert split_calls == [False, False]
-
-
-def test_flashmla_sparse_pcp_one_preserves_separate_phase_default(monkeypatch):
-    adapter = _adapter("patch_flashmla_sparse")
-    split_calls: list[bool] = []
-    metadata_calls: list[str] = []
-
-    def cuda_get_mla_metadata():
-        metadata_calls.append("cuda")
-        return "cuda-metadata"
-
-    def hcu_get_mla_metadata():
-        metadata_calls.append("hcu")
-        return "hcu-metadata"
-
-    module, builder_cls = _make_flashmla_sparse_separate_metadata_module(
-        adapter,
-        split_calls,
-        get_mla_metadata=cuda_get_mla_metadata,
-    )
-    original_separate_builder = (
-        builder_cls._build_fp8_separate_prefill_decode
-    )
-    import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(hcu_flashmla, "FlashMLASchedMeta", object)
-    monkeypatch.setattr(hcu_flashmla, "flash_mla_sparse_fwd", lambda *a, **k: None)
-    monkeypatch.setattr(
-        hcu_flashmla,
-        "flash_mla_with_kvcache",
-        lambda **kwargs: (kwargs, None),
-    )
-    monkeypatch.setattr(
-        hcu_flashmla, "get_mla_metadata", hcu_get_mla_metadata
-    )
-    monkeypatch.setattr(
-        henvs,
-        "VLLM_HCU_USE_FP8_MIXED_BATCH",
-        False,
-        raising=False,
-    )
-    assert adapter.apply_to_module(module)
-    assert (
-        builder_cls._build_fp8_separate_prefill_decode
-        is original_separate_builder
-    )
-    builder = builder_cls()
-    builder.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=1,
-            cp_kv_cache_interleave_size=1,
-        )
-    )
-
-    metadata = builder.build(
-        0,
-        SimpleNamespace(
-            num_actual_tokens=2,
-            num_reqs=2,
-            max_query_len=1,
-            query_start_loc_cpu=torch.tensor([0, 1, 2]),
-            is_prefilling=torch.tensor([False, True]),
-        ),
-    )
-
-    assert metadata.fp8_use_mixed_batch is False
-    assert metadata.fp8_extra_metadata.num_decodes == 2
-    assert metadata.fp8_extra_metadata.num_prefills == 0
-    assert metadata.fp8_extra_metadata.decode_metadata == "hcu-metadata"
-    assert metadata_calls == ["hcu"]
-    assert split_calls == [True]
 
 
 def test_attention_direct_forward_preserves_cpu_values_and_query_device():
@@ -746,22 +459,16 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     assert runtime_torch is torch
     calls = {}
 
-    class Impl:
-        def do_kv_cache_update(self, layer, key, value, cache, slots):
-            calls["dummy_device"] = key.device
+    def kv_cache_update(key, value, layer_name):
+        calls["cache"] = (key, value, layer_name)
+        return torch.empty(0, device=key.device, dtype=key.dtype)
 
     def attention(query, key, value, output, layer_name, **kwargs):
         output.copy_(query + key + value)
 
     upstream = SimpleNamespace(
         _encode_layer_name=lambda value: value,
-        _resolve_layer_name=lambda value: value,
-        get_attention_context=lambda value: (
-            None,
-            SimpleNamespace(impl=Impl()),
-            (torch.empty(0), torch.empty(0)),
-            torch.tensor([0]),
-        ),
+        unified_kv_cache_update=kv_cache_update,
         unified_attention_with_output=attention,
     )
     self = SimpleNamespace(
@@ -775,6 +482,7 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
         kv_cache_dtype="auto",
         attn_backend=SimpleNamespace(forward_includes_kv_cache_update=False),
         kv_sharing_target_layer_name=None,
+        use_direct_call=True,
     )
     query = torch.tensor([[1.0, 2.0]])
     key = torch.tensor([[3.0, 4.0]])
@@ -791,7 +499,54 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
         output, torch.tensor([[9.0, 12.0]], dtype=torch.float64)
     )
     assert output.dtype is torch.float64
-    assert calls["dummy_device"] == query.device
+    cache_key, cache_value, cache_layer_name = calls["cache"]
+    torch.testing.assert_close(cache_key, key.view(1, 1, 2))
+    torch.testing.assert_close(cache_value, value.view(1, 1, 2))
+    assert cache_layer_name == "layer"
+
+
+def test_attention_direct_forward_keeps_layer_name_resolution_outside_fullgraph():
+    from vllm.utils.torch_utils import LayerName
+    from vllm_hcu.model_executor.layers import attention_forward_runtime as runtime
+
+    upstream = ModuleType("compiled_attention_upstream")
+    upstream._encode_layer_name = lambda value: value
+    upstream.unified_kv_cache_update = lambda key, value, layer_name: torch.empty(
+        0, device=key.device, dtype=key.dtype
+    )
+
+    def attention(query, key, value, output, layer_name, **kwargs):
+        output.copy_(query + key + value)
+
+    upstream.unified_attention_with_output = attention
+
+    class Probe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calculate_kv_scales = False
+            self.query_quant = None
+            self.num_heads = 1
+            self.num_kv_heads = 1
+            self.head_size = 2
+            self.head_size_v = 2
+            self.layer_name = LayerName("layer")
+            self.kv_cache_dtype = "fp8_e5m2"
+            self.attn_backend = SimpleNamespace(
+                forward_includes_kv_cache_update=False
+            )
+            self.kv_sharing_target_layer_name = None
+            self.use_direct_call = True
+
+        def forward(self, query, key, value):
+            return runtime.attention_forward(
+                upstream, self, query, key, value
+            )
+
+    query = torch.tensor([[1.0, 2.0]])
+    output = torch.compile(Probe(), backend="eager", fullgraph=True)(
+        query, query, query
+    )
+    torch.testing.assert_close(output, query * 3)
 
 
 @pytest.mark.parametrize(

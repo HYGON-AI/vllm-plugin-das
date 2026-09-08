@@ -252,6 +252,14 @@ register_hcu_ci(
     est_time=5400,
 )
 register_hcu_ci(
+    job="qwen38-flash-next-humaneval",
+    target=(
+        "tests/integration/server/test_evalscope_qwen38_flash_next_humaneval.py::"
+        "test_qwen38_flash_next_humaneval_evalscope_server"
+    ),
+    est_time=10800,
+)
+register_hcu_ci(
     job="deepseek-gsm8k",
     target=(
         "tests/integration/server/test_evalscope_deepseek_r1_gsm8k.py::"

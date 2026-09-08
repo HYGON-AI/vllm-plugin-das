@@ -57,33 +57,39 @@ def attention_forward(
         value = value.view(-1, self.num_kv_heads, self.head_size_v)
 
     kv_cache_dummy_dep = None
-    if (
+    needs_kv_cache_update = (
         not self.attn_backend.forward_includes_kv_cache_update
         and self.kv_sharing_target_layer_name is None
         and key is not None
         and value is not None
-    ):
-        layer_name = upstream._resolve_layer_name(self.layer_name)
-        _, attn_layer, kv_cache, layer_slot_mapping = upstream.get_attention_context(
-            layer_name
-        )
-        if layer_slot_mapping is not None:
-            update = getattr(attn_layer.impl, "do_kv_cache_update", None)
-            if not callable(update):
-                raise RuntimeError(
-                    f"{attn_layer.impl.__class__.__name__} does not support KV cache update"
-                )
-            update(attn_layer, key, value, kv_cache, layer_slot_mapping)
-        # HCU's custom cache is a (key, value) pair and has no ``.device``.
-        kv_cache_dummy_dep = torch.empty(0, device=key.device, dtype=key.dtype)
-    upstream.unified_attention_with_output(
-        query,
-        key,
-        value,
-        output,
-        self.layer_name,
-        kv_cache_dummy_dep=kv_cache_dummy_dep,
     )
+    if self.use_direct_call:
+        if needs_kv_cache_update:
+            kv_cache_dummy_dep = upstream.unified_kv_cache_update(
+                key, value, self.layer_name
+            )
+        upstream.unified_attention_with_output(
+            query,
+            key,
+            value,
+            output,
+            self.layer_name,
+            kv_cache_dummy_dep=kv_cache_dummy_dep,
+        )
+    else:
+        encoded = upstream._encode_layer_name(self.layer_name)
+        if needs_kv_cache_update:
+            kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+                key, value, encoded
+            )
+        torch.ops.vllm.unified_attention_with_output(
+            query,
+            key,
+            value,
+            output,
+            encoded,
+            kv_cache_dummy_dep=kv_cache_dummy_dep,
+        )
     return output.view(-1, hidden_size)
 
 

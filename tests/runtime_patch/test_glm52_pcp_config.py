@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -13,6 +14,24 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.platform.core_fix import patch_vllm_config
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
+
+
+def test_glm_dsa_defaults_to_mrv2_for_hcu(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    model_config = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+
+    patch_vllm_config._normalize_hcu_model_runner(model_config)
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
+def test_glm_dsa_preserves_explicit_model_runner_choice(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    model_config = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+
+    patch_vllm_config._normalize_hcu_model_runner(model_config)
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
 
 def _make_pcp_config(**overrides: object) -> object:

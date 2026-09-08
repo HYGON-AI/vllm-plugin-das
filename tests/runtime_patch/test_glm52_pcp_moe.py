@@ -32,7 +32,6 @@ def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
         if op_name in {
             "moe_forward",
             "moe_forward_shared",
-            "moe_forward_shared_inplace",
         }:
             moe_op_registrations[op_name] = kwargs
             return None
@@ -47,80 +46,6 @@ def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
         torch_utils.direct_register_custom_op = register_custom_op
     assert module.MoERunner.__module__.startswith("vllm_hcu.")
     return module
-
-
-def test_inplace_moe_forward_shared_satisfies_aot_mutation_contract(
-    monkeypatch: pytest.MonkeyPatch,
-    moe_runner_module: ModuleType,
-    moe_op_registrations: dict[str, dict],
-) -> None:
-    """AOT must preserve the input mutation without returning an input alias."""
-
-    class Layer:
-        def _forward_impl(self, hidden_states, *_args, **_kwargs):
-            hidden_states.add_(1)
-            return torch.full_like(hidden_states, 7), hidden_states
-
-    monkeypatch.setattr(
-        moe_runner_module,
-        "get_layer_from_name",
-        lambda _name: Layer(),
-    )
-    registration = moe_op_registrations["moe_forward_shared_inplace"]
-    test_library = torch.library.Library("vllm_hcu_test_moe", "FRAGMENT")
-    torch_utils.direct_register_custom_op(
-        op_name="moe_forward_shared_inplace",
-        op_func=registration["op_func"],
-        mutates_args=registration["mutates_args"],
-        fake_impl=registration["fake_impl"],
-        target_lib=test_library,
-        dispatch_key="CPU",
-        tags=registration["tags"],
-    )
-    torch.library.opcheck(
-        torch.ops.vllm_hcu_test_moe.moe_forward_shared_inplace.default,
-        (
-            torch.zeros((2, 2)),
-            None,
-            torch.zeros((2, 2)),
-            None,
-            None,
-            None,
-            None,
-            None,
-            "test-layer",
-            0,
-        ),
-        test_utils=("test_schema",),
-    )
-
-    def invoke(hidden_states):
-        return torch.ops.vllm_hcu_test_moe.moe_forward_shared_inplace(
-            hidden_states,
-            None,
-            hidden_states,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "test-layer",
-            0,
-        )
-
-    compiled = torch.compile(invoke, backend="aot_eager", fullgraph=True)
-    hidden_states = torch.zeros((2, 2))
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "error",
-            message=r".*moe_forward_shared.*custom operator.*",
-            category=UserWarning,
-        )
-        shared_output = compiled(hidden_states)
-
-    torch.testing.assert_close(hidden_states, torch.ones_like(hidden_states))
-    torch.testing.assert_close(shared_output, torch.full_like(hidden_states, 7))
-    assert not torch._C._is_alias_of(shared_output, hidden_states)
 
 
 def test_fallback_moe_forward_shared_satisfies_aot_mutation_contract(
@@ -210,43 +135,6 @@ def make_logits() -> torch.Tensor:
 
 
 @pytest.mark.parametrize(
-    ("supports_inplace", "dp_size", "sequence_parallel", "pcp_size", "expected"),
-    [
-        (True, 1, False, 1, True),
-        (False, 1, False, 1, False),
-        (True, 2, False, 1, False),
-        (True, 1, True, 1, False),
-        (True, 1, False, 2, False),
-    ],
-)
-def test_inplace_shared_output_requires_local_inplace_kernel(
-    moe_runner_module: ModuleType,
-    supports_inplace: bool,
-    dp_size: int,
-    sequence_parallel: bool,
-    pcp_size: int,
-    expected: bool,
-) -> None:
-    """Dispatch or an out-of-place kernel must retain the tuple-returning op."""
-
-    runner = object.__new__(moe_runner_module.MoERunner)
-    runner._shared_experts = object()
-    runner.routed_experts = SimpleNamespace(
-        quant_method=SimpleNamespace(
-            supports_inplace_output=supports_inplace,
-            supports_internal_mk=False,
-        )
-    )
-    runner.moe_config = SimpleNamespace(
-        dp_size=dp_size,
-        is_sequence_parallel=sequence_parallel,
-        pcp_size=pcp_size,
-    )
-
-    assert runner._can_use_inplace_shared_output() is expected
-
-
-@pytest.mark.parametrize(
     ("use_deepep", "use_aiter", "expected"),
     [
         (False, False, True),
@@ -277,11 +165,11 @@ def test_slimquant_marlin_only_advertises_local_inplace_output(
     assert method.supports_inplace_output is expected
 
 
-def test_forward_entry_refreshes_after_runtime_reconfiguration(
+def test_forward_entry_stays_on_official_shared_op_after_reconfiguration(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
 ) -> None:
-    """Runtime method/config swaps must not retain a stale in-place entry."""
+    """AITER capabilities must not select a plugin-only custom op."""
 
     class RoutedExperts:
         def __init__(self) -> None:
@@ -312,9 +200,8 @@ def test_forward_entry_refreshes_after_runtime_reconfiguration(
         pcp_size=1,
     )
 
-    runner._refresh_forward_entry()
-    assert runner._forward_uses_mutated_hidden_states is True
-    assert runner._forward_entry is moe_runner_module._moe_forward_shared_inplace
+    runner._forward_entry = runner._select_forward()
+    assert runner._forward_entry is moe_runner_module._moe_forward_shared
 
     runner._replace_quant_method(
         SimpleNamespace(
@@ -322,7 +209,6 @@ def test_forward_entry_refreshes_after_runtime_reconfiguration(
             supports_internal_mk=False,
         )
     )
-    assert runner._forward_uses_mutated_hidden_states is False
     assert runner._forward_entry is moe_runner_module._moe_forward_shared
 
     runner._replace_quant_method(
@@ -331,8 +217,7 @@ def test_forward_entry_refreshes_after_runtime_reconfiguration(
             supports_internal_mk=False,
         )
     )
-    assert runner._forward_uses_mutated_hidden_states is True
-    assert runner._forward_entry is moe_runner_module._moe_forward_shared_inplace
+    assert runner._forward_entry is moe_runner_module._moe_forward_shared
 
     runner._set_moe_config(
         SimpleNamespace(
@@ -341,7 +226,6 @@ def test_forward_entry_refreshes_after_runtime_reconfiguration(
             pcp_size=2,
         )
     )
-    assert runner._forward_uses_mutated_hidden_states is False
     assert runner._forward_entry is moe_runner_module._moe_forward_shared
 
 
@@ -436,11 +320,9 @@ def test_pcp_dispatch_requires_router_logits(
         runner._maybe_dispatch(make_hidden(), None)
 
 
-@pytest.mark.parametrize("uses_mutated_output", [False, True])
 def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
-    uses_mutated_output: bool,
 ) -> None:
     """Reordering either local output before the shared+routed add is a bug."""
 
@@ -456,19 +338,10 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     runner.router = object()
     shared_output = torch.tensor([[100.0, 101.0], [200.0, 201.0]])
     fused_output = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
-    runner._forward_uses_mutated_hidden_states = uses_mutated_output
-    if uses_mutated_output:
-
-        def forward_entry(hidden_states, *_args):
-            hidden_states.copy_(fused_output)
-            return shared_output
-
-        runner.__dict__["_forward_entry"] = forward_entry
-    else:
-        runner.__dict__["_forward_entry"] = lambda *_args: (
-            shared_output,
-            fused_output,
-        )
+    runner.__dict__["_forward_entry"] = lambda *_args: (
+        shared_output,
+        fused_output,
+    )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_pad_hidden_states",

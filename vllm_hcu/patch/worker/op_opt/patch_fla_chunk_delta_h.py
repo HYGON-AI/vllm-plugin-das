@@ -9,7 +9,7 @@ from types import ModuleType
 
 from ._common import already_applied, load_exact_module, require_callable, require_exact_signature
 
-TARGET_MODULE = "vllm.model_executor.layers.fla.ops.chunk_delta_h"
+TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk_delta_h"
 PATCH_ID = "worker.op_opt.fla.chunk_delta_h.aiter"
 TARGETS = (f"{TARGET_MODULE}.chunk_gated_delta_rule_fwd_h",)
 _MARKER = "_vllm_hcu_chunk_delta_h_applied"

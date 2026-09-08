@@ -785,26 +785,22 @@ def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
             kv_c_and_k_pe_cache,
             topk_indices,
             topk_length=None,
+            actual_num_heads=None,
         ):
             return q
 
     sparse_module = ModuleType(sparse_adapter.TARGET_MODULE)
     sparse_module.FlashMLASparseMetadataBuilder = FlashMLASparseMetadataBuilder
     sparse_module.FlashMLASparseImpl = FlashMLASparseImpl
-    sparse_module.split_decodes_and_prefills = (
-        lambda common_attn_metadata,
-        decode_threshold=1,
-        require_uniform=False,
-        treat_short_extends_as_decodes=True: (0, 0, 0, 0)
-    )
     sparse_module.current_platform = SimpleNamespace(is_rocm=lambda: False)
     sparse_module.torch = torch
     sparse_module.SimpleNamespace = SimpleNamespace
     exec(
         """
-def _build_fp8_separate_prefill_decode(self, common_attn_metadata):
-    counts = split_decodes_and_prefills(common_attn_metadata)
-    return SimpleNamespace(num_prefills=counts[1])
+def _build_fp8_separate_prefill_decode(
+    self, common_attn_metadata, metadata
+):
+    return SimpleNamespace(num_prefills=metadata.num_prefills)
 """,
         sparse_module.__dict__,
     )
