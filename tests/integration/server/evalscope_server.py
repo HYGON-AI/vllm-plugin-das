@@ -29,6 +29,16 @@ EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
 EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
 EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
 EVALSCOPE_PROCESS_OWNER_ENV = "VLLM_HCU_EVAL_PROCESS_OWNER"
+SERVER_LOG_ENV_ALLOWLIST = frozenset(
+    {
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT",
+        "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED",
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE",
+        "VLLM_HCU_USE_LIGHTOP_W16A16_MOE",
+        "VLLM_USE_OPT_CAT",
+    }
+)
 _DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
@@ -206,7 +216,17 @@ def _reset_evalscope_artifacts(work_dir: Path) -> None:
         raise ValueError(f"EvalScope ownership marker must not be a symlink: {marker}")
     if not marker.exists():
         owned_root = EVALSCOPE_OWNED_ROOT.resolve()
-        if root.parent != owned_root:
+        ci_job_root_value = os.environ.get("HCU_CI_JOB_ROOT")
+        ci_job_root = (
+            Path(ci_job_root_value).resolve() if ci_job_root_value else None
+        )
+        ci_work_dir = (
+            ci_job_root / "evalscope"
+            if ci_job_root is not None
+            and ci_job_root != Path(ci_job_root.anchor)
+            else None
+        )
+        if root.parent != owned_root and root != ci_work_dir:
             raise ValueError(
                 "refusing to reset EvalScope artifacts without an ownership "
                 f"marker under {root}"
@@ -344,6 +364,15 @@ def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
     return env
 
 
+def _server_log_environment(env: dict[str, str]) -> dict[str, str]:
+    """Return only non-sensitive route controls needed as test evidence."""
+
+    return {
+        name: env[name]
+        for name in sorted(SERVER_LOG_ENV_ALLOWLIST.intersection(env))
+    }
+
+
 def _report_metric(
     work_dir: Path,
     *,
@@ -460,9 +489,55 @@ def _assert_pass_criteria(
         dataset=dataset,
         metric=metric,
     )
+    expected_predictions = criteria.get("num_predictions")
+    expected_reviews = criteria.get("num_reviews")
+    artifact_verdict = ""
+    if expected_predictions is not None or expected_reviews is not None:
+        if expected_predictions is None or expected_reviews is None:
+            raise TypeError(
+                "threshold pass criteria must set both num_predictions and "
+                "num_reviews"
+            )
+        expected_predictions = int(expected_predictions)
+        expected_reviews = int(expected_reviews)
+        assert num == expected_predictions, (
+            f"{dataset} {metric} expected {expected_predictions} samples, "
+            f"got {num}; report={report_path}"
+        )
+        model = str(
+            config.get("server", {}).get(
+                "served_model_name",
+                _model_path(config, model_env),
+            )
+        )
+        prediction_count, prediction_path = _artifact_record_count(
+            work_dir,
+            artifact="predictions",
+            model=model,
+            dataset=dataset,
+        )
+        review_count, review_path = _artifact_record_count(
+            work_dir,
+            artifact="reviews",
+            model=model,
+            dataset=dataset,
+        )
+        assert prediction_count == expected_predictions, (
+            f"expected {expected_predictions} predictions, got "
+            f"{prediction_count}; path={prediction_path}"
+        )
+        assert review_count == expected_reviews, (
+            f"expected {expected_reviews} reviews, got {review_count}; "
+            f"path={review_path}"
+        )
+        artifact_verdict = (
+            f"; predictions={prediction_count}, reviews={review_count}, "
+            f"prediction_path={prediction_path}, review_path={review_path}"
+        )
     verdict = (
         f"pass criterion: {dataset} {display_name}={score:.4f}, "
         f"required>={minimum_score:.4f}, samples={num}, report={report_path}"
+        f"{artifact_verdict}"
     )
     with _open_log(eval_log_path) as eval_log:
         eval_log.write((verdict + "\n").encode())
@@ -767,7 +842,14 @@ def run_evalscope_server_test(
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())
-        server_log.write(b"server environment: VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1\n")
+        visible_environment = _server_log_environment(env)
+        rendered_environment = " ".join(
+            f"{name}={visible_environment[name]}"
+            for name in sorted(visible_environment)
+        )
+        server_log.write(
+            ("server environment: " + rendered_environment + "\n").encode()
+        )
         server_log.flush()
         proc = subprocess.Popen(
             command,

@@ -3945,6 +3945,46 @@ def test_clamp_swiglu_enforces_rocm_custom_op():
     assert instance.beta == 0.25
 
 
+def test_clamp_swiglu_falls_back_to_native_when_compiled_op_is_missing():
+    class CustomOp:
+        def __init__(self, *, enforce_enable=False, compile_native=False):
+            self.base_args = (enforce_enable, compile_native)
+            self._forward_method = "dispatched"
+
+    class SiluAndMulWithClamp(CustomOp):
+        def __init__(
+            self,
+            swiglu_limit: float,
+            alpha: float = 1.0,
+            beta: float = 0.0,
+            *,
+            compile_native: bool = True,
+        ):
+            super().__init__(compile_native=compile_native)
+
+        def forward_native(self, x):
+            return ("native", x)
+
+    platform = SimpleNamespace(
+        is_rocm=lambda: True,
+        is_cuda_alike=lambda: False,
+        is_xpu=lambda: False,
+        is_cpu=lambda: False,
+    )
+    module = _module(
+        patch_activation.TARGET_MODULE,
+        SiluAndMulWithClamp=SiluAndMulWithClamp,
+        current_platform=platform,
+        torch=SimpleNamespace(ops=SimpleNamespace(_C=SimpleNamespace())),
+    )
+
+    patch_activation.apply_to_module(module)
+    instance = SiluAndMulWithClamp(7.0, compile_native=False)
+
+    assert instance.base_args == (True, False)
+    assert instance._forward_method("value") == ("native", "value")
+
+
 def test_compressed_linear_only_forwards_supported_prequantized_input():
     class CompressedTensorsLinearMethod:
         def apply(self, layer, x, bias=None):

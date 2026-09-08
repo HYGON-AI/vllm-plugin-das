@@ -257,6 +257,21 @@ def select_jobs(
             selected_ids.update(group["jobs"])
             classified_paths.update(matched_paths)
 
+    registered_jobs_by_file: dict[str, set[str]] = {}
+    for registration in parse_registry():
+        if registration.disabled is None and registration.job in jobs:
+            registered_jobs_by_file.setdefault(registration.test_file, set()).add(
+                registration.job
+            )
+    registered_paths = {
+        path for path in normalized if path in registered_jobs_by_file
+    }
+    if registered_paths.difference(classified_paths):
+        selected_groups.append("registered-hcu-test")
+    for path in registered_paths:
+        selected_ids.update(registered_jobs_by_file[path])
+    classified_paths.update(registered_paths)
+
     production_patterns = config.get("production_patterns", [])
     test_patterns = config.get("test_patterns", [])
     fallback = any(

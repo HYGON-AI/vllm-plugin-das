@@ -30,6 +30,36 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/accuracy/test_aiter_batched_gemm_bf16.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_mla_concat_accuracy.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_sqrtsoftplus_gate.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_qwen_rmsnorm_gated_accuracy.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_moe_align_fallback_graph.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_w16a16_moe_accuracy.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
     est_time=330,
 )
@@ -271,6 +301,32 @@ register_hcu_ci(
         "test_deepseek_r1_channel_fp8_gsm8k_evalscope_server"
     ),
     est_time=14400,
+)
+register_hcu_ci(
+    job="deepseek-tp-ep",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_operator_adaptation_humaneval.py::"
+        "test_deepseek_v4_int8_operator_adaptation_humaneval32"
+    ),
+    est_time=14400,
+    disabled=(
+        "the exact DeepSeek-V4 Flash Channel-INT8 checkpoint is not available "
+        "in the public CI model roots"
+    ),
+)
+register_hcu_ci(
+    job="qwen35-smoke",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_operator_adaptation_humaneval.py::"
+        "test_qwen36_35b_a3b_operator_adaptation_humaneval32"
+    ),
+    est_time=7200,
+    disabled=(
+        "the exact Qwen3.6-35B-A3B checkpoint is not available in the public "
+        "CI model roots"
+    ),
 )
 register_hcu_ci(
     job="glm52-pcp",
