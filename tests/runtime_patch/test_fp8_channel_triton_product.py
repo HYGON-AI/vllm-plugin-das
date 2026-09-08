@@ -22,10 +22,12 @@ _TRITON_MODULE = (
     "vllm.model_executor.layers.quantization.compressed_tensors."
     "triton_scaled_mm"
 )
+_LIGHTOP_MODULE = "lightop.gemm_ops"
 _FP8_DTYPE = getattr(torch, "float8_e4m3fnuz", None)
+_LIGHTOP_FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 
 pytestmark = pytest.mark.skipif(
-    _FP8_DTYPE is None,
+    _FP8_DTYPE is None or _LIGHTOP_FP8_DTYPE is None,
     reason="the target vLLM Channel-FP8 contract requires torch FP8 dtypes",
 )
 
@@ -67,7 +69,12 @@ def _install_fake_module_tree(
 def fake_product(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     original_calls: list[dict[str, object]] = []
     triton_calls: list[dict[str, object]] = []
+    lightop_calls: list[dict[str, object]] = []
     state: dict[str, object] = {}
+
+    # Most existing product tests exercise the retained Triton route. Tests
+    # for the default/custom route delete or override this value explicitly.
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "0")
 
     def original_get_output_padding(self):
         return "target-padding"
@@ -130,11 +137,48 @@ def fake_product(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     triton = ModuleType(_TRITON_MODULE)
     triton.triton_scaled_mm = triton_scaled_mm
+    lightop = ModuleType(_LIGHTOP_MODULE)
+
+    def hipblaslt_w8a8_channelwise_gemm(
+        a,
+        b,
+        scale_a,
+        scale_b,
+        m,
+        n,
+        k,
+        transpose_flag,
+        out_dtype,
+        bias=None,
+    ):
+        values = torch.arange(m * n, dtype=torch.float32).reshape(1, m, n)
+        result = values.to(out_dtype)
+        lightop_calls.append(
+            {
+                "a": a,
+                "b": b,
+                "scale_a": scale_a,
+                "scale_b": scale_b,
+                "m": m,
+                "n": n,
+                "k": k,
+                "transpose_flag": transpose_flag,
+                "out_dtype": out_dtype,
+                "bias": bias,
+                "result": result,
+            }
+        )
+        return True, result
+
+    lightop.hipblaslt_w8a8_channelwise_gemm = (
+        hipblaslt_w8a8_channelwise_gemm
+    )
     _install_fake_module_tree(
         monkeypatch,
         {
             _TARGET_MODULE: target,
             _TRITON_MODULE: triton,
+            _LIGHTOP_MODULE: lightop,
         },
     )
     # Ordinary product tests exercise adapter ownership and eager contracts.
@@ -155,6 +199,7 @@ def fake_product(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         original_apply_scaled_mm=original_apply_scaled_mm,
         original_calls=original_calls,
         triton_calls=triton_calls,
+        lightop_calls=lightop_calls,
         state=state,
     )
 
@@ -187,6 +232,15 @@ def _valid_call(
 def _install_and_make_kernel(fake_product: SimpleNamespace):
     scaled_mm.install_fp8_scaled_mm_compat(fake_product.target)
     return fake_product.channel_class()
+
+
+def test_hcu_channel_fp8_backend_is_selectable_on_official_main(
+    fake_product: SimpleNamespace,
+):
+    kernel = _install_and_make_kernel(fake_product)
+    assert type(kernel).is_supported(None) == (True, None)
+    descriptor = vars(type(kernel))["is_supported"]
+    assert descriptor.__func__._hcu_fp8_support_wrapper is True
 
 
 @pytest.fixture(autouse=True)
@@ -485,7 +539,7 @@ def test_existing_marker_without_reviewed_wrapper_identity_fails_closed(
 ):
     fake_product.channel_class._hcu_fp8_patch_applied = True
     fake_product.channel_class._hcu_fp8_backend = "target-triton"
-    with pytest.raises(RuntimeError, match="without the reviewed target Triton"):
+    with pytest.raises(RuntimeError, match="without the reviewed HCU wrapper"):
         scaled_mm.install_fp8_scaled_mm_compat(fake_product.target)
 
 
@@ -536,6 +590,104 @@ def test_channelwise_route_calls_target_triton_and_reshapes_output(
     assert fake_product.original_calls == []
 
 
+@pytest.mark.parametrize("value", [None, "1", "true"])
+def test_channelwise_route_uses_lightop_by_default_or_when_enabled(
+    fake_product: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+):
+    if value is None:
+        monkeypatch.delenv(
+            "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM",
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", value)
+    kernel = _install_and_make_kernel(fake_product)
+    kwargs = _valid_call(output_shape=(2, 3, 5))
+    kwargs["A"] = kwargs["A"].to(_LIGHTOP_FP8_DTYPE)
+    kwargs["B"] = _column_major_weight(4, 5, dtype=_LIGHTOP_FP8_DTYPE)
+
+    output = kernel.apply_scaled_mm(**kwargs)
+
+    assert tuple(output.shape) == (2, 3, 5)
+    assert fake_product.triton_calls == []
+    assert len(fake_product.lightop_calls) == 1
+    call = fake_product.lightop_calls[0]
+    assert call["a"] is kwargs["A"]
+    assert tuple(call["b"].shape) == (
+        kwargs["B"].shape[1],
+        kwargs["B"].shape[0],
+    )
+    assert call["b"].is_contiguous()
+    assert call["b"].untyped_storage().data_ptr() == (
+        kwargs["B"].untyped_storage().data_ptr()
+    )
+    assert call["scale_a"] is kwargs["As"]
+    assert call["scale_b"] is kwargs["Bs"]
+    assert (call["m"], call["n"], call["k"]) == (6, 5, 4)
+    assert call["transpose_flag"] == "NT"
+    assert call["out_dtype"] is torch.bfloat16
+    assert call["bias"] is kwargs["bias"]
+    assert output.untyped_storage().data_ptr() == (
+        call["result"].untyped_storage().data_ptr()
+    )
+    assert fake_product.channel_class._hcu_fp8_backend == "lightop"
+
+
+def test_lightop_backend_resolution_returns_stable_adapter(
+    fake_product: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "1")
+
+    first_name, first_backend = scaled_mm._resolve_scaled_mm_backend()
+    second_name, second_backend = scaled_mm._resolve_scaled_mm_backend()
+
+    assert first_name == second_name == "lightop"
+    assert first_backend is second_backend
+
+
+@pytest.mark.parametrize(
+    ("case", "match"),
+    [
+        ("fp8-fnuz", "float8_e4m3fn"),
+        ("scale-f16", "float32 scales"),
+        ("output-f32", "float16 or bfloat16"),
+        ("bias-mismatch", "bias dtype"),
+    ],
+)
+def test_lightop_route_rejects_unsupported_dtypes_before_backend(
+    fake_product: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    match: str,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "1")
+    kernel = _install_and_make_kernel(fake_product)
+    kwargs = _valid_call()
+    kwargs["A"] = kwargs["A"].to(_LIGHTOP_FP8_DTYPE)
+    kwargs["B"] = _column_major_weight(4, 5, dtype=_LIGHTOP_FP8_DTYPE)
+
+    if case == "fp8-fnuz":
+        kwargs["A"] = kwargs["A"].to(_FP8_DTYPE)
+        kwargs["B"] = _column_major_weight(4, 5, dtype=_FP8_DTYPE)
+    elif case == "scale-f16":
+        kwargs["As"] = kwargs["As"].to(torch.float16)
+        kwargs["Bs"] = kwargs["Bs"].to(torch.float16)
+    elif case == "output-f32":
+        kwargs["out_dtype"] = torch.float32
+        kwargs["bias"] = kwargs["bias"].to(torch.float32)
+    elif case == "bias-mismatch":
+        kwargs["bias"] = kwargs["bias"].to(torch.float16)
+    else:  # pragma: no cover - protects the parameter table itself
+        raise AssertionError(f"unknown test case: {case}")
+
+    with pytest.raises(ValueError, match=match):
+        kernel.apply_scaled_mm(**kwargs)
+    assert fake_product.lightop_calls == []
+
+
 def test_channelwise_route_preserves_target_per_tensor_weight_scale(
     fake_product: SimpleNamespace,
 ):
@@ -550,13 +702,17 @@ def test_channelwise_route_preserves_target_per_tensor_weight_scale(
     assert fake_product.triton_calls[0]["scale_b"] is kwargs["Bs"]
 
 
-def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
+@pytest.mark.parametrize("custom_quantization_gemm", ["0", "1"])
+def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph(
+    custom_quantization_gemm: str,
+):
     """Exercise production plumbing with an isolated test dispatch key."""
 
     probe = textwrap.dedent(
         r"""
         from __future__ import annotations
 
+        import os
         import sys
         from types import ModuleType
 
@@ -576,6 +732,9 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
         )
         LIBRARIES = []
         REAL_CALLS = []
+        USE_LIGHTOP = (
+            os.environ["VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM"] == "1"
+        )
 
 
         def package(name):
@@ -652,11 +811,43 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
                 bucket = 128
             else:
                 bucket = 256
-            REAL_CALLS.append((m, bucket))
+            REAL_CALLS.append(("target-triton", m, bucket))
             return torch.zeros(
                 (m, weight.shape[1]),
                 dtype=out_dtype,
                 device=input.device,
+            )
+
+
+        def hipblaslt_w8a8_channelwise_gemm(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            m,
+            n,
+            k,
+            transpose_flag,
+            out_dtype,
+            bias,
+        ):
+            del scale_a, scale_b, bias
+            assert transpose_flag == "NT"
+            assert tuple(a.shape) == (m, k)
+            assert tuple(b.shape) == (n, k)
+            if m <= 32:
+                bucket = 32
+            elif m <= 64:
+                bucket = 64
+            elif m <= 128:
+                bucket = 128
+            else:
+                bucket = 256
+            REAL_CALLS.append(("lightop", m, bucket))
+            return True, torch.zeros(
+                (1, m, n),
+                dtype=out_dtype,
+                device=a.device,
             )
 
 
@@ -666,17 +857,27 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
         )
         triton = ModuleType(TRITON)
         triton.triton_scaled_mm = triton_scaled_mm
+        lightop_gemm_ops = ModuleType("lightop.gemm_ops")
+        lightop_gemm_ops.hipblaslt_w8a8_channelwise_gemm = (
+            hipblaslt_w8a8_channelwise_gemm
+        )
         torch_utils = ModuleType("vllm.utils.torch_utils")
         torch_utils.direct_register_custom_op = direct_register_custom_op
         install_tree(
             {
                 TARGET: target,
                 TRITON: triton,
+                "lightop.gemm_ops": lightop_gemm_ops,
                 "vllm.utils.torch_utils": torch_utils,
             }
         )
 
         scaled_mm.install_fp8_scaled_mm_compat(target)
+        expected_backend = "lightop" if USE_LIGHTOP else "target-triton"
+        assert (
+            ChannelWiseTorchFP8ScaledMMLinearKernel._hcu_fp8_backend
+            == expected_backend
+        )
         kernel = ChannelWiseTorchFP8ScaledMMLinearKernel()
         graphs = []
         captured_graphs = []
@@ -710,7 +911,7 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
             fullgraph=True,
             dynamic=True,
         )
-        fp8 = torch.float8_e4m3fnuz
+        fp8 = torch.float8_e4m3fn if USE_LIGHTOP else torch.float8_e4m3fnuz
         B = torch.zeros((5, 4), dtype=fp8).t()
         Bs = torch.ones((5, 1), dtype=torch.float32)
         bias = torch.ones((5,), dtype=torch.bfloat16)
@@ -726,7 +927,12 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
         assert len(graphs) == 1, graphs
         assert len(captured_graphs) == 1, captured_graphs
         assert "hcu_channel_fp8_target_triton_scaled_mm" in graphs[0]
-        assert REAL_CALLS == [(2, 32), (33, 64), (65, 128), (129, 256)]
+        assert REAL_CALLS == [
+            (expected_backend, 2, 32),
+            (expected_backend, 33, 64),
+            (expected_backend, 65, 128),
+            (expected_backend, 129, 256),
+        ]
 
         captured_graph, _ = captured_graphs[0]
         _, split_items = split_graph(captured_graph, ["aten::sigmoid"])
@@ -791,6 +997,7 @@ def test_channelwise_custom_op_keeps_full_profile_range_in_one_graph():
             "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
             "VLLM_PLUGINS": "__disabled__",
+            "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM": custom_quantization_gemm,
         }
     )
     completed = subprocess.run(
@@ -968,7 +1175,7 @@ def test_incompatible_triton_outputs_fail_closed_without_fallback(
         )
 
     fake_product.state["behavior"] = bad_behavior
-    with pytest.raises(RuntimeError, match="target triton_scaled_mm"):
+    with pytest.raises(RuntimeError, match="selected Channel-FP8 backend"):
         kernel.apply_scaled_mm(**kwargs)
     assert len(fake_product.triton_calls) == 1
     assert fake_product.original_calls == []

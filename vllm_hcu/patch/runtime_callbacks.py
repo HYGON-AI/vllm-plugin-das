@@ -83,6 +83,12 @@ def apply_fp8_scaled_mm(module: ModuleType) -> None:
     function(module)
     if not getattr(channel_class, "_hcu_fp8_patch_applied", False):
         raise Stage3CompatibilityError("FP8 scaled-mm runtime patch did not apply")
+    support_descriptor = vars(channel_class).get("is_supported")
+    support_wrapper = getattr(support_descriptor, "__func__", support_descriptor)
+    if not getattr(support_wrapper, "_hcu_fp8_support_wrapper", False):
+        raise Stage3CompatibilityError(
+            "FP8 scaled-mm support selector runtime patch did not apply"
+        )
 
 
 def apply_hcu_lora_column_parallel(module: ModuleType) -> None:

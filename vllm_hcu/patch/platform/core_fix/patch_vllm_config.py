@@ -249,6 +249,14 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # the validated v0.25 routing semantics without a user environment knob.
         os.environ["VLLM_MOE_SKIP_PADDING"] = "0"
 
+    # Upstream AITER ScaledMM kernels still gate their support checks on the
+    # ROCm environment switches even when the public linear-backend selector
+    # explicitly requests AITER. Normalize that legacy contract in the parent
+    # process so spawned workers see it without requiring user-side env vars.
+    if getattr(kernel_config, "linear_backend", None) == "aiter":
+        os.environ["VLLM_ROCM_USE_AITER"] = "1"
+        os.environ["VLLM_ROCM_USE_AITER_LINEAR"] = "1"
+
     if parallel_config is not None:
         setattr(
             parallel_config,
