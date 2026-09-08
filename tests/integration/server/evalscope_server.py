@@ -256,6 +256,17 @@ def _open_log(path: Path):
     return path.open("ab")
 
 
+def _log_tail(path: Path, max_bytes: int = 8 * 1024) -> str:
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes))
+            return stream.read().decode(errors="replace")
+    except OSError as exc:
+        return f"<unable to read log: {exc}>"
+
+
 def _reset_evalscope_artifacts(work_dir: Path) -> None:
     """Remove outputs that EvalScope reuses when ``--no-timestamp`` is set."""
 
@@ -929,10 +940,13 @@ def run_evalscope_server_test(
                     stderr=subprocess.STDOUT,
                     check=False,
                 )
-            assert result.returncode == 0, (
-                f"evalscope failed with rc={result.returncode}; "
-                f"server_log={server_log_path}; eval_log={eval_log_path}"
-            )
+            if result.returncode != 0:
+                raise AssertionError(
+                    f"evalscope failed with rc={result.returncode}; "
+                    f"server_log={server_log_path}; eval_log={eval_log_path}\n"
+                    f"EvalScope log tail:\n{_log_tail(eval_log_path)}\n"
+                    f"vLLM server log tail:\n{_log_tail(server_log_path)}"
+                )
             _assert_pass_criteria(
                 config,
                 model_env=model_env,

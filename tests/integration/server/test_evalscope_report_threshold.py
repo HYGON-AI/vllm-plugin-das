@@ -21,12 +21,20 @@ from tests.integration.server import evalscope_server
 from tests.integration.server.evalscope_server import (
     _assert_pass_criteria,
     _direct_urlopen,
+    _log_tail,
     _server_environment,
     load_config,
 )
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_log_tail_reads_only_the_requested_suffix(tmp_path: Path) -> None:
+    log_path = tmp_path / "evalscope.log"
+    log_path.write_bytes(b"discard-this\nroot cause\n")
+
+    assert _log_tail(log_path, max_bytes=11) == "root cause\n"
 
 
 def test_qwen3_gsm8k_config_uses_reproducible_greedy_generation(
