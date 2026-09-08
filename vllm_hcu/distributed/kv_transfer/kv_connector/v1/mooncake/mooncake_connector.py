@@ -43,10 +43,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+    get_pcp_group,
+    # === HCU_MOONCAKE_PCP_NIXL52779_END ===
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -143,11 +147,12 @@ class TransferRegion:
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
-    """Return the TP ratio used by heterogeneous TP transfer planning.
+    """TP ratio for heterogeneous KV transfer.
 
-    Positive values mean one local rank maps into a larger remote KV region.
-    Negative values mean one local rank must gather from multiple remote KV
-    regions.
+    Sign convention aligned with v0.21:
+    - ``1``: homogeneous TP
+    - ``> 1``: P_TP > D_TP
+    - ``< 0``: D_TP > P_TP
     """
     if local_tp_size >= remote_tp_size:
         assert local_tp_size % remote_tp_size == 0, (
@@ -161,6 +166,65 @@ def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
         f"by local tensor parallel size {local_tp_size}."
     )
     return -(remote_tp_size // local_tp_size)
+
+
+def _get_head_split_ratio(tp_ratio: int) -> int:
+    """Head-chunk count for heterogeneous TP (always positive)."""
+    if tp_ratio > 1:
+        return tp_ratio
+    if tp_ratio < 0:
+        return -tp_ratio
+    return 1
+
+
+def _cache_type_sort_key(layer_name: str) -> int:
+    """Indexer cache entries sort before MLA/FA in the same model layer."""
+    if layer_name.endswith(".indexer") or ".indexer." in layer_name:
+        return 0
+    return 1
+
+
+def _is_hcu_global_first_rank() -> bool:
+    """Internal LB launches bootstrap only on the global first rank."""
+    try:
+        from vllm.distributed.parallel_state import is_global_first_rank
+    except ImportError:
+        return True
+    try:
+        return bool(is_global_first_rank())
+    except Exception:
+        return True
+
+
+def _select_cache_entry_indices(
+    layer_names: list[str],
+    layer_indices: list[int],
+    *,
+    model_layer_start: int = -1,
+    model_layer_end: int = -1,
+    src_layer_offset: int = 0,
+) -> list[int]:
+    """Select cache rows by model-layer overlap, then indexer-first."""
+    if model_layer_start >= 0:
+        selected = [
+            index
+            for index, layer_idx in enumerate(layer_indices)
+            if model_layer_start <= layer_idx < model_layer_end
+        ]
+    else:
+        selected = list(range(src_layer_offset, len(layer_names)))
+    selected.sort(
+        key=lambda index: (
+            layer_indices[index],
+            _cache_type_sort_key(layer_names[index]),
+            index,
+        )
+    )
+    return selected
+
+
+def _take_cache_entries(values_list: list, indices: list[int]):
+    return [values_list[index] for index in indices]
 
 
 def _expand_transfer_regions(
@@ -584,6 +648,11 @@ class MooncakeXferMetadata(
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
+    src_layer_offset: int = 0
+    model_layer_start: int = -1
+    model_layer_end: int = -1
+    xfer_head_rank: int = -1
+    remote_pp_size: int = 1
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -672,6 +741,9 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+        _validate_mooncake_pcp_pd(vllm_config)
+        # === HCU_MOONCAKE_PCP_NIXL52779_END ===
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -1160,6 +1232,20 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+        # PCP adds KV replicas, not extra shards.
+        self.pcp_size = int(
+            getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
+            or 1
+        )
+        self.dcp_size = int(
+            getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+            or 1
+        )
+        self.pcp_rank = (
+            int(get_pcp_group().rank_in_group) if self.pcp_size > 1 else 0
+        )
+        # === HCU_MOONCAKE_PCP_NIXL52779_END ===
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -1450,13 +1536,33 @@ class MooncakeConnectorWorker:
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
                 return
+        local_base_addrs = self.kv_caches_base_addr
+        local_block_lens = self.block_len_per_layer
+        local_kv_block_lens = self.kv_block_len_per_layer
+        local_layer_names = self.registered_layer_names
+        local_layer_indices = self.registered_layer_indices
+        local_group_indices = self.registered_group_indices
+        if meta.model_layer_start >= 0 or meta.src_layer_offset:
+            local_keep = _select_cache_entry_indices(
+                local_layer_names,
+                local_layer_indices,
+                model_layer_start=meta.model_layer_start,
+                model_layer_end=meta.model_layer_end,
+                src_layer_offset=meta.src_layer_offset,
+            )
+            local_base_addrs = _take_cache_entries(local_base_addrs, local_keep)
+            local_block_lens = _take_cache_entries(local_block_lens, local_keep)
+            local_kv_block_lens = _take_cache_entries(local_kv_block_lens, local_keep)
+            local_layer_names = _take_cache_entries(local_layer_names, local_keep)
+            local_layer_indices = _take_cache_entries(local_layer_indices, local_keep)
+            local_group_indices = _take_cache_entries(local_group_indices, local_keep)
         local_regions = self._get_transfer_regions(
-            self.kv_caches_base_addr,
-            self.block_len_per_layer,
-            self.kv_block_len_per_layer,
-            self.registered_layer_names,
-            self.registered_layer_indices,
-            self.registered_group_indices,
+            local_base_addrs,
+            local_block_lens,
+            local_kv_block_lens,
+            local_layer_names,
+            local_layer_indices,
+            local_group_indices,
         )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
@@ -1542,7 +1648,11 @@ class MooncakeConnectorWorker:
                     # Mark it sending to avoid expiration.
                     send_meta.sending += 1
                     if not send_meta.need_send:
-                        self.resolve_need_send(send_meta, remote_tp_ranks)
+                        self.resolve_need_send(
+                            send_meta,
+                            remote_tp_ranks,
+                            remote_pp_size=meta.remote_pp_size,
+                        )
                     ready_reqs.append((d_req_id, send_meta))
                 else:
                     # Otherwise (expired, very unlikely), just forget it.
@@ -1628,18 +1738,41 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
+    def _count_overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
+        """How many consumer PP stages overlap this producer's layer range."""
+        remote_pp_size = max(int(remote_pp_size), 1)
+        if remote_pp_size == 1 or self.pp_size <= 0:
+            return remote_pp_size
+        total_model_layers = self.model_config.get_total_num_hidden_layers()
+        p_start, p_end = get_pp_indices(
+            total_model_layers, self.pp_rank, self.pp_size
+        )
+        overlap = 0
+        for d_pp_rank in range(remote_pp_size):
+            d_start, d_end = get_pp_indices(
+                total_model_layers, d_pp_rank, remote_pp_size
+            )
+            if d_start >= p_end or p_start >= d_end:
+                continue
+            overlap += 1
+        return max(overlap, 1)
+
     def resolve_need_send(
         self,
         send_meta: SendBlockMeta,
         remote_tp_ranks: list[int],
+        remote_pp_size: int = 1,
     ):
-        # Prepare for heterogeneous TP (one P pairs to multiple D)
-        send_meta.need_send = len(remote_tp_ranks)
+        pp_contacts = self._count_overlapping_remote_pp_stages(remote_pp_size)
+        send_meta.need_send = len(remote_tp_ranks) * pp_contacts
         logger.debug(
-            "Mooncake request %s will be served by %d consumer TP workers: TP ranks=%s",
+            "Mooncake request %s will be served by %d consumer contacts "
+            "(tp_ranks=%s pp_contacts=%d remote_pp_size=%d)",
             send_meta.transfer_id,
             send_meta.need_send,
             remote_tp_ranks,
+            pp_contacts,
+            remote_pp_size,
         )
 
     def _logical_to_kernel_block_ids(
@@ -1803,7 +1936,11 @@ class MooncakeConnectorWorker:
                 ) = self._get_sender_transfer_plan(
                     local_kv_block_len=local_region.kv_block_len,
                     remote_kv_block_len=remote_region.kv_block_len,
-                    remote_tp_rank=agent_meta.remote_tp_rank,
+                    remote_tp_rank=(
+                        agent_meta.xfer_head_rank
+                        if agent_meta.xfer_head_rank >= 0
+                        else agent_meta.remote_tp_rank
+                    ),
                     remote_tp_size=agent_meta.remote_tp_size,
                 )
                 if not should_transfer:
@@ -2043,6 +2180,29 @@ class MooncakeConnectorWorker:
                     kv_data_ptrs.append(storage_addr)
                     kv_data_lens.append(storage_len)
 
+        indexer_order = _select_cache_entry_indices(
+            self.registered_layer_names,
+            self.registered_layer_indices,
+        )
+        region_base_addresses = _take_cache_entries(
+            region_base_addresses, indexer_order
+        )
+        self.block_len_per_layer = _take_cache_entries(
+            self.block_len_per_layer, indexer_order
+        )
+        self.kv_block_len_per_layer = _take_cache_entries(
+            self.kv_block_len_per_layer, indexer_order
+        )
+        self.registered_layer_names = _take_cache_entries(
+            self.registered_layer_names, indexer_order
+        )
+        self.registered_layer_indices = _take_cache_entries(
+            self.registered_layer_indices, indexer_order
+        )
+        self.registered_group_indices = _take_cache_entries(
+            self.registered_group_indices, indexer_order
+        )
+
         self.kv_caches_base_addr = region_base_addresses
         self.seen_base_addresses = kv_data_ptrs
 
@@ -2063,6 +2223,17 @@ class MooncakeConnectorWorker:
         # No need to launch server for D node.
         if self.is_kv_consumer:
             return
+        # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+        # Non-canonical PCP replicas do not listen or register.
+        if not self._is_canonical_pcp_kv_replica():
+            logger.info(
+                "Mooncake PCP replica skip listen/register: pcp_rank=%s "
+                "pcp_size=%s (rank0 sends the KV replica)",
+                self.pcp_rank,
+                self.pcp_size,
+            )
+            return
+        # === HCU_MOONCAKE_PCP_NIXL52779_END ===
 
         ready_event = threading.Event()
         asyncio.run_coroutine_threadsafe(
@@ -2147,8 +2318,31 @@ class MooncakeConnectorWorker:
         self,
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
+        *,
+        chunk_idx: int | None = None,
+        model_layer_start: int = -1,
+        model_layer_end: int = -1,
     ):
         req_ids = set(pull_metas)
+        base_addrs = self.kv_caches_base_addr
+        block_lens = self.block_len_per_layer
+        kv_block_lens = self.kv_block_len_per_layer
+        layer_names = self.registered_layer_names
+        layer_indices = self.registered_layer_indices
+        group_indices = self.registered_group_indices
+        if model_layer_start >= 0:
+            keep = _select_cache_entry_indices(
+                layer_names,
+                layer_indices,
+                model_layer_start=model_layer_start,
+                model_layer_end=model_layer_end,
+            )
+            base_addrs = _take_cache_entries(base_addrs, keep)
+            block_lens = _take_cache_entries(block_lens, keep)
+            kv_block_lens = _take_cache_entries(kv_block_lens, keep)
+            layer_names = _take_cache_entries(layer_names, keep)
+            layer_indices = _take_cache_entries(layer_indices, keep)
+            group_indices = _take_cache_entries(group_indices, keep)
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -2158,12 +2352,18 @@ class MooncakeConnectorWorker:
                 req_id: (pull_meta.transfer_id, pull_meta.local_block_ids)
                 for req_id, pull_meta in pull_metas.items()
             },
-            kv_caches_base_addr=self.kv_caches_base_addr,
-            block_lens=self.block_len_per_layer,
-            kv_block_lens=self.kv_block_len_per_layer,
-            registered_layer_names=self.registered_layer_names,
-            registered_layer_indices=self.registered_layer_indices,
-            registered_group_indices=self.registered_group_indices,
+            kv_caches_base_addr=base_addrs,
+            block_lens=block_lens,
+            kv_block_lens=kv_block_lens,
+            registered_layer_names=layer_names,
+            registered_layer_indices=layer_indices,
+            registered_group_indices=group_indices,
+            model_layer_start=model_layer_start,
+            model_layer_end=model_layer_end,
+            xfer_head_rank=(
+                chunk_idx if chunk_idx is not None else self.tp_rank
+            ),
+            remote_pp_size=self.pp_size,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2295,18 +2495,43 @@ class MooncakeConnectorWorker:
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
-        worker_addrs: list[str] = []
+        worker_jobs: list[tuple[str, int | None, int, int]] = []
         selected_remote_pp: dict[int, list[int]] = {}
-        for remote_tp_rank in remote_tp_ranks:
+        needs_chunk_idx = len(remote_tp_ranks) > 1
+        for i, remote_tp_rank in enumerate(remote_tp_ranks):
             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
+            remote_pp_size = len(pp_to_addr)
+            same_pp = self.pp_size == remote_pp_size and self.pp_rank in pp_to_addr
+            if same_pp:
                 pp_ranks = [self.pp_rank]
             else:
-                pp_ranks = sorted(pp_to_addr)
+                pp_ranks = self._overlapping_remote_pp_ranks(
+                    remote_pp_size, sorted(pp_to_addr)
+                )
             selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+            chunk_idx = i if needs_chunk_idx else None
+            for pp_rank in pp_ranks:
+                if same_pp:
+                    worker_jobs.append(
+                        (pp_to_addr[pp_rank], chunk_idx, -1, -1)
+                    )
+                    continue
+                overlap_start, overlap_end = self._pp_overlap_layer_range(
+                    remote_pp_rank=pp_rank,
+                    remote_pp_size=remote_pp_size,
+                )
+                if overlap_start >= overlap_end:
+                    continue
+                worker_jobs.append(
+                    (
+                        pp_to_addr[pp_rank],
+                        chunk_idx,
+                        overlap_start,
+                        overlap_end,
+                    )
+                )
 
-        count = len(worker_addrs)
+        count = len(worker_jobs)
         logger.debug(
             "Receiving Mooncake KV for engine %s from producer TP ranks %s "
             "and PP ranks %s",
@@ -2314,11 +2539,24 @@ class MooncakeConnectorWorker:
             remote_tp_ranks,
             selected_remote_pp,
         )
+        if count == 0:
+            self._fail_pull_metas(
+                pull_metas,
+                f"asymmetric PP has zero overlap tasks for engine "
+                f"{remote_engine_id}",
+            )
+            return
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
-        for worker_addr in worker_addrs:
+        for worker_addr, chunk_idx, layer_start, layer_end in worker_jobs:
             asyncio.create_task(
-                self.receive_kv_from_single_worker(worker_addr, pull_metas)
+                self.receive_kv_from_single_worker(
+                    worker_addr,
+                    pull_metas,
+                    chunk_idx=chunk_idx,
+                    model_layer_start=layer_start,
+                    model_layer_end=layer_end,
+                )
             )
 
     async def handle_new_engine_id(
@@ -2387,6 +2625,27 @@ class MooncakeConnectorWorker:
             if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
+    # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+    def _is_canonical_pcp_kv_replica(self) -> bool:
+        """True if this rank owns the sendable PCP KV replica."""
+
+        return int(getattr(self, "pcp_size", 1) or 1) <= 1 or int(
+            getattr(self, "pcp_rank", 0)
+        ) == 0
+
+    async def _complete_noncanonical_pcp_sends(
+        self, metadata: MooncakeConnectorMetadata
+    ) -> None:
+        """Mark send complete without transferring KV on non-rank0 PCP."""
+
+        for p_req_id, (_transfer_id, _block_ids) in metadata.reqs_to_send.items():
+            self.finished_sending_reqs.add(p_req_id)
+        for transfer_id in metadata.reqs_not_processed:
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None and send_meta.p_req_id:
+                self.finished_sending_reqs.add(send_meta.p_req_id)
+
+    # === HCU_MOONCAKE_PCP_NIXL52779_END ===
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
@@ -2396,12 +2655,44 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
-            asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+            # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+            # Non-canonical PCP replicas only mark send complete.
+            send_coro = (
+                self.record_send_reqs(metadata)
+                if self._is_canonical_pcp_kv_replica()
+                else self._complete_noncanonical_pcp_sends(metadata)
             )
+            asyncio.run_coroutine_threadsafe(send_coro, self.sender_loop)
+            # === HCU_MOONCAKE_PCP_NIXL52779_END ===
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
+
+    def _pp_overlap_layer_range(
+        self, *, remote_pp_rank: int, remote_pp_size: int
+    ) -> tuple[int, int]:
+        total_model_layers = self.model_config.get_total_num_hidden_layers()
+        d_start, d_end = get_pp_indices(
+            total_model_layers, self.pp_rank, self.pp_size
+        )
+        p_start, p_end = get_pp_indices(
+            total_model_layers, remote_pp_rank, remote_pp_size
+        )
+        return max(d_start, p_start), min(d_end, p_end)
+
+    def _overlapping_remote_pp_ranks(
+        self, remote_pp_size: int, remote_pp_ranks: list[int]
+    ) -> list[int]:
+        selected: list[int] = []
+        for pp_rank in remote_pp_ranks:
+            start, end = self._pp_overlap_layer_range(
+                remote_pp_rank=pp_rank,
+                remote_pp_size=remote_pp_size,
+            )
+            if start >= end:
+                continue
+            selected.append(pp_rank)
+        return selected
 
     def _get_transfer_regions(
         self,
@@ -2503,8 +2794,51 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
     loop.run_forever()
 
 
+# === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
+    """Reject PCP on consumers, kv_both, DCP>1, and bidirectional xfer."""
+
+    parallel_config = vllm_config.parallel_config
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if parallel_config is None or kv_transfer_config is None:
+        return
+    pcp_size = int(
+        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+    )
+    if pcp_size <= 1:
+        return
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    dcp_size = int(
+        getattr(parallel_config, "decode_context_parallel_size", 1) or 1
+    )
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if kv_role in ("kv_consumer", "kv_both"):
+        raise NotImplementedError(
+            "MooncakeConnector PCP currently supports kv_producer only. "
+            "Consumers and kv_both require prefill_context_parallel_size=1."
+        )
+    if dcp_size > 1:
+        raise NotImplementedError(
+            "MooncakeConnector PCP producers currently require "
+            "decode_context_parallel_size=1."
+        )
+    if extra.get("bidirectional_kv_xfer"):
+        raise NotImplementedError(
+            "MooncakeConnector PCP producers do not support bidirectional KV transfer."
+        )
+
+
+# === HCU_MOONCAKE_PCP_NIXL52779_END ===
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
+    # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
+    # TP=1 shares tp_rank=0 across PCP ranks; skip non-rank0 replicas.
+    _pcp_size = int(
+        getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+    )
+    if _pcp_size > 1 and int(get_pcp_group().rank_in_group) != 0:
+        return False
+    # === HCU_MOONCAKE_PCP_NIXL52779_END ===
     # Only the TP=0, PP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
@@ -2516,8 +2850,10 @@ def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     if parallel_config.local_engines_only:
         return parallel_config.data_parallel_rank_local == 0
 
-    # In internal LB mode,
-    # only the first data-parallel engine should launch the bootstrap server.
+    # Hybrid/external LB: each local engine keeps its own bootstrap.
+    # Multi-node prefill (Ray/internal LB): only global rank 0 on dp index 0.
+    if not _is_hcu_global_first_rank():
+        return False
     return parallel_config.data_parallel_index == 0
 
 

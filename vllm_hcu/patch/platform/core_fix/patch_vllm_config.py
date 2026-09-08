@@ -170,7 +170,29 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if kv_transfer_config is not None and _require_hcu_pcp_attribute(
         kv_transfer_config, "kv_connector", "KVTransferConfig"
     ) is not None:
-        raise ValueError("HCU PCP does not support P/D disaggregation.")
+        # HCU_MOONCAKE_PCP_NIXL52779: producer-only PCP, DCP=1.
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        dcp_size = int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "decode_context_parallel_size", "ParallelConfig"
+            )
+        )
+        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        if kv_role in ("kv_consumer", "kv_both"):
+            raise ValueError(
+                "HCU PCP currently supports kv_producer only. "
+                "Consumers and kv_both require prefill_context_parallel_size=1."
+            )
+        if dcp_size > 1:
+            raise ValueError(
+                "HCU PCP producers currently require decode_context_parallel_size=1."
+            )
+        if extra.get("bidirectional_kv_xfer"):
+            raise ValueError(
+                "HCU PCP producers do not support bidirectional KV transfer."
+            )
+        if kv_role != "kv_producer":
+            raise ValueError("HCU PCP does not support P/D disaggregation.")
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:
