@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Annotate Qwen4Exp MTP groups on the upstream vLLM scheduler."""
+"""Align Qwen hybrid MTP scheduling with the upstream vLLM scheduler."""
 
 from __future__ import annotations
 
@@ -16,6 +16,10 @@ from ._common import (
     require_class,
     require_signature_prefix,
 )
+from .patch_qwen4_exp_mtp_kv_cache_groups import (
+    _is_mtp_layer,
+    _is_qwen_hybrid_mtp,
+)
 
 TARGET_MODULE = "vllm.v1.core.sched.scheduler"
 PATCH_ID = "platform.framework_opt.hcu_scheduler"
@@ -25,21 +29,15 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids",
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids_in_output",
     f"{TARGET_MODULE}.Scheduler.__init__",
+    f"{TARGET_MODULE}.Scheduler._mamba_block_aligned_split",
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
 
 
-def _mark_qwen4_exp_mtp_groups(vllm_config: object, kv_cache_config: object) -> None:
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    if getattr(hf_config, "model_type", None) != "qwen4_exp":
-        return
-
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    use_eagle_block_drop = getattr(
-        speculative_config, "use_eagle_block_drop", None
-    )
-    if not callable(use_eagle_block_drop) or not use_eagle_block_drop():
+def _mark_qwen_hybrid_mtp_groups(
+    vllm_config: object, kv_cache_config: object
+) -> None:
+    if not _is_qwen_hybrid_mtp(vllm_config):
         return
 
     marked_group_ids = []
@@ -47,12 +45,12 @@ def _mark_qwen4_exp_mtp_groups(vllm_config: object, kv_cache_config: object) -> 
         getattr(kv_cache_config, "kv_cache_groups", ())
     ):
         layer_names = getattr(group, "layer_names", ())
-        if any("mtp" in layer_name.split(".") for layer_name in layer_names):
+        if any(_is_mtp_layer(layer_name) for layer_name in layer_names):
             group.is_eagle_group = True
             marked_group_ids.append(index)
     if marked_group_ids:
         logger.info(
-            "Marked Qwen4Exp MTP KV cache groups as Eagle at scheduler "
+            "Marked Qwen hybrid MTP KV cache groups as Eagle at scheduler "
             "boundary: %s",
             marked_group_ids,
         )
@@ -91,17 +89,36 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
     )
     init_signature = signature(scheduler_init)
+    original_mamba_split = require_callable(
+        scheduler, "_mamba_block_aligned_split", TARGETS[4]
+    )
 
     @wraps(scheduler_init)
-    def scheduler_init_with_qwen4_exp_mtp_groups(self, *args, **kwargs):
+    def scheduler_init_with_qwen_mtp_groups(self, *args, **kwargs):
         bound = init_signature.bind(self, *args, **kwargs)
-        _mark_qwen4_exp_mtp_groups(
+        _mark_qwen_hybrid_mtp_groups(
             bound.arguments["vllm_config"],
             bound.arguments["kv_cache_config"],
         )
         return scheduler_init(self, *args, **kwargs)
 
-    scheduler.__init__ = scheduler_init_with_qwen4_exp_mtp_groups
+    @wraps(original_mamba_split)
+    def hcu_mamba_block_aligned_split(self, *args, **kwargs):
+        # Upstream reads CacheConfig.block_size here, while hybrid cache
+        # construction can enlarge the scheduler/Mamba page. Reuse the
+        # upstream split algorithm with the actual scheduling granularity.
+        cache_block_size = self.cache_config.block_size
+        scheduler_block_size = self.block_size
+        if cache_block_size == scheduler_block_size:
+            return original_mamba_split(self, *args, **kwargs)
+        self.cache_config.block_size = scheduler_block_size
+        try:
+            return original_mamba_split(self, *args, **kwargs)
+        finally:
+            self.cache_config.block_size = cache_block_size
+
+    scheduler.__init__ = scheduler_init_with_qwen_mtp_groups
+    scheduler._mamba_block_aligned_split = hcu_mamba_block_aligned_split
     setattr(target, _MARKER, True)
     return True
 

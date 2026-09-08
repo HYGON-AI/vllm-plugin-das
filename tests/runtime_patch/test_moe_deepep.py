@@ -1847,6 +1847,151 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     ]
 
 
+def test_triton_moe_rebinds_hcu_moe_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def official_align(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=None,
+        pad_sorted_ids=False,
+        ignore_invalid_experts=False,
+    ):
+        del (
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+        return "official"
+
+    align_module = _module(
+        patch_moe_align_block_size.TARGET_MODULE,
+        torch=torch,
+        triton=SimpleNamespace(cdiv=lambda value, block: (value + block - 1) // block),
+        round_up=lambda value, block: (value + block - 1) // block * block,
+        moe_align_block_size=official_align,
+    )
+    assert patch_moe_align_block_size.apply_to_module(align_module) is True
+    monkeypatch.setitem(sys.modules, patch_moe_align_block_size.TARGET_MODULE, align_module)
+
+    class TritonExperts:
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+    triton_module = _module(
+        patch_triton_moe.TARGET_MODULE,
+        TritonExperts=TritonExperts,
+        current_platform=SimpleNamespace(is_rocm=lambda: False),
+        kInt8StaticChannelSym=object(),
+        kInt8DynamicTokenSym=object(),
+        moe_align_block_size=official_align,
+    )
+
+    assert patch_triton_moe.apply_to_module(triton_module) is True
+    assert triton_module.moe_align_block_size is align_module.moe_align_block_size
+
+
+def test_fused_moe_rebinds_hcu_moe_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def official_align(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=None,
+        pad_sorted_ids=False,
+        ignore_invalid_experts=False,
+    ):
+        del (
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+        return "official"
+
+    align_module = _module(
+        patch_moe_align_block_size.TARGET_MODULE,
+        torch=torch,
+        triton=SimpleNamespace(cdiv=lambda value, block: (value + block - 1) // block),
+        round_up=lambda value, block: (value + block - 1) // block * block,
+        moe_align_block_size=official_align,
+    )
+    assert patch_moe_align_block_size.apply_to_module(align_module) is True
+    monkeypatch.setitem(sys.modules, patch_moe_align_block_size.TARGET_MODULE, align_module)
+
+    def fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        ocp_mx_scheme=None,
+        per_channel_quant=False,
+        global_num_experts=-1,
+        expert_map=None,
+        w1_scale=None,
+        w2_scale=None,
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+        w1_bias=None,
+        w2_bias=None,
+    ):
+        del (
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            ocp_mx_scheme,
+            per_channel_quant,
+            global_num_experts,
+            expert_map,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            w1_bias,
+            w2_bias,
+        )
+
+    fused_module = _module(
+        patch_fused_moe.TARGET_MODULE,
+        torch=torch,
+        fused_experts_impl=fused_experts_impl,
+        moe_align_block_size=official_align,
+    )
+
+    assert patch_fused_moe.apply_to_module(fused_module) is True
+    assert fused_module.moe_align_block_size is align_module.moe_align_block_size
+
+
 def test_moe_align_feature_off_and_lightop_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -5,13 +5,18 @@
 from __future__ import annotations
 
 import functools
+import importlib
 from types import ModuleType
 
+from . import patch_moe_align_block_size
 from ._common import load_exact_module, require_callable, require_parameter_names
 
 TARGET_MODULE = "vllm.model_executor.layers.fused_moe.fused_moe"
 PATCH_ID = "worker.op_opt.moe.fused_moe.aiter_w4a16"
-TARGETS = (f"{TARGET_MODULE}.fused_experts_impl",)
+TARGETS = (
+    f"{TARGET_MODULE}.fused_experts_impl",
+    f"{TARGET_MODULE}.moe_align_block_size",
+)
 _MARKER = "_vllm_hcu_fused_moe_w4a16_applied"
 
 
@@ -31,6 +36,13 @@ def apply_to_module(module: ModuleType) -> bool:
             "expert_map", "w1_scale", "w2_scale", "w1_zp", "w2_zp",
             "a1_scale", "a2_scale", "block_shape", "w1_bias", "w2_bias",
         ),
+    )
+    align_module = importlib.import_module(patch_moe_align_block_size.TARGET_MODULE)
+    patch_moe_align_block_size.apply_to_module(align_module)
+    hcu_moe_align_block_size = require_callable(
+        align_module,
+        "moe_align_block_size",
+        TARGETS[1],
     )
 
     @functools.wraps(original)
@@ -165,6 +177,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     target._vllm_hcu_original_fused_experts_impl = original
     target.fused_experts_impl = hcu_fused_experts_impl
+    target.moe_align_block_size = hcu_moe_align_block_size
     setattr(target, _MARKER, True)
     return True
 

@@ -321,19 +321,26 @@ def test_flash_attention_splits_legacy_and_official_main_kv_cache(
     nhd_storage = torch.arange(3 * 5 * 4 * 16).reshape(3, 5, 4, 16)
     official_nhd = nhd_storage.transpose(1, 2)
     nhd_key, nhd_value = flash_attn._split_kv_cache(official_nhd, 8)
-    nhd_flat = nhd_storage.view(-1)
-    nhd_half = nhd_flat.numel() // 2
-    assert torch.equal(nhd_key, nhd_flat[:nhd_half].view(3, 5, 4, 8))
-    assert torch.equal(nhd_value, nhd_flat[nhd_half:].view(3, 5, 4, 8))
-    assert nhd_key.is_contiguous() and nhd_value.is_contiguous()
+    assert torch.equal(nhd_key, nhd_storage[..., :8])
+    assert torch.equal(nhd_value, nhd_storage[..., 8:])
+    assert nhd_key.stride() == nhd_storage.stride()
+    assert nhd_value.stride() == nhd_storage.stride()
+
+    singleton_storage = torch.arange(3 * 5 * 1 * 16).reshape(3, 5, 1, 16)
+    singleton_official = singleton_storage.transpose(1, 2)
+    singleton_key, singleton_value = flash_attn._split_kv_cache(
+        singleton_official, 8
+    )
+    assert singleton_official.stride(1) == singleton_official.stride(2)
+    assert singleton_key.shape == (3, 5, 1, 8)
+    assert singleton_value.shape == (3, 5, 1, 8)
 
     official_hnd = torch.arange(3 * 4 * 5 * 16).reshape(3, 4, 5, 16)
     hnd_key, hnd_value = flash_attn._split_kv_cache(official_hnd, 8)
-    hnd_flat = official_hnd.view(-1)
-    hnd_half = hnd_flat.numel() // 2
-    assert torch.equal(hnd_key, hnd_flat[:hnd_half].view(3, 4, 5, 8))
-    assert torch.equal(hnd_value, hnd_flat[hnd_half:].view(3, 4, 5, 8))
-    assert hnd_key.is_contiguous() and hnd_value.is_contiguous()
+    assert torch.equal(hnd_key, official_hnd[..., :8].transpose(1, 2))
+    assert torch.equal(hnd_value, official_hnd[..., 8:].transpose(1, 2))
+    assert hnd_key.shape == (3, 5, 4, 8)
+    assert hnd_value.shape == (3, 5, 4, 8)
 
 
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
@@ -1200,3 +1207,112 @@ def test_unified_attention_proxy_forces_single_stage_and_preserves_other_kwargs(
     assert kernel.launches == [
         ((3, 7), ("q",), {"num_stages": 1, "num_warps": 8})
     ]
+
+
+def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
+    monkeypatch,
+) -> None:
+    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+
+    calls: dict[str, object] = {}
+
+    def fake_official_gather(
+        key_source,
+        value_source,
+        key_output,
+        value_output,
+        block_table,
+        seq_lens,
+        cu_seqlens_k,
+        max_seqlen,
+    ) -> None:
+        calls["source_shapes"] = (key_source.shape, value_source.shape)
+        calls["output_shapes"] = (key_output.shape, value_output.shape)
+        calls["cu_seqlens_k"] = cu_seqlens_k.clone()
+        calls["max_seqlen"] = max_seqlen
+
+    def fake_flash_attn(**kwargs):
+        calls["flash_kwargs"] = kwargs
+        return "flash-result"
+
+    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
+    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", fake_flash_attn)
+    monkeypatch.setattr(
+        fa_utils,
+        "_gather_paged_kv",
+        fake_official_gather,
+    )
+    query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
+    packed_cache = torch.zeros((144, 2, 64, 256), dtype=torch.bfloat16)
+    key_cache, value_cache = packed_cache.split(128, dim=-1)
+    seq_lens = torch.tensor([8421], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 37], dtype=torch.int32)
+    block_table = torch.arange(144, dtype=torch.int32).unsqueeze(0)
+
+    result = fa_utils.flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=37,
+        max_seqlen_k=8421,
+        seqused_k=seq_lens,
+        block_table=block_table,
+    )
+
+    assert result == "flash-result"
+    assert calls["source_shapes"] == (
+        torch.Size([144, 64, 2, 128]),
+        torch.Size([144, 64, 2, 128]),
+    )
+    assert calls["output_shapes"] == (
+        torch.Size([8421, 2, 128]),
+        torch.Size([8421, 2, 128]),
+    )
+    assert calls["cu_seqlens_k"].tolist() == [0, 8421]
+    assert calls["max_seqlen"] == 8421
+    forwarded = calls["flash_kwargs"]
+    assert isinstance(forwarded, dict)
+    assert forwarded["block_table"] is None
+    assert forwarded["seqused_k"] is None
+    assert forwarded["cu_seqlens_k"].shape == (2,)
+
+
+def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
+    monkeypatch,
+) -> None:
+    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+
+    calls = []
+
+    def fake_flash_attn(**kwargs):
+        calls.append(kwargs)
+        return "vendor-result"
+
+    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
+    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", fake_flash_attn)
+    monkeypatch.setattr(
+        fa_utils,
+        "_gather_paged_kv",
+        lambda *args, **kwargs: pytest.fail("unexpected Triton KV gather"),
+    )
+    query = torch.zeros((75, 8, 128), dtype=torch.bfloat16)
+    packed_cache = torch.zeros((72, 2, 64, 256), dtype=torch.bfloat16)
+    key_cache, value_cache = packed_cache.split(128, dim=-1)
+    block_table = torch.arange(72, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor([4171], dtype=torch.int32)
+
+    result = fa_utils.flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=torch.tensor([0, 75], dtype=torch.int32),
+        max_seqlen_q=75,
+        max_seqlen_k=4171,
+        seqused_k=seq_lens,
+        block_table=block_table,
+    )
+
+    assert result == "vendor-result"
+    assert calls[0]["block_table"] is block_table
+    assert calls[0]["seqused_k"] is seq_lens

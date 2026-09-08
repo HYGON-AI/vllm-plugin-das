@@ -5,8 +5,11 @@ from __future__ import annotations
 
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from vllm_hcu.patch.platform.framework_opt import (
     patch_qwen4_exp_mtp_kv_cache_groups as kv_groups_patch,
+    patch_scheduler as scheduler_patch,
 )
 from vllm_hcu.patch.worker.framework_opt import (
     patch_qwen4_exp_qsa_metadata as qsa_metadata_patch,
@@ -58,7 +61,10 @@ def test_qsa_draft_metadata_refresh_reuses_official_builder_in_place():
     assert metadata.fast_build is True
 
 
-def test_qwen4_exp_mtp_groups_are_annotated_without_target_mamba_groups():
+@pytest.mark.parametrize(
+    "model_type", ["qwen4_exp", "qwen3_5_moe", "qwen3_5_moe_text"]
+)
+def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
     module = ModuleType(kv_groups_patch.TARGET_MODULE)
     original_calls = []
 
@@ -83,9 +89,7 @@ def test_qwen4_exp_mtp_groups_are_annotated_without_target_mamba_groups():
     spec_config = SimpleNamespace(use_eagle_block_drop=lambda: True)
     qwen_config = SimpleNamespace(
         speculative_config=spec_config,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="qwen4_exp")
-        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
     )
     groups = [
         SimpleNamespace(
@@ -162,3 +166,63 @@ def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
 
     assert returned_groups is groups
     assert [group.is_eagle_group for group in groups] == [False, True]
+
+
+def test_scheduler_marks_qwen35_mtp_and_uses_actual_hybrid_block_size():
+    module = ModuleType(scheduler_patch.TARGET_MODULE)
+    observed_block_sizes = []
+
+    class Scheduler:
+        def update_draft_token_ids(self, draft_token_ids):
+            del self, draft_token_ids
+
+        def update_draft_token_ids_in_output(
+            self, draft_token_ids, scheduler_output
+        ):
+            del self, draft_token_ids, scheduler_output
+
+        def __init__(
+            self,
+            vllm_config,
+            kv_cache_config,
+            structured_output_manager,
+            block_size,
+        ):
+            del vllm_config, kv_cache_config, structured_output_manager
+            self.block_size = block_size
+            self.cache_config = SimpleNamespace(block_size=64)
+
+        def _mamba_block_aligned_split(self, request, num_new_tokens):
+            del request
+            observed_block_sizes.append(self.cache_config.block_size)
+            return num_new_tokens - 1
+
+    module.Scheduler = Scheduler
+    assert scheduler_patch.apply_to_module(module) is True
+    assert scheduler_patch.apply_to_module(module) is False
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="qwen3_5_moe_text")
+        ),
+    )
+    groups = [
+        SimpleNamespace(
+            layer_names=["model.layers.0.linear_attn"], is_eagle_group=False
+        ),
+        SimpleNamespace(
+            layer_names=["mtp.layers.0.self_attn"], is_eagle_group=False
+        ),
+    ]
+    scheduler = module.Scheduler(
+        config,
+        SimpleNamespace(kv_cache_groups=groups),
+        None,
+        576,
+    )
+
+    assert [group.is_eagle_group for group in groups] == [False, True]
+    assert scheduler._mamba_block_aligned_split(object(), 128) == 127
+    assert observed_block_sizes == [576]
+    assert scheduler.cache_config.block_size == 64

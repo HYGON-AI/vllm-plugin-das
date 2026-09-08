@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Identify Qwen4Exp MTP KV groups without classifying target Mamba groups."""
+"""Identify Qwen hybrid MTP KV groups without classifying target Mamba groups."""
 
 from __future__ import annotations
 
@@ -28,29 +28,36 @@ _MARKER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_applied"
 _WRAPPER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_wrapper"
 _GROUPS_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_groups_wrapper"
 logger = init_logger(__name__)
+_SUPPORTED_MODEL_TYPES = frozenset(
+    {
+        "qwen4_exp",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+)
 
 
-def _is_qwen4_exp_mtp(vllm_config: object) -> bool:
+def _is_qwen_hybrid_mtp(vllm_config: object) -> bool:
     spec_config = getattr(vllm_config, "speculative_config", None)
     use_block_drop = getattr(spec_config, "use_eagle_block_drop", None)
     if not callable(use_block_drop) or not use_block_drop():
         return False
     model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
-    return getattr(hf_config, "model_type", None) == "qwen4_exp"
+    return getattr(hf_config, "model_type", None) in _SUPPORTED_MODEL_TYPES
 
 
 def _is_mtp_layer(name: object) -> bool:
     return isinstance(name, str) and "mtp" in name.lower().split(".")
 
 
-def _annotate_qwen4_exp_mtp_groups(vllm_config, kv_cache_groups) -> None:
-    if not _is_qwen4_exp_mtp(vllm_config):
+def _annotate_qwen_mtp_groups(vllm_config, kv_cache_groups) -> None:
+    if not _is_qwen_hybrid_mtp(vllm_config):
         return
 
-    # Qwen4Exp registers its draft model below the stable ``mtp`` prefix.
-    # Mark every group containing such a layer and leave target Mamba
-    # groups untouched so align-mode prefix checkpoints remain reusable.
+    # These Qwen architectures register their draft model below the stable
+    # ``mtp`` prefix.  Mark every group containing such a layer and leave
+    # target Mamba groups untouched so align-mode checkpoints remain reusable.
     for group in kv_cache_groups:
         if any(_is_mtp_layer(name) for name in group.layer_names):
             group.is_eagle_group = True
@@ -109,15 +116,15 @@ def apply_to_module(module: ModuleType) -> bool:
             kv_cache_groups,
             use_deepseek_v4_fallback,
         )
-        _annotate_qwen4_exp_mtp_groups(vllm_config, kv_cache_groups)
+        _annotate_qwen_mtp_groups(vllm_config, kv_cache_groups)
 
     @functools.wraps(original_get_groups)
     def hcu_get_kv_cache_groups(vllm_config, kv_cache_spec):
         groups = original_get_groups(vllm_config, kv_cache_spec)
-        _annotate_qwen4_exp_mtp_groups(vllm_config, groups)
-        if _is_qwen4_exp_mtp(vllm_config):
+        _annotate_qwen_mtp_groups(vllm_config, groups)
+        if _is_qwen_hybrid_mtp(vllm_config):
             logger.info(
-                "Qwen4Exp MTP KV cache groups after Eagle annotation: %s",
+                "Qwen hybrid MTP KV cache groups after Eagle annotation: %s",
                 [
                     {
                         "index": index,

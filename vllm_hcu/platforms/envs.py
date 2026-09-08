@@ -291,7 +291,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_W8A8_FP8_MOE", "False").lower() in
                     ("true", "1")),
     "VLLM_HCU_USE_LIGHTOP_MOE_ALIGN":
-        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "True").lower() in
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MOE_ALIGN", "False").lower() in
                     ("true", "1")),
 
     # DeepEP HT permute: use lightop op.ep_scatter when True (also requires

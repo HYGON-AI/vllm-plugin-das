@@ -30,6 +30,7 @@ from vllm_hcu.v1.attention.backends.fa_utils import (
     is_fa_version_supported,
     is_flash_attn_varlen_func_available,
 )
+from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_ar,
@@ -69,7 +70,6 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
 import vllm.envs as envs
 
@@ -96,25 +96,7 @@ def _split_kv_cache(
                 "Official fused KV cache must have 2 * head_size channels, "
                 f"got shape {tuple(kv_cache.shape)} and head_size {head_size}"
             )
-        # The vendor paged-attention kernel derives addresses from shape and
-        # layout, not tensor block strides. Official main packs K/V together
-        # in C, whose channel-split views have a doubled block stride. Preserve
-        # the 0.25.1 dense, independent K/V page contract by dividing the
-        # physical storage into planar halves instead.
-        nhd_layout = kv_cache.stride(1) < kv_cache.stride(2)
-        physical_cache = kv_cache.transpose(1, 2) if nhd_layout else kv_cache
-        if not physical_cache.is_contiguous():
-            raise ValueError(
-                "HCU FLASH_ATTN requires a compact per-layer fused KV cache, "
-                f"got shape {tuple(kv_cache.shape)} and strides {kv_cache.stride()}"
-            )
-        cache_shape = (*physical_cache.shape[:-1], head_size)
-        flat_cache = physical_cache.view(-1)
-        half = flat_cache.numel() // 2
-        return (
-            flat_cache[:half].view(cache_shape),
-            flat_cache[half:].view(cache_shape),
-        )
+        return kv_cache.transpose(1, 2).split(head_size, dim=-1)
     raise ValueError(f"Unsupported KV cache shape {tuple(kv_cache.shape)}")
 
 if TYPE_CHECKING:

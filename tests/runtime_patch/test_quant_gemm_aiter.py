@@ -2431,6 +2431,53 @@ def test_aiter_replacement_maps_each_optional_capability_exactly():
     assert "_hcu_runtime.is_aiter_moe_requested()" in fused_moe_source
 
 
+def test_aiter_replacement_fused_moe_matches_main_extended_abi():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/aiter_ops.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    owner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "rocm_aiter_ops"
+    )
+    method = next(
+        node
+        for node in owner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "fused_moe"
+    )
+    assert tuple(arg.arg for arg in method.args.args)[-7:] == (
+        "beta",
+        "linear_beta",
+        "shared_w1",
+        "shared_w2",
+        "shared_w1_scale",
+        "shared_w2_scale",
+        "shared_expert_id",
+    )
+    method_source = ast.unparse(method)
+    for name in (
+        "beta",
+        "linear_beta",
+        "shared_w1",
+        "shared_w2",
+        "shared_w1_scale",
+        "shared_w2_scale",
+        "shared_expert_id",
+    ):
+        assert f"'{name}'" in method_source
+    custom_op_calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "rocm_aiter_fused_moe"
+    ]
+    assert len(custom_op_calls) == 1
+    assert len(custom_op_calls[0].args) == 22
+
+
 def test_aiter_replacement_uses_workspace_aiter_module_layout():
     source = (
         Path(__file__).resolve().parents[2]

@@ -2262,7 +2262,29 @@ class rocm_aiter_ops:
         bias2: torch.Tensor | None = None,
         moe_sorting_dispatch_policy: int = 0,
         swiglu_limit: float = 0.0,
+        beta: float | None = None,
+        linear_beta: float | None = None,
+        shared_w1: torch.Tensor | None = None,
+        shared_w2: torch.Tensor | None = None,
+        shared_w1_scale: torch.Tensor | None = None,
+        shared_w2_scale: torch.Tensor | None = None,
+        shared_expert_id: int = -1,
     ) -> torch.Tensor:
+        unsupported = {
+            "beta": beta is not None,
+            "linear_beta": linear_beta is not None,
+            "shared_w1": shared_w1 is not None,
+            "shared_w2": shared_w2 is not None,
+            "shared_w1_scale": shared_w1_scale is not None,
+            "shared_w2_scale": shared_w2_scale is not None,
+            "shared_expert_id": shared_expert_id != -1,
+        }
+        enabled = [name for name, is_set in unsupported.items() if is_set]
+        if enabled:
+            raise _hcu_runtime.HcuAiterRuntimeError(
+                "HCU AITER fused_moe ABI does not support non-default "
+                + ", ".join(enabled)
+            )
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
             w1,

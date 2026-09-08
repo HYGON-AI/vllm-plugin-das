@@ -17,5 +17,5 @@ def test_hcu_fused_moe_experts_default_to_canonical_expert_map() -> None:
         "input",
         "topk_ids",
         "expert_map",
-        "valid_rows",
+        "valid_token_counts",
     )
