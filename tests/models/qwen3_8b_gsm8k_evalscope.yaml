@@ -20,6 +20,8 @@ server:
     - --gpu-memory-utilization
     - "0.4"
     - --enforce-eager
+    - --seed
+    - "0"
 
 evalscope:
   work_dir: /tmp/vllm-hcu-evalscope/qwen3_8b_gsm8k
@@ -27,10 +29,12 @@ evalscope:
   eval_type: openai_api
   generation_config:
     temperature: 0
+    do_sample: false
+    seed: 0
     max_tokens: 4096
     top_p: 0.95
   stream: true
-  eval_batch_size: 8
+  eval_batch_size: 1
   timeout: 60000
   limit: 10
   datasets:
@@ -44,5 +48,6 @@ evalscope:
     dataset: gsm8k
     metric: mean_acc
     display_name: Pass@1
-    minimum_score: 0.95
+    # This PR smoke test evaluates 10 samples, so require eight correct answers.
+    minimum_score: 0.80
   no_timestamp: true

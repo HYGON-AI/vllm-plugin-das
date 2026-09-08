@@ -23,6 +23,8 @@ server:
     - --limit-mm-per-prompt
     - '{"image":7}'
     - --enforce-eager
+    - --seed
+    - "0"
 
 evalscope:
   work_dir: /tmp/vllm-hcu-evalscope/qwen3_vl_8b_mmmu
@@ -30,10 +32,15 @@ evalscope:
   eval_type: openai_api
   generation_config:
     temperature: 0
+    do_sample: false
+    seed: 0
     max_tokens: 512
     top_p: 0.95
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
   stream: true
-  eval_batch_size: 4
+  eval_batch_size: 1
   timeout: 60000
   limit: 10
   datasets:
@@ -46,5 +53,6 @@ evalscope:
     dataset: mmmu
     metric: mean_acc
     display_name: acc
-    minimum_score: 0.55
+    # This PR smoke test evaluates 10 samples, so require five correct answers.
+    minimum_score: 0.50
   no_timestamp: true

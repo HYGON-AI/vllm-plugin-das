@@ -168,6 +168,18 @@ jobs:
           clean: true
           fetch-depth: 1
 
+      - name: Verify tested revision
+        env:
+          EXPECTED_TESTED_REF: ${{ inputs.tested_ref }}
+        run: |
+          set -euo pipefail
+          actual_ref="$(git rev-parse HEAD)"
+          echo "tested revision: $actual_ref"
+          if [[ -n "$EXPECTED_TESTED_REF" && "$actual_ref" != "$EXPECTED_TESTED_REF" ]]; then
+            echo "Checked out $actual_ref; expected $EXPECTED_TESTED_REF" >&2
+            exit 2
+          fi
+
       - name: Diagnose HCU host runtime
         run: |
           echo "runner=$RUNNER_NAME arch=$HCU_CI_ARCH cards=$HCU_CI_CARDS"
@@ -229,21 +241,51 @@ jobs:
           fi
 
       - name: Upload HCU logs and reports
+        id: upload_hcu_artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hcu-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.HCU_CI_HOST_JOB_ROOT }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Report local HCU logs and reports
-        if: always()
+      - name: Remove archived HCU logs from runner
+        if: always() && steps.upload_hcu_artifacts.outcome == 'success'
         run: |
-          echo "HCU logs retained on runner $RUNNER_NAME at $HCU_CI_HOST_JOB_ROOT"
+          case "$HCU_CI_HOST_JOB_ROOT" in
+            /tmp/vllm-hcu-ci/${{ github.run_id }}/${{ github.run_attempt }}/*)
+              rm -rf -- "$HCU_CI_HOST_JOB_ROOT"
+              rmdir -- "$(dirname "$HCU_CI_HOST_JOB_ROOT")" 2>/dev/null || true
+              rmdir -- "$(dirname "$(dirname "$HCU_CI_HOST_JOB_ROOT")")" \
+                2>/dev/null || true
+              ;;
+            *)
+              echo "Refusing to remove unexpected artifact path: $HCU_CI_HOST_JOB_ROOT" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Report GitHub HCU artifact
+        if: always() && steps.upload_hcu_artifacts.outcome == 'success'
+        run: |
+          artifact_name="hcu-${HCU_CI_JOB_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           {
-            echo "### Local HCU logs"
+            echo "### HCU logs and reports"
+            echo
+            echo "- GitHub Artifact: \`$artifact_name\`"
+            echo "- Retention: 30 days"
+            echo "- Download: [$run_url]($run_url)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report retained logs after upload failure
+        if: always() && steps.upload_hcu_artifacts.outcome != 'success'
+        run: |
+          echo "GitHub Artifact upload failed; logs remain on the runner." >&2
+          {
+            echo "### HCU artifact upload failed"
             echo
             echo "- Runner: \`$RUNNER_NAME\`"
-            echo "- Path: \`$HCU_CI_HOST_JOB_ROOT\`"
+            echo "- Retained path: \`$HCU_CI_HOST_JOB_ROOT\`"
           } >> "$GITHUB_STEP_SUMMARY"
