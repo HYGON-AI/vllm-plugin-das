@@ -10,6 +10,7 @@ from collections import defaultdict
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -192,6 +193,58 @@ def test_every_hcu_marked_test_file_is_registered() -> None:
     }
     registered_files = {registration.test_file for registration in parse_registry()}
     assert hcu_test_files <= registered_files
+
+
+def test_qwen35_mtp3_graph_has_exact_registration_on_multicard_job() -> None:
+    target = (
+        "tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py::"
+        "test_qwen35_35b_a3b_tp2_ep2_mtp3_full_decode_graph_aiter_auto_shuffle"
+    )
+    registrations = [
+        item for item in parse_registry()
+        if item.target == target and item.disabled is None
+    ]
+    assert {item.job for item in registrations} == {"qwen35-tp-ep"}
+    jobs = validate_config(_config())
+    assert jobs["qwen35-tp-ep"]["cards"] >= 2
+    assert jobs["qwen35-tp-ep"]["arch"] == "gfx938"
+
+
+def test_qwen35_mtp3_graph_routes_to_multicard_job_without_widening_other_graphs():
+    assert "qwen35-tp-ep" in _selected_job_ids(
+        "tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py"
+    )
+    assert "qwen35-tp-ep" not in _selected_job_ids(
+        "tests/integration/graph/test_qwen35_9b_graph_parity.py"
+    )
+
+
+def test_qwen35_mtp3_graph_job_filter_collects_graph_and_existing_smoke() -> None:
+    job = validate_config(_config())["qwen35-tp-ep"]
+    graph_target = (
+        "tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py::"
+        "test_qwen35_35b_a3b_tp2_ep2_mtp3_full_decode_graph_aiter_auto_shuffle"
+    )
+    smoke_target = (
+        "tests/integration/parallel/test_tp_ep_models.py::"
+        "test_qwen35_35b_a3b_tp_ep_smoke"
+    )
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "--collect-only", "-q",
+            graph_target, smoke_target, *job["pytest_args"],
+        ],
+        cwd=REPOSITORY,
+        env={**os.environ, "VLLM_PLUGINS": "__disabled__"},
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    collected = result.stdout.splitlines()
+    assert graph_target in collected, result.stdout
+    assert sum(line.startswith(smoke_target + "[") for line in collected) == 6
 
 
 def test_due_quarantine_builds_a_fail_closed_retest_job(tmp_path: Path) -> None:
@@ -695,7 +748,7 @@ def test_deepseek_runtime_change_selects_deepseek_jobs() -> None:
     assert fallback is False
 
 
-def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
+def test_model_runtime_change_selects_text_vl_pooling_and_tp_ep_models() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
         ["tests/integration/model_runtime.py"],
@@ -705,6 +758,7 @@ def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
             "qwen35-smoke",
             "qwen25-models",
             "qwen3-pooling",
+            "qwen35-tp-ep",
         }
     )
     assert "model-runtime-helper" in groups

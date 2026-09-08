@@ -224,7 +224,7 @@
       "suite": "model",
       "pytest_args": [
         "-k",
-        "qwen35_35b_a3b_tp_ep_smoke"
+        "qwen35_35b_a3b_tp_ep_smoke or qwen35_35b_a3b_tp2_ep2_mtp3_full_decode_graph_aiter_auto_shuffle"
       ],
       "timeout_minutes": 240,
       "requirements": [
@@ -554,6 +554,14 @@
         "qwen35-graph"
       ]
     },
+    "qwen35-mtp3-graph": {
+      "patterns": [
+        "tests/integration/graph/test_qwen35_35b_a3b_mtp3_graph_parity.py"
+      ],
+      "jobs": [
+        "qwen35-tp-ep"
+      ]
+    },
     "engine-features": {
       "patterns": [
         "vllm_hcu/**cache*",
@@ -660,6 +668,7 @@
       ],
       "jobs": [
         "qwen35-smoke",
+        "qwen35-tp-ep",
         "qwen25-models",
         "qwen3-pooling",
         "mamba-smoke",
