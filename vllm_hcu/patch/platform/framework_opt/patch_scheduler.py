@@ -29,7 +29,6 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids",
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids_in_output",
     f"{TARGET_MODULE}.Scheduler.__init__",
-    f"{TARGET_MODULE}.Scheduler._mamba_block_aligned_split",
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
 
@@ -89,10 +88,6 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
     )
     init_signature = signature(scheduler_init)
-    original_mamba_split = require_callable(
-        scheduler, "_mamba_block_aligned_split", TARGETS[4]
-    )
-
     @wraps(scheduler_init)
     def scheduler_init_with_qwen_mtp_groups(self, *args, **kwargs):
         bound = init_signature.bind(self, *args, **kwargs)
@@ -102,23 +97,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return scheduler_init(self, *args, **kwargs)
 
-    @wraps(original_mamba_split)
-    def hcu_mamba_block_aligned_split(self, *args, **kwargs):
-        # Upstream reads CacheConfig.block_size here, while hybrid cache
-        # construction can enlarge the scheduler/Mamba page. Reuse the
-        # upstream split algorithm with the actual scheduling granularity.
-        cache_block_size = self.cache_config.block_size
-        scheduler_block_size = self.block_size
-        if cache_block_size == scheduler_block_size:
-            return original_mamba_split(self, *args, **kwargs)
-        self.cache_config.block_size = scheduler_block_size
-        try:
-            return original_mamba_split(self, *args, **kwargs)
-        finally:
-            self.cache_config.block_size = cache_block_size
-
     scheduler.__init__ = scheduler_init_with_qwen_mtp_groups
-    scheduler._mamba_block_aligned_split = hcu_mamba_block_aligned_split
     setattr(target, _MARKER, True)
     return True
 

@@ -161,7 +161,6 @@ def test_dense_attention_layer_installs_hcu_runtime_and_preserves_fallback(
     import vllm_hcu.model_executor.layers as hcu_layers
 
     monkeypatch.setattr(hcu_layers, "attention_runtime", runtime, raising=False)
-    monkeypatch.setattr(adapter, "_feature_flags", lambda: (False, False))
     module = _module(
         adapter.TARGET_MODULE,
         Attention=Attention,

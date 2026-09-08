@@ -230,7 +230,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 import vllm_hcu.platforms.envs as henvs 
-from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm_hcu.patch.config import get_hcu_config
 
 logger = init_logger(__name__)
@@ -6978,86 +6977,26 @@ class GPUModelRunner(
                             or self.cache_config.cache_dtype
                         )
 
-                    if (
-                        get_hcu_flash_attn_mode() == "custom"
-                        and self.vllm_config.attention_config.backend
-                        != AttentionBackendEnum.TRITON_ATTN
-                        and not self.vllm_config.model_config.use_mla
-                    ):
-                        if packing is not None:
-                            raise NotImplementedError(
-                                "HCU custom FlashAttention does not yet support "
-                                "the target vLLM packed KV-cache contract"
-                            )
-                        key_cache_shape, value_cache_shape = attn_backend.get_kv_cache_shape(
-                            kernel_num_blocks,
-                            shape_block_size,
-                            kv_cache_spec.num_kv_heads,
-                            kv_cache_spec.head_size,
-                            cache_dtype_str=layer_cache_dtype_str,
-                        )
-                        dtype = kv_cache_spec.dtype
-                        try:
-                            key_stride_order, value_stride_order = attn_backend.get_kv_cache_stride_order()
-                            assert len(key_stride_order) == len(key_cache_shape)
-                            assert len(value_stride_order) == len(value_cache_shape)
-                        except (AttributeError, NotImplementedError):
-                            key_stride_order = tuple(range(len(key_cache_shape)))
-                            value_stride_order = tuple(range(len(value_cache_shape)))
-                        # The allocation respects the backend-defined stride order
-                        # to ensure the semantic remains consistent for each
-                        # backend. We first obtain the generic kv cache shape and
-                        # then permute it according to the stride order which could
-                        # result in a non-contiguous tensor.
-                        key_cache_shape = tuple(
-                            key_cache_shape[i] for i in key_stride_order)
-                        value_cache_shape = tuple(
-                            value_cache_shape[i] for i in value_stride_order)
-                        # Maintain original KV shape view.
-                        inv_key_order = [
-                            key_stride_order.index(i)
-                            for i in range(len(key_stride_order))
-                        ]
-                        inv_value_order = [
-                            value_stride_order.index(i)
-                            for i in range(len(value_stride_order))
-                        ]
-                        
-                        raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
-                        total_elements = raw_tensor.numel()
-                        key_elements = (key_cache_shape[0] * key_cache_shape[1] * 
-                                        key_cache_shape[2] * key_cache_shape[3])
-                        value_elements = (value_cache_shape[0] * value_cache_shape[1] *
-                                        value_cache_shape[2] * value_cache_shape[3])
-
-                        assert total_elements == key_elements + value_elements
-
-                        key_cache = raw_tensor[:key_elements].view(key_cache_shape).permute(
-                            *inv_key_order)
-                        value_cache = raw_tensor[key_elements:].view(value_cache_shape).permute(
-                            *inv_value_order)
-                        kv_caches[layer_name] = (key_cache, value_cache)
-                    else:
-                        kv_cache_shape = attn_backend.get_kv_cache_shape(
-                            kernel_num_blocks,
-                            shape_block_size,
-                            kv_cache_spec.num_kv_heads,
-                            kv_cache_spec.head_size,
-                            cache_dtype_str=layer_cache_dtype_str,
-                        )
-                        try:
-                            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                            assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                        except (AttributeError, NotImplementedError):
-                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                        kv_caches[layer_name] = _reshape_attention_kv_cache(
-                            raw_tensor,
-                            kv_cache_spec,
-                            kv_cache_shape,
-                            kv_cache_stride_order,
-                            kernel_num_blocks,
-                            packing,
-                        )
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        kernel_num_blocks,
+                        shape_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        cache_dtype_str=layer_cache_dtype_str,
+                    )
+                    try:
+                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                    except (AttributeError, NotImplementedError):
+                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                    kv_caches[layer_name] = _reshape_attention_kv_cache(
+                        raw_tensor,
+                        kv_cache_spec,
+                        kv_cache_shape,
+                        kv_cache_stride_order,
+                        kernel_num_blocks,
+                        packing,
+                    )
 
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
@@ -7117,7 +7056,7 @@ class GPUModelRunner(
         Args:
             kv_caches: The KV cache buffer of each layer.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
-            Non-custom FlashAttention is already block-first; legacy backends
+            HCU FlashAttention is already block-first; legacy backends
             may still require an in-place stride reinterpretation.
         """
 

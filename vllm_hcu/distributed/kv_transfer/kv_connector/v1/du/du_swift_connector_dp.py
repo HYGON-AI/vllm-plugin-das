@@ -23,7 +23,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
 import zmq
@@ -264,53 +263,13 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
-            if get_hcu_flash_attn_mode() != "custom":
-                if (isinstance(attn_metadata, MLACommonMetadata) or layer.ndim == 3 or layer.shape[1] == 2):
-                    num_block = kv_cache.shape[0]
-                    self.check_tensors_except_dim(layer, kv_cache, 0)
-                    if len(block_ids) == num_block:
-                        layer[block_ids, ...] = kv_cache
-                    else:
-                        layer[block_ids[:num_block], ...] = kv_cache
-                        logger.warning(
-                            "🚧kv_cache does not match, block_ids:%d, "
-                            "num_block:%d, request_id:%s",
-                            len(block_ids),
-                            num_block,
-                            request_id,
-                        )
-                elif layer.shape[0] == 2: #FlashAttention_NV #FlashAttention_NV
-                    num_block = kv_cache.shape[1]
-                    self.check_tensors_except_dim(layer, kv_cache, 1)
-                    if len(block_ids) == num_block:
-                        layer[:, block_ids, ...] = kv_cache
-                    else:
-                        layer[:, block_ids[:num_block], ...] = kv_cache
-                        logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
-                        "num_block:%d, request_id:%s",
-                        len(block_ids),
-                        num_block,
-                        request_id,
-                    )
-                else:
-                    logger.error("🚧kv_cache not mla && gqa")
-
-            else:  # FlashAttention_HCU
-                num_block = kv_cache.shape[1]
-                # self.check_tensors_except_dim(layer, kv_cache, 1)
+            if (isinstance(attn_metadata, MLACommonMetadata) or layer.ndim == 3 or layer.shape[1] == 2):
+                num_block = kv_cache.shape[0]
+                self.check_tensors_except_dim(layer, kv_cache, 0)
                 if len(block_ids) == num_block:
-                    # layer[:, block_ids, ...] = kv_cache
-                    k_ = kv_cache[0].permute(0, 2, 1, 3)
-                    v_ = kv_cache[1].permute(0, 2, 3, 1)
-                    layer[0][block_ids, ...] = k_
-                    layer[1][block_ids, ...] = v_
+                    layer[block_ids, ...] = kv_cache
                 else:
-                    # layer[:, block_ids[:num_block], ...] = kv_cache
-                    k_ = kv_cache[0].permute(0, 2, 1, 3)
-                    v_ = kv_cache[1].permute(0, 2, 3, 1)
-                    layer[0][block_ids[:num_block], ...] = k_
-                    layer[1][block_ids[:num_block], ...] = v_
+                    layer[block_ids[:num_block], ...] = kv_cache
                     logger.warning(
                         "🚧kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
@@ -318,6 +277,22 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
                         num_block,
                         request_id,
                     )
+            elif layer.shape[0] == 2: #FlashAttention_NV #FlashAttention_NV
+                num_block = kv_cache.shape[1]
+                self.check_tensors_except_dim(layer, kv_cache, 1)
+                if len(block_ids) == num_block:
+                    layer[:, block_ids, ...] = kv_cache
+                else:
+                    layer[:, block_ids[:num_block], ...] = kv_cache
+                    logger.warning(
+                    "🚧kv_cache does not match, block_ids:%d, "
+                    "num_block:%d, request_id:%s",
+                    len(block_ids),
+                    num_block,
+                    request_id,
+                )
+            else:
+                logger.error("🚧kv_cache not mla && gqa")
 
         # Get the metadata
         metadata: KVConnectorMetadata = self._get_connector_metadata()
@@ -396,8 +371,7 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
 
         assert self.du_swift_engine is not None
 
-        is_mla = (isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3) \
-                if (not isinstance(kv_layer, tuple)) else False
+        is_mla = isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3
 
         def extract_kv_from_layer(
             layer: torch.Tensor,
@@ -420,26 +394,15 @@ class DuSwiftConnectorDp(KVConnectorBase_V1):
                 torch.Tensor: A tensor containing the extracted KV slices.
                 Returns None if the layout is unsupported.
             """
-            if (not isinstance(kv_layer, tuple)):
-                if (isinstance(attn_metadata, MLACommonMetadata) or kv_layer.ndim == 3 or layer.shape[1] == 2):
-                    return layer[block_ids, ...]
-                elif get_hcu_flash_attn_mode() not in (
-                    "classic",
-                    "cutlass",
-                    "varlen",
-                ):  # FlashAttention_NV
-                    return layer[:, block_ids, ...]
-                else:
-                    logger.error("🚧kv_cache not mla && gqa")
-            else:  # FlashAttention_HCU
-                # return layer[:, block_ids, ...]
-                k = layer[0]  #(num_blocks, num_kv_heads, block_size, head_size)
-                v = layer[1]  #(num_blocks, num_kv_heads, head_size, block_size)
-
-                k = k.permute(0,2,1,3)
-                v = v.permute(0,3,1,2)
-                kv = torch.stack([k, v], dim=0).contiguous()
-                return kv[:, block_ids, ...]
+            if (
+                isinstance(attn_metadata, MLACommonMetadata)
+                or kv_layer.ndim == 3
+                or layer.shape[1] == 2
+            ):
+                return layer[block_ids, ...]
+            if layer.shape[0] == 2:  # FlashAttention NV layout
+                return layer[:, block_ids, ...]
+            logger.error("🚧kv_cache not mla && gqa")
 
 
         connector_metadata = self._get_connector_metadata()

@@ -12,7 +12,6 @@ from typing import final
 import torch
 
 import vllm.envs as envs
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -1183,22 +1182,6 @@ class FusedMoEKernelModularImpl:
         )
         if begin_moe_call is not None:
             begin_moe_call()
-
-        # Skip cudagraph/DP padding tokens uniformly across all a2a backends:
-        # forcing padded rows' expert ids to -1 makes every prepare_finalize drop
-        # them (not dispatched / not computed by the experts). The V2 model runner
-        # marks them in forward_context.is_padding; it is None for runners that do
-        # not populate it, leaving topk_ids unchanged.
-        # Gated by VLLM_MOE_SKIP_PADDING (off by default) because this requires the
-        # experts kernel to treat topk_id == -1 as a skip sentinel, which not all
-        # MoE backends support yet.
-        is_padding = None
-        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-            is_padding = get_forward_context().is_padding
-        if is_padding is not None:
-            n = topk_ids.shape[0]
-            # TODO: Properly support DBO (padding lives at the batch tail).
-            topk_ids = torch.where(is_padding[:n].unsqueeze(1), -1, topk_ids)
 
         if self.fused_experts.activation_format() == FusedMoEActivationFormat.BatchedExperts:
             num_tokens = hidden_states.shape[0]

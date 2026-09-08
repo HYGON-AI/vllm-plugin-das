@@ -61,9 +61,7 @@ def test_qsa_draft_metadata_refresh_reuses_official_builder_in_place():
     assert metadata.fast_build is True
 
 
-@pytest.mark.parametrize(
-    "model_type", ["qwen4_exp", "qwen3_5_moe", "qwen3_5_moe_text"]
-)
+@pytest.mark.parametrize("model_type", ["qwen4_exp"])
 def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
     module = ModuleType(kv_groups_patch.TARGET_MODULE)
     original_calls = []
@@ -168,7 +166,7 @@ def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
     assert [group.is_eagle_group for group in groups] == [False, True]
 
 
-def test_scheduler_marks_qwen35_mtp_and_uses_actual_hybrid_block_size():
+def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
     module = ModuleType(scheduler_patch.TARGET_MODULE)
     observed_block_sizes = []
 
@@ -222,7 +220,24 @@ def test_scheduler_marks_qwen35_mtp_and_uses_actual_hybrid_block_size():
         576,
     )
 
-    assert [group.is_eagle_group for group in groups] == [False, True]
+    assert [group.is_eagle_group for group in groups] == [False, False]
     assert scheduler._mamba_block_aligned_split(object(), 128) == 127
-    assert observed_block_sizes == [576]
+    assert observed_block_sizes == [64]
     assert scheduler.cache_config.block_size == 64
+
+    no_mtp_config = SimpleNamespace(
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="qwen3_5_moe_text")
+        ),
+    )
+    no_mtp_scheduler = module.Scheduler(
+        no_mtp_config,
+        SimpleNamespace(kv_cache_groups=groups),
+        None,
+        576,
+    )
+
+    assert no_mtp_scheduler._mamba_block_aligned_split(object(), 128) == 127
+    assert observed_block_sizes == [64, 64]
+    assert no_mtp_scheduler.cache_config.block_size == 64

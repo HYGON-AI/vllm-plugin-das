@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Configuration contracts for maintained HCU runtime paths.
-
-Legacy custom FlashAttention plumbing remains in production code pending its
-unified cleanup, but it is intentionally not asserted as a supported mode here.
-"""
+"""Configuration contracts for maintained HCU runtime paths."""
 
 from __future__ import annotations
 
@@ -302,7 +298,6 @@ def test_plain_flash_attention_defers_submode_to_legacy_environment(
         "VLLM_HCU_USE_FLASH_ATTN",
         "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
         "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
-        "VLLM_HCU_USE_CUSTOM_FLASH_ATTN",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in environment.items():
@@ -698,7 +693,7 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
         8,
     )
     assert config.splitting_calls == 1
-    assert config.splitting_ops[-1] == "vllm::hcu_sparse_attn_indexer"
+    assert config.splitting_ops[-1:] == ["vllm::hcu_sparse_attn_indexer"]
 
     config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
@@ -1035,6 +1030,49 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         kernel_config=SimpleNamespace(moe_backend=feature_config.moe_backend),
         kv_transfer_config=None,
     )
+
+
+def test_explicit_aiter_stays_inside_official_cudagraph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    config = _validation_config(HcuFeatureConfig())
+    config.model_config.enforce_eager = False
+    config.kernel_config.moe_backend = "aiter"
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    config.compilation_config.use_inductor_graph_partition = True
+    config.compilation_config.splitting_ops = ["existing::split"]
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert (
+        config.compilation_config.cudagraph_mode
+        is CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert config.compilation_config.use_inductor_graph_partition is False
+    assert config.compilation_config.splitting_ops == ["existing::split"]
+    assert os.environ["VLLM_MOE_SKIP_PADDING"] == "0"
+
+
+def test_triton_moe_preserves_official_cudagraph_mode() -> None:
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = _validation_config(HcuFeatureConfig())
+    config.kernel_config.moe_backend = "triton"
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    config.compilation_config.use_inductor_graph_partition = True
+    config.compilation_config.splitting_ops = []
+
+    patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert (
+        config.compilation_config.cudagraph_mode
+        is CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert config.compilation_config.use_inductor_graph_partition is True
+    assert config.compilation_config.splitting_ops == []
 
 
 def test_deepep_low_latency_defers_capacity_check_until_model_is_known() -> None:

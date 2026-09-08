@@ -137,11 +137,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
-        super().initialize_kv_cache(
-            kv_cache_config,
-            is_profiling=is_profiling,
-            kv_cache_allocation_context=kv_cache_allocation_context,
-        )
+        from vllm_hcu.v1.kv_cache import use_hcu_flash_kv_cache_allocator
+
+        with use_hcu_flash_kv_cache_allocator(self):
+            super().initialize_kv_cache(
+                kv_cache_config,
+                is_profiling=is_profiling,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+            )
         if pcp_size > 1:
             self.pcp_manager = maybe_build_pcp_manager(
                 self.vllm_config,

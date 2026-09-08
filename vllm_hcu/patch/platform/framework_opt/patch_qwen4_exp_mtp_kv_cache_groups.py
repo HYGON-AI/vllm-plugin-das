@@ -31,8 +31,6 @@ logger = init_logger(__name__)
 _SUPPORTED_MODEL_TYPES = frozenset(
     {
         "qwen4_exp",
-        "qwen3_5_moe",
-        "qwen3_5_moe_text",
     }
 )
 
@@ -40,11 +38,13 @@ _SUPPORTED_MODEL_TYPES = frozenset(
 def _is_qwen_hybrid_mtp(vllm_config: object) -> bool:
     spec_config = getattr(vllm_config, "speculative_config", None)
     use_block_drop = getattr(spec_config, "use_eagle_block_drop", None)
-    if not callable(use_block_drop) or not use_block_drop():
-        return False
     model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
-    return getattr(hf_config, "model_type", None) in _SUPPORTED_MODEL_TYPES
+    return (
+        callable(use_block_drop)
+        and use_block_drop()
+        and getattr(hf_config, "model_type", None) in _SUPPORTED_MODEL_TYPES
+    )
 
 
 def _is_mtp_layer(name: object) -> bool:

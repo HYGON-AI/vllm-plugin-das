@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 from types import ModuleType
 from typing import Any
 
@@ -229,6 +230,24 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)
+
+    if getattr(kernel_config, "moe_backend", None) == "aiter":
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        if compilation_config is None:
+            raise PatchCompatibilityError(
+                "AITER MoE requires VllmConfig.compilation_config"
+            )
+        # Match the validated v0.25 HCU graph topology. AITER MoE must remain
+        # inside the captured graph. Splitting either the nested AITER op or an
+        # official outer MoE op executes AITER eagerly on the graph-builder
+        # side stream and faults in MoeSortingMultiPhaseKernel.
+        compilation_config.use_inductor_graph_partition = False
+        # Official main enables padding-token skipping by default and represents
+        # skipped routes with expert id -1. The self-developed HCU AITER sorting
+        # kernel does not implement that sentinel contract. Normalize the
+        # official switch before EngineCore workers are spawned; this preserves
+        # the validated v0.25 routing semantics without a user environment knob.
+        os.environ["VLLM_MOE_SKIP_PADDING"] = "0"
 
     if parallel_config is not None:
         setattr(

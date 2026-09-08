@@ -27,19 +27,6 @@ _MODULE_MARKER = "_vllm_hcu_attention_runtime_applied"
 _WRAPPER_MARKER = "_vllm_hcu_attention_runtime_wrapper"
 
 
-def _feature_flags() -> tuple[bool, bool]:
-    try:
-        from vllm_hcu.platforms import envs as henvs
-        from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
-
-        return (
-            get_hcu_flash_attn_mode() == "custom",
-            bool(henvs.VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE),
-        )
-    except (AttributeError, ImportError) as exc:
-        raise PatchCompatibilityError("required HCU attention flags are unavailable") from exc
-
-
 def apply_to_module(module: ModuleType) -> bool:
     attention = load_exact_module(TARGET_MODULE, module)
     attention_class = require_class(
@@ -93,8 +80,7 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_forward(
         self, query, key, value, output_shape=None, output_dtype=None
     ):
-        custom_flash, _ = _feature_flags()
-        if custom_flash or getattr(self, "kv_cache_dtype", None) == "fp8_e5m2":
+        if getattr(self, "kv_cache_dtype", None) == "fp8_e5m2":
             return attention_runtime.attention_forward(
                 attention,
                 self,

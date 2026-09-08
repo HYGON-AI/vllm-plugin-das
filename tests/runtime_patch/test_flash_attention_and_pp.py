@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Runtime contracts for PP partitioning and maintained HCU attention paths.
-
-Legacy custom FlashAttention code remains present but is outside this release's
-supported runtime contract; functional attention coverage is scoped accordingly.
-"""
+"""Runtime contracts for PP partitioning and maintained HCU attention paths."""
 
 from __future__ import annotations
 
@@ -308,15 +304,22 @@ def test_cutlass_block_first_hnd_stride_contract(
     assert backend.get_kv_cache_stride_order(True) == (1, 4, 0, 2, 3, 5)
 
 
-def test_flash_attention_splits_legacy_and_official_main_kv_cache(
+def test_flash_attention_splits_vendor_and_official_main_kv_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     flash_attn = _load_hcu_flash_attention_module(monkeypatch)
 
-    legacy = torch.arange(3 * 2 * 4 * 5 * 8).reshape(3, 2, 4, 5, 8)
-    legacy_key, legacy_value = flash_attn._split_kv_cache(legacy, 8)
-    assert torch.equal(legacy_key, legacy[:, 0])
-    assert torch.equal(legacy_value, legacy[:, 1])
+    vendor = torch.arange(3 * 2 * 4 * 5 * 8).reshape(3, 2, 4, 5, 8)
+    vendor_key, vendor_value = flash_attn._split_kv_cache(vendor, 8)
+    assert torch.equal(vendor_key, vendor[:, 0])
+    assert torch.equal(vendor_value, vendor[:, 1])
+
+    transitional = torch.arange(2 * 3 * 4 * 5 * 8).reshape(2, 3, 4, 5, 8)
+    transitional_key, transitional_value = flash_attn._split_kv_cache(
+        transitional, 8
+    )
+    assert torch.equal(transitional_key, transitional[0])
+    assert torch.equal(transitional_value, transitional[1])
 
     nhd_storage = torch.arange(3 * 5 * 4 * 16).reshape(3, 5, 4, 16)
     official_nhd = nhd_storage.transpose(1, 2)

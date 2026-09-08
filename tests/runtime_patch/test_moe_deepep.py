@@ -517,6 +517,14 @@ def test_slimquant_w4a8_deepep_auto_advertises_w4a8_quant_scheme_only():
     )
 
 
+def test_modular_kernel_keeps_official_main_padding_ownership() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
+
+    source = Path(module.__file__).read_text()
+    assert "VLLM_MOE_SKIP_PADDING" not in source
+    assert "torch.where(is_padding[:n].unsqueeze(1), -1, topk_ids)" not in source
+
+
 def test_modular_prepare_begins_auto_call_before_expert_contract_queries():
     from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as module
 
