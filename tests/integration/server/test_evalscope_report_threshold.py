@@ -72,6 +72,23 @@ def test_server_environment_bypasses_proxy_for_local_eval_client(
     assert environment["no_proxy"] == environment["NO_PROXY"]
 
 
+def test_server_log_environment_allowlists_route_switches() -> None:
+    visible = evalscope_server._server_log_environment(
+        {
+            "VLLM_HCU_USE_CUSTOM_OPS": "1",
+            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE": "1",
+            "VLLM_HCU_ACCESS_TOKEN": "must-not-be-logged",
+            "VLLM_ROCM_SECRET_KEY": "must-not-be-logged",
+            evalscope_server.EVALSCOPE_PROCESS_OWNER_ENV: "owner-secret",
+        }
+    )
+
+    assert visible == {
+        "VLLM_HCU_USE_CUSTOM_OPS": "1",
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE": "1",
+    }
+
+
 def test_reset_evalscope_artifacts_removes_stale_outputs_only(
     tmp_path: Path,
 ) -> None:
@@ -108,6 +125,22 @@ def test_reset_evalscope_artifacts_rejects_unowned_broad_path(
         evalscope_server._reset_evalscope_artifacts(broad)
 
     assert report.read_text(encoding="utf-8") == "keep"
+
+
+def test_reset_evalscope_artifacts_claims_exact_ci_job_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "evalscope"
+    stale = work_dir / "reports/stale.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale", encoding="utf-8")
+    monkeypatch.setenv("HCU_CI_JOB_ROOT", str(tmp_path))
+
+    evalscope_server._reset_evalscope_artifacts(work_dir)
+
+    assert not stale.exists()
+    assert (work_dir / evalscope_server.EVALSCOPE_OWNER_MARKER).is_file()
 
 
 def test_reset_evalscope_artifacts_rejects_symlinked_work_dir(
@@ -529,6 +562,34 @@ def test_exact_humaneval_criteria_rejects_partial_artifacts(tmp_path: Path) -> N
     with pytest.raises(AssertionError, match="expected 32 predictions, got 31"):
         _assert_pass_criteria(
             _exact_humaneval_config(),
+            model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+            work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+
+@pytest.mark.parametrize("records", [31, 33])
+def test_threshold_humaneval_criteria_rejects_non_exact_artifact_counts(
+    tmp_path: Path,
+    records: int,
+) -> None:
+    config = _exact_humaneval_config()
+    config["evalscope"]["pass_criteria"] = {
+        "dataset": "humaneval",
+        "metric": "mean_acc_pass@1",
+        "display_name": "Pass@1",
+        "minimum_score": 0.80,
+        "num_predictions": 32,
+        "num_reviews": 32,
+    }
+    _write_exact_humaneval_artifacts(tmp_path, records=records)
+
+    with pytest.raises(
+        AssertionError,
+        match=f"expected 32 predictions, got {records}",
+    ):
+        _assert_pass_criteria(
+            config,
             model_env="VLLM_HCU_TEST_UNUSED_MODEL",
             work_dir=tmp_path,
             eval_log_path=tmp_path / "logs/evalscope.log",

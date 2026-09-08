@@ -180,9 +180,19 @@ def test_every_registered_hcu_test_file_routes_to_one_of_its_jobs() -> None:
     missing = {
         test_file: sorted(expected_jobs)
         for test_file, expected_jobs in jobs_by_file.items()
-        if not (_selected_job_ids(test_file) & expected_jobs)
+        if not expected_jobs.issubset(_selected_job_ids(test_file))
     }
     assert missing == {}
+
+
+def test_registered_hcu_test_routes_without_workflow_pattern_or_fallback() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["tests/accuracy/test_aiter_batched_gemm_bf16.py"],
+    )
+    assert {job["registry_job"] for job in jobs} == {"accuracy-gfx938"}
+    assert groups == ["registered-hcu-test"]
+    assert fallback is False
 
 
 def test_every_hcu_marked_test_file_is_registered() -> None:
@@ -765,12 +775,15 @@ def test_model_runtime_change_selects_text_vl_pooling_and_tp_ep_models() -> None
     assert fallback is False
 
 
-def test_qwen35_smoke_change_does_not_select_unrelated_models() -> None:
+def test_qwen35_smoke_change_selects_every_registered_job() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),
         ["tests/integration/models/test_qwen35_9b_smoke.py"],
     )
-    assert {job["registry_job"] for job in jobs} == {"qwen35-smoke"}
+    assert {job["registry_job"] for job in jobs} == {
+        "integration-smoke-gfx938",
+        "qwen35-smoke",
+    }
     assert groups == ["qwen35-smoke-tests"]
     assert fallback is False
 
@@ -850,7 +863,10 @@ def test_non_hcu_document_does_not_add_fallback_to_classified_change() -> None:
             "tests/integration/lora/test_qwen3_4b_lora_switching.py",
         ],
     )
-    assert {job["registry_job"] for job in jobs} == {"lora"}
+    assert {job["registry_job"] for job in jobs} == {
+        "integration-smoke-gfx938",
+        "lora",
+    }
     assert groups == ["lora"]
     assert fallback is False
 

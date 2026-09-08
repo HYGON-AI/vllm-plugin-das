@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: qwen36_27b_gated_rmsnorm_humaneval
+model: /models/Qwen3.6-27B
+
+server:
+  host: 127.0.0.1
+  startup_timeout_s: 3600
+  shutdown_timeout_s: 120
+  served_model_name: Qwen3.6-27B
+  args:
+    - --trust-remote-code
+    - --language-model-only
+    - --tensor-parallel-size
+    - "1"
+    - --max-model-len
+    - "4096"
+    - --max-num-batched-tokens
+    - "16"
+    - --max-num-seqs
+    - "1"
+    - --gpu-memory-utilization
+    - "0.72"
+    - --enforce-eager
+
+evalscope:
+  api_key: EMPTY
+  eval_type: openai_api
+  generation_config:
+    temperature: 0
+    do_sample: false
+    max_tokens: 1024
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  stream: true
+  eval_batch_size: 1
+  timeout: 7200
+  limit: 32
+  datasets:
+    - humaneval
+  dataset_args:
+    humaneval: {}
+  pass_criteria:
+    dataset: humaneval
+    metric: mean_acc_pass@1
+    display_name: Pass@1
+    minimum_score: 0.80
+    num_predictions: 32
+    num_reviews: 32
+  no_timestamp: true
+
+profiles:
+  feature_off:
+    server:
+      port: 10146
+      environment:
+        VLLM_HCU_USE_CUSTOM_OPS: "1"
+        VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: "0"
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/qwen36_27b_gated_rmsnorm_off
+
+  feature_on:
+    server:
+      port: 10147
+      environment:
+        VLLM_HCU_USE_CUSTOM_OPS: "1"
+        VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: "1"
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/qwen36_27b_gated_rmsnorm_on

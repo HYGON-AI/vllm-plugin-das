@@ -33,6 +33,10 @@ from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
 )
+from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm_hcu.model_executor.layers.attention.lightop_concat_runtime import (
+    concat_mla_decode,
+)
 from vllm_hcu.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
@@ -42,8 +46,7 @@ from vllm_hcu.v1.attention.ops.flashmla import (
     get_mla_metadata_dense_fp8,
     is_flashmla_dense_supported,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
-import vllm_hcu.platforms.envs as henvs 
+import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
@@ -335,14 +338,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 )                
                 o = reshape_attn_output_for_spec_decode(o)
                 return o, lse 
-            if henvs.VLLM_USE_OPT_CAT and q_nope.shape[0] < 1024:
-                from vllm_hcu.ops.test_concat import (
-                    concat_helper_decode,
-                )
-
-                q = concat_helper_decode(q_nope, q_pe, dim=2)
-            else:
-                q = torch.cat((q_nope, q_pe), dim=-1)
+            q = concat_mla_decode(q_nope, q_pe, dim=-1)
         
         # mypy assertion: q is now always a tensor
         assert isinstance(q, torch.Tensor)

@@ -794,6 +794,7 @@ assert base_name not in sys.modules
 assert "vllm._aiter_ops" not in sys.modules
 
 ids = (
+    "worker.op_opt.mamba.gdn.rms_norm_gated",
     "worker.op_opt.mamba.gdn.causal_conv1d",
     "worker.op_opt.mamba.gdn.base_state_dtype",
     "worker.op_opt.mamba.gdn.qwen_kernel_bindings",
@@ -842,6 +843,11 @@ assert (
 )
 assert not bool(qwen.GDN_AITER_TRITON_AVAILABLE)
 assert getattr(qwen, "_vllm_hcu_qwen_gdn_aiter_layout_applied", False)
+from vllm_hcu.ops.rms_norm_gated import HcuRMSNormGated
+assert qwen.RMSNormGated is HcuRMSNormGated
+assert qwen._vllm_hcu_original_rms_norm_gated.__module__ == (
+    "vllm.model_executor.layers.layernorm"
+)
 
 consumer_specs = (
     "vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn",
@@ -857,6 +863,8 @@ for name, consumer in consumers.items():
 
 kimi = consumers["vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn"]
 olmo = consumers["vllm.model_executor.layers.mamba.gdn.olmo_gdn_linear_attn"]
+from vllm.model_executor.layers.layernorm import RMSNormGated as CanonicalRMSNormGated
+assert olmo.RMSNormGated is CanonicalRMSNormGated
 assert "get_state_dtype" in kimi.KimiGatedDeltaNetAttention.__dict__
 assert kimi.KimiGatedDeltaNetAttention.get_state_dtype is not base_method
 assert "get_state_dtype" not in olmo.OlmoHybridGatedDeltaNetAttention.__dict__
