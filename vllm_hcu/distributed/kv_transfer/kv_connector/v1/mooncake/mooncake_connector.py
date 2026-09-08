@@ -43,9 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
-    # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
     get_pcp_group,
-    # === HCU_MOONCAKE_PCP_NIXL52779_END ===
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -741,9 +739,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
-        # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
         _validate_mooncake_pcp_pd(vllm_config)
-        # === HCU_MOONCAKE_PCP_NIXL52779_END ===
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -1232,7 +1228,6 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
         # PCP adds KV replicas, not extra shards.
         self.pcp_size = int(
             getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
@@ -1245,7 +1240,6 @@ class MooncakeConnectorWorker:
         self.pcp_rank = (
             int(get_pcp_group().rank_in_group) if self.pcp_size > 1 else 0
         )
-        # === HCU_MOONCAKE_PCP_NIXL52779_END ===
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -1738,11 +1732,24 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
+    def _reject_custom_partition_for_hetero_pp(self, remote_pp_size: int) -> None:
+        """Custom PP partitions are process-local and cannot map a remote PP size."""
+        if int(self.pp_size) == int(remote_pp_size):
+            return
+        partition = getattr(envs, "VLLM_PP_LAYER_PARTITION", None) or ""
+        if not partition:
+            return
+        raise RuntimeError(
+            "Mooncake heterogeneous PP does not support VLLM_PP_LAYER_PARTITION; "
+            "unset it or use matching PP sizes."
+        )
+
     def _count_overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
         """How many consumer PP stages overlap this producer's layer range."""
         remote_pp_size = max(int(remote_pp_size), 1)
         if remote_pp_size == 1 or self.pp_size <= 0:
             return remote_pp_size
+        self._reject_custom_partition_for_hetero_pp(remote_pp_size)
         total_model_layers = self.model_config.get_total_num_hidden_layers()
         p_start, p_end = get_pp_indices(
             total_model_layers, self.pp_rank, self.pp_size
@@ -2223,7 +2230,6 @@ class MooncakeConnectorWorker:
         # No need to launch server for D node.
         if self.is_kv_consumer:
             return
-        # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
         # Non-canonical PCP replicas do not listen or register.
         if not self._is_canonical_pcp_kv_replica():
             logger.info(
@@ -2233,7 +2239,6 @@ class MooncakeConnectorWorker:
                 self.pcp_size,
             )
             return
-        # === HCU_MOONCAKE_PCP_NIXL52779_END ===
 
         ready_event = threading.Event()
         asyncio.run_coroutine_threadsafe(
@@ -2625,7 +2630,6 @@ class MooncakeConnectorWorker:
             if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
-    # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
     def _is_canonical_pcp_kv_replica(self) -> bool:
         """True if this rank owns the sendable PCP KV replica."""
 
@@ -2638,14 +2642,16 @@ class MooncakeConnectorWorker:
     ) -> None:
         """Mark send complete without transferring KV on non-rank0 PCP."""
 
-        for p_req_id, (_transfer_id, _block_ids) in metadata.reqs_to_send.items():
+        for p_req_id, (_transfer_id, block_ids) in metadata.reqs_to_send.items():
+            if not block_ids:
+                # Alloc-time placeholder; report complete on request_finished.
+                continue
             self.finished_sending_reqs.add(p_req_id)
         for transfer_id in metadata.reqs_not_processed:
             send_meta = self.reqs_need_send.pop(transfer_id, None)
             if send_meta is not None and send_meta.p_req_id:
                 self.finished_sending_reqs.add(send_meta.p_req_id)
 
-    # === HCU_MOONCAKE_PCP_NIXL52779_END ===
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
@@ -2655,7 +2661,6 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
-            # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
             # Non-canonical PCP replicas only mark send complete.
             send_coro = (
                 self.record_send_reqs(metadata)
@@ -2663,7 +2668,6 @@ class MooncakeConnectorWorker:
                 else self._complete_noncanonical_pcp_sends(metadata)
             )
             asyncio.run_coroutine_threadsafe(send_coro, self.sender_loop)
-            # === HCU_MOONCAKE_PCP_NIXL52779_END ===
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
@@ -2671,6 +2675,7 @@ class MooncakeConnectorWorker:
     def _pp_overlap_layer_range(
         self, *, remote_pp_rank: int, remote_pp_size: int
     ) -> tuple[int, int]:
+        self._reject_custom_partition_for_hetero_pp(remote_pp_size)
         total_model_layers = self.model_config.get_total_num_hidden_layers()
         d_start, d_end = get_pp_indices(
             total_model_layers, self.pp_rank, self.pp_size
@@ -2794,7 +2799,6 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
     loop.run_forever()
 
 
-# === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
 def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
     """Reject PCP on consumers, kv_both, DCP>1, and bidirectional xfer."""
 
@@ -2828,17 +2832,14 @@ def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
         )
 
 
-# === HCU_MOONCAKE_PCP_NIXL52779_END ===
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
-    # === HCU_MOONCAKE_PCP_NIXL52779_BEGIN ===
     # TP=1 shares tp_rank=0 across PCP ranks; skip non-rank0 replicas.
     _pcp_size = int(
         getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
     )
     if _pcp_size > 1 and int(get_pcp_group().rank_in_group) != 0:
         return False
-    # === HCU_MOONCAKE_PCP_NIXL52779_END ===
     # Only the TP=0, PP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False

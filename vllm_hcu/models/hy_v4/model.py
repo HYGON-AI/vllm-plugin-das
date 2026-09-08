@@ -1115,7 +1115,6 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
         return self.model.get_expert_mapping()
 
 
-# === HCU_HYV4_PP_TOPK_V21_ALIGN_BEGIN ===
 def _hcu_hyv4_resolve_topk_buffer(model):
     """Return the live top-k buffer on this model or its inner module."""
 
@@ -1251,4 +1250,3 @@ if "HYV4ForCausalLM" in globals():
     _hcu_hyv4_orig_causal_fwd = HYV4ForCausalLM.forward
     if not getattr(_hcu_hyv4_orig_causal_fwd, "_hcu_hyv4_pp_topk_wrapped", False):
         HYV4ForCausalLM.forward = _hcu_hyv4_wrap_forward(_hcu_hyv4_orig_causal_fwd)
-# === HCU_HYV4_PP_TOPK_V21_ALIGN_END ===

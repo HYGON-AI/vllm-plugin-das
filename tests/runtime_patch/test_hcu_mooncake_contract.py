@@ -105,6 +105,11 @@ def test_target_metadata_schema_and_round_trip(mooncake):
         "registered_layer_names",
         "registered_layer_indices",
         "registered_group_indices",
+        "src_layer_offset",
+        "model_layer_start",
+        "model_layer_end",
+        "xfer_head_rank",
+        "remote_pp_size",
     )
     metadata = _metadata(
         mooncake,
@@ -785,8 +790,17 @@ def test_receive_kv_selects_matching_remote_pp_workers(mooncake):
     worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0, 1]
     calls = []
 
-    async def receive(worker_addr, pull_metas):
-        calls.append((worker_addr, pull_metas))
+    async def receive(
+        worker_addr,
+        pull_metas,
+        *,
+        chunk_idx=None,
+        model_layer_start=-1,
+        model_layer_end=-1,
+    ):
+        calls.append(
+            (worker_addr, pull_metas, chunk_idx, model_layer_start, model_layer_end)
+        )
 
     worker.receive_kv_from_single_worker = receive
     pull_meta = SimpleNamespace(pull_tasks_count=0)
@@ -798,9 +812,10 @@ def test_receive_kv_selects_matching_remote_pp_workers(mooncake):
 
     asyncio.run(run())
 
-    assert [address for address, _ in calls] == ["tp0-pp1", "tp1-pp1"]
-    assert all(metadata is pull_metas for _, metadata in calls)
+    assert [address for address, *_ in calls] == ["tp0-pp1", "tp1-pp1"]
+    assert all(metadata is pull_metas for _, metadata, *_ in calls)
     assert pull_meta.pull_tasks_count == 2
+    assert all(start == -1 and end == -1 for _, _, _, start, end in calls)
 
 
 def test_target_first_patch_contract_is_idempotent(
@@ -827,3 +842,107 @@ def test_ttft_transfer_identity(mooncake):
     assert mooncake.transfer_id_from_req(req_id, {"transfer_id": "explicit"}) == (
         "explicit"
     )
+
+
+def _even_pp_indices(num_hidden_layers, pp_rank, pp_size):
+    per = num_hidden_layers // pp_size
+    start = pp_rank * per
+    end = num_hidden_layers if pp_rank + 1 == pp_size else start + per
+    return start, end
+
+
+def test_noncanonical_pcp_skips_empty_alloc_send(mooncake):
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.finished_sending_reqs = set()
+    worker.reqs_need_send = {}
+    metadata = mooncake.MooncakeConnectorMetadata()
+    metadata.reqs_to_send = {"req-1": ("xfer-1", [])}
+
+    asyncio.run(worker._complete_noncanonical_pcp_sends(metadata))
+
+    assert worker.finished_sending_reqs == set()
+
+
+def test_noncanonical_pcp_reports_complete_on_final_blocks(mooncake):
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.finished_sending_reqs = set()
+    worker.reqs_need_send = {}
+    metadata = mooncake.MooncakeConnectorMetadata()
+    metadata.reqs_to_send = {"req-1": ("xfer-1", [[1, 2]])}
+
+    asyncio.run(worker._complete_noncanonical_pcp_sends(metadata))
+
+    assert worker.finished_sending_reqs == {"req-1"}
+
+
+def test_validate_mooncake_pcp_pd_rejects_consumer_and_dcp(mooncake):
+    consumer = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_consumer",
+            kv_connector_extra_config={},
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="kv_producer only"):
+        mooncake._validate_mooncake_pcp_pd(consumer)
+
+    dcp = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_producer",
+            kv_connector_extra_config={},
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="decode_context_parallel_size"):
+        mooncake._validate_mooncake_pcp_pd(dcp)
+
+
+def test_receive_kv_uses_layer_overlap_for_heterogeneous_pp(mooncake, monkeypatch):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    worker._fail_pull_metas = lambda *args, **kwargs: None
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake, "get_pp_indices", _even_pp_indices)
+    calls = []
+
+    async def receive(
+        worker_addr,
+        pull_metas,
+        *,
+        chunk_idx=None,
+        model_layer_start=-1,
+        model_layer_end=-1,
+    ):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+    pull_meta = SimpleNamespace(pull_tasks_count=0)
+    pull_metas = {"request": pull_meta}
+
+    async def run():
+        worker.receive_kv("engine", pull_metas)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert calls == [("tp0-pp0", 0, 4), ("tp0-pp1", 4, 8)]
+    assert pull_meta.pull_tasks_count == 2
+
+
+def test_hetero_pp_rejects_custom_layer_partition(mooncake, monkeypatch):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "4,4")
+    with pytest.raises(RuntimeError, match="VLLM_PP_LAYER_PARTITION"):
+        worker._pp_overlap_layer_range(remote_pp_rank=0, remote_pp_size=2)

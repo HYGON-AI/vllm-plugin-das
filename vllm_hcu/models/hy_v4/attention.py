@@ -850,7 +850,8 @@ __all__ = [
     "require_local_indexer_producer",
     "require_hyv4_sink_backend",
 ]
-# === HCU_HYV4_PP_TOPK_V21_ALIGN_BEGIN ===
+
+
 def _hcu_hyv4_require_local_indexer_producer_v21(func):
     """Allow PP stages that start on a shared indexer layer."""
 
@@ -874,4 +875,3 @@ def _hcu_hyv4_require_local_indexer_producer_v21(func):
 require_local_indexer_producer = _hcu_hyv4_require_local_indexer_producer_v21(
     require_local_indexer_producer
 )
-# === HCU_HYV4_PP_TOPK_V21_ALIGN_END ===
