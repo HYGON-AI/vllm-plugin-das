@@ -53,13 +53,8 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
 
 COPY requirements-test.txt /tmp/requirements-test.txt
 
-# AICC 编译器: 用 hcu_llvm_installer.sh 固定安装 1.0.0 大版本(该版本内日期最新)
 # 安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录
-RUN if ! command -v curl >/dev/null 2>&1; then \
-        apt-get update -qq && apt-get install -y -qq --no-install-recommends curl \
-        && rm -rf /var/lib/apt/lists/*; \
-    fi && \
-    wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
+RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
     chmod +x /tmp/hcu_llvm_installer.sh && \
     bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
     rm -f /tmp/hcu_llvm_installer.sh
