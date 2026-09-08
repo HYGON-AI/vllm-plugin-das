@@ -22,7 +22,32 @@ from tests.integration.server.evalscope_server import (
     _assert_pass_criteria,
     _direct_urlopen,
     _server_environment,
+    load_config,
 )
+
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_qwen3_gsm8k_config_uses_reproducible_greedy_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_env = "VLLM_HCU_TEST_UNUSED_QWEN3_GSM8K_CONFIG"
+    monkeypatch.delenv(config_env, raising=False)
+    config = load_config(
+        ROOT / "tests/models/qwen3_8b_gsm8k_evalscope.yaml",
+        config_env,
+    )
+
+    assert config["server"]["args"][-2:] == ["--seed", "0"]
+    assert config["evalscope"]["eval_batch_size"] == 1
+    assert config["evalscope"]["generation_config"] == {
+        "temperature": 0,
+        "do_sample": False,
+        "seed": 0,
+        "max_tokens": 4096,
+        "top_p": 0.95,
+    }
 
 
 class _HealthyHandler(BaseHTTPRequestHandler):
