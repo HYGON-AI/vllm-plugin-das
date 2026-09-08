@@ -53,16 +53,16 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
 
 COPY requirements-test.txt /tmp/requirements-test.txt
 
-# AICC 编译器 (nightly 最新版地址由 CI 通过 build-arg 传入, 在镜像内下载安装)
-# AICC_VERSION 由 CI 从同一 URL 解析传入; ENV 指令不支持 bash 参数展开, 无法在 Dockerfile 内由 URL 自动推导
-ARG AICC_URL
-ARG AICC_VERSION
-ENV AICC_VERSION=${AICC_VERSION}
-
-RUN wget -q "${AICC_URL}" -O /tmp/aicc.run && \
-    chmod +x /tmp/aicc.run && \
-    yes | /tmp/aicc.run --dtk_dir /opt/dtk && \
-    rm -f /tmp/aicc.run
+# AICC 编译器: 用 hcu_llvm_installer.sh 固定安装 1.0.0 大版本(该版本内日期最新)
+# 安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录
+RUN if ! command -v curl >/dev/null 2>&1; then \
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends curl \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi && \
+    wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
+    chmod +x /tmp/hcu_llvm_installer.sh && \
+    bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
+    rm -f /tmp/hcu_llvm_installer.sh
 
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
