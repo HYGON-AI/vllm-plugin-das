@@ -1089,6 +1089,17 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
     )
     assert calls[-1][0] == "upstream"
 
+    impl.q_concat_buffer = torch.empty(2, 8, 3)
+    q_pe_empty = torch.empty(2, 4, 0)
+    assert impl.forward_mqa((q_nope, q_pe_empty), cache, metadata, layer) == (
+        "upstream-output",
+        None,
+    )
+    upstream_query = calls[-1][1]
+    assert isinstance(upstream_query, torch.Tensor)
+    assert upstream_query.shape == (2, 4, 3)
+    torch.testing.assert_close(upstream_query, q_nope)
+
 
 def test_flashmla_cat_route_consumes_split_query(
     monkeypatch,

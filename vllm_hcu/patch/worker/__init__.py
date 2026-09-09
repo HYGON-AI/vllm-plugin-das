@@ -216,10 +216,12 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
+    _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),
+    _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
 )
 
 
@@ -240,13 +242,14 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer2")),
-    # All GDN deltas bind Qwen's module-local symbols/class only.  The
+    # GDN deltas bind model-local symbols/classes only. The canonical
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
     # the GDN adapters.
     _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
+    _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_conv_weight")),
     _CallbackSpec(_adapter("op_opt", "patch_gate_linear")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),

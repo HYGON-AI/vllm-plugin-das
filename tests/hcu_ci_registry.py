@@ -41,6 +41,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_glm53_channel_fp8.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/patch/test_clean_process_bootstrap.py",
     est_time=300,
 )
@@ -284,6 +289,15 @@ register_hcu_ci(
         "required GLM-5.2 model is unavailable in the public and parastor CI "
         "model roots"
     ),
+)
+register_hcu_ci(
+    job="glm53-flash-channel-fp8-humaneval",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_glm53_flash_channel_fp8_humaneval.py::"
+        "test_glm53_flash_channel_fp8_humaneval_evalscope_server"
+    ),
+    est_time=14400,
 )
 register_hcu_ci(
     job="single-node-topology",

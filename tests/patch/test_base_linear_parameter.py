@@ -24,6 +24,7 @@ from vllm_hcu.patch.runtime_state import LatchedPatchError, PatchRegistry
 from vllm_hcu.runtime_compat.base_linear_parameter import (
     install_base_linear_parameter_compat,
 )
+from vllm_hcu.version import __vllm_target_version__
 
 
 TARGET = "vllm.model_executor.parameter"
@@ -211,6 +212,21 @@ def test_nn_layout_loaders_transpose_and_use_physical_dimensions(
     )
     local_column.load_column_parallel_weight(full_column[2:4])
     torch.testing.assert_close(local_column.data, full_column[2:4].t())
+
+    # KDA convolution weights add a singleton dimension after constructing a
+    # column-parallel linear. Preserve the HCU NN layout for that N-D weight.
+    full_conv = torch.arange(24).reshape(6, 1, 4)
+    conv_column = _instance(
+        module._ColumnvLLMParameter,
+        data=torch.zeros(4, 1, 3, dtype=full_conv.dtype),
+        output_dim=0,
+        tp_rank=1,
+    )
+    conv_column.load_column_parallel_weight(full_conv)
+    torch.testing.assert_close(
+        conv_column.data,
+        full_conv[3:6].permute(2, 1, 0),
+    )
 
     # Equal logical and physical shapes do not imply equal layouts.  Square
     # checkpoint matrices still require the NN-layout transpose.
@@ -408,6 +424,10 @@ def _clean_v0251_environment(cache_root: Path) -> dict[str, str]:
 
 
 @pytest.mark.hcu
+@pytest.mark.skipif(
+    not __vllm_target_version__.startswith("0.25."),
+    reason="full v0.25.1 bootstrap only applies to a v0.25.x plugin target",
+)
 def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
     tmp_path: Path,
 ):
@@ -504,6 +524,10 @@ def test_official_registry_stdin_protocol_applies_adapter_and_one_linear(
 
 
 @pytest.mark.hcu
+@pytest.mark.skipif(
+    not __vllm_target_version__.startswith("0.25."),
+    reason="full v0.25.1 bootstrap only applies to a v0.25.x plugin target",
+)
 def test_qwen35_real_inspect_cache_miss_uses_official_registry_command(
     tmp_path: Path,
 ):
