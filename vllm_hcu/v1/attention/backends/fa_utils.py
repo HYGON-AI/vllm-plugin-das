@@ -21,6 +21,7 @@ import vllm_hcu.hcu_ops as hcu_ops
 
 _DSPARK_MAX_CAPTURE_TOKENS = 512
 _DSPARK_MAX_CONTEXT_LENGTH = 4096
+_DSPARK_MAX_STATIC_KV_SCRATCH_BYTES = 584 * 1024**2
 
 
 def _flash_attn_layout() -> str:
@@ -131,6 +132,11 @@ def _matches_dspark_attention_shape(
         return False
     if k.shape[-2] <= 0 or q.shape[-2] % k.shape[-2] != 0:
         return False
+    # The vendor paged-attention kernel flattens the query-token and query-head
+    # axes and accepts at most 64 such heads per KV head.  The qlen=7 route
+    # below uses varlen_fwd instead and does not have this restriction.
+    if causal and q.shape[-2] * query_len > k.shape[-2] * 64:
+        return False
     max_seqlen_k = kwargs.get("max_seqlen_k")
     if (
         not isinstance(max_seqlen_k, int)
@@ -144,6 +150,17 @@ def _matches_dspark_attention_shape(
         return False
     if any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, out)):
         return False
+    if not causal:
+        scratch_bytes = (
+            2
+            * batch_size
+            * max_seqlen_k
+            * k.shape[-2]
+            * k.shape[-1]
+            * k.element_size()
+        )
+        if scratch_bytes > _DSPARK_MAX_STATIC_KV_SCRATCH_BYTES:
+            return False
     if bool(kwargs.get("causal", False)) is not causal:
         return False
     if window_size is not None:
@@ -220,8 +237,9 @@ def _flash_attn_varlen_func_with_dspark_capture(
         # DSpark's non-causal draft block cannot use paged_attention, which
         # applies a causal mask. Gather into a statically sized buffer instead
         # of materializing seqused_k.sum() on the host during graph capture.
-        # The matcher bounds this scratch space to 584 MiB per Qwen3-8B TP2
-        # rank: 2 * floor(512 / 7) * 4096 * 4 * 128 * sizeof(bfloat16).
+        # The matcher bounds this scratch space to 584 MiB per rank, matching
+        # Qwen3-8B TP2 at its maximum admitted shape:
+        # 2 * floor(512 / 7) * 4096 * 4 * 128 * sizeof(bfloat16).
         max_seqlen_k = kwargs["max_seqlen_k"]
         total_k = batch_size * max_seqlen_k
         contiguous_k = torch.empty(

@@ -183,6 +183,61 @@ def test_nn_layout_delegates_output_major_quantized_weights(
     )
 
 
+def test_nn_layout_rejects_mixed_quantization_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = importlib.import_module(
+        "vllm_hcu.patch.worker.core_fix.patch_qwen3_dflash_nn_layout"
+    )
+    module = _upstream_module()
+    monkeypatch.setattr(patch, "_use_nn_layout", lambda: True)
+    assert patch.apply_to_module(module) is True
+
+    model = module.DFlashQwen3Model()
+    model.hidden_norm = SimpleNamespace(weight=torch.ones(4))
+    unquantized = _attention(
+        torch.arange(24, dtype=torch.float32).reshape(4, 6),
+        torch.arange(6, dtype=torch.float32),
+        torch.ones(2),
+    )
+    quantized = _attention(
+        torch.arange(24, dtype=torch.float32).reshape(6, 4),
+        torch.arange(6, dtype=torch.float32),
+        torch.ones(2),
+        input_size=4,
+        is_quantization=True,
+    )
+
+    with pytest.raises(PatchCompatibilityError, match="quantization.*inconsistent"):
+        model._build_context_kv_buffers(
+            [unquantized, quantized],
+            has_bias=False,
+        )
+
+
+def test_nn_layout_rejects_missing_quantization_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = importlib.import_module(
+        "vllm_hcu.patch.worker.core_fix.patch_qwen3_dflash_nn_layout"
+    )
+    module = _upstream_module()
+    monkeypatch.setattr(patch, "_use_nn_layout", lambda: True)
+    assert patch.apply_to_module(module) is True
+
+    model = module.DFlashQwen3Model()
+    model.hidden_norm = SimpleNamespace(weight=torch.ones(4))
+    attention = _attention(
+        torch.arange(24, dtype=torch.float32).reshape(4, 6),
+        torch.arange(6, dtype=torch.float32),
+        torch.ones(2),
+    )
+    del attention.qkv_proj.is_quantization
+
+    with pytest.raises(PatchCompatibilityError, match="metadata.*missing"):
+        model._build_context_kv_buffers([attention], has_bias=False)
+
+
 def test_nn_layout_rejects_unexpected_unquantized_weight_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

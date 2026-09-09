@@ -206,6 +206,88 @@ def test_hcu_varlen_routes_dspark_q_len_8_to_paged_attention(
     assert paged_args[12:] == (128, None, 2)
 
 
+def test_hcu_varlen_q_len_8_falls_back_above_paged_attention_head_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep high-GQA callers on the vendor path instead of crashing."""
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    paged_attention_calls: list[tuple[object, ...]] = []
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        paged_attention=lambda *args: paged_attention_calls.append(args)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    query_len = 8
+    q = torch.zeros((query_len, 16, 128), dtype=torch.bfloat16)
+    k = torch.zeros((1, 64, 1, 128), dtype=torch.bfloat16)
+    fa_utils.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=torch.zeros_like(k),
+        out=torch.empty_like(q),
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([64], dtype=torch.int32),
+        max_seqlen_k=64,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    assert len(calls["flash_attn_varlen_func"]) == 1
+    assert paged_attention_calls == []
+
+
+def test_hcu_varlen_drafter_route_respects_static_kv_scratch_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not admit other model shapes whose graph scratch can exceed TP2."""
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    query_len = 7
+    batch_size = 37
+    q = torch.zeros(
+        (batch_size * query_len, 32, 128),
+        dtype=torch.bfloat16,
+    )
+    k = torch.zeros((1, 64, 8, 128), dtype=torch.bfloat16)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": torch.zeros_like(k),
+        "out": torch.empty_like(q),
+        "cu_seqlens_q": torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+        ),
+        "max_seqlen_q": query_len,
+        "seqused_k": torch.full((batch_size,), 4096, dtype=torch.int32),
+        "max_seqlen_k": 4096,
+        "causal": False,
+        "window_size": (-1, -1),
+        "block_table": torch.zeros((batch_size, 64), dtype=torch.int32),
+        "layout": "bshd",
+    }
+
+    assert not fa_utils._matches_dspark_attention_shape(
+        kwargs,
+        query_len=query_len,
+        causal=False,
+    )
+
+
 def test_hcu_varlen_routes_dspark_drafter_q_len_7_to_static_varlen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

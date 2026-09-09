@@ -152,12 +152,80 @@ def test_hcu_dspark_attention_matches_vendor_and_replays_in_cuda_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         hcu_varlen(out=actual_out, **common)
+
+    # Change captured inputs in place and poison the prior output so this test
+    # fails if replay is a no-op or reuses the warmup result.
+    q.neg_()
+    actual_out.fill_(float("nan"))
     graph.replay()
+    replay_reference = vendor_varlen(out=reference_out, **common).clone()
     torch.cuda.synchronize(device)
     replay = actual_out.clone()
-    eager = hcu_varlen(out=actual_out, **common).clone()
+    assert not torch.isnan(replay).any().item()
+    torch.testing.assert_close(replay, replay_reference, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("q_heads", "expected_paged_route"),
+    [(8, True), (9, False)],
+    ids=["flattened-head-limit", "above-flattened-head-limit"],
+)
+def test_hcu_dspark_paged_attention_head_limit_matches_vendor(
+    q_heads: int,
+    expected_paged_route: bool,
+) -> None:
+    from flash_attn import flash_attn_varlen_func as vendor_varlen
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        _flash_attn_varlen_func_with_dspark_capture as hcu_varlen,
+        _matches_dspark_attention_shape,
+    )
+
+    device = _hcu_device()
+    torch.manual_seed(42)
+    query_len, kv_heads, head_dim = 8, 1, 128
+    q = torch.randn(
+        (query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = torch.randn(
+        (1, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv.unbind(1)
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": torch.tensor(
+            [0, query_len], device=device, dtype=torch.int32
+        ),
+        "max_seqlen_q": query_len,
+        "seqused_k": torch.tensor([64], device=device, dtype=torch.int32),
+        "max_seqlen_k": 64,
+        "softmax_scale": head_dim**-0.5,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": torch.tensor([[0]], device=device, dtype=torch.int32),
+        "layout": "bshd",
+    }
+    reference_out = torch.empty_like(q)
+    actual_out = torch.empty_like(q)
+
+    assert (
+        _matches_dspark_attention_shape(
+            {**common, "out": actual_out},
+            query_len=query_len,
+            causal=True,
+        )
+        is expected_paged_route
+    )
+    reference = vendor_varlen(out=reference_out, **common).clone()
+    actual = hcu_varlen(out=actual_out, **common).clone()
     torch.cuda.synchronize(device)
-    assert torch.equal(replay, eager)
+
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
