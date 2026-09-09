@@ -1225,7 +1225,7 @@ def test_gpu_dp_cg_padding_sync_skip_for_deepep_low_latency():
         patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=False)
 
 
-def test_draft_speculator_temperature_seeds_zero_copy():
+def test_draft_speculator_eager_temperature_seeds_zero_copy():
     class _IdxMapping:
         def __getitem__(self, key):
             return self
@@ -1238,6 +1238,9 @@ def test_draft_speculator_temperature_seeds_zero_copy():
 
     class DraftModelSpeculator:
         def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                compilation_config=SimpleNamespace(cudagraph_mode=False)
+            )
             self.temperature = SimpleNamespace(name="buf_t")
             self.seeds = SimpleNamespace(name="buf_s")
             self.idx_mapping = _IdxMapping()
@@ -1258,6 +1261,134 @@ def test_draft_speculator_temperature_seeds_zero_copy():
     assert obj.temperature is temperature
     assert obj.seeds is seeds
     assert obj.idx_mapping.copied is idx
+
+
+def test_draft_speculator_full_graph_keeps_fixed_inputs_across_uva_rotation():
+    class _FixedGraphInput:
+        def __init__(self):
+            self.value = None
+
+        def copy_(self, other):
+            self.value = other.value
+
+    class _IdxMapping:
+        def __getitem__(self, key):
+            return self
+
+        def copy_(self, other):
+            self.copied = other
+
+        def fill_(self, value):
+            self.filled = value
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                compilation_config=SimpleNamespace(cudagraph_mode=True)
+            )
+            self.temperature = _FixedGraphInput()
+            self.seeds = _FixedGraphInput()
+            self.idx_mapping = _IdxMapping()
+            self.draft_logits = None
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            self.temperature.copy_(temperature)
+            self.seeds.copy_(seeds)
+            self.idx_mapping[:num_reqs].copy_(idx_mapping)
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+
+    obj = DraftModelSpeculator()
+    fixed_temperature = obj.temperature
+    fixed_seeds = obj.seeds
+
+    # First staged write selects UVA views A. A full graph captures the
+    # addresses held by the speculator after this copy.
+    obj._copy_request_inputs(
+        1,
+        object(),
+        SimpleNamespace(value=0.25),
+        SimpleNamespace(value=101),
+    )
+    captured_temperature = obj.temperature
+    captured_seeds = obj.seeds
+
+    # The next staged write rotates the caller to UVA views B. Replaying the
+    # graph must still read its stable inputs, now updated with B's values.
+    obj._copy_request_inputs(
+        1,
+        object(),
+        SimpleNamespace(value=0.75),
+        SimpleNamespace(value=202),
+    )
+
+    assert obj.temperature is fixed_temperature is captured_temperature
+    assert obj.seeds is fixed_seeds is captured_seeds
+    assert captured_temperature.value == 0.75
+    assert captured_seeds.value == 202
+
+
+@pytest.mark.hcu
+def test_draft_speculator_full_graph_replay_reads_rotated_sampling_inputs():
+    if not torch.cuda.is_available():
+        pytest.skip("requires an HCU device")
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                compilation_config=SimpleNamespace(cudagraph_mode=True)
+            )
+            self.temperature = torch.zeros(1, dtype=torch.float32, device="cuda")
+            self.seeds = torch.zeros(1, dtype=torch.int64, device="cuda")
+            self.idx_mapping = torch.zeros(1, dtype=torch.int32, device="cuda")
+            self.draft_logits = None
+            self.original_calls = 0
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            self.original_calls += 1
+            self.temperature[:num_reqs].copy_(temperature)
+            self.seeds[:num_reqs].copy_(seeds)
+            self.idx_mapping[:num_reqs].copy_(idx_mapping)
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+
+    obj = DraftModelSpeculator()
+    fixed_temperature_ptr = obj.temperature.data_ptr()
+    fixed_seeds_ptr = obj.seeds.data_ptr()
+    idx_mapping = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    # These distinct allocations model consecutive views selected from the
+    # rotating UVA pool without requiring the UVA extension in contract CI.
+    temperature_a = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+    seeds_a = torch.tensor([101], dtype=torch.int64, device="cuda")
+    temperature_b = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    seeds_b = torch.tensor([202], dtype=torch.int64, device="cuda")
+    assert temperature_a.data_ptr() != temperature_b.data_ptr()
+    assert seeds_a.data_ptr() != seeds_b.data_ptr()
+
+    obj._copy_request_inputs(1, idx_mapping, temperature_a, seeds_a)
+    torch.cuda.synchronize()
+
+    output_temperature = torch.empty_like(obj.temperature)
+    output_seeds = torch.empty_like(obj.seeds)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output_temperature.copy_(obj.temperature)
+        output_seeds.copy_(obj.seeds)
+
+    obj._copy_request_inputs(1, idx_mapping, temperature_b, seeds_b)
+    assert obj.temperature.data_ptr() == fixed_temperature_ptr
+    assert obj.seeds.data_ptr() == fixed_seeds_ptr
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output_temperature.cpu().item() == 0.75
+    assert output_seeds.cpu().item() == 202
+    assert obj.original_calls == 2
 
 
 class _Buffer:

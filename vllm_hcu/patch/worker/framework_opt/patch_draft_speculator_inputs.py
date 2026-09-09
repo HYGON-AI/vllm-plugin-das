@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Avoid per-step H2D by reusing caller temperature/seeds buffers."""
+"""Reuse caller sampling buffers only when CUDA graphs are disabled."""
 
 from __future__ import annotations
 
@@ -39,8 +39,21 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
-        # Alias caller buffers (often UVA views) instead of H2D copy_.
-        # idx_mapping still copied into the fixed CG-padded buffer.
+        compilation_config = getattr(
+            getattr(self, "vllm_config", None),
+            "compilation_config",
+            None,
+        )
+        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+        if cudagraph_mode is None or bool(cudagraph_mode):
+            # Full graphs capture the addresses of the fixed speculator inputs.
+            # SamplingStates rotates its UVA views, so aliasing a later view
+            # would leave graph replay reading stale temperature/seed values.
+            return original(self, num_reqs, idx_mapping, temperature, seeds)
+
+        # With CUDA graphs explicitly disabled, alias caller buffers (often
+        # UVA views) instead of copying them H2D. idx_mapping still uses the
+        # fixed padded buffer expected by the remaining speculator code.
         self.temperature = temperature
         self.seeds = seeds
         self.idx_mapping[:num_reqs].copy_(idx_mapping)
