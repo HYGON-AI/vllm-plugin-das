@@ -88,6 +88,82 @@ def test_boolean_environment_values_are_lazily_parsed(
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
+)
+def test_lightop_sqrtsoftplus_environment_is_lazy_and_defaults_on(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert hcu_envs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE is expected
+    assert hcu_envs.is_set(name) is (value is not None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
+)
+def test_lightop_qwen_rmsnorm_gated_environment_is_lazy_and_defaults_on(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert getattr(hcu_envs, name) is expected
+    assert hcu_envs.is_set(name) is (value is not None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, False), ("1", True), ("true", True), ("0", False), ("false", False)),
+)
+def test_lightop_w16a16_environment_is_lazy_and_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_W16A16_MOE"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert hcu_envs.VLLM_HCU_USE_LIGHTOP_W16A16_MOE is expected
+    assert hcu_envs.is_set(name) is (value is not None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
+)
+def test_lightop_mla_decode_cat_environment_is_lazy_and_defaults_on(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert hcu_envs.VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT is expected
+    assert hcu_envs.is_set(name) is (value is not None)
+
+
+@pytest.mark.parametrize(
     "name",
     [
         "VLLM_HCU_LIGHTLY_CP_THRESHOLD",
@@ -324,6 +400,7 @@ def test_input_fp8_environment_selects_custom_or_official_wrapper(
     )
     runtime = _module(
         "vllm_hcu.model_executor.layers.quantization.lightop_fp8_runtime",
+        ensure_registered=lambda dtype, register: None,
         quantize=lambda x, dtype, register: (
             calls.append("custom") or ("custom", x, dtype, register)
         ),

@@ -199,6 +199,7 @@ _COLD_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
 _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_config")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_utils")),
+    _CallbackSpec(_adapter("op_opt.moe", "patch_unquantized_oracle")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_int8_oracle")),
     _CallbackSpec(
         _adapter("op_opt.moe", "patch_fp8_oracle"),
@@ -244,6 +245,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
     # the GDN adapters.
+    _CallbackSpec(_adapter("op_opt", "patch_gdn_rms_norm_gated")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),

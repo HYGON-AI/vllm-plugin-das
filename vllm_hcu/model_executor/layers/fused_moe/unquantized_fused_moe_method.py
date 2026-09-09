@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
     make_unquantized_moe_kernel,
+    select_unquantized_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod as _Original,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import replace_parameter
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
@@ -25,6 +30,13 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     select_aiter_moe_config,
 )
 from vllm_hcu.platforms import envs as henvs
+
+
+def _reject_lightop_w16a16_weight_reload(*_args, **_kwargs) -> None:
+    raise RuntimeError(
+        "cannot reload canonical MoE weights after installing the LightOp "
+        "W16A16 packed layout; recreate the model instance"
+    )
 
 
 def _is_hcu_aiter_moe_requested(method: object | None = None) -> bool:
@@ -105,7 +117,71 @@ def _has_installed_aiter_layout(
 class HcuUnquantizedFusedMoEMethod(_Original):
     """Install the AITER ASM layout once instead of caching a second copy."""
 
+    def __init__(self, moe) -> None:
+        # The official implementation imports the selector directly into its
+        # module.  Patching the oracle later cannot update that captured
+        # binding, so calling _Original.__init__ would silently bypass HCU's
+        # opt-in backend.  Initialize the common base and resolve through the
+        # HCU module binding that is armed after the oracle patch instead.
+        FusedMoEMethodBase.__init__(self, moe)
+        self.unquantized_backend, self.experts_cls = (
+            select_unquantized_moe_backend(moe_config=self.moe)
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if (
+            getattr(getattr(self, "unquantized_backend", None), "name", None)
+            == "HCU_LIGHTOP_W16A16"
+        ):
+            # Do not run vLLM's ROCm padding first: that creates a strided
+            # canonical view, while LightOp packing requires contiguous
+            # logical weights and owns a different permanent layout.
+            QuantizeMethodBase.process_weights_after_loading(self, layer)
+            from vllm_hcu.model_executor.layers.fused_moe import (
+                lightop_w16a16_runtime,
+            )
+
+            original_w13 = layer.w13_weight
+            original_w2 = layer.w2_weight
+            attrs13 = dict(getattr(original_w13, "__dict__", {}))
+            attrs2 = dict(getattr(original_w2, "__dict__", {}))
+            packed13, packed2, layout = (
+                lightop_w16a16_runtime.pack_lightop_w16a16_weights(
+                    original_w13, original_w2
+                )
+            )
+            is_weight_update = self.moe_kernel is not None
+            replace_parameter(
+                layer, "w13_weight", packed13, prefer_copy=is_weight_update
+            )
+            replace_parameter(
+                layer, "w2_weight", packed2, prefer_copy=is_weight_update
+            )
+            for weight, attributes in (
+                (layer.w13_weight, attrs13),
+                (layer.w2_weight, attrs2),
+            ):
+                for name, value in attributes.items():
+                    if not hasattr(weight, name):
+                        setattr(weight, name, value)
+                weight.weight_loader = _reject_lightop_w16a16_weight_reload
+            lightop_w16a16_runtime.mark_lightop_w16a16_weights(
+                layer.w13_weight, layer.w2_weight, layout
+            )
+
+            if not is_weight_update:
+                self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+                assert self.moe_quant_config is not None
+                assert self.experts_cls is not None
+                self.moe_kernel = make_unquantized_moe_kernel(
+                    quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    backend=self.unquantized_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=_expert_routing_tables(layer),
+                )
+            return
+
         if (
             not _is_hcu_aiter_moe_requested(self)
             or getattr(self, "unquantized_backend", None)

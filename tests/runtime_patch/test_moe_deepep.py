@@ -1624,7 +1624,16 @@ def test_eplb_torch_map_and_record_numeric_contract(monkeypatch: pytest.MonkeyPa
     assert torch.equal(loads, torch.tensor([1, 0, 1]))
 
 
-def test_hash_router_normalizes_index_dtypes():
+def test_hash_router_normalizes_index_dtypes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import sqrtsoftplus_routing
+
+    monkeypatch.setattr(
+        sqrtsoftplus_routing,
+        "_load_lightop_sqrtsoftplus",
+        lambda: None,
+    )
     captured = {}
 
     def original(
@@ -1690,7 +1699,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.moe_quant_config = "official-config"
 
     class RoutedExperts:
-        def __init__(self):
+        def __init__(self, apply_router_weight_on_input=False):
             self.moe_config = "moe-config"
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
@@ -1700,6 +1709,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.official_loads = []
             self._expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
             self.expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+            self.apply_router_weight_on_input = apply_router_weight_on_input
 
         @property
         def expert_map(self):
@@ -1720,8 +1730,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             yield "official-load"
 
     class Runner:
-        def __init__(self):
-            self.routed_experts = RoutedExperts()
+        def __init__(self, apply_router_weight_on_input=False):
+            self.routed_experts = RoutedExperts(apply_router_weight_on_input)
             self.replaced = None
 
         def _replace_quant_method(self, method):
@@ -1736,7 +1746,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     source = (
         "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
-        + "):\n    return Runner()\n"
+        + "):\n    return Runner(apply_router_weight_on_input)\n"
     )
     exec(source, layer_module.__dict__)
     fused_moe_package = _module(
@@ -1755,8 +1765,17 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         "vllm.model_executor.layers.fused_moe.layer",
         layer_module,
     )
+    routed_experts_module = _module(
+        "vllm.model_executor.layers.fused_moe.routed_experts",
+        UnquantizedFusedMoEMethod=UnquantizedFusedMoEMethod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.routed_experts",
+        routed_experts_module,
+    )
 
-    class HcuUnquantizedFusedMoEMethod:
+    class HcuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         def __init__(self, moe_config):
             self.moe_config = moe_config
             self.moe_quant_config = None
@@ -1774,11 +1793,26 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert patch_layer.apply_to_module(fused_moe_package) is True
     assert fused_moe_package.FusedMoEFactory is layer_module.FusedMoEFactory
     assert fused_moe_package.FusedMoE is fused_moe_package.FusedMoEFactory
+    assert (
+        routed_experts_module.UnquantizedFusedMoEMethod
+        is HcuUnquantizedFusedMoEMethod
+    )
+    assert (
+        fused_moe_package.UnquantizedFusedMoEMethod
+        is HcuUnquantizedFusedMoEMethod
+    )
     runner = fused_moe_package.FusedMoE()
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+    router_weight_runner = fused_moe_package.FusedMoE(
+        apply_router_weight_on_input=True
+    )
+    assert type(router_weight_runner.routed_experts.quant_method) is (
+        UnquantizedFusedMoEMethod
+    )
+    assert router_weight_runner.replaced is None
     assert experts.expert_map is experts.expert_mask
     assert (
         experts.expert_mask._vllm_hcu_native_expert_map is experts._expert_map
@@ -1853,6 +1887,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert list(experts.load_weights([("experts.down_proj", down_scale)])) == [
         "official-load"
     ]
+
+    routed_experts_module.UnquantizedFusedMoEMethod = UnquantizedFusedMoEMethod
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_layer.apply_to_module(fused_moe_package)
 
 
 def test_triton_moe_rebinds_hcu_moe_alignment(
@@ -2003,6 +2041,14 @@ def test_fused_moe_rebinds_hcu_moe_alignment(
 def test_moe_align_feature_off_and_lightop_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    class TorchWithCompiledMoeAlign:
+        ops = SimpleNamespace(
+            _moe_C=SimpleNamespace(moe_align_block_size=lambda: None)
+        )
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
     def official(
         topk_ids,
         block_size,
@@ -2023,7 +2069,7 @@ def test_moe_align_feature_off_and_lightop_contract(
 
     module = _module(
         patch_moe_align_block_size.TARGET_MODULE,
-        torch=torch,
+        torch=TorchWithCompiledMoeAlign(),
         triton=SimpleNamespace(
             cdiv=lambda value, block: (value + block - 1) // block
         ),
@@ -2093,6 +2139,103 @@ def test_moe_align_feature_off_and_lightop_contract(
     )
     assert calls[-1][0][6] is None
     assert torch.equal(expert_ids, torch.tensor([1, 0], dtype=torch.int32))
+
+
+def test_moe_align_feature_off_uses_torch_when_vllm_kernel_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class TorchWithoutCompiledMoeAlign:
+        ops = SimpleNamespace(_moe_C=SimpleNamespace())
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    def unavailable_official(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=None,
+        pad_sorted_ids=False,
+        ignore_invalid_experts=False,
+    ):
+        del (
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+        raise AssertionError("missing _moe_C kernel must not be invoked")
+
+    module = _module(
+        patch_moe_align_block_size.TARGET_MODULE,
+        torch=TorchWithoutCompiledMoeAlign(),
+        ops=SimpleNamespace(moe_align_block_size=None),
+        triton=SimpleNamespace(
+            cdiv=lambda value, block: (value + block - 1) // block
+        ),
+        round_up=lambda value, block: (value + block - 1) // block * block,
+        moe_align_block_size=unavailable_official,
+    )
+    assert patch_moe_align_block_size.apply_to_module(module) is True
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+
+    sorted_ids, expert_ids, count = module.moe_align_block_size(ids, 2, 3)
+
+    assert count.item() == 6
+    assert torch.equal(
+        sorted_ids[: count.item()],
+        torch.tensor([0, 4, 1, 2, 3, 4], dtype=torch.int32),
+    )
+    assert torch.equal(expert_ids[:3], torch.tensor([0, 1, 2], dtype=torch.int32))
+
+
+def test_moe_align_rebinds_preimported_fused_moe_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def official(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=None,
+        pad_sorted_ids=False,
+        ignore_invalid_experts=False,
+    ):
+        del (
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+        return "official"
+
+    module = _module(
+        patch_moe_align_block_size.TARGET_MODULE,
+        torch=torch,
+        triton=SimpleNamespace(
+            cdiv=lambda value, block: (value + block - 1) // block
+        ),
+        round_up=lambda value, block: (value + block - 1) // block * block,
+        moe_align_block_size=official,
+    )
+    consumer_name = (
+        "vllm.model_executor.layers.fused_moe.fused_moe"
+    )
+    consumer = _module(consumer_name, moe_align_block_size=official)
+    monkeypatch.setitem(sys.modules, consumer_name, consumer)
+
+    assert patch_moe_align_block_size.apply_to_module(module) is True
+
+    assert consumer.moe_align_block_size is module.moe_align_block_size
+    module.moe_align_block_size = official
+    with pytest.raises(PatchCompatibilityError, match="stale"):
+        patch_moe_align_block_size.apply_to_module(module)
 
 
 def test_moe_align_requires_categorized_out_api(
@@ -2295,6 +2438,14 @@ else:
 def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    class TorchWithCompiledMoeAlign:
+        ops = SimpleNamespace(
+            _moe_C=SimpleNamespace(moe_align_block_size=lambda: None)
+        )
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
     def official(
         topk_ids,
         block_size,
@@ -2329,7 +2480,7 @@ def test_moe_align_ep_remap_rejects_uninitialized_buffer_ids(
 
     module = _module(
         patch_moe_align_block_size.TARGET_MODULE,
-        torch=torch,
+        torch=TorchWithCompiledMoeAlign(),
         ops=SimpleNamespace(moe_align_block_size=native_align),
         triton=SimpleNamespace(cdiv=lambda value, block: (value + block - 1) // block),
         round_up=lambda value, block: (value + block - 1) // block * block,
