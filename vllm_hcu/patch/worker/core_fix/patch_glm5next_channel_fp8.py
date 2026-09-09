@@ -33,8 +33,8 @@ _INDEXER_CACHE_PATCH_MARKER = "_vllm_hcu_glm5next_indexer_cache_applied"
 _INDEXER_CACHE_WRAPPER_MARKER = "_vllm_hcu_glm5next_indexer_cache_wrapper"
 _QUANT_IGNORE_PATCH_MARKER = "_vllm_hcu_glm5next_quant_ignore_applied"
 _QUANT_IGNORE_WRAPPER_MARKER = "_vllm_hcu_glm5next_quant_ignore_wrapper"
-_MHC_PATCH_MARKER = "_vllm_hcu_glm5next_native_mhc_applied"
-_MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_native_mhc_wrapper"
+_MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
+_MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
 
 
 def _native_mhc_pre(
@@ -141,7 +141,112 @@ def _bind_glm5next_native_mhc(layer, mhc) -> None:
     )
 
 
-def _patch_glm5next_native_mhc(glm_model: ModuleType) -> bool:
+def _boltops_mhc_pre(
+    backend,
+    mhc,
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    norm_weight=None,
+    norm_eps=0.0,
+):
+    post_mix, comb_mix, layer_input = backend.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+    return (
+        post_mix,
+        comb_mix,
+        mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps),
+    )
+
+
+def _boltops_mhc_post(
+    backend,
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+):
+    return backend.mhc_post(x, residual, post_layer_mix, comb_res_mix)
+
+
+def _boltops_mhc_fused_post_pre(
+    backend,
+    mhc,
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    tile_n=1,
+    norm_weight=None,
+    norm_eps=0.0,
+):
+    residual_cur, post_mix, comb_mix, layer_input = backend.mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        tile_n,
+    )
+    return (
+        residual_cur,
+        post_mix,
+        comb_mix,
+        mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps),
+    )
+
+
+def _bind_glm5next_boltops_mhc(layer, mhc, backend) -> None:
+    """Bind GLM5Next to BoltOPs while preserving the official main ABI."""
+
+    layer.mhc_pre_op._forward_method = functools.partial(
+        _boltops_mhc_pre, backend, mhc
+    )
+    layer.mhc_post_op._forward_method = functools.partial(
+        _boltops_mhc_post, backend
+    )
+    layer.mhc_fused_post_pre_op._forward_method = functools.partial(
+        _boltops_mhc_fused_post_pre,
+        backend,
+        mhc,
+    )
+
+
+def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
     decoder_cls = vars(glm_model).get("Glm5NextDecoderLayer")
     if not isinstance(decoder_cls, type):
         raise PatchCompatibilityError(
@@ -154,7 +259,7 @@ def _patch_glm5next_native_mhc(glm_model: ModuleType) -> bool:
     )
     if getattr(decoder_cls, _MHC_PATCH_MARKER, False):
         if not getattr(original, _MHC_WRAPPER_MARKER, False):
-            raise PatchCompatibilityError("GLM5Next native-mHC patch marker is stale")
+            raise PatchCompatibilityError("GLM5Next BoltOPs-mHC patch marker is stale")
         return False
 
     @functools.wraps(original)
@@ -182,8 +287,9 @@ def _patch_glm5next_native_mhc(glm_model: ModuleType) -> bool:
             self, "is_mtp_layer", False
         ):
             from vllm.model_executor.layers import mhc
+            from vllm_hcu.model_executor.layers import mhc as boltops_mhc
 
-            _bind_glm5next_native_mhc(self, mhc)
+            _bind_glm5next_boltops_mhc(self, mhc, boltops_mhc)
 
     setattr(hcu_decoder_init, _MHC_WRAPPER_MARKER, True)
     setattr(decoder_cls, "_vllm_hcu_original_init", original)
@@ -460,7 +566,7 @@ def _dequantize_channel_fp8(
 def apply_to_module(module: ModuleType) -> bool:
     glm_model = load_exact_module(TARGET_MODULE, module)
     changed = _patch_multimodal_quant_ignore(glm_model)
-    changed = _patch_glm5next_native_mhc(glm_model) or changed
+    changed = _patch_glm5next_boltops_mhc(glm_model) or changed
     kpool = sys.modules.get(KPOOL_MODULE)
     if isinstance(kpool, ModuleType):
         changed = _patch_sparse_indexer_kpool(kpool)
