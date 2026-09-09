@@ -563,6 +563,39 @@ print("disable-rearrange-cli-normalized")
     assert "disable-rearrange-cli-normalized" in result.stdout
 
 
+def test_real_v0251_cli_extracts_static_dispatch_policy_before_validation() -> None:
+    result = _run_fresh_v0251(
+        r'''
+import argparse
+import json
+
+from vllm.engine import arg_utils
+from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.patch.platform.core_fix import patch_engine_args
+
+arg_utils.current_platform.device_type = "cpu"
+patch_engine_args.apply_to_module(arg_utils)
+parser = argparse.ArgumentParser()
+arg_utils.EngineArgs.add_cli_args(parser)
+namespace = parser.parse_args([
+    "--eplb-config",
+    json.dumps({
+        "window_size": 8,
+        "static_dispatch_policy": "locality_fair",
+    }),
+])
+args = arg_utils.EngineArgs.from_cli_args(namespace)
+config = args.create_engine_config()
+assert args.eplb_config.window_size == 8
+assert not hasattr(args.eplb_config, "static_dispatch_policy")
+assert get_hcu_config(config).eplb_static_dispatch_policy == "locality_fair"
+print("static-dispatch-policy-cli-normalized")
+'''
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "static-dispatch-policy-cli-normalized" in result.stdout
+
+
 def test_nested_speculative_multi_mtp_is_extracted_before_official_config() -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
@@ -651,6 +684,30 @@ def test_nested_eplb_disable_rearrange_is_extracted() -> None:
     assert get_hcu_config(
         args.create_engine_config()
     ).eplb_disable_rearrange is True
+
+
+def test_nested_eplb_static_dispatch_policy_is_extracted() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        eplb_config={
+            "window_size": 8,
+            "static_dispatch_policy": "locality_fair",
+        }
+    )
+
+    assert args.eplb_config == {"window_size": 8}
+    assert (
+        get_hcu_config(args).eplb_static_dispatch_policy
+        == "locality_fair"
+    )
+    assert (
+        get_hcu_config(
+            args.create_engine_config()
+        ).eplb_static_dispatch_policy
+        == "locality_fair"
+    )
 
 
 def test_positional_additional_config_is_merged_not_overwritten() -> None:

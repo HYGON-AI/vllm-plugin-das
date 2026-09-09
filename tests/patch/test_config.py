@@ -58,6 +58,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "expert_map_record_path": None,
                 "expert_map_path": None,
                 "eplb_disable_rearrange": False,
+                "eplb_static_dispatch_policy": "nearest",
             }
         }
     }
@@ -131,6 +132,7 @@ def test_legacy_deep_gemm_sidecar_is_normalized_with_one_warning(
         ),
         ({"expert_map_record_path": 7}, TypeError),
         ({"eplb_disable_rearrange": 1}, TypeError),
+        ({"eplb_static_dispatch_policy": 1}, TypeError),
         (
             {
                 "expert_map_record_path": "/tmp/record.json",
@@ -163,3 +165,19 @@ def test_disable_eplb_rearrange_round_trips_through_sidecar() -> None:
 
     assert config.eplb_disable_rearrange is True
     assert HcuFeatureConfig.from_mapping(config.to_dict()) == config
+
+
+def test_locality_fair_eplb_dispatch_round_trips_through_sidecar() -> None:
+    config = HcuFeatureConfig.from_mapping(
+        {"eplb_static_dispatch_policy": "locality_fair"}
+    )
+
+    assert config.eplb_static_dispatch_policy == "locality_fair"
+    assert HcuFeatureConfig.from_mapping(config.to_dict()) == config
+
+
+def test_invalid_eplb_static_dispatch_policy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="eplb_static_dispatch_policy"):
+        HcuFeatureConfig.from_mapping(
+            {"eplb_static_dispatch_policy": "first_replica"}
+        )

@@ -26,6 +26,7 @@ _FEATURE_FIELDS = (
     "expert_map_record_path",
     "expert_map_path",
     "eplb_disable_rearrange",
+    "eplb_static_dispatch_policy",
 )
 _BOOLEAN_FIELDS = (
     "enable_lightly_cp",
@@ -36,6 +37,9 @@ _BOOLEAN_FIELDS = (
     "eplb_disable_rearrange",
 )
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
+_SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES = frozenset(
+    {"nearest", "locality_fair"}
+)
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _legacy_backend_warning_emitted = False
@@ -82,6 +86,7 @@ class HcuFeatureConfig:
     expert_map_record_path: str | None = None
     expert_map_path: str | None = None
     eplb_disable_rearrange: bool = False
+    eplb_static_dispatch_policy: str = "nearest"
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -130,6 +135,22 @@ class HcuFeatureConfig:
         if self.expert_map_record_path and self.eplb_disable_rearrange:
             raise ValueError(
                 "expert_map_record_path and disable_rearrange are mutually exclusive"
+            )
+        if not isinstance(self.eplb_static_dispatch_policy, str):
+            raise TypeError(
+                "HCU config field 'eplb_static_dispatch_policy' must be str, "
+                f"got {type(self.eplb_static_dispatch_policy).__name__}"
+            )
+        if (
+            self.eplb_static_dispatch_policy
+            not in _SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES
+        ):
+            supported = ", ".join(
+                sorted(_SUPPORTED_EPLB_STATIC_DISPATCH_POLICIES)
+            )
+            raise ValueError(
+                "unsupported HCU eplb_static_dispatch_policy "
+                f"{self.eplb_static_dispatch_policy!r}; expected one of {supported}"
             )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")

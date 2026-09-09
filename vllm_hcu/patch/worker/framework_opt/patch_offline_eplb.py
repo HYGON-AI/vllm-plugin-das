@@ -40,6 +40,7 @@ TARGETS = (
     f"{TARGET_MODULE}.EplbState.rearrange",
     f"{TARGET_MODULE}.rearrange_expert_weights_inplace",
     f"{TARGET_MODULE}._commit_eplb_maps",
+    f"{TARGET_MODULE}._commit_eplb_maps_for_layer",
     f"{TARGET_MODULE}._move_to_workspace",
 )
 _MARKER = "_vllm_hcu_offline_eplb_patch_applied"
@@ -47,8 +48,10 @@ _WRAPPER_MARKER = "_vllm_hcu_offline_eplb_wrapper"
 _RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _LOAD_PATH_ATTR = "_vllm_hcu_expert_map_path"
 _DISABLE_REARRANGE_ATTR = "_vllm_hcu_eplb_disable_rearrange"
+_STATIC_DISPATCH_POLICY_ATTR = "_vllm_hcu_eplb_static_dispatch_policy"
 _MODEL_RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _MODEL_KEY_ATTR = "_vllm_hcu_expert_map_key"
+_MODEL_STATIC_DISPATCH_POLICY_ATTR = "_vllm_hcu_eplb_static_dispatch_policy"
 _RECORD_ONLY_REARRANGE = ContextVar(
     "vllm_hcu_record_only_eplb_rearrange",
     default=False,
@@ -252,6 +255,58 @@ def _find_static_eplb_plan(model: object) -> StaticEplbPlan | None:
     return plan
 
 
+def _apply_locality_fair_replica_order(
+    module: ModuleType,
+    model_state: object,
+    *,
+    layer: int | None = None,
+) -> bool:
+    policy = getattr(model_state, _MODEL_STATIC_DISPATCH_POLICY_ATTR, "nearest")
+    if policy != "locality_fair":
+        return False
+
+    from vllm_hcu.model_executor.layers.fused_moe.eplb_dispatch import (
+        build_locality_fair_replica_order,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH
+    ):
+        return False
+
+    ep_group = module.get_ep_group().device_group
+    ep_rank = ep_group.rank()
+    ep_size = ep_group.size()
+    replica_counts = model_state.logical_replica_count
+    logical_map = model_state.logical_to_physical_map
+    if layer is not None:
+        replica_counts = replica_counts[layer : layer + 1]
+        logical_map = logical_map[layer : layer + 1]
+    max_replicas = int(replica_counts.max().item())
+    if max_replicas <= 1:
+        return False
+    logical_map_prefix = logical_map[..., :max_replicas]
+    ordered_map = build_locality_fair_replica_order(
+        logical_map_prefix,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        num_nodes=module.get_node_count(),
+        num_physical_experts=model_state.physical_to_logical_map.shape[1],
+        layer_offset=0 if layer is None else layer,
+    )
+    logical_map_prefix.copy_(ordered_map)
+    if layer is None or layer == model_state.model.num_moe_layers - 1:
+        module.logger.info(
+            "Applied locality-fair EPLB replica ordering for model %s "
+            "on EP rank %d.",
+            model_state.model_name,
+            ep_rank,
+        )
+    return True
+
+
 def _validate_direct_load_plan(
     plan: StaticEplbPlan,
     *,
@@ -333,6 +388,7 @@ def apply_to_module(module: ModuleType) -> bool:
             (eplb_state_cls, "rearrange"),
             (eplb_module, "rearrange_expert_weights_inplace"),
             (eplb_module, "_commit_eplb_maps"),
+            (eplb_module, "_commit_eplb_maps_for_layer"),
             (eplb_module, "_move_to_workspace"),
         )
         if not all(_wrapped_is_valid(owner, name) for owner, name in wrapped):
@@ -369,7 +425,12 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[3],
     )
     original_commit = require_callable(eplb_module, "_commit_eplb_maps", TARGETS[4])
-    original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[5])
+    original_commit_layer = require_callable(
+        eplb_module,
+        "_commit_eplb_maps_for_layer",
+        TARGETS[5],
+    )
+    original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[6])
 
     @functools.wraps(original_add_model)
     def hcu_add_model(self, model, model_config) -> None:
@@ -411,6 +472,15 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         setattr(model_state, _MODEL_RECORD_PATH_ATTR, record_path)
         setattr(model_state, _MODEL_KEY_ATTR, model_key)
+        setattr(
+            model_state,
+            _MODEL_STATIC_DISPATCH_POLICY_ATTR,
+            getattr(
+                self.parallel_config,
+                _STATIC_DISPATCH_POLICY_ATTR,
+                "nearest",
+            ),
+        )
 
         if record_path:
             # Recording is an offline planning operation. Running the async
@@ -451,6 +521,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 model_state,
                 new_physical_to_logical_map=target_map,
             )
+            _apply_locality_fair_replica_order(eplb_module, model_state)
             eplb_module.get_ep_group().barrier()
             eplb_module.logger.info(
                 "Static EPLB direct-loaded model %s with map SHA-256 %s; "
@@ -467,6 +538,9 @@ def apply_to_module(module: ModuleType) -> bool:
             # worker. Load collection may remain active for balancedness
             # logging, but the map must never be rearranged dynamically.
             self.is_async = False
+
+        if not load_path:
+            _apply_locality_fair_replica_order(eplb_module, model_state)
 
         _record_model_state(eplb_module, model_state)
 
@@ -601,9 +675,31 @@ def apply_to_module(module: ModuleType) -> bool:
             model_state,
             new_physical_to_logical_map=new_physical_to_logical_map,
         )
+        _apply_locality_fair_replica_order(eplb_module, model_state)
         _record_model_state(eplb_module, model_state)
 
     setattr(hcu_commit, _WRAPPER_MARKER, True)
+
+    @functools.wraps(original_commit_layer)
+    def hcu_commit_layer(
+        model_state,
+        new_physical_to_logical_map,
+        layer,
+    ) -> None:
+        if _RECORD_ONLY_REARRANGE.get():
+            return
+        original_commit_layer(
+            model_state,
+            new_physical_to_logical_map=new_physical_to_logical_map,
+            layer=layer,
+        )
+        _apply_locality_fair_replica_order(
+            eplb_module,
+            model_state,
+            layer=layer,
+        )
+
+    setattr(hcu_commit_layer, _WRAPPER_MARKER, True)
 
     @functools.wraps(original_move)
     def hcu_move_to_workspace(model_state, ep_rank) -> None:
@@ -634,9 +730,15 @@ def apply_to_module(module: ModuleType) -> bool:
         original_rearrange_weights,
     )
     setattr(eplb_module, "_vllm_hcu_original_offline_commit", original_commit)
+    setattr(
+        eplb_module,
+        "_vllm_hcu_original_offline_commit_layer",
+        original_commit_layer,
+    )
     setattr(eplb_module, "_vllm_hcu_original_offline_move", original_move)
     setattr(eplb_module, "rearrange_expert_weights_inplace", hcu_rearrange_weights)
     setattr(eplb_module, "_commit_eplb_maps", hcu_commit)
+    setattr(eplb_module, "_commit_eplb_maps_for_layer", hcu_commit_layer)
     setattr(eplb_module, "_move_to_workspace", hcu_move_to_workspace)
     setattr(eplb_module, _MARKER, True)
     return True

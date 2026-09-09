@@ -190,14 +190,16 @@ def test_load_rejects_invalid_maps(
 
 
 class _FakeDeviceGroup:
-    world_size = 1
-    rank_in_group = 0
-
-    def __init__(self) -> None:
+    def __init__(self, *, rank: int = 0, world_size: int = 1) -> None:
+        self.world_size = world_size
+        self.rank_in_group = rank
         self.barrier_calls = 0
 
     def rank(self) -> int:
-        return 0
+        return self.rank_in_group
+
+    def size(self) -> int:
+        return self.world_size
 
     def barrier(self) -> None:
         self.barrier_calls += 1
@@ -221,6 +223,12 @@ class HYV4ForCausalLM:
 
 class GenericMoEForCausalLM(HYV4ForCausalLM):
     pass
+
+
+class DenseExpertPlacementForCausalLM(HYV4ForCausalLM):
+    num_logical_experts = 4
+    num_redundant_experts = 0
+    num_physical_experts = 4
 
 
 class _StageMoERunner:
@@ -270,12 +278,15 @@ def _make_eplb_module(
     load_path: Path | None = None,
     pipeline_parallel_size: int = 1,
     pipeline_parallel_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    num_nodes: int = 1,
 ) -> tuple[ModuleType, list[tuple[torch.Tensor, torch.Tensor]], _FakeDeviceGroup]:
     module = ModuleType(
         "vllm.distributed.eplb.eplb_state"
     )
     rearrangements: list[tuple[torch.Tensor, torch.Tensor]] = []
-    ep_group = _FakeDeviceGroup()
+    ep_group = _FakeDeviceGroup(rank=ep_rank, world_size=ep_size)
 
     class EplbModelState:
         pass
@@ -289,6 +300,7 @@ def _make_eplb_module(
                 _vllm_hcu_expert_map_path=(
                     str(load_path) if load_path is not None else None
                 ),
+                _vllm_hcu_eplb_static_dispatch_policy="nearest",
                 eplb_config=SimpleNamespace(
                     log_balancedness=False,
                     log_balancedness_interval=1,
@@ -306,13 +318,38 @@ def _make_eplb_module(
         def add_model(self, model, model_config) -> None:
             state = EplbModelState()
             state.physical_to_logical_map = (
-                torch.tensor([0, 1, 2, 3, 0, 1], dtype=torch.int64)
+                (
+                    torch.arange(model.num_physical_experts, dtype=torch.int64)
+                    % model.num_logical_experts
+                )
                 .unsqueeze(0)
                 .expand(model.num_moe_layers, -1)
                 .clone()
             )
-            state.logical_to_physical_map = torch.empty(0)
-            state.logical_replica_count = torch.empty(0)
+            state.logical_to_physical_map = torch.full(
+                (
+                    model.num_moe_layers,
+                    model.num_logical_experts,
+                    model.num_redundant_experts + 1,
+                ),
+                -1,
+                dtype=torch.int64,
+            )
+            state.logical_replica_count = torch.zeros(
+                (model.num_moe_layers, model.num_logical_experts),
+                dtype=torch.int64,
+            )
+            for layer_id in range(model.num_moe_layers):
+                for physical_id, logical_id in enumerate(
+                    state.physical_to_logical_map[layer_id].tolist()
+                ):
+                    replica_id = state.logical_replica_count[
+                        layer_id, logical_id
+                    ].item()
+                    state.logical_to_physical_map[
+                        layer_id, logical_id, replica_id
+                    ] = physical_id
+                    state.logical_replica_count[layer_id, logical_id] += 1
             state.expert_load_pass = torch.zeros(
                 (model.num_moe_layers, model.num_physical_experts),
                 dtype=torch.int64,
@@ -400,11 +437,31 @@ def _make_eplb_module(
         del expert_weights, expert_buffer, ep_group, communicator, is_profile, rank_mapping
         rearrangements.append((source_map.clone(), target_map.clone()))
 
+    def update_logical_maps(model_state, *, layers: tuple[int, ...]) -> None:
+        for layer_id in layers:
+            model_state.logical_to_physical_map[layer_id].fill_(-1)
+            model_state.logical_replica_count[layer_id].zero_()
+            for physical_id, logical_id in enumerate(
+                model_state.physical_to_logical_map[layer_id].tolist()
+            ):
+                replica_id = model_state.logical_replica_count[
+                    layer_id, logical_id
+                ].item()
+                model_state.logical_to_physical_map[
+                    layer_id, logical_id, replica_id
+                ] = physical_id
+                model_state.logical_replica_count[layer_id, logical_id] += 1
+
     def commit(model_state, new_physical_to_logical_map) -> None:
         model_state.physical_to_logical_map.copy_(new_physical_to_logical_map)
+        update_logical_maps(
+            model_state,
+            layers=tuple(range(model_state.physical_to_logical_map.shape[0])),
+        )
 
     def commit_layer(model_state, new_physical_to_logical_map, layer) -> None:
         model_state.physical_to_logical_map[layer].copy_(new_physical_to_logical_map)
+        update_logical_maps(model_state, layers=(layer,))
 
     def move_to_workspace(model_state, ep_rank) -> None:
         del model_state, ep_rank
@@ -417,12 +474,231 @@ def _make_eplb_module(
     module._move_to_workspace = move_to_workspace
     module.get_ep_group = lambda: SimpleNamespace(
         device_group=ep_group,
+        cpu_group=object(),
         world_size=ep_group.world_size,
         rank_in_group=ep_group.rank_in_group,
         barrier=ep_group.barrier,
     )
+    module.get_node_count = lambda: num_nodes
     module.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
     return module, rearrangements, ep_group
+
+
+def test_runtime_patch_applies_rank_local_replica_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH",
+        True,
+        raising=False,
+    )
+    rank_maps = []
+    for ep_rank in range(2):
+        module, _, _ = _make_eplb_module(ep_size=2, ep_rank=ep_rank)
+        assert apply_to_module(module)
+        state = module.EplbState()
+        state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = (
+            "locality_fair"
+        )
+        state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+        rank_maps.append(
+            state.model_states["hy4-hash"].logical_to_physical_map.tolist()
+        )
+
+    assert rank_maps == [
+        [[[0, 4, -1], [1, 5, -1], [2, -1, -1], [3, -1, -1]]],
+        [[[4, 0, -1], [5, 1, -1], [2, -1, -1], [3, -1, -1]]],
+    ]
+
+
+def test_runtime_patch_reapplies_rank_local_order_after_layer_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH",
+        True,
+        raising=False,
+    )
+    module, _, _ = _make_eplb_module(ep_size=2, ep_rank=1)
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = "locality_fair"
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    model_state = state.model_states["hy4-hash"]
+
+    module._commit_eplb_maps_for_layer(
+        model_state,
+        torch.tensor([3, 2, 1, 0, 3, 2], dtype=torch.int64),
+        0,
+    )
+
+    assert model_state.logical_to_physical_map.tolist() == [
+        [[3, -1, -1], [2, -1, -1], [5, 1, -1], [4, 0, -1]]
+    ]
+
+
+def test_runtime_patch_reapplies_rank_local_order_after_full_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH",
+        True,
+        raising=False,
+    )
+    module, _, _ = _make_eplb_module(ep_size=2, ep_rank=1)
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = "locality_fair"
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+    model_state = state.model_states["hy4-hash"]
+
+    module._commit_eplb_maps(
+        model_state,
+        torch.tensor([[3, 2, 1, 0, 3, 2]], dtype=torch.int64),
+    )
+
+    assert model_state.logical_to_physical_map.tolist() == [
+        [[3, -1, -1], [2, -1, -1], [5, 1, -1], [4, 0, -1]]
+    ]
+
+
+def test_runtime_patch_applies_rank_local_order_to_static_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    source = tmp_path / "static.json"
+    source.write_text(
+        json.dumps(
+            {
+                "model_maps": {
+                    "GenericMoEForCausalLM": {
+                        "physical_to_logical_map": [[3, 2, 1, 0, 3, 2]],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = GenericMoEForCausalLM()
+    model._vllm_hcu_static_eplb_plan = load_static_eplb_plan(
+        source,
+        model_key="GenericMoEForCausalLM",
+        expected_shape=(1, 6),
+        num_logical_experts=4,
+        num_redundant_experts=2,
+    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, group=None: output.__setitem__(
+            slice(None), [value] * len(output)
+        ),
+    )
+    module, rearrangements, _ = _make_eplb_module(
+        load_path=source,
+        ep_size=2,
+        ep_rank=1,
+    )
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = "locality_fair"
+
+    state.add_model(model, _FakeModelConfig())
+
+    model_state = state.model_states["hy4-hash"]
+    assert rearrangements == []
+    assert model_state.physical_to_logical_map.tolist() == [[3, 2, 1, 0, 3, 2]]
+    assert model_state.logical_to_physical_map.tolist() == [
+        [[3, -1, -1], [2, -1, -1], [5, 1, -1], [4, 0, -1]]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("policy", "master_enabled", "leaf_enabled"),
+    [
+        ("nearest", True, True),
+        ("locality_fair", False, True),
+        ("locality_fair", True, False),
+    ],
+)
+def test_runtime_patch_keeps_official_order_when_locality_fair_is_disabled(
+    policy: str,
+    master_enabled: bool,
+    leaf_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        master_enabled,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH",
+        leaf_enabled,
+        raising=False,
+    )
+    module, _, _ = _make_eplb_module(ep_size=2, ep_rank=1)
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = policy
+
+    state.add_model(HYV4ForCausalLM(), _FakeModelConfig())
+
+    assert state.model_states["hy4-hash"].logical_to_physical_map.tolist() == [
+        [[0, 4, -1], [1, 5, -1], [2, -1, -1], [3, -1, -1]]
+    ]
+
+
+def test_runtime_patch_skips_locality_fair_without_redundant_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH",
+        True,
+        raising=False,
+    )
+    log_calls: list[tuple[object, ...]] = []
+    module, _, _ = _make_eplb_module(ep_size=2, ep_rank=1)
+    module.logger.info = lambda *args: log_calls.append(args)
+    assert apply_to_module(module)
+    state = module.EplbState()
+    state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = "locality_fair"
+
+    state.add_model(DenseExpertPlacementForCausalLM(), _FakeModelConfig())
+
+    assert state.model_states["hy4-hash"].logical_to_physical_map.tolist() == [
+        [[0], [1], [2], [3]]
+    ]
+    assert not any("locality-fair" in str(call[0]) for call in log_calls)
 
 
 def test_runtime_patch_records_initial_and_committed_maps(tmp_path: Path) -> None:

@@ -811,6 +811,9 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
                 parallel_config["_vllm_hcu_eplb_disable_rearrange"] = (
                     config.eplb_disable_rearrange
                 )
+                parallel_config["_vllm_hcu_eplb_static_dispatch_policy"] = (
+                    config.eplb_static_dispatch_policy
+                )
             elif parallel_config is not None:
                 setattr(
                     parallel_config,
@@ -831,6 +834,11 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
                     parallel_config,
                     "_vllm_hcu_eplb_disable_rearrange",
                     config.eplb_disable_rearrange,
+                )
+                setattr(
+                    parallel_config,
+                    "_vllm_hcu_eplb_static_dispatch_policy",
+                    config.eplb_static_dispatch_policy,
                 )
             rebound = _bind_deserialized_hcu_config(vllm_config)
             if rebound != config:

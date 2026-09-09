@@ -50,11 +50,13 @@ _HCU_EPLB_FIELDS = {
     "expert_map_record_path": "expert_map_record_path",
     "expert_map_path": "expert_map_path",
     "disable_rearrange": "eplb_disable_rearrange",
+    "static_dispatch_policy": "eplb_static_dispatch_policy",
 }
 _HCU_EPLB_ATTRS = {
     "expert_map_record_path": "_vllm_hcu_expert_map_record_path",
     "expert_map_path": "_vllm_hcu_expert_map_path",
     "disable_rearrange": "_vllm_hcu_eplb_disable_rearrange",
+    "static_dispatch_policy": "_vllm_hcu_eplb_static_dispatch_policy",
 }
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
