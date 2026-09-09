@@ -65,6 +65,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.nixl.package_name",
             "vllm.distributed.nixl_utils",
         ),
+        (
+            "platform.core_fix.parallel_config.pcp_eplb",
+            "vllm.config.parallel",
+        ),
         ("platform.core_fix.hcu_config.engine_args", "vllm.engine.arg_utils"),
         (
             "platform.core_fix.hcu_config.compilation_cudagraph",
@@ -293,9 +297,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 49,
+        "count": 50,
         "replacements": 11,
-        "callbacks": 38,
+        "callbacks": 39,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

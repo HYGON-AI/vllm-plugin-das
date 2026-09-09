@@ -658,9 +658,15 @@ def test_hcu_block_quant_group_shapes_and_sequence_parallel_contract(
     ) == ("official", False)
     parallel = module.FusedMoEParallelConfig()
     parallel.dp_size = 1
+    parallel.pcp_size = 1
     parallel.use_ep = True
     parallel.is_sequence_parallel = True
     assert parallel.use_all2all_kernels is True
+    parallel.is_sequence_parallel = False
+    parallel.pcp_size = 2
+    assert parallel.use_all2all_kernels is True
+    parallel.pcp_size = 1
+    assert parallel.use_all2all_kernels is False
     upstream = SimpleNamespace(
         all2all_backend="deepep_low_latency",
         enable_expert_parallel=True,
