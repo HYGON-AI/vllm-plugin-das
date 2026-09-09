@@ -574,6 +574,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         }
         if (
             num_decode_tokens == 0
+            or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
         ):
