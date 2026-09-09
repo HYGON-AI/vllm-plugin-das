@@ -108,6 +108,8 @@ _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._run_layer",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._disable_shared_experts_overlap",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._determine_shared_experts_order",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.requires_input_preservation",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.allows_inplace_routed_output",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._should_run_shared_in_aux_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts.maybe_sync_shared_experts_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._launch_in_aux_stream",
@@ -217,10 +219,13 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
+    _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_conv")),
+    _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
 )
 
 
@@ -249,6 +254,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
+    _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_conv_weight")),
     _CallbackSpec(_adapter("op_opt", "patch_gate_linear")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),

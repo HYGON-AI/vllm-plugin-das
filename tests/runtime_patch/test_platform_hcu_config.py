@@ -1609,6 +1609,53 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     assert config.cache_config.block_size == 64
 
 
+def test_sparse_flashmla_preserves_upstream_hybrid_block_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=False,
+        block_size=64,
+        kv_cache_dtype_skip_layers=[],
+    )
+    config.attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASHMLA_SPARSE
+    )
+    config.model_config.is_hybrid = True
+
+    class FlashMLABackend:
+        @staticmethod
+        def get_preferred_block_size(_default):
+            return 64
+
+        @staticmethod
+        def get_name():
+            return "FLASHMLA_SPARSE"
+
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: FlashMLABackend),
+    )
+
+    def _align_hybrid_block_size(cls, vllm_config, backend_cls):
+        del cls, backend_cls
+        vllm_config.cache_config.block_size = 1152
+
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_align_hybrid_block_size",
+        classmethod(_align_hybrid_block_size),
+    )
+
+    HCUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 1152
+
+
 @pytest.mark.parametrize(
     ("backend_name", "expected_path"),
     [

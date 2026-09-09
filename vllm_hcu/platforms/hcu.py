@@ -672,6 +672,7 @@ class HCUPlatform(Platform):
         if (
             cache_config is not None
             and not cache_config.user_specified_block_size
+            and not vllm_config.model_config.is_hybrid
             and backend
             in (
                 AttentionBackendEnum.FLASHMLA,

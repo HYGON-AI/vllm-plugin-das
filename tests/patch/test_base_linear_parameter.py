@@ -212,6 +212,21 @@ def test_nn_layout_loaders_transpose_and_use_physical_dimensions(
     local_column.load_column_parallel_weight(full_column[2:4])
     torch.testing.assert_close(local_column.data, full_column[2:4].t())
 
+    # KDA convolution weights add a singleton dimension after constructing a
+    # column-parallel linear. Preserve the HCU NN layout for that N-D weight.
+    full_conv = torch.arange(24).reshape(6, 1, 4)
+    conv_column = _instance(
+        module._ColumnvLLMParameter,
+        data=torch.zeros(4, 1, 3, dtype=full_conv.dtype),
+        output_dim=0,
+        tp_rank=1,
+    )
+    conv_column.load_column_parallel_weight(full_conv)
+    torch.testing.assert_close(
+        conv_column.data,
+        full_conv[3:6].permute(2, 1, 0),
+    )
+
     # Equal logical and physical shapes do not imply equal layouts.  Square
     # checkpoint matrices still require the NN-layout transpose.
     square_weight = torch.arange(9).reshape(3, 3)

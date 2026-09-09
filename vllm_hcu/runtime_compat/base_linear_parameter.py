@@ -174,13 +174,22 @@ def _nn_layout_enabled() -> bool:
 
 
 def _nn_storage_dim(data: Any, logical_dim: int) -> int | None:
-    """Return the transposed physical dimension for a 2-D NN-layout tensor."""
+    """Return the reversed physical dimension for an NN-layout tensor."""
 
-    if getattr(data, "ndim", None) != 2:
+    ndim = getattr(data, "ndim", None)
+    if ndim is None or ndim < 2:
         return None
-    if logical_dim not in (0, 1):
-        raise _fail(f"NN layout requires logical dimension 0 or 1, got {logical_dim}")
-    return 1 - logical_dim
+    if logical_dim < 0 or logical_dim >= ndim:
+        raise _fail(
+            f"NN layout dimension {logical_dim} is invalid for a {ndim}-D tensor"
+        )
+    return ndim - 1 - logical_dim
+
+
+def _to_nn_layout(tensor: Any) -> Any:
+    """Reverse logical dimensions to match HCU NN physical storage."""
+
+    return tensor.permute(tuple(range(tensor.ndim - 1, -1, -1)))
 
 
 def _verify_parent_exports(module: ModuleType) -> None:
@@ -311,16 +320,19 @@ def _install_base_linear_parameter_compat_unlocked(
         # tensor that has already been narrowed to this TP rank.  The latter
         # is common for Mamba weights loaded through weight_loader_v2.  Do not
         # narrow an already-local shard a second time.
-        if loaded_weight.transpose(0, 1).shape == self.data.shape:
-            self.data.copy_(loaded_weight.t())
+        loaded_weight_nn = _to_nn_layout(loaded_weight)
+        if loaded_weight_nn.shape == self.data.shape:
+            self.data.copy_(loaded_weight_nn)
             return
 
         shard_size = self.data.shape[storage_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim,
-            self.tp_rank * shard_size,
-            shard_size,
-        ).t()
+        loaded_weight = _to_nn_layout(
+            loaded_weight.narrow(
+                self.output_dim,
+                self.tp_rank * shard_size,
+                shard_size,
+            )
+        )
         if self.data.shape != loaded_weight.shape:
             raise AssertionError(
                 "HCU NN-layout column weight shape mismatch: "

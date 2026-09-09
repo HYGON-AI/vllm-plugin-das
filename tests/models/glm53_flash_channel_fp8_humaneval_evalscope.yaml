@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: glm53_flash_channel_fp8_humaneval_evalscope
+model: /models/GLM-5.3-Flash-Channel-FP8-w8a8
+
+server:
+  host: 127.0.0.1
+  port: 10153
+  startup_timeout_s: 7200
+  shutdown_timeout_s: 120
+  served_model_name: GLM-5.3-Flash-Channel-FP8-w8a8
+  args:
+    - --tensor-parallel-size
+    - "4"
+    - --attention-backend
+    - FLASHMLA_SPARSE
+    - --moe-backend
+    - aiter
+    - --speculative-config
+    - '{"method":"mtp","num_speculative_tokens":3}'
+    - --enable-prefix-caching
+    - --max-model-len
+    - "4096"
+    - --max-num-batched-tokens
+    - "1024"
+    - --max-num-seqs
+    - "8"
+    - --default-chat-template-kwargs
+    - '{"reasoning_effort":"low"}'
+
+evalscope:
+  work_dir: /tmp/vllm-hcu-evalscope/glm53_flash_channel_fp8_humaneval
+  api_key: EMPTY
+  eval_type: openai_api
+  generation_config:
+    temperature: 0
+    do_sample: false
+    max_tokens: 2048
+    extra_body:
+      chat_template_kwargs:
+        reasoning_effort: low
+  stream: true
+  eval_batch_size: 8
+  timeout: 7200
+  limit: 32
+  datasets:
+    - humaneval
+  dataset_args:
+    humaneval: {}
+  pass_criteria:
+    dataset: humaneval
+    metric: mean_acc
+    display_name: Pass@1
+    minimum_score: 1.0
+  no_timestamp: true

@@ -28,6 +28,13 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
+_GLM5NEXT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+    {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    }
+)
 _REQUEST_CAPTURE_SIZES = (
     *range(1, 9),
     *range(10, 33, 2),
@@ -44,6 +51,25 @@ def _normalize_hcu_model_runner(model_config: object) -> None:
         and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
     ):
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+
+
+def _normalize_glm5next_breakable_cudagraph(vllm_config: object) -> None:
+    """Restore upstream's architecture opt-in for GLM5Next on HCU."""
+
+    if "VLLM_USE_BREAKABLE_CUDAGRAPH" in os.environ:
+        return
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    if not architectures & _GLM5NEXT_BREAKABLE_CUDAGRAPH_ARCHITECTURES:
+        return
+    if bool(getattr(model_config, "enforce_eager", False)):
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    none_mode = getattr(type(cudagraph_mode), "NONE", None)
+    if cudagraph_mode is None or cudagraph_mode == none_mode:
+        return
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
 
 def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any:
@@ -220,8 +246,10 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
-    _normalize_hcu_model_runner(vllm_config.model_config)
     """Validate cross-config invariants and bind the compilation adapter."""
+
+    _normalize_hcu_model_runner(vllm_config.model_config)
+    _normalize_glm5next_breakable_cudagraph(vllm_config)
 
     _validate_hcu_pcp_scope(vllm_config)
     _validate_dspark_pd_scope(vllm_config)

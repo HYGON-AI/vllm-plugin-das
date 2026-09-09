@@ -13,6 +13,16 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
 )
 
 
+def _normalize_nope_query(
+    q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(q, tuple) and q[1].shape[-1] == 0:
+        # The concatenated result is exactly ql_nope for NoPE models. Avoid
+        # the current vLLM stable op, whose compiled kernel requires rope_dim=64.
+        return q[0]
+    return q
+
+
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
@@ -24,6 +34,7 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         attn_metadata,
         layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        q = _normalize_nope_query(q)
         if self.dcp_world_size <= 1:
             return super().forward_mqa(
                 q,
@@ -88,6 +99,15 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
 
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        # The HCU FlashMLA library supports GLM5Next's absorbed D512 path.
+        # Retain every size supported by the current official backend.
+        return [
+            512,
+            *(size for size in super().get_supported_head_sizes() if size != 512),
+        ]
+
     @staticmethod
     def get_name() -> str:
         return "FLASHMLA_SPARSE"

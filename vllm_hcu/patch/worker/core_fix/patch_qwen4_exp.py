@@ -15,9 +15,10 @@ from ._common import (
     require_class,
 )
 
-TARGET_MODULE = "vllm.models.qwen4_exp"
+TARGET_MODULE = "vllm.models.qwen4_exp.amd.model"
 TARGET_MODULES = (
     TARGET_MODULE,
+    "vllm.models.qwen4_exp.nvidia.model",
     "vllm.model_executor.models.qwen4_exp",
 )
 PATCH_ID = "worker.core_fix.qwen4_exp.tie_word_embeddings"
