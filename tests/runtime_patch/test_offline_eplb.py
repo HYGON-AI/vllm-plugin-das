@@ -289,6 +289,10 @@ def _make_eplb_module(
                 _vllm_hcu_expert_map_path=(
                     str(load_path) if load_path is not None else None
                 ),
+                eplb_config=SimpleNamespace(
+                    log_balancedness=False,
+                    log_balancedness_interval=1,
+                ),
                 pipeline_parallel_size=pipeline_parallel_size,
                 pipeline_parallel_rank=pipeline_parallel_rank,
             )
@@ -309,6 +313,10 @@ def _make_eplb_module(
             )
             state.logical_to_physical_map = torch.empty(0)
             state.logical_replica_count = torch.empty(0)
+            state.expert_load_pass = torch.zeros(
+                (model.num_moe_layers, model.num_physical_experts),
+                dtype=torch.int64,
+            )
             state.model_name = model_config.model
             state.model = model
             state.expert_buffer = [torch.zeros(1)]
@@ -624,6 +632,72 @@ def test_runtime_patch_commits_generic_static_plan_without_rearrangement(
     assert state.official_profile_steps == 0
     assert state.step(is_profile=False) is None
     assert state.official_steps == 0
+
+
+def test_runtime_patch_static_map_logs_load_without_rearrangement(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "load.json"
+    source.write_text(
+        json.dumps(
+            {
+                "model_maps": {
+                    "GenericMoEForCausalLM": {
+                        "physical_to_logical_map": [[3, 2, 1, 0, 3, 2]],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = GenericMoEForCausalLM()
+    model._vllm_hcu_static_eplb_plan = load_static_eplb_plan(
+        source,
+        model_key="GenericMoEForCausalLM",
+        expected_shape=(1, 6),
+        num_logical_experts=4,
+        num_redundant_experts=2,
+    )
+    module, rearrangements, ep_group = _make_eplb_module(load_path=source)
+    log_calls: list[tuple[object, ...]] = []
+    module.logger.info = lambda _message, *args: log_calls.append(args)
+    module.get_ep_group = lambda: SimpleNamespace(
+        device_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+        world_size=1,
+        barrier=ep_group.barrier,
+    )
+    assert apply_to_module(module)
+
+    state = module.EplbState()
+    state.parallel_config.eplb_config = SimpleNamespace(
+        log_balancedness=True,
+        log_balancedness_interval=1,
+    )
+    state.add_model(model, _FakeModelConfig())
+    model_state = state.model_states["hy4-hash"]
+    static_map = model_state.physical_to_logical_map.clone()
+    model_state.expert_load_pass = torch.tensor([[80, 20]])
+
+    assert state.step(is_profile=True, log_stats=True) is None
+    assert state.official_profile_steps == 0
+    assert model_state.expert_load_pass.tolist() == [[0, 0]]
+
+    model_state.expert_load_pass = torch.tensor([[8, 2]])
+    model_state.expert_load_window = torch.zeros((1, 1, 2), dtype=torch.int64)
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 1
+    state.expert_load_window_step = 0
+    state.expert_load_window_size = 1
+    state.simulate_official_rearrange_step = True
+
+    assert state.should_record_tensor.item() is True
+    assert state.is_async is False
+    assert state.step(log_stats=True) == "official-step"
+
+    assert state.official_steps == 1
+    assert rearrangements == []
+    assert torch.equal(model_state.physical_to_logical_map, static_map)
+    assert any(args[4] == 0.625 for args in log_calls if len(args) == 6)
 
 
 def test_runtime_patch_record_mode_plans_without_live_rearrangement(

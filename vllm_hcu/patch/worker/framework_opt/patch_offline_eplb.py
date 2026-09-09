@@ -460,9 +460,12 @@ def apply_to_module(module: ModuleType) -> bool:
             )
             should_record = getattr(self, "should_record_tensor", None)
             if should_record is not None:
-                should_record.fill_(False)
+                should_record.fill_(
+                    bool(self.parallel_config.eplb_config.log_balancedness)
+                )
             # A loaded map is static: do not start the asynchronous EPLB
-            # worker or collect data for a later dynamic rearrangement.
+            # worker. Load collection may remain active for balancedness
+            # logging, but the map must never be rearranged dynamically.
             self.is_async = False
 
         _record_model_state(eplb_module, model_state)
@@ -477,7 +480,11 @@ def apply_to_module(module: ModuleType) -> bool:
         log_stats: bool = False,
     ) -> Any:
         _, load_path = _parallel_offline_paths(self.parallel_config)
-        if load_path:
+        if load_path and is_profile:
+            for model_state in self.model_states.values():
+                model_state.expert_load_pass.zero_()
+            return None
+        if load_path and not log_stats:
             return None
 
         should_log = False
@@ -532,13 +539,19 @@ def apply_to_module(module: ModuleType) -> bool:
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
     ) -> Any:
+        _, load_path = _parallel_offline_paths(self.parallel_config)
         if (
             not is_profile
-            and getattr(self.parallel_config, _DISABLE_REARRANGE_ATTR, False)
+            and (
+                load_path
+                or getattr(self.parallel_config, _DISABLE_REARRANGE_ATTR, False)
+            )
         ):
             eplb_module.logger.info(
-                "Skipping dynamic EPLB expert rearrangement because "
-                "disable_rearrange=true."
+                "Skipping dynamic EPLB expert rearrangement because %s.",
+                "a static expert map is loaded"
+                if load_path
+                else "disable_rearrange=true",
             )
             return None
 
