@@ -17,6 +17,7 @@ from . import (
     patch_gpt_oss_mlp_block,
     patch_mhc_backend,
     patch_qwen3_5_mamba_state_dtype,
+    patch_qwen3_dflash_nn_layout,
     patch_qwen3_vl,
     patch_qwen3_vl_moe,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "patch_gpt_oss_mlp_block",
     "patch_mhc_backend",
     "patch_qwen3_5_mamba_state_dtype",
+    "patch_qwen3_dflash_nn_layout",
     "patch_qwen3_vl",
     "patch_qwen3_vl_moe",
 ]
