@@ -458,7 +458,112 @@ print("legacy-backend-normalized")
     assert "legacy-backend-normalized" in result.stdout
 
 
-def test_real_v0251_cli_extracts_offline_eplb_path_before_validation() -> None:
+@pytest.mark.parametrize(
+    ("path_key", "path_value"),
+    [
+        ("expert_map_record_path", "/models/maps/hy4-record.json"),
+        ("expert_map_path", "/models/maps/hy4-load.json"),
+    ],
+)
+def test_real_v0251_cli_extracts_offline_eplb_path_before_validation(
+    path_key: str,
+    path_value: str,
+) -> None:
+    result = _run_fresh_v0251(
+        r'''
+import argparse
+import json
+
+from vllm.engine import arg_utils
+from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.patch.platform.core_fix import patch_engine_args
+
+arg_utils.current_platform.device_type = "cpu"
+patch_engine_args.apply_to_module(arg_utils)
+parser = argparse.ArgumentParser()
+arg_utils.EngineArgs.add_cli_args(parser)
+path_key = PATH_KEY
+path_value = PATH_VALUE
+namespace = parser.parse_args([
+    "--eplb-config",
+    json.dumps({"window_size": 2, path_key: path_value}),
+])
+args = arg_utils.EngineArgs.from_cli_args(namespace)
+config = args.create_engine_config()
+assert args.eplb_config.window_size == 2
+assert not hasattr(args.eplb_config, path_key)
+assert getattr(get_hcu_config(config), path_key) == path_value
+print("offline-eplb-cli-normalized")
+'''.replace("PATH_KEY", repr(path_key)).replace("PATH_VALUE", repr(path_value))
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "offline-eplb-cli-normalized" in result.stdout
+
+
+def test_real_v0251_cli_rejects_conflicting_offline_eplb_paths() -> None:
+    result = _run_fresh_v0251(
+        r'''
+import argparse
+import json
+
+from vllm.engine import arg_utils
+from vllm_hcu.patch.platform.core_fix import patch_engine_args
+
+arg_utils.current_platform.device_type = "cpu"
+patch_engine_args.apply_to_module(arg_utils)
+parser = argparse.ArgumentParser()
+arg_utils.EngineArgs.add_cli_args(parser)
+namespace = parser.parse_args([
+    "--eplb-config",
+    json.dumps({
+        "expert_map_record_path": "/models/maps/record.json",
+        "expert_map_path": "/models/maps/load.json",
+    }),
+])
+try:
+    arg_utils.EngineArgs.from_cli_args(namespace)
+except ValueError as error:
+    assert "mutually exclusive" in str(error)
+else:
+    raise AssertionError("conflicting offline EPLB paths were accepted")
+print("offline-eplb-cli-conflict-rejected")
+'''
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "offline-eplb-cli-conflict-rejected" in result.stdout
+
+
+def test_real_v0251_cli_extracts_disable_rearrange_before_validation() -> None:
+    result = _run_fresh_v0251(
+        r'''
+import argparse
+import json
+
+from vllm.engine import arg_utils
+from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.patch.platform.core_fix import patch_engine_args
+
+arg_utils.current_platform.device_type = "cpu"
+patch_engine_args.apply_to_module(arg_utils)
+parser = argparse.ArgumentParser()
+arg_utils.EngineArgs.add_cli_args(parser)
+namespace = parser.parse_args([
+    "--eplb-config",
+    json.dumps({"window_size": 8, "disable_rearrange": True}),
+])
+args = arg_utils.EngineArgs.from_cli_args(namespace)
+config = args.create_engine_config()
+assert args.eplb_config.window_size == 8
+assert not hasattr(args.eplb_config, "disable_rearrange")
+assert get_hcu_config(config).eplb_disable_rearrange is True
+print("disable-rearrange-cli-normalized")
+'''
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "disable-rearrange-cli-normalized" in result.stdout
+
+
+def test_real_v0251_cli_extracts_static_dispatch_policy_before_validation() -> None:
     result = _run_fresh_v0251(
         r'''
 import argparse
@@ -476,21 +581,19 @@ namespace = parser.parse_args([
     "--eplb-config",
     json.dumps({
         "window_size": 8,
-        "step_interval": 16,
-        "expert_map_record_path": "/models/maps/hy4.json",
+        "static_dispatch_policy": "locality_fair",
     }),
 ])
 args = arg_utils.EngineArgs.from_cli_args(namespace)
-feature = get_hcu_config(args)
+config = args.create_engine_config()
 assert args.eplb_config.window_size == 8
-assert args.eplb_config.step_interval == 16
-assert feature.expert_map_record_path == "/models/maps/hy4.json"
-assert feature.expert_map_path is None
-print("offline-eplb-cli-normalized")
+assert not hasattr(args.eplb_config, "static_dispatch_policy")
+assert get_hcu_config(config).eplb_static_dispatch_policy == "locality_fair"
+print("static-dispatch-policy-cli-normalized")
 '''
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "offline-eplb-cli-normalized" in result.stdout
+    assert "static-dispatch-policy-cli-normalized" in result.stdout
 
 
 def test_nested_speculative_multi_mtp_is_extracted_before_official_config() -> None:
@@ -563,6 +666,48 @@ def test_nested_offline_eplb_paths_reject_conflicts() -> None:
                 "expert_map_path": "/models/maps/load.json",
             }
         )
+
+
+def test_nested_eplb_disable_rearrange_is_extracted() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        eplb_config={
+            "window_size": 8,
+            "disable_rearrange": True,
+        }
+    )
+
+    assert args.eplb_config == {"window_size": 8}
+    assert get_hcu_config(args).eplb_disable_rearrange is True
+    assert get_hcu_config(
+        args.create_engine_config()
+    ).eplb_disable_rearrange is True
+
+
+def test_nested_eplb_static_dispatch_policy_is_extracted() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    args = module.EngineArgs(
+        eplb_config={
+            "window_size": 8,
+            "static_dispatch_policy": "locality_fair",
+        }
+    )
+
+    assert args.eplb_config == {"window_size": 8}
+    assert (
+        get_hcu_config(args).eplb_static_dispatch_policy
+        == "locality_fair"
+    )
+    assert (
+        get_hcu_config(
+            args.create_engine_config()
+        ).eplb_static_dispatch_policy
+        == "locality_fair"
+    )
 
 
 def test_positional_additional_config_is_merged_not_overwritten() -> None:
@@ -1102,6 +1247,7 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
             decode_context_parallel_size=1,
             data_parallel_size=1,
             enable_expert_parallel=False,
+            enable_elastic_ep=False,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         speculative_config=None,
@@ -1156,6 +1302,32 @@ def test_deepep_auto_rejects_eplb_before_model_loading() -> None:
     with pytest.raises(
         ValueError,
         match="deepep_auto.*EPLB.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_static_offline_eplb_rejects_elastic_ep_before_model_loading() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(expert_map_path="/models/maps/static.json")
+    )
+    config.parallel_config.enable_elastic_ep = True
+
+    with pytest.raises(
+        ValueError,
+        match="static offline EPLB.*elastic EP.*not supported",
+    ):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+def test_disable_eplb_rearrange_rejects_elastic_ep_before_loading() -> None:
+    config = _validation_config(
+        HcuFeatureConfig(eplb_disable_rearrange=True)
+    )
+    config.parallel_config.enable_elastic_ep = True
+
+    with pytest.raises(
+        ValueError,
+        match="disable_rearrange.*elastic EP.*not supported",
     ):
         patch_vllm_config.validate_and_update_hcu_config(config)
 

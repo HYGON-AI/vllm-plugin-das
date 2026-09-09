@@ -1429,7 +1429,7 @@ def test_hash_router_normalizes_index_dtypes():
     assert captured == {"input": torch.int32, "hash": torch.int32}
 
 
-def test_moe_layer_forward_and_repacked_weight_contract(
+def test_moe_layer_patch_forward_and_repacked_weight_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
     factory_names = (
@@ -1452,14 +1452,28 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.moe_quant_config = "official-config"
 
     class RoutedExperts:
+        build_calls = []
+
         def __init__(self):
-            self.moe_config = "moe-config"
+            self.moe_config = SimpleNamespace(
+                num_logical_experts=3,
+                num_experts=4,
+            )
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
             self._dsv4_channel_deepgemm_repacked = False
             self.layer_name = "model.layers.0.mlp"
+            self.ckpt_gate_proj_name = "gate_proj"
+            self.ckpt_down_proj_name = "down_proj"
+            self.ckpt_up_proj_name = "up_proj"
+            self.lora_base_layer_prefix = ""
             self.expert_mapping = []
+            self.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
             self.official_loads = []
+            self.weight_loader_calls = []
+            self.local_physical_ids = set(range(4))
+            # Quantization methods capture this bound callback in create_weights.
+            self.parameter_weight_loader = self.weight_loader
 
         def _replace_quant_method(self, method):
             self.quant_method = method
@@ -1467,11 +1481,131 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         def get_expert_weights(self):
             return "official-weights"
 
-        def get_expert_mapping(self, include_fused=False):
+        def weight_loader(
+            self,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            self.weight_loader_calls.append(
+                (
+                    param,
+                    loaded_weight,
+                    weight_name,
+                    shard_id,
+                    expert_id,
+                    return_success,
+                )
+            )
+            loaded = expert_id in self.local_physical_ids
+            return loaded if return_success else None
+
+        def get_expert_mapping(
+            self,
+            ckpt_gate_proj_name=None,
+            ckpt_down_proj_name=None,
+            ckpt_up_proj_name=None,
+            include_fused=False,
+        ):
             assert include_fused is True
             return self.expert_mapping
 
+        @staticmethod
+        def make_expert_params_mapping(
+            model,
+            ckpt_gate_proj_name,
+            ckpt_down_proj_name,
+            ckpt_up_proj_name,
+            num_experts,
+            num_redundant_experts=0,
+            routed_experts_prefix="routed_experts",
+        ):
+            base_layer_prefix = (
+                "base_layer."
+                if any(".base_layer." in name for name, _ in model.named_parameters())
+                else ""
+            )
+            return RoutedExperts.build_expert_params_mapping(
+                ckpt_gate_proj_name,
+                ckpt_down_proj_name,
+                ckpt_up_proj_name,
+                num_experts,
+                num_redundant_experts,
+                routed_experts_prefix,
+                base_layer_prefix,
+            )
+
+        @staticmethod
+        def build_expert_params_mapping(
+            ckpt_gate_proj_name,
+            ckpt_down_proj_name,
+            ckpt_up_proj_name,
+            num_experts,
+            num_redundant_experts=0,
+            routed_experts_prefix="routed_experts",
+            lora_base_layer_prefix="",
+            include_fused=False,
+        ):
+            RoutedExperts.build_calls.append(
+                (
+                    ckpt_gate_proj_name,
+                    ckpt_down_proj_name,
+                    ckpt_up_proj_name,
+                    num_experts,
+                    num_redundant_experts,
+                    routed_experts_prefix,
+                    lora_base_layer_prefix,
+                    include_fused,
+                )
+            )
+            routed_prefix = (
+                f"{routed_experts_prefix}." if routed_experts_prefix else ""
+            )
+            w13 = f"experts.{routed_prefix}{lora_base_layer_prefix}w13_"
+            w2 = f"experts.{routed_prefix}{lora_base_layer_prefix}w2_"
+            fused = []
+            if include_fused:
+                fused = [
+                    (f"{w13}weight", "experts.gate_up_proj", 0, "w1"),
+                    (f"{w13}weight", "experts.gate_up_proj", 1, "w3"),
+                    (f"{w2}weight", "experts.down_proj", 0, "w2"),
+                ]
+            split = [
+                (
+                    w13 if shard_id in {"w1", "w3"} else w2,
+                    f"experts.{expert_id}.{weight_name}.{lora_base_layer_prefix}",
+                    expert_id,
+                    shard_id,
+                )
+                for expert_id in range(num_experts + num_redundant_experts)
+                for shard_id, weight_name in (
+                    ("w1", ckpt_gate_proj_name),
+                    ("w2", ckpt_down_proj_name),
+                    ("w3", ckpt_up_proj_name),
+                )
+            ]
+            return fused + split
+
         def load_weights(self, weights):
+            if hasattr(self, "standard_fused_param"):
+                for weight_name, loaded_weight in weights:
+                    for logical_expert_id, loaded_expert in enumerate(
+                        loaded_weight.unbind()
+                    ):
+                        success = self.standard_fused_param.weight_loader(
+                            param=self.standard_fused_param,
+                            loaded_weight=loaded_expert,
+                            weight_name=weight_name,
+                            shard_id="w2",
+                            expert_id=logical_expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            yield "w2_weight"
+                return
             self.official_loads.extend(weights)
             yield "official-load"
 
@@ -1534,6 +1668,185 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+
+    static_experts = fused_moe_package.FusedMoE().routed_experts
+    static_experts._vllm_hcu_static_eplb_row = (2, 1, 0, 2)
+    static_experts.local_physical_ids = {0, 3}
+    param = object()
+    tensor = torch.tensor([7.0])
+    assert (
+        static_experts.parameter_weight_loader(
+            param,
+            tensor,
+            "w13_weight",
+            "w1",
+            2,
+            return_success=True,
+        )
+        is True
+    )
+    assert [call[4] for call in static_experts.weight_loader_calls] == [0, 3]
+    assert all(call[0] is param for call in static_experts.weight_loader_calls)
+    assert all(call[1] is tensor for call in static_experts.weight_loader_calls)
+
+    second_experts = fused_moe_package.FusedMoE().routed_experts
+    second_experts._vllm_hcu_static_eplb_row = (1, 0, 2, 1)
+    second_experts.local_physical_ids = {2}
+    assert (
+        second_experts.parameter_weight_loader(
+            param,
+            tensor,
+            "w13_weight",
+            "w1",
+            2,
+            return_success=True,
+        )
+        is True
+    )
+    assert [call[4] for call in second_experts.weight_loader_calls] == [2]
+
+    static_experts.weight_loader_calls.clear()
+    static_experts.local_physical_ids = {1}
+    assert (
+        static_experts.weight_loader(
+            param,
+            tensor,
+            "w13_weight_scale",
+            "w1",
+            2,
+            return_success=True,
+        )
+        is False
+    )
+    assert [call[4] for call in static_experts.weight_loader_calls] == [0, 3]
+    assert all(
+        call[2] == "w13_weight_scale"
+        for call in static_experts.weight_loader_calls
+    )
+    assert all(call[5] is True for call in static_experts.weight_loader_calls)
+
+    static_experts.weight_loader_calls.clear()
+    static_experts.local_physical_ids = {0, 3}
+    assert (
+        static_experts.weight_loader(
+            param,
+            tensor,
+            "w13_weight",
+            "w1",
+            2,
+            return_success=False,
+        )
+        is None
+    )
+    assert [call[4] for call in static_experts.weight_loader_calls] == [0, 3]
+
+    split_mapping = static_experts.get_expert_mapping()
+    assert len(split_mapping) == 9
+    assert [entry[2] for entry in split_mapping[::3]] == [0, 1, 2]
+    assert RoutedExperts.build_calls[-1][4] == 0
+
+    fused_mapping = static_experts.get_expert_mapping(include_fused=True)
+    assert fused_mapping[:3] == [
+        ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+        ("experts.w13_weight", "experts.gate_up_proj", 1, "w3"),
+        ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+    ]
+    assert len(fused_mapping) == 12
+
+    static_experts.weight_loader_calls.clear()
+    static_experts.local_physical_ids = {0, 1, 2, 3}
+    static_experts.standard_fused_param = SimpleNamespace(
+        weight_loader=static_experts.parameter_weight_loader
+    )
+    fused_tensor = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    assert list(
+        static_experts.load_weights([("experts.down_proj", fused_tensor)])
+    ) == ["w2_weight"] * 3
+    assert [call[4] for call in static_experts.weight_loader_calls] == [
+        2,
+        1,
+        0,
+        3,
+    ]
+    assert [call[1].tolist() for call in static_experts.weight_loader_calls] == [
+        [0.0, 1.0],
+        [2.0, 3.0],
+        [4.0, 5.0],
+        [4.0, 5.0],
+    ]
+
+    static_experts.expert_map_manager.num_fused_shared_experts = 1
+    shared_mapping = static_experts.get_expert_mapping()
+    assert len(shared_mapping) == 12
+    assert [entry[2] for entry in shared_mapping[::3]] == [0, 1, 2, 3]
+
+    static_experts.weight_loader_calls.clear()
+    static_experts.local_physical_ids = {4}
+    assert (
+        static_experts.parameter_weight_loader(
+            param,
+            tensor,
+            "w13_weight",
+            "w1",
+            3,
+            return_success=True,
+        )
+        is True
+    )
+    assert [call[4] for call in static_experts.weight_loader_calls] == [4]
+    static_experts.expert_map_manager.num_fused_shared_experts = 0
+
+    static_model = SimpleNamespace(
+        named_parameters=lambda: iter(()),
+        modules=lambda: iter((static_experts,)),
+    )
+    legacy_mapping = RoutedExperts.make_expert_params_mapping(
+        static_model,
+        "gate_proj",
+        "down_proj",
+        "up_proj",
+        3,
+        1,
+    )
+    assert len(legacy_mapping) == 9
+    assert RoutedExperts.build_calls[-1][4] == 0
+
+    upstream_param = object()
+    upstream_tensor = torch.tensor([11.0])
+    assert (
+        experts.parameter_weight_loader(
+            upstream_param,
+            upstream_tensor,
+            "ordinary.weight",
+            "w2",
+            1,
+            return_success=True,
+        )
+        is True
+    )
+    assert experts.weight_loader_calls[-1] == (
+        upstream_param,
+        upstream_tensor,
+        "ordinary.weight",
+        "w2",
+        1,
+        True,
+    )
+    ordinary_mapping = [("ordinary", "checkpoint", 7, "w1")]
+    experts.expert_mapping = ordinary_mapping
+    assert experts.get_expert_mapping(include_fused=True) is ordinary_mapping
+
+    ordinary_model = SimpleNamespace(named_parameters=lambda: iter(()))
+    ordinary_legacy_mapping = RoutedExperts.make_expert_params_mapping(
+        ordinary_model,
+        "gate_proj",
+        "down_proj",
+        "up_proj",
+        3,
+        1,
+    )
+    assert len(ordinary_legacy_mapping) == 12
+    assert RoutedExperts.build_calls[-1][4] == 1
 
     experts._dsv4_channel_deepgemm_repacked = True
     experts.w13_weight = torch.arange(24).reshape(2, 3, 4)

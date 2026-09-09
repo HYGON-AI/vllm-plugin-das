@@ -631,11 +631,18 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
             return False
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        routed_experts = getattr(weight_loader, "__self__", None)
+        num_checkpoint_experts = (
+            num_experts
+            if hasattr(routed_experts, "_vllm_hcu_static_eplb_row")
+            else num_experts + num_redundant_experts
+        )
         loaded_local_expert = False
-        for expert_id in range(num_experts + num_redundant_experts):
+        for expert_id in range(num_checkpoint_experts):
+            logical_expert_id = expert_id % num_experts
             success = weight_loader(
                 param,
-                loaded_weight[expert_id % num_experts],
+                loaded_weight[logical_expert_id],
                 name,
                 shard_id,
                 expert_id,
@@ -704,9 +711,7 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
             return True
 
         consumed = False
-        for param_name, weight_name, expert_id, shard_id in (
-            split_expert_params_mapping
-        ):
+        for param_name, weight_name, expert_id, shard_id in split_expert_params_mapping:
             if weight_name not in name:
                 continue
             consumed = True

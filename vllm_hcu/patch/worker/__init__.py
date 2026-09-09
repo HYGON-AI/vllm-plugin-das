@@ -208,6 +208,18 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 )
 
 
+# Model construction is the last common boundary before the loader can invoke
+# ``model.load_weights``. Arm this callback before any model-specific adapter
+# can import a model module.
+_MODEL_LOADER_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb_gate")
+    ),
+    _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb")),
+    _CallbackSpec(_adapter("framework_opt", "patch_llama4_static_eplb")),
+)
+
+
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
@@ -270,6 +282,7 @@ _MOE_RUNTIME_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_rocm_aiter_moe")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_triton_moe")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_base_router")),
+    _CallbackSpec(_adapter("op_opt.moe", "patch_routing_simulator")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_fused_topk_bias_router")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_router_factory")),
     _CallbackSpec(
@@ -373,6 +386,7 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 
 _ALL_CALLBACK_GROUPS: tuple[tuple[_CallbackSpec, ...], ...] = (
+    _MODEL_LOADER_CALLBACKS,
     _MOE_FOUNDATION_CALLBACKS,
     _CORE_CALLBACKS,
     _OP_CALLBACKS,
@@ -794,6 +808,12 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
                 parallel_config["_vllm_hcu_expert_map_path"] = (
                     config.expert_map_path
                 )
+                parallel_config["_vllm_hcu_eplb_disable_rearrange"] = (
+                    config.eplb_disable_rearrange
+                )
+                parallel_config["_vllm_hcu_eplb_static_dispatch_policy"] = (
+                    config.eplb_static_dispatch_policy
+                )
             elif parallel_config is not None:
                 setattr(
                     parallel_config,
@@ -809,6 +829,16 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
                     parallel_config,
                     "_vllm_hcu_expert_map_path",
                     config.expert_map_path,
+                )
+                setattr(
+                    parallel_config,
+                    "_vllm_hcu_eplb_disable_rearrange",
+                    config.eplb_disable_rearrange,
+                )
+                setattr(
+                    parallel_config,
+                    "_vllm_hcu_eplb_static_dispatch_policy",
+                    config.eplb_static_dispatch_policy,
                 )
             rebound = _bind_deserialized_hcu_config(vllm_config)
             if rebound != config:

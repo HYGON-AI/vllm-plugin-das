@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+
 from .lightop_routing import lightop_moe_gate_kwargs
 
 
@@ -148,4 +151,149 @@ def make_hcu_grouped_topk_router(base_class):
     return HcuGroupedTopKRouter
 
 
-__all__ = ["eplb_map_to_physical_and_record", "make_hcu_grouped_topk_router"]
+def _ep_world_size() -> int:
+    from vllm.distributed.parallel_state import get_ep_group
+
+    return get_ep_group().world_size
+
+
+def _nearest_max_rank_load(
+    num_assignments: int,
+    ep_size: int,
+    target: float,
+) -> int:
+    """Choose the integer max load whose mean/max ratio is nearest target."""
+    minimum_load = math.ceil(num_assignments / ep_size)
+    ideal_load = num_assignments / (ep_size * target)
+    candidates = {
+        max(minimum_load, min(num_assignments, math.floor(ideal_load))),
+        max(minimum_load, min(num_assignments, math.ceil(ideal_load))),
+    }
+    return min(
+        candidates,
+        key=lambda load: (
+            abs(num_assignments / (ep_size * load) - target),
+            load,
+        ),
+    )
+
+
+def make_hcu_eplb_balancedness_strategy(base_class):
+    class HcuEplbBalancednessRouting(base_class):
+        def __init__(
+            self,
+            ep_size_getter: Callable[[], int] = _ep_world_size,
+        ) -> None:
+            self._ep_size_getter = ep_size_getter
+
+        def route_tokens(
+            self,
+            hidden_states,
+            router_logits,
+            top_k,
+            indices_type=None,
+        ):
+            import torch
+
+            from vllm_hcu.platforms import envs as henvs
+
+            ep_size = int(self._ep_size_getter())
+            num_tokens = hidden_states.shape[0]
+            num_experts = router_logits.shape[-1]
+            target = float(
+                henvs.VLLM_HCU_MOE_ROUTING_SIMULATION_BALANCEDNESS
+            )
+
+            if ep_size < 1:
+                raise ValueError(f"EP size must be positive, got {ep_size}")
+            if num_experts < ep_size:
+                raise ValueError(
+                    f"Routing simulation needs at least one expert per EP rank; "
+                    f"got {num_experts} experts for EP size {ep_size}"
+                )
+            minimum = 1.0 / ep_size
+            if not math.isfinite(target) or target < minimum:
+                raise ValueError(
+                    "VLLM_HCU_MOE_ROUTING_SIMULATION_BALANCEDNESS must be "
+                    f"at least the EP-size minimum {minimum:g}, got {target}"
+                )
+            if target > 1.0:
+                raise ValueError(
+                    "VLLM_HCU_MOE_ROUTING_SIMULATION_BALANCEDNESS must be "
+                    f"at most 1.0, got {target}"
+                )
+            if top_k < 1:
+                raise ValueError(f"top_k must be positive, got {top_k}")
+            minimum_experts_per_rank = num_experts // ep_size
+            if top_k > minimum_experts_per_rank:
+                raise ValueError(
+                    "HCU EPLB routing simulation requires top_k to be no "
+                    "larger than the smallest EP-rank expert partition so "
+                    "each token receives distinct experts; "
+                    f"got top_k={top_k}, minimum experts per rank="
+                    f"{minimum_experts_per_rank}"
+                )
+
+            output_shape = (num_tokens, top_k)
+            weights = torch.ones(
+                output_shape,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            num_assignments = num_tokens * top_k
+            if num_assignments == 0:
+                dtype = indices_type if indices_type is not None else torch.long
+                return weights, torch.empty(
+                    output_shape,
+                    dtype=dtype,
+                    device=hidden_states.device,
+                )
+
+            assignment_ids = torch.arange(
+                num_assignments,
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            if ep_size == 1:
+                rank_ids = torch.zeros_like(assignment_ids)
+            else:
+                hot_count = _nearest_max_rank_load(
+                    num_assignments,
+                    ep_size,
+                    target,
+                )
+                cool_ids = 1 + (assignment_ids - hot_count).clamp_min(0) % (
+                    ep_size - 1
+                )
+                rank_ids = torch.where(
+                    assignment_ids < hot_count,
+                    torch.zeros_like(assignment_ids),
+                    cool_ids,
+                )
+
+            experts_per_rank = num_experts // ep_size
+            extra_experts = num_experts % ep_size
+            rank_sizes = experts_per_rank + (rank_ids < extra_experts).long()
+            rank_starts = (
+                rank_ids * experts_per_rank
+                + torch.minimum(
+                    rank_ids,
+                    torch.full_like(rank_ids, extra_experts),
+                )
+            )
+            expert_ids = rank_starts + assignment_ids % rank_sizes
+            if indices_type is None:
+                indices_type = torch.long
+            return weights, expert_ids.reshape(output_shape).to(indices_type)
+
+    HcuEplbBalancednessRouting.__name__ = "HcuEplbBalancednessRouting"
+    HcuEplbBalancednessRouting.__qualname__ = "HcuEplbBalancednessRouting"
+    HcuEplbBalancednessRouting.__module__ = __name__
+    return HcuEplbBalancednessRouting
+
+
+__all__ = [
+    "eplb_map_to_physical_and_record",
+    "make_hcu_eplb_balancedness_strategy",
+    "make_hcu_grouped_topk_router",
+]

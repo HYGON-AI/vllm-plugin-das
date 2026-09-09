@@ -660,9 +660,16 @@ class HYV4Model(nn.Module, MixtureOfExperts):
     ) -> bool:
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        routed_experts = getattr(weight_loader, "__self__", None)
+        num_checkpoint_experts = (
+            num_experts
+            if hasattr(routed_experts, "_vllm_hcu_static_eplb_row")
+            else num_experts + num_redundant_experts
+        )
         loaded_local_expert = False
-        for expert_id in range(num_experts + num_redundant_experts):
-            curr_expert_weight = loaded_weight[expert_id % num_experts]
+        for expert_id in range(num_checkpoint_experts):
+            logical_expert_id = expert_id % num_experts
+            curr_expert_weight = loaded_weight[logical_expert_id]
             success = weight_loader(
                 param,
                 curr_expert_weight,
@@ -812,11 +819,10 @@ class HYV4Model(nn.Module, MixtureOfExperts):
 
             # Determine per-weight whether this is fused or split format.
             is_fused_expert = _is_fused_expert_weight(name)
-            expert_params_mapping = (
-                fused_expert_params_mapping
-                if is_fused_expert
-                else split_expert_params_mapping
-            )
+            if is_fused_expert:
+                expert_params_mapping = fused_expert_params_mapping
+            else:
+                expert_params_mapping = split_expert_params_mapping
 
             is_expert_weight = False
             loaded_expert_param_names: set[str] = set()

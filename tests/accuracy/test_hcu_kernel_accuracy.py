@@ -573,6 +573,51 @@ def test_hcu_indexer_fp8_cache_roundtrip_matches_ue8m0_reference(
     )
 
 
+def test_hcu_indexer_cache_writer_masks_negative_slots_during_capture() -> None:
+    """Catch dummy decode slots writing through during HCU graph capture."""
+    device = _hcu_device()
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        indexer_k_quant_and_cache_triton,
+    )
+
+    source = torch.stack(
+        (
+            torch.ones(128, device=device),
+            torch.full((128,), 7.0, device=device),
+        )
+    ).to(torch.bfloat16)
+    cache = torch.zeros((4, 1, 132), device=device, dtype=torch.uint8)
+    slots = torch.tensor([1, -1], device=device, dtype=torch.int64)
+
+    # Compile the Triton specialization before capture. The captured launch must
+    # retain a fixed shape while suppressing the dummy ``-1`` slot on-device.
+    indexer_k_quant_and_cache_triton(
+        source,
+        cache,
+        torch.tensor([1, 2], device=device, dtype=torch.int64),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+    )
+    torch.cuda.synchronize()
+    cache.zero_()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        indexer_k_quant_and_cache_triton(
+            source,
+            cache,
+            slots,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(cache[1]).item() > 0
+    assert torch.count_nonzero(cache[0]).item() == 0
+    assert torch.count_nonzero(cache[-1]).item() == 0
+
+
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_lightop_indexer_cache_roundtrip_uses_normal_layout(
     block_size: int,

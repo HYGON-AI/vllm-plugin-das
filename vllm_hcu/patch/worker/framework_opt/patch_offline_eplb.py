@@ -4,14 +4,24 @@
 
 from __future__ import annotations
 
+import fcntl
 import functools
 import json
+import os
+import tempfile
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import torch
+
+from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+    StaticEplbPlan,
+    load_static_eplb_plan,
+    resolve_offline_eplb_model_key,
+)
 
 from ._common import (
     PatchCompatibilityError,
@@ -27,38 +37,68 @@ PATCH_ID = "worker.framework_opt.eplb.offline_expert_map"
 TARGETS = (
     f"{TARGET_MODULE}.EplbState.add_model",
     f"{TARGET_MODULE}.EplbState.step",
+    f"{TARGET_MODULE}.EplbState.rearrange",
+    f"{TARGET_MODULE}.rearrange_expert_weights_inplace",
     f"{TARGET_MODULE}._commit_eplb_maps",
+    f"{TARGET_MODULE}._commit_eplb_maps_for_layer",
     f"{TARGET_MODULE}._move_to_workspace",
 )
 _MARKER = "_vllm_hcu_offline_eplb_patch_applied"
 _WRAPPER_MARKER = "_vllm_hcu_offline_eplb_wrapper"
 _RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _LOAD_PATH_ATTR = "_vllm_hcu_expert_map_path"
+_DISABLE_REARRANGE_ATTR = "_vllm_hcu_eplb_disable_rearrange"
+_STATIC_DISPATCH_POLICY_ATTR = "_vllm_hcu_eplb_static_dispatch_policy"
 _MODEL_RECORD_PATH_ATTR = "_vllm_hcu_expert_map_record_path"
 _MODEL_KEY_ATTR = "_vllm_hcu_expert_map_key"
+_MODEL_STATIC_DISPATCH_POLICY_ATTR = "_vllm_hcu_eplb_static_dispatch_policy"
+_RECORD_ONLY_REARRANGE = ContextVar(
+    "vllm_hcu_record_only_eplb_rearrange",
+    default=False,
+)
 
 
-def _select_model_payload(
-    path: Path,
-    payload: dict,
-    model_key: str,
-) -> dict:
-    model_maps = payload.get("model_maps")
-    if model_maps is None:
-        return payload
-    if not isinstance(model_maps, dict):
-        raise ValueError(f"Offline EPLB map {str(path)!r} has invalid model_maps.")
-    if model_key not in model_maps:
-        raise ValueError(
-            f"Offline EPLB map {str(path)!r} does not contain key "
-            f"{model_key!r}; available keys: {sorted(model_maps)}."
+def _compute_eplb_load_stats(
+    num_tokens_per_rank: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backport vLLM #51813's per-layer EP load reduction."""
+    avg_tokens = num_tokens_per_rank.mean(dim=1).sum()
+    max_tokens = num_tokens_per_rank.max(dim=1).values.sum()
+    return avg_tokens, max_tokens
+
+
+def _log_corrected_eplb_balancedness(eplb_module: ModuleType, state) -> None:
+    expert_load_pass_list = state._sync_load_pass()
+    ep_group = eplb_module.get_ep_group().device_group
+    for expert_load_pass, model_state in zip(
+        expert_load_pass_list,
+        state.model_states.values(),
+    ):
+        num_tokens_per_rank = (
+            expert_load_pass.reshape(
+                expert_load_pass.shape[0],
+                ep_group.size(),
+                -1,
+            )
+            .sum(dim=-1)
+            .float()
         )
-    selected = model_maps[model_key]
-    if not isinstance(selected, dict):
-        raise ValueError(
-            f"Offline EPLB map {str(path)!r} key {model_key!r} is invalid."
-        )
-    return selected
+        avg_tensor, max_tensor = _compute_eplb_load_stats(num_tokens_per_rank)
+        avg_tokens, max_tokens = torch.stack([avg_tensor, max_tensor]).tolist()
+        balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
+        if ep_group.rank() == 0:
+            eplb_module.logger.info(
+                "EPLB step: %d for model %s: avg_tokens=%.2f, "
+                "max_tokens=%d, balancedness=%.4f, "
+                "steps until the next rearrangement: %d",
+                state.expert_rearrangement_step,
+                model_state.model_name,
+                avg_tokens,
+                max_tokens,
+                balancedness,
+                state.expert_rearrangement_step_interval
+                - state.expert_rearrangement_step,
+            )
 
 
 def load_offline_expert_map(
@@ -72,68 +112,14 @@ def load_offline_expert_map(
 ) -> torch.Tensor:
     """Load and validate one model's physical-to-logical expert map."""
 
-    input_path = Path(path)
-    with input_path.open(encoding="utf-8") as source:
-        payload = json.load(source)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Offline EPLB map {str(input_path)!r} must be an object.")
-    selected = _select_model_payload(input_path, payload, model_key)
-    raw_map = selected.get(
-        "physical_to_logical_map",
-        selected.get("expert_map"),
+    plan = load_static_eplb_plan(
+        path,
+        model_key=model_key,
+        expected_shape=expected_shape,
+        num_logical_experts=num_logical_experts,
+        num_redundant_experts=expected_shape[1] - num_logical_experts,
     )
-    if raw_map is None:
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} must contain "
-            "physical_to_logical_map."
-        )
-
-    loaded = torch.tensor(raw_map, device="cpu")
-    if (
-        loaded.dtype == torch.bool
-        or loaded.is_floating_point()
-        or loaded.is_complex()
-    ):
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} must contain integer expert ids."
-        )
-    loaded = loaded.to(dtype=dtype)
-    loaded_shape = tuple(loaded.shape)
-    if loaded_shape != expected_shape:
-        if (
-            loaded.ndim == 2
-            and loaded.shape[0] > expected_shape[0]
-            and loaded.shape[1] == expected_shape[1]
-        ):
-            loaded = loaded[-expected_shape[0] :]
-        else:
-            raise ValueError(
-                f"Offline EPLB map {str(input_path)!r} has shape "
-                f"{loaded_shape}, expected {expected_shape}."
-            )
-    if loaded.numel() == 0:
-        raise ValueError(f"Offline EPLB map {str(input_path)!r} is empty.")
-    if loaded.min().item() < 0:
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} contains negative expert ids."
-        )
-    if loaded.max().item() >= num_logical_experts:
-        raise ValueError(
-            f"Offline EPLB map {str(input_path)!r} contains logical expert id "
-            f">= {num_logical_experts}."
-        )
-    for layer_idx, layer_map in enumerate(loaded):
-        counts = torch.bincount(
-            layer_map.to(torch.long),
-            minlength=num_logical_experts,
-        )
-        missing = torch.nonzero(counts[:num_logical_experts] == 0).flatten()
-        if missing.numel() > 0:
-            raise ValueError(
-                f"Offline EPLB map {str(input_path)!r} layer {layer_idx} "
-                f"misses logical experts {missing.tolist()}."
-            )
-    return loaded.to(device=device)
+    return plan.physical_to_logical_map.to(dtype=dtype, device=device)
 
 
 def _merge_record_payload(
@@ -173,7 +159,7 @@ def record_offline_expert_map(
     num_logical_experts: int,
     num_redundant_experts: int,
 ) -> None:
-    """Atomically merge one model's committed map into an offline JSON file."""
+    """Atomically merge one model's candidate map into an offline JSON file."""
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,11 +176,24 @@ def record_offline_expert_map(
         "physical_to_logical_map": map_cpu.tolist(),
     }
     with _FILE_LOCK:
-        payload = _merge_record_payload(output_path, model_key, model_payload)
-        tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as destination:
-            json.dump(payload, destination)
-        tmp_path.replace(output_path)
+        lock_path = output_path.with_suffix(output_path.suffix + ".lock")
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            payload = _merge_record_payload(output_path, model_key, model_payload)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+                dir=output_path.parent,
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+                    json.dump(payload, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                temporary_path.replace(output_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
 
 
 def _parallel_offline_paths(parallel_config: object) -> tuple[str | None, str | None]:
@@ -207,7 +206,12 @@ def _parallel_offline_paths(parallel_config: object) -> tuple[str | None, str | 
     return record_path, load_path
 
 
-def _record_model_state(module: ModuleType, model_state: object) -> None:
+def _record_model_state(
+    module: ModuleType,
+    model_state: object,
+    *,
+    physical_to_logical_map: torch.Tensor | None = None,
+) -> None:
     path = getattr(model_state, _MODEL_RECORD_PATH_ATTR, None)
     if not path or module.get_ep_group().device_group.rank() != 0:
         return
@@ -218,7 +222,11 @@ def _record_model_state(module: ModuleType, model_state: object) -> None:
         model_key=model_key,
         model_name=model_state.model_name,
         model_class=model.__class__.__name__,
-        physical_to_logical_map=model_state.physical_to_logical_map,
+        physical_to_logical_map=(
+            model_state.physical_to_logical_map
+            if physical_to_logical_map is None
+            else physical_to_logical_map
+        ),
         num_logical_experts=model.num_logical_experts,
         num_redundant_experts=model.num_redundant_experts,
     )
@@ -232,6 +240,131 @@ def _record_model_state(module: ModuleType, model_state: object) -> None:
 def _wrapped_is_valid(owner: object, name: str) -> bool:
     function = getattr(owner, name, None)
     return callable(function) and bool(getattr(function, _WRAPPER_MARKER, False))
+
+
+def _find_static_eplb_plan(model: object) -> StaticEplbPlan | None:
+    plan = getattr(model, "_vllm_hcu_static_eplb_plan", None)
+    if plan is None:
+        inner_model = getattr(model, "model", None)
+        plan = getattr(inner_model, "_vllm_hcu_static_eplb_plan", None)
+    if plan is not None and not isinstance(plan, StaticEplbPlan):
+        raise PatchCompatibilityError(
+            "Static EPLB model published an invalid direct-load plan: "
+            f"model_key={model.__class__.__name__!r}."
+        )
+    return plan
+
+
+def _apply_locality_fair_replica_order(
+    module: ModuleType,
+    model_state: object,
+    *,
+    layer: int | None = None,
+) -> bool:
+    policy = getattr(model_state, _MODEL_STATIC_DISPATCH_POLICY_ATTR, "nearest")
+    if policy != "locality_fair":
+        return False
+
+    from vllm_hcu.model_executor.layers.fused_moe.eplb_dispatch import (
+        build_locality_fair_replica_order,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_EPLB_LOCALITY_FAIR_DISPATCH
+    ):
+        return False
+
+    ep_group = module.get_ep_group().device_group
+    ep_rank = ep_group.rank()
+    ep_size = ep_group.size()
+    replica_counts = model_state.logical_replica_count
+    logical_map = model_state.logical_to_physical_map
+    if layer is not None:
+        replica_counts = replica_counts[layer : layer + 1]
+        logical_map = logical_map[layer : layer + 1]
+    max_replicas = int(replica_counts.max().item())
+    if max_replicas <= 1:
+        return False
+    logical_map_prefix = logical_map[..., :max_replicas]
+    ordered_map = build_locality_fair_replica_order(
+        logical_map_prefix,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        num_nodes=module.get_node_count(),
+        num_physical_experts=model_state.physical_to_logical_map.shape[1],
+        layer_offset=0 if layer is None else layer,
+    )
+    logical_map_prefix.copy_(ordered_map)
+    if layer is None or layer == model_state.model.num_moe_layers - 1:
+        module.logger.info(
+            "Applied locality-fair EPLB replica ordering for model %s "
+            "on EP rank %d.",
+            model_state.model_name,
+            ep_rank,
+        )
+    return True
+
+
+def _validate_direct_load_plan(
+    plan: StaticEplbPlan,
+    *,
+    load_path: str,
+    model_key: str,
+    model: object,
+    expected_shape: tuple[int, int],
+) -> None:
+    configured_path = str(Path(load_path).expanduser().resolve(strict=True))
+    if plan.source_path != configured_path:
+        raise PatchCompatibilityError(
+            "Static EPLB direct-load plan path does not match the runtime "
+            f"configuration: plan={plan.source_path!r}, configured={configured_path!r}."
+        )
+    if plan.model_key != model_key:
+        raise PatchCompatibilityError(
+            "Static EPLB direct-load model key mismatch: "
+            f"plan={plan.model_key!r}, runtime={model_key!r}."
+        )
+    observed = (
+        plan.num_logical_experts,
+        plan.num_physical_experts,
+        plan.num_redundant_experts,
+    )
+    expected = (
+        int(getattr(model, "num_logical_experts")),
+        int(getattr(model, "num_physical_experts")),
+        int(getattr(model, "num_redundant_experts")),
+    )
+    if observed != expected or tuple(plan.physical_to_logical_map.shape) != expected_shape:
+        raise PatchCompatibilityError(
+            "Static EPLB direct-load plan metadata does not match EPLB state: "
+            f"plan_counts={observed}, model_counts={expected}, "
+            f"plan_shape={tuple(plan.physical_to_logical_map.shape)}, "
+            f"state_shape={expected_shape}."
+        )
+
+
+def _verify_static_plan_across_ep_ranks(
+    module: ModuleType,
+    plan: StaticEplbPlan,
+) -> None:
+    ep_group = module.get_ep_group()
+    world_size = int(getattr(ep_group, "world_size", 1))
+    if world_size <= 1:
+        return
+    fingerprints: list[object] = [None] * world_size
+    torch.distributed.all_gather_object(
+        fingerprints,
+        plan.fingerprint(),
+        group=ep_group.cpu_group,
+    )
+    if any(fingerprint != fingerprints[0] for fingerprint in fingerprints[1:]):
+        raise RuntimeError(
+            "Static EPLB plan fingerprints differ across EP ranks: "
+            f"local_rank={getattr(ep_group, 'rank_in_group', 'unknown')}, "
+            f"fingerprints={fingerprints}."
+        )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -252,7 +385,10 @@ def apply_to_module(module: ModuleType) -> bool:
         wrapped = (
             (eplb_state_cls, "add_model"),
             (eplb_state_cls, "step"),
+            (eplb_state_cls, "rearrange"),
+            (eplb_module, "rearrange_expert_weights_inplace"),
             (eplb_module, "_commit_eplb_maps"),
+            (eplb_module, "_commit_eplb_maps_for_layer"),
             (eplb_module, "_move_to_workspace"),
         )
         if not all(_wrapped_is_valid(owner, name) for owner, name in wrapped):
@@ -263,16 +399,70 @@ def apply_to_module(module: ModuleType) -> bool:
 
     original_add_model = require_callable(eplb_state_cls, "add_model", TARGETS[0])
     original_step = require_callable(eplb_state_cls, "step", TARGETS[1])
-    original_commit = require_callable(eplb_module, "_commit_eplb_maps", TARGETS[2])
-    original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[3])
-    rearrange = require_callable(
+    require_callable(
+        eplb_state_cls,
+        "_sync_load_pass",
+        f"{TARGET_MODULE}.EplbState._sync_load_pass",
+    )
+    require_callable(
+        eplb_state_cls,
+        "_should_record_current_step",
+        f"{TARGET_MODULE}.EplbState._should_record_current_step",
+    )
+    require_callable(
+        eplb_state_cls,
+        "_update_layer_should_record",
+        f"{TARGET_MODULE}.EplbState._update_layer_should_record",
+    )
+    original_rearrange = require_callable(
+        eplb_state_cls,
+        "rearrange",
+        TARGETS[2],
+    )
+    original_rearrange_weights = require_callable(
         eplb_module,
         "rearrange_expert_weights_inplace",
-        f"{TARGET_MODULE}.rearrange_expert_weights_inplace",
+        TARGETS[3],
     )
+    original_commit = require_callable(eplb_module, "_commit_eplb_maps", TARGETS[4])
+    original_commit_layer = require_callable(
+        eplb_module,
+        "_commit_eplb_maps_for_layer",
+        TARGETS[5],
+    )
+    original_move = require_callable(eplb_module, "_move_to_workspace", TARGETS[6])
 
     @functools.wraps(original_add_model)
     def hcu_add_model(self, model, model_config) -> None:
+        record_path, load_path = _parallel_offline_paths(self.parallel_config)
+        model_key = (
+            resolve_offline_eplb_model_key(model, self.parallel_config)
+            if record_path or load_path
+            else model.__class__.__name__
+        )
+        direct_plan = _find_static_eplb_plan(model) if load_path else None
+        if load_path and direct_plan is None:
+            raise PatchCompatibilityError(
+                f"Static EPLB path {load_path!r} for model key {model_key!r} "
+                "requires a direct-load plan for expert counts "
+                f"logical={model.num_logical_experts}, "
+                f"physical={model.num_physical_experts}, "
+                f"redundant={model.num_redundant_experts}; "
+                "model._vllm_hcu_static_eplb_plan must be bound before "
+                "checkpoint loading."
+            )
+
+        if record_path or load_path:
+            local_num_moe_layers = len(tuple(model.moe_layers))
+            if local_num_moe_layers <= 0:
+                raise PatchCompatibilityError(
+                    f"Offline EPLB found no PP-local MoE layers for {model_key!r}."
+                )
+            # Upstream sizes every EPLB state tensor from this public count.
+            # DeepSeek V2 and GLM expose a global count while ``moe_layers`` is
+            # PP-local, so offline modes must align it before upstream allocates.
+            model.num_moe_layers = local_num_moe_layers
+
         original_add_model(self, model, model_config)
         model_hash = model_config.compute_hash()
         model_state = self.model_states.get(model_hash)
@@ -280,41 +470,77 @@ def apply_to_module(module: ModuleType) -> bool:
             raise PatchCompatibilityError(
                 "vLLM EPLB add_model did not publish the expected model state"
             )
-        record_path, load_path = _parallel_offline_paths(self.parallel_config)
-        model_key = model.__class__.__name__
         setattr(model_state, _MODEL_RECORD_PATH_ATTR, record_path)
         setattr(model_state, _MODEL_KEY_ATTR, model_key)
+        setattr(
+            model_state,
+            _MODEL_STATIC_DISPATCH_POLICY_ATTR,
+            getattr(
+                self.parallel_config,
+                _STATIC_DISPATCH_POLICY_ATTR,
+                "nearest",
+            ),
+        )
 
-        if load_path:
-            target_map = load_offline_expert_map(
-                load_path,
-                model_key=model_key,
-                expected_shape=tuple(model_state.physical_to_logical_map.shape),
-                num_logical_experts=model.num_logical_experts,
-                dtype=model_state.physical_to_logical_map.dtype,
-                device=torch.device("cpu"),
-            )
+        if record_path:
+            # Recording is an offline planning operation. Running the async
+            # worker would transfer expert weights and block later layer
+            # commits even though the candidate map must not become live.
+            self.is_async = False
             eplb_module.logger.info(
-                "Loading offline EPLB expert map from %s for model %s "
-                "with key %s.",
-                load_path,
-                model_config.model,
+                "EPLB expert-map recording for model %s uses plan-only mode; "
+                "online expert rearrangement is disabled.",
                 model_key,
             )
-            rearrange(
-                model_state.physical_to_logical_map,
-                target_map,
-                model_state.model.expert_weights,
-                model_state.expert_buffer,
-                eplb_module.get_ep_group().device_group,
-                model_state.communicator,
-                False,
-                None,
+
+        if getattr(self.parallel_config, _DISABLE_REARRANGE_ATTR, False):
+            # No rearrangement will publish work to the async worker. Avoid
+            # starting an idle background loop while retaining load recording.
+            self.is_async = False
+            eplb_module.logger.info(
+                "EPLB load logging remains enabled for model %s; dynamic "
+                "expert rearrangement is disabled.",
+                model_key,
+            )
+
+        if load_path:
+            assert direct_plan is not None
+            _validate_direct_load_plan(
+                direct_plan,
+                load_path=load_path,
+                model_key=model_key,
+                model=model,
+                expected_shape=tuple(model_state.physical_to_logical_map.shape),
+            )
+            _verify_static_plan_across_ep_ranks(eplb_module, direct_plan)
+            target_map = direct_plan.physical_to_logical_map.to(
+                dtype=model_state.physical_to_logical_map.dtype,
+                device="cpu",
             )
             original_commit(
                 model_state,
                 new_physical_to_logical_map=target_map,
             )
+            _apply_locality_fair_replica_order(eplb_module, model_state)
+            eplb_module.get_ep_group().barrier()
+            eplb_module.logger.info(
+                "Static EPLB direct-loaded model %s with map SHA-256 %s; "
+                "committed routing metadata with zero expert rearrangement.",
+                model_key,
+                direct_plan.source_sha256,
+            )
+            should_record = getattr(self, "should_record_tensor", None)
+            if should_record is not None:
+                should_record.fill_(
+                    bool(self.parallel_config.eplb_config.log_balancedness)
+                )
+            # A loaded map is static: do not start the asynchronous EPLB
+            # worker. Load collection may remain active for balancedness
+            # logging, but the map must never be rearranged dynamically.
+            self.is_async = False
+
+        if not load_path:
+            _apply_locality_fair_replica_order(eplb_module, model_state)
 
         _record_model_state(eplb_module, model_state)
 
@@ -328,26 +554,152 @@ def apply_to_module(module: ModuleType) -> bool:
         log_stats: bool = False,
     ) -> Any:
         _, load_path = _parallel_offline_paths(self.parallel_config)
-        if is_profile and load_path:
+        if load_path and is_profile:
+            for model_state in self.model_states.values():
+                model_state.expert_load_pass.zero_()
             return None
-        return original_step(
+        if load_path and not log_stats:
+            return None
+
+        should_log = False
+        if log_stats and not is_profile:
+            log_interval = (
+                self.parallel_config.eplb_config.log_balancedness_interval
+            )
+            should_log = self.expert_rearrangement_step % log_interval == 0
+        if not should_log:
+            return original_step(
+                self,
+                is_dummy=is_dummy,
+                is_profile=is_profile,
+                log_stats=log_stats,
+            )
+
+        # vLLM before #51813 reduces the layer/rank axes in the wrong order,
+        # which reports 1.0 when every layer has the same hot EP rank. Log the
+        # corrected values here, then let upstream perform every state change.
+        if is_dummy:
+            for model_state in self.model_states.values():
+                model_state.expert_load_pass.zero_()
+        _log_corrected_eplb_balancedness(eplb_module, self)
+
+        # Calling upstream with log_stats=False suppresses only its incorrect
+        # log block. Preserve the load-window update that log_stats=True would
+        # have requested when rearrangement proximity would not request it.
+        if not is_dummy and not self._should_record_current_step(log_stats=False):
+            for model_state in self.model_states.values():
+                model_state.expert_load_window[self.expert_load_window_step].copy_(
+                    model_state.expert_load_pass
+                )
+                model_state.expert_load_pass.zero_()
+            self.expert_load_window_step += 1
+            if self.expert_load_window_step >= self.expert_load_window_size:
+                self.expert_load_window_step = 0
+
+        result = original_step(
             self,
             is_dummy=is_dummy,
             is_profile=is_profile,
-            log_stats=log_stats,
+            log_stats=False,
         )
+        self._update_layer_should_record(log_stats=True)
+        return result
 
     setattr(hcu_step, _WRAPPER_MARKER, True)
 
+    @functools.wraps(original_rearrange)
+    def hcu_rearrange(
+        self,
+        is_profile: bool = False,
+        rank_mapping: dict[int, int] | None = None,
+    ) -> Any:
+        _, load_path = _parallel_offline_paths(self.parallel_config)
+        if (
+            not is_profile
+            and (
+                load_path
+                or getattr(self.parallel_config, _DISABLE_REARRANGE_ATTR, False)
+            )
+        ):
+            eplb_module.logger.info(
+                "Skipping dynamic EPLB expert rearrangement because %s.",
+                "a static expert map is loaded"
+                if load_path
+                else "disable_rearrange=true",
+            )
+            return None
+
+        record_path, _ = _parallel_offline_paths(self.parallel_config)
+        if not record_path or is_profile:
+            return original_rearrange(
+                self,
+                is_profile=is_profile,
+                rank_mapping=rank_mapping,
+            )
+
+        token = _RECORD_ONLY_REARRANGE.set(True)
+        try:
+            result = original_rearrange(
+                self,
+                is_profile=False,
+                rank_mapping=rank_mapping,
+            )
+        finally:
+            _RECORD_ONLY_REARRANGE.reset(token)
+        eplb_module.logger.info(
+            "Recorded candidate EPLB expert maps without transferring weights "
+            "or changing live routing metadata."
+        )
+        return result
+
+    setattr(hcu_rearrange, _WRAPPER_MARKER, True)
+
+    @functools.wraps(original_rearrange_weights)
+    def hcu_rearrange_weights(*args, **kwargs) -> None:
+        if _RECORD_ONLY_REARRANGE.get():
+            return None
+        return original_rearrange_weights(*args, **kwargs)
+
+    setattr(hcu_rearrange_weights, _WRAPPER_MARKER, True)
+
     @functools.wraps(original_commit)
     def hcu_commit(model_state, new_physical_to_logical_map) -> None:
+        if _RECORD_ONLY_REARRANGE.get():
+            _record_model_state(
+                eplb_module,
+                model_state,
+                physical_to_logical_map=new_physical_to_logical_map,
+            )
+            return
         original_commit(
             model_state,
             new_physical_to_logical_map=new_physical_to_logical_map,
         )
+        _apply_locality_fair_replica_order(eplb_module, model_state)
         _record_model_state(eplb_module, model_state)
 
     setattr(hcu_commit, _WRAPPER_MARKER, True)
+
+    @functools.wraps(original_commit_layer)
+    def hcu_commit_layer(
+        model_state,
+        new_physical_to_logical_map,
+        layer,
+    ) -> None:
+        if _RECORD_ONLY_REARRANGE.get():
+            return
+        original_commit_layer(
+            model_state,
+            new_physical_to_logical_map=new_physical_to_logical_map,
+            layer=layer,
+        )
+        _apply_locality_fair_replica_order(
+            eplb_module,
+            model_state,
+            layer=layer,
+        )
+
+    setattr(hcu_commit_layer, _WRAPPER_MARKER, True)
 
     @functools.wraps(original_move)
     def hcu_move_to_workspace(model_state, ep_rank) -> None:
@@ -364,11 +716,29 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(eplb_state_cls, "_vllm_hcu_original_offline_add_model", original_add_model)
     setattr(eplb_state_cls, "_vllm_hcu_original_offline_step", original_step)
+    setattr(
+        eplb_state_cls,
+        "_vllm_hcu_original_offline_rearrange",
+        original_rearrange,
+    )
     setattr(eplb_state_cls, "add_model", hcu_add_model)
     setattr(eplb_state_cls, "step", hcu_step)
+    setattr(eplb_state_cls, "rearrange", hcu_rearrange)
+    setattr(
+        eplb_module,
+        "_vllm_hcu_original_offline_rearrange_weights",
+        original_rearrange_weights,
+    )
     setattr(eplb_module, "_vllm_hcu_original_offline_commit", original_commit)
+    setattr(
+        eplb_module,
+        "_vllm_hcu_original_offline_commit_layer",
+        original_commit_layer,
+    )
     setattr(eplb_module, "_vllm_hcu_original_offline_move", original_move)
+    setattr(eplb_module, "rearrange_expert_weights_inplace", hcu_rearrange_weights)
     setattr(eplb_module, "_commit_eplb_maps", hcu_commit)
+    setattr(eplb_module, "_commit_eplb_maps_for_layer", hcu_commit_layer)
     setattr(eplb_module, "_move_to_workspace", hcu_move_to_workspace)
     setattr(eplb_module, _MARKER, True)
     return True

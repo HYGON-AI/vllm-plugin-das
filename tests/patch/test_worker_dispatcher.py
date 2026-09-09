@@ -17,6 +17,7 @@ import pytest
 import vllm_hcu.patch.worker as worker_dispatcher
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import LatchedPatchError, PatchRegistry, PatchStatus
+from vllm_hcu.patch.worker.framework_opt import patch_model_loader_static_eplb_gate
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -97,6 +98,7 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.op_opt.attention.fused_qkv_public_export"
     ]
     framework_order = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
@@ -144,6 +146,49 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert "os.walk(" not in source
 
 
+def test_static_eplb_callbacks_apply_during_cold_model_loader_import():
+    result = _run_fresh(
+        """
+import json
+
+from vllm_hcu.patch.worker import prepare_worker_patches
+
+prepare_worker_patches()
+import vllm.model_executor.model_loader as model_loader
+from vllm.model_executor.model_loader import base_loader, utils
+from vllm.model_executor.models import llama4
+
+print(json.dumps({
+    "initializer_wrapped": bool(getattr(
+        utils.initialize_model,
+        "_vllm_hcu_static_eplb_model_loader_wrapper",
+        False,
+    )),
+    "base_alias_current": base_loader.initialize_model is utils.initialize_model,
+    "entrypoint_wrapped": bool(getattr(
+        model_loader.get_model_loader,
+        "_vllm_hcu_static_eplb_loader_gate_wrapper",
+        False,
+    )),
+    "llama4_fused_wrapped": bool(getattr(
+        llama4.Llama4Model.load_moe_expert_weights,
+        "_vllm_hcu_llama4_static_eplb_fused_wrapper",
+        False,
+    )),
+}))
+""",
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "initializer_wrapped": True,
+        "base_alias_current": True,
+        "entrypoint_wrapped": True,
+        "llama4_fused_wrapped": True,
+    }
+
+
 def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
     patch_id = "worker.framework_opt.pcp.default_model_state_metadata"
     assert (
@@ -151,6 +196,13 @@ def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
         "vllm.v1.worker.gpu.model_states.default",
     ) in worker_dispatcher.worker_callback_names()
     assert worker_dispatcher._patch_features()[patch_id] == "always"
+
+
+def test_static_eplb_loader_gate_has_auditable_dispatch_metadata():
+    assert (
+        patch_model_loader_static_eplb_gate.PATCH_ID,
+        patch_model_loader_static_eplb_gate.TARGET_MODULE,
+    ) in worker_dispatcher.worker_callback_names()
 
 
 def test_cold_replacement_metadata_matches_lazy_adapter_contracts():
@@ -707,6 +759,42 @@ def test_worker_binds_offline_eplb_paths_to_parallel_config():
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {"record": "/models/maps/hy4.json", "load": None}
+
+
+def test_worker_binds_disable_eplb_rearrange_to_parallel_config():
+    result = _run_fresh(
+        "import json; from types import SimpleNamespace; "
+        "CompilationConfig=type('CompilationConfig',(),{}); "
+        "from vllm_hcu.patch.worker import apply_worker_patches; "
+        "parallel=SimpleNamespace(all2all_backend='allgather_reducescatter'); "
+        "config=SimpleNamespace(additional_config={'hcu':{"
+        "'eplb_disable_rearrange':True}},"
+        "compilation_config=CompilationConfig(),parallel_config=parallel); "
+        "apply_worker_patches(config); "
+        "print(json.dumps({'disable':getattr(parallel,"
+        "'_vllm_hcu_eplb_disable_rearrange',None)}))"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {"disable": True}
+
+
+def test_worker_binds_eplb_static_dispatch_policy_to_parallel_config():
+    result = _run_fresh(
+        "import json; from types import SimpleNamespace; "
+        "CompilationConfig=type('CompilationConfig',(),{}); "
+        "from vllm_hcu.patch.worker import apply_worker_patches; "
+        "parallel=SimpleNamespace(all2all_backend='allgather_reducescatter'); "
+        "config=SimpleNamespace(additional_config={'hcu':{"
+        "'eplb_static_dispatch_policy':'locality_fair'}},"
+        "compilation_config=CompilationConfig(),parallel_config=parallel); "
+        "apply_worker_patches(config); "
+        "print(json.dumps({'policy':getattr(parallel,"
+        "'_vllm_hcu_eplb_static_dispatch_policy',None)}))"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {"policy": "locality_fair"}
 
 
 def test_pcp_model_state_adapter_matches_exact_v0251_target():
