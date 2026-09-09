@@ -45,6 +45,13 @@ from hcu_ci_register import (  # noqa: E402
     partition_registrations,
     validate_registrations,
 )
+from tests.integration.server import evalscope_server as evalscope_server_module  # noqa: E402
+from tests.integration.server.evalscope_server import (  # noqa: E402
+    EVALSCOPE_OWNER_MARKER,
+    EVALSCOPE_OWNER_SIGNATURE,
+    _reset_evalscope_artifacts,
+    evalscope_command,
+)
 
 
 def _config() -> dict:
@@ -571,6 +578,159 @@ def test_hcu_container_uses_checked_out_environment_lock() -> None:
     assert "/models/public" in source
     assert "/models/parastor" in source
     assert ":/models/llm-models:ro" not in source
+    assert "/public/opendas/DL_DATA/ci_datasets" in source
+    assert '"$dataset_root:/datasets:ro"' in source
+
+
+def test_evalscope_resolves_named_datasets_from_shared_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("gsm8k", "humaneval", "MMMU"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    config = {
+        "model": "/models/test",
+        "evalscope": {
+            "generation_config": {"temperature": 0},
+            "eval_batch_size": 1,
+            "timeout": 60,
+            "limit": 1,
+            "datasets": ["gsm8k", "humaneval", "mmmu"],
+            "dataset_args": {"mmmu": {"subset_list": ["Art"]}},
+        },
+    }
+
+    command = evalscope_command(
+        config,
+        model_env="VLLM_HCU_TEST_MODEL",
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path / "output",
+    )
+    option_index = command.index("--dataset-args")
+    dataset_args = json.loads(command[option_index + 1])
+
+    assert dataset_args["gsm8k"]["local_path"] == str(
+        (tmp_path / "gsm8k").resolve()
+    )
+    assert dataset_args["humaneval"]["local_path"] == str(
+        (tmp_path / "humaneval").resolve()
+    )
+    assert dataset_args["mmmu"] == {
+        "subset_list": ["Art"],
+        "local_path": str((tmp_path / "MMMU").resolve()),
+    }
+
+
+def test_evalscope_uses_writable_view_for_read_only_dataset_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_root = tmp_path / "datasets"
+    dataset = dataset_root / "MMMU"
+    dataset.mkdir(parents=True)
+    metadata = dataset / "dataset_infos.json"
+    metadata.write_text("{}", encoding="utf-8")
+    data_file = dataset / "validation.jsonl"
+    data_file.write_text('{"id": 1}\n', encoding="utf-8")
+    view_root = tmp_path / "views"
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(dataset_root))
+    monkeypatch.setenv("VLLM_HCU_EVAL_DATASET_VIEW_ROOT", str(view_root))
+    config = {
+        "model": "/models/test",
+        "evalscope": {
+            "generation_config": {},
+            "eval_batch_size": 1,
+            "timeout": 60,
+            "limit": 1,
+            "datasets": ["mmmu"],
+            "dataset_args": {},
+        },
+    }
+
+    command = evalscope_command(
+        config,
+        model_env="VLLM_HCU_TEST_MODEL",
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path / "output",
+    )
+    dataset_args = json.loads(command[command.index("--dataset-args") + 1])
+    local_path = Path(dataset_args["mmmu"]["local_path"])
+
+    assert local_path == view_root / "MMMU"
+    assert not (local_path / "dataset_infos.json").exists()
+    assert (local_path / "validation.jsonl").read_text(encoding="utf-8") == (
+        '{"id": 1}\n'
+    )
+    assert (local_path / "validation.jsonl").is_symlink()
+    assert metadata.exists()
+
+
+def test_evalscope_fails_before_network_fallback_when_dataset_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_TEST_DATASET_ROOT", str(tmp_path))
+    config = {
+        "model": "/models/test",
+        "evalscope": {
+            "generation_config": {},
+            "eval_batch_size": 1,
+            "timeout": 60,
+            "limit": 1,
+            "datasets": ["gsm8k"],
+            "dataset_args": {},
+        },
+    }
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="local dataset 'gsm8k' is unavailable",
+    ):
+        evalscope_command(
+            config,
+            model_env="VLLM_HCU_TEST_MODEL",
+            host="127.0.0.1",
+            port=10128,
+            work_dir=tmp_path / "output",
+        )
+
+
+def test_evalscope_accepts_ci_owned_artifact_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_root = tmp_path / "hcu-ci-artifacts"
+    work_dir = job_root / "evalscope"
+    stale_report = work_dir / "reports" / "stale.json"
+    stale_report.parent.mkdir(parents=True)
+    stale_report.write_text("stale", encoding="utf-8")
+    monkeypatch.setenv("HCU_CI_JOB_ROOT", str(job_root))
+
+    _reset_evalscope_artifacts(work_dir)
+
+    assert not stale_report.exists()
+    assert (work_dir / EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == EVALSCOPE_OWNER_SIGNATURE
+
+
+def test_evalscope_accepts_standard_ci_artifact_directory_without_job_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_root = tmp_path / "hcu-ci-artifacts"
+    work_dir = job_root / "evalscope"
+    monkeypatch.delenv("HCU_CI_JOB_ROOT", raising=False)
+    monkeypatch.setattr(evalscope_server_module, "HCU_CI_ARTIFACT_ROOT", job_root)
+
+    _reset_evalscope_artifacts(work_dir)
+
+    assert (work_dir / EVALSCOPE_OWNER_MARKER).read_text(
+        encoding="utf-8"
+    ) == EVALSCOPE_OWNER_SIGNATURE
 
 
 def test_hcu_control_container_uses_runner_identity() -> None:
@@ -666,6 +826,21 @@ def test_selected_hcu_workflow_pins_mutable_image_before_matrix() -> None:
     assert "Using immutable HCU CI image" in source
     assert "needs: resolve-image" in source
     assert "HCU_CI_IMAGE: ${{ needs.resolve-image.outputs.image }}" in source
+
+
+def test_pr_hardware_jobs_reuse_the_static_gate_revision() -> None:
+    pr_workflow = (
+        REPOSITORY / ".github/workflows/hcu-pr-ci.yml"
+    ).read_text(encoding="utf-8")
+    selected_workflow = (
+        REPOSITORY / ".github/workflows/_selected-hcu-tests.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "tested_ref: ${{ steps.tested-ref.outputs.sha }}" in pr_workflow
+    assert "tested_ref: ${{ needs.static-and-select.outputs.tested_ref }}" in pr_workflow
+    assert "github.event.pull_request.merge_commit_sha" not in pr_workflow
+    assert "actual_ref=\"$(git rev-parse HEAD)\"" in selected_workflow
+    assert '"$actual_ref" != "$EXPECTED_TESTED_REF"' in selected_workflow
 
 
 def test_fork_pr_uses_non_secret_hcu_image_fallback() -> None:

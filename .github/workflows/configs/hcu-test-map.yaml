@@ -392,7 +392,7 @@
       ]
     },
     "deepseek-gsm8k": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "nmz36",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",

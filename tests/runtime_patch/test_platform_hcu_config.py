@@ -78,6 +78,9 @@ def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["HF_HUB_OFFLINE"] = "1"
+    env["HF_DATASETS_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -425,21 +428,43 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
 def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
     result = _run_fresh_v0251(
         r'''
+import json
+import tempfile
+from pathlib import Path
+
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
 patch_engine_args.apply_to_module(arg_utils)
 arg_utils.current_platform.device_type = "cpu"
 
+model_dir = tempfile.TemporaryDirectory()
+Path(model_dir.name, "config.json").write_text(json.dumps({
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "max_position_embeddings": 128,
+    "model_type": "llama",
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 2,
+    "vocab_size": 32,
+}))
+model_kwargs = {
+    "model": model_dir.name,
+    "tokenizer": model_dir.name,
+    "skip_tokenizer_init": True,
+}
+
 for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
     {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
 ):
-    args = arg_utils.EngineArgs(**kwargs)
+    args = arg_utils.EngineArgs(**model_kwargs, **kwargs)
     assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
     assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
-args = arg_utils.EngineArgs()
+args = arg_utils.EngineArgs(**model_kwargs)
 args.moe_backend = "dpsk_deep_gemm"
 assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 

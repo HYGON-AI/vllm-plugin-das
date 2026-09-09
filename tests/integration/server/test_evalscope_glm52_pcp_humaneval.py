@@ -88,6 +88,7 @@ def test_glm52_humaneval_config_contract(
     assert evalscope["generation_config"] == {
         "temperature": 0,
         "do_sample": False,
+        "seed": 0,
         "max_tokens": 2048,
         "extra_body": {
             "chat_template_kwargs": {"enable_thinking": False},
