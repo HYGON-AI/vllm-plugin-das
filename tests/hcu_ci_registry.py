@@ -30,6 +30,36 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/accuracy/test_aiter_batched_gemm_bf16.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_mla_concat_accuracy.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_sqrtsoftplus_gate.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_qwen_rmsnorm_gated_accuracy.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_moe_align_fallback_graph.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_w16a16_moe_accuracy.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
     est_time=330,
 )
