@@ -81,6 +81,85 @@ def _hcu_device() -> torch.device:
     return torch.device("cuda", 0)
 
 
+@pytest.mark.parametrize(
+    ("query_len", "causal"),
+    [(8, True), (7, False)],
+    ids=["target-verification", "dspark-drafter"],
+)
+def test_hcu_dspark_attention_matches_vendor_and_replays_in_cuda_graph(
+    query_len: int,
+    causal: bool,
+) -> None:
+    from flash_attn import flash_attn_varlen_func as vendor_varlen
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        _flash_attn_varlen_func_with_dspark_capture as hcu_varlen,
+    )
+
+    device = _hcu_device()
+    torch.manual_seed(42)
+    batch_size, q_heads, kv_heads, head_dim = 2, 16, 4, 128
+    q = torch.randn(
+        (batch_size * query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = torch.randn(
+        (4, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv.unbind(1)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_len,
+        query_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    seqused_k = torch.tensor(
+        [query_len, 128],
+        device=device,
+        dtype=torch.int32,
+    )
+    block_table = torch.tensor(
+        [[0, 1], [2, 3]],
+        device=device,
+        dtype=torch.int32,
+    )
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen_q": query_len,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": 128,
+        "softmax_scale": head_dim**-0.5,
+        "causal": causal,
+        "window_size": (-1, -1),
+        "block_table": block_table,
+        "layout": "bshd",
+    }
+    reference_out = torch.empty_like(q)
+    actual_out = torch.empty_like(q)
+
+    reference = vendor_varlen(out=reference_out, **common).clone()
+    actual = hcu_varlen(out=actual_out, **common).clone()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+
+    hcu_varlen(out=actual_out, **common)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        hcu_varlen(out=actual_out, **common)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    replay = actual_out.clone()
+    eager = hcu_varlen(out=actual_out, **common).clone()
+    torch.cuda.synchronize(device)
+    assert torch.equal(replay, eager)
+
+
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize(
     "cache_storage_dtype",
