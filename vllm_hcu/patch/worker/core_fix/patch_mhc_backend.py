@@ -40,7 +40,11 @@ def apply_to_module(module: ModuleType) -> bool:
     # importable TileLang package need not contain the HIP code generator.
     tilelang_usable = has_tilelang_mhc
     if has_tilelang_mhc and mhc.current_platform.is_rocm():
-        import tvm
+        # TileLang initializes its bundled TVM search path and registers
+        # code generators when loading its shared library. Probe afterwards.
+        import tilelang
+
+        tvm = tilelang.tvm
 
         tilelang_usable = tvm.ffi.get_global_func(
             "target.build.tilelang_hip", allow_missing=True

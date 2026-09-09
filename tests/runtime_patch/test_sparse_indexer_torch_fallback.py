@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-"""gfx936 indexer numerical, multi-token and CUDA Graph regression tests."""
+"""Sparse indexer PyTorch fallback numerical and GPU Graph regression tests."""
 
 import ast
 from pathlib import Path
@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-def test_gfx936_indexer_reference(monkeypatch):
+def test_sparse_indexer_torch_reference(monkeypatch):
     import ast
     import sys
     from types import SimpleNamespace, ModuleType
@@ -194,3 +194,161 @@ def test_multitoken(next_n, per_query, device):
                 end = data[b][j] if per_query else max(0, data[b] - next_n + j + 1)
                 expected[b, j, :end] = ((q[b, j].float() @ keys[:end].T).relu() * weights[b * next_n + j, :, None]).sum(0) * scale[:end]
         torch.testing.assert_close(out, expected.reshape(batch * next_n, limit), atol=0.0002, rtol=0.0002)
+
+
+def test_long_context_bounds_decode_workspace(monkeypatch):
+    """A large configured limit must not expand all requests' KV at once."""
+    fn = _load_decode_fn()
+    batch, block, dim, heads, limit = 9, 256, 128, 8, 32769
+    values = torch.ones(1, block, dim).to(torch.float8_e4m3fn)
+    scales = torch.ones(1, block)
+    cache = torch.cat((values.view(torch.uint8).reshape(1, -1),
+                       scales.view(torch.uint8).reshape(1, -1)), 1)
+    cache = cache.view(1, block, 1, dim + 4)
+    table = torch.full((batch, (limit + block - 1) // block), -999, dtype=torch.int32)
+    table[:, 0] = 0
+    q = torch.ones(batch, 1, heads, dim)
+    weights = torch.ones(batch, heads)
+    lengths = torch.arange(batch, dtype=torch.int32)
+    original_bmm = torch.bmm
+    workspaces = []
+
+    def bounded_bmm(a, b):
+        workspaces.append((b.numel() + a.shape[0] * a.shape[1] * b.shape[2]) * 4)
+        return original_bmm(a, b)
+
+    monkeypatch.setattr(torch, 'bmm', bounded_bmm)
+    out = fn(q, cache, weights, lengths, table, limit)
+    assert len(workspaces) > 2
+    assert max(workspaces) <= 8 * 1024 * 1024
+    for row in range(batch):
+        torch.testing.assert_close(out[row, :row], torch.full((row,), float(heads * dim)))
+        assert torch.isneginf(out[row, row:]).all()
+
+
+def test_fallback_packs_weights_with_variable_decode_lengths():
+    """Exercise the dispatch branch with a short decode beside a full decode."""
+    path = Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py'
+    branch = next(
+        n for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+        and n.test.id == 'v4_fp8_fallback'
+        and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                and c.func.id == 'fp8_paged_mqa_logits_torch' for c in ast.walk(n))
+    )
+    block, dim, heads = 4, 8, 3
+    values = torch.ones(1, block, dim).to(torch.float8_e4m3fn)
+    scales = torch.ones(1, block)
+    cache = torch.cat((values.view(torch.uint8).reshape(1, -1),
+                       scales.view(torch.uint8).reshape(1, -1)), 1).view(1, block, 1, dim + 4)
+    weights = torch.arange(1, 5).float()[:, None].expand(-1, heads)
+    calls = []
+
+    def pack(tensor, lengths):
+        calls.append(tensor.clone())
+        out = torch.zeros(2, 3, heads)
+        out[0, 0] = tensor[0]
+        out[1] = tensor[1:4]
+        return out
+
+    namespace = dict(
+        fp8_paged_mqa_logits_torch=_load_decode_fn(), pack_seq_triton=pack,
+        padded_q_fp8_decode_tokens=torch.ones(2, 3, heads, dim),
+        kv_cache=cache, weights=weights, num_decode_tokens=4, num_padded_tokens=6,
+        seq_lens=torch.tensor([[1, 0, 0], [1, 2, 3]]),
+        decode_lens=torch.tensor([1, 3]), max_model_len=4,
+        decode_metadata=SimpleNamespace(requires_padding=True,
+                                        block_table=torch.zeros(2, 1, dtype=torch.int32)),
+    )
+    exec(compile(ast.Module(body=branch.body, type_ignores=[]), str(path), 'exec'), namespace)
+    assert len(calls) == 1
+    out = namespace['logits']
+    for row, length, weight in [(0, 1, 1), (3, 1, 2), (4, 2, 3), (5, 3, 4)]:
+        torch.testing.assert_close(out[row, :length], torch.full((length,), float(heads * dim * weight)))
+        assert torch.isneginf(out[row, length:]).all()
+
+
+def _load_prefill_fn():
+    path = Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py'
+    node = next(n for n in ast.parse(path.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == 'fp8_mqa_logits_torch')
+    namespace = dict(torch=torch)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), namespace)
+    return namespace[node.name]
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_prefill_bounds_workspace_and_preserves_masks(monkeypatch, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('GPU required')
+    fn = _load_prefill_fn()
+    # Cross both query and key chunk boundaries with the V4 head count.
+    m, n, h, d = 65, 1025, 64, 8
+    torch.manual_seed(81)
+    q = torch.randint(-3, 4, (m, h, d), device=device).to(torch.float8_e4m3fn)
+    k = torch.randint(-3, 4, (n, d), device=device).to(torch.float8_e4m3fn)
+    scales = torch.rand(n, 1, device=device) + 0.25
+    weights = torch.randn(m, h, device=device)
+    lo = torch.arange(m, device=device, dtype=torch.int32) * 7
+    hi = torch.clamp(lo + 300, max=n)
+    lo[0], hi[0] = 0, n
+    hi[1] = lo[1]  # Empty interval must stay entirely masked.
+    calls = []
+    original_einsum = torch.einsum
+
+    def measured_einsum(equation, a, b):
+        result = original_einsum(equation, a, b)
+        calls.append((a.shape[0], b.shape[0], result.numel() * 6))
+        return result
+
+    monkeypatch.setattr(torch, 'einsum', measured_einsum)
+    actual = fn(q, (k, scales), weights, lo, hi)
+    assert len(calls) > 1
+    assert max(size for _, _, size in calls) <= 8 * 1024 * 1024
+    # Independent head-by-head reference keeps test memory small.
+    expected = torch.zeros(m, n, device=device)
+    for head in range(h):
+        score = (q[:, head].float() @ k.float().T) * scales.flatten()[None, :]
+        expected += score.relu() * weights[:, head, None]
+    offsets = torch.arange(n, device=device)
+    expected.masked_fill_((offsets[None, :] < lo[:, None]) |
+                          (offsets[None, :] >= hi[:, None]), -torch.inf)
+    torch.testing.assert_close(actual, expected, atol=0.001, rtol=0.0002)
+    torch.testing.assert_close(fn(q, (k, scales.flatten()), weights, lo, hi), actual)
+
+
+def test_prefill_logits_graph_replay():
+    if not torch.cuda.is_available():
+        pytest.skip('GPU graph test requires a visible GPU')
+    fn = _load_prefill_fn()
+    m, n, h, d = 65, 1025, 64, 8
+    q = torch.ones(m, h, d, device='cuda').to(torch.float8_e4m3fn)
+    k = torch.ones(n, d, device='cuda').to(torch.float8_e4m3fn)
+    scales = torch.ones(n, 1, device='cuda')
+    weights = torch.ones(m, h, device='cuda')
+    lo = torch.zeros(m, dtype=torch.int32, device='cuda')
+    hi = torch.full_like(lo, n)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fn(q, (k, scales), weights, lo, hi)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fn(q, (k, scales), weights, lo, hi)
+    for step in range(3):
+        q.copy_(torch.full_like(q.float(), step + 1).to(q.dtype))
+        k.copy_(torch.full_like(k.float(), 3 - step).to(k.dtype))
+        scales.fill_(0.5 * (step + 1))
+        weights.fill_(0.25 * (step + 1))
+        lo.fill_(step * 300)
+        hi.fill_(n - step * 100)
+        hi[1] = lo[1]
+        graph.replay()
+        value = h * d * (step + 1) * (3 - step) * 0.5 * (step + 1) * 0.25 * (step + 1)
+        expected = torch.full((m, n), value, device='cuda')
+        offsets = torch.arange(n, device='cuda')
+        expected.masked_fill_((offsets[None, :] < lo[:, None]) |
+                              (offsets[None, :] >= hi[:, None]), -torch.inf)
+        torch.testing.assert_close(out, expected)

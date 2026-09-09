@@ -537,7 +537,7 @@ def test_mhc_tilelang_requires_hip_codegen(monkeypatch, rocm, available, expecte
     module.current_platform = SimpleNamespace(is_rocm=lambda: rocm)
     tvm = _module("tvm", ffi=SimpleNamespace(
         get_global_func=lambda name, allow_missing: object() if available else None))
-    monkeypatch.setitem(sys.modules, "tvm", tvm)
+    monkeypatch.setitem(sys.modules, "tilelang", _module("tilelang", tvm=tvm))
     assert patch_mhc_backend.apply_to_module(module) is True
     assert module.HAS_TILELANG_MHC is expected
     assert module._vllm_hcu_original_has_tilelang_mhc is True
