@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Normalize `tie_word_embeddings` for Qwen4-Exp constructors."""
+"""Normalize `tie_word_embeddings` for HCU Qwen4-Exp constructors."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from ._common import (
     require_class,
 )
 
-TARGET_MODULE = "vllm.models.qwen4_exp"
+TARGET_MODULE = "vllm.models.qwen4_exp.amd.model"
 TARGET_MODULES = (
     TARGET_MODULE,
     "vllm.model_executor.models.qwen4_exp",

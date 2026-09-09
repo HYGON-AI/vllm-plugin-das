@@ -61,7 +61,9 @@ def test_qsa_draft_metadata_refresh_reuses_official_builder_in_place():
     assert metadata.fast_build is True
 
 
-@pytest.mark.parametrize("model_type", ["qwen4_exp"])
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp"]
+)
 def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
     module = ModuleType(kv_groups_patch.TARGET_MODULE)
     original_calls = []
