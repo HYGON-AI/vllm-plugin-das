@@ -15,11 +15,13 @@ from . import (
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
     patch_gpt_oss_mlp_block,
+    patch_glm5next_channel_fp8,
     patch_mhc_backend,
     patch_qwen3_5_mamba_state_dtype,
     patch_qwen3_vl,
     patch_qwen3_vl_moe,
     patch_qwen4_exp,
+    patch_rocm_mla_sparse_metadata,
 )
 
 __all__ = [
@@ -30,9 +32,11 @@ __all__ = [
     "patch_deepseek_v4_rocm_dspark_metadata",
     "patch_deepseek_v4_rocm_wo_a_layout",
     "patch_gpt_oss_mlp_block",
+    "patch_glm5next_channel_fp8",
     "patch_mhc_backend",
     "patch_qwen3_5_mamba_state_dtype",
     "patch_qwen3_vl",
     "patch_qwen3_vl_moe",
     "patch_qwen4_exp",
+    "patch_rocm_mla_sparse_metadata",
 ]

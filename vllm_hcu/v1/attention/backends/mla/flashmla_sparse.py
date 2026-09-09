@@ -24,6 +24,15 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         attn_metadata,
         layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Match the official ROCm sparse-MLA handling for native NoPE models.
+        # The stable concat_mla_q kernel only accepts a 64-wide RoPE component,
+        # so materialize the zero-RoPE query in the preallocated graph buffer.
+        if isinstance(q, tuple) and q[1].shape[-1] == 0:
+            ql_nope, _ = q
+            q_buffer = self.q_concat_buffer[: ql_nope.shape[0]]
+            q_buffer[:, : ql_nope.shape[1], :].copy_(ql_nope)
+            q = q_buffer[:, : ql_nope.shape[1], :]
+
         if self.dcp_world_size <= 1:
             return super().forward_mqa(
                 q,
@@ -88,6 +97,12 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
 
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        # vLLM selects an MLA backend with kv_lora_rank + qk_rope_head_dim.
+        # GLM5Next therefore selects D512, while DeepSeek uses D576.
+        return [512, 576]
+
     @staticmethod
     def get_name() -> str:
         return "FLASHMLA_SPARSE"

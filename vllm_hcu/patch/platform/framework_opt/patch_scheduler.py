@@ -38,6 +38,10 @@ def _mark_qwen_hybrid_mtp_groups(
 ) -> None:
     if not _is_qwen_hybrid_mtp(vllm_config):
         return
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "qwen4_exp":
+        return
 
     marked_group_ids = []
     for index, group in enumerate(
