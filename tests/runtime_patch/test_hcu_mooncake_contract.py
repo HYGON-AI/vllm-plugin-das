@@ -946,3 +946,28 @@ def test_hetero_pp_rejects_custom_layer_partition(mooncake, monkeypatch):
     monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "4,4")
     with pytest.raises(RuntimeError, match="VLLM_PP_LAYER_PARTITION"):
         worker._pp_overlap_layer_range(remote_pp_rank=0, remote_pp_size=2)
+
+
+def test_same_pp_rejects_custom_layer_partition(mooncake, monkeypatch):
+    """Same PP size still cannot guess the remote custom partition."""
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    with pytest.raises(RuntimeError, match="VLLM_PP_LAYER_PARTITION"):
+        worker._reject_custom_partition_for_hetero_pp(remote_pp_size=2)
+
+
+def test_receive_kv_same_pp_rejects_custom_partition(mooncake, monkeypatch):
+    """same_pp pairs by rank; reject custom partitions before the pull."""
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    worker._fail_pull_metas = lambda *args, **kwargs: None
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    pull_metas = {"request": SimpleNamespace(pull_tasks_count=0)}
+    with pytest.raises(RuntimeError, match="VLLM_PP_LAYER_PARTITION"):
+        worker.receive_kv("engine", pull_metas)

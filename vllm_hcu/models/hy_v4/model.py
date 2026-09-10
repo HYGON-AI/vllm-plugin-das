@@ -1244,9 +1244,4 @@ def _hcu_hyv4_model_init(self, *args, **kwargs):
 
 
 HYV4Model.__init__ = _hcu_hyv4_model_init
-
-# Wrap forward only; wrapping ForCausalLM.__init__ drops keyword-only args.
-if "HYV4ForCausalLM" in globals():
-    _hcu_hyv4_orig_causal_fwd = HYV4ForCausalLM.forward
-    if not getattr(_hcu_hyv4_orig_causal_fwd, "_hcu_hyv4_pp_topk_wrapped", False):
-        HYV4ForCausalLM.forward = _hcu_hyv4_wrap_forward(_hcu_hyv4_orig_causal_fwd)
+# Wrap HYV4Model.forward only; wrapping ForCausalLM again double-copies top-k.

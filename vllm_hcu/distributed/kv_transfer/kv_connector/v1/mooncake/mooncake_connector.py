@@ -1733,23 +1733,29 @@ class MooncakeConnectorWorker:
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
     def _reject_custom_partition_for_hetero_pp(self, remote_pp_size: int) -> None:
-        """Custom PP partitions are process-local and cannot map a remote PP size."""
-        if int(self.pp_size) == int(remote_pp_size):
-            return
+        """Reject process-local PP partitions; remote stage bounds are unknown.
+
+        Same PP size is not enough: P/D may still set different
+        ``VLLM_PP_LAYER_PARTITION`` values. The same-PP path pairs by rank
+        and skips overlap checks, so extra consumer layers silently miss KV.
+        Fail closed until stage ``(start, end)`` is exchanged.
+        ``remote_pp_size`` is unused and kept for the call sites.
+        """
+        del remote_pp_size
         partition = getattr(envs, "VLLM_PP_LAYER_PARTITION", None) or ""
         if not partition:
             return
         raise RuntimeError(
-            "Mooncake heterogeneous PP does not support VLLM_PP_LAYER_PARTITION; "
-            "unset it or use matching PP sizes."
+            "Mooncake P/D does not support VLLM_PP_LAYER_PARTITION; "
+            "unset it so both sides use the default even split."
         )
 
     def _count_overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
         """How many consumer PP stages overlap this producer's layer range."""
         remote_pp_size = max(int(remote_pp_size), 1)
+        self._reject_custom_partition_for_hetero_pp(remote_pp_size)
         if remote_pp_size == 1 or self.pp_size <= 0:
             return remote_pp_size
-        self._reject_custom_partition_for_hetero_pp(remote_pp_size)
         total_model_layers = self.model_config.get_total_num_hidden_layers()
         p_start, p_end = get_pp_indices(
             total_model_layers, self.pp_rank, self.pp_size
@@ -2506,6 +2512,8 @@ class MooncakeConnectorWorker:
         for i, remote_tp_rank in enumerate(remote_tp_ranks):
             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
             remote_pp_size = len(pp_to_addr)
+            # Same-PP still cannot infer the remote custom partition.
+            self._reject_custom_partition_for_hetero_pp(remote_pp_size)
             same_pp = self.pp_size == remote_pp_size and self.pp_rank in pp_to_addr
             if same_pp:
                 pp_ranks = [self.pp_rank]
