@@ -190,6 +190,11 @@ def test_hcu_dspark_flash_attention_forward_accepts_expanded_descales(
     from vllm_hcu.v1.attention.backends import flash_attn as hcu_flash_attn
     from vllm_hcu.v1.attention.backends import fa_utils
 
+    monkeypatch.setattr(
+        hcu_flash_attn,
+        "_get_flash_attn_mode",
+        lambda: "varlen",
+    )
     monkeypatch.setattr(fa_utils, "get_kv_cache_layout", lambda: "NHD")
 
     device = _hcu_device()
