@@ -149,6 +149,520 @@ def test_hcu_fa_entrypoints_map_kv_cache_layout_to_kernel_layout(
     assert calls[entrypoint_name] == [{"layout": expected_fa_layout}]
 
 
+def test_hcu_varlen_routes_dspark_q_len_8_to_paged_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    paged_attention_calls: list[tuple[object, ...]] = []
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        paged_attention=lambda *args: paged_attention_calls.append(args)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    q = torch.zeros((16, 4, 128), dtype=torch.bfloat16)
+    kv = torch.zeros((4, 2, 64, 2, 128), dtype=torch.bfloat16)
+    k, v = kv.unbind(1)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, 8, 16], dtype=torch.int32)
+    seqused_k = torch.tensor([96, 128], dtype=torch.int32)
+    block_table = torch.zeros((2, 2), dtype=torch.int32)
+    q_descale = torch.tensor(1.0).expand(2, 2)
+    k_descale = torch.tensor(1.0).expand(2, 2)
+    v_descale = torch.tensor(1.0).expand(2, 2)
+
+    result = fa_utils.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=8,
+        seqused_k=seqused_k,
+        max_seqlen_k=128,
+        softmax_scale=128**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert result is out
+    assert calls["flash_attn_varlen_func"] == []
+    assert len(paged_attention_calls) == 1
+    paged_args = paged_attention_calls[0]
+    assert len(paged_args) == 15
+    assert paged_args[0] is out
+    assert paged_args[1].shape == (2, 8, 4, 128)
+    assert paged_args[2] is k
+    assert paged_args[3] is v
+    assert paged_args[4] == 128**-0.5
+    assert paged_args[5] is block_table
+    assert paged_args[6] is seqused_k
+    assert paged_args[7:9] == (None, "")
+    assert paged_args[9] is q_descale
+    assert paged_args[10] is k_descale
+    assert paged_args[11] is v_descale
+    assert paged_args[12:] == (128, None, 2)
+
+
+def test_hcu_varlen_q_len_8_falls_back_above_paged_attention_head_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep high-GQA callers on the vendor path instead of crashing."""
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    paged_attention_calls: list[tuple[object, ...]] = []
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        paged_attention=lambda *args: paged_attention_calls.append(args)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    query_len = 8
+    q = torch.zeros((query_len, 16, 128), dtype=torch.bfloat16)
+    k = torch.zeros((1, 64, 1, 128), dtype=torch.bfloat16)
+    fa_utils.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=torch.zeros_like(k),
+        out=torch.empty_like(q),
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([64], dtype=torch.int32),
+        max_seqlen_k=64,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    assert len(calls["flash_attn_varlen_func"]) == 1
+    assert paged_attention_calls == []
+
+
+def test_hcu_varlen_drafter_route_respects_static_kv_scratch_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not admit other model shapes whose graph scratch can exceed TP2."""
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    query_len = 7
+    batch_size = 37
+    q = torch.zeros(
+        (batch_size * query_len, 32, 128),
+        dtype=torch.bfloat16,
+    )
+    k = torch.zeros((1, 64, 8, 128), dtype=torch.bfloat16)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": torch.zeros_like(k),
+        "out": torch.empty_like(q),
+        "cu_seqlens_q": torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+        ),
+        "max_seqlen_q": query_len,
+        "seqused_k": torch.full((batch_size,), 4096, dtype=torch.int32),
+        "max_seqlen_k": 4096,
+        "causal": False,
+        "window_size": (-1, -1),
+        "block_table": torch.zeros((batch_size, 64), dtype=torch.int32),
+        "layout": "bshd",
+    }
+
+    assert not fa_utils._matches_dspark_attention_shape(
+        kwargs,
+        query_len=query_len,
+        causal=False,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 64, 73])
+def test_hcu_varlen_drafter_uses_vendor_path_outside_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+) -> None:
+    """An eager qlen=7 call must not allocate worst-case static KV scratch."""
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    gather_calls: list[tuple[object, ...]] = []
+    varlen_calls: list[tuple[object, ...]] = []
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        pagedkv_to_contiguouskv=lambda *args: gather_calls.append(args),
+        varlen_fwd=lambda *args: varlen_calls.append(args),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    query_len = 7
+    q = torch.zeros(
+        (batch_size * query_len, 4, 128),
+        dtype=torch.bfloat16,
+    )
+    k = torch.zeros((1, 64, 2, 128), dtype=torch.bfloat16)
+    fa_utils.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=torch.zeros_like(k),
+        out=torch.empty_like(q),
+        cu_seqlens_q=torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+        ),
+        max_seqlen_q=query_len,
+        seqused_k=torch.full((batch_size,), 64, dtype=torch.int32),
+        max_seqlen_k=4096,
+        causal=False,
+        window_size=(-1, -1),
+        block_table=torch.zeros((batch_size, 64), dtype=torch.int32),
+    )
+
+    assert len(calls["flash_attn_varlen_func"]) == 1
+    assert gather_calls == []
+    assert varlen_calls == []
+
+
+def test_hcu_varlen_routes_dspark_drafter_q_len_7_to_static_varlen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+    gather_calls: list[tuple[object, ...]] = []
+    varlen_calls: list[tuple[object, ...]] = []
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        pagedkv_to_contiguouskv=lambda *args: gather_calls.append(args),
+        varlen_fwd=lambda *args: varlen_calls.append(args),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    q = torch.zeros((14, 4, 128), dtype=torch.bfloat16)
+    kv = torch.zeros((4, 2, 64, 2, 128), dtype=torch.bfloat16)
+    k, v = kv.unbind(1)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, 7, 14], dtype=torch.int32)
+    seqused_k = torch.tensor([96, 128], dtype=torch.int32)
+    block_table = torch.zeros((2, 2), dtype=torch.int32)
+    q_descale = torch.tensor(1.0).expand(2, 2)
+    k_descale = torch.tensor(1.0).expand(2, 2)
+    v_descale = torch.tensor(1.0).expand(2, 2)
+
+    result = fa_utils.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=7,
+        seqused_k=seqused_k,
+        max_seqlen_k=128,
+        softmax_scale=128**-0.5,
+        causal=False,
+        window_size=(-1, -1),
+        block_table=block_table,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert result is out
+    assert calls["flash_attn_varlen_func"] == []
+    assert len(gather_calls) == 1
+    gathered_k, gathered_v = gather_calls[0][:2]
+    assert gathered_k.shape == (256, 2, 128)
+    assert gathered_v.shape == gathered_k.shape
+    assert gather_calls[0][2] is k
+    assert gather_calls[0][3] is v
+    assert gather_calls[0][4] is block_table
+    assert gather_calls[0][5] is seqused_k
+    assert gather_calls[0][6].shape == (3,)
+    assert gather_calls[0][7:] == (128, 2)
+    assert len(varlen_calls) == 1
+    varlen_args = varlen_calls[0]
+    assert len(varlen_args) == 25
+    assert varlen_args[0] is q
+    assert varlen_args[1] is gathered_k
+    assert varlen_args[2] is gathered_v
+    assert varlen_args[3] is out
+    assert varlen_args[4] is cu_seqlens_q
+    assert varlen_args[5] is gather_calls[0][6]
+    assert varlen_args[6:10] == (None, None, None, None)
+    assert varlen_args[10:20] == (
+        7,
+        128,
+        0.0,
+        128**-0.5,
+        False,
+        False,
+        -1,
+        -1,
+        0.0,
+        False,
+    )
+    assert varlen_args[20] is q_descale
+    assert varlen_args[21] is k_descale
+    assert varlen_args[22] is v_descale
+    assert varlen_args[23:] == (None, None)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"max_seqlen_q": 9},
+        {"window_size": (128, 0)},
+        {"causal": False},
+        {"out": None},
+        {"return_softmax_lse": True},
+    ],
+)
+def test_hcu_varlen_keeps_existing_path_outside_dspark_q_len_8_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, object],
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    q = torch.zeros((16, 4, 128), dtype=torch.bfloat16)
+    k = torch.zeros((4, 64, 2, 128), dtype=torch.bfloat16)
+    kwargs: dict[str, object] = {
+        "q": q,
+        "k": k,
+        "v": torch.zeros_like(k),
+        "out": torch.empty_like(q),
+        "cu_seqlens_q": torch.tensor([0, 8, 16], dtype=torch.int32),
+        "max_seqlen_q": 8,
+        "seqused_k": torch.tensor([96, 128], dtype=torch.int32),
+        "max_seqlen_k": 128,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": torch.zeros((2, 2), dtype=torch.int32),
+    }
+    kwargs.update(override)
+
+    fa_utils.flash_attn_varlen_func(**kwargs)
+
+    assert len(calls["flash_attn_varlen_func"]) == 1
+    assert calls["flash_attn_varlen_func"][0]["layout"] == "bshd"
+
+
+@pytest.mark.parametrize(
+    ("query_len", "causal"),
+    [(8, True), (7, False)],
+)
+@pytest.mark.parametrize(
+    "unsupported_case",
+    [
+        "wrong_causal",
+        "layout",
+        "window",
+        "dtype",
+        "block_size",
+        "head_dim",
+        "gqa",
+        "cu_rank",
+        "metadata_dtype",
+        "noncontiguous_query",
+        "kv_inner_stride",
+        "dropout",
+        "softcap",
+        "alibi",
+        "sink",
+        "q_v",
+        "cu_seqlens_k",
+        "deterministic",
+        "scheduler_metadata",
+        "num_splits",
+        "cp_world_size",
+        "cp_rank",
+        "cp_sequence_lengths",
+        "descale_shape",
+        "descale_dtype",
+        "context_limit",
+        "capture_token_limit",
+        "block_table_capacity",
+    ],
+)
+def test_hcu_varlen_dspark_routes_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    query_len: int,
+    causal: bool,
+    unsupported_case: str,
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="HND" if unsupported_case == "layout" else "NHD",
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: query_len == 7,
+    )
+    batch_size = 2
+    q = torch.zeros((batch_size * query_len, 4, 128), dtype=torch.bfloat16)
+    k = torch.zeros((4, 64, 2, 128), dtype=torch.bfloat16)
+    kwargs: dict[str, object] = {
+        "q": q,
+        "k": k,
+        "v": torch.zeros_like(k),
+        "out": torch.empty_like(q),
+        "cu_seqlens_q": torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+        ),
+        "max_seqlen_q": query_len,
+        "seqused_k": torch.full((batch_size,), 128, dtype=torch.int32),
+        "max_seqlen_k": 128,
+        "causal": causal,
+        "window_size": (-1, -1),
+        "block_table": torch.zeros((batch_size, 2), dtype=torch.int32),
+    }
+
+    if unsupported_case == "wrong_causal":
+        kwargs["causal"] = not causal
+    elif unsupported_case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif unsupported_case == "dtype":
+        kwargs["q"] = q.float()
+        kwargs["out"] = torch.empty_like(q.float())
+    elif unsupported_case == "block_size":
+        kwargs["k"] = torch.zeros((4, 32, 2, 128), dtype=torch.bfloat16)
+        kwargs["v"] = torch.zeros_like(kwargs["k"])
+    elif unsupported_case == "head_dim":
+        smaller_q = torch.zeros(
+            (batch_size * query_len, 4, 64), dtype=torch.bfloat16
+        )
+        kwargs["q"] = smaller_q
+        kwargs["out"] = torch.empty_like(smaller_q)
+    elif unsupported_case == "gqa":
+        incompatible_q = torch.zeros(
+            (batch_size * query_len, 3, 128), dtype=torch.bfloat16
+        )
+        kwargs["q"] = incompatible_q
+        kwargs["out"] = torch.empty_like(incompatible_q)
+    elif unsupported_case == "cu_rank":
+        kwargs["cu_seqlens_q"] = torch.tensor(0, dtype=torch.int32)
+    elif unsupported_case == "metadata_dtype":
+        kwargs["seqused_k"] = kwargs["seqused_k"].long()
+    elif unsupported_case == "noncontiguous_query":
+        noncontiguous_q = torch.zeros(
+            (batch_size * query_len, 128, 4), dtype=torch.bfloat16
+        ).transpose(1, 2)
+        kwargs["q"] = noncontiguous_q
+        kwargs["out"] = torch.empty_like(noncontiguous_q)
+    elif unsupported_case == "kv_inner_stride":
+        invalid_k = torch.zeros(
+            (4, 64, 128, 2), dtype=torch.bfloat16
+        ).transpose(2, 3)
+        kwargs["k"] = invalid_k
+        kwargs["v"] = torch.empty_like(invalid_k)
+    elif unsupported_case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif unsupported_case == "softcap":
+        kwargs["softcap"] = 1.0
+    elif unsupported_case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(4)
+    elif unsupported_case == "sink":
+        kwargs["s_aux"] = torch.ones(1)
+    elif unsupported_case == "q_v":
+        kwargs["q_v"] = torch.ones(1)
+    elif unsupported_case == "cu_seqlens_k":
+        kwargs["cu_seqlens_k"] = torch.ones(3, dtype=torch.int32)
+    elif unsupported_case == "deterministic":
+        kwargs["deterministic"] = True
+    elif unsupported_case == "scheduler_metadata":
+        kwargs["scheduler_metadata"] = torch.ones(1)
+    elif unsupported_case == "num_splits":
+        kwargs["num_splits"] = 1
+    elif unsupported_case == "cp_world_size":
+        kwargs["cp_world_size"] = 2
+    elif unsupported_case == "cp_rank":
+        kwargs["cp_rank"] = 1
+    elif unsupported_case == "cp_sequence_lengths":
+        kwargs["cp_tot_seqused_k"] = torch.ones(2, dtype=torch.int32)
+    elif unsupported_case == "descale_shape":
+        kwargs["k_descale"] = torch.ones(batch_size, 1)
+    elif unsupported_case == "descale_dtype":
+        kwargs["k_descale"] = torch.ones(
+            batch_size,
+            k.shape[-2],
+            dtype=torch.bfloat16,
+        )
+    elif unsupported_case == "context_limit":
+        kwargs["max_seqlen_k"] = 4097
+        kwargs["block_table"] = torch.zeros((batch_size, 65), dtype=torch.int32)
+    elif unsupported_case == "capture_token_limit":
+        batch_size = 74
+        larger_q = torch.zeros(
+            (batch_size * query_len, 4, 128), dtype=torch.bfloat16
+        )
+        kwargs["q"] = larger_q
+        kwargs["out"] = torch.empty_like(larger_q)
+        kwargs["cu_seqlens_q"] = torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+        )
+        kwargs["seqused_k"] = torch.full(
+            (batch_size,), 4096, dtype=torch.int32
+        )
+        kwargs["max_seqlen_k"] = 4096
+        kwargs["block_table"] = torch.zeros((batch_size, 64), dtype=torch.int32)
+    elif unsupported_case == "block_table_capacity":
+        kwargs["max_seqlen_k"] = 129
+
+    fa_utils.flash_attn_varlen_func(**kwargs)
+
+    assert len(calls["flash_attn_varlen_func"]) == 1
+
+
 def test_hcu_fa_boundary_rejects_interface_without_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -749,6 +1263,92 @@ def test_hcu_flash_attention_varlen_mode_routes_layout_to_native_interface(
     assert calls["flash_attn_varlen_func"][0]["layout"] == expected_fa_layout
     assert calls["hg_flash_attn_varlen_func"] == []
     assert calls["varlen_fwd_unified"] == []
+
+
+def test_hcu_flash_attention_forward_passes_expanded_descales_to_varlen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the production scale expansion before the native FA boundary."""
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.attn_type = flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    impl.num_kv_heads = 2
+    impl.supports_quant_query_input = True
+    impl.dcp_world_size = 1
+    impl.scale = 128**-0.5
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = 0.0
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+
+    calls: list[dict[str, object]] = []
+
+    def native_forward(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: "varlen")
+    monkeypatch.setattr(
+        flash_attn,
+        "canonicalize_singleton_dim_strides",
+        lambda tensor: tensor,
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "_select_flash_attn_varlen_func",
+        lambda: native_forward,
+    )
+
+    batch_size, query_len = 2, 7
+    metadata = SimpleNamespace(
+        num_actual_tokens=batch_size * query_len,
+        use_cascade=False,
+        query_start_loc=torch.tensor([0, 7, 14], dtype=torch.int32),
+        seq_lens=torch.tensor([64, 128], dtype=torch.int32),
+        max_query_len=query_len,
+        max_seq_len=128,
+        block_table=torch.zeros((batch_size, 2), dtype=torch.int32),
+        scheduler_metadata=None,
+        causal=False,
+        sliding_window=None,
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(1.0),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+    )
+    query = torch.zeros(
+        batch_size * query_len,
+        4,
+        128,
+        dtype=torch.bfloat16,
+    )
+    key = torch.zeros(
+        batch_size * query_len,
+        2,
+        128,
+        dtype=torch.bfloat16,
+    )
+
+    impl.forward(
+        layer,
+        query,
+        key,
+        key,
+        torch.zeros(4, 2, 64, 2, 128, dtype=torch.bfloat16),
+        metadata,
+        torch.empty_like(query),
+    )
+
+    assert len(calls) == 1
+    for name in ("q_descale", "k_descale", "v_descale"):
+        scale = calls[0][name]
+        assert isinstance(scale, torch.Tensor)
+        assert scale.shape == (batch_size, impl.num_kv_heads)
+        assert scale.dtype == torch.float32
+        assert scale.stride() == (0, 0)
+        assert not scale.is_contiguous()
 
 
 @pytest.mark.parametrize(
