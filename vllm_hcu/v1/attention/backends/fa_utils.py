@@ -195,7 +195,10 @@ def _matches_dspark_attention_shape(
     for name in ("q_descale", "k_descale", "v_descale"):
         scale = kwargs.get(name)
         if scale is not None and (
-            not isinstance(scale, Tensor) or scale.device != q.device
+            not isinstance(scale, Tensor)
+            or scale.device != q.device
+            or scale.dtype != torch.float32
+            or scale.shape != (batch_size, k.shape[-2])
         ):
             return False
     return True
@@ -214,10 +217,13 @@ def _flash_attn_varlen_func_with_dspark_capture(
         query_len=8,
         causal=True,
     )
-    use_static_varlen = _matches_dspark_attention_shape(
-        kwargs,
-        query_len=7,
-        causal=False,
+    use_static_varlen = (
+        _matches_dspark_attention_shape(
+            kwargs,
+            query_len=7,
+            causal=False,
+        )
+        and torch.cuda.is_current_stream_capturing()
     )
     if not use_paged_attention and not use_static_varlen:
         return _flash_attn_varlen_func(**kwargs)
