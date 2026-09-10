@@ -684,6 +684,15 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         return loaded_local_expert
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        checkpoint_format = getattr(
+            getattr(self, "quant_config", None), "checkpoint_format", None
+        )
+        if checkpoint_format == "hy4-w4a8-custom-v1":
+            from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
+                adapt_weights,
+            )
+
+            weights = adapt_weights(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),

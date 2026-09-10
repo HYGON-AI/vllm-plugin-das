@@ -57,6 +57,10 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SlimQuantW4A8Int8Config":
+        if config.get("checkpoint_format") == "hy4-w4a8-custom-v1":
+            from .hyv4_w4a8 import HYV4W4A8Config
+
+            return HYV4W4A8Config(config["conversion_manifest"])
         return cls()
 
     def get_quant_method(
