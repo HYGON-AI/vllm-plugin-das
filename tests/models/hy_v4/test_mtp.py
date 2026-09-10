@@ -8,12 +8,17 @@ from types import SimpleNamespace
 import torch
 import pytest
 from torch import nn
+from vllm.model_executor.models.interfaces import supports_pp
 
 from tests.models.static_eplb_test_utils import apply_real_moe_layer_patch
 from vllm_hcu.models.hy_v4 import mtp as hy_v4_mtp
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     load_static_logical_expert,
 )
+
+
+def test_hy_v4_mtp_declares_pipeline_parallel_support() -> None:
+    assert supports_pp(hy_v4_mtp.HYV4MTP)
 
 
 def test_shared_head_uses_backbone_lm_head_quant_prefix(monkeypatch) -> None:
