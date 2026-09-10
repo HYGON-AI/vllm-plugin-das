@@ -15,6 +15,11 @@ from __future__ import annotations
 
 register_hcu_ci(
     job="accuracy-gfx936",
+    target="tests/accuracy/test_hyv4_w4a8_kernels.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,
 )

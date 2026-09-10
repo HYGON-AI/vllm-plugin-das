@@ -806,3 +806,45 @@ def test_triton_moe_sum_uses_fp32_accumulation_on_hcu() -> None:
 
     expected = expert_output.float().sum(dim=1).to(torch.bfloat16)
     torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('seq_len', [8, 129])
+def test_hyv4_fp8_indexer_prefill_and_decode_match_reference(seq_len):
+    device = _hcu_device()
+    from vllm.platforms import current_platform
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+    if not current_platform.is_rocm():
+        pytest.skip('enable HCU plugins for native indexer validation')
+    torch.manual_seed(27)
+    dtype = current_platform.fp8_dtype()
+    q = torch.randn(1, 32, 128, device=device).to(dtype)
+    k = torch.randn(seq_len, 128, device=device).to(dtype)
+    scales = torch.full((seq_len, 1), .25, device=device)
+    weights = torch.rand(1, 32, device=device)
+    starts = torch.tensor([0], device=device, dtype=torch.int32)
+    ends = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    expected = (
+        torch.relu(torch.einsum('mhd,nd->mhn', q.float(), k.float()))
+        * weights[:, :, None]
+    ).sum(1) * scales.T
+    actual = sparse.rocm_fp8_mqa_logits(q, (k, scales), weights, starts, ends)
+    torch.testing.assert_close(actual, expected, rtol=.03, atol=.05)
+
+    block_size = 64
+    num_pages = (seq_len + block_size - 1) // block_size
+    cache = torch.zeros(num_pages, block_size, 1, 132, device=device,
+                        dtype=torch.uint8)
+    # NORMAL indexer layout stores all FP8 values before all FP32 scales
+    # within each page; it is not an interleaved 132-byte token layout.
+    pages = cache.view(num_pages, -1)
+    values = torch.zeros(num_pages * block_size, 128, device=device,
+                         dtype=torch.uint8)
+    values[:seq_len] = k.view(torch.uint8)
+    pages[:, :block_size * 128] = values.view(num_pages, -1)
+    pages[:, block_size * 128:].view(torch.float32).fill_(.25)
+    table = torch.arange(num_pages, device=device, dtype=torch.int32)[None]
+    actual = sparse.rocm_fp8_paged_mqa_logits(
+        q[:, None], cache, weights, ends, table, None,
+        num_pages * block_size,
+    )
+    torch.testing.assert_close(actual[:, :seq_len], expected, rtol=.03, atol=.05)

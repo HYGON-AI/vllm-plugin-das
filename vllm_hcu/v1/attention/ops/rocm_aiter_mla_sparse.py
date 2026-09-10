@@ -24,7 +24,7 @@ else:
     
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMetadata
 import vllm_hcu.platforms.envs as henvs 
-from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.platforms.hcu import on_gfx938, on_gfx93x
 try:
     import lightop
     from lightop import gemmopt, op
@@ -966,8 +966,19 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    # gfx936 LightOp's FP8 prefill entry can return zero logits. The aiter
+    # Triton implementation handles FP8 inputs on this device correctly.
+    use_gfx936_fp8 = (
+        current_platform.is_rocm()
+        and on_gfx93x()
+        and not on_gfx938()
+        and q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    )
+    if rocm_aiter_ops.is_enabled() or use_gfx936_fp8:
         aiter_mqa_logits_module = mqa_logits_module()
+
+    if use_gfx936_fp8 and aiter_mqa_logits_module is None:
+        raise RuntimeError("gfx936 FP8 indexer requires aiter fp8_mqa_logits")
 
     if aiter_mqa_logits_module is not None:
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
@@ -1245,7 +1256,11 @@ def rocm_aiter_sparse_attn_indexer_native(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype() if not current_platform.is_rocm() or on_gfx938() else k.dtype
+    # HYV4 uses a packed FP8 indexer cache on gfx936 as well as gfx938.
+    # Select the cache reader/writer from storage, not the device generation
+    # or the incoming K dtype (K can also be absent for a shared indexer).
+    use_fp8_cache = kv_cache.dtype == torch.uint8
+    fp8_dtype = current_platform.fp8_dtype() if use_fp8_cache else kv_cache.dtype
     from vllm import _custom_ops as ops
     from vllm.utils.torch_utils import _resolve_layer_name
 
@@ -1294,7 +1309,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                 quant_block_size,
                 scale_fmt,
             )
-        elif on_gfx938():
+        elif use_fp8_cache:
             indexer_k_quant_and_cache_triton(
                 k,
                 kv_cache,
@@ -1339,7 +1354,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                     chunk.block_table,
                     chunk.cu_seq_lens,
                 )
-            elif on_gfx938():
+            elif use_fp8_cache:
                 cp_gather_indexer_k_quant_cache_triton(
                     kv_cache,
                     k_fp8,

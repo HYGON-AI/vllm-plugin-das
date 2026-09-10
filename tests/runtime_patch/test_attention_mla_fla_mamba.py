@@ -1563,7 +1563,8 @@ def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
     assert Builder().build(0, common).num_kv_actual_tokens == 5
 
 
-def test_gfx938_sparse_indexer_uses_triton_fp8_cache_insert(monkeypatch):
+@pytest.mark.parametrize("gfx938", [True, False])
+def test_hcu_uint8_indexer_uses_triton_fp8_cache_insert(monkeypatch, gfx938):
     from vllm import _custom_ops as ops
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
@@ -1590,7 +1591,7 @@ def test_gfx938_sparse_indexer_uses_triton_fp8_cache_insert(monkeypatch):
             fp8_dtype=lambda: torch.float8_e4m3fn,
         ),
     )
-    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: gfx938)
     monkeypatch.setattr(
         sparse,
         "indexer_k_quant_and_cache_triton",
@@ -1626,8 +1627,9 @@ def test_gfx938_sparse_indexer_uses_triton_fp8_cache_insert(monkeypatch):
     torch.testing.assert_close(topk_indices, torch.full_like(topk_indices, -1))
 
 
-def test_gfx938_sparse_indexer_prefill_uses_triton_fp8_cache_gather(
-    monkeypatch,
+@pytest.mark.parametrize("gfx938", [True, False])
+def test_hcu_uint8_indexer_prefill_uses_triton_fp8_cache_gather(
+    monkeypatch, gfx938,
 ):
     from vllm import _custom_ops as ops
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
@@ -1666,7 +1668,7 @@ def test_gfx938_sparse_indexer_prefill_uses_triton_fp8_cache_gather(
             fp8_dtype=lambda: torch.float8_e4m3fn,
         ),
     )
-    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: gfx938)
 
     def gather(*args, **kwargs):
         calls.append((args, kwargs))
