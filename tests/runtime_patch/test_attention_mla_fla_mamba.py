@@ -687,13 +687,136 @@ def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
     torch.testing.assert_close(module.chunk_fwd_o(x, x, x, x), original(x, x, x, x))
 
 
-def test_fla_chunk_delta_h_enabled_missing_aiter_fails_clearly(monkeypatch):
+def test_fla_chunk_delta_h_prefers_hip_kernel(monkeypatch):
     adapter = _adapter("patch_fla_chunk_delta_h")
+    calls = []
 
     def original(k, w, u, g=None, gk=None, initial_state=None,
                  output_final_state=False, chunk_size=64, save_new_value=True,
                  cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
                  use_exp2=False):
+        return "official"
+
+    def hip(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "hip-h", "hip-v", "hip-final"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_gated_delta_rule_fwd_h=original,
+        prepare_chunk_indices=lambda *_args: torch.tensor([[0, 0]]),
+        prepare_chunk_offsets=lambda *_args: torch.tensor([0]),
+        triton=SimpleNamespace(cdiv=lambda value, divisor: (value + divisor - 1) // divisor),
+        torch=torch,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_gated_delta_rule_fwd_vllm_hip_blockdim64=hip,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.vllm.chunk_delta_h",
+        launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64=lambda **_kwargs: pytest.fail(
+            "HIP must have priority"
+        ),
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    cu_seqlens = torch.tensor([0, 2])
+    result = module.chunk_gated_delta_rule_fwd_h(
+        torch.empty(1, 2, 1, 4),
+        torch.empty(1),
+        torch.empty(1, 2, 1, 4),
+        output_final_state=True,
+        chunk_size=32,
+        save_new_value=False,
+        cu_seqlens=cu_seqlens,
+        use_exp2=True,
+    )
+
+    assert result == ("hip-h", "hip-v", "hip-final")
+    assert len(calls) == 1
+    _, kwargs = calls[0]
+    assert kwargs["cu_seqlens"] is cu_seqlens
+    assert kwargs["chunk_size"] == 32
+    assert kwargs["output_final_state"] is True
+    assert kwargs["save_new_value"] is False
+    assert kwargs["use_exp2"] is True
+    assert kwargs["transpose_state_layout"] is True
+
+
+def test_fla_chunk_o_prefers_hip_and_preserves_output_buffer(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+    calls = []
+
+    def original(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+                 chunk_indices=None, chunk_size=64, core_attn_out=None):
+        return "official"
+
+    def hip(**kwargs):
+        calls.append(kwargs)
+        return kwargs["v"] + 3
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_fwd_o=original,
+        prepare_chunk_indices=lambda *_args: torch.tensor([[0, 0]]),
+        triton=SimpleNamespace(cdiv=lambda value, divisor: (value + divisor - 1) // divisor),
+        torch=torch,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.fla",
+        chunk_fwd_o_vllm_hip_blockdim64=hip,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "aiter.ops.triton.fla.vllm.chunk_o",
+        launch_chunk_fwd_kernel_o=lambda **_kwargs: pytest.fail(
+            "HIP must have priority"
+        ),
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    q = torch.zeros(1, 2, 1, 4)
+    v = torch.ones_like(q)
+    core_attn_out = torch.empty(v.numel() + 8)
+    result = module.chunk_fwd_o(
+        q,
+        q,
+        v,
+        q,
+        scale=0.25,
+        chunk_size=32,
+        core_attn_out=core_attn_out,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["scale"] == 0.25
+    assert calls[0]["chunk_size"] == 32
+    assert calls[0]["transpose_state_layout"] is True
+    assert result.data_ptr() == core_attn_out.data_ptr()
+    torch.testing.assert_close(result, v + 3)
+
+
+def test_fla_chunk_delta_h_enabled_missing_aiter_falls_back(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_delta_h")
+    calls = []
+
+    def original(k, w, u, g=None, gk=None, initial_state=None,
+                 output_final_state=False, chunk_size=64, save_new_value=True,
+                 cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
+                 use_exp2=False):
+        calls.append((chunk_indices, chunk_offsets, use_exp2))
         return k, u, None
 
     module = _module(
@@ -709,15 +832,73 @@ def test_fla_chunk_delta_h_enabled_missing_aiter_fails_clearly(monkeypatch):
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setitem(
         sys.modules,
+        "aiter.ops.fla",
+        ModuleType("aiter.ops.fla"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
         "aiter.ops.triton.fla.vllm.chunk_delta_h",
         ModuleType("aiter.ops.triton.fla.vllm.chunk_delta_h"),
     )
-    with pytest.raises(RuntimeError, match="enabled but unavailable"):
-        module.chunk_gated_delta_rule_fwd_h(
-            torch.empty(1, 1, 1, 1),
-            torch.empty(1),
-            torch.empty(1, 1, 1, 1),
-        )
+    chunk_indices = torch.tensor([[0, 0]])
+    chunk_offsets = torch.tensor([0])
+    result = module.chunk_gated_delta_rule_fwd_h(
+        torch.empty(1, 1, 1, 1),
+        torch.empty(1),
+        torch.empty(1, 1, 1, 1),
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        use_exp2=True,
+    )
+
+    assert len(result) == 3
+    assert calls == [(chunk_indices, chunk_offsets, True)]
+
+
+def test_fla_chunk_o_enabled_missing_aiter_falls_back(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+    calls = []
+
+    def original(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+                 chunk_indices=None, chunk_size=64, core_attn_out=None):
+        calls.append((scale, chunk_indices, core_attn_out))
+        return "official"
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_fwd_o=original,
+        torch=torch,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.fla",
+        ModuleType("aiter.ops.fla"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.triton.fla.vllm.chunk_o",
+        ModuleType("aiter.ops.triton.fla.vllm.chunk_o"),
+    )
+    chunk_indices = torch.tensor([[0, 0]])
+    core_attn_out = torch.empty(8)
+    result = module.chunk_fwd_o(
+        torch.empty(1, 1, 1, 1),
+        torch.empty(1, 1, 1, 1),
+        torch.empty(1, 1, 1, 1),
+        torch.empty(1, 1, 1, 1),
+        scale=0.5,
+        chunk_indices=chunk_indices,
+        core_attn_out=core_attn_out,
+    )
+
+    assert result == "official"
+    assert calls == [(0.5, chunk_indices, core_attn_out)]
 
 
 def test_mamba_nn_sharded_loader_cpu_numeric():
@@ -897,6 +1078,31 @@ def test_gdn_runtime_adapter_has_stable_patch_id():
     )
 
 
+def _gdn_sigmoid_contract(
+    A_log,
+    a,
+    b,
+    dt_bias,
+    q,
+    k,
+    v,
+    beta=1.0,
+    threshold=20.0,
+    scale=None,
+    initial_state=None,
+    inplace_final_state=True,
+    cu_seqlens=None,
+    ssm_state_indices=None,
+    num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False,
+    is_kda=False,
+):
+    del A_log, a, b, dt_bias, q, k, v, beta, threshold, scale
+    del initial_state, inplace_final_state, cu_seqlens, ssm_state_indices
+    del num_accepted_tokens, use_qk_l2norm_in_kernel, is_kda
+    return "official-sigmoid"
+
+
 def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     causal_adapter = _adapter("patch_gdn_causal_conv1d")
     qwen_adapter = _adapter("patch_gdn_linear_attention")
@@ -978,7 +1184,7 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
         GDN_AITER_TRITON_AVAILABLE=True,
         gdn_aiter_fused_reshape_causal_conv1d_update_single_token=aiter_update,
         fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
-        fused_sigmoid_gating_delta_rule_update=lambda *a, **k: "official-sigmoid",
+        fused_sigmoid_gating_delta_rule_update=_gdn_sigmoid_contract,
         GatedDeltaNetAttention=GatedDeltaNetAttention,
         MambaStateDtypeCalculator=SimpleNamespace(
             gated_delta_net_state_dtype=lambda *a: "calculator"
@@ -1035,7 +1241,7 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     )
 
 
-def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
+def test_gdn_recurrent_remains_target_owned_and_sigmoid_is_qwen_local(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
 
     _install_fake_module(
@@ -1057,9 +1263,7 @@ def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
         del args, kwargs
         return "official-recurrent"
 
-    def sigmoid(*args, **kwargs):
-        del args, kwargs
-        return "official-sigmoid"
+    sigmoid = _gdn_sigmoid_contract
 
     module = _module(
         adapter.TARGET_MODULE,
@@ -1071,10 +1275,16 @@ def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
     from vllm_hcu.platforms import envs as henvs
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", False)
     assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
-    assert module.fused_sigmoid_gating_delta_rule_update is sigmoid
+    assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
+    assert module._vllm_hcu_original_fused_sigmoid is sigmoid
     assert module.fused_recurrent_gated_delta_rule_packed_decode() == "official-recurrent"
-    assert module.fused_sigmoid_gating_delta_rule_update() == "official-sigmoid"
+    sigmoid_args = tuple(torch.empty(1) for _ in range(7))
+    assert (
+        module.fused_sigmoid_gating_delta_rule_update(*sigmoid_args)
+        == "official-sigmoid"
+    )
 
 
 def test_gdn_state_dtype_feature_on_uses_auto_ssm_dtype(monkeypatch):

@@ -43,9 +43,19 @@ def apply_to_module(module: ModuleType) -> bool:
             return original(q, k, v, h, g, scale, cu_seqlens, chunk_indices,
                             chunk_size, core_attn_out)
         try:
+            from aiter.ops.fla import chunk_fwd_o_vllm_hip_blockdim64 as hip_kernel
+        except ImportError:
+            hip_kernel = None
+        try:
             from aiter.ops.triton.fla.vllm.chunk_o import launch_chunk_fwd_kernel_o
-        except ImportError as exc:
-            raise RuntimeError("HCU AITER FLA chunk_o is enabled but unavailable") from exc
+        except ImportError:
+            launch_chunk_fwd_kernel_o = None
+        if hip_kernel is None and launch_chunk_fwd_kernel_o is None:
+            return original(
+                q, k, v, h, g, scale, cu_seqlens, chunk_indices,
+                chunk_size, core_attn_out,
+            )
+
         B, T, Hg, K, V = *q.shape, v.shape[-1]
         H, BT = v.shape[-2], chunk_size
         if chunk_indices is None and cu_seqlens is not None:
@@ -53,6 +63,32 @@ def apply_to_module(module: ModuleType) -> bool:
         NT = chunk.triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
         if scale is None:
             scale = k.shape[-1] ** -0.5
+
+        if hip_kernel is not None:
+            hip_output = hip_kernel(
+                q=q,
+                k=k,
+                v=v,
+                h=h,
+                g=g,
+                g_gamma=None,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
+                use_exp2=False,
+                transpose_state_layout=True,
+                kernel_cfg=None,
+            )
+            if core_attn_out is None:
+                return hip_output
+            if core_attn_out.numel() < v.numel():
+                raise ValueError("core_attn_out is too small for HCU FLA chunk_o")
+            out = core_attn_out[:v.numel()].view(*v.shape)
+            out.copy_(hip_output)
+            return out
+
+        assert launch_chunk_fwd_kernel_o is not None
         if core_attn_out is not None:
             if core_attn_out.numel() < v.numel():
                 raise ValueError("core_attn_out is too small for HCU FLA chunk_o")
