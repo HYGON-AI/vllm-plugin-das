@@ -3,12 +3,61 @@
 
 from types import SimpleNamespace
 
+import torch
+
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
     compressed_tensors_moe_w8a8_fp8 as target_fp8,
 )
 from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors_marlin as marlin_config,
+)
+from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
     compressed_tensors_moe_marlin as marlin,
 )
+
+
+def test_explicit_aiter_bypasses_slimquant_marlin_selector(
+    monkeypatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (
+        CompressedTensorsMoEMethod,
+    )
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = SimpleNamespace(moe_backend="aiter")
+    config = SimpleNamespace(ignore=[], packed_modules_mapping={})
+    expected = object()
+    calls = []
+
+    def official_selector(quant_config, routed_experts, layer_name):
+        calls.append((quant_config, routed_experts, layer_name))
+        return expected
+
+    monkeypatch.setattr(
+        CompressedTensorsMoEMethod,
+        "get_moe_method",
+        staticmethod(official_selector),
+    )
+    monkeypatch.setattr(
+        marlin.CompressedTensorsMarlinMoEMethod,
+        "get_moe_method",
+        staticmethod(
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("explicit AITER must bypass SlimQuant Marlin")
+            )
+        ),
+    )
+
+    method = marlin_config.SlimQuantCompressedTensorsMarlinConfig.get_quant_method(
+        config,
+        layer,
+        "model.layers.0.mlp.experts",
+    )
+
+    assert method is expected
+    assert calls == [(config, layer, "model.layers.0.mlp.experts")]
 
 
 def test_explicit_aiter_precedes_slimquant_marlin(
