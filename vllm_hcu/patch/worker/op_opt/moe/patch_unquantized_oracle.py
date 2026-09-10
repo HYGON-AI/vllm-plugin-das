@@ -93,7 +93,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 lightop_w16a16_moe,
             )
 
-            return lightop_w16a16_moe.LightopW16A16Experts
+            return [lightop_w16a16_moe.LightopW16A16Experts]
         return backend_to_cls(_normalize_backend(backend, old_enum, hcu_enum))
 
     @functools.wraps(map_backend)

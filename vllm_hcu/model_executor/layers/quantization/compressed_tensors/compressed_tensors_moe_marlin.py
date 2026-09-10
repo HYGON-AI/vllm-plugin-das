@@ -225,6 +225,33 @@ class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
                 scheme_dict,
             )
         elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_int8 import (  # noqa: E501
+                CompressedTensorsW8A8Int8MoEMethod,
+            )
+
+            if not is_lightop_marlin_moe_supported(layer.moe_config):
+                triton_moe = copy.copy(layer.moe_config)
+                triton_moe.moe_backend = "triton"
+                logger.warning_once(
+                    "LightOp Marlin has no config for SlimQuant INT8 MoE "
+                    "layer %s (experts=%s, hidden=%s, intermediate/tp=%s); "
+                    "using the official Triton INT8 MoE method before weight "
+                    "packing.",
+                    layer_name,
+                    getattr(layer.moe_config, "num_experts", "unknown"),
+                    getattr(layer.moe_config, "hidden_dim", "unknown"),
+                    getattr(
+                        layer.moe_config,
+                        "intermediate_size_per_partition",
+                        "unknown",
+                    ),
+                )
+                return CompressedTensorsW8A8Int8MoEMethod(
+                    weight_quant,
+                    input_quant,
+                    triton_moe,
+                    layer_name=layer_name,
+                )
             return CompressedTensorsW8A8Int8MarlinMoEMethod(
                 quant_config,
                 layer.moe_config,

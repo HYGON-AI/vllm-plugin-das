@@ -316,6 +316,22 @@ def test_w16a16_auto_selects_lightop_only_when_master_and_leaf_enabled(
     assert not [call for call in calls if call[0] == "select"]
 
 
+def test_w16a16_backend_to_kernel_cls_preserves_official_list_contract() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts.lightop_w16a16_moe import (
+        LightopW16A16Experts,
+    )
+    from vllm_hcu.patch.worker.op_opt.moe import patch_unquantized_oracle
+
+    module, _ = _target_module()
+    assert patch_unquantized_oracle.apply_to_module(module) is True
+
+    result = module.backend_to_kernel_cls(
+        module.UnquantizedMoeBackend.HCU_LIGHTOP_W16A16
+    )
+
+    assert result == [LightopW16A16Experts]
+
+
 @pytest.mark.parametrize(
     "binding",
     (

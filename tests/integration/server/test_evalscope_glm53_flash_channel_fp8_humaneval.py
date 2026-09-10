@@ -58,6 +58,7 @@ def test_glm53_flash_channel_fp8_command_contract(
     assert json.loads(_option_value(server, "--speculative-config")) == {
         "method": "mtp",
         "num_speculative_tokens": 3,
+        "use_local_argmax_reduction": True,
     }
     assert "--compilation-config" not in server
     assert "--enable-prefix-caching" in server

@@ -20,7 +20,7 @@ server:
     - --moe-backend
     - aiter
     - --speculative-config
-    - '{"method":"mtp","num_speculative_tokens":3}'
+    - '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
     - --enable-prefix-caching
     - --max-model-len
     - "4096"

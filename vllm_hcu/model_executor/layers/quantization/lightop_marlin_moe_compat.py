@@ -41,30 +41,34 @@ def is_lightop_marlin_moe_supported(moe: object) -> bool:
         intermediate = int(getattr(moe, "intermediate_size_per_partition"))
         hidden = int(getattr(moe, "hidden_dim"))
         w13_num_shards = int(getattr(moe, "w13_num_shards"))
-        result = get_moe_cuda_marlin_config(
-            int(getattr(moe, "num_experts")),
-            1,
-            w13_num_shards * intermediate,
-            hidden,
-            hidden,
-            intermediate,
-            int(getattr(moe, "experts_per_token")),
-            lightop_envs.LMSLIM_GPU_NAME,
-            properties.multi_processor_count,
-            compute_dtype,
-        )
+        max_num_tokens = max(1, int(getattr(moe, "max_num_tokens", 1)))
+        for num_tokens in range(1, max_num_tokens + 1):
+            result = get_moe_cuda_marlin_config(
+                int(getattr(moe, "num_experts")),
+                num_tokens,
+                w13_num_shards * intermediate,
+                hidden,
+                hidden,
+                intermediate,
+                int(getattr(moe, "experts_per_token")),
+                lightop_envs.LMSLIM_GPU_NAME,
+                properties.multi_processor_count,
+                compute_dtype,
+            )
+            if not (
+                isinstance(result, tuple)
+                and len(result) == 3
+                and isinstance(result[0], dict)
+                and isinstance(result[1], dict)
+                and result[0]
+                and result[1]
+                and result[2]
+            ):
+                return False
     except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
         return False
 
-    return bool(
-        isinstance(result, tuple)
-        and len(result) == 3
-        and isinstance(result[0], dict)
-        and isinstance(result[1], dict)
-        and result[0]
-        and result[1]
-        and result[2]
-    )
+    return True
 
 
 def _safe_remap_expert_ids(
