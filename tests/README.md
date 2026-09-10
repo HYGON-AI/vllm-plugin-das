@@ -137,9 +137,11 @@ python tools/run_patch_tests.py --suite model -- -k llama2_7b_eagle
 python tools/run_patch_tests.py --suite model -- -k example_connector
 ```
 
-Model integration tests force `VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1` in the test
-environment. Server/EvalScope cases also clear `VLLM_PLUGINS` before launching
-`vllm serve`, so vLLM can load the HCU entry points normally.
+EvalScope-backed server tests do not force a FlashAttention submode. Configure
+one explicitly through the case's `server.environment` only for backend A/B
+tests; otherwise `--attention-backend FLASH_ATTN` exercises the plugin default.
+These cases clear `VLLM_PLUGINS` before launching `vllm serve`, so vLLM can
+load the HCU entry points normally.
 
 Logs and reports:
 

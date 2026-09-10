@@ -134,6 +134,27 @@ def test_qwen_gated_rmsnorm_eligibility_is_strict(
     assert not rms_norm_gated._is_qwen_gated_rmsnorm_eligible(_layer(), x, z)
 
 
+def test_hcu_qwen_gated_rmsnorm_enables_device_dispatch_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", True
+    )
+    monkeypatch.setattr(
+        rms_norm_gated.RMSNormGated,
+        "enabled",
+        classmethod(lambda cls: False),
+    )
+
+    assert rms_norm_gated.HcuRMSNormGated.enabled() is True
+
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", False
+    )
+    assert rms_norm_gated.HcuRMSNormGated.enabled() is False
+
+
 @pytest.mark.parametrize("export", (None, object()))
 def test_qwen_gated_rmsnorm_missing_categorized_export_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,

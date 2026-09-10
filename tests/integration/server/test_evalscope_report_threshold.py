@@ -72,6 +72,16 @@ def test_server_environment_bypasses_proxy_for_local_eval_client(
     assert environment["no_proxy"] == environment["NO_PROXY"]
 
 
+def test_server_environment_does_not_force_flash_attention_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", raising=False)
+
+    environment = _server_environment()
+
+    assert "VLLM_HCU_USE_FLASH_ATTN_UNIFIED" not in environment
+
+
 def test_reset_evalscope_artifacts_removes_stale_outputs_only(
     tmp_path: Path,
 ) -> None:

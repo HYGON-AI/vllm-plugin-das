@@ -188,6 +188,13 @@ def _is_qwen_gated_rmsnorm_eligible(
 
 
 class HcuRMSNormGated(RMSNormGated):
+    @classmethod
+    def enabled(cls) -> bool:
+        return bool(
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED
+        ) or super().enabled()
+
     def forward_hip(
         self,
         x: torch.Tensor,
