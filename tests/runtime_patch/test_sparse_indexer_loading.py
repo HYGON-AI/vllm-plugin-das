@@ -214,7 +214,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
 
     def hcu_op(*args):
         events.append(("hcu_op", *args))
-        return "topk"
+        return None
 
     fake_torch = SimpleNamespace(
         Tensor=torch.Tensor,
@@ -253,7 +253,10 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
         topk_indices_buffer=object(),
     )
 
-    assert forward_hip(indexer, hidden_states, q_quant, local_k, weights) == "topk"
+    assert (
+        forward_hip(indexer, hidden_states, q_quant, local_k, weights)
+        is indexer.topk_indices_buffer
+    )
 
     assert [event[0] for event in events] == ["gather", "cache", "hcu_op"]
     assert events[0][1] is local_k
@@ -278,7 +281,7 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
 
     def hcu_op(*args):
         calls.append(args)
-        return "topk"
+        return None
 
     fake_torch = SimpleNamespace(
         Tensor=torch.Tensor,
@@ -321,7 +324,10 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
         topk_indices_buffer=object(),
     )
 
-    assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
+    assert (
+        forward_hip(indexer, object(), q_quant, local_k, object())
+        is indexer.topk_indices_buffer
+    )
     assert len(calls) == 1
     assert calls[0][4] is local_k
     assert calls[0][-1] is False
@@ -592,7 +598,7 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
 
     def hcu_op(*args):
         calls.append(args)
-        return "topk"
+        return None
 
     fake_torch = SimpleNamespace(
         Tensor=torch.Tensor,
@@ -620,6 +626,7 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
     )
     local_k = torch.ones(1, 2)
     q_quant = torch.ones(1, 2)
+    topk_indices_buffer = object()
     indexer = SimpleNamespace(
         use_fp4_cache=False,
         use_pcp=False,
@@ -632,10 +639,20 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
         head_dim=128,
         max_model_len=65536,
         max_total_seq_len=65536,
-        topk_indices_buffer=object(),
+        topk_indices_buffer=topk_indices_buffer,
     )
 
-    assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
+    assert (
+        forward_hip(indexer, object(), q_quant, local_k, object())
+        is topk_indices_buffer
+    )
     assert len(calls) == 1
     assert calls[0][4] is local_k
     assert calls[0][-1] is False
+
+
+def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
+    importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
+
+    schema = torch.ops.vllm.hcu_sparse_attn_indexer.default._schema
+    assert len(schema.returns) == 0

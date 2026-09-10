@@ -731,8 +731,8 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
-    ) -> torch.Tensor:
-        return rocm_aiter_sparse_attn_indexer_native(
+    ) -> None:
+        rocm_aiter_sparse_attn_indexer_native(
             hidden_states,
             k_cache_prefix,
             kv_cache,
@@ -764,9 +764,9 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
-    ) -> torch.Tensor:
+    ) -> None:
         del skip_k_cache_insert
-        return rocm_aiter_sparse_attn_indexer_fake(
+        rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,
             kv_cache,
@@ -1031,7 +1031,7 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
                 # The complete cache write is explicit above.  Keep the
                 # existing HCU custom op for local Q/top-k work only.
                 skip_k_cache_insert = True
-        return torch.ops.vllm.hcu_sparse_attn_indexer(
+        torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
             self.k_cache.kv_cache,
@@ -1047,3 +1047,4 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             self.topk_indices_buffer,
             skip_k_cache_insert,
         )
+        return self.topk_indices_buffer
