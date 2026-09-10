@@ -102,7 +102,7 @@ def test_qwen_gated_rmsnorm_eligibility_is_strict(
     assert rms_norm_gated._is_qwen_gated_rmsnorm_eligible(
         _layer(256), x_256, _TensorMetadata((32, 256))
     )
-    assert not rms_norm_gated._is_qwen_gated_rmsnorm_eligible(
+    assert rms_norm_gated._is_qwen_gated_rmsnorm_eligible(
         _layer(), _TensorMetadata((3, 128)), _TensorMetadata((3, 128))
     )
     assert not rms_norm_gated._is_qwen_gated_rmsnorm_eligible(
@@ -238,6 +238,82 @@ def test_qwen_gated_rmsnorm_forward_dispatch_is_fullgraph_compilable(
     assert result.dtype is torch.bfloat16
 
 
+def test_qwen_gated_rmsnorm_ineligible_semantics_use_graph_safe_native_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", True
+    )
+    sentinel = object()
+    layer = _layer(
+        activation="sigmoid",
+        forward_native=lambda _x, _z: sentinel,
+        forward_cuda=lambda _x, _z: (_ for _ in ()).throw(
+            AssertionError("ineligible fallback must remain graph compilable")
+        ),
+    )
+    x = _TensorMetadata((32, 128))
+    z = _TensorMetadata((32, 128))
+
+    result = rms_norm_gated.HcuRMSNormGated.forward_hip(layer, x, z)
+
+    assert result is sentinel
+
+
+def test_qwen_gated_rmsnorm_dynamic_rows_do_not_specialize_fullgraph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", True
+    )
+    with FakeTensorMode():
+        x = torch.empty((32, 128), device="cuda", dtype=torch.bfloat16)
+        z = torch.empty_like(x)
+        torch._dynamo.mark_dynamic(x, 0)
+        torch._dynamo.mark_dynamic(z, 0)
+        layer = _layer(
+            weight=torch.empty(
+                (128,), device="cuda", dtype=torch.bfloat16
+            )
+        )
+
+        def forward(a, b):
+            return rms_norm_gated.HcuRMSNormGated.forward_hip(layer, a, b)
+
+        result = torch.compile(forward, backend="eager", fullgraph=True)(x, z)
+
+    assert result.shape == x.shape
+
+
+def test_qwen_gated_rmsnorm_unverified_rows_fall_back_inside_custom_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        rms_norm_gated,
+        "_lightop_layer_norm_fwd_1pass_opt",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unverified rows must not enter LightOp")
+        ),
+    )
+    sentinel = object()
+    monkeypatch.setattr(
+        rms_norm_gated,
+        "_vllm_qwen_rmsnorm_gated_fallback",
+        lambda *_args: sentinel,
+    )
+
+    result = rms_norm_gated._hcu_lightop_qwen_rmsnorm_gated_impl(
+        torch.zeros((3, 128), dtype=torch.bfloat16),
+        torch.zeros((3, 128), dtype=torch.bfloat16),
+        torch.ones((128,), dtype=torch.bfloat16),
+        1e-6,
+    )
+
+    assert result is sentinel
+
+
 def test_qwen_gated_rmsnorm_does_not_log_when_operator_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -246,6 +322,11 @@ def test_qwen_gated_rmsnorm_does_not_log_when_operator_fails(
 
     monkeypatch.setattr(
         rms_norm_gated, "_lightop_layer_norm_fwd_1pass_opt", lambda: fail
+    )
+    monkeypatch.setattr(
+        rms_norm_gated,
+        "_is_lightop_runtime_tensor_eligible",
+        lambda *_args: True,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
     monkeypatch.setattr(
@@ -290,6 +371,11 @@ def test_qwen_gated_rmsnorm_uses_categorized_lightop_api(
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.setitem(sys.modules, "lightop.norm", norm)
     rms_norm_gated._lightop_layer_norm_fwd_1pass_opt.cache_clear()
+    monkeypatch.setattr(
+        rms_norm_gated,
+        "_is_lightop_runtime_tensor_eligible",
+        lambda *_args: True,
+    )
     monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
     monkeypatch.setattr(
         torch.cuda,
