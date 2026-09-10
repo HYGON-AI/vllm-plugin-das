@@ -82,8 +82,13 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             events.append("super.prepare_inputs")
             assert scheduler_output == "scheduler-output"
             assert batch_req_state == "batch-req-state"
-            assert batch_desc == "batch-desc"
-            return self.global_batch
+            input_batch = self.global_batch
+            if getattr(self, "pcp_manager", None) is not None:
+                return self.pcp_manager.partition_batch(
+                    input_batch,
+                    padded_num_tokens=batch_desc.num_tokens,
+                )
+            return input_batch
 
         def execute_model(
             self,
@@ -132,6 +137,7 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             return "sampled"
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
+    upstream_module.init_kv_cache = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
     monkeypatch.setitem(sys.modules, pcp_module.__name__, pcp_module)
     monkeypatch.delitem(sys.modules, adapter_name, raising=False)
@@ -179,9 +185,10 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     synchronized_batches: list[object] = []
 
     class Manager:
-        def partition_batch(self, input_batch):
+        def partition_batch(self, input_batch, padded_num_tokens=None):
             events.append("partition_batch")
             assert input_batch is global_batch
+            assert padded_num_tokens == 17
             return local_batch
 
         def prepare_attn(self, input_batch):
@@ -225,7 +232,9 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     assert runner.pcp_manager is manager
     prepared = runner.prepare_inputs(
-        "scheduler-output", "batch-req-state", "batch-desc"
+        "scheduler-output",
+        "batch-req-state",
+        SimpleNamespace(num_tokens=17),
     )
     assert prepared is local_batch
     assert runner.prepare_attn(prepared) == ("local-blocks", "gathered-slots")
@@ -496,7 +505,9 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     assert runner.kv_cache_initialize_args == (True, allocation_context)
     assert (
         runner.prepare_inputs(
-            "scheduler-output", "batch-req-state", "batch-desc"
+            "scheduler-output",
+            "batch-req-state",
+            SimpleNamespace(num_tokens=17),
         )
         is global_batch
     )

@@ -72,10 +72,13 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_split_batch(common_attn_metadata, decode_threshold=1,
                         require_uniform=False,
                         treat_short_extends_as_decodes=None):
-        if treat_short_extends_as_decodes is None:
-            treat_short_extends_as_decodes = (
-                getattr(common_attn_metadata, "is_prefilling", None) is None
-            )
+        if getattr(common_attn_metadata, "is_prefilling", None) is None:
+            # Rebuilt multi-step draft metadata is a uniform decode batch and
+            # intentionally has no prefill mask. Current upstream callers may
+            # still pass False here for target-model short-extend splitting.
+            treat_short_extends_as_decodes = True
+        elif treat_short_extends_as_decodes is None:
+            treat_short_extends_as_decodes = False
         return split_batch(
             common_attn_metadata, decode_threshold, require_uniform,
             treat_short_extends_as_decodes,

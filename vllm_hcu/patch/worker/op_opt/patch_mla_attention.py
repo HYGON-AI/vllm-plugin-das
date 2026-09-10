@@ -22,6 +22,7 @@ TARGETS = (
     f"{TARGET_MODULE}.MLACommonMetadata.__init__",
     f"{TARGET_MODULE}.MLACommonMetadataBuilder.build",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
+    f"{TARGET_MODULE}.maybe_gather_mla_latent_cache_inputs",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -40,6 +41,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (metadata_cls, "__init__", TARGETS[4], _WRAPPER),
         (builder_cls, "build", TARGETS[5], _WRAPPER),
         (mla, "split_decodes_and_prefills", TARGETS[6], _WRAPPER),
+        (mla, "maybe_gather_mla_latent_cache_inputs", TARGETS[7], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -69,6 +71,22 @@ def apply_to_module(module: ModuleType) -> bool:
         defaults={"output_shape": None, "q_dcp_replicated": None},
     )
     original_forward = require_callable(cls, "forward_impl", TARGETS[2])
+    original_cache_gather = require_callable(
+        mla,
+        "maybe_gather_mla_latent_cache_inputs",
+        TARGETS[7],
+    )
+    require_exact_signature(
+        original_cache_gather,
+        TARGETS[7],
+        positional=(
+            "kv_c_normed",
+            "k_pe",
+            "slot_mapping",
+            "num_decode_tokens",
+            "use_pcp",
+        ),
+    )
     require_exact_signature(
         original_forward, TARGETS[2],
         positional=("self", "q", "k_c_normed", "k_pe", "kv_cache", "attn_metadata",
@@ -193,7 +211,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 q_dcp_replicated,
             )
 
-        if self.calculate_kv_scales:
+        # Current vLLM initializes KV-cache quantization without the legacy
+        # calculate_kv_scales flag. Preserve the older ABI when present while
+        # treating its absence as the current upstream no-op behavior.
+        if getattr(self, "calculate_kv_scales", False):
             torch_module.ops.vllm.maybe_calc_kv_scales(
                 q,
                 kv_c_normed,
@@ -339,6 +360,28 @@ def apply_to_module(module: ModuleType) -> bool:
             hcu_treat_short_extends_as_decodes,
         )
 
+    @functools.wraps(original_cache_gather)
+    def hcu_cache_gather(
+        kv_c_normed,
+        k_pe,
+        slot_mapping,
+        num_decode_tokens,
+        use_pcp,
+    ):
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            in_replicated_mtp_batch,
+        )
+
+        if in_replicated_mtp_batch():
+            return kv_c_normed, k_pe, slot_mapping
+        return original_cache_gather(
+            kv_c_normed,
+            k_pe,
+            slot_mapping,
+            num_decode_tokens,
+            use_pcp,
+        )
+
     for function in (
         hcu_init,
         hcu_full_forward,
@@ -347,6 +390,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_metadata_init,
         hcu_build,
         hcu_split_batch,
+        hcu_cache_gather,
     ):
         setattr(function, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
@@ -363,6 +407,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(metadata_cls, "__init__", hcu_metadata_init)
     setattr(builder_cls, "build", hcu_build)
     setattr(mla, "split_decodes_and_prefills", hcu_split_batch)
+    setattr(mla, "maybe_gather_mla_latent_cache_inputs", hcu_cache_gather)
     setattr(mla, _MARKER, True)
     return True
 

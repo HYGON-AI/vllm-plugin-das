@@ -227,6 +227,34 @@ class HcuPCPManager:
 
         return segment(pcp_rank), segment(chunk_count - 1 - pcp_rank)
 
+    def get_num_tokens_for_dispatch(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+    ) -> int:
+        """Return the largest real rank-local batch before runner padding."""
+
+        largest = 0
+        for rank in range(self.pcp_size):
+            local_tokens = 0
+            for length_value, is_prefill_value in zip(
+                num_scheduled_tokens, is_prefilling
+            ):
+                length = int(length_value)
+                if bool(is_prefill_value):
+                    local_tokens += sum(
+                        segment.num_tokens
+                        for segment in self.rank_segments(
+                            length,
+                            pcp_rank=rank,
+                            pcp_size=self.pcp_size,
+                        )
+                    )
+                else:
+                    local_tokens += length
+            largest = max(largest, local_tokens)
+        return largest
+
     @staticmethod
     def _reorder_segments(
         segments: list[_BatchSegment],
@@ -301,7 +329,9 @@ class HcuPCPManager:
         )
 
     def _build_batch_layout(
-        self, input_batch: InputBatch
+        self,
+        input_batch: InputBatch,
+        padded_num_tokens: int | None = None,
     ) -> tuple[list[list[_BatchSegment]], list[int]]:
         segments_by_rank = [
             self._segments_for_rank(rank, input_batch)
@@ -373,7 +403,14 @@ class HcuPCPManager:
             sum(segment.num_tokens for segment in segments)
             for segments in segments_by_rank
         ]
-        padded_num_tokens = max(per_rank_num_tokens, default=0)
+        required_num_tokens = max(per_rank_num_tokens, default=0)
+        if padded_num_tokens is None:
+            padded_num_tokens = required_num_tokens
+        elif padded_num_tokens < required_num_tokens:
+            raise PatchCompatibilityError(
+                "official PCP dispatch padding is smaller than the HCU "
+                f"rank-local batch: {padded_num_tokens} < {required_num_tokens}"
+            )
         expanded_num_tokens = padded_num_tokens * self.pcp_size
         padded_gather_idx = np.zeros(expanded_num_tokens, dtype=np.int64)
         kv_write_mask = np.zeros(expanded_num_tokens, dtype=np.bool_)
@@ -419,7 +456,11 @@ class HcuPCPManager:
         )
         return segments_by_rank, per_rank_num_tokens
 
-    def partition_batch(self, input_batch: InputBatch) -> InputBatch:
+    def partition_batch(
+        self,
+        input_batch: InputBatch,
+        padded_num_tokens: int | None = None,
+    ) -> InputBatch:
         """Return a rank-local InputBatch without mutating the global batch."""
 
         if (
@@ -432,7 +473,10 @@ class HcuPCPManager:
         self._global_batch = input_batch
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
-        segments_by_rank, per_rank_num_tokens = self._build_batch_layout(input_batch)
+        segments_by_rank, per_rank_num_tokens = self._build_batch_layout(
+            input_batch,
+            padded_num_tokens=padded_num_tokens,
+        )
         segments = segments_by_rank[self.pcp_rank]
         if not segments:
             # Preserve one metadata row on a rank with no owned prefill tokens,
@@ -645,7 +689,7 @@ class HcuPCPManager:
         local_is_prefilling = self._is_prefilling_np[:num_local_reqs]
         local_is_prefilling[:] = (
             local_num_computed_prefill < local_prefill_len
-        )
+        ) & input_batch.is_prefilling_np[global_req_indices]
         local_num_draft_tokens_per_req = None
         local_num_draft_tokens = 0
         if input_batch.num_draft_tokens_per_req is not None:
@@ -767,6 +811,11 @@ class HcuPCPManager:
             else global_slots
         )
         setattr(input_batch, "_vllm_hcu_pcp_plan", self.build_plan())
+        setattr(
+            input_batch,
+            "_vllm_hcu_pcp_has_global_prefill",
+            self._global_has_prefill,
+        )
         return local_tables, slot_mappings
 
     def prepare_global_attn(

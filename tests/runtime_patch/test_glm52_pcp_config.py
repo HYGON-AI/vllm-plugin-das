@@ -202,7 +202,7 @@ def test_gqa_pcp_allows_piecewise_graph_execution(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
-@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
 def test_glm52_pcp_allows_validated_builtin_mtp_depths(
     make_pcp_config, num_speculative_tokens: int
 ) -> None:
@@ -265,8 +265,8 @@ def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
             "only supports built-in MTP",
         ),
         (
-            {"speculative": True, "num_speculative_tokens": 3},
-            "one or two speculative tokens",
+            {"speculative": True, "num_speculative_tokens": 4},
+            "one to three speculative tokens",
         ),
         ({"enforce_eager": False}, "eager"),
         ({"lora": True}, "LoRA"),

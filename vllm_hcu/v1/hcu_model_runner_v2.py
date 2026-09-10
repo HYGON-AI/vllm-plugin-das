@@ -159,8 +159,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             batch_req_state,
             batch_desc,
         )
-        if self.pcp_manager is not None:
-            input_batch = self.pcp_manager.partition_batch(input_batch)
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)
         return input_batch
 

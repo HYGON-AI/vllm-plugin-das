@@ -316,6 +316,24 @@ def test_two_token_warmup_prefill_drops_empty_runtime_rows() -> None:
         assert local.is_prefilling_np.tolist() == [True]
 
 
+def test_mtp_decode_partition_cannot_reclassify_rows_as_prefill() -> None:
+    global_batch = _make_batch(
+        [("mtp-decode", [10, 11, 12, 13], 20, False)]
+    )
+    # MRV2 retains the prompt boundary after prefill has completed. Rebuilding
+    # phase from a rank-local token offset alone would incorrectly turn the
+    # decode request back into a short-extend prefill.
+    global_batch.prefill_len_np[:] = 20
+    managers, _ = _make_managers(block_tables=_InMemoryBlockTables())
+
+    for manager in managers:
+        local = manager.partition_batch(global_batch)
+        assert not local.is_prefilling_np.any()
+        assert not local.has_prefill
+        manager.prepare_attn(local)
+        assert local._vllm_hcu_pcp_has_global_prefill is False
+
+
 def test_one_token_prefill_materializes_padding_on_the_empty_rank() -> None:
     """An empty rank needs a padding-only row with the peer's token width."""
 

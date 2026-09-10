@@ -332,6 +332,13 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
     module.MLACommonMetadata = MLACommonMetadata
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
     module.split_decodes_and_prefills = split_decodes_and_prefills
+    module.maybe_gather_mla_latent_cache_inputs = (
+        lambda kv_c_normed, k_pe, slot_mapping, num_decode_tokens, use_pcp: (
+            kv_c_normed,
+            k_pe,
+            slot_mapping,
+        )
+    )
     module.split_calls = split_calls
     module.full_forward_calls = full_forward_calls
     module.get_forward_context = lambda: pytest.fail(
@@ -583,7 +590,7 @@ def test_mla_pcp_full_forward_gathers_cache_inputs_and_keeps_q_local(
     instance._hcu_use_pcp = True
     instance._hcu_pcp_world_size = 2
     instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
-    instance.calculate_kv_scales = False
+    # Current upstream no longer exposes the legacy calculate_kv_scales flag.
     instance.layer_name = "layer"
     instance.kv_cache = torch.empty(0)
     instance.kv_cache_dtype = "auto"
@@ -734,8 +741,16 @@ def test_replicated_mtp_scope_uses_target_mla_forward(monkeypatch):
     scope = getattr(pcp, "replicated_mtp_batch_scope", nullcontext)
 
     with scope():
+        cache_inputs = module.maybe_gather_mla_latent_cache_inputs(
+            kv,
+            rope,
+            "global-slots",
+            0,
+            True,
+        )
         result = instance.forward(q, kv, rope)
 
+    assert cache_inputs == (kv, rope, "global-slots")
     assert result == "target-opaque-v0.25.1"
     assert module.full_forward_calls == [(instance, (q, kv, rope, None, None))]
     assert events == ["opaque_forward"]

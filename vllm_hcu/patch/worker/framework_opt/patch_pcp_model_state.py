@@ -46,6 +46,24 @@ def _attach_pcp_plan(attn_metadata: dict[str, object], pcp_plan: object) -> None
             setattr(metadata, "pcp_plan", pcp_plan)
 
 
+def _attach_pcp_cache_ownership(
+    attn_metadata: dict[str, object], has_global_prefill: bool
+) -> None:
+    """Keep PCP cache ownership separate from backend kernel classification."""
+    visited: set[int] = set()
+    for metadata in attn_metadata.values():
+        metadata_id = id(metadata)
+        if metadata_id in visited:
+            continue
+        visited.add(metadata_id)
+        if hasattr(metadata, "pcp_world_size"):
+            setattr(
+                metadata,
+                "pcp_has_global_prefill",
+                bool(has_global_prefill),
+            )
+
+
 def _require_source_fingerprint(function, target: str, expected: str) -> None:
     try:
         source = textwrap.dedent(inspect.getsource(function))
@@ -146,6 +164,17 @@ def apply_to_module(module: ModuleType) -> bool:
             _attach_pcp_plan(
                 attn_metadata,
                 getattr(input_batch, "_vllm_hcu_pcp_plan", None),
+            )
+            has_global_prefill = getattr(
+                input_batch,
+                "_vllm_hcu_pcp_has_global_prefill",
+                None,
+            )
+            if has_global_prefill is None:
+                has_global_prefill = bool(input_batch.is_prefilling_np.any())
+            _attach_pcp_cache_ownership(
+                attn_metadata,
+                has_global_prefill,
             )
         return attn_metadata
 

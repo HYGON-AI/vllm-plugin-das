@@ -98,7 +98,13 @@ def _rank_slot_slice(
         assert slot_mapping.shape[0] == expected_slots, (
             "PCP cache inputs require one equal-width slot segment per rank: "
             f"slots={slot_mapping.shape[0]}, local_tokens={local_num_tokens}, "
-            f"world_size={world_size}"
+            f"world_size={world_size}, "
+            f"num_decodes={getattr(metadata, 'num_decodes', None)}, "
+            f"num_decode_tokens={getattr(metadata, 'num_decode_tokens', None)}, "
+            f"num_prefills={getattr(metadata, 'num_prefills', None)}, "
+            f"num_actual_tokens={getattr(metadata, 'num_actual_tokens', None)}, "
+            "pcp_has_global_prefill="
+            f"{getattr(metadata, 'pcp_has_global_prefill', None)}"
         )
         start = rank * local_num_tokens
         return slot_mapping[start : start + local_num_tokens]
@@ -173,6 +179,34 @@ def _gather_prefill_cache_inputs(
         "PCP decode token count is outside the local tensor: "
         f"decode={num_decode_tokens}, local={local_num_tokens}"
     )
+    if getattr(metadata, "pcp_has_global_prefill", None) is False:
+        num_actual_tokens = int(
+            getattr(metadata, "num_actual_tokens", local_num_tokens)
+        )
+        assert 0 <= num_actual_tokens <= local_num_tokens, (
+            "PCP actual token count is outside the local tensor: "
+            f"actual={num_actual_tokens}, local={local_num_tokens}"
+        )
+        assert slot_mapping.shape[0] >= num_actual_tokens, (
+            "PCP cache slot mapping is shorter than the actual token prefix: "
+            f"slots={slot_mapping.shape[0]}, actual={num_actual_tokens}"
+        )
+        return (
+            tuple(tensor[:num_actual_tokens] for tensor in tensors),
+            slot_mapping[:num_actual_tokens],
+        )
+    if getattr(metadata, "num_prefills", None) == 0:
+        # Official MLA metadata counts actual tokens, while graph/warmup
+        # tensors can include right padding. Decode KV is replicated across
+        # PCP ranks, so cache only the actual decode prefix without gathering.
+        cache_tensors = tuple(
+            tensor[:num_decode_tokens] for tensor in tensors
+        )
+        return cache_tensors, _decode_only_slot_mapping(
+            slot_mapping,
+            local_num_tokens,
+            metadata,
+        )
     if num_decode_tokens == local_num_tokens:
         return tensors, _decode_only_slot_mapping(
             slot_mapping,
