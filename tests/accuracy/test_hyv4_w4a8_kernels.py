@@ -15,6 +15,12 @@ def runtime():
     return module
 
 
+@pytest.fixture
+def hcu_runtime():
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("a live HCU/ROCm device is required")
+
+
 def pack(values):
     return (((values[..., ::2].to(torch.int16) & 15) << 4)
             | (values[..., 1::2].to(torch.int16) & 15)).to(torch.int8)
@@ -25,9 +31,9 @@ def test_signed_nibble_reference():
     torch.testing.assert_close(values, torch.tensor([[-8, -1, 0, 7, -6, 5]], dtype=torch.int8))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires Hygon GPU')
+@pytest.mark.hcu
 @pytest.mark.parametrize('m,k,n', [(1,128,64), (35,256,96), (2,6144,512), (1,256,6144)])
-def test_linear_matches_quantized_reference(m,k,n):
+def test_linear_matches_quantized_reference(hcu_runtime,m,k,n):
     torch.manual_seed(12)
     x = torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
     w = torch.randint(-8,8,(n,k),device='cuda',dtype=torch.int8)
@@ -39,8 +45,8 @@ def test_linear_matches_quantized_reference(m,k,n):
     torch.testing.assert_close(actual,expected,rtol=.008,atol=.002)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires Hygon GPU')
-def test_moe_preserves_gate_up_clamp_and_routing():
+@pytest.mark.hcu
+def test_moe_preserves_gate_up_clamp_and_routing(hcu_runtime):
     torch.manual_seed(22)
     m,k,n,e = 5,128,128,3
     x = torch.randn(m,k,device='cuda',dtype=torch.bfloat16) * 3

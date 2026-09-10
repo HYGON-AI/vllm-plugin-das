@@ -629,6 +629,7 @@
       "patterns": [
         "vllm_hcu/model_executor/layers/fused_moe/**",
         "vllm_hcu/model_executor/layers/quantization/**",
+        "tests/accuracy/test_hyv4_w4a8_kernels.py",
         "vllm_hcu/patch/worker/**moe*",
         "tests/gemma4_test/**"
       ],

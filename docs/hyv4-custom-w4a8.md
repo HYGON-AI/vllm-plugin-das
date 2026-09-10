@@ -30,7 +30,7 @@ curl --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 ## Validation
 
 ```bash
-python -m pytest tests/models/hy_v4/test_custom_w4a8.py tests/ops/test_hyv4_w4a8_kernels.py -q
+python -m pytest tests/models/hy_v4/test_custom_w4a8.py tests/accuracy/test_hyv4_w4a8_kernels.py -q
 python -m pytest tests/models/hy_v4 tests/hy_v4 -q
 PYTHONPATH="$PWD" python -m vllm_hcu.doctor
 ```
@@ -70,3 +70,5 @@ The Graph-enabled completion matched all 32 baseline tokens, and the Chinese cha
 A 207-token prompt also exercised chunked prefill with the 128-token batch limit and returned a correct answer (32 generated tokens, finite log probabilities).
 
 The plugin contract suite (`python tools/run_patch_tests.py --suite contract -- -q`) also passed: 1317 tests, exit code 0.
+
+W4A8 kernel tests live in `tests/accuracy/test_hyv4_w4a8_kernels.py`. The CPU nibble reference is unmarked and runs in the contract suite; the five GPU numerical cases carry `hcu` and run in `accuracy-hcu` and nightly. Hardware availability is checked in a fixture at execution time.
