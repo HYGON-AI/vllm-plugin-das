@@ -15,6 +15,8 @@ server:
     - "4"
     - --attention-backend
     - FLASHMLA_SPARSE
+    - --reasoning-parser
+    - glm45
     - --moe-backend
     - aiter
     - --speculative-config
