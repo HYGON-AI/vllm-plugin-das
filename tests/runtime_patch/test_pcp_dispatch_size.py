@@ -14,6 +14,7 @@ from vllm_hcu.v1.pcp_manager import HcuPCPManager
 def _manager(pcp_size: int) -> HcuPCPManager:
     manager = object.__new__(HcuPCPManager)
     manager.pcp_size = pcp_size
+    manager._use_mla = True
     return manager
 
 
@@ -41,6 +42,19 @@ def test_pcp_dispatch_size_preserves_decode_and_empty_batches() -> None:
         np.array([], dtype=np.int32),
         np.array([], dtype=np.bool_),
     ) == 0
+
+
+def test_pcp_dispatch_size_includes_per_request_virtual_padding() -> None:
+    manager = _manager(2)
+
+    result = manager.get_num_tokens_for_dispatch(
+        np.array([1, 10], dtype=np.int32),
+        np.array([True, True], dtype=np.bool_),
+    )
+
+    # Each prefill is padded to its own widest PCP rank. Their widest chunks
+    # land on different ranks, so max(sum(rank))=6 would under-allocate.
+    assert result == 7
 
 
 def test_pcp_partition_accepts_official_runner_padding_contract() -> None:

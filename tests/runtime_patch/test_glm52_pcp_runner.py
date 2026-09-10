@@ -111,13 +111,22 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             events.append("super.prepare_attn")
             return ("global-blocks", input_batch), "global-slots"
 
-        def prepare_dummy_attn(self, input_batch):
+        def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
             events.append("super.prepare_dummy_attn")
             return ("global-dummy-blocks", input_batch), "global-dummy-slots"
 
         def sample_tokens(self, grammar_output):
             events.append("super.sample_tokens")
             assert grammar_output == "grammar"
+            manager = getattr(self, "pcp_manager", None)
+            if manager is not None:
+                hidden_states, input_batch = manager.restore_for_sampling(
+                    self.execute_model_state.hidden_states
+                )
+                self.execute_model_state = self.execute_model_state._replace(
+                    hidden_states=hidden_states,
+                    input_batch=input_batch,
+                )
             assert self.execute_model_state.hidden_states is self.expected_hidden
             assert self.execute_model_state.input_batch is self.expected_batch
             if hasattr(self, "expected_attn_metadata"):
@@ -145,11 +154,12 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
     yield adapter_module, events
 
 
-def _config(pcp_size: int) -> object:
+def _config(pcp_size: int, *, speculative: bool = True) -> object:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
-        )
+        ),
+        speculative_config=object() if speculative else None,
     )
 
 
@@ -171,7 +181,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Moving partition or restore across its upstream boundary is a bug."""
+    """Current upstream owns ordinary PCP sampling restore exactly once."""
 
     runner_module, events = pcp_runner_module
     global_batch = SimpleNamespace(
@@ -212,7 +222,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         return manager
 
     def synchronize(model_runner, input_batch):
-        assert events[-1] == "super.sample_tokens"
+        assert events[-2:] == ["super.sample_tokens", "restore_for_sampling"]
         assert model_runner is runner
         synchronized_batches.append(input_batch)
         return False
@@ -256,8 +266,8 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         "super.prepare_inputs",
         "partition_batch",
         "pcp.prepare_attn",
-        "restore_for_sampling",
         "super.sample_tokens",
+        "restore_for_sampling",
     ]
 
 
@@ -300,7 +310,7 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """v0.25.1 stores execution state in an immutable NamedTuple."""
+    """Upstream PCP restore replaces immutable execution state exactly once."""
 
     runner_module, _ = pcp_runner_module
     global_batch = object()

@@ -23,6 +23,7 @@ TARGETS = (
     f"{TARGET_MODULE}.MLACommonMetadataBuilder.build",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.maybe_gather_mla_latent_cache_inputs",
+    f"{TARGET_MODULE}.MLAAttention._use_sparse_mha",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -42,6 +43,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (builder_cls, "build", TARGETS[5], _WRAPPER),
         (mla, "split_decodes_and_prefills", TARGETS[6], _WRAPPER),
         (mla, "maybe_gather_mla_latent_cache_inputs", TARGETS[7], _WRAPPER),
+        (cls, "_use_sparse_mha", TARGETS[8], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -75,6 +77,16 @@ def apply_to_module(module: ModuleType) -> bool:
         mla,
         "maybe_gather_mla_latent_cache_inputs",
         TARGETS[7],
+    )
+    original_use_sparse_mha = require_callable(
+        cls,
+        "_use_sparse_mha",
+        TARGETS[8],
+    )
+    require_exact_signature(
+        original_use_sparse_mha,
+        TARGETS[8],
+        positional=("self", "attn_metadata"),
     )
     require_exact_signature(
         original_cache_gather,
@@ -188,101 +200,18 @@ def apply_to_module(module: ModuleType) -> bool:
         output_shape=None,
         q_dcp_replicated=None,
     ):
-        if not getattr(self, "_hcu_use_pcp", False):
-            return original_full_forward(
-                self,
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape,
-                q_dcp_replicated,
-            )
-        from vllm_hcu.model_executor.layers.attention.pcp import (
-            in_replicated_mtp_batch,
-        )
-
-        if in_replicated_mtp_batch():
-            return original_full_forward(
-                self,
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape,
-                q_dcp_replicated,
-            )
-
-        # Current vLLM initializes KV-cache quantization without the legacy
-        # calculate_kv_scales flag. Preserve the older ABI when present while
-        # treating its absence as the current upstream no-op behavior.
-        if getattr(self, "calculate_kv_scales", False):
-            torch_module.ops.vllm.maybe_calc_kv_scales(
-                q,
-                kv_c_normed,
-                k_pe,
-                encode_layer_name(self.layer_name),
-            )
-
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
-        if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw[self.layer_name]
-        elif isinstance(attn_metadata_raw, list):
-            attn_metadata = attn_metadata_raw[0][self.layer_name]
-        else:
-            attn_metadata = attn_metadata_raw
-        if attn_metadata is not None:
-            slot_mapping = forward_context.slot_mapping
-            if not isinstance(slot_mapping, dict):
-                raise RuntimeError(
-                    "PCP MLA direct forward requires per-layer slot mappings"
-                )
-            layer_slot_mapping = slot_mapping.get(self.layer_name)
-            if layer_slot_mapping is None:
-                raise RuntimeError(
-                    "PCP MLA slot mapping is missing for layer "
-                    f"{self.layer_name!r}"
-                )
-            metadata_world_size = int(
-                getattr(attn_metadata, "pcp_world_size", 1)
-            )
-            if metadata_world_size != self._hcu_pcp_world_size:
-                raise RuntimeError(
-                    "PCP MLA metadata world size mismatch: "
-                    f"layer={self._hcu_pcp_world_size}, "
-                    f"metadata={metadata_world_size}"
-                )
-
-            from vllm_hcu.model_executor.layers.attention.pcp import (
-                maybe_gather_mla_latent_cache_inputs,
-            )
-
-            kv_for_cache, kpe_for_cache, layer_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c_normed,
-                    k_pe,
-                    layer_slot_mapping,
-                    attn_metadata,
-                )
-            )
-            self.impl.do_kv_cache_update(
-                kv_for_cache,
-                kpe_for_cache,
-                self.kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
-        output = torch_module.empty(output_shape, dtype=q.dtype, device=q.device)
-        self.forward_impl(
+        # Current upstream owns the direct MLA forward and PCP cache gather.
+        # The imported gather alias is wrapped below only to preserve the HCU
+        # replicated-MTP slot-layout contract. The backend cache-update method
+        # remains HCU-owned, so this continues to use the HIPC writer.
+        return original_full_forward(
+            self,
             q,
             kv_c_normed,
             k_pe,
-            self.kv_cache,
-            attn_metadata,
-            output=output,
-            q_dcp_replicated=q_dcp_replicated,
+            output_shape,
+            q_dcp_replicated,
         )
-        return output
 
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
@@ -374,6 +303,21 @@ def apply_to_module(module: ModuleType) -> bool:
 
         if in_replicated_mtp_batch():
             return kv_c_normed, k_pe, slot_mapping
+        # MTP can reclassify a replicated non-spec decode as a prefill when it
+        # shares a batch with speculative decode tokens.  HcuPCPManager keeps
+        # one slot per replicated token in that case; only a genuinely PCP-
+        # partitioned prefill carries one local-width slot segment per rank.
+        # Do not let the upstream gather reinterpret the replicated layout as
+        # ``pcp_size * local_num_tokens``.  KV writes still use the upstream
+        # MLA path and the HCU HIPC writer.
+        if (
+            use_pcp
+            and num_decode_tokens is not None
+            and num_decode_tokens < kv_c_normed.shape[0]
+            and slot_mapping is not None
+            and slot_mapping.shape[0] == kv_c_normed.shape[0]
+        ):
+            return kv_c_normed, k_pe, slot_mapping
         return original_cache_gather(
             kv_c_normed,
             k_pe,
@@ -381,6 +325,15 @@ def apply_to_module(module: ModuleType) -> bool:
             num_decode_tokens,
             use_pcp,
         )
+
+    @functools.wraps(original_use_sparse_mha)
+    def hcu_use_sparse_mha(self, attn_metadata):
+        # The current upstream short-prefill MHA path is rank-local and does
+        # not combine PCP attention states. Keep the v0.25.1 sparse-MQA path
+        # for PCP until upstream MHA prefill owns that collective.
+        if getattr(self, "_hcu_use_pcp", False):
+            return False
+        return original_use_sparse_mha(self, attn_metadata)
 
     for function in (
         hcu_init,
@@ -391,12 +344,14 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_build,
         hcu_split_batch,
         hcu_cache_gather,
+        hcu_use_sparse_mha,
     ):
         setattr(function, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
     setattr(cls, "_vllm_hcu_original_forward", original_full_forward)
     setattr(cls, "_vllm_hcu_original_forward_impl", original_forward)
     setattr(cls, "_vllm_hcu_original_process_weights", process)
+    setattr(cls, "_vllm_hcu_original_use_sparse_mha", original_use_sparse_mha)
     setattr(metadata_cls, "_vllm_hcu_original_init", metadata_init)
     setattr(builder_cls, "_vllm_hcu_original_build", builder)
     setattr(mla, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
@@ -404,6 +359,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "forward", hcu_full_forward)
     setattr(cls, "forward_impl", hcu_forward)
     setattr(cls, "process_weights_after_loading", hcu_process)
+    setattr(cls, "_use_sparse_mha", hcu_use_sparse_mha)
     setattr(metadata_cls, "__init__", hcu_metadata_init)
     setattr(builder_cls, "build", hcu_build)
     setattr(mla, "split_decodes_and_prefills", hcu_split_batch)

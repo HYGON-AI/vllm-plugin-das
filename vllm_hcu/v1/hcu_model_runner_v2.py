@@ -194,8 +194,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
-        use_replicated_mtp_batch = False
-        if self.pcp_manager is not None and execute_model_state is not None:
+        use_replicated_mtp_batch = (
+            self.pcp_manager is not None
+            and execute_model_state is not None
+            and getattr(self, "speculator", None) is not None
+        )
+        if use_replicated_mtp_batch:
             (
                 restored_hidden_states,
                 restored_input_batch,
@@ -206,7 +210,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
-            use_replicated_mtp_batch = getattr(self, "speculator", None) is not None
             self.execute_model_state = execute_model_state
         input_batch = (
             None
@@ -218,11 +221,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if use_replicated_mtp_batch
             else nullcontext()
         )
+        pcp_manager = self.pcp_manager
         with scope:
             if use_replicated_mtp_batch:
                 assert execute_model_state is not None
                 assert input_batch is not None
-                block_tables, slot_mappings = self.pcp_manager.prepare_global_attn()
+                block_tables, slot_mappings = pcp_manager.prepare_global_attn()
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
                     slot_mappings, self.kv_cache_config
                 )
@@ -239,7 +243,21 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     slot_mappings_by_layer=slot_mappings_by_layer,
                 )
                 self.execute_model_state = execute_model_state
-            output = super().sample_tokens(grammar_output)
+            if use_replicated_mtp_batch:
+                # The HCU path restored PCP state above so it could rebuild
+                # global draft metadata. Upstream sample_tokens() now performs
+                # the same restore itself, so hide the manager to avoid a
+                # second gather/reorder of the global batch.
+                self.pcp_manager = None
+                try:
+                    output = super().sample_tokens(grammar_output)
+                finally:
+                    self.pcp_manager = pcp_manager
+            else:
+                # Current upstream owns the ordinary PCP restore lifecycle.
+                output = super().sample_tokens(grammar_output)
+                if self.execute_model_state is not None:
+                    input_batch = self.execute_model_state.input_batch
         if input_batch is not None:
             synchronize_pp_spec_draft_tokens(self, input_batch)
         return output

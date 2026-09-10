@@ -234,6 +234,33 @@ class HcuPCPManager:
     ) -> int:
         """Return the largest real rank-local batch before runner padding."""
 
+        if self._use_mla:
+            # MLA/EP collectives require each request to contribute the same
+            # token width on every PCP rank. _build_batch_layout() adds virtual
+            # padding per request, so sum each request's widest rank rather
+            # than taking the widest aggregate rank. Different requests can
+            # have different widest ranks.
+            num_tokens = 0
+            for length_value, is_prefill_value in zip(
+                num_scheduled_tokens, is_prefilling
+            ):
+                length = int(length_value)
+                if not bool(is_prefill_value):
+                    num_tokens += length
+                    continue
+                num_tokens += max(
+                    sum(
+                        segment.num_tokens
+                        for segment in self.rank_segments(
+                            length,
+                            pcp_rank=rank,
+                            pcp_size=self.pcp_size,
+                        )
+                    )
+                    for rank in range(self.pcp_size)
+                )
+            return num_tokens
+
         largest = 0
         for rank in range(self.pcp_size):
             local_tokens = 0
@@ -491,7 +518,7 @@ class HcuPCPManager:
         self._local_segments = list(segments)
         num_local_reqs = len(segments)
         num_local_tokens = per_rank_num_tokens[self.pcp_rank]
-        num_padded_tokens = max(per_rank_num_tokens, default=0)
+        num_padded_tokens = self._padded_num_tokens
         if num_local_reqs > self._max_local_reqs:
             raise RuntimeError("PCP local request count exceeds its buffer")
         if num_padded_tokens > self._max_local_tokens:

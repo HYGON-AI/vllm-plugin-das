@@ -193,6 +193,8 @@ def _adapter():
 def _fake_mla_module(adapter, target_calls, event_log=None):
     split_calls = []
     full_forward_calls = []
+    sparse_mha_calls = []
+    cache_gather_calls = []
 
     def split_decodes_and_prefills(
         common_attn_metadata,
@@ -311,6 +313,10 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
         def process_weights_after_loading(self, act_dtype):
             return act_dtype
 
+        def _use_sparse_mha(self, attn_metadata):
+            sparse_mha_calls.append((self, attn_metadata))
+            return True
+
     class MLACommonMetadata:
         def __init__(self, num_actual_tokens):
             self.num_actual_tokens = num_actual_tokens
@@ -332,15 +338,29 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
     module.MLACommonMetadata = MLACommonMetadata
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
     module.split_decodes_and_prefills = split_decodes_and_prefills
-    module.maybe_gather_mla_latent_cache_inputs = (
-        lambda kv_c_normed, k_pe, slot_mapping, num_decode_tokens, use_pcp: (
+    def maybe_gather_mla_latent_cache_inputs(
+        kv_c_normed,
+        k_pe,
+        slot_mapping,
+        num_decode_tokens,
+        use_pcp,
+    ):
+        cache_gather_calls.append(
+            (kv_c_normed, k_pe, slot_mapping, num_decode_tokens, use_pcp)
+        )
+        return (
             kv_c_normed,
             k_pe,
             slot_mapping,
         )
+
+    module.maybe_gather_mla_latent_cache_inputs = (
+        maybe_gather_mla_latent_cache_inputs
     )
     module.split_calls = split_calls
     module.full_forward_calls = full_forward_calls
+    module.sparse_mha_calls = sparse_mha_calls
+    module.cache_gather_calls = cache_gather_calls
     module.get_forward_context = lambda: pytest.fail(
         "test did not install a forward context"
     )
@@ -447,6 +467,22 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     assert module.split_calls[-1] == (warmup, 3, True, True)
 
 
+def test_mla_pcp_disables_rank_local_sparse_mha_prefill():
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    assert adapter.apply_to_module(module) is True
+
+    metadata = object()
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_use_pcp = True
+    assert instance._use_sparse_mha(metadata) is False
+    assert module.sparse_mha_calls == []
+
+    instance._hcu_use_pcp = False
+    assert instance._use_sparse_mha(metadata) is True
+    assert module.sparse_mha_calls == [(instance, metadata)]
+
+
 def test_mla_feature_on_uses_hcu_lightly_cp_delta(monkeypatch):
     adapter = _adapter()
     target_calls = []
@@ -530,7 +566,7 @@ def test_mla_init_rejects_combined_pcp_and_lightly_cp(monkeypatch):
         module.MLAAttention(1, 1.0, 1, 1, 1, None, 1, object())
 
 
-def test_mla_pcp_full_forward_gathers_cache_inputs_and_keeps_q_local(
+def test_mla_pcp_full_forward_delegates_current_upstream_ownership(
     monkeypatch,
 ):
     adapter = _adapter()
@@ -604,15 +640,15 @@ def test_mla_pcp_full_forward_gathers_cache_inputs_and_keeps_q_local(
         output_shape=torch.Size([2, 1]),
     )
 
-    assert result.shape == (2, 1)
-    assert events == ["gather", "cache", "forward_impl"]
-    assert module.full_forward_calls == []
-    assert len(target_calls) == 1
-    forwarded_args = target_calls[0][1]
-    assert forwarded_args[0] is q
-    assert forwarded_args[1] is local_kv
-    assert forwarded_args[2] is local_rope
-    assert forwarded_args[4] is metadata
+    assert result == "target-opaque-v0.25.1"
+    assert events == ["opaque_forward"]
+    assert module.full_forward_calls == [
+        (
+            instance,
+            (q, local_kv, local_rope, torch.Size([2, 1]), None),
+        )
+    ]
+    assert target_calls == []
 
 
 def test_mla_pcp_profile_forward_skips_cache_without_metadata(monkeypatch):
@@ -658,39 +694,15 @@ def test_mla_pcp_profile_forward_skips_cache_without_metadata(monkeypatch):
         output_shape=torch.Size([2, 1]),
     )
 
-    assert result.shape == (2, 1)
-    assert events == ["forward_impl"]
-    assert len(target_calls) == 1
-    forwarded_args = target_calls[0][1]
-    assert forwarded_args[0] is q
-    assert forwarded_args[1] is local_kv
-    assert forwarded_args[2] is local_rope
-    assert forwarded_args[4] is None
-
-
-def test_mla_pcp_real_forward_rejects_missing_layer_slots():
-    adapter = _adapter()
-    module = _fake_mla_module(adapter, [])
-    metadata = SimpleNamespace(pcp_world_size=2)
-    module.get_forward_context = lambda: SimpleNamespace(
-        attn_metadata={"layer": metadata},
-        slot_mapping={},
-    )
-    assert adapter.apply_to_module(module) is True
-
-    instance = object.__new__(module.MLAAttention)
-    instance._hcu_use_pcp = True
-    instance._hcu_pcp_world_size = 2
-    instance.calculate_kv_scales = False
-    instance.layer_name = "layer"
-
-    with pytest.raises(RuntimeError, match="slot mapping is missing"):
-        instance.forward(
-            torch.ones(1, 1),
-            torch.ones(1, 1),
-            torch.ones(1, 1, 1),
-            output_shape=torch.Size([1, 1]),
+    assert result == "target-opaque-v0.25.1"
+    assert events == ["opaque_forward"]
+    assert module.full_forward_calls == [
+        (
+            instance,
+            (q, local_kv, local_rope, torch.Size([2, 1]), None),
         )
+    ]
+    assert target_calls == []
 
 
 def test_mla_pcp_one_keeps_target_opaque_full_forward(monkeypatch):
@@ -754,6 +766,28 @@ def test_replicated_mtp_scope_uses_target_mla_forward(monkeypatch):
     assert result == "target-opaque-v0.25.1"
     assert module.full_forward_calls == [(instance, (q, kv, rope, None, None))]
     assert events == ["opaque_forward"]
+
+
+def test_mla_cache_gather_distinguishes_replicated_mtp_from_pcp_prefill():
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+    assert adapter.apply_to_module(module) is True
+
+    kv = torch.ones(5, 1)
+    rope = torch.ones(5, 1, 1)
+    replicated_slots = torch.arange(5)
+    assert module.maybe_gather_mla_latent_cache_inputs(
+        kv, rope, replicated_slots, 4, True
+    ) == (kv, rope, replicated_slots)
+    assert module.cache_gather_calls == []
+
+    partitioned_slots = torch.arange(10)
+    assert module.maybe_gather_mla_latent_cache_inputs(
+        kv, rope, partitioned_slots, 4, True
+    ) == (kv, rope, partitioned_slots)
+    assert module.cache_gather_calls == [
+        (kv, rope, partitioned_slots, 4, True)
+    ]
 
 
 def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
