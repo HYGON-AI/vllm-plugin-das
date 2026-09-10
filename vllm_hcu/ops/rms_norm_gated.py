@@ -83,12 +83,40 @@ def _vllm_qwen_rmsnorm_gated_fallback(
     )
 
 
+def _is_lightop_runtime_tensor_eligible(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    return (
+        x.ndim == 2
+        and z.ndim == 2
+        and weight.ndim == 1
+        and x.shape[0] in _VERIFIED_QWEN_ROWS
+        and x.shape[1] in _VERIFIED_QWEN_WIDTHS
+        and z.shape == x.shape
+        and weight.shape[0] == x.shape[1]
+        and x.dtype is torch.bfloat16
+        and z.dtype is x.dtype
+        and weight.dtype is x.dtype
+        and x.device.type == "cuda"
+        and z.device == x.device
+        and weight.device == x.device
+        and x.is_contiguous()
+        and z.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
 def _hcu_lightop_qwen_rmsnorm_gated_impl(
     x: torch.Tensor,
     z: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
+    if not _is_lightop_runtime_tensor_eligible(x, z, weight):
+        return _vllm_qwen_rmsnorm_gated_fallback(x, z, weight, eps)
+
     layer_norm_fwd_1pass_opt = _lightop_layer_norm_fwd_1pass_opt()
     if layer_norm_fwd_1pass_opt is None:
         return _vllm_qwen_rmsnorm_gated_fallback(x, z, weight, eps)
@@ -151,13 +179,9 @@ def _is_qwen_gated_rmsnorm_eligible(
         and henvs.VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED
     ):
         return False
-    if (
-        x.ndim != 2
-        or x.shape[0] not in _VERIFIED_QWEN_ROWS
-        or x.shape[1] not in _VERIFIED_QWEN_WIDTHS
-    ):
+    if x.ndim != 2 or x.shape[1] not in _VERIFIED_QWEN_WIDTHS:
         return False
-    if z is None or z.shape != x.shape:
+    if z is None or z.ndim != 2 or z.shape[1] != x.shape[1]:
         return False
     weight = layer.weight
     if (
@@ -208,7 +232,7 @@ class HcuRMSNormGated(RMSNormGated):
                 self.weight,
                 self.eps,
             )
-        return self.forward_cuda(x, z)
+        return self.forward_native(x, z)
 
 
 __all__ = [
