@@ -665,6 +665,30 @@ def test_lightop_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
     assert q.shape == (num_tokens, q_size // head_size, head_size)
 
 
+def _boltops_chunk_h_contract(
+    k, w, u, g=None, gk=None, initial_state=None,
+    initial_state_indices=None, output_final_state=True,
+    inplace_final_state=False, chunk_size=64, save_new_value=True,
+    cu_seqlens=None, chunk_indices=None, use_exp2=False,
+    transpose_state_layout=True, kernel_cfg=None,
+):
+    pass
+
+
+def _boltops_chunk_o_contract(
+    q, k, v, h, g=None, g_gamma=None, scale=None, cu_seqlens=None,
+    chunk_size=64, chunk_indices=None, use_exp2=False,
+    transpose_state_layout=False, kernel_cfg=None,
+):
+    pass
+
+
+def _boltops_recompute_contract(
+    k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=None,
+):
+    pass
+
+
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
     adapter = _adapter("patch_fla_chunk_o")
 
@@ -700,6 +724,8 @@ def test_fla_chunk_delta_h_uses_boltops(monkeypatch):
     def boltops(*args, **kwargs):
         calls.append((args, kwargs))
         return "boltops-h", "boltops-v", "boltops-final"
+
+    boltops.__signature__ = inspect.signature(_boltops_chunk_h_contract)
 
     module = _module(
         adapter.TARGET_MODULE,
@@ -754,6 +780,8 @@ def test_fla_chunk_o_uses_boltops_and_preserves_output_buffer(monkeypatch):
     def boltops(**kwargs):
         calls.append(kwargs)
         return kwargs["v"] + 3
+
+    boltops.__signature__ = inspect.signature(_boltops_chunk_o_contract)
 
     module = _module(
         adapter.TARGET_MODULE,
@@ -888,6 +916,8 @@ def test_fla_recompute_w_u_uses_boltops(monkeypatch):
         calls.append((args, kwargs))
         return "boltops-w", "boltops-u"
 
+    boltops.__signature__ = inspect.signature(_boltops_recompute_contract)
+
     module = _module(adapter.TARGET_MODULE, recompute_w_u_fwd=original)
     _install_fake_module(
         monkeypatch,
@@ -944,6 +974,36 @@ def test_fla_recompute_w_u_missing_boltops_falls_back(monkeypatch):
 
     assert result == "official"
     assert calls == [(cu_seqlens, chunk_indices)]
+
+
+def test_fla_boltops_signature_drift_fails_closed(monkeypatch):
+    adapter = _adapter("patch_fla_chunk_o")
+
+    def original(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+                 chunk_indices=None, chunk_size=64, core_attn_out=None):
+        return "official"
+
+    def incompatible(q, k, v):
+        return q
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FLA_CHUNK_SIZE=64,
+        chunk_fwd_o=original,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "boltops.fla.gdn",
+        chunk_fwd_o=incompatible,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    adapter.apply_to_module(module)
+    compatibility_error = _adapter("_common").PatchCompatibilityError
+    with pytest.raises(compatibility_error, match="audited BoltOPs 0.1.0"):
+        module.chunk_fwd_o(*(torch.empty(1) for _ in range(4)))
 
 
 def test_mamba_nn_sharded_loader_cpu_numeric():

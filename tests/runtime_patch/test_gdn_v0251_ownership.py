@@ -307,6 +307,22 @@ def _packed_recurrent_contract(
     return "target-recurrent"
 
 
+def _boltops_sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0,
+    scale=None, initial_state=None, inplace_final_state=True,
+    cu_seqlens=None, ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False, kernel_cfg=None,
+):
+    pass
+
+
+def _boltops_packed_recurrent_contract(
+    mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
+    ssm_state_indices, use_qk_l2norm_in_kernel=False, kernel_cfg=None,
+):
+    pass
+
+
 def _sigmoid_args(A_log_dtype=torch.bfloat16, q_dtype=torch.bfloat16):
     return (
         torch.empty(1, dtype=A_log_dtype),
@@ -328,6 +344,8 @@ def test_qwen_sigmoid_uses_boltops(monkeypatch):
     def boltops(*args, **kwargs):
         calls.append((args, kwargs))
         return "boltops"
+
+    boltops.__signature__ = inspect.signature(_boltops_sigmoid_contract)
 
     _install_module(
         monkeypatch,
@@ -352,12 +370,14 @@ def test_qwen_sigmoid_uses_boltops_for_mixed_dtype(monkeypatch):
     module, _, _, _, _ = _fake_qwen(aiter_available=False)
     module.fused_sigmoid_gating_delta_rule_update = _sigmoid_contract
     calls = []
+    boltops = lambda *args, **kwargs: (
+        calls.append((args, kwargs)) or "boltops"
+    )
+    boltops.__signature__ = inspect.signature(_boltops_sigmoid_contract)
     _install_module(
         monkeypatch,
         "boltops.fla.gdn",
-        fused_sigmoid_gating_delta_rule_update=lambda *args, **kwargs: (
-            calls.append((args, kwargs)) or "boltops"
-        ),
+        fused_sigmoid_gating_delta_rule_update=boltops,
     )
     from vllm_hcu.platforms import envs as henvs
 
@@ -380,6 +400,10 @@ def test_qwen_packed_recurrent_uses_boltops(monkeypatch):
     def boltops(*args, **kwargs):
         calls.append((args, kwargs))
         return "boltops-out", "boltops-state"
+
+    boltops.__signature__ = inspect.signature(
+        _boltops_packed_recurrent_contract
+    )
 
     _install_module(
         monkeypatch,
@@ -404,6 +428,41 @@ def test_qwen_packed_recurrent_uses_boltops(monkeypatch):
     assert result == ("boltops-out", "boltops-state")
     assert len(calls) == 1
     assert calls[0][0][-1] is True
+
+
+def test_qwen_sigmoid_missing_boltops_symbol_falls_back(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    _install_module(monkeypatch, "boltops.fla.gdn")
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    adapter.apply_to_module(module)
+    assert (
+        module.fused_sigmoid_gating_delta_rule_update(*_sigmoid_args())
+        == "target-sigmoid"
+    )
+
+
+def test_qwen_packed_recurrent_missing_boltops_symbol_falls_back(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    _install_module(monkeypatch, "boltops.fla.gdn")
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    adapter.apply_to_module(module)
+    args = tuple(torch.empty(1) for _ in range(5))
+    result = module.fused_recurrent_gated_delta_rule_packed_decode(
+        *args,
+        0.5,
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1, dtype=torch.long),
+    )
+    assert result == "target-packed_recurrent"
 
 
 def _install_module(monkeypatch: pytest.MonkeyPatch, name: str, **values):

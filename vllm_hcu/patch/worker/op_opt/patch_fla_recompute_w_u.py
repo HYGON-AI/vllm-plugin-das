@@ -13,6 +13,7 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
+from ._boltops_fla import make_boltops_gdn_resolver
 
 TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk"
 PATCH_ID = "worker.op_opt.fla.recompute_w_u.boltops"
@@ -45,6 +46,7 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
         defaults={"chunk_indices": None},
     )
+    resolve_boltops = make_boltops_gdn_resolver("recompute_w_u_fwd")
 
     @functools.wraps(original)
     def hcu_recompute_w_u(
@@ -60,9 +62,8 @@ def apply_to_module(module: ModuleType) -> bool:
             return original(
                 k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices,
             )
-        try:
-            from boltops.fla.gdn import recompute_w_u_fwd as boltops_kernel
-        except ImportError:
+        boltops_kernel = resolve_boltops()
+        if boltops_kernel is None:
             return original(
                 k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices,
             )

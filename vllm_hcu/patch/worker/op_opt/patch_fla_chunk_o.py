@@ -13,6 +13,7 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
+from ._boltops_fla import make_boltops_gdn_resolver
 
 TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk"
 PATCH_ID = "worker.op_opt.fla.chunk_o.boltops"
@@ -52,6 +53,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "core_attn_out": None,
         },
     )
+    resolve_boltops = make_boltops_gdn_resolver("chunk_fwd_o")
 
     @functools.wraps(original)
     def hcu_chunk_o(
@@ -71,9 +73,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 q, k, v, h, g, scale, cu_seqlens, chunk_indices,
                 chunk_size, core_attn_out,
             )
-        try:
-            from boltops.fla.gdn import chunk_fwd_o as boltops_kernel
-        except ImportError:
+        boltops_kernel = resolve_boltops()
+        if boltops_kernel is None:
             return original(
                 q, k, v, h, g, scale, cu_seqlens, chunk_indices,
                 chunk_size, core_attn_out,

@@ -13,6 +13,7 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
+from ._boltops_fla import make_boltops_gdn_resolver
 
 TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk"
 PATCH_ID = "worker.op_opt.fla.chunk_delta_h.boltops"
@@ -57,6 +58,9 @@ def apply_to_module(module: ModuleType) -> bool:
             "use_exp2": False,
         },
     )
+    resolve_boltops = make_boltops_gdn_resolver(
+        "chunk_gated_delta_rule_fwd_h"
+    )
 
     @functools.wraps(original)
     def hcu_chunk_delta_h(
@@ -80,11 +84,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 chunk_size, save_new_value, cu_seqlens, chunk_indices,
                 chunk_offsets, use_exp2,
             )
-        try:
-            from boltops.fla.gdn import (
-                chunk_gated_delta_rule_fwd_h as boltops_kernel,
-            )
-        except ImportError:
+        boltops_kernel = resolve_boltops()
+        if boltops_kernel is None:
             return original(
                 k, w, u, g, gk, initial_state, output_final_state,
                 chunk_size, save_new_value, cu_seqlens, chunk_indices,

@@ -15,6 +15,7 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
+from ._boltops_fla import make_boltops_gdn_resolver
 from ._gdn_common import (
     normalize_nn_conv_weight,
     require_parameter_names,
@@ -144,18 +145,19 @@ def apply_to_module(module: ModuleType) -> bool:
         defaults={"use_qk_l2norm_in_kernel": False},
     )
     recurrent_signature = inspect.signature(official_recurrent)
+    resolve_boltops_sigmoid = make_boltops_gdn_resolver(
+        "fused_sigmoid_gating_delta_rule_update"
+    )
+    resolve_boltops_recurrent = make_boltops_gdn_resolver(
+        "fused_recurrent_gated_delta_rule_packed_decode"
+    )
 
     @functools.wraps(official_sigmoid)
     def hcu_sigmoid_update(*args, **kwargs):
         bound = sigmoid_signature.bind(*args, **kwargs)
         bound.apply_defaults()
         if _boltops_enabled():
-            try:
-                from boltops.fla.gdn import (
-                    fused_sigmoid_gating_delta_rule_update as boltops_kernel,
-                )
-            except ImportError:
-                boltops_kernel = None
+            boltops_kernel = resolve_boltops_sigmoid()
             if boltops_kernel is not None:
                 return boltops_kernel(*bound.args, **bound.kwargs)
         return official_sigmoid(*bound.args, **bound.kwargs)
@@ -165,12 +167,7 @@ def apply_to_module(module: ModuleType) -> bool:
         bound = recurrent_signature.bind(*args, **kwargs)
         bound.apply_defaults()
         if _boltops_enabled():
-            try:
-                from boltops.fla.gdn import (
-                    fused_recurrent_gated_delta_rule_packed_decode as boltops_kernel,
-                )
-            except ImportError:
-                boltops_kernel = None
+            boltops_kernel = resolve_boltops_recurrent()
             if boltops_kernel is not None:
                 return boltops_kernel(*bound.args, **bound.kwargs)
         return official_recurrent(*bound.args, **bound.kwargs)
