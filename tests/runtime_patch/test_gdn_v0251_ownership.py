@@ -240,9 +240,11 @@ def _fake_qwen(*, aiter_available: bool = True):
     class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         pass
 
-    def recurrent(*args, **kwargs):
-        del args, kwargs
-        return "target-recurrent"
+    recurrent = _recording_callable(
+        _packed_recurrent_contract,
+        "packed_recurrent",
+        calls,
+    )
 
     sigmoid = _recording_callable(_sigmoid_contract, "sigmoid", calls)
 
@@ -288,6 +290,23 @@ def _sigmoid_contract(
     return "target-sigmoid"
 
 
+def _packed_recurrent_contract(
+    mixed_qkv,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    scale,
+    initial_state,
+    out,
+    ssm_state_indices,
+    use_qk_l2norm_in_kernel=False,
+):
+    del mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out
+    del ssm_state_indices, use_qk_l2norm_in_kernel
+    return "target-recurrent"
+
+
 def _sigmoid_args(A_log_dtype=torch.bfloat16, q_dtype=torch.bfloat16):
     return (
         torch.empty(1, dtype=A_log_dtype),
@@ -300,27 +319,20 @@ def _sigmoid_args(A_log_dtype=torch.bfloat16, q_dtype=torch.bfloat16):
     )
 
 
-def test_qwen_sigmoid_prefers_aiter_hip_for_matching_dtype(monkeypatch):
+def test_qwen_sigmoid_uses_boltops(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
     module, _, _, _, _ = _fake_qwen(aiter_available=False)
     module.fused_sigmoid_gating_delta_rule_update = _sigmoid_contract
     calls = []
 
-    def hip(*args, **kwargs):
+    def boltops(*args, **kwargs):
         calls.append((args, kwargs))
-        return "hip"
+        return "boltops"
 
     _install_module(
         monkeypatch,
-        "aiter",
-        vllm_fused_sigmoid_gating_delta_rule_update=hip,
-    )
-    _install_module(
-        monkeypatch,
-        "aiter.ops.triton.fla.fused_sigmoid_gating",
-        fused_sigmoid_gating_delta_rule_update=lambda *_args, **_kwargs: pytest.fail(
-            "HIP must have priority"
-        ),
+        "boltops.fla.gdn",
+        fused_sigmoid_gating_delta_rule_update=boltops,
     )
     from vllm_hcu.platforms import envs as henvs
 
@@ -328,27 +340,23 @@ def test_qwen_sigmoid_prefers_aiter_hip_for_matching_dtype(monkeypatch):
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
     adapter.apply_to_module(module)
 
-    assert module.fused_sigmoid_gating_delta_rule_update(*_sigmoid_args()) == "hip"
+    assert (
+        module.fused_sigmoid_gating_delta_rule_update(*_sigmoid_args())
+        == "boltops"
+    )
     assert len(calls) == 1
 
 
-def test_qwen_sigmoid_uses_aiter_triton_for_mixed_dtype(monkeypatch):
+def test_qwen_sigmoid_uses_boltops_for_mixed_dtype(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
     module, _, _, _, _ = _fake_qwen(aiter_available=False)
     module.fused_sigmoid_gating_delta_rule_update = _sigmoid_contract
     calls = []
     _install_module(
         monkeypatch,
-        "aiter",
-        vllm_fused_sigmoid_gating_delta_rule_update=lambda *_args, **_kwargs: pytest.fail(
-            "mixed dtype must not enter HIP"
-        ),
-    )
-    _install_module(
-        monkeypatch,
-        "aiter.ops.triton.fla.fused_sigmoid_gating",
+        "boltops.fla.gdn",
         fused_sigmoid_gating_delta_rule_update=lambda *args, **kwargs: (
-            calls.append((args, kwargs)) or "triton"
+            calls.append((args, kwargs)) or "boltops"
         ),
     )
     from vllm_hcu.platforms import envs as henvs
@@ -360,8 +368,42 @@ def test_qwen_sigmoid_uses_aiter_triton_for_mixed_dtype(monkeypatch):
     result = module.fused_sigmoid_gating_delta_rule_update(
         *_sigmoid_args(torch.float32, torch.bfloat16)
     )
-    assert result == "triton"
+    assert result == "boltops"
     assert len(calls) == 1
+
+
+def test_qwen_packed_recurrent_uses_boltops(monkeypatch):
+    adapter = _adapter("patch_gdn_linear_attention")
+    module, _, _, _, _ = _fake_qwen(aiter_available=False)
+    calls = []
+
+    def boltops(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "boltops-out", "boltops-state"
+
+    _install_module(
+        monkeypatch,
+        "boltops.fla.gdn",
+        fused_recurrent_gated_delta_rule_packed_decode=boltops,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    adapter.apply_to_module(module)
+    args = tuple(torch.empty(1) for _ in range(5))
+    result = module.fused_recurrent_gated_delta_rule_packed_decode(
+        *args,
+        0.5,
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1, dtype=torch.long),
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert result == ("boltops-out", "boltops-state")
+    assert len(calls) == 1
+    assert calls[0][0][-1] is True
 
 
 def _install_module(monkeypatch: pytest.MonkeyPatch, name: str, **values):
@@ -448,9 +490,9 @@ def test_qwen_local_weight_deltas_and_target_fla_ownership(
     assert canonical.causal_conv1d_update is consumer.causal_conv1d_update
     assert module.causal_conv1d_fn is not canonical.causal_conv1d_fn
     assert module.causal_conv1d_update is not canonical.causal_conv1d_update
-    assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
+    assert module.fused_recurrent_gated_delta_rule_packed_decode is not recurrent
+    assert module._vllm_hcu_original_fused_recurrent is recurrent
     assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
-    assert not hasattr(module, "_vllm_hcu_original_fused_recurrent")
     assert module._vllm_hcu_original_fused_sigmoid is sigmoid
 
     conv_state = torch.empty(1, 8, 3)
@@ -536,7 +578,8 @@ def test_native_aiter_unavailable_is_idempotent_and_does_not_require_symbol():
     module, _, _, recurrent, sigmoid = _fake_qwen(aiter_available=False)
     assert adapter.apply_to_module(module) is True
     assert adapter.apply_to_module(module) is False
-    assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
+    assert module.fused_recurrent_gated_delta_rule_packed_decode is not recurrent
+    assert module._vllm_hcu_original_fused_recurrent is recurrent
     assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
     assert module._vllm_hcu_original_fused_sigmoid is sigmoid
     assert not hasattr(
@@ -640,13 +683,16 @@ assert not getattr(base_method, "_vllm_hcu_gdn_base_wrapper", False)
 
 assert (
     qwen.fused_recurrent_gated_delta_rule_packed_decode
-    is fla.fused_recurrent_gated_delta_rule_packed_decode
+    is not fla.fused_recurrent_gated_delta_rule_packed_decode
 )
 assert (
     qwen.fused_sigmoid_gating_delta_rule_update
     is not fla.fused_sigmoid_gating_delta_rule_update
 )
-assert not hasattr(qwen, "_vllm_hcu_original_fused_recurrent")
+assert (
+    qwen._vllm_hcu_original_fused_recurrent
+    is fla.fused_recurrent_gated_delta_rule_packed_decode
+)
 assert (
     qwen._vllm_hcu_original_fused_sigmoid
     is fla.fused_sigmoid_gating_delta_rule_update

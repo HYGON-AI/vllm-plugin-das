@@ -687,7 +687,7 @@ def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
     torch.testing.assert_close(module.chunk_fwd_o(x, x, x, x), original(x, x, x, x))
 
 
-def test_fla_chunk_delta_h_prefers_hip_kernel(monkeypatch):
+def test_fla_chunk_delta_h_uses_boltops(monkeypatch):
     adapter = _adapter("patch_fla_chunk_delta_h")
     calls = []
 
@@ -697,9 +697,9 @@ def test_fla_chunk_delta_h_prefers_hip_kernel(monkeypatch):
                  use_exp2=False):
         return "official"
 
-    def hip(*args, **kwargs):
+    def boltops(*args, **kwargs):
         calls.append((args, kwargs))
-        return "hip-h", "hip-v", "hip-final"
+        return "boltops-h", "boltops-v", "boltops-final"
 
     module = _module(
         adapter.TARGET_MODULE,
@@ -712,15 +712,8 @@ def test_fla_chunk_delta_h_prefers_hip_kernel(monkeypatch):
     )
     _install_fake_module(
         monkeypatch,
-        "aiter.ops.fla",
-        chunk_gated_delta_rule_fwd_vllm_hip_blockdim64=hip,
-    )
-    _install_fake_module(
-        monkeypatch,
-        "aiter.ops.triton.fla.vllm.chunk_delta_h",
-        launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64=lambda **_kwargs: pytest.fail(
-            "HIP must have priority"
-        ),
+        "boltops.fla.gdn",
+        chunk_gated_delta_rule_fwd_h=boltops,
     )
     adapter.apply_to_module(module)
     from vllm_hcu.platforms import envs as henvs
@@ -739,7 +732,7 @@ def test_fla_chunk_delta_h_prefers_hip_kernel(monkeypatch):
         use_exp2=True,
     )
 
-    assert result == ("hip-h", "hip-v", "hip-final")
+    assert result == ("boltops-h", "boltops-v", "boltops-final")
     assert len(calls) == 1
     _, kwargs = calls[0]
     assert kwargs["cu_seqlens"] is cu_seqlens
@@ -750,7 +743,7 @@ def test_fla_chunk_delta_h_prefers_hip_kernel(monkeypatch):
     assert kwargs["transpose_state_layout"] is True
 
 
-def test_fla_chunk_o_prefers_hip_and_preserves_output_buffer(monkeypatch):
+def test_fla_chunk_o_uses_boltops_and_preserves_output_buffer(monkeypatch):
     adapter = _adapter("patch_fla_chunk_o")
     calls = []
 
@@ -758,7 +751,7 @@ def test_fla_chunk_o_prefers_hip_and_preserves_output_buffer(monkeypatch):
                  chunk_indices=None, chunk_size=64, core_attn_out=None):
         return "official"
 
-    def hip(**kwargs):
+    def boltops(**kwargs):
         calls.append(kwargs)
         return kwargs["v"] + 3
 
@@ -772,15 +765,8 @@ def test_fla_chunk_o_prefers_hip_and_preserves_output_buffer(monkeypatch):
     )
     _install_fake_module(
         monkeypatch,
-        "aiter.ops.fla",
-        chunk_fwd_o_vllm_hip_blockdim64=hip,
-    )
-    _install_fake_module(
-        monkeypatch,
-        "aiter.ops.triton.fla.vllm.chunk_o",
-        launch_chunk_fwd_kernel_o=lambda **_kwargs: pytest.fail(
-            "HIP must have priority"
-        ),
+        "boltops.fla.gdn",
+        chunk_fwd_o=boltops,
     )
     adapter.apply_to_module(module)
     from vllm_hcu.platforms import envs as henvs
@@ -808,7 +794,7 @@ def test_fla_chunk_o_prefers_hip_and_preserves_output_buffer(monkeypatch):
     torch.testing.assert_close(result, v + 3)
 
 
-def test_fla_chunk_delta_h_enabled_missing_aiter_falls_back(monkeypatch):
+def test_fla_chunk_delta_h_enabled_missing_boltops_falls_back(monkeypatch):
     adapter = _adapter("patch_fla_chunk_delta_h")
     calls = []
 
@@ -832,13 +818,8 @@ def test_fla_chunk_delta_h_enabled_missing_aiter_falls_back(monkeypatch):
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setitem(
         sys.modules,
-        "aiter.ops.fla",
-        ModuleType("aiter.ops.fla"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.ops.triton.fla.vllm.chunk_delta_h",
-        ModuleType("aiter.ops.triton.fla.vllm.chunk_delta_h"),
+        "boltops.fla.gdn",
+        ModuleType("boltops.fla.gdn"),
     )
     chunk_indices = torch.tensor([[0, 0]])
     chunk_offsets = torch.tensor([0])
@@ -855,7 +836,7 @@ def test_fla_chunk_delta_h_enabled_missing_aiter_falls_back(monkeypatch):
     assert calls == [(chunk_indices, chunk_offsets, True)]
 
 
-def test_fla_chunk_o_enabled_missing_aiter_falls_back(monkeypatch):
+def test_fla_chunk_o_enabled_missing_boltops_falls_back(monkeypatch):
     adapter = _adapter("patch_fla_chunk_o")
     calls = []
 
@@ -877,13 +858,8 @@ def test_fla_chunk_o_enabled_missing_aiter_falls_back(monkeypatch):
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setitem(
         sys.modules,
-        "aiter.ops.fla",
-        ModuleType("aiter.ops.fla"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.ops.triton.fla.vllm.chunk_o",
-        ModuleType("aiter.ops.triton.fla.vllm.chunk_o"),
+        "boltops.fla.gdn",
+        ModuleType("boltops.fla.gdn"),
     )
     chunk_indices = torch.tensor([[0, 0]])
     core_attn_out = torch.empty(8)
@@ -899,6 +875,75 @@ def test_fla_chunk_o_enabled_missing_aiter_falls_back(monkeypatch):
 
     assert result == "official"
     assert calls == [(0.5, chunk_indices, core_attn_out)]
+
+
+def test_fla_recompute_w_u_uses_boltops(monkeypatch):
+    adapter = _adapter("patch_fla_recompute_w_u")
+    calls = []
+
+    def original(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices=None):
+        return "official"
+
+    def boltops(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "boltops-w", "boltops-u"
+
+    module = _module(adapter.TARGET_MODULE, recompute_w_u_fwd=original)
+    _install_fake_module(
+        monkeypatch,
+        "boltops.fla.gdn",
+        recompute_w_u_fwd=boltops,
+    )
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    tensors = tuple(torch.empty(1) for _ in range(5))
+    cu_seqlens = torch.tensor([0, 1])
+    chunk_indices = torch.tensor([[0, 0]])
+    result = module.recompute_w_u_fwd(
+        *tensors,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+
+    assert result == ("boltops-w", "boltops-u")
+    assert len(calls) == 1
+    assert calls[0][1]["cu_seqlens"] is cu_seqlens
+    assert calls[0][1]["chunk_indices"] is chunk_indices
+
+
+def test_fla_recompute_w_u_missing_boltops_falls_back(monkeypatch):
+    adapter = _adapter("patch_fla_recompute_w_u")
+    calls = []
+
+    def original(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices=None):
+        calls.append((cu_seqlens, chunk_indices))
+        return "official"
+
+    module = _module(adapter.TARGET_MODULE, recompute_w_u_fwd=original)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "boltops.fla.gdn",
+        ModuleType("boltops.fla.gdn"),
+    )
+    tensors = tuple(torch.empty(1) for _ in range(5))
+    cu_seqlens = torch.tensor([0, 1])
+    chunk_indices = torch.tensor([[0, 0]])
+    result = module.recompute_w_u_fwd(
+        *tensors,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+
+    assert result == "official"
+    assert calls == [(cu_seqlens, chunk_indices)]
 
 
 def test_mamba_nn_sharded_loader_cpu_numeric():
@@ -1103,6 +1148,23 @@ def _gdn_sigmoid_contract(
     return "official-sigmoid"
 
 
+def _gdn_packed_recurrent_contract(
+    mixed_qkv,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    scale,
+    initial_state,
+    out,
+    ssm_state_indices,
+    use_qk_l2norm_in_kernel=False,
+):
+    del mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out
+    del ssm_state_indices, use_qk_l2norm_in_kernel
+    return "official-recurrent"
+
+
 def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     causal_adapter = _adapter("patch_gdn_causal_conv1d")
     qwen_adapter = _adapter("patch_gdn_linear_attention")
@@ -1183,7 +1245,9 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
         qwen_adapter.TARGET_MODULE,
         GDN_AITER_TRITON_AVAILABLE=True,
         gdn_aiter_fused_reshape_causal_conv1d_update_single_token=aiter_update,
-        fused_recurrent_gated_delta_rule_packed_decode=lambda *a, **k: "official-recurrent",
+        fused_recurrent_gated_delta_rule_packed_decode=(
+            _gdn_packed_recurrent_contract
+        ),
         fused_sigmoid_gating_delta_rule_update=_gdn_sigmoid_contract,
         GatedDeltaNetAttention=GatedDeltaNetAttention,
         MambaStateDtypeCalculator=SimpleNamespace(
@@ -1241,7 +1305,7 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     )
 
 
-def test_gdn_recurrent_remains_target_owned_and_sigmoid_is_qwen_local(monkeypatch):
+def test_gdn_recurrent_and_sigmoid_are_qwen_local(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
 
     _install_fake_module(
@@ -1259,9 +1323,7 @@ def test_gdn_recurrent_remains_target_owned_and_sigmoid_is_qwen_local(monkeypatc
         ),
     )
 
-    def recurrent(*args, **kwargs):
-        del args, kwargs
-        return "official-recurrent"
+    recurrent = _gdn_packed_recurrent_contract
 
     sigmoid = _gdn_sigmoid_contract
 
@@ -1276,10 +1338,21 @@ def test_gdn_recurrent_remains_target_owned_and_sigmoid_is_qwen_local(monkeypatc
 
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", False)
-    assert module.fused_recurrent_gated_delta_rule_packed_decode is recurrent
+    assert module.fused_recurrent_gated_delta_rule_packed_decode is not recurrent
+    assert module._vllm_hcu_original_fused_recurrent is recurrent
     assert module.fused_sigmoid_gating_delta_rule_update is not sigmoid
     assert module._vllm_hcu_original_fused_sigmoid is sigmoid
-    assert module.fused_recurrent_gated_delta_rule_packed_decode() == "official-recurrent"
+    recurrent_args = tuple(torch.empty(1) for _ in range(5))
+    assert (
+        module.fused_recurrent_gated_delta_rule_packed_decode(
+            *recurrent_args,
+            0.5,
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1, dtype=torch.long),
+        )
+        == "official-recurrent"
+    )
     sigmoid_args = tuple(torch.empty(1) for _ in range(7))
     assert (
         module.fused_sigmoid_gating_delta_rule_update(*sigmoid_args)
