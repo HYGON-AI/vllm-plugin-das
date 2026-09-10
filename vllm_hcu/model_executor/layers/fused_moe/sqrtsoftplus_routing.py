@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+"""LightOp integration for vLLM's non-hash sqrt-softplus MoE routing."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+from vllm.logger import init_logger
+
+
+_SUPPORTED_ROUTE_SHAPES = frozenset(
+    {
+        (256, 6, 1024),
+        (256, 8, 256),
+        (256, 8, 1024),
+        (384, 6, 1024),
+        (384, 8, 256),
+        (384, 8, 1024),
+    }
+)
+logger = init_logger(__name__)
+
+
+def _is_contiguous(value: Any) -> bool:
+    check = getattr(value, "is_contiguous", None)
+    return bool(callable(check) and check())
+
+
+def _load_lightop_sqrtsoftplus() -> Any | None:
+    try:
+        from lightop.moe import moe_fused_gate_sqrtsoftplus
+    except ImportError:
+        return None
+    if not callable(moe_fused_gate_sqrtsoftplus):
+        return None
+    return moe_fused_gate_sqrtsoftplus
+
+
+def is_lightop_sqrtsoftplus_available() -> bool:
+    """Return whether the optional categorized LightOp export is usable."""
+
+    return _load_lightop_sqrtsoftplus() is not None
+
+
+def is_lightop_sqrtsoftplus_shape_supported(
+    tokens: int,
+    experts: int,
+    topk: int,
+) -> bool:
+    """Return whether production-route performance passed for this shape."""
+
+    return (int(experts), int(topk), int(tokens)) in _SUPPORTED_ROUTE_SHAPES
+
+
+def can_use_lightop_sqrtsoftplus(
+    gating_output: Any,
+    correction_bias: Any,
+    *,
+    topk: int,
+    input_tokens: torch.Tensor | None,
+    hash_indices_table: torch.Tensor | None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
+) -> bool:
+    """Return whether LightOp can preserve this vLLM routing contract."""
+
+    del input_tokens  # It is only semantically relevant with a hash table.
+    logits_shape = getattr(gating_output, "shape", ())
+    bias_shape = getattr(correction_bias, "shape", ())
+    logits_device = getattr(gating_output, "device", None)
+    bias_device = getattr(correction_bias, "device", None)
+    if (
+        hash_indices_table is not None
+        or bias_vl is not None
+        or image_sentinel_lo != 0
+    ):
+        return False
+    if len(logits_shape) != 2 or len(bias_shape) != 1:
+        return False
+    num_tokens = int(logits_shape[0])
+    num_experts = int(logits_shape[-1])
+    return bool(
+        getattr(logits_device, "type", None) == "cuda"
+        and bias_device == logits_device
+        and getattr(gating_output, "dtype", None) == torch.float32
+        and getattr(correction_bias, "dtype", None) == torch.float32
+        and _is_contiguous(gating_output)
+        and _is_contiguous(correction_bias)
+        and int(bias_shape[0]) == num_experts
+        and is_lightop_sqrtsoftplus_shape_supported(
+            num_tokens, num_experts, topk
+        )
+    )
+
+
+def run_lightop_sqrtsoftplus(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    indices_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute the LightOp route and normalize its index dtype for vLLM."""
+
+    operator = _load_lightop_sqrtsoftplus()
+    if operator is None:
+        raise RuntimeError(
+            "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE requires callable "
+            "lightop.moe.moe_fused_gate_sqrtsoftplus"
+        )
+    topk_weights, topk_ids = operator(
+        gating_output,
+        correction_bias,
+        int(topk),
+        0,
+        bool(renormalize),
+        float(routed_scaling_factor),
+        True,
+    )
+    if topk_ids.dtype != indices_dtype:
+        topk_ids = topk_ids.to(dtype=indices_dtype)
+    logger.warning_once("Using LightOp sqrt-softplus MoE routing.")
+    return topk_weights, topk_ids
+
+
+__all__ = [
+    "can_use_lightop_sqrtsoftplus",
+    "is_lightop_sqrtsoftplus_available",
+    "is_lightop_sqrtsoftplus_shape_supported",
+    "run_lightop_sqrtsoftplus",
+]

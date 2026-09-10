@@ -15,18 +15,19 @@ server:
     - "4"
     - --attention-backend
     - FLASHMLA_SPARSE
+    - --reasoning-parser
+    - glm45
     - --moe-backend
     - aiter
     - --speculative-config
-    - '{"method":"mtp","num_speculative_tokens":3}'
+    - '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
+    - --enable-prefix-caching
     - --max-model-len
     - "4096"
     - --max-num-batched-tokens
     - "1024"
     - --max-num-seqs
     - "8"
-    - --compilation-config
-    - '{"cudagraph_mode":"PIECEWISE"}'
     - --default-chat-template-kwargs
     - '{"reasoning_effort":"low"}'
 
@@ -44,7 +45,7 @@ evalscope:
   stream: true
   eval_batch_size: 8
   timeout: 7200
-  limit: 8
+  limit: 32
   datasets:
     - humaneval
   dataset_args:

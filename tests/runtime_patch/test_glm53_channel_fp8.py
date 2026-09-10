@@ -249,6 +249,34 @@ def test_kpool_indexer_uses_official_triton_path_without_aiter() -> None:
     ) == "official-hip"
 
 
+def test_glm5next_forced_sparse_triton_requires_packaged_modules(
+    monkeypatch,
+) -> None:
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "mqa_logits_module", lambda: None)
+    with pytest.raises(RuntimeError, match="fp8_mqa_logits Triton module"):
+        sparse.rocm_fp8_mqa_logits(
+            torch.empty(1, 1, 1),
+            (torch.empty(1, 1), torch.empty(1)),
+            torch.empty(1, 1),
+            torch.zeros(1, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            force_aiter_triton=True,
+        )
+
+    monkeypatch.setattr(sparse, "paged_mqa_logits_module", lambda: None)
+    with pytest.raises(RuntimeError, match="pa_mqa_logits Triton module"):
+        sparse.rocm_fp8_paged_mqa_logits(
+            torch.empty(1, 1, 1, 1),
+            torch.empty(1, 1, 1, 5, dtype=torch.uint8),
+            torch.empty(1, 1),
+            torch.ones(1, dtype=torch.int32),
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.empty(0),
+            1,
+            force_aiter_triton=True,
+        )
 def test_indexer_derives_gate_weight_from_hcu_nn_layout() -> None:
     attention = ModuleType(patch_glm5next_channel_fp8.ATTENTION_MODULE)
 

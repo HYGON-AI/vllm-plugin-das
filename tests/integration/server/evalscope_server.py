@@ -319,7 +319,6 @@ def _terminate_process_group(
 def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("VLLM_PLUGINS", None)
-    env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     if config is not None:
         configured = config.get("server", {}).get("environment", {})
@@ -767,7 +766,19 @@ def run_evalscope_server_test(
 
     with _open_log(server_log_path) as server_log:
         server_log.write(("server command: " + " ".join(command) + "\n").encode())
-        server_log.write(b"server environment: VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1\n")
+        attention_environment = " ".join(
+            f"{name}={env[name]}"
+            for name in (
+                "VLLM_HCU_USE_FLASH_ATTN",
+                "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+                "VLLM_HCU_USE_FLASH_ATTN_VARLEN",
+            )
+            if name in env
+        )
+        server_log.write(
+            f"server attention environment: "
+            f"{attention_environment or 'default'}\n".encode()
+        )
         server_log.flush()
         proc = subprocess.Popen(
             command,

@@ -196,7 +196,7 @@ def test_multi_mtp_uses_existing_draft_token_ids_channel():
     assert callable(module.Scheduler.update_draft_token_ids_in_output)
 
 
-def test_qwen4_exp_mtp_group_is_annotated_at_scheduler_boundary():
+def test_qwen4_exp_mtp_group_is_not_modified_at_scheduler_boundary():
     module = _fake_scheduler_module()
     assert patch_scheduler.apply_to_module(module) is True
     groups = [
@@ -221,7 +221,8 @@ def test_qwen4_exp_mtp_group_is_annotated_at_scheduler_boundary():
         structured_output_manager=None,
         block_size=16,
     )
-    assert module.Scheduler.observed_eagle_groups == [False, True]
+    assert module.Scheduler.observed_eagle_groups == [False, False]
+    assert [group.is_eagle_group for group in groups] == [False, False]
 
 
 

@@ -415,6 +415,11 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
 
 
 def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
+    from vllm_hcu.v1.attention.ops.lightop_kpool_topk_transform import (
+        install_lightop_kpool_topk_transform,
+    )
+
+    install_lightop_kpool_topk_transform(kpool)
     indexer = vars(kpool).get("SparseAttnIndexerKpool")
     if not isinstance(indexer, type):
         raise PatchCompatibilityError(
@@ -443,6 +448,38 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
             "positions": None,
         },
     )
+
+    # Official kpool imports these helpers inside forward_cuda. HCU's AITER
+    # package exposes the required Triton modules even though the upstream
+    # ROCm capability probe is false. Force that module path only in this
+    # GLM5Next process; preserve the shared HCU fallback policy for all other
+    # sparse models.
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    def glm5next_fp8_mqa_logits(*args, **kwargs):
+        return hcu_sparse.rocm_fp8_mqa_logits(
+            *args,
+            **kwargs,
+            force_aiter_triton=True,
+        )
+
+    def glm5next_fp8_paged_mqa_logits(*args, **kwargs):
+        return hcu_sparse.rocm_fp8_paged_mqa_logits(
+            *args,
+            **kwargs,
+            force_aiter_triton=True,
+        )
+
+    if not hasattr(upstream_sparse, "_vllm_hcu_original_rocm_fp8_mqa_logits"):
+        upstream_sparse._vllm_hcu_original_rocm_fp8_mqa_logits = (
+            upstream_sparse.rocm_fp8_mqa_logits
+        )
+        upstream_sparse._vllm_hcu_original_rocm_fp8_paged_mqa_logits = (
+            upstream_sparse.rocm_fp8_paged_mqa_logits
+        )
+    upstream_sparse.rocm_fp8_mqa_logits = glm5next_fp8_mqa_logits
+    upstream_sparse.rocm_fp8_paged_mqa_logits = glm5next_fp8_paged_mqa_logits
 
     @functools.wraps(original)
     def hcu_forward_hip(

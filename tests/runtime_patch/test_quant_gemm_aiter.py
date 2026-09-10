@@ -3945,6 +3945,46 @@ def test_clamp_swiglu_enforces_rocm_custom_op():
     assert instance.beta == 0.25
 
 
+def test_clamp_swiglu_falls_back_to_native_when_compiled_op_is_missing():
+    class CustomOp:
+        def __init__(self, *, enforce_enable=False, compile_native=False):
+            self.base_args = (enforce_enable, compile_native)
+            self._forward_method = "dispatched"
+
+    class SiluAndMulWithClamp(CustomOp):
+        def __init__(
+            self,
+            swiglu_limit: float,
+            alpha: float = 1.0,
+            beta: float = 0.0,
+            *,
+            compile_native: bool = True,
+        ):
+            super().__init__(compile_native=compile_native)
+
+        def forward_native(self, x):
+            return ("native", x)
+
+    platform = SimpleNamespace(
+        is_rocm=lambda: True,
+        is_cuda_alike=lambda: False,
+        is_xpu=lambda: False,
+        is_cpu=lambda: False,
+    )
+    module = _module(
+        patch_activation.TARGET_MODULE,
+        SiluAndMulWithClamp=SiluAndMulWithClamp,
+        current_platform=platform,
+        torch=SimpleNamespace(ops=SimpleNamespace(_C=SimpleNamespace())),
+    )
+
+    patch_activation.apply_to_module(module)
+    instance = SiluAndMulWithClamp(7.0, compile_native=False)
+
+    assert instance.base_args == (True, False)
+    assert instance._forward_method("value") == ("native", "value")
+
+
 def test_compressed_linear_only_forwards_supported_prequantized_input():
     class CompressedTensorsLinearMethod:
         def apply(self, layer, x, bias=None):
@@ -8049,7 +8089,7 @@ def test_weight8bit_marlin2_layout_2d_3d_and_validation():
         module.weight8bit_nt_kpack2_marlin2(torch.ones(16, dtype=torch.int8))
 
 
-def test_marlin_moe_never_imports_lmslim(
+def test_slimquant_marlin_ignores_aiter_backend_and_uses_lightop(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
@@ -8072,15 +8112,13 @@ def test_marlin_moe_never_imports_lmslim(
         fused_experts_impl_int8_marlin=int8_kernel,
     )
     _reject_import_prefix(monkeypatch, "lmslim")
-    monkeypatch.setattr(
-        marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda *args: False
-    )
     layer = _fp8_moe_layer()
     x = torch.ones(2, 4)
     weights = torch.ones(2, 2)
     ids = torch.zeros(2, 2, dtype=torch.int64)
 
     fp8_method = object.__new__(marlin.CompressedTensorsW8A8FP8MarlinMoEMethod)
+    fp8_method.moe = SimpleNamespace(moe_backend="aiter")
     fp8_output = fp8_method.fused_moe_forward(layer, x, weights, ids)
     torch.testing.assert_close(fp8_output, x + 2)
     assert calls[0][1]["hidden_states"] is x
@@ -8088,7 +8126,7 @@ def test_marlin_moe_never_imports_lmslim(
     assert calls[0][1]["use_fp8_w8a8"] is True
 
     int8_method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
-    int8_method.moe = None
+    int8_method.moe = SimpleNamespace(moe_backend="aiter")
     int8_method.moe_quant_config = "int8-config"
     int8_output = int8_method.apply(layer, x, weights, ids, None, None)
     torch.testing.assert_close(int8_output, x + 3)
@@ -8097,6 +8135,55 @@ def test_marlin_moe_never_imports_lmslim(
     assert calls[1][1]["quant_config"] == "int8-config"
     assert calls[1][1]["use_int8_w8a8"] is True
     assert [kind for kind, _ in calls] == ["fp8", "int8"]
+
+
+def test_slimquant_marlin_resolves_regex_expert_schemes_by_layer_name(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    scheme = {
+        "weights": object(),
+        "input_activations": object(),
+    }
+    requested_names: list[str] = []
+    quant_config = SimpleNamespace(
+        _add_fused_moe_to_target_scheme_map=lambda: None,
+        get_scheme_dict=lambda _layer, name: (
+            requested_names.append(name) or scheme
+        ),
+        _is_fp8_w8a8=lambda weight, activation: (
+            weight is scheme["weights"]
+            and activation is scheme["input_activations"]
+        ),
+        _is_dynamic_token_w8a8=lambda _weight, _activation: False,
+    )
+    marker = object()
+    monkeypatch.setattr(
+        marlin,
+        "is_lightop_marlin_moe_supported",
+        lambda _moe: True,
+    )
+    monkeypatch.setattr(
+        marlin,
+        "CompressedTensorsW8A8FP8MarlinMoEMethod",
+        lambda config, moe, selected_scheme: marker,
+    )
+
+    result = marlin.CompressedTensorsMarlinMoEMethod.get_moe_method(
+        quant_config,
+        SimpleNamespace(moe_config=object()),
+        "model.layers.3.mlp.experts",
+    )
+
+    assert result is marker
+    assert requested_names == [
+        "model.layers.3.mlp.experts.0.gate_proj",
+        "model.layers.3.mlp.experts.0.up_proj",
+        "model.layers.3.mlp.experts.0.down_proj",
+    ]
 
 
 def test_missing_lightop_marlin_export_fails_without_lmslim_retry(
@@ -8110,7 +8197,6 @@ def test_missing_lightop_marlin_export_fails_without_lmslim_retry(
     monkeypatch.setitem(sys.modules, "lightop", lightop)
     monkeypatch.delitem(sys.modules, "lightop.moe", raising=False)
     _reject_import_prefix(monkeypatch, "lmslim")
-    monkeypatch.setattr(marlin, "_is_hcu_aiter_w8a8_moe_requested", lambda: False)
 
     layer = _fp8_moe_layer()
     x = torch.ones(2, 4)
@@ -8168,212 +8254,6 @@ print("SLIMQUANT_PREPATCH_IMPORT_OK")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SLIMQUANT_PREPATCH_IMPORT_OK" in result.stdout
-
-
-def test_marlin_aiter_moe_no_solution_uses_native_triton_not_lmslim(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
-        compressed_tensors_moe_marlin as marlin,
-    )
-
-    method_class = marlin.CompressedTensorsW8A8Int8MarlinMoEMethod
-    assert not hasattr(method_class, "_get_aiter_moe_runtime_config")
-    assert not hasattr(method_class, "_get_aiter_weights_for_solution")
-    method = object.__new__(method_class)
-    method.moe = SimpleNamespace(num_experts=3)
-    method.moe_quant_config = SimpleNamespace(
-        use_fp8_w8a8=False,
-        use_int8_w8a8=True,
-        w1_scale=torch.ones((3, 8, 1)),
-        w2_scale=torch.ones((3, 4, 1)),
-        w1_zp=None,
-        w2_zp=None,
-        a1_scale=None,
-        a2_scale=None,
-        block_shape=None,
-    )
-    monkeypatch.setattr(
-        marlin,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda _moe=None: True,
-    )
-    monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
-
-    class MoeQuantType:
-        W8A8 = "int8_w8a8"
-
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.moe",
-        _module(
-            "aiter.moe",
-            MoeQuantType=MoeQuantType,
-            get_aiter_moe_config=lambda **kwargs: (False, None),
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
-        _module(
-            "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
-            fused_experts_impl_int8_marlin=lambda **kwargs: pytest.fail(
-                "AITER no-solution must use vLLM Triton, not LMSlim"
-            ),
-        ),
-    )
-    expected = torch.full((2, 4), 4.0)
-    fallback_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    fused_moe_module = __import__(
-        "vllm.model_executor.layers.fused_moe.fused_moe",
-        fromlist=["fused_experts_impl"],
-    )
-
-    def fallback(*args: object, **kwargs: object):
-        fallback_calls.append((args, kwargs))
-        return expected
-
-    monkeypatch.setattr(fused_moe_module, "fused_experts_impl", fallback)
-    layer = _fp8_moe_layer()
-    layer.w13_weight = torch.zeros((3, 8, 4), dtype=torch.int8)
-    layer.w2_weight = torch.zeros((3, 4, 4), dtype=torch.int8)
-
-    actual = method.apply(
-        layer,
-        torch.ones((2, 4), dtype=torch.bfloat16),
-        torch.ones((2, 2)),
-        torch.zeros((2, 2), dtype=torch.int64),
-        None,
-        None,
-    )
-
-    assert actual is expected
-    assert fallback_calls[0][1]["use_int8_w8a8"] is True
-
-
-def test_marlin_explicit_triton_backend_bypasses_aiter_env(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
-        compressed_tensors_moe_marlin as marlin,
-    )
-
-    _install_fake_vllm_envs(
-        monkeypatch,
-        VLLM_ROCM_USE_AITER=True,
-        VLLM_ROCM_USE_AITER_MOE=True,
-    )
-
-    assert not marlin._is_hcu_aiter_w8a8_moe_requested(
-        SimpleNamespace(moe_backend="triton")
-    )
-
-
-def test_marlin_aiter_moe_prewarms_m1_during_weight_loading(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
-        compressed_tensors_moe_marlin as marlin,
-    )
-
-    method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
-    method.moe = SimpleNamespace(
-        num_experts=3,
-        experts_per_token=2,
-        in_dtype=torch.bfloat16,
-        activation=SimpleNamespace(value="silu"),
-    )
-    quant_config = SimpleNamespace(
-        use_fp8_w8a8=False,
-        use_int8_w8a8=True,
-        block_shape=None,
-    )
-    method.get_fused_moe_quant_config = lambda unused_layer: quant_config
-    monkeypatch.setattr(
-        marlin,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda _moe=None: True,
-    )
-    monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
-    calls: list[tuple[object, object, object]] = []
-    monkeypatch.setattr(
-        compressed_tensors_moe_runtime,
-        "prewarm_aiter_quantized_moe",
-        lambda layer, moe, config: calls.append((layer, moe, config)),
-        raising=False,
-    )
-    layer = _fp8_moe_layer()
-    layer.w13_weight = torch.zeros((3, 8, 4), dtype=torch.int8)
-    layer.w2_weight = torch.zeros((3, 4, 4), dtype=torch.int8)
-
-    method.process_weights_after_loading(layer)
-
-    assert method.moe_quant_config is quant_config
-    assert calls == [(layer, method.moe, quant_config)]
-
-
-def test_marlin_aiter_moe_config_fault_does_not_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
-        compressed_tensors_moe_marlin as marlin,
-    )
-
-    method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
-    method.moe = SimpleNamespace(num_experts=3)
-    method.moe_quant_config = SimpleNamespace(
-        use_fp8_w8a8=False,
-        use_int8_w8a8=True,
-        w1_scale=torch.ones((3, 8, 1)),
-        w2_scale=torch.ones((3, 4, 1)),
-        block_shape=None,
-    )
-    monkeypatch.setattr(
-        marlin,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda _moe=None: True,
-    )
-    monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
-
-    class MoeQuantType:
-        W8A8 = "int8_w8a8"
-
-    def config_fault(**kwargs: object):
-        raise RuntimeError("aiter config fault")
-
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.moe",
-        _module(
-            "aiter.moe",
-            MoeQuantType=MoeQuantType,
-            get_aiter_moe_config=config_fault,
-        ),
-    )
-    fallback_calls: list[object] = []
-    fused_moe_module = __import__(
-        "vllm.model_executor.layers.fused_moe.fused_moe",
-        fromlist=["fused_experts_impl"],
-    )
-    monkeypatch.setattr(
-        fused_moe_module,
-        "fused_experts_impl",
-        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
-    )
-    layer = _fp8_moe_layer()
-    layer.w13_weight = torch.zeros((3, 8, 4), dtype=torch.int8)
-    layer.w2_weight = torch.zeros((3, 4, 4), dtype=torch.int8)
-
-    with pytest.raises(RuntimeError, match="aiter config fault"):
-        method.apply(
-            layer,
-            torch.ones((2, 4), dtype=torch.bfloat16),
-            torch.ones((2, 2)),
-            torch.zeros((2, 2), dtype=torch.int64),
-            None,
-            None,
-        )
-    assert fallback_calls == []
 
 
 @pytest.mark.parametrize("is_rocm", [False, True])

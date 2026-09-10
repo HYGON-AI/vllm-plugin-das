@@ -108,6 +108,8 @@ _MOE_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._run_layer",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._disable_shared_experts_overlap",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._determine_shared_experts_order",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.requires_input_preservation",
+            f"{_SHARED_EXPERTS_MODULE}.SharedExperts.allows_inplace_routed_output",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._should_run_shared_in_aux_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts.maybe_sync_shared_experts_stream",
             f"{_SHARED_EXPERTS_MODULE}.SharedExperts._launch_in_aux_stream",
@@ -199,6 +201,7 @@ _COLD_REPLACEMENTS: tuple[_ReplacementSpec, ...] = (
 _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_config")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_utils")),
+    _CallbackSpec(_adapter("op_opt.moe", "patch_unquantized_oracle")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_int8_oracle")),
     _CallbackSpec(
         _adapter("op_opt.moe", "patch_fp8_oracle"),
@@ -221,6 +224,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_conv")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
 )
 
@@ -242,10 +246,11 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer2")),
-    # GDN deltas bind model-local symbols/classes only. The canonical
+    # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
     # the GDN adapters.
+    _CallbackSpec(_adapter("op_opt", "patch_gdn_rms_norm_gated")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),

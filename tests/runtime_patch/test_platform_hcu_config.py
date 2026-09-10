@@ -1609,7 +1609,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     assert config.cache_config.block_size == 64
 
 
-def test_sparse_flashmla_preserves_official_hybrid_manager_block_size(
+def test_sparse_flashmla_preserves_upstream_hybrid_block_alignment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -1618,7 +1618,7 @@ def test_sparse_flashmla_preserves_official_hybrid_manager_block_size(
     config = _validation_config(HcuFeatureConfig())
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
-        block_size=16,
+        block_size=64,
         kv_cache_dtype_skip_layers=[],
     )
     config.attention_config = SimpleNamespace(
@@ -1626,33 +1626,34 @@ def test_sparse_flashmla_preserves_official_hybrid_manager_block_size(
     )
     config.model_config.is_hybrid = True
 
-    class IndexerBackend:
+    class FlashMLABackend:
         @staticmethod
         def get_preferred_block_size(_default):
-            return 16
+            return 64
 
         @staticmethod
         def get_name():
-            return "DEEPSEEK_V32_INDEXER"
+            return "FLASHMLA_SPARSE"
 
     monkeypatch.setattr(
         HCUPlatform,
         "_find_non_ssm_backend",
-        classmethod(lambda cls, vllm_config: IndexerBackend),
+        classmethod(lambda cls, vllm_config: FlashMLABackend),
     )
+
+    def _align_hybrid_block_size(cls, vllm_config, backend_cls):
+        del cls, backend_cls
+        vllm_config.cache_config.block_size = 1152
+
     monkeypatch.setattr(
         HCUPlatform,
         "_align_hybrid_block_size",
-        classmethod(
-            lambda cls, vllm_config, backend_cls: setattr(
-                vllm_config.cache_config, "block_size", 640
-            )
-        ),
+        classmethod(_align_hybrid_block_size),
     )
 
     HCUPlatform.update_block_size_for_backend(config)
 
-    assert config.cache_config.block_size == 640
+    assert config.cache_config.block_size == 1152
 
 
 @pytest.mark.parametrize(

@@ -58,10 +58,10 @@ def test_glm53_flash_channel_fp8_command_contract(
     assert json.loads(_option_value(server, "--speculative-config")) == {
         "method": "mtp",
         "num_speculative_tokens": 3,
+        "use_local_argmax_reduction": True,
     }
-    assert json.loads(_option_value(server, "--compilation-config")) == {
-        "cudagraph_mode": "PIECEWISE"
-    }
+    assert "--compilation-config" not in server
+    assert "--enable-prefix-caching" in server
     assert _option_value(server, "--max-model-len") == "4096"
     assert _option_value(server, "--max-num-batched-tokens") == "1024"
     assert _option_value(server, "--max-num-seqs") == "8"
@@ -71,7 +71,7 @@ def test_glm53_flash_channel_fp8_command_contract(
         _option_value(server, "--default-chat-template-kwargs")
     ) == {"reasoning_effort": "low"}
     assert _option_value(evaluation, "--datasets") == "humaneval"
-    assert _option_value(evaluation, "--limit") == "8"
+    assert _option_value(evaluation, "--limit") == "32"
     assert _option_value(evaluation, "--eval-batch-size") == "8"
     assert _option_value(evaluation, "--model") == _option_value(
         server,

@@ -246,9 +246,10 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
+    """Validate cross-config invariants and bind the compilation adapter."""
+
     _normalize_hcu_model_runner(vllm_config.model_config)
     _normalize_glm5next_breakable_cudagraph(vllm_config)
-    """Validate cross-config invariants and bind the compilation adapter."""
 
     _validate_hcu_pcp_scope(vllm_config)
     _validate_dspark_pd_scope(vllm_config)

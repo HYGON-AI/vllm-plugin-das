@@ -731,6 +731,8 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    *,
+    force_aiter_triton: bool = False,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -775,8 +777,13 @@ def rocm_fp8_paged_mqa_logits(
         kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
     block_size = kv_cache_fp8.shape[1]
 
-    if rocm_aiter_ops.is_enabled():
+    if force_aiter_triton or rocm_aiter_ops.is_enabled():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
+    if force_aiter_triton and aiter_paged_mqa_logits_module is None:
+        raise RuntimeError(
+            "HCU GLM5Next sparse decode requires the packaged AITER "
+            "pa_mqa_logits Triton module"
+        )
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942:
@@ -910,6 +917,8 @@ def rocm_fp8_mqa_logits(
     weights: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
+    *,
+    force_aiter_triton: bool = False,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits for a single sequence without KV paging.
 
@@ -934,8 +943,13 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    if force_aiter_triton or rocm_aiter_ops.is_enabled():
         aiter_mqa_logits_module = mqa_logits_module()
+    if force_aiter_triton and aiter_mqa_logits_module is None:
+        raise RuntimeError(
+            "HCU GLM5Next sparse prefill requires the packaged AITER "
+            "fp8_mqa_logits Triton module"
+        )
 
     if aiter_mqa_logits_module is not None:
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits

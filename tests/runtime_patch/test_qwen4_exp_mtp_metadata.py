@@ -62,7 +62,8 @@ def test_qsa_draft_metadata_refresh_reuses_official_builder_in_place():
 
 
 @pytest.mark.parametrize(
-    "model_type", ["qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp"]
+    "model_type",
+    ["qwen4_exp", "qwen3_5_moe", "qwen3_5_moe_text"],
 )
 def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
     module = ModuleType(kv_groups_patch.TARGET_MODULE)
@@ -198,8 +199,10 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
             return num_new_tokens - 1
 
     module.Scheduler = Scheduler
+    original_init = Scheduler.__init__
     assert scheduler_patch.apply_to_module(module) is True
     assert scheduler_patch.apply_to_module(module) is False
+    assert Scheduler.__init__ is original_init
 
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True),

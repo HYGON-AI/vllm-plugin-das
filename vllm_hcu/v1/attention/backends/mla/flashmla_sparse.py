@@ -12,7 +12,6 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
 )
 
-
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
@@ -32,7 +31,6 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
             q_buffer = self.q_concat_buffer[: ql_nope.shape[0]]
             q_buffer[:, : ql_nope.shape[1], :].copy_(ql_nope)
             q = q_buffer[:, : ql_nope.shape[1], :]
-
         if self.dcp_world_size <= 1:
             return super().forward_mqa(
                 q,
@@ -99,9 +97,12 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        # vLLM selects an MLA backend with kv_lora_rank + qk_rope_head_dim.
-        # GLM5Next therefore selects D512, while DeepSeek uses D576.
-        return [512, 576]
+        # The HCU FlashMLA library supports GLM5Next's absorbed D512 path.
+        # Retain every size supported by the current official backend.
+        return [
+            512,
+            *(size for size in super().get_supported_head_sizes() if size != 512),
+        ]
 
     @staticmethod
     def get_name() -> str:
