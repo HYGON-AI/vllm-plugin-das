@@ -1,70 +1,106 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Select the HCU AITER FLA output kernel without source mutation."""
+"""Route the vLLM FLA chunk-output kernel through BoltOPs on HCU."""
 
 from __future__ import annotations
 
 import functools
 from types import ModuleType
 
-from ._common import already_applied, load_exact_module, require_callable, require_exact_signature
+from ._common import (
+    already_applied,
+    load_exact_module,
+    require_callable,
+    require_exact_signature,
+)
+from ._boltops_fla import make_boltops_gdn_resolver
 
-TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk_o"
-PATCH_ID = "worker.op_opt.fla.chunk_o.aiter"
+TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk"
+PATCH_ID = "worker.op_opt.fla.chunk_o.boltops"
 TARGETS = (f"{TARGET_MODULE}.chunk_fwd_o",)
-_MARKER = "_vllm_hcu_chunk_o_applied"
-_WRAPPER = "_vllm_hcu_chunk_o_wrapper"
+_MARKER = "_vllm_hcu_fla_chunk_o_applied"
+_WRAPPER = "_vllm_hcu_fla_chunk_o_wrapper"
 
 
 def _enabled() -> bool:
     from vllm_hcu.platforms import envs as henvs
 
-    return bool(henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA and henvs.VLLM_HCU_USE_CUSTOM_OPS)
+    return bool(
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
     chunk = load_exact_module(TARGET_MODULE, module)
-    if already_applied(chunk, _MARKER, ((chunk, "chunk_fwd_o", TARGETS[0], _WRAPPER),)):
+    wrapped = ((chunk, "chunk_fwd_o", TARGETS[0], _WRAPPER),)
+    if already_applied(chunk, _MARKER, wrapped):
         return False
     original = require_callable(chunk, "chunk_fwd_o", TARGETS[0])
     require_exact_signature(
         original,
         TARGETS[0],
-        positional=("q", "k", "v", "h", "g", "scale", "cu_seqlens", "chunk_indices", "chunk_size", "core_attn_out"),
-        defaults={"g": None, "scale": None, "cu_seqlens": None, "chunk_indices": None,
-                  "chunk_size": chunk.FLA_CHUNK_SIZE, "core_attn_out": None},
+        positional=(
+            "q", "k", "v", "h", "g", "scale", "cu_seqlens",
+            "chunk_indices", "chunk_size", "core_attn_out",
+        ),
+        defaults={
+            "g": None,
+            "scale": None,
+            "cu_seqlens": None,
+            "chunk_indices": None,
+            "chunk_size": chunk.FLA_CHUNK_SIZE,
+            "core_attn_out": None,
+        },
     )
+    resolve_boltops = make_boltops_gdn_resolver("chunk_fwd_o")
 
     @functools.wraps(original)
-    def hcu_chunk_o(q, k, v, h, g=None, scale=None, cu_seqlens=None,
-                    chunk_indices=None, chunk_size=chunk.FLA_CHUNK_SIZE,
-                    core_attn_out=None):
+    def hcu_chunk_o(
+        q,
+        k,
+        v,
+        h,
+        g=None,
+        scale=None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        chunk_size=chunk.FLA_CHUNK_SIZE,
+        core_attn_out=None,
+    ):
         if not _enabled():
-            return original(q, k, v, h, g, scale, cu_seqlens, chunk_indices,
-                            chunk_size, core_attn_out)
-        try:
-            from aiter.ops.triton.fla.vllm.chunk_o import launch_chunk_fwd_kernel_o
-        except ImportError as exc:
-            raise RuntimeError("HCU AITER FLA chunk_o is enabled but unavailable") from exc
-        B, T, Hg, K, V = *q.shape, v.shape[-1]
-        H, BT = v.shape[-2], chunk_size
-        if chunk_indices is None and cu_seqlens is not None:
-            chunk_indices = chunk.prepare_chunk_indices(cu_seqlens, BT)
-        NT = chunk.triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-        if scale is None:
-            scale = k.shape[-1] ** -0.5
-        if core_attn_out is not None:
-            if core_attn_out.numel() < v.numel():
-                raise ValueError("core_attn_out is too small for HCU FLA chunk_o")
-            out = core_attn_out[:v.numel()].view(*v.shape)
-        else:
-            out = chunk.torch.empty_like(v)
-        launch_chunk_fwd_kernel_o(
-            q=q, k=k, v=v, h=h, g=g, g_gamma=None, o=out,
-            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, scale=scale,
-            T=T, H=H, Hg=Hg, K=K, V=V, BT=BT, NT=NT, B=B,
-            use_exp2=False, transpose_state_layout=True, kernel_cfg=None,
+            return original(
+                q, k, v, h, g, scale, cu_seqlens, chunk_indices,
+                chunk_size, core_attn_out,
+            )
+        boltops_kernel = resolve_boltops()
+        if boltops_kernel is None:
+            return original(
+                q, k, v, h, g, scale, cu_seqlens, chunk_indices,
+                chunk_size, core_attn_out,
+            )
+
+        boltops_output = boltops_kernel(
+            q=q,
+            k=k,
+            v=v,
+            h=h,
+            g=g,
+            g_gamma=None,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            use_exp2=False,
+            transpose_state_layout=True,
+            kernel_cfg=None,
         )
+        if core_attn_out is None:
+            return boltops_output
+        if core_attn_out.numel() < v.numel():
+            raise ValueError("core_attn_out is too small for HCU FLA chunk_o")
+        out = core_attn_out[:v.numel()].view(*v.shape)
+        out.copy_(boltops_output)
         return out
 
     setattr(hcu_chunk_o, _WRAPPER, True)
