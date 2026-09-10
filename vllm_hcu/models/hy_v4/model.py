@@ -1161,13 +1161,19 @@ def _hcu_hyv4_append_topk_to_pp(model, intermediate_tensors):
     topk = buffer[:num_tokens]
     try:
         from vllm.forward_context import get_forward_context
+    except ImportError:
+        get_forward_context = None
+    if get_forward_context is not None:
+        try:
+            from vllm.forward_context import is_forward_context_available
+        except ImportError:
+            is_forward_context_available = lambda: True
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if getattr(ctx, "enable_lightly_cp", False):
+                from vllm.distributed.parallel_state import get_tp_group
 
-        if getattr(get_forward_context(), "enable_lightly_cp", False):
-            from vllm.distributed.parallel_state import get_tp_group
-
-            topk = get_tp_group().all_gather(topk.contiguous(), dim=0)
-    except Exception:
-        pass
+                topk = get_tp_group().all_gather(topk.contiguous(), dim=0)
     tensors["topk_indices_buffer"] = topk.clone()
 
 

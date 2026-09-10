@@ -959,15 +959,29 @@ def test_same_pp_rejects_custom_layer_partition(mooncake, monkeypatch):
 
 
 def test_receive_kv_same_pp_rejects_custom_partition(mooncake, monkeypatch):
-    """same_pp pairs by rank; reject custom partitions before the pull."""
+    """Background receive must finish the pull instead of raising."""
     worker = _worker(mooncake, blocks_first=True)
     worker.pp_size = 2
     worker.pp_rank = 0
-    worker._fail_pull_metas = lambda *args, **kwargs: None
+    failures = []
+
+    def fail_pull(pull_metas, err_msg):
+        failures.append((pull_metas, err_msg))
+
+    worker._fail_pull_metas = fail_pull
     worker._tp_size = {"engine": 1}
     worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
     worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
     monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
     pull_metas = {"request": SimpleNamespace(pull_tasks_count=0)}
+    worker.receive_kv("engine", pull_metas)
+    assert len(failures) == 1
+    assert failures[0][0] is pull_metas
+    assert "VLLM_PP_LAYER_PARTITION" in failures[0][1]
+
+
+def test_mooncake_init_rejects_custom_pp_partition(mooncake, monkeypatch):
+    """Config-time reject so the background send/recv path never starts."""
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
     with pytest.raises(RuntimeError, match="VLLM_PP_LAYER_PARTITION"):
-        worker.receive_kv("engine", pull_metas)
+        mooncake._reject_custom_pp_partition()

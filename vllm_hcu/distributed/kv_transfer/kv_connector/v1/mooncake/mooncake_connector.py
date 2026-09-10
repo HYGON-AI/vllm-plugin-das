@@ -740,6 +740,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         _validate_mooncake_pcp_pd(vllm_config)
+        _reject_custom_pp_partition()
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -1634,6 +1635,8 @@ class MooncakeConnectorWorker:
                 else MooncakeXferResponseStatus.FINISH
             )
             ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            resolve_err_reqs: list[ReqId] = []
+            resolve_err_msg: str | None = None
             for task in done:
                 d_req_id, send_meta = task.result()
                 del pending_reqs[d_req_id]
@@ -1641,12 +1644,23 @@ class MooncakeConnectorWorker:
                 if send_meta.transfer_id in self.reqs_need_send:
                     # Mark it sending to avoid expiration.
                     send_meta.sending += 1
-                    if not send_meta.need_send:
-                        self.resolve_need_send(
-                            send_meta,
-                            remote_tp_ranks,
-                            remote_pp_size=meta.remote_pp_size,
+                    try:
+                        if not send_meta.need_send:
+                            self.resolve_need_send(
+                                send_meta,
+                                remote_tp_ranks,
+                                remote_pp_size=meta.remote_pp_size,
+                            )
+                    except Exception as e:
+                        send_meta.sending -= 1
+                        logger.error(
+                            "Mooncake resolve_need_send failed for %s: %s",
+                            d_req_id,
+                            e,
                         )
+                        resolve_err_reqs.append(d_req_id)
+                        resolve_err_msg = str(e)
+                        continue
                     ready_reqs.append((d_req_id, send_meta))
                 else:
                     # Otherwise (expired, very unlikely), just forget it.
@@ -1667,6 +1681,14 @@ class MooncakeConnectorWorker:
                 remote_regions,
             )
             err_req_set = set(err_reqs)
+            if resolve_err_reqs:
+                err_reqs = list(err_reqs) + resolve_err_reqs
+                err_req_set.update(resolve_err_reqs)
+                err_msg = (
+                    resolve_err_msg
+                    if err_msg is None
+                    else f"{err_msg}; {resolve_err_msg}"
+                )
             ok_ready_reqs = [
                 (d_req_id, send_meta)
                 for d_req_id, send_meta in ready_reqs
@@ -1742,13 +1764,7 @@ class MooncakeConnectorWorker:
         ``remote_pp_size`` is unused and kept for the call sites.
         """
         del remote_pp_size
-        partition = getattr(envs, "VLLM_PP_LAYER_PARTITION", None) or ""
-        if not partition:
-            return
-        raise RuntimeError(
-            "Mooncake P/D does not support VLLM_PP_LAYER_PARTITION; "
-            "unset it so both sides use the default even split."
-        )
+        _reject_custom_pp_partition()
 
     def _count_overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
         """How many consumer PP stages overlap this producer's layer range."""
@@ -2509,11 +2525,15 @@ class MooncakeConnectorWorker:
         worker_jobs: list[tuple[str, int | None, int, int]] = []
         selected_remote_pp: dict[int, list[int]] = {}
         needs_chunk_idx = len(remote_tp_ranks) > 1
+        try:
+            # Config errors on this background path must finish the pull.
+            self._reject_custom_partition_for_hetero_pp(self.pp_size)
+        except RuntimeError as e:
+            self._fail_pull_metas(pull_metas, str(e))
+            return
         for i, remote_tp_rank in enumerate(remote_tp_ranks):
             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
             remote_pp_size = len(pp_to_addr)
-            # Same-PP still cannot infer the remote custom partition.
-            self._reject_custom_partition_for_hetero_pp(remote_pp_size)
             same_pp = self.pp_size == remote_pp_size and self.pp_rank in pp_to_addr
             if same_pp:
                 pp_ranks = [self.pp_rank]
@@ -2805,6 +2825,17 @@ def get_mooncake_side_channel_port(vllm_config: VllmConfig) -> int:
 def _async_loop(loop: asyncio.AbstractEventLoop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+
+def _reject_custom_pp_partition() -> None:
+    """Reject Mooncake P/D when a process-local PP partition is set."""
+    partition = getattr(envs, "VLLM_PP_LAYER_PARTITION", None) or ""
+    if not partition:
+        return
+    raise RuntimeError(
+        "Mooncake P/D does not support VLLM_PP_LAYER_PARTITION; "
+        "unset it so both sides use the default even split."
+    )
 
 
 def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
