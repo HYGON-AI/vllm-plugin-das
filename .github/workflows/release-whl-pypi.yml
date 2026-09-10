@@ -86,7 +86,7 @@ jobs:
             --git_commit "${WHEEL_COMMIT_SHA}" \
             --outputdir output \
             -f dist/*.whl
-          CIUpload NIGHTLY --devpi_url ${PYPI_URL} --password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl --record
+          CIUpload NIGHTLY --devpi_url ${{ vars.PYPI_URL }} --password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl --record
 
       # 容器内以 root 运行, workspace 里的文件会归 root 所有,
       # 宿主机 job (release-docker-image) 的 checkout 无法清理, 退出前清空
