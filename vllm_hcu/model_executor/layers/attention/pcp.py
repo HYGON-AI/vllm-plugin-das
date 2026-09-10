@@ -25,6 +25,10 @@ _REPLICATED_MTP_BATCH = ContextVar(
     "vllm_hcu_replicated_mtp_batch",
     default=False,
 )
+_LOGICAL_PCP_METADATA_WORLD_SIZE: ContextVar[int | None] = ContextVar(
+    "vllm_hcu_logical_pcp_metadata_world_size",
+    default=None,
+)
 _REPLICATED_MTP_GRAPH_STATE = local()
 
 
@@ -71,6 +75,33 @@ def effective_pcp_world_size(configured_world_size: int) -> int:
     if in_replicated_mtp_batch():
         return 1
     return configured_world_size
+
+
+@contextmanager
+def logical_pcp_metadata_scope(world_size: int) -> Iterator[None]:
+    """Expose batch ownership while synchronous attention metadata is built."""
+
+    if world_size < 1:
+        raise ValueError(
+            f"logical PCP metadata world size must be positive: {world_size}"
+        )
+    token = _LOGICAL_PCP_METADATA_WORLD_SIZE.set(world_size)
+    try:
+        yield
+    finally:
+        _LOGICAL_PCP_METADATA_WORLD_SIZE.reset(token)
+
+
+def effective_pcp_metadata_world_size(configured_world_size: int) -> int:
+    """Resolve PCP width for metadata builders before collectives execute."""
+
+    scoped_world_size = _LOGICAL_PCP_METADATA_WORLD_SIZE.get()
+    if scoped_world_size is not None:
+        return min(
+            effective_pcp_world_size(configured_world_size),
+            scoped_world_size,
+        )
+    return effective_pcp_world_size(configured_world_size)
 
 
 def _pcp_world_size(metadata: object | None) -> int:

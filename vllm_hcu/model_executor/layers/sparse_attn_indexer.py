@@ -1002,6 +1002,11 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
                 metadata_world_size = int(
                     getattr(layer_metadata, "pcp_world_size", 1)
                 )
+                if not bool(
+                    getattr(layer_metadata, "pcp_has_global_prefill", True)
+                ):
+                    pcp_world_size = 1
+            if pcp_world_size > 1 and isinstance(attn_metadata, dict):
                 if metadata_world_size != pcp_world_size:
                     raise RuntimeError(
                         "PCP sparse-indexer metadata world size mismatch: "

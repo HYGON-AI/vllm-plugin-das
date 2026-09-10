@@ -333,6 +333,69 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
     assert calls[0][-1] is False
 
 
+def test_v32_decode_only_target_bypasses_pcp_indexer_gather():
+    """Replicated target verification uses local complete indexer caches."""
+
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+        return None
+
+    metadata = SimpleNamespace(
+        pcp_world_size=1,
+        pcp_has_global_prefill=False,
+    )
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "decode-only target gathered PCP indexer inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *args: pytest.fail(
+                "decode-only target used external PCP cache insertion"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "decode-only target used PCP BF16 cache insertion"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    local_k = torch.ones(2, 2)
+    q_quant = torch.ones(2, 2)
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=True,
+        pcp_world_size=2,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert (
+        forward_hip(indexer, object(), q_quant, local_k, object())
+        is indexer.topk_indices_buffer
+    )
+    assert len(calls) == 1
+    assert calls[0][4] is local_k
+    assert calls[0][-1] is False
+
+
 def test_v32_hcu_indexer_impl_advertises_pcp_capability():
     assert _load_v32_sparse_indexer_class().supports_pcp is True
 

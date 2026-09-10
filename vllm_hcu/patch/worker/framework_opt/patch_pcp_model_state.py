@@ -9,6 +9,7 @@ import functools
 import hashlib
 import inspect
 import textwrap
+from contextlib import nullcontext
 from types import ModuleType
 
 from ._common import (
@@ -57,6 +58,13 @@ def _attach_pcp_cache_ownership(
             continue
         visited.add(metadata_id)
         if hasattr(metadata, "pcp_world_size"):
+            # PCP manager replicates every decode row and materializes the
+            # complete prefill KV cache on each rank. A decode-only step must
+            # therefore execute as one logical PCP rank. This is especially
+            # important for speculative verification, where unequal draft
+            # counts can make a replicated decode row use a prefill kernel.
+            if not has_global_prefill:
+                setattr(metadata, "pcp_world_size", 1)
             setattr(
                 metadata,
                 "pcp_has_global_prefill",
@@ -146,25 +154,12 @@ def apply_to_module(module: ModuleType) -> bool:
         for_capture=False,
         ubatch_idx=0,
     ):
-        attn_metadata = original_prepare_attn(
-            self,
-            input_batch,
-            cudagraph_mode,
-            block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture,
-            ubatch_idx,
-        )
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
+        has_global_prefill = True
+        metadata_scope = nullcontext()
         if pcp_size > 1:
-            _attach_pcp_plan(
-                attn_metadata,
-                getattr(input_batch, "_vllm_hcu_pcp_plan", None),
-            )
             has_global_prefill = getattr(
                 input_batch,
                 "_vllm_hcu_pcp_has_global_prefill",
@@ -172,6 +167,30 @@ def apply_to_module(module: ModuleType) -> bool:
             )
             if has_global_prefill is None:
                 has_global_prefill = bool(input_batch.is_prefilling_np.any())
+            from vllm_hcu.model_executor.layers.attention.pcp import (
+                logical_pcp_metadata_scope,
+            )
+
+            metadata_scope = logical_pcp_metadata_scope(
+                pcp_size if has_global_prefill else 1
+            )
+        with metadata_scope:
+            attn_metadata = original_prepare_attn(
+                self,
+                input_batch,
+                cudagraph_mode,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                for_capture,
+                ubatch_idx,
+            )
+        if pcp_size > 1:
+            _attach_pcp_plan(
+                attn_metadata,
+                getattr(input_batch, "_vllm_hcu_pcp_plan", None),
+            )
             _attach_pcp_cache_ownership(
                 attn_metadata,
                 has_global_prefill,

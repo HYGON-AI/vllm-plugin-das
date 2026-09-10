@@ -924,6 +924,94 @@ def test_pcp_model_state_routes_plan_only_to_flash_attention_builder() -> None:
     assert not hasattr(mla_metadata, "pcp_plan")
 
 
+def test_pcp_decode_only_metadata_disables_prefill_collectives() -> None:
+    """Replicated decode rows must not re-enter PCP prefill collectives."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    decode_metadata = SimpleNamespace(pcp_world_size=2)
+    prefill_metadata = SimpleNamespace(pcp_world_size=2)
+
+    adapter._attach_pcp_cache_ownership(
+        {"decode": decode_metadata}, has_global_prefill=False
+    )
+    adapter._attach_pcp_cache_ownership(
+        {"prefill": prefill_metadata}, has_global_prefill=True
+    )
+
+    assert decode_metadata.pcp_world_size == 1
+    assert decode_metadata.pcp_has_global_prefill is False
+    assert prefill_metadata.pcp_world_size == 2
+    assert prefill_metadata.pcp_has_global_prefill is True
+
+
+def test_pcp_model_state_scopes_logical_width_before_metadata_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target ownership must reach compressed builders before they gather."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    target = _fake_default_model_state_module(adapter)
+    _accept_synthetic_model_state_sources(monkeypatch, adapter, target)
+    assert adapter.apply_to_module(target) is True
+
+    observed_world_sizes: list[int] = []
+
+    def capture_build(**kwargs):
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            effective_pcp_metadata_world_size,
+        )
+
+        observed_world_sizes.append(effective_pcp_metadata_world_size(2))
+        return {"mla.layer": SimpleNamespace(pcp_world_size=2)}
+
+    target.build_attn_metadata = capture_build
+    state = target.DefaultModelState()
+    state.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+    state.supports_mm_inputs = False
+    state.max_model_len = 64
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        query_start_loc_np=np.array([0, 1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        dcp_local_seq_lens=None,
+        positions=torch.tensor([0], dtype=torch.int64),
+        req_ids=["decode"],
+        is_prefilling_np=np.array([False], dtype=np.bool_),
+        prompt_lens=None,
+        max_query_len=1,
+        _vllm_hcu_pcp_has_global_prefill=False,
+    )
+    args = (
+        input_batch,
+        target.CUDAGraphMode.NONE,
+        (torch.zeros((1, 1), dtype=torch.int32),),
+        torch.zeros((1, 1), dtype=torch.int64),
+        [[]],
+        SimpleNamespace(kv_cache_groups=[object()]),
+    )
+
+    decode_metadata = state.prepare_attn(*args)["mla.layer"]
+    input_batch._vllm_hcu_pcp_has_global_prefill = True
+    input_batch.is_prefilling_np[:] = True
+    prefill_metadata = state.prepare_attn(*args)["mla.layer"]
+
+    assert observed_world_sizes == [1, 2]
+    assert decode_metadata.pcp_world_size == 1
+    assert prefill_metadata.pcp_world_size == 2
+
+
 def test_pcp_default_model_state_rejects_same_signature_behavior_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
