@@ -10,7 +10,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -677,7 +677,9 @@ def test_sparse_replacements_keep_reviewed_hcu_deltas():
     build_tile_scheduler = sparse_swa_source.split(
         "    def build_tile_scheduler(", 1
     )[1].split("    def _build_deepseek_v4_metadata(", 1)[0]
-    assert "current_platform.is_rocm()" not in build_tile_scheduler
+    # ROCm may skip planning only for a decode path that does not consume it.
+    # Both native and generic ROCm builders are exercised below.
+    assert "VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK" in build_tile_scheduler
     assert "current_platform.is_xpu()" in build_tile_scheduler
     sparse_swa_tree = ast.parse(sparse_swa_source)
     backend_class = next(
@@ -834,3 +836,77 @@ def test_modular_kernel_strict_late_policy_keeps_official_and_hcu_exclusive(
     assert replacement not in sys.modules
     record = registry.get("module_exchange.modular_kernel")
     assert record is not None and record.status is PatchStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "platform,native_builder,fallback,num_decode_tokens,expects_scheduler",
+    [("rocm", False, False, 8, True),
+     ("rocm", False, True, 8, False),
+     ("rocm", True, False, 8, False),
+     ("rocm", True, True, 8, False),
+     ("rocm", False, False, 0, False),
+     ("xpu", False, False, 8, False),
+     ("sm120", False, False, 8, False),
+     ("cuda", False, False, 0, False),
+     ("cuda", False, False, 8, True),
+     ("cuda", False, True, 8, True)],
+)
+def test_sparse_swa_tile_scheduler_platform_behavior(
+    monkeypatch, platform, native_builder, fallback, num_decode_tokens,
+    expects_scheduler,
+):
+    # Execute the actual builder method without importing GPU extensions.
+    source = (REPO_ROOT / "vllm_hcu/v1/attention/backends/mla/sparse_swa.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    builder = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "DeepseekSparseSWAMetadataBuilder"
+    )
+    method = next(
+        node for node in builder.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_tile_scheduler"
+    )
+    class NativeBuilder:
+        pass
+
+    native_module = ModuleType("vllm.models.deepseek_v4.amd.rocm")
+    native_module.DeepseekV4ROCMAiterSparseSWAMetadataBuilder = NativeBuilder
+    monkeypatch.setitem(sys.modules, native_module.__name__, native_module)
+    calls = []
+
+    def get_metadata():
+        metadata = object()
+        calls.append(metadata)
+        return (metadata,)
+
+    namespace = {
+        "current_platform": SimpleNamespace(
+            is_rocm=lambda: platform == "rocm",
+            is_xpu=lambda: platform == "xpu",
+            is_device_capability_family=lambda family: platform == "sm120" and family == 120,
+        ),
+        "henvs": SimpleNamespace(VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK=fallback),
+        "get_mla_metadata": get_metadata,
+        "FlashMLASchedMeta": object,
+        "_LAYER_TYPE_SWAONLY": "swaonly",
+        "_LAYER_TYPE_C4A": "c4a",
+        "_LAYER_TYPE_C128A": "c128a",
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "<tile_scheduler>", "exec"), namespace)
+    # Include an absent layer type to verify it retains the None sentinel.
+    instance = NativeBuilder() if native_builder else SimpleNamespace()
+    instance._layer_types = ["swaonly", "c4a"]
+    result = namespace["build_tile_scheduler"](instance, num_decode_tokens)
+    assert set(result) == {"swaonly", "c4a", "c128a"}
+    if expects_scheduler:
+        assert len(calls) == 2
+        assert result["swaonly"] is calls[0]
+        assert result["c4a"] is calls[1]
+        assert calls[0] is not calls[1]
+        assert result["c128a"] is None
+    else:
+        assert calls == []
+        assert all(value is None for value in result.values())

@@ -7,6 +7,8 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm_hcu.platforms.envs as henvs
+
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
@@ -564,8 +566,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         call of each type. Subsequent same-type calls reuse the plan because
         the tensors (and ``have_initialized``) are populated on the struct.
 
-        Returns all-``None`` when there are no decode tokens this step, so
-        ``_forward_decode`` sees a clean sentinel.
+        Returns all-``None`` for paths that do not consume FlashMLA tile
+        metadata, including native ROCm/AITER and the explicit HCU decode
+        fallback, or when there are no decode tokens this step.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
             _LAYER_TYPE_SWAONLY: None,
@@ -574,11 +577,24 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         }
         if (
             num_decode_tokens == 0
-            or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
         ):
             return out
+        if current_platform.is_rocm():
+            # The native ROCm/AITER builder serves a decode implementation
+            # that never consumes FlashMLA tile metadata. The generic builder
+            # still needs it unless its explicit decode fallback is enabled.
+            # Import lazily: the native builder inherits this class.
+            from vllm.models.deepseek_v4.amd.rocm import (
+                DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
+            )
+
+            if (
+                isinstance(self, DeepseekV4ROCMAiterSparseSWAMetadataBuilder)
+                or henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK
+            ):
+                return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
             # returns a fresh empty FlashMLASchedMeta; using it keeps this
