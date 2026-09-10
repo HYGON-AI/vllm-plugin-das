@@ -125,6 +125,7 @@ def cpu_flashmla(monkeypatch):
     _install_stub(
         monkeypatch,
         "vllm.utils.torch_utils",
+        direct_register_custom_op=lambda **kwargs: None,
         is_quantized_kv_cache=lambda cache_dtype: str(cache_dtype).startswith(
             "fp8"
         ),

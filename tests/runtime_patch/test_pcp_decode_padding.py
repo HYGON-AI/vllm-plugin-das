@@ -11,7 +11,7 @@ from vllm_hcu.model_executor.layers.attention import pcp
 
 def _decode_only_metadata() -> SimpleNamespace:
     return SimpleNamespace(
-        pcp_world_size=8,
+        pcp_world_size=1,
         num_decode_tokens=4,
         num_prefills=0,
         num_actual_tokens=4,

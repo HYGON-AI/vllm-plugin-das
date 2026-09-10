@@ -29,6 +29,10 @@ _LOGICAL_PCP_METADATA_WORLD_SIZE: ContextVar[int | None] = ContextVar(
     "vllm_hcu_logical_pcp_metadata_world_size",
     default=None,
 )
+_PCP_CACHE_OWNERSHIP_METADATA: ContextVar[object | None] = ContextVar(
+    "vllm_hcu_pcp_cache_ownership_metadata",
+    default=None,
+)
 _REPLICATED_MTP_GRAPH_STATE = local()
 
 
@@ -102,6 +106,21 @@ def effective_pcp_metadata_world_size(configured_world_size: int) -> int:
             scoped_world_size,
         )
     return effective_pcp_world_size(configured_world_size)
+
+
+@contextmanager
+def pcp_cache_ownership_scope(metadata: object | None) -> Iterator[None]:
+    """Expose row ownership to the official MLA cache-gather helper."""
+
+    token = _PCP_CACHE_OWNERSHIP_METADATA.set(metadata)
+    try:
+        yield
+    finally:
+        _PCP_CACHE_OWNERSHIP_METADATA.reset(token)
+
+
+def current_pcp_cache_ownership_metadata() -> object | None:
+    return _PCP_CACHE_OWNERSHIP_METADATA.get()
 
 
 def _pcp_world_size(metadata: object | None) -> int:
@@ -192,8 +211,29 @@ def _gather_prefill_cache_inputs(
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Keep replicated decode writes local and gather partitioned prefills."""
 
+    if metadata is None:
+        return tensors, slot_mapping
+
+    if getattr(metadata, "pcp_has_global_prefill", None) is False:
+        local_num_tokens = tensors[0].shape[0]
+        num_actual_tokens = int(
+            getattr(metadata, "num_actual_tokens", local_num_tokens)
+        )
+        assert 0 <= num_actual_tokens <= local_num_tokens, (
+            "PCP actual token count is outside the local tensor: "
+            f"actual={num_actual_tokens}, local={local_num_tokens}"
+        )
+        assert slot_mapping.shape[0] >= num_actual_tokens, (
+            "PCP cache slot mapping is shorter than the actual token prefix: "
+            f"slots={slot_mapping.shape[0]}, actual={num_actual_tokens}"
+        )
+        return (
+            tuple(tensor[:num_actual_tokens] for tensor in tensors),
+            slot_mapping[:num_actual_tokens],
+        )
+
     world_size = _pcp_world_size(metadata)
-    if world_size == 1 or metadata is None:
+    if world_size == 1:
         return tensors, slot_mapping
 
     num_decode_tokens = getattr(metadata, "num_decode_tokens", None)
@@ -210,34 +250,53 @@ def _gather_prefill_cache_inputs(
         "PCP decode token count is outside the local tensor: "
         f"decode={num_decode_tokens}, local={local_num_tokens}"
     )
-    if getattr(metadata, "pcp_has_global_prefill", None) is False:
-        num_actual_tokens = int(
-            getattr(metadata, "num_actual_tokens", local_num_tokens)
+    replicated_mask = getattr(metadata, "pcp_replicated_token_mask", None)
+    if replicated_mask is not None:
+        assert isinstance(replicated_mask, torch.Tensor), (
+            "PCP replicated-token ownership must be a tensor"
         )
-        assert 0 <= num_actual_tokens <= local_num_tokens, (
-            "PCP actual token count is outside the local tensor: "
-            f"actual={num_actual_tokens}, local={local_num_tokens}"
+        assert replicated_mask.dtype == torch.bool, (
+            "PCP replicated-token ownership must use bool dtype"
         )
-        assert slot_mapping.shape[0] >= num_actual_tokens, (
-            "PCP cache slot mapping is shorter than the actual token prefix: "
-            f"slots={slot_mapping.shape[0]}, actual={num_actual_tokens}"
+        assert replicated_mask.ndim == 1, (
+            "PCP replicated-token ownership must be one-dimensional"
         )
-        return (
-            tuple(tensor[:num_actual_tokens] for tensor in tensors),
-            slot_mapping[:num_actual_tokens],
+        assert replicated_mask.shape[0] == local_num_tokens, (
+            "PCP replicated-token ownership length mismatch: "
+            f"mask={replicated_mask.shape[0]}, local={local_num_tokens}"
         )
-    if getattr(metadata, "num_prefills", None) == 0:
-        # Official MLA metadata counts actual tokens, while graph/warmup
-        # tensors can include right padding. Decode KV is replicated across
-        # PCP ranks, so cache only the actual decode prefix without gathering.
-        cache_tensors = tuple(
-            tensor[:num_decode_tokens] for tensor in tensors
+        expected_slots = world_size * local_num_tokens
+        assert slot_mapping.shape[0] == expected_slots, (
+            "PCP ownership-aware cache gather requires exactly one "
+            "rank-ordered slot segment per PCP rank: "
+            f"slots={slot_mapping.shape[0]}, expected={expected_slots}"
         )
-        return cache_tensors, _decode_only_slot_mapping(
-            slot_mapping,
-            local_num_tokens,
-            metadata,
+        pcp_group = get_pcp_group()
+        assert int(pcp_group.world_size) == world_size, (
+            "PCP metadata/process-group size mismatch: "
+            f"metadata={world_size}, group={pcp_group.world_size}"
         )
+        partitioned_mask = ~replicated_mask
+        gathered_partitioned = tuple(
+            pcp_group.all_gather(
+                tensor[partitioned_mask].contiguous(), dim=0
+            )
+            for tensor in tensors
+        )
+        rank_slots = slot_mapping[:expected_slots].view(
+            world_size, local_num_tokens
+        )
+        cache_inputs = tuple(
+            torch.cat((tensor[replicated_mask], gathered), dim=0)
+            for tensor, gathered in zip(tensors, gathered_partitioned)
+        )
+        cache_slot_mapping = torch.cat(
+            (
+                rank_slots[0, replicated_mask],
+                rank_slots[:, partitioned_mask].flatten(),
+            )
+        )
+        return cache_inputs, cache_slot_mapping
     if num_decode_tokens == local_num_tokens:
         return tensors, _decode_only_slot_mapping(
             slot_mapping,
@@ -298,8 +357,7 @@ def maybe_gather_mla_latent_cache_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather MLA latent KV, RoPE K, and matching slots for cache writes."""
 
-    world_size = _pcp_world_size(metadata)
-    if world_size == 1 or metadata is None:
+    if metadata is None:
         return kv_c_normed, k_pe, slot_mapping
     num_decode_tokens = getattr(metadata, "num_decode_tokens", None)
     if num_decode_tokens is None:
@@ -307,14 +365,23 @@ def maybe_gather_mla_latent_cache_inputs(
     assert kv_c_normed.shape[0] == k_pe.shape[0], (
         "PCP MLA latent KV and RoPE K must have the same token dimension"
     )
-    if int(num_decode_tokens) == kv_c_normed.shape[0]:
-        cache_slot_mapping = _decode_only_slot_mapping(
-            slot_mapping,
-            kv_c_normed.shape[0],
-            metadata,
-        )
-        return kv_c_normed, k_pe, cache_slot_mapping
-
+    if getattr(metadata, "pcp_has_global_prefill", None) is not False:
+        world_size = _pcp_world_size(metadata)
+        if world_size == 1:
+            return kv_c_normed, k_pe, slot_mapping
+        if (
+            int(num_decode_tokens) == kv_c_normed.shape[0]
+            and getattr(metadata, "pcp_replicated_token_mask", None) is None
+        ):
+            return (
+                kv_c_normed,
+                k_pe,
+                _decode_only_slot_mapping(
+                    slot_mapping,
+                    kv_c_normed.shape[0],
+                    metadata,
+                ),
+            )
     num_tokens = kv_c_normed.shape[0]
     k_pe_flat = k_pe.reshape(num_tokens, -1)
     (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = (
@@ -335,11 +402,15 @@ def maybe_gather_indexer_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather sparse-indexer K and matching slots for its cache write."""
 
-    world_size = _pcp_world_size(metadata)
-    if world_size == 1 or metadata is None:
+    if metadata is None:
         return k, slot_mapping
     num_decode_tokens = getattr(metadata, "num_decode_tokens", None)
     if num_decode_tokens is None:
+        return k, slot_mapping
+    if (
+        getattr(metadata, "pcp_has_global_prefill", None) is not False
+        and _pcp_world_size(metadata) == 1
+    ):
         return k, slot_mapping
     (cache_k,), cache_slot_mapping = _gather_prefill_cache_inputs(
         (k,),
@@ -350,9 +421,13 @@ def maybe_gather_indexer_k(
 
 
 __all__ = (
+    "current_pcp_cache_ownership_metadata",
+    "effective_pcp_metadata_world_size",
     "effective_pcp_world_size",
     "in_replicated_mtp_batch",
+    "logical_pcp_metadata_scope",
     "maybe_gather_indexer_k",
     "maybe_gather_mla_latent_cache_inputs",
+    "pcp_cache_ownership_scope",
     "replicated_mtp_batch_scope",
 )

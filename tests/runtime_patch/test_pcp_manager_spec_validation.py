@@ -1,91 +1,83 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Contracts for handing HCU PCP+MTP to the plugin-owned PCP manager."""
+"""Contracts for selecting the plugin manager through official MRV2 hooks."""
 
 from __future__ import annotations
 
-import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+import inspect
+from types import SimpleNamespace
 
 import pytest
 
-
-TARGET_MODULE = "vllm.v1.worker.gpu.pcp_manager"
-ADAPTER_MODULE = (
-    "vllm_hcu.patch.worker.framework_opt.patch_pcp_spec_validation"
-)
+from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
+from vllm_hcu.v1 import pcp_manager
 
 
-def _load_adapter(monkeypatch: pytest.MonkeyPatch):
-    calls: list[tuple[object, bool]] = []
-    target = ModuleType(TARGET_MODULE)
-
-    class PCPManager:
-        @staticmethod
-        def validate_config(vllm_config, supports_mm_inputs):
-            calls.append((vllm_config, supports_mm_inputs))
-            if vllm_config.speculative_config is not None:
-                raise NotImplementedError(
-                    "MRV2 PCP does not support speculative decoding yet."
-                )
-            if supports_mm_inputs:
-                raise RuntimeError("official validation after speculative guard")
-
-    target.PCPManager = PCPManager
-    monkeypatch.setitem(sys.modules, TARGET_MODULE, target)
-    monkeypatch.delitem(sys.modules, ADAPTER_MODULE, raising=False)
-    adapter = importlib.import_module(ADAPTER_MODULE)
-    return adapter, target, PCPManager, calls
+def _config() -> SimpleNamespace:
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=16,
+            max_num_batched_tokens=128,
+        ),
+    )
 
 
-def test_supported_hcu_pcp_mtp_preserves_official_validation(
+def test_hcu_manager_owns_validation_without_patching_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter, target, manager, calls = _load_adapter(monkeypatch)
-    monkeypatch.setattr(adapter, "_validate_hcu_pcp_scope", lambda config: True)
-    speculative_config = object()
-    config = SimpleNamespace(speculative_config=speculative_config)
+    config = _config()
+    calls: list[object] = []
+    monkeypatch.setattr(
+        pcp_manager,
+        "_validate_hcu_pcp_scope",
+        lambda value: calls.append(value) or True,
+    )
 
-    assert adapter.apply_to_module(target) is True
-    manager.validate_config(config, False)
+    pcp_manager.HcuPCPManager.validate_config(config, False)
 
-    assert len(calls) == 1
-    validated_config, supports_mm_inputs = calls[0]
-    assert validated_config is not config
-    assert validated_config.speculative_config is None
-    assert supports_mm_inputs is False
-    assert config.speculative_config is speculative_config
-
-    with pytest.raises(RuntimeError, match="official validation after"):
-        manager.validate_config(config, True)
+    assert calls == [config]
+    with pytest.raises(ValueError, match="multimodal"):
+        pcp_manager.HcuPCPManager.validate_config(config, True)
 
 
-def test_non_speculative_pcp_delegates_without_copy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter, target, manager, calls = _load_adapter(monkeypatch)
-    config = SimpleNamespace(speculative_config=None)
+def test_bound_manager_matches_official_constructor_contract() -> None:
+    manager_cls = pcp_manager.make_hcu_pcp_manager_cls(_config())
+    signature = inspect.signature(manager_cls.__init__)
 
-    adapter.apply_to_module(target)
-    manager.validate_config(config, False)
+    assert list(signature.parameters) == [
+        "self",
+        "pcp_world_size",
+        "pcp_rank",
+        "device",
+        "req_states",
+        "max_num_reqs",
+        "max_num_tokens",
+        "block_tables",
+        "dcp_world_size",
+        "dcp_rank",
+        "cp_interleave",
+    ]
+    assert issubclass(manager_cls, pcp_manager.HcuPCPManager)
 
-    assert calls == [(config, False)]
 
+def test_bound_manager_fails_closed_before_allocating_on_argument_drift() -> None:
+    manager_cls = pcp_manager.make_hcu_pcp_manager_cls(_config())
 
-def test_unsupported_hcu_pcp_spec_fails_before_official_bypass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter, target, manager, calls = _load_adapter(monkeypatch)
-
-    def reject(config):
-        raise ValueError("unsupported HCU PCP scope")
-
-    monkeypatch.setattr(adapter, "_validate_hcu_pcp_scope", reject)
-    config = SimpleNamespace(speculative_config=object())
-
-    adapter.apply_to_module(target)
-    with pytest.raises(ValueError, match="unsupported HCU PCP scope"):
-        manager.validate_config(config, False)
-
-    assert calls == []
+    with pytest.raises(PatchCompatibilityError, match="constructor arguments"):
+        manager_cls(
+            pcp_world_size=4,
+            pcp_rank=0,
+            device="cpu",
+            req_states=object(),
+            max_num_reqs=16,
+            max_num_tokens=128,
+            block_tables=object(),
+            dcp_world_size=1,
+            dcp_rank=0,
+            cp_interleave=1,
+        )

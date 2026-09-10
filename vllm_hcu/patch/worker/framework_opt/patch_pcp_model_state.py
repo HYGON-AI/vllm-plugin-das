@@ -48,7 +48,9 @@ def _attach_pcp_plan(attn_metadata: dict[str, object], pcp_plan: object) -> None
 
 
 def _attach_pcp_cache_ownership(
-    attn_metadata: dict[str, object], has_global_prefill: bool
+    attn_metadata: dict[str, object],
+    has_global_prefill: bool,
+    replicated_token_mask: object | None = None,
 ) -> None:
     """Keep PCP cache ownership separate from backend kernel classification."""
     visited: set[int] = set()
@@ -70,6 +72,12 @@ def _attach_pcp_cache_ownership(
                 "pcp_has_global_prefill",
                 bool(has_global_prefill),
             )
+            if replicated_token_mask is not None:
+                setattr(
+                    metadata,
+                    "pcp_replicated_token_mask",
+                    replicated_token_mask,
+                )
 
 
 def _require_source_fingerprint(function, target: str, expected: str) -> None:
@@ -194,6 +202,11 @@ def apply_to_module(module: ModuleType) -> bool:
             _attach_pcp_cache_ownership(
                 attn_metadata,
                 has_global_prefill,
+                getattr(
+                    input_batch,
+                    "_vllm_hcu_pcp_replicated_token_mask",
+                    None,
+                ),
             )
         return attn_metadata
 

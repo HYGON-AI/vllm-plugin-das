@@ -18,7 +18,7 @@ from vllm_hcu.forward_context_runtime import (
     deepep_auto_request_phase_scope,
     set_deepep_auto_request_phase,
 )
-from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
+from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 
 
 _FIXED_WIDTH_PP_BROADCAST_MARKER = "_vllm_hcu_fixed_width_pp_broadcast"
@@ -121,8 +121,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     """HCU compatibility adapter around upstream v0.25.1 Model Runner V2."""
 
     def __init__(self, vllm_config, device):
+        self._hcu_pcp_manager_cls = None
         super().__init__(vllm_config, device)
-        self.pcp_manager = None
+
+    @property
+    def pcp_manager_cls(self):
+        if self._hcu_pcp_manager_cls is None:
+            self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(
+                self.vllm_config
+            )
+        return self._hcu_pcp_manager_cls
 
     def initialize_kv_cache(
         self,
@@ -145,12 +153,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 is_profiling=is_profiling,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
-        if pcp_size > 1:
-            self.pcp_manager = maybe_build_pcp_manager(
-                self.vllm_config,
-                self.device,
-                self.req_states,
-                self.block_tables,
+        if pcp_size > 1 and self.pcp_manager is None:
+            raise RuntimeError(
+                "official MRV2 did not initialize the selected HCU PCP manager"
             )
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):

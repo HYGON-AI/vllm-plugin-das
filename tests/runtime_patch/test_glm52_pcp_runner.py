@@ -45,7 +45,16 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
     adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
     upstream_module = ModuleType(upstream_name)
     pcp_module = ModuleType("vllm_hcu.v1.pcp_manager")
-    pcp_module.maybe_build_pcp_manager = lambda *args: None
+
+    class NullPCPManager:
+        @staticmethod
+        def validate_config(vllm_config, supports_mm_inputs):
+            return None
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    pcp_module.make_hcu_pcp_manager_cls = lambda config: NullPCPManager
 
     class FakeBlockTables:
         def get_dummy_block_tables(self, num_reqs):
@@ -63,6 +72,7 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             self.device = device
             self.req_states = object()
             self.execute_model_state = None
+            self.pcp_manager = None
 
         def initialize_kv_cache(
             self,
@@ -77,6 +87,21 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                 kv_cache_allocation_context,
             )
             self.block_tables = FakeBlockTables()
+            if self.vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                manager_cls = self.pcp_manager_cls
+                manager_cls.validate_config(self.vllm_config, False)
+                self.pcp_manager = manager_cls(
+                    pcp_world_size=2,
+                    pcp_rank=0,
+                    device=self.device,
+                    req_states=self.req_states,
+                    max_num_reqs=16,
+                    max_num_tokens=128,
+                    block_tables=self.block_tables,
+                    dcp_world_size=1,
+                    dcp_rank=0,
+                    cp_interleave=1,
+                )
 
         def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
             events.append("super.prepare_inputs")
@@ -213,13 +238,23 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
 
     manager = Manager()
 
-    def build_manager(vllm_config, device, req_states, block_tables):
-        events.append("build_pcp_manager")
+    def bind_manager(vllm_config):
         assert vllm_config.parallel_config.prefill_context_parallel_size == 2
-        assert device == "hcu:0"
-        assert req_states is runner.req_states
-        assert block_tables is runner.block_tables
-        return manager
+
+        class BoundManager:
+            @staticmethod
+            def validate_config(config, supports_mm_inputs):
+                assert config is vllm_config
+                assert supports_mm_inputs is False
+
+            def __new__(cls, **kwargs):
+                events.append("build_pcp_manager")
+                assert kwargs["device"] == "hcu:0"
+                assert kwargs["req_states"] is runner.req_states
+                assert kwargs["block_tables"] is runner.block_tables
+                return manager
+
+        return BoundManager
 
     def synchronize(model_runner, input_batch):
         assert events[-2:] == ["super.sample_tokens", "restore_for_sampling"]
@@ -227,7 +262,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         synchronized_batches.append(input_batch)
         return False
 
-    monkeypatch.setattr(runner_module, "maybe_build_pcp_manager", build_manager)
+    monkeypatch.setattr(runner_module, "make_hcu_pcp_manager_cls", bind_manager)
     monkeypatch.setattr(
         runner_module,
         "synchronize_pp_spec_draft_tokens",
@@ -449,10 +484,22 @@ def test_pcp_runner_routes_dummy_slots_through_manager(
             return "pcp-dummy-slots"
 
     manager = Manager()
+
+    def bind_manager(vllm_config):
+        class BoundManager:
+            @staticmethod
+            def validate_config(config, supports_mm_inputs):
+                return None
+
+            def __new__(cls, **kwargs):
+                return manager
+
+        return BoundManager
+
     monkeypatch.setattr(
         runner_module,
-        "maybe_build_pcp_manager",
-        lambda *args: manager,
+        "make_hcu_pcp_manager_cls",
+        bind_manager,
     )
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
@@ -482,7 +529,7 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     hidden_states = object()
 
     def unexpected_builder(*args):
-        pytest.fail("PCP=1 called maybe_build_pcp_manager")
+        pytest.fail("PCP=1 selected an HCU PCP manager class")
 
     def synchronize(model_runner, input_batch):
         events.append("synchronize_pp_spec_draft_tokens")
@@ -492,7 +539,7 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
 
     monkeypatch.setattr(
         runner_module,
-        "maybe_build_pcp_manager",
+        "make_hcu_pcp_manager_cls",
         unexpected_builder,
     )
     monkeypatch.setattr(
@@ -992,6 +1039,7 @@ def test_pcp_model_state_scopes_logical_width_before_metadata_build(
         prompt_lens=None,
         max_query_len=1,
         _vllm_hcu_pcp_has_global_prefill=False,
+        _vllm_hcu_pcp_replicated_token_mask=torch.tensor([True]),
     )
     args = (
         input_batch,
@@ -1009,6 +1057,10 @@ def test_pcp_model_state_scopes_logical_width_before_metadata_build(
 
     assert observed_world_sizes == [1, 2]
     assert decode_metadata.pcp_world_size == 1
+    assert torch.equal(
+        decode_metadata.pcp_replicated_token_mask,
+        torch.tensor([True]),
+    )
     assert prefill_metadata.pcp_world_size == 2
 
 

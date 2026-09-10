@@ -200,18 +200,28 @@ def apply_to_module(module: ModuleType) -> bool:
         output_shape=None,
         q_dcp_replicated=None,
     ):
-        # Current upstream owns the direct MLA forward and PCP cache gather.
-        # The imported gather alias is wrapped below only to preserve the HCU
-        # replicated-MTP slot-layout contract. The backend cache-update method
-        # remains HCU-owned, so this continues to use the HIPC writer.
-        return original_full_forward(
-            self,
-            q,
-            kv_c_normed,
-            k_pe,
-            output_shape,
-            q_dcp_replicated,
+        # Current upstream owns the direct MLA forward and HIPC cache writer.
+        # Keep its kernel split separate from HCU's per-token PCP ownership.
+        if not getattr(self, "_hcu_use_pcp", False):
+            return original_full_forward(
+                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+            )
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            attn_metadata = attn_metadata_raw.get(self.layer_name)
+        elif isinstance(attn_metadata_raw, list):
+            attn_metadata = attn_metadata_raw[0].get(self.layer_name)
+        else:
+            attn_metadata = attn_metadata_raw
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            pcp_cache_ownership_scope,
         )
+
+        with pcp_cache_ownership_scope(attn_metadata):
+            return original_full_forward(
+                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+            )
 
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
@@ -298,11 +308,21 @@ def apply_to_module(module: ModuleType) -> bool:
         use_pcp,
     ):
         from vllm_hcu.model_executor.layers.attention.pcp import (
+            current_pcp_cache_ownership_metadata,
             in_replicated_mtp_batch,
+            maybe_gather_mla_latent_cache_inputs as gather_owned_cache_inputs,
         )
 
         if in_replicated_mtp_batch():
             return kv_c_normed, k_pe, slot_mapping
+        ownership_metadata = current_pcp_cache_ownership_metadata()
+        if ownership_metadata is not None and slot_mapping is not None:
+            return gather_owned_cache_inputs(
+                kv_c_normed,
+                k_pe,
+                slot_mapping,
+                ownership_metadata,
+            )
         # MTP can reclassify a replicated non-spec decode as a prefill when it
         # shares a batch with speculative decode tokens.  HcuPCPManager keeps
         # one slot per replicated token in that case; only a genuinely PCP-

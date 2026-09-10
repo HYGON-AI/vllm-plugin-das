@@ -473,8 +473,33 @@ def test_partition_creates_two_prefill_rows_and_replicates_decode() -> None:
             [0, 1, 2, 3, 4, 5],
             [0, 3, 6],
         ),
+        (
+            [
+                ("decode-a", [900, 901, 902, 903], 20, False),
+                ("decode-b", [800, 801, 802, 803], 14, False),
+            ],
+            6,
+            [3, 3],
+            [10, 10, 10, 10, 11, 11, 11, 11],
+            [0, 1, 2, 3, 0, 1, 2, 3],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 4, 8],
+        ),
+        (
+            [
+                ("decode-a", [900], 17, False),
+                ("decode-b", [800, 801], 12, False),
+                ("decode-c", [700, 701, 702, 703], 24, False),
+            ],
+            4,
+            [0, 1, 3],
+            [10, 11, 11, 12, 12, 12, 12],
+            [0, 0, 1, 0, 1, 2, 3],
+            [0, 1, 2, 3, 4, 5, 6],
+            [0, 1, 3, 7],
+        ),
     ],
-    ids=["mtp1", "mtp2"],
+    ids=["mtp1", "mtp2", "mtp3", "mtp-uneven"],
 )
 def test_partition_replicates_spec_decode_layout_on_every_pcp_rank(
     requests,
@@ -638,12 +663,12 @@ def test_uneven_prefill_and_mtp_decode_keep_equal_collective_shapes() -> None:
         cu_num_logits=torch.tensor([0, 0, 2], dtype=torch.int32),
         cu_num_logits_np=np.asarray([0, 0, 2], dtype=np.int32),
     )
-    managers, _ = _make_managers()
+    managers, _ = _make_managers(block_tables=_InMemoryBlockTables())
     local_batches = [manager.partition_batch(global_batch) for manager in managers]
 
     assert len({local.num_reqs for local in local_batches}) == 1
     assert len({local.num_tokens for local in local_batches}) == 1
-    for local in local_batches:
+    for manager, local in zip(managers, local_batches):
         decode_row = local.req_ids.index("decode")
         decode_start = int(local.query_start_loc_np[decode_row])
         decode_stop = int(local.query_start_loc_np[decode_row + 1])
@@ -652,6 +677,16 @@ def test_uneven_prefill_and_mtp_decode_keep_equal_collective_shapes() -> None:
         assert local.num_draft_tokens == 1
         assert local.num_draft_tokens_per_req[decode_row] == 1
         assert local.logits_indices.tolist() == [decode_start, decode_start + 1]
+        manager.prepare_attn(local)
+        ownership = local._vllm_hcu_pcp_replicated_token_mask
+        assert ownership.shape[0] == local.num_tokens_after_padding
+        assert torch.all(ownership[decode_start:decode_stop])
+        for row, req_id in enumerate(local.req_ids):
+            if req_id != "prefill":
+                continue
+            start = int(local.query_start_loc_np[row])
+            stop = int(local.query_start_loc_np[row + 1])
+            assert not torch.any(ownership[start:stop])
 
 
 def test_uneven_prefill_padding_never_owns_a_kv_slot() -> None:
