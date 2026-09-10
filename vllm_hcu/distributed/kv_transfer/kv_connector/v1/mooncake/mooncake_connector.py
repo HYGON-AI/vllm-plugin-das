@@ -651,6 +651,8 @@ class MooncakeXferMetadata(
     model_layer_end: int = -1
     xfer_head_rank: int = -1
     remote_pp_size: int = 1
+    # Consumer's VLLM_PP_LAYER_PARTITION; empty means default even split.
+    pp_layer_partition: str = ""
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -740,7 +742,6 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         _validate_mooncake_pcp_pd(vllm_config)
-        _reject_custom_pp_partition()
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -1512,6 +1513,14 @@ class MooncakeConnectorWorker:
             )
             await reject_metadata(msg)
             return
+        try:
+            self._reject_custom_partition_for_hetero_pp(
+                meta.remote_pp_size,
+                remote_partition=getattr(meta, "pp_layer_partition", "") or "",
+            )
+        except RuntimeError as e:
+            await reject_metadata(str(e))
+            return
         has_transfer_blocks = any(
             any(group for group in block_groups)
             for _, block_groups in meta.req_blocks.values()
@@ -1754,17 +1763,44 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
-    def _reject_custom_partition_for_hetero_pp(self, remote_pp_size: int) -> None:
-        """Reject process-local PP partitions; remote stage bounds are unknown.
+    def _reject_custom_partition_for_hetero_pp(
+        self,
+        remote_pp_size: int,
+        remote_partition: str | None = None,
+    ) -> None:
+        """Reject custom PP partitions that cannot be verified.
 
-        Same PP size is not enough: P/D may still set different
-        ``VLLM_PP_LAYER_PARTITION`` values. The same-PP path pairs by rank
-        and skips overlap checks, so extra consumer layers silently miss KV.
-        Fail closed until stage ``(start, end)`` is exchanged.
-        ``remote_pp_size`` is unused and kept for the call sites.
+        Same-PP P/D with a matching partition (including both unset) keeps
+        the rank-pair path. Heterogeneous PP cannot map remote stages from
+        the local env, so any custom partition is fail-closed.
         """
-        del remote_pp_size
-        _reject_custom_pp_partition()
+        local = _normalize_pp_layer_partition(
+            getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+        )
+        remote_pp_size = max(int(remote_pp_size), 1)
+        same_pp = remote_pp_size == int(self.pp_size)
+        if remote_partition is None:
+            if same_pp or not local:
+                return
+            raise RuntimeError(
+                "Mooncake heterogeneous PP does not support "
+                "VLLM_PP_LAYER_PARTITION; unset it so both sides use the "
+                "default even split."
+            )
+        remote = _normalize_pp_layer_partition(remote_partition)
+        if same_pp:
+            if local == remote:
+                return
+            raise RuntimeError(
+                "Mooncake same-PP P/D requires matching "
+                "VLLM_PP_LAYER_PARTITION "
+                f"(local={local!r} remote={remote!r})."
+            )
+        if local or remote:
+            raise RuntimeError(
+                "Mooncake heterogeneous PP does not support "
+                "VLLM_PP_LAYER_PARTITION; unset it on both sides."
+            )
 
     def _count_overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
         """How many consumer PP stages overlap this producer's layer range."""
@@ -2391,6 +2427,9 @@ class MooncakeConnectorWorker:
                 chunk_idx if chunk_idx is not None else self.tp_rank
             ),
             remote_pp_size=self.pp_size,
+            pp_layer_partition=_normalize_pp_layer_partition(
+                getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+            ),
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2526,43 +2565,43 @@ class MooncakeConnectorWorker:
         selected_remote_pp: dict[int, list[int]] = {}
         needs_chunk_idx = len(remote_tp_ranks) > 1
         try:
+            for i, remote_tp_rank in enumerate(remote_tp_ranks):
+                pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
+                remote_pp_size = len(pp_to_addr)
+                same_pp = self.pp_size == remote_pp_size and self.pp_rank in pp_to_addr
+                if same_pp:
+                    pp_ranks = [self.pp_rank]
+                else:
+                    self._reject_custom_partition_for_hetero_pp(remote_pp_size)
+                    pp_ranks = self._overlapping_remote_pp_ranks(
+                        remote_pp_size, sorted(pp_to_addr)
+                    )
+                selected_remote_pp[remote_tp_rank] = pp_ranks
+                chunk_idx = i if needs_chunk_idx else None
+                for pp_rank in pp_ranks:
+                    if same_pp:
+                        worker_jobs.append(
+                            (pp_to_addr[pp_rank], chunk_idx, -1, -1)
+                        )
+                        continue
+                    overlap_start, overlap_end = self._pp_overlap_layer_range(
+                        remote_pp_rank=pp_rank,
+                        remote_pp_size=remote_pp_size,
+                    )
+                    if overlap_start >= overlap_end:
+                        continue
+                    worker_jobs.append(
+                        (
+                            pp_to_addr[pp_rank],
+                            chunk_idx,
+                            overlap_start,
+                            overlap_end,
+                        )
+                    )
+        except (RuntimeError, ValueError) as e:
             # Config errors on this background path must finish the pull.
-            self._reject_custom_partition_for_hetero_pp(self.pp_size)
-        except RuntimeError as e:
             self._fail_pull_metas(pull_metas, str(e))
             return
-        for i, remote_tp_rank in enumerate(remote_tp_ranks):
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            remote_pp_size = len(pp_to_addr)
-            same_pp = self.pp_size == remote_pp_size and self.pp_rank in pp_to_addr
-            if same_pp:
-                pp_ranks = [self.pp_rank]
-            else:
-                pp_ranks = self._overlapping_remote_pp_ranks(
-                    remote_pp_size, sorted(pp_to_addr)
-                )
-            selected_remote_pp[remote_tp_rank] = pp_ranks
-            chunk_idx = i if needs_chunk_idx else None
-            for pp_rank in pp_ranks:
-                if same_pp:
-                    worker_jobs.append(
-                        (pp_to_addr[pp_rank], chunk_idx, -1, -1)
-                    )
-                    continue
-                overlap_start, overlap_end = self._pp_overlap_layer_range(
-                    remote_pp_rank=pp_rank,
-                    remote_pp_size=remote_pp_size,
-                )
-                if overlap_start >= overlap_end:
-                    continue
-                worker_jobs.append(
-                    (
-                        pp_to_addr[pp_rank],
-                        chunk_idx,
-                        overlap_start,
-                        overlap_end,
-                    )
-                )
 
         count = len(worker_jobs)
         logger.debug(
@@ -2827,15 +2866,11 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
     loop.run_forever()
 
 
-def _reject_custom_pp_partition() -> None:
-    """Reject Mooncake P/D when a process-local PP partition is set."""
-    partition = getattr(envs, "VLLM_PP_LAYER_PARTITION", None) or ""
+def _normalize_pp_layer_partition(partition: str | None) -> str:
+    """Canonical comma-separated PP layer counts, or empty for even split."""
     if not partition:
-        return
-    raise RuntimeError(
-        "Mooncake P/D does not support VLLM_PP_LAYER_PARTITION; "
-        "unset it so both sides use the default even split."
-    )
+        return ""
+    return ",".join(part.strip() for part in str(partition).split(",") if part.strip())
 
 
 def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
