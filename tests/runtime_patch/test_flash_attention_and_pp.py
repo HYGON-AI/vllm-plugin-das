@@ -537,6 +537,11 @@ def test_hcu_varlen_dspark_routes_fail_closed(
         monkeypatch,
         kv_cache_layout="HND" if unsupported_case == "layout" else "NHD",
     )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: query_len == 7,
+    )
     batch_size = 2
     q = torch.zeros((batch_size * query_len, 4, 128), dtype=torch.bfloat16)
     k = torch.zeros((4, 64, 2, 128), dtype=torch.bfloat16)
