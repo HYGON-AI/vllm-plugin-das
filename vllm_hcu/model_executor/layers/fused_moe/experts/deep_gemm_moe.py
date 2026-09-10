@@ -430,10 +430,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     raise ValueError(
                         "HCU Channel INT8 DeepGEMM supports only SiLU activation"
                     )
+                from deepgemm import m_grouped_i8_gemm_nt_contiguous
                 from lightop.activation import fuse_silu_mul_quant
-                from lightop.gemm_ops import m_grouped_w8a8_gemm_nt_contig_asm
 
-                m_grouped_w8a8_gemm_nt_contig_asm(
+                m_grouped_i8_gemm_nt_contiguous(
                     (a1q, a1q_scale),
                     (w1, self.w1_scale),
                     mm1_out,
@@ -450,7 +450,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     expert_ids=expert_ids,
                 )
                 mm2_out = _resize_cache(workspace2, (M_sum, K))
-                m_grouped_w8a8_gemm_nt_contig_asm(
+                m_grouped_i8_gemm_nt_contiguous(
                     (a2q, a2q_scale),
                     (w2, self.w2_scale),
                     mm2_out,

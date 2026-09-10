@@ -174,12 +174,21 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             return super().prepare_attn(input_batch)
         return self.pcp_manager.prepare_attn(input_batch)
 
-    def prepare_dummy_attn(self, input_batch):
+    def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
         if self.pcp_manager is None:
-            return super().prepare_dummy_attn(input_batch)
+            return super().prepare_dummy_attn(input_batch, valid_state_slots)
         block_tables = self.block_tables.get_dummy_block_tables(
             input_batch.num_reqs
         )
+        if valid_state_slots:
+            state_slots = torch.arange(
+                1,
+                input_batch.num_reqs + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for block_table in block_tables:
+                block_table[:, 0].copy_(state_slots)
         slot_mappings = self.pcp_manager.get_dummy_slot_mappings(
             input_batch.num_tokens
         )
