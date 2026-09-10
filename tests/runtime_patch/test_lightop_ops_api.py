@@ -706,11 +706,10 @@ def _run_deep_int8_apply(apply, output: torch.Tensor) -> None:
     )
 
 
-def test_contiguous_deep_gemm_prefers_categorized_kernels_and_consumes_activation(
+def test_contiguous_deep_gemm_pairs_deepgemm_gemm_with_lightop_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     activation = ModuleType("lightop.activation")
-    gemm_ops = ModuleType("lightop.gemm_ops")
     calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 
     def gemm(*args, **kwargs) -> None:
@@ -723,8 +722,8 @@ def test_contiguous_deep_gemm_prefers_categorized_kernels_and_consumes_activatio
         return torch.full((1, 2), 6, dtype=torch.int8), torch.ones((1, 1))
 
     activation.fuse_silu_mul_quant = quant
-    gemm_ops.m_grouped_w8a8_gemm_nt_contig_asm = gemm
-    _install_lightop(monkeypatch, activation=activation, gemm_ops=gemm_ops)
+    _install_deepgemm_i8(monkeypatch, contiguous=gemm)
+    _install_lightop(monkeypatch, activation=activation)
     apply = _method(
         "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
         "DeepGemmExperts",
@@ -765,11 +764,10 @@ def test_contiguous_deep_gemm_rejects_top_level_activation_and_grouped_gemm(
     assert legacy_calls == []
 
 
-def test_masked_deep_gemm_prefers_categorized_kernels_and_consumes_activation(
+def test_masked_deep_gemm_pairs_deepgemm_gemm_with_lightop_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     activation = ModuleType("lightop.activation")
-    gemm_ops = ModuleType("lightop.gemm_ops")
     calls: list[tuple[str, tuple[object, ...]]] = []
 
     def gemm(*args) -> None:
@@ -782,8 +780,8 @@ def test_masked_deep_gemm_prefers_categorized_kernels_and_consumes_activation(
         return torch.full((1, 1, 2), 7, dtype=torch.int8), torch.ones((1, 1, 1))
 
     activation.fuse_silu_mul_quant_ep = quant
-    gemm_ops.m_grouped_w8a8_gemm_nt_masked = gemm
-    _install_lightop(monkeypatch, activation=activation, gemm_ops=gemm_ops)
+    _install_deepgemm_i8(monkeypatch, masked=gemm)
+    _install_lightop(monkeypatch, activation=activation)
     namespace = {
         "torch": torch,
         "MoEActivation": SimpleNamespace(SILU="silu"),
