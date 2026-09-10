@@ -12,17 +12,6 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
 )
 
-
-def _normalize_nope_query(
-    q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(q, tuple) and q[1].shape[-1] == 0:
-        # The concatenated result is exactly ql_nope for NoPE models. Avoid
-        # the current vLLM stable op, whose compiled kernel requires rope_dim=64.
-        return q[0]
-    return q
-
-
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
@@ -34,7 +23,14 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         attn_metadata,
         layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        q = _normalize_nope_query(q)
+        # Match the official ROCm sparse-MLA handling for native NoPE models.
+        # The stable concat_mla_q kernel only accepts a 64-wide RoPE component,
+        # so materialize the zero-RoPE query in the preallocated graph buffer.
+        if isinstance(q, tuple) and q[1].shape[-1] == 0:
+            ql_nope, _ = q
+            q_buffer = self.q_concat_buffer[: ql_nope.shape[0]]
+            q_buffer[:, : ql_nope.shape[1], :].copy_(ql_nope)
+            q = q_buffer[:, : ql_nope.shape[1], :]
         if self.dcp_world_size <= 1:
             return super().forward_mqa(
                 q,

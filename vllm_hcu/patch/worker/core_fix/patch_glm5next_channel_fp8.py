@@ -37,6 +37,110 @@ _MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
 _MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
 
 
+def _native_mhc_pre(
+    mhc,
+    op,
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    norm_weight=None,
+    norm_eps=0.0,
+):
+    post_mix, comb_mix, layer_input = op.forward_native(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        norm_weight,
+        norm_eps,
+    )
+    return (
+        post_mix,
+        comb_mix,
+        mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps),
+    )
+
+
+def _native_mhc_post(mhc, op, x, residual, post_layer_mix, comb_res_mix):
+    del mhc
+    return op.forward_native(x, residual, post_layer_mix, comb_res_mix)
+
+
+def _native_mhc_fused_post_pre(
+    mhc,
+    op,
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    tile_n=1,
+    norm_weight=None,
+    norm_eps=0.0,
+):
+    residual_cur, post_mix, comb_mix, layer_input = op.forward_native(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        tile_n,
+        norm_weight,
+        norm_eps,
+    )
+    return (
+        residual_cur,
+        post_mix,
+        comb_mix,
+        mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps),
+    )
+
+
+def _bind_glm5next_native_mhc(layer, mhc) -> None:
+    """Keep GLM5Next on the official native mHC equations on HCU."""
+
+    layer.mhc_pre_op._forward_method = functools.partial(
+        _native_mhc_pre, mhc, layer.mhc_pre_op
+    )
+    layer.mhc_post_op._forward_method = functools.partial(
+        _native_mhc_post, mhc, layer.mhc_post_op
+    )
+    layer.mhc_fused_post_pre_op._forward_method = functools.partial(
+        _native_mhc_fused_post_pre,
+        mhc,
+        layer.mhc_fused_post_pre_op,
+    )
+
+
 def _boltops_mhc_pre(
     backend,
     mhc,

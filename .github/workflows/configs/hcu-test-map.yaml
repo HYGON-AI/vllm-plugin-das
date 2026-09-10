@@ -463,6 +463,30 @@
         }
       ]
     },
+    "glm53-flash-channel-fp8-humaneval": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "glm53_flash_channel_fp8_humaneval_evalscope_server"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_GLM53_FLASH_CHANNEL_FP8_MODEL",
+          "relative": "GLM-5.3-Flash-Channel-FP8-w8a8"
+        }
+      ]
+    },
     "single-node-topology": {
       "runner": "nmz36",
       "arch": "gfx938",
@@ -496,6 +520,7 @@
     {"job": "qwen38-flash-next-humaneval", "timeout_minutes": 210},
     {"job": "deepseek-gsm8k", "timeout_minutes": 360},
     {"job": "glm52-pcp", "timeout_minutes": 360},
+    {"job": "glm53-flash-channel-fp8-humaneval", "timeout_minutes": 360},
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
@@ -679,6 +704,15 @@
         "glm52-pcp"
       ]
     },
+    "glm53-flash-channel-fp8-evalscope": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_glm53_flash_channel_fp8_humaneval.py",
+        "tests/models/glm53_flash_channel_fp8_humaneval_evalscope.yaml"
+      ],
+      "jobs": [
+        "glm53-flash-channel-fp8-humaneval"
+      ]
+    },
     "model-runtime-helper": {
       "patterns": [
         "tests/integration/model_runtime.py"
@@ -780,7 +814,8 @@
         "qwen3-8b-gsm8k",
         "qwen38-flash-next-humaneval",
         "qwen3-vl-mmmu",
-        "deepseek-gsm8k"
+        "deepseek-gsm8k",
+        "glm53-flash-channel-fp8-humaneval"
       ]
     },
     "evalscope-report-tests": {

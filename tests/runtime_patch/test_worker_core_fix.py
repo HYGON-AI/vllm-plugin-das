@@ -403,6 +403,11 @@ def _qwen4_exp_module(calls: list[tuple[object, ...]]) -> ModuleType:
     )
 
 
+def test_qwen4_exp_patch_targets_concrete_hcu_model_module():
+    assert patch_qwen4_exp.TARGET_MODULE == "vllm.models.qwen4_exp.amd.model"
+    assert "vllm.models.qwen4_exp" not in patch_qwen4_exp.TARGET_MODULES
+
+
 @pytest.mark.parametrize(
     ("top_value", "text_value", "expected_text"),
     [

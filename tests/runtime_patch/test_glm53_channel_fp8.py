@@ -277,8 +277,6 @@ def test_glm5next_forced_sparse_triton_requires_packaged_modules(
             1,
             force_aiter_triton=True,
         )
-
-
 def test_indexer_derives_gate_weight_from_hcu_nn_layout() -> None:
     attention = ModuleType(patch_glm5next_channel_fp8.ATTENTION_MODULE)
 
@@ -448,15 +446,3 @@ def test_quantized_channel_fp8_target_stays_on_official_loader_path() -> None:
         set(),
         0,
     )
-def test_glm53_flashmla_nope_query_skips_empty_rope_concat():
-    from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
-        _normalize_nope_query,
-    )
-
-    ql_nope = torch.empty(2, 4, 512)
-    q_pe = torch.empty(2, 4, 0)
-    rope_q = torch.empty(2, 4, 64)
-
-    assert _normalize_nope_query((ql_nope, q_pe)) is ql_nope
-    assert _normalize_nope_query((ql_nope, rope_q)) == (ql_nope, rope_q)
-    assert _normalize_nope_query(ql_nope) is ql_nope

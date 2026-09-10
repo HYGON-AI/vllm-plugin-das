@@ -386,6 +386,7 @@ def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
         "qwen38-flash-next-humaneval",
         "deepseek-gsm8k",
         "glm52-pcp",
+        "glm53-flash-channel-fp8-humaneval",
     }
     expected = {
         "kind": "distribution",

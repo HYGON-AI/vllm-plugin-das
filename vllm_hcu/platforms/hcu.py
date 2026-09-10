@@ -661,9 +661,9 @@ class HCUPlatform(Platform):
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         # Preserve upstream backend/hybrid alignment first. Sparse MLA models
         # also contain an indexer attention layer, which upstream can discover
-        # before the configured MLA backend and therefore reset the page size
-        # to 16. Apply the configured HCU kernel's hard page-size constraint
-        # last so both the pre-fork config and worker-local config stay aligned.
+        # before the configured MLA backend and therefore select a 16-token
+        # block. Keep the manager block at least 64 and 64-aligned without
+        # shrinking a larger hybrid block selected by upstream.
         super().update_block_size_for_backend(vllm_config)
 
         cache_config = getattr(vllm_config, "cache_config", None)
@@ -678,11 +678,18 @@ class HCUPlatform(Platform):
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             )
-            and cache_config.block_size != 64
+            and (
+                cache_config.block_size < 64
+                or cache_config.block_size % 64 != 0
+            )
         ):
-            cache_config.block_size = 64
+            cache_config.block_size = max(
+                64,
+                ((cache_config.block_size + 63) // 64) * 64,
+            )
             logger.info(
-                "Setting kv cache block size to 64 for HCU %s backend.",
+                "Aligning kv cache block size to %d for HCU %s backend.",
+                cache_config.block_size,
                 backend.name,
             )
 

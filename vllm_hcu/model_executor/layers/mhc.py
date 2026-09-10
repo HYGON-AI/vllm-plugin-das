@@ -28,11 +28,11 @@ else:
     T = None  # type: ignore[assignment]
     
 import vllm_hcu.platforms.envs as henvs
-from aiter.ops.tilelang import (
-    mhc_fused_tilelang,
-    mhc_post_fwd,
-    mhc_pre_big_fuse,
-    pre_big_fuse_tilelang,
+from boltops.mhc import (
+    mhc_fused_tilelang as _boltops_mhc_fused_tilelang,
+    mhc_post_fwd as _boltops_mhc_post_fwd,
+    mhc_pre_big_fuse as _boltops_mhc_pre_big_fuse,
+    pre_big_fuse_tilelang as _boltops_pre_big_fuse_tilelang,
 )
 
 _DEEPGEMM_MHC_SUPPORTED_SPLITS = (1, 2, 4, 8)
@@ -497,7 +497,7 @@ def mhc_pre(
     fn_flat = fn
 
     if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
-        post_mix, comb_mix, layer_input = mhc_pre_big_fuse(
+        post_mix, comb_mix, layer_input = _boltops_mhc_pre_big_fuse(
             residual=residual_flat,
             fn=fn_flat,
             mhc_scale=hc_scale,
@@ -594,7 +594,7 @@ def mhc_pre(
     )
 
     if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
-        pre_big_fuse_tilelang(
+        _boltops_pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -877,7 +877,7 @@ def mhc_post(
         hc_mult = residual.shape[-2]
         hidden_size = residual.shape[-1]
         outer_shape = residual.shape[:-2]
-        out = mhc_post_fwd(
+        out = _boltops_mhc_post_fwd(
             x.reshape(-1, hidden_size).contiguous(),
             residual.reshape(-1, hc_mult, hidden_size),
             post_layer_mix.reshape(-1, hc_mult).contiguous(),
@@ -1020,7 +1020,7 @@ def mhc_fused_post_pre(
     )
 
     if num_tokens <= fma_token_threshold:
-        mhc_fused_tilelang(
+        _boltops_mhc_fused_tilelang(
             comb_res_mix,
             residual,
             post_layer_mix.squeeze(-1),
@@ -1052,7 +1052,7 @@ def mhc_fused_post_pre(
         # )
     else:
         if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
-            mhc_post_fwd(
+            _boltops_mhc_post_fwd(
                 x_flat,
                 residual_flat,
                 post_layer_mix_flat,
@@ -1089,7 +1089,7 @@ def mhc_fused_post_pre(
             )
 
     if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
-        pre_big_fuse_tilelang(
+        _boltops_pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
