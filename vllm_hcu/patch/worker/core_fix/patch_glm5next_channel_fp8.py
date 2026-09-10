@@ -415,6 +415,11 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
 
 
 def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
+    from vllm_hcu.v1.attention.ops.lightop_kpool_topk_transform import (
+        install_lightop_kpool_topk_transform,
+    )
+
+    install_lightop_kpool_topk_transform(kpool)
     indexer = vars(kpool).get("SparseAttnIndexerKpool")
     if not isinstance(indexer, type):
         raise PatchCompatibilityError(
