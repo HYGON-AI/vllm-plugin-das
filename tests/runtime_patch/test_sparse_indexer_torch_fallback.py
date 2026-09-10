@@ -100,45 +100,62 @@ def test_decode_graph_replay():
                 expected[i, :length] = ((q[i, 0].float() @ k.T).relu() * weights[i, :, None]).sum(0) * scale
             torch.testing.assert_close(output, expected, atol=0.002, rtol=0.0002)
 
-def test_prefill_gather_graph_replay():
-    if not torch.cuda.is_available():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prefill_gather_graph_replay(device):
+    if device == "cuda" and not torch.cuda.is_available():
         import pytest
         pytest.skip('GPU graph test requires a visible GPU')
     source = (Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py').read_text()
     branch = next((n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and (n.test.id == 'v4_fp8_fallback') and any((isinstance(x, ast.Assign) and any((isinstance(t, ast.Name) and t.id == 'page_size' for t in x.targets)) for x in n.body))))
     code = compile(ast.Module(body=branch.body, type_ignores=[]), '<gather>', 'exec')
     (block, dim, count) = (4, 8, 7)
-    values = torch.arange(3 * block * dim, device='cuda').reshape(3, block, dim).remainder(7).to(torch.float8_e4m3fn)
-    scales = torch.arange(12, device='cuda', dtype=torch.float32).reshape(3, 4) + 1
+    values = torch.arange(3 * block * dim, device=device).reshape(3, block, dim).remainder(7).to(torch.float8_e4m3fn)
+    scales = torch.arange(12, device=device, dtype=torch.float32).reshape(3, 4) + 1
     cache = torch.cat((values.view(torch.uint8).reshape(3, -1), scales.view(torch.uint8).reshape(3, -1)), 1).view(3, block, dim + 4)
-    chunk = SimpleNamespace(total_seq_lens=count, cu_seq_lens=torch.tensor([0, 3, 7], device='cuda', dtype=torch.int32), block_table=torch.tensor([[2, 1], [0, 2]], device='cuda', dtype=torch.int32))
-    out = torch.empty(count, dim, device='cuda', dtype=torch.float8_e4m3fn)
-    out_scale = torch.empty(count, 4, device='cuda', dtype=torch.uint8)
+    chunk = SimpleNamespace(total_seq_lens=count, cu_seq_lens=torch.tensor([0, 3, 7], device=device, dtype=torch.int32), block_table=torch.tensor([[2, 1], [0, 2]], device=device, dtype=torch.int32))
+    out = torch.empty(count, dim, device=device, dtype=torch.float8_e4m3fn)
+    out_scale = torch.empty(count, 4, device=device, dtype=torch.uint8)
     ns = dict(torch=torch, chunk=chunk, kv_cache=cache, head_dim=dim, fp8_dtype=torch.float8_e4m3fn, k_fp8=out, k_scale=out_scale)
 
     def gather():
         exec(code, ns)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
+    graph = None
+    if device == "cuda":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                gather()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
             gather()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        gather()
-    for boundary in (0, 2, 5):
-        chunk.cu_seq_lens.copy_(torch.tensor([0, boundary, count], device='cuda', dtype=torch.int32))
-        graph.replay()
+    # Shrink the exact total, including zero and empty requests, then regrow.
+    # Allocation shapes and graph remain unchanged throughout.
+    for boundary, total in ((0, 7), (2, 4), (0, 0), (3, 3), (0, 2), (5, 7)):
+        chunk.cu_seq_lens.copy_(torch.tensor([0, boundary, total], device=device, dtype=torch.int32))
+        tables = [[2, 1], [0, 2]]
+        if boundary == 0:
+            tables[0] = [-999, -999]
+        if boundary == total:
+            tables[1] = [-999, -999]
+        chunk.block_table.copy_(torch.tensor(tables, device=device, dtype=torch.int32))
+        if graph is not None:
+            graph.replay()
+        else:
+            gather()
         expected = []
         expected_scales = []
-        for (seq, (start, end)) in enumerate(((0, boundary), (boundary, count))):
+        for (seq, (start, end)) in enumerate(((0, boundary), (boundary, total))):
             for j in range(end - start):
                 page = int(chunk.block_table[seq, j // block].item())
                 expected.append(values[page, j % block].float())
                 expected_scales.append(scales[page, j % block])
-        torch.testing.assert_close(out.float(), torch.stack(expected))
-        torch.testing.assert_close(out_scale.view(torch.float32).flatten(), torch.stack(expected_scales))
+        if total:
+            torch.testing.assert_close(out[:total].float(), torch.stack(expected))
+            torch.testing.assert_close(out_scale.view(torch.float32).flatten()[:total], torch.stack(expected_scales))
+        assert torch.count_nonzero(out.view(torch.uint8)[total:]) == 0
+        assert torch.count_nonzero(out_scale[total:]) == 0
 
 def _load_decode_fn():
     path = Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py'

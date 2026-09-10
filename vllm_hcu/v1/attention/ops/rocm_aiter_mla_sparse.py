@@ -1298,13 +1298,26 @@ def rocm_aiter_sparse_attn_indexer_native(
                 pages = kv_cache.view(kv_cache.shape[0], -1)
                 offsets = torch.arange(chunk.total_seq_lens, device=kv_cache.device)
                 seq = torch.searchsorted(chunk.cu_seq_lens[1:].contiguous(), offsets, right=True)
-                local = offsets - chunk.cu_seq_lens[seq]
-                page_ids = chunk.block_table[seq, local // page_size].long()
+                # The CPU allocation length is an upper bound during async
+                # speculation. Mask before indexing the exact device tables:
+                # searchsorted returns num_reqs for the inactive tail.
+                active = offsets < chunk.cu_seq_lens[-1]
+                seq = torch.where(active, seq, 0)
+                local = torch.where(active, offsets - chunk.cu_seq_lens[seq], 0)
+                page_ids = torch.where(
+                    active, chunk.block_table[seq, local // page_size], 0
+                ).long()
                 values = pages[:, :page_size * head_dim].reshape(-1, page_size, head_dim)
                 scales = pages[:, page_size * head_dim:].reshape(-1, page_size, 4)
                 # Gather bytes before viewing FP8 for HIP indexing compatibility.
-                k_fp8.copy_(values[page_ids, local % page_size].contiguous().view(fp8_dtype))
-                k_scale.copy_(scales[page_ids, local % page_size])
+                value_bytes = values[page_ids, local % page_size]
+                scale_bytes = scales[page_ids, local % page_size]
+                # Zero inactive output bytes as well: page 0 may contain stale
+                # data, including NaNs. Mask uint8 before interpreting FP8.
+                value_bytes.masked_fill_(~active[:, None], 0)
+                scale_bytes.masked_fill_(~active[:, None], 0)
+                k_fp8.copy_(value_bytes.contiguous().view(fp8_dtype))
+                k_scale.copy_(scale_bytes)
             elif not current_platform.is_rocm() or on_gfx938():
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
