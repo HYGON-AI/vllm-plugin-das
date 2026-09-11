@@ -52,7 +52,14 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    && pip install --no-cache-dir amd-quark==0.12.post1 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    # vllm 0.28.1 强制依赖 amd-quark==0.12.post1, 该版本元数据要求 Python>=3.11 (镜像为 3.10);
+    # quark 只服务 AMD 量化路径, HCU 不使用, 这里写入空发行版元数据让 pip 跳过该依赖.
+    && SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && mkdir -p "${SITE_PACKAGES}/amd_quark-0.12.post1.dist-info" \
+    && printf 'Metadata-Version: 2.1\nName: amd-quark\nVersion: 0.12.post1\n' \
+        > "${SITE_PACKAGES}/amd_quark-0.12.post1.dist-info/METADATA" \
+    && printf 'stub: quark is unused on HCU, see docker/Dockerfile\n' \
+        > "${SITE_PACKAGES}/amd_quark-0.12.post1.dist-info/INSTALLER" \
     && pip install --no-cache-dir vllm==0.28.1 \
     && pip install --no-cache-dir --pre "vllm-hcu>0.28.0,<=0.28.1" \
     && pip cache purge
