@@ -18,102 +18,30 @@ from vllm_hcu.forward_context_runtime import (
     deepep_auto_request_phase_scope,
     set_deepep_auto_request_phase,
 )
-from vllm_hcu.v1.pcp_manager import maybe_build_pcp_manager
+from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 
 
-_FIXED_WIDTH_PP_BROADCAST_MARKER = "_vllm_hcu_fixed_width_pp_broadcast"
-
-
-def install_fixed_width_pp_sample_broadcast(model_runner: object) -> bool:
-    """Match the last PP rank's first sample to the fixed receive width.
-
-    Before draft tokens exist, MRV2's sampler returns one token per request,
-    while ``PPHandler.receive`` always allocates ``num_speculative_steps + 1``
-    columns.  NCCL requires identical element counts on both sides.  Pad only
-    the broadcast payload; ``num_sampled`` continues to describe valid tokens.
-    """
-
-    pp_handler = getattr(model_runner, "pp_handler", None)
-    if pp_handler is None or not getattr(pp_handler, "is_last_rank", False):
-        return False
-    broadcast = getattr(pp_handler, "broadcast")
-    if getattr(broadcast, _FIXED_WIDTH_PP_BROADCAST_MARKER, False):
-        return False
-
-    max_sample_len = int(getattr(pp_handler, "max_sample_len"))
-
-    @functools.wraps(broadcast)
-    def fixed_width_broadcast(sampled_token_ids, *args, **kwargs):
-        sample_len = int(sampled_token_ids.shape[-1])
-        if sample_len > max_sample_len:
-            raise ValueError(
-                "PP sampled-token width exceeds the receiver allocation: "
-                f"{sample_len} > {max_sample_len}"
-            )
-        if sample_len < max_sample_len:
-            padded = sampled_token_ids.new_zeros(
-                (*sampled_token_ids.shape[:-1], max_sample_len)
-            )
-            padded[..., :sample_len].copy_(sampled_token_ids)
-            sampled_token_ids = padded
-        return broadcast(sampled_token_ids, *args, **kwargs)
-
-    setattr(fixed_width_broadcast, _FIXED_WIDTH_PP_BROADCAST_MARKER, True)
-    setattr(pp_handler, "broadcast", fixed_width_broadcast)
-    return True
-
-
-def synchronize_pp_spec_draft_tokens(
-    model_runner: object, input_batch: object
+def record_pp_spec_draft_index_stream(
+    model_runner: object, input_batch: object | None
 ) -> bool:
-    """Copy last-rank MTP drafts to every earlier PP stage.
-
-    Async scheduling sends only placeholder draft IDs through the scheduler.
-    MRV2 keeps the real IDs in worker-local GPU state, but under PP only the
-    last rank owns the speculator.  Without this transfer, earlier stages run
-    the target model on zero draft IDs while the last stage rejection-samples
-    against the real drafts.
-
-    Use the sampled-token broadcast stream and group so collective ordering is
-    identical on every rank.  The explicit stream completion is conservative
-    but necessary before a non-last rank publishes the received tensor into
-    its request state.
-    """
-
+    """Backport upstream PP draft index stream ownership fix (#55745)."""
     if getattr(model_runner, "_vllm_hcu_suppress_pp_spec_draft_sync", False):
         return False
     pp_handler = getattr(model_runner, "pp_handler", None)
     num_speculative_steps = int(
         getattr(model_runner, "num_speculative_steps", 0)
     )
-    if pp_handler is None or num_speculative_steps == 0:
+    if (
+        pp_handler is None
+        or num_speculative_steps == 0
+        or input_batch is None
+        or not getattr(pp_handler, "is_last_rank")
+    ):
         return False
 
-    req_states = getattr(model_runner, "req_states")
-    idx_mapping = getattr(input_batch, "idx_mapping")
-    num_reqs = int(getattr(input_batch, "num_reqs"))
-    broadcast_stream = getattr(pp_handler, "broadcast_stream")
-    main_stream = getattr(pp_handler, "main_stream")
-
-    with torch.cuda.stream(broadcast_stream):
-        broadcast_stream.wait_stream(main_stream)
-        if getattr(pp_handler, "is_last_rank"):
-            draft_tokens = req_states.draft_tokens[idx_mapping].contiguous()
-        else:
-            draft_tokens = torch.empty(
-                (num_reqs, num_speculative_steps),
-                dtype=req_states.draft_tokens.dtype,
-                device=getattr(model_runner, "device"),
-            )
-        torch.distributed.broadcast(
-            draft_tokens,
-            src=getattr(pp_handler, "last_rank"),
-            group=getattr(pp_handler, "broadcast_group"),
-        )
-    broadcast_stream.synchronize()
-
-    if not getattr(pp_handler, "is_last_rank"):
-        req_states.draft_tokens[idx_mapping] = draft_tokens
+    getattr(input_batch, "idx_mapping").record_stream(
+        getattr(pp_handler, "broadcast_stream")
+    )
     return True
 
 
@@ -121,8 +49,21 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     """HCU compatibility adapter around upstream v0.25.1 Model Runner V2."""
 
     def __init__(self, vllm_config, device):
+        self._hcu_pcp_manager_cls = None
         super().__init__(vllm_config, device)
-        self.pcp_manager = None
+        # Upstream creates the selected manager during KV-cache
+        # initialization. Keep the adapter attribute available before that
+        # lifecycle point without allocating a second manager.
+        if not hasattr(self, "pcp_manager"):
+            self.pcp_manager = None
+
+    @property
+    def pcp_manager_cls(self):
+        if self._hcu_pcp_manager_cls is None:
+            self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(
+                self.vllm_config
+            )
+        return self._hcu_pcp_manager_cls
 
     def initialize_kv_cache(
         self,
@@ -145,12 +86,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 is_profiling=is_profiling,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
-        if pcp_size > 1:
-            self.pcp_manager = maybe_build_pcp_manager(
-                self.vllm_config,
-                self.device,
-                self.req_states,
-                self.block_tables,
+        if pcp_size > 1 and self.pcp_manager is None:
+            raise RuntimeError(
+                "official MRV2 did not initialize the selected HCU PCP manager"
             )
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
@@ -159,8 +97,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             batch_req_state,
             batch_desc,
         )
-        if self.pcp_manager is not None:
-            input_batch = self.pcp_manager.partition_batch(input_batch)
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)
         return input_batch
 
@@ -196,8 +132,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state
-        use_replicated_mtp_batch = False
-        if self.pcp_manager is not None and execute_model_state is not None:
+        use_replicated_mtp_batch = (
+            self.pcp_manager is not None
+            and execute_model_state is not None
+            and getattr(self, "speculator", None) is not None
+        )
+        if use_replicated_mtp_batch:
             (
                 restored_hidden_states,
                 restored_input_batch,
@@ -208,7 +148,6 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
-            use_replicated_mtp_batch = getattr(self, "speculator", None) is not None
             self.execute_model_state = execute_model_state
         input_batch = (
             None
@@ -220,11 +159,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if use_replicated_mtp_batch
             else nullcontext()
         )
+        pcp_manager = self.pcp_manager
+        record_pp_spec_draft_index_stream(self, input_batch)
         with scope:
             if use_replicated_mtp_batch:
                 assert execute_model_state is not None
                 assert input_batch is not None
-                block_tables, slot_mappings = self.pcp_manager.prepare_global_attn()
+                block_tables, slot_mappings = pcp_manager.prepare_global_attn()
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
                     slot_mappings, self.kv_cache_config
                 )
@@ -241,14 +182,23 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     slot_mappings_by_layer=slot_mappings_by_layer,
                 )
                 self.execute_model_state = execute_model_state
-            output = super().sample_tokens(grammar_output)
-        if input_batch is not None:
-            synchronize_pp_spec_draft_tokens(self, input_batch)
+            if use_replicated_mtp_batch:
+                # The HCU path restored PCP state above so it could rebuild
+                # global draft metadata. Upstream sample_tokens() now performs
+                # the same restore itself, so hide the manager to avoid a
+                # second gather/reorder of the global batch.
+                self.pcp_manager = None
+                try:
+                    output = super().sample_tokens(grammar_output)
+                finally:
+                    self.pcp_manager = pcp_manager
+            else:
+                # Current upstream owns the ordinary PCP restore lifecycle.
+                output = super().sample_tokens(grammar_output)
         return output
 
 
 __all__ = [
     "HcuGPUModelRunnerV2",
-    "install_fixed_width_pp_sample_broadcast",
-    "synchronize_pp_spec_draft_tokens",
+    "record_pp_spec_draft_index_stream",
 ]

@@ -17,7 +17,7 @@ import torch
 
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
     _validate_hcu_pcp_scope,
@@ -78,6 +78,15 @@ class PCPPlan(NamedTuple):
 class HcuPCPManager:
     """Build rank-local virtual rows while retaining the global step batch."""
 
+    @staticmethod
+    def validate_config(
+        vllm_config: object,
+        supports_mm_inputs: bool,
+    ) -> None:
+        if supports_mm_inputs:
+            raise ValueError("HCU PCP does not support multimodal inputs.")
+        _validate_hcu_pcp_scope(vllm_config)
+
     def __init__(
         self,
         vllm_config: object,
@@ -135,27 +144,22 @@ class HcuPCPManager:
         self._num_scheduled_tokens = np.empty(
             self._max_local_reqs, dtype=np.int32
         )
-        self._positions = torch.empty(
-            self._max_local_tokens, dtype=torch.int64, device=device
+        self._input_buffers = InputBuffers(
+            self._max_local_reqs,
+            self._max_local_tokens,
+            device,
         )
-        self._seq_lens = torch.empty(
-            self._max_local_reqs, dtype=torch.int32, device=device
-        )
+        self._positions = self._input_buffers.positions
+        self._seq_lens = self._input_buffers.seq_lens
         self._seq_lens_i64 = torch.empty(
             self._max_local_reqs, dtype=torch.int64, device=device
         )
-        self._query_start_loc = torch.empty(
-            self._max_local_reqs + 1, dtype=torch.int32, device=device
-        )
+        self._query_start_loc = self._input_buffers.query_start_loc
         self._query_start_loc_np = np.empty(
             self._max_local_reqs + 1, dtype=np.int32
         )
-        self._input_ids = torch.empty(
-            self._max_local_tokens, dtype=torch.int32, device=device
-        )
-        self._is_padding = torch.empty(
-            self._max_local_tokens, dtype=torch.bool, device=device
-        )
+        self._input_ids = self._input_buffers.input_ids
+        self._is_padding = self._input_buffers.is_padding
         self._logits_indices = torch.empty(
             self._max_local_tokens, dtype=torch.int64, device=device
         )
@@ -166,6 +170,15 @@ class HcuPCPManager:
             self._max_local_reqs + 1, dtype=np.int32
         )
         self._is_prefilling_np = np.empty(self._max_local_reqs, dtype=np.bool_)
+        self._replicated_token_mask = torch.empty(
+            self._max_local_tokens, dtype=torch.bool, device=device
+        )
+        self._replicated_slot_indices = torch.empty(
+            self._max_local_tokens, dtype=torch.int64, device=device
+        )
+        self._replicated_slot_indices_np = np.empty(
+            self._max_local_tokens, dtype=np.int64
+        )
 
         input_block_tables = getattr(block_tables, "input_block_tables", ())
         self._local_block_tables = tuple(
@@ -226,6 +239,65 @@ class HcuPCPManager:
             return RankSegment(start, min(start + chunk_size, length))
 
         return segment(pcp_rank), segment(chunk_count - 1 - pcp_rank)
+
+    def get_num_tokens_for_dispatch(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+    ) -> int:
+        """Return the largest real rank-local batch before runner padding."""
+
+        if self._use_mla:
+            # MLA/EP collectives require each request to contribute the same
+            # token width on every PCP rank. _build_batch_layout() adds virtual
+            # padding per request, so sum each request's widest rank rather
+            # than taking the widest aggregate rank. Different requests can
+            # have different widest ranks.
+            num_tokens = 0
+            for length_value, is_prefill_value in zip(
+                num_scheduled_tokens, is_prefilling
+            ):
+                length = int(length_value)
+                if not bool(is_prefill_value):
+                    num_tokens += length
+                    continue
+                num_tokens += max(
+                    sum(
+                        segment.num_tokens
+                        for segment in self.rank_segments(
+                            length,
+                            pcp_rank=rank,
+                            pcp_size=self.pcp_size,
+                        )
+                    )
+                    for rank in range(self.pcp_size)
+                )
+            return num_tokens
+
+        largest = 0
+        for rank in range(self.pcp_size):
+            local_tokens = 0
+            for length_value, is_prefill_value in zip(
+                num_scheduled_tokens, is_prefilling
+            ):
+                length = int(length_value)
+                if bool(is_prefill_value):
+                    local_tokens += sum(
+                        segment.num_tokens
+                        for segment in self.rank_segments(
+                            length,
+                            pcp_rank=rank,
+                            pcp_size=self.pcp_size,
+                        )
+                    )
+                else:
+                    local_tokens += length
+            largest = max(largest, local_tokens)
+        return largest
+
+    @property
+    def input_buffers(self) -> InputBuffers:
+        return self._input_buffers
 
     @staticmethod
     def _reorder_segments(
@@ -301,7 +373,9 @@ class HcuPCPManager:
         )
 
     def _build_batch_layout(
-        self, input_batch: InputBatch
+        self,
+        input_batch: InputBatch,
+        padded_num_tokens: int | None = None,
     ) -> tuple[list[list[_BatchSegment]], list[int]]:
         segments_by_rank = [
             self._segments_for_rank(rank, input_batch)
@@ -373,7 +447,14 @@ class HcuPCPManager:
             sum(segment.num_tokens for segment in segments)
             for segments in segments_by_rank
         ]
-        padded_num_tokens = max(per_rank_num_tokens, default=0)
+        required_num_tokens = max(per_rank_num_tokens, default=0)
+        if padded_num_tokens is None:
+            padded_num_tokens = required_num_tokens
+        elif padded_num_tokens < required_num_tokens:
+            raise PatchCompatibilityError(
+                "official PCP dispatch padding is smaller than the HCU "
+                f"rank-local batch: {padded_num_tokens} < {required_num_tokens}"
+            )
         expanded_num_tokens = padded_num_tokens * self.pcp_size
         padded_gather_idx = np.zeros(expanded_num_tokens, dtype=np.int64)
         kv_write_mask = np.zeros(expanded_num_tokens, dtype=np.bool_)
@@ -419,7 +500,11 @@ class HcuPCPManager:
         )
         return segments_by_rank, per_rank_num_tokens
 
-    def partition_batch(self, input_batch: InputBatch) -> InputBatch:
+    def partition_batch(
+        self,
+        input_batch: InputBatch,
+        padded_num_tokens: int | None = None,
+    ) -> InputBatch:
         """Return a rank-local InputBatch without mutating the global batch."""
 
         if (
@@ -432,7 +517,10 @@ class HcuPCPManager:
         self._global_batch = input_batch
         self._global_has_prefill = bool(input_batch.is_prefilling_np.any())
         self._global_attn_ready = False
-        segments_by_rank, per_rank_num_tokens = self._build_batch_layout(input_batch)
+        segments_by_rank, per_rank_num_tokens = self._build_batch_layout(
+            input_batch,
+            padded_num_tokens=padded_num_tokens,
+        )
         segments = segments_by_rank[self.pcp_rank]
         if not segments:
             # Preserve one metadata row on a rank with no owned prefill tokens,
@@ -447,7 +535,7 @@ class HcuPCPManager:
         self._local_segments = list(segments)
         num_local_reqs = len(segments)
         num_local_tokens = per_rank_num_tokens[self.pcp_rank]
-        num_padded_tokens = max(per_rank_num_tokens, default=0)
+        num_padded_tokens = self._padded_num_tokens
         if num_local_reqs > self._max_local_reqs:
             raise RuntimeError("PCP local request count exceeds its buffer")
         if num_padded_tokens > self._max_local_tokens:
@@ -491,6 +579,28 @@ class HcuPCPManager:
         input_ids.zero_()
         positions.zero_()
         is_padding.fill_(True)
+        replicated_token_mask = self._replicated_token_mask[
+            :num_padded_tokens
+        ]
+        replicated_token_mask.fill_(False)
+        replicated_slot_indices_np = self._replicated_slot_indices_np[
+            :num_padded_tokens
+        ]
+        replicated_slot_indices_np.fill(0)
+        rank0_decode_position = np.full(
+            input_batch.num_tokens, -1, dtype=np.int64
+        )
+        for segment in segments_by_rank[0]:
+            if (
+                segment.num_actual_tokens == 0
+                or bool(input_batch.is_prefilling_np[segment.global_req_idx])
+            ):
+                continue
+            rank0_decode_position[segment.global_slice] = np.arange(
+                segment.local_slice.start,
+                segment.local_slice.start + segment.num_actual_tokens,
+                dtype=np.int64,
+            )
         for row, segment in enumerate(segments):
             local_slice = segment.local_slice
             if segment.num_actual_tokens == 0:
@@ -510,6 +620,23 @@ class HcuPCPManager:
                 input_batch.positions[segment.global_slice]
             )
             is_padding[actual_slice] = False
+            if not bool(
+                input_batch.is_prefilling_np[segment.global_req_idx]
+            ):
+                replicated_token_mask[actual_slice] = True
+                owner_positions = rank0_decode_position[segment.global_slice]
+                if np.any(owner_positions < 0):
+                    raise RuntimeError(
+                        "PCP rank-0 decode slot ownership is incomplete"
+                    )
+                replicated_slot_indices_np[actual_slice] = owner_positions
+
+        replicated_slot_indices = self._replicated_slot_indices[
+            :num_padded_tokens
+        ]
+        replicated_slot_indices.copy_(
+            torch.from_numpy(replicated_slot_indices_np).to(self.device)
+        )
 
         # A full request row can reuse MRV2's rejection-corrected device
         # seq_len directly. This is the common decode path and keeps the
@@ -645,7 +772,7 @@ class HcuPCPManager:
         local_is_prefilling = self._is_prefilling_np[:num_local_reqs]
         local_is_prefilling[:] = (
             local_num_computed_prefill < local_prefill_len
-        )
+        ) & input_batch.is_prefilling_np[global_req_indices]
         local_num_draft_tokens_per_req = None
         local_num_draft_tokens = 0
         if input_batch.num_draft_tokens_per_req is not None:
@@ -767,6 +894,23 @@ class HcuPCPManager:
             else global_slots
         )
         setattr(input_batch, "_vllm_hcu_pcp_plan", self.build_plan())
+        setattr(
+            input_batch,
+            "_vllm_hcu_pcp_has_global_prefill",
+            self._global_has_prefill,
+        )
+        setattr(
+            input_batch,
+            "_vllm_hcu_pcp_replicated_token_mask",
+            self._replicated_token_mask[: input_batch.num_tokens_after_padding],
+        )
+        setattr(
+            input_batch,
+            "_vllm_hcu_pcp_replicated_slot_indices",
+            self._replicated_slot_indices[
+                : input_batch.num_tokens_after_padding
+            ],
+        )
         return local_tables, slot_mappings
 
     def prepare_global_attn(
@@ -956,6 +1100,61 @@ def maybe_build_pcp_manager(
     return HcuPCPManager(vllm_config, device, req_states, block_tables)
 
 
+def make_hcu_pcp_manager_cls(
+    vllm_config: object,
+) -> type[HcuPCPManager]:
+    """Bind the plugin manager to the official MRV2 manager constructor."""
+
+    class ConfiguredHcuPCPManager(HcuPCPManager):
+        def __init__(
+            self,
+            pcp_world_size: int,
+            pcp_rank: int,
+            device: torch.device,
+            req_states: object | None = None,
+            max_num_reqs: int | None = None,
+            max_num_tokens: int | None = None,
+            block_tables: object | None = None,
+            dcp_world_size: int = 1,
+            dcp_rank: int = 0,
+            cp_interleave: int = 1,
+        ) -> None:
+            parallel_config = vllm_config.parallel_config
+            scheduler_config = vllm_config.scheduler_config
+            expected = (
+                int(parallel_config.prefill_context_parallel_size),
+                int(parallel_config.decode_context_parallel_size),
+                int(parallel_config.cp_kv_cache_interleave_size),
+                int(scheduler_config.max_num_seqs),
+                int(scheduler_config.max_num_batched_tokens),
+            )
+            actual = (
+                int(pcp_world_size),
+                int(dcp_world_size),
+                int(cp_interleave),
+                max_num_reqs,
+                max_num_tokens,
+            )
+            if actual != expected:
+                raise PatchCompatibilityError(
+                    "official PCP manager constructor arguments do not match "
+                    f"the bound HCU config: actual={actual}, expected={expected}"
+                )
+            if req_states is None or block_tables is None:
+                raise PatchCompatibilityError(
+                    "official PCP manager constructor omitted HCU runtime state"
+                )
+            super().__init__(vllm_config, device, req_states, block_tables)
+            if self.pcp_rank != int(pcp_rank) or self.dcp_rank != int(dcp_rank):
+                raise PatchCompatibilityError(
+                    "official PCP manager ranks do not match HCU process groups"
+                )
+
+    ConfiguredHcuPCPManager.__name__ = "ConfiguredHcuPCPManager"
+    ConfiguredHcuPCPManager.__qualname__ = "ConfiguredHcuPCPManager"
+    return ConfiguredHcuPCPManager
+
+
 def maybe_partition_pcp_batch(
     manager: HcuPCPManager | None, input_batch: InputBatch
 ) -> InputBatch:
@@ -979,6 +1178,7 @@ __all__ = [
     "PCPContextPlan",
     "PCPPlan",
     "RankSegment",
+    "make_hcu_pcp_manager_cls",
     "maybe_build_pcp_manager",
     "maybe_partition_pcp_batch",
     "maybe_restore_pcp_for_sampling",

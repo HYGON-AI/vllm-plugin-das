@@ -57,17 +57,22 @@ def suppress_pp_v2_warmup_sample_broadcast(model_runner: object):
     pp_handler = getattr(model_runner, "pp_handler")
     receive = getattr(pp_handler, "receive")
     broadcast = getattr(pp_handler, "broadcast")
+    broadcast_drafts = getattr(pp_handler, "broadcast_drafts", None)
     suppress_attr = "_vllm_hcu_suppress_pp_spec_draft_sync"
     missing = object()
     previous_suppress = getattr(model_runner, suppress_attr, missing)
     setattr(model_runner, suppress_attr, True)
     setattr(pp_handler, "receive", lambda *args, **kwargs: False)
     setattr(pp_handler, "broadcast", lambda *args, **kwargs: None)
+    if broadcast_drafts is not None:
+        setattr(pp_handler, "broadcast_drafts", lambda *args, **kwargs: None)
     try:
         yield
     finally:
         setattr(pp_handler, "receive", receive)
         setattr(pp_handler, "broadcast", broadcast)
+        if broadcast_drafts is not None:
+            setattr(pp_handler, "broadcast_drafts", broadcast_drafts)
         if previous_suppress is missing:
             delattr(model_runner, suppress_attr)
         else:

@@ -72,10 +72,13 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_split_batch(common_attn_metadata, decode_threshold=1,
                         require_uniform=False,
                         treat_short_extends_as_decodes=None):
-        if treat_short_extends_as_decodes is None:
-            treat_short_extends_as_decodes = (
-                getattr(common_attn_metadata, "is_prefilling", None) is None
-            )
+        if getattr(common_attn_metadata, "is_prefilling", None) is None:
+            # Rebuilt multi-step draft metadata is a uniform decode batch and
+            # intentionally has no prefill mask. Current upstream callers may
+            # still pass False here for target-model short-extend splitting.
+            treat_short_extends_as_decodes = True
+        elif treat_short_extends_as_decodes is None:
+            treat_short_extends_as_decodes = False
         return split_batch(
             common_attn_metadata, decode_threshold, require_uniform,
             treat_short_extends_as_decodes,
@@ -83,10 +86,30 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(build)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        result = build(self, common_prefix_len, common_attn_metadata, fast_build)
         from vllm_hcu.model_executor.layers.attention.pcp import (
-            effective_pcp_world_size,
+            effective_pcp_metadata_world_size,
         )
+
+        configured_builder_pcp_size = int(getattr(self, "pcp_world_size", 1))
+        logical_builder_pcp_size = effective_pcp_metadata_world_size(
+            configured_builder_pcp_size
+        )
+        override_builder_pcp_size = (
+            hasattr(self, "pcp_world_size")
+            and logical_builder_pcp_size != configured_builder_pcp_size
+        )
+        if override_builder_pcp_size:
+            # Upstream compressed-slot metadata gathers with this builder
+            # field. Replicated MTP target rows already own complete slots, so
+            # the builder must observe the logical PCP width before it builds.
+            self.pcp_world_size = logical_builder_pcp_size
+        try:
+            result = build(
+                self, common_prefix_len, common_attn_metadata, fast_build
+            )
+        finally:
+            if override_builder_pcp_size:
+                self.pcp_world_size = configured_builder_pcp_size
 
         result.num_kv_actual_tokens = getattr(
             common_attn_metadata, "num_kv_actual_tokens",
@@ -94,7 +117,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         vllm_config = getattr(self, "vllm_config", None)
         if vllm_config is None:
-            result.pcp_world_size = effective_pcp_world_size(
+            result.pcp_world_size = effective_pcp_metadata_world_size(
                 int(getattr(common_attn_metadata, "pcp_world_size", 1))
             )
         else:
@@ -109,7 +132,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     "required vLLM 0.25.1 prefill_context_parallel_size "
                     "is missing from sparse indexer metadata builder"
                 )
-            result.pcp_world_size = effective_pcp_world_size(
+            result.pcp_world_size = effective_pcp_metadata_world_size(
                 int(pcp_world_size)
             )
         # HCU's AITER, lightop, and torch paged-MQA paths do not consume the

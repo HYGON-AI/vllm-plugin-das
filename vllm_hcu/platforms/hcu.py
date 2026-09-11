@@ -536,7 +536,6 @@ class HCUPlatform(Platform):
         ):
             compilation_config.custom_ops.append("+grouped_topk")
 
-        # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
         
 

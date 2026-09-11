@@ -113,8 +113,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
         is_prefilling = common_attn_metadata.is_prefilling
         if is_prefilling is None:
-            raise AssertionError(
-                "uniform short-extend classification requires is_prefilling"
+            # Current MRV2 rebuilds uniform multi-step draft metadata without
+            # a prefill mask. Such batches are decode-only; the False flag is
+            # inherited from target-model short-extend classification.
+            return original_split(
+                common_attn_metadata,
+                decode_threshold,
+                require_uniform,
+                True,
             )
         is_prefill = is_prefilling.clone()
         is_prefill |= query_lens > decode_threshold

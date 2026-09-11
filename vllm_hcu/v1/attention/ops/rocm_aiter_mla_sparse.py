@@ -1221,7 +1221,7 @@ def rocm_aiter_sparse_attn_indexer_native(
     k_cache_prefix: LayerNameType,
     kv_cache: torch.Tensor,
     q_fp8: torch.Tensor,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -1234,7 +1234,11 @@ def rocm_aiter_sparse_attn_indexer_native(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype() if not current_platform.is_rocm() or on_gfx938() else k.dtype
+    fp8_dtype = (
+        current_platform.fp8_dtype()
+        if not current_platform.is_rocm() or on_gfx938()
+        else kv_cache.dtype if k is None else k.dtype
+    )
     from vllm import _custom_ops as ops
     from vllm.utils.torch_utils import _resolve_layer_name
 

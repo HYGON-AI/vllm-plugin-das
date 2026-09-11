@@ -45,7 +45,16 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
     adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
     upstream_module = ModuleType(upstream_name)
     pcp_module = ModuleType("vllm_hcu.v1.pcp_manager")
-    pcp_module.maybe_build_pcp_manager = lambda *args: None
+
+    class NullPCPManager:
+        @staticmethod
+        def validate_config(vllm_config, supports_mm_inputs):
+            return None
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    pcp_module.make_hcu_pcp_manager_cls = lambda config: NullPCPManager
 
     class FakeBlockTables:
         def get_dummy_block_tables(self, num_reqs):
@@ -63,6 +72,7 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             self.device = device
             self.req_states = object()
             self.execute_model_state = None
+            self.pcp_manager = None
 
         def initialize_kv_cache(
             self,
@@ -77,13 +87,33 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                 kv_cache_allocation_context,
             )
             self.block_tables = FakeBlockTables()
+            if self.vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                manager_cls = self.pcp_manager_cls
+                manager_cls.validate_config(self.vllm_config, False)
+                self.pcp_manager = manager_cls(
+                    pcp_world_size=2,
+                    pcp_rank=0,
+                    device=self.device,
+                    req_states=self.req_states,
+                    max_num_reqs=16,
+                    max_num_tokens=128,
+                    block_tables=self.block_tables,
+                    dcp_world_size=1,
+                    dcp_rank=0,
+                    cp_interleave=1,
+                )
 
         def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
             events.append("super.prepare_inputs")
             assert scheduler_output == "scheduler-output"
             assert batch_req_state == "batch-req-state"
-            assert batch_desc == "batch-desc"
-            return self.global_batch
+            input_batch = self.global_batch
+            if getattr(self, "pcp_manager", None) is not None:
+                return self.pcp_manager.partition_batch(
+                    input_batch,
+                    padded_num_tokens=batch_desc.num_tokens,
+                )
+            return input_batch
 
         def execute_model(
             self,
@@ -106,13 +136,22 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             events.append("super.prepare_attn")
             return ("global-blocks", input_batch), "global-slots"
 
-        def prepare_dummy_attn(self, input_batch):
+        def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
             events.append("super.prepare_dummy_attn")
             return ("global-dummy-blocks", input_batch), "global-dummy-slots"
 
         def sample_tokens(self, grammar_output):
             events.append("super.sample_tokens")
             assert grammar_output == "grammar"
+            manager = getattr(self, "pcp_manager", None)
+            if manager is not None:
+                hidden_states, input_batch = manager.restore_for_sampling(
+                    self.execute_model_state.hidden_states
+                )
+                self.execute_model_state = self.execute_model_state._replace(
+                    hidden_states=hidden_states,
+                    input_batch=input_batch,
+                )
             assert self.execute_model_state.hidden_states is self.expected_hidden
             assert self.execute_model_state.input_batch is self.expected_batch
             if hasattr(self, "expected_attn_metadata"):
@@ -132,6 +171,7 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
             return "sampled"
 
     upstream_module.GPUModelRunner = UpstreamGPUModelRunner
+    upstream_module.init_kv_cache = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
     monkeypatch.setitem(sys.modules, pcp_module.__name__, pcp_module)
     monkeypatch.delitem(sys.modules, adapter_name, raising=False)
@@ -139,11 +179,12 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
     yield adapter_module, events
 
 
-def _config(pcp_size: int) -> object:
+def _config(pcp_size: int, *, speculative: bool = True) -> object:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
-        )
+        ),
+        speculative_config=object() if speculative else None,
     )
 
 
@@ -165,7 +206,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Moving partition or restore across its upstream boundary is a bug."""
+    """Current upstream owns ordinary PCP sampling restore exactly once."""
 
     runner_module, events = pcp_runner_module
     global_batch = SimpleNamespace(
@@ -179,9 +220,10 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     synchronized_batches: list[object] = []
 
     class Manager:
-        def partition_batch(self, input_batch):
+        def partition_batch(self, input_batch, padded_num_tokens=None):
             events.append("partition_batch")
             assert input_batch is global_batch
+            assert padded_num_tokens == 17
             return local_batch
 
         def prepare_attn(self, input_batch):
@@ -196,26 +238,25 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
 
     manager = Manager()
 
-    def build_manager(vllm_config, device, req_states, block_tables):
-        events.append("build_pcp_manager")
+    def bind_manager(vllm_config):
         assert vllm_config.parallel_config.prefill_context_parallel_size == 2
-        assert device == "hcu:0"
-        assert req_states is runner.req_states
-        assert block_tables is runner.block_tables
-        return manager
 
-    def synchronize(model_runner, input_batch):
-        assert events[-1] == "super.sample_tokens"
-        assert model_runner is runner
-        synchronized_batches.append(input_batch)
-        return False
+        class BoundManager:
+            @staticmethod
+            def validate_config(config, supports_mm_inputs):
+                assert config is vllm_config
+                assert supports_mm_inputs is False
 
-    monkeypatch.setattr(runner_module, "maybe_build_pcp_manager", build_manager)
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        synchronize,
-    )
+            def __new__(cls, **kwargs):
+                events.append("build_pcp_manager")
+                assert kwargs["device"] == "hcu:0"
+                assert kwargs["req_states"] is runner.req_states
+                assert kwargs["block_tables"] is runner.block_tables
+                return manager
+
+        return BoundManager
+
+    monkeypatch.setattr(runner_module, "make_hcu_pcp_manager_cls", bind_manager)
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     assert runner.pcp_manager is None
@@ -225,7 +266,9 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[object()]))
     assert runner.pcp_manager is manager
     prepared = runner.prepare_inputs(
-        "scheduler-output", "batch-req-state", "batch-desc"
+        "scheduler-output",
+        "batch-req-state",
+        SimpleNamespace(num_tokens=17),
     )
     assert prepared is local_batch
     assert runner.prepare_attn(prepared) == ("local-blocks", "gathered-slots")
@@ -240,15 +283,15 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     assert state.input_batch is local_batch
     assert runner.execute_model_state.hidden_states is global_hidden
     assert runner.execute_model_state.input_batch is global_batch
-    assert synchronized_batches == [global_batch]
+    assert synchronized_batches == []
     assert events == [
         "super.initialize_kv_cache",
         "build_pcp_manager",
         "super.prepare_inputs",
         "partition_batch",
         "pcp.prepare_attn",
-        "restore_for_sampling",
         "super.sample_tokens",
+        "restore_for_sampling",
     ]
 
 
@@ -291,7 +334,7 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """v0.25.1 stores execution state in an immutable NamedTuple."""
+    """Upstream PCP restore replaces immutable execution state exactly once."""
 
     runner_module, _ = pcp_runner_module
     global_batch = object()
@@ -304,11 +347,6 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
             assert hidden_states is local_hidden
             return global_hidden, global_batch
 
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        lambda *args: False,
-    )
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     runner.pcp_manager = Manager()
     original_state = _ExecuteModelState(local_batch, local_hidden)
@@ -378,12 +416,6 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
         build_slots,
         raising=False,
     )
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        lambda *args: False,
-    )
-
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     runner.pcp_manager = Manager()
     runner.speculator = object()
@@ -430,10 +462,22 @@ def test_pcp_runner_routes_dummy_slots_through_manager(
             return "pcp-dummy-slots"
 
     manager = Manager()
+
+    def bind_manager(vllm_config):
+        class BoundManager:
+            @staticmethod
+            def validate_config(config, supports_mm_inputs):
+                return None
+
+            def __new__(cls, **kwargs):
+                return manager
+
+        return BoundManager
+
     monkeypatch.setattr(
         runner_module,
-        "maybe_build_pcp_manager",
-        lambda *args: manager,
+        "make_hcu_pcp_manager_cls",
+        bind_manager,
     )
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
@@ -463,23 +507,12 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     hidden_states = object()
 
     def unexpected_builder(*args):
-        pytest.fail("PCP=1 called maybe_build_pcp_manager")
-
-    def synchronize(model_runner, input_batch):
-        events.append("synchronize_pp_spec_draft_tokens")
-        assert model_runner is runner
-        assert input_batch is global_batch
-        return True
+        pytest.fail("PCP=1 selected an HCU PCP manager class")
 
     monkeypatch.setattr(
         runner_module,
-        "maybe_build_pcp_manager",
+        "make_hcu_pcp_manager_cls",
         unexpected_builder,
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        synchronize,
     )
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
@@ -496,7 +529,9 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     assert runner.kv_cache_initialize_args == (True, allocation_context)
     assert (
         runner.prepare_inputs(
-            "scheduler-output", "batch-req-state", "batch-desc"
+            "scheduler-output",
+            "batch-req-state",
+            SimpleNamespace(num_tokens=17),
         )
         is global_batch
     )
@@ -522,7 +557,6 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
         "super.prepare_attn",
         "super.prepare_dummy_attn",
         "super.sample_tokens",
-        "synchronize_pp_spec_draft_tokens",
     ]
 
 
@@ -901,6 +935,99 @@ def test_pcp_model_state_routes_plan_only_to_flash_attention_builder() -> None:
     )
     assert flash_metadata.pcp_plan is plan
     assert not hasattr(mla_metadata, "pcp_plan")
+
+
+def test_pcp_decode_only_metadata_disables_prefill_collectives() -> None:
+    """Replicated decode rows must not re-enter PCP prefill collectives."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    decode_metadata = SimpleNamespace(pcp_world_size=2)
+    prefill_metadata = SimpleNamespace(pcp_world_size=2)
+
+    adapter._attach_pcp_cache_ownership(
+        {"decode": decode_metadata}, has_global_prefill=False
+    )
+    adapter._attach_pcp_cache_ownership(
+        {"prefill": prefill_metadata}, has_global_prefill=True
+    )
+
+    assert decode_metadata.pcp_world_size == 1
+    assert decode_metadata.pcp_has_global_prefill is False
+    assert prefill_metadata.pcp_world_size == 2
+    assert prefill_metadata.pcp_has_global_prefill is True
+
+
+def test_pcp_model_state_scopes_logical_width_before_metadata_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target ownership must reach compressed builders before they gather."""
+
+    adapter = importlib.import_module(
+        "vllm_hcu.patch.worker.framework_opt.patch_pcp_model_state"
+    )
+    target = _fake_default_model_state_module(adapter)
+    _accept_synthetic_model_state_sources(monkeypatch, adapter, target)
+    assert adapter.apply_to_module(target) is True
+
+    observed_world_sizes: list[int] = []
+
+    def capture_build(**kwargs):
+        from vllm_hcu.model_executor.layers.attention.pcp import (
+            effective_pcp_metadata_world_size,
+        )
+
+        observed_world_sizes.append(effective_pcp_metadata_world_size(2))
+        return {"mla.layer": SimpleNamespace(pcp_world_size=2)}
+
+    target.build_attn_metadata = capture_build
+    state = target.DefaultModelState()
+    state.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
+    )
+    state.supports_mm_inputs = False
+    state.max_model_len = 64
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        query_start_loc_np=np.array([0, 1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        dcp_local_seq_lens=None,
+        positions=torch.tensor([0], dtype=torch.int64),
+        req_ids=["decode"],
+        is_prefilling_np=np.array([False], dtype=np.bool_),
+        prompt_lens=None,
+        max_query_len=1,
+        _vllm_hcu_pcp_has_global_prefill=False,
+        _vllm_hcu_pcp_replicated_token_mask=torch.tensor([True]),
+    )
+    args = (
+        input_batch,
+        target.CUDAGraphMode.NONE,
+        (torch.zeros((1, 1), dtype=torch.int32),),
+        torch.zeros((1, 1), dtype=torch.int64),
+        [[]],
+        SimpleNamespace(kv_cache_groups=[object()]),
+    )
+
+    decode_metadata = state.prepare_attn(*args)["mla.layer"]
+    input_batch._vllm_hcu_pcp_has_global_prefill = True
+    input_batch.is_prefilling_np[:] = True
+    prefill_metadata = state.prepare_attn(*args)["mla.layer"]
+
+    assert observed_world_sizes == [1, 2]
+    assert decode_metadata.pcp_world_size == 1
+    assert torch.equal(
+        decode_metadata.pcp_replicated_token_mask,
+        torch.tensor([True]),
+    )
+    assert prefill_metadata.pcp_world_size == 2
 
 
 def test_pcp_default_model_state_rejects_same_signature_behavior_drift(

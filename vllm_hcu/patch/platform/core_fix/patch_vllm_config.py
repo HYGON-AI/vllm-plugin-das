@@ -177,9 +177,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             "num_speculative_tokens",
             "SpeculativeConfig",
         )
-        if num_speculative_tokens not in (1, 2):
+        if num_speculative_tokens not in (1, 2, 3):
             raise ValueError(
-                "GLM-5.2 PCP+MTP requires one or two speculative tokens."
+                "GLM-5.2 PCP+MTP requires one to three speculative tokens."
             )
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")

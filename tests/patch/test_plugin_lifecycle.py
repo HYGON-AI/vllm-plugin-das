@@ -632,9 +632,6 @@ def test_worker_selects_plugin_owned_model_runner(
             events.append((config, device))
 
     setattr(runner_module, expected_class, Runner)
-    installed: list[object] = []
-    if use_v2:
-        runner_module.install_fixed_width_pp_sample_broadcast = installed.append
     monkeypatch.setitem(sys.modules, expected_module, runner_module)
     config = object()
     device = object()
@@ -647,7 +644,6 @@ def test_worker_selects_plugin_owned_model_runner(
 
     assert isinstance(result, Runner)
     assert events == [(config, device)]
-    assert installed == ([result] if use_v2 else [])
 
 
 def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(

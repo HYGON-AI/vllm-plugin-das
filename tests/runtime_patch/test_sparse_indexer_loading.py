@@ -333,6 +333,69 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
     assert calls[0][-1] is False
 
 
+def test_v32_decode_only_target_bypasses_pcp_indexer_gather():
+    """Replicated target verification uses local complete indexer caches."""
+
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+        return None
+
+    metadata = SimpleNamespace(
+        pcp_world_size=1,
+        pcp_has_global_prefill=False,
+    )
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "decode-only target gathered PCP indexer inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *args: pytest.fail(
+                "decode-only target used external PCP cache insertion"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "decode-only target used PCP BF16 cache insertion"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    local_k = torch.ones(2, 2)
+    q_quant = torch.ones(2, 2)
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=True,
+        pcp_world_size=2,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert (
+        forward_hip(indexer, object(), q_quant, local_k, object())
+        is indexer.topk_indices_buffer
+    )
+    assert len(calls) == 1
+    assert calls[0][4] is local_k
+    assert calls[0][-1] is False
+
+
 def test_v32_hcu_indexer_impl_advertises_pcp_capability():
     assert _load_v32_sparse_indexer_class().supports_pcp is True
 
@@ -656,3 +719,81 @@ def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
 
     schema = torch.ops.vllm.hcu_sparse_attn_indexer.default._schema
     assert len(schema.returns) == 0
+    assert "Tensor? k" in str(schema)
+
+
+def test_sparse_indexer_non_aiter_fallback_stays_opaque(monkeypatch):
+    """The non-AITER fallback must not be traced into its fake implementation."""
+    import sys
+    from types import ModuleType
+
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    namespace = {
+        "torch": fake_torch,
+        "rocm_aiter_ops": SimpleNamespace(is_enabled=lambda: False),
+        "_encode_layer_name": lambda value: value,
+    }
+    exec(compile(module, "sparse_indexer_forward_hip", "exec"), namespace)
+
+    native_module = ModuleType(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
+    )
+    native_module.rocm_aiter_sparse_attn_indexer_native = lambda *args, **kwargs: (
+        pytest.fail("non-AITER fallback was traced through the Python native path")
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse",
+        native_module,
+    )
+
+    topk_buffer = object()
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        skip_k_cache_insert=True,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=163840,
+        topk_indices_buffer=topk_buffer,
+    )
+
+    result = namespace["forward_hip"](
+        indexer, object(), torch.ones(1, 1), None, object()
+    )
+
+    assert result is topk_buffer
+    assert len(calls) == 1
+    assert calls[0][4] is None
+    assert calls[0][-1] is True

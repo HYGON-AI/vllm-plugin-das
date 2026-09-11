@@ -62,6 +62,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ("platform.core_fix.envs", "vllm.envs"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
         (
+            "platform.core.layer_name_value_member",
+            "vllm.utils.torch_utils",
+        ),
+        (
             "platform.core_fix.nixl.package_name",
             "vllm.distributed.nixl_utils",
         ),
@@ -269,9 +273,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 43,
+        "count": 44,
         "replacements": 11,
-        "callbacks": 32,
+        "callbacks": 33,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
