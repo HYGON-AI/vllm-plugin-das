@@ -39,10 +39,11 @@ ARG AICC_URL
 ARG AICC_VERSION
 ENV AICC_VERSION=${AICC_VERSION}
 
-RUN wget -q "${AICC_URL}" -O /tmp/aicc.run && \
-    chmod +x /tmp/aicc.run && \
-    yes | /tmp/aicc.run --dtk_dir /opt/dtk && \
-    rm -f /tmp/aicc.run
+# 安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录
+RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
+    chmod +x /tmp/hcu_llvm_installer.sh && \
+    bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
+    rm -f /tmp/hcu_llvm_installer.sh
 
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
@@ -50,17 +51,15 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
-    && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    && pip install --no-cache-dir vllm==${VLLM_VERSION} \
-    && pip install --no-cache-dir vllm-hcu==${VLLM_VERSION} \
-    && pip install --no-cache-dir -r /tmp/requirements-test.txt \
-    && pip install --no-cache-dir evalscope==1.9.1 pytest==9.1.1 \
+    && pip install --no-cache-dir vllm==0.28.1 \
+    && pip install --no-cache-dir --pre "vllm-hcu>0.28.0,<=0.28.1" \
     && pip cache purge
 
 # ---layer--- torch + das 加速库
 ARG TORCH_VERSION
 RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && pip install --no-cache-dir torch==${TORCH_VERSION} torchvision \
+    && das-install triton==3.6.0 ${TORCH_TAG} \
     && das-install flash_attn ${TORCH_TAG} \
     && das-install lightop ${TORCH_TAG} \
     && das-install lmslim ${TORCH_TAG} \
@@ -68,7 +67,6 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install aiter ${TORCH_TAG} \
     && pip install --no-cache-dir mooncake_transfer_engine \
     && das-install deep_ep ${TORCH_TAG} \
-    && das-install tilelang ${TORCH_TAG} \
     && das-install boltops ${TORCH_TAG} \
     && das-install causal_conv1d==1.5.4 ${TORCH_TAG} \
     && das-install flash_mla ${TORCH_TAG} \
@@ -76,6 +74,8 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install flash_kda ${TORCH_TAG} \
     && das-install vllm-router ${TORCH_TAG} \
     && das-install nixl ${TORCH_TAG} \
+    # tilelang 放最后: 安装真实包会替换上面 vLLM 层写的 0.1.10 stub, 之后不应再有触发 vllm 依赖解析的安装
+    && das-install tilelang ${TORCH_TAG} \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip cache purge
     
