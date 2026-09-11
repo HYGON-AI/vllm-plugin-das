@@ -67,13 +67,38 @@ def test_frozen_opendas_vllm_wheel_is_accepted(
 @pytest.mark.parametrize(
     "value",
     (
+        "0.28.1",
+        "0.28.1+das.vendor.dtk2604",
+        "0.28.1rc1.dev491+g58ad1f3b",
+        "0.28.1rc1.dev999+gdeadbee.das.vendor.dtk2604",
+        "0.28.1rc2",
+        "0.28.1.post1",
+    ),
+)
+def test_v0281_release_line_accepts_rolling_vendor_builds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+) -> None:
+    _install_version(monkeypatch, tmp_path, value)
+
+    result = compatibility.ensure_vllm_compatible()
+
+    assert result.compatible
+    assert result.actual_version == value
+    assert result.reason == (
+        "installed vLLM build matches supported release line 0.28.1"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
         "0.20.2",
         "0.22.0",
         "0.25.1+das.local",
         "0.28.0",
         "0.28.9",
-        "0.28.1rc1.dev491+g58ad1f3b",
-        "0.28.1rc1.dev491+g462fdb097.das.other.dtk2604",
         "1!0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604",
         "not a version",
     ),
