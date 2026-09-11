@@ -22,6 +22,7 @@ from . import (
     patch_qwen3_vl_moe,
     patch_qwen4_exp,
     patch_qwen4_exp_ple_conv,
+    patch_qwen4_exp_ple_int8,
     patch_rocm_mla_sparse_metadata,
 )
 
@@ -40,5 +41,6 @@ __all__ = [
     "patch_qwen3_vl_moe",
     "patch_qwen4_exp",
     "patch_qwen4_exp_ple_conv",
+    "patch_qwen4_exp_ple_int8",
     "patch_rocm_mla_sparse_metadata",
 ]
