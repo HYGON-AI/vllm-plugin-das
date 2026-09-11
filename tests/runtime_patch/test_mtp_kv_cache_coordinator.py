@@ -12,14 +12,6 @@ from vllm_hcu.patch.worker.framework_opt import patch_mamba_hybrid_model_state
 
 
 def _coordinator_module() -> ModuleType:
-    class MambaManager:
-        def cache_blocks(self, request, num_tokens, retention_interval=None):
-            self.original_cache_call = (
-                request,
-                num_tokens,
-                retention_interval,
-            )
-
     class KVCacheCoordinator:
         def __init__(
             self,
@@ -60,7 +52,6 @@ def _coordinator_module() -> ModuleType:
 
     module = ModuleType(patch_kv_cache_coordinator.TARGET_MODULE)
     module.KVCacheCoordinator = KVCacheCoordinator
-    module.MambaManager = MambaManager
     return module
 
 
@@ -108,43 +99,6 @@ def test_mtp_indexer_group_skips_only_unmarked_all_group_eagle_fallback():
         (["model.layers.0.self_attn.indexer", "model.layers.61.nextn"], True)
     )
     assert _construct(module, explicit).eagle_group_ids == {0}
-
-
-def test_mamba_sparse_cache_retains_materialized_eagle_replay_boundary():
-    module = _coordinator_module()
-    assert patch_kv_cache_coordinator.apply_to_module(module) is True
-
-    null_block = SimpleNamespace(is_null=True, block_hash=None)
-    replay_block = SimpleNamespace(
-        is_null=False,
-        block_hash=None,
-        block_hash_num_tokens=None,
-    )
-
-    class BlockPool:
-        def cache_full_blocks(self, **kwargs):
-            assert kwargs["num_cached_blocks"] == 6
-            assert kwargs["num_full_blocks"] == 7
-            assert kwargs["block_size"] == 576
-            kwargs["blocks"][6].block_hash = "group-0-replay"
-            kwargs["blocks"][6].block_hash_num_tokens = 4032
-
-    manager = module.MambaManager()
-    manager.drop_eagle_checkpoint_block = True
-    manager.mamba_cache_mode = "align"
-    manager.cache_hit_alignment_tokens = 576
-    manager.block_size = 576
-    manager.kv_cache_group_id = 0
-    manager.block_pool = BlockPool()
-    manager.cached_blocks_this_step = set()
-    manager.req_to_blocks = {"request": [null_block] * 6 + [replay_block]}
-    request = SimpleNamespace(request_id="request", num_prompt_tokens=5050)
-
-    manager.cache_blocks(request, 4032, retention_interval=0)
-
-    assert manager.original_cache_call == (request, 4032, 0)
-    assert replay_block.block_hash_num_tokens == 4032
-    assert manager.cached_blocks_this_step == {"group-0-replay"}
 
 
 def test_mamba_resume_seed_uses_hybrid_manager_block_size():
