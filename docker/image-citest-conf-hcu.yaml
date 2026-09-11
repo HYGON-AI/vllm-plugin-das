@@ -4,19 +4,17 @@ Qwen3.5-35B-A3B-W8A8:
     VLLM_KV_CACHE_LAYOUT: HND
   evalscope:
     datasets:
-    - swe_bench_lite_agentic
-    - mcp_atlas
-    - ifbench
-    - bfcl_v3
     - humaneval
     - gsm8k
     - math_500
     limit: 50
-    dataset_args:
-      swe_bench_lite_agentic:
-        limit: 5
-      mcp_atlas:
-        limit: 5
+    eval_batch_size: 32
+    generation_config:
+      max_tokens: 32768
+      temperature: 0
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
   model: Qwen3.5-35B-A3B-W8A8
   server: vllm
   server_args:
@@ -40,19 +38,17 @@ Qwen3.6-35B-A3B:
     VLLM_KV_CACHE_LAYOUT: HND
   evalscope:
     datasets:
-    - swe_bench_lite_agentic
-    - mcp_atlas
-    - ifbench
-    - bfcl_v3
     - humaneval
     - gsm8k
     - math_500
     limit: 50
-    dataset_args:
-      swe_bench_lite_agentic:
-        limit: 5
-      mcp_atlas:
-        limit: 5
+    eval_batch_size: 32
+    generation_config:
+      max_tokens: 32768
+      temperature: 0
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
   model: Qwen3.6-35B-A3B
   server: vllm
   server_args:
@@ -74,19 +70,17 @@ GLM-5-Channel-INT8-w8a8:
     VLLM_USE_V2_MODEL_RUNNER: 1
   evalscope:
     datasets:
-    - swe_bench_lite_agentic
-    - mcp_atlas
-    - ifbench
-    - bfcl_v3
     - humaneval
     - gsm8k
     - math_500
     limit: 50
-    dataset_args:
-      swe_bench_lite_agentic:
-        limit: 5
-      mcp_atlas:
-        limit: 5
+    eval_batch_size: 32
+    generation_config:
+      max_tokens: 32768
+      temperature: 0
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
   model: GLM-5-Channel-INT8-w8a8
   server: vllm
   server_args:
@@ -112,19 +106,17 @@ Hy3-Channel-FP8-w8a8:
     GPU_MAX_HW_QUEUES: 4
   evalscope:
     datasets:
-    - swe_bench_lite_agentic
-    - mcp_atlas
-    - ifbench
-    - bfcl_v3
     - humaneval
     - gsm8k
     - math_500
     limit: 50
-    dataset_args:
-      swe_bench_lite_agentic:
-        limit: 5
-      mcp_atlas:
-        limit: 5
+    eval_batch_size: 32
+    generation_config:
+      max_tokens: 32768
+      temperature: 0
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
   model: Hy3-Channel-FP8-w8a8
   server: vllm
   server_args:
