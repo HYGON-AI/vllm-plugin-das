@@ -95,6 +95,7 @@ jobs:
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
+          BASE_VERSION="${BASE_VERSION%%.dev*}"
           echo "IMAGE_TAG=vllm:${BASE_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=vllm:${BASE_VERSION}-latest" >> "$GITHUB_ENV"
           echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
