@@ -596,3 +596,51 @@ python -m evalscope.cli.cli eval \
 The run completed all 32 requests in 266.43 seconds with no API or runtime
 errors. EvalScope reported `Accuracy=1.0` and `Pass@1=1.0` (32/32 correct),
 with mean per-request latency 98.273 seconds and mean output length 135 tokens.
+
+### PP2 + PCP4 MTP validation
+
+The same topology supports built-in MTP with one or two speculative tokens.
+Append one of these options to the service command and update
+`--served-model-name` accordingly:
+
+```bash
+# MTP1
+--speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+
+# MTP2
+--speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+```
+
+Both MTP1 and MTP2 loaded the `HYV4MTPModel` on the final PP stage while
+retaining DeepEP HT, DeepGEMM HT, and FP8 E4M3 KV cache. MTP1 returned HTTP
+200 with exact assistant content `OK`; its log reported one drafted and one
+accepted token. MTP2 also returned exact `OK` for the short request and logged
+nonzero speculative work. During HumanEval, its 10-second acceptance windows
+were typically 89% to 97%.
+
+The 3,049-token MTP2 prefill request returned HTTP 200 and content
+`OK</think:opensource>OK`. This differs from the target-only exact `OK` response
+and is recorded as a deterministic generation-trajectory difference rather
+than hidden by the accuracy aggregate.
+
+HumanEval-32 used the same dataset, batch size, seed, temperature, and output
+limit as target-only, changing only the served model and work directory to the
+MTP2 values:
+
+```bash
+--model hy4-pp2-pcp4-mtp2
+--model-id Hy4-preview-Channel-FP8-w8a8-v2-deepgemm-pp2-pcp4-ep4-mtp2-fp8kv-no_think
+--work-dir /models/evalscope_hy4_pp2_pcp4_deepgemm_mtp2_humaneval32_20260911
+```
+
+| Mode | Predictions/reviews | Correct | Accuracy | Pass@1 | Wall time | Mean latency | Mean output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Target-only | 32/32 | 32/32 | 100% | 100% | 266.43 s | 98.273 s | 135 tokens |
+| MTP2 | 32/32 | 32/32 | 100% | 100% | 115.65 s | 41.543 s | 135 tokens |
+
+The two runs produced byte-identical assistant text for 24 of 32 tasks. Eight
+tasks followed different valid generation trajectories, but there were no
+pass/fail flips and no API or runtime errors. The timing comparison is an
+observation from consecutive runs on the same host, not an isolated throughput
+benchmark. MTP3 remains fail-closed because the PCP contract validates only
+one or two speculative tokens.
