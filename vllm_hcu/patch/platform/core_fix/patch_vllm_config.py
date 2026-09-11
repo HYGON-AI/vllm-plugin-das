@@ -100,9 +100,35 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError(
             "FlashAttention PCP does not support hybrid KV cache groups."
         )
-    if _require_hcu_pcp_attribute(
-        parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1:
+    pp_size = int(
+        _require_hcu_pcp_attribute(
+            parallel_config, "pipeline_parallel_size", "ParallelConfig"
+        )
+    )
+    tp_size = int(
+        _require_hcu_pcp_attribute(
+            parallel_config, "tensor_parallel_size", "ParallelConfig"
+        )
+    )
+    pcp_size = int(
+        _require_hcu_pcp_attribute(
+            parallel_config,
+            "prefill_context_parallel_size",
+            "ParallelConfig",
+        )
+    )
+    hy4_pp_pcp = (
+        architecture == "HYV4ForCausalLM"
+        and pp_size == 2
+        and tp_size == 1
+        and pcp_size == 4
+    )
+    if pp_size != 1 and not hy4_pp_pcp:
+        if architecture == "HYV4ForCausalLM":
+            raise ValueError(
+                "Hy4 PP+PCP only supports PP=2, TP=1, and PCP=4; "
+                f"got PP={pp_size}, TP={tp_size}, and PCP={pcp_size}."
+            )
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
@@ -135,6 +161,10 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         vllm_config, "speculative_config", "VllmConfig"
     )
     if speculative_config is not None:
+        if hy4_pp_pcp:
+            raise ValueError(
+                "Hy4 PP+PCP does not support speculative decoding or MTP."
+            )
         if not use_mla:
             raise ValueError(
                 "FlashAttention PCP does not support speculative decoding or MTP."

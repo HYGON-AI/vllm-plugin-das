@@ -296,6 +296,47 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     assert runner.execute_model_state.hidden_states is global_hidden
 
 
+def test_pcp_non_final_pp_rank_restores_only_global_sampling_batch(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-final PP rank has no hidden states to gather across PCP."""
+
+    runner_module, events = pcp_runner_module
+    global_batch = object()
+    local_batch = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            pytest.fail(
+                "non-final PP rank attempted a PCP hidden-state collective"
+            )
+
+        def restore_batch_for_sampling(self):
+            events.append("restore_batch_for_sampling")
+            return global_batch
+
+    monkeypatch.setattr(
+        runner_module,
+        "synchronize_pp_spec_draft_tokens",
+        lambda *args: False,
+    )
+    runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
+    runner.pcp_manager = Manager()
+    runner.execute_model_state = _ExecuteModelState(local_batch, None)
+    runner.expected_hidden = None
+    runner.expected_batch = global_batch
+    events.clear()
+
+    assert runner.sample_tokens("grammar") == "sampled"
+    assert runner.execute_model_state.hidden_states is None
+    assert runner.execute_model_state.input_batch is global_batch
+    assert events == [
+        "restore_batch_for_sampling",
+        "super.sample_tokens",
+    ]
+
+
 def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,

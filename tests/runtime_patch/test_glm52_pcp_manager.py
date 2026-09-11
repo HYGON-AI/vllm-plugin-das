@@ -775,6 +775,7 @@ def test_restore_returns_global_token_and_request_order() -> None:
         sampled_hidden, sampled_batch = manager.restore_for_sampling(local)
         assert sampled_hidden[:, 0].tolist() == expected.tolist()
         assert sampled_batch is global_batch
+        assert manager.restore_batch_for_sampling() is global_batch
 
 
 def test_dummy_slots_are_invalid_without_touching_real_block_tables() -> None:
