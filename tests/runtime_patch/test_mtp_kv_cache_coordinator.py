@@ -5,7 +5,10 @@ from __future__ import annotations
 
 from types import ModuleType, SimpleNamespace
 
+import torch
+
 from vllm_hcu.patch.platform.framework_opt import patch_kv_cache_coordinator
+from vllm_hcu.patch.worker.framework_opt import patch_mamba_hybrid_model_state
 
 
 def _coordinator_module() -> ModuleType:
@@ -142,3 +145,58 @@ def test_mamba_sparse_cache_retains_materialized_eagle_replay_boundary():
     assert manager.original_cache_call == (request, 4032, 0)
     assert replay_block.block_hash_num_tokens == 4032
     assert manager.cached_blocks_this_step == {"group-0-replay"}
+
+
+def test_mamba_resume_seed_uses_hybrid_manager_block_size():
+    class MambaHybridModelState:
+        def __init__(self):
+            self._align_mode = True
+            self.cache_config = SimpleNamespace(block_size=64)
+            self._mamba_spec = None
+            self._mamba_state_idx_gpu = torch.full((4,), -99, dtype=torch.int32)
+            self.state_idx_seen = None
+
+        def add_request(self, req_index, new_req_data):
+            self._mamba_state_idx_gpu[req_index].fill_(
+                (new_req_data.num_computed_tokens - 1)
+                // self.cache_config.block_size
+            )
+
+        def _get_mamba_group_info(self, kv_cache_config):
+            del kv_cache_config
+            self._mamba_spec = SimpleNamespace(block_size=832)
+            return [0], self._mamba_spec
+
+        def preprocess_state(
+            self,
+            input_batch,
+            block_tables,
+            kv_cache_config,
+            num_computed_tokens,
+        ):
+            del input_batch, block_tables, kv_cache_config, num_computed_tokens
+            self.state_idx_seen = self._mamba_state_idx_gpu.clone()
+
+    module = ModuleType(patch_mamba_hybrid_model_state.TARGET_MODULE)
+    module.MambaHybridModelState = MambaHybridModelState
+    assert patch_mamba_hybrid_model_state.apply_to_module(module) is True
+    assert patch_mamba_hybrid_model_state.apply_to_module(module) is False
+
+    state = module.MambaHybridModelState()
+    resumed = SimpleNamespace(num_computed_tokens=4992)
+    earlier = SimpleNamespace(num_computed_tokens=1664)
+    state.add_request(1, earlier)
+    state.add_request(2, resumed)
+    assert state._mamba_state_idx_gpu[2].item() == 77
+
+    state.preprocess_state(None, (), object(), torch.tensor([4992]))
+    assert state.state_idx_seen[1].item() == 1
+    assert state.state_idx_seen[2].item() == 5
+
+    state.add_request(3, resumed)
+    assert state._mamba_state_idx_gpu[3].item() == 5
+
+    non_aligned = module.MambaHybridModelState()
+    non_aligned._align_mode = False
+    non_aligned.add_request(0, resumed)
+    assert non_aligned._mamba_state_idx_gpu[0].item() == 77

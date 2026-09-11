@@ -156,21 +156,66 @@ def test_hcu_glm5next_kpool_cache_keeps_compression_without_deepgemm_page() -> N
     assert spec.num_states == 16
 
 
-def test_glm5next_graph_auto_enables_breakable_cudagraph(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Glm5NextForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MTP",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeMTP",
+    ],
+)
+def test_hcu_recurrent_graph_auto_enables_breakable_cudagraph(
+    monkeypatch, architecture: str
+) -> None:
     from vllm.config.compilation import CUDAGraphMode
 
     monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
-            architectures=["Glm5NextForConditionalGeneration"],
+            architectures=[architecture],
             enforce_eager=False,
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
     )
 
-    patch_vllm_config._normalize_glm5next_breakable_cudagraph(config)
+    patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
 
     assert __import__("os").environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
+
+
+def test_hcu_breakable_normalization_wraps_official_enable_hook(monkeypatch) -> None:
+    from vllm.config.compilation import CompilationMode
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            enforce_eager=False,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=None,
+            mode=CompilationMode.VLLM_COMPILE,
+        ),
+    )
+
+    def official_maybe_enable(self) -> bool:
+        enabled = (
+            __import__("os").environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") == "1"
+        )
+        if enabled:
+            self.compilation_config.mode = CompilationMode.NONE
+        return enabled
+
+    wrapped = patch_vllm_config._wrap_maybe_enable_breakable_cudagraph(
+        official_maybe_enable
+    )
+
+    assert wrapped(config) is True
+    assert config.compilation_config.mode == CompilationMode.NONE
 
 
 def test_rocm_sparse_builder_disables_missing_aiter_metadata_api(

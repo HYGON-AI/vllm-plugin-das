@@ -145,6 +145,9 @@ def test_kv_factory_passes_dp_rank_only_to_supporting_connector(monkeypatch):
 
 
 def _fake_scheduler_module():
+    class MambaSpec:
+        pass
+
     class Scheduler:
         observed_eagle_groups = None
 
@@ -191,7 +194,11 @@ def _fake_scheduler_module():
         "_preempt_request",
     ):
         setattr(Scheduler, name, lambda self, *args, **kwargs: None)
-    return _module(patch_scheduler.TARGET_MODULE, Scheduler=Scheduler)
+    return _module(
+        patch_scheduler.TARGET_MODULE,
+        Scheduler=Scheduler,
+        MambaSpec=MambaSpec,
+    )
 
 
 

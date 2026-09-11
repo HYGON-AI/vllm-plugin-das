@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 from types import ModuleType
 
 from ._common import (
@@ -23,8 +24,11 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler.__init__",
     f"{TARGET_MODULE}.Scheduler._update_after_schedule",
     f"{TARGET_MODULE}.Scheduler._mamba_block_aligned_split",
+    f"{TARGET_MODULE}.MambaSpec",
+    "vllm.v1.kv_cache_interface.iter_layer_specs",
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
+_MAMBA_BLOCK_SIZE = "_vllm_hcu_mamba_block_size"
 
 
 def _install_pp_spec_decode_cadence(scheduler: type) -> None:
@@ -50,38 +54,80 @@ def _install_pp_spec_decode_cadence(scheduler: type) -> None:
     scheduler._update_after_schedule = _update_after_schedule
 
 
-def _install_hybrid_mamba_split_block_size(scheduler: type) -> None:
-    """Run the official Mamba split with the hybrid scheduler block size.
+def _install_hybrid_mamba_split_block_size(
+    scheduler: type, mamba_spec_type: type, iter_layer_specs
+) -> None:
+    """Run the official Mamba split with the actual Mamba block size.
 
     HCU attention keeps ``cache_config.block_size`` at the 64-token vendor
-    kernel page, while official hybrid cache grouping may select a larger
-    scheduler block. The upstream split currently reads the former even though
-    ``Scheduler.block_size`` already contains the latter. Scope the correction
-    to the upstream call and restore the kernel page immediately afterwards.
+    kernel page. ``Scheduler.block_size`` is the LCM of all effective group
+    sizes and can exceed the Mamba page under DCP, so retain the concrete
+    ``MambaSpec.block_size`` from the official KV groups. Scope the correction
+    to the upstream split and restore the kernel page immediately afterwards.
     """
 
+    original_init = scheduler.__init__
     original = scheduler._mamba_block_aligned_split
+
+    @functools.wraps(original_init)
+    def __init__(
+        self,
+        vllm_config,
+        kv_cache_config,
+        structured_output_manager,
+        block_size,
+        *args,
+        **kwargs,
+    ):
+        original_init(
+            self,
+            vllm_config,
+            kv_cache_config,
+            structured_output_manager,
+            block_size,
+            *args,
+            **kwargs,
+        )
+        mamba_spec = next(
+            (
+                spec
+                for group in kv_cache_config.kv_cache_groups
+                for spec in iter_layer_specs(
+                    getattr(group, "kv_cache_spec", None)
+                )
+                if isinstance(spec, mamba_spec_type)
+            ),
+            None,
+        )
+        if mamba_spec is not None:
+            setattr(self, _MAMBA_BLOCK_SIZE, mamba_spec.block_size)
 
     @functools.wraps(original)
     def _mamba_block_aligned_split(self, request, num_new_tokens, *args, **kwargs):
         cache_config = self.cache_config
         kernel_block_size = cache_config.block_size
-        scheduler_block_size = self.block_size
-        if kernel_block_size == scheduler_block_size:
+        mamba_block_size = getattr(self, _MAMBA_BLOCK_SIZE, kernel_block_size)
+        if kernel_block_size == mamba_block_size:
             return original(self, request, num_new_tokens, *args, **kwargs)
 
-        cache_config.block_size = scheduler_block_size
+        cache_config.block_size = mamba_block_size
         try:
             return original(self, request, num_new_tokens, *args, **kwargs)
         finally:
             cache_config.block_size = kernel_block_size
 
+    scheduler.__init__ = __init__
     scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 
 
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     scheduler = require_class(target, "Scheduler", TARGETS[0])
+    mamba_spec_type = require_class(target, "MambaSpec", TARGETS[6])
+    kv_cache_interface = importlib.import_module("vllm.v1.kv_cache_interface")
+    iter_layer_specs = require_callable(
+        kv_cache_interface, "iter_layer_specs", TARGETS[7]
+    )
     if getattr(target, _MARKER, False):
         return False
 
@@ -120,8 +166,15 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[5],
         ("self", "request", "num_new_tokens"),
     )
+    require_signature_prefix(
+        iter_layer_specs,
+        TARGETS[7],
+        ("kv_cache_spec",),
+    )
     _install_pp_spec_decode_cadence(scheduler)
-    _install_hybrid_mamba_split_block_size(scheduler)
+    _install_hybrid_mamba_split_block_size(
+        scheduler, mamba_spec_type, iter_layer_specs
+    )
     setattr(target, _MARKER, True)
     return True
 
