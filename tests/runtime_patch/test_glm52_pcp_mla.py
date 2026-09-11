@@ -182,6 +182,7 @@ def test_mixed_cache_ownership_survives_uniform_kernel_reclassification(
         pcp_replicated_token_mask=torch.tensor(
             [True, True, True, True, True, True, False, False]
         ),
+        pcp_replicated_slot_indices=torch.arange(8, dtype=torch.int64),
     )
 
     actual_kv, actual_rope, actual_slots = (
@@ -239,6 +240,49 @@ def test_mixed_cache_ownership_survives_uniform_kernel_reclassification(
     torch.testing.assert_close(actual_indexer_slots, actual_slots)
     assert indexer_group.calls == ["indexer_k"]
     indexer_group.assert_exhausted()
+
+
+def test_replicated_decode_uses_rank0_layout_slot_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shorter local continued-prefill must not shift decode KV slots."""
+
+    pcp = _pcp_module()
+    local_k = torch.tensor([[10.0], [11.0], [90.0], [91.0]])
+    rank_slots = torch.tensor(
+        [[100, 101, 102, 900], [200, 201, -1, -1]], dtype=torch.int64
+    )
+    group = _FakePCPGroup(
+        [
+            (
+                "indexer_k",
+                local_k[:2],
+                torch.tensor([[10.0], [11.0], [20.0], [21.0]]),
+            )
+        ],
+        rank=1,
+    )
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+    metadata = SimpleNamespace(
+        pcp_world_size=2,
+        num_decode_tokens=2,
+        num_prefills=1,
+        pcp_replicated_token_mask=torch.tensor([False, False, True, True]),
+        pcp_replicated_slot_indices=torch.tensor([0, 0, 2, 3]),
+    )
+
+    actual_k, actual_slots = pcp.maybe_gather_indexer_k(
+        local_k, rank_slots.flatten(), metadata
+    )
+
+    torch.testing.assert_close(
+        actual_k,
+        torch.tensor([[90.0], [91.0], [10.0], [11.0], [20.0], [21.0]]),
+    )
+    torch.testing.assert_close(
+        actual_slots, torch.tensor([102, 900, 100, 101, 200, 201])
+    )
+    group.assert_exhausted()
 
 
 def test_indexer_prefill_gathers_k_and_matching_slots_in_rank_order(

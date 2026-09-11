@@ -173,6 +173,12 @@ class HcuPCPManager:
         self._replicated_token_mask = torch.empty(
             self._max_local_tokens, dtype=torch.bool, device=device
         )
+        self._replicated_slot_indices = torch.empty(
+            self._max_local_tokens, dtype=torch.int64, device=device
+        )
+        self._replicated_slot_indices_np = np.empty(
+            self._max_local_tokens, dtype=np.int64
+        )
 
         input_block_tables = getattr(block_tables, "input_block_tables", ())
         self._local_block_tables = tuple(
@@ -577,6 +583,24 @@ class HcuPCPManager:
             :num_padded_tokens
         ]
         replicated_token_mask.fill_(False)
+        replicated_slot_indices_np = self._replicated_slot_indices_np[
+            :num_padded_tokens
+        ]
+        replicated_slot_indices_np.fill(0)
+        rank0_decode_position = np.full(
+            input_batch.num_tokens, -1, dtype=np.int64
+        )
+        for segment in segments_by_rank[0]:
+            if (
+                segment.num_actual_tokens == 0
+                or bool(input_batch.is_prefilling_np[segment.global_req_idx])
+            ):
+                continue
+            rank0_decode_position[segment.global_slice] = np.arange(
+                segment.local_slice.start,
+                segment.local_slice.start + segment.num_actual_tokens,
+                dtype=np.int64,
+            )
         for row, segment in enumerate(segments):
             local_slice = segment.local_slice
             if segment.num_actual_tokens == 0:
@@ -600,6 +624,19 @@ class HcuPCPManager:
                 input_batch.is_prefilling_np[segment.global_req_idx]
             ):
                 replicated_token_mask[actual_slice] = True
+                owner_positions = rank0_decode_position[segment.global_slice]
+                if np.any(owner_positions < 0):
+                    raise RuntimeError(
+                        "PCP rank-0 decode slot ownership is incomplete"
+                    )
+                replicated_slot_indices_np[actual_slice] = owner_positions
+
+        replicated_slot_indices = self._replicated_slot_indices[
+            :num_padded_tokens
+        ]
+        replicated_slot_indices.copy_(
+            torch.from_numpy(replicated_slot_indices_np).to(self.device)
+        )
 
         # A full request row can reuse MRV2's rejection-corrected device
         # seq_len directly. This is the common decode path and keeps the
@@ -866,6 +903,13 @@ class HcuPCPManager:
             input_batch,
             "_vllm_hcu_pcp_replicated_token_mask",
             self._replicated_token_mask[: input_batch.num_tokens_after_padding],
+        )
+        setattr(
+            input_batch,
+            "_vllm_hcu_pcp_replicated_slot_indices",
+            self._replicated_slot_indices[
+                : input_batch.num_tokens_after_padding
+            ],
         )
         return local_tables, slot_mappings
 

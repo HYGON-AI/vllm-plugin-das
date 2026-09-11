@@ -23,6 +23,7 @@ from . import (
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
+    patch_layer_name,
     patch_nixl_utils,
     patch_slimquant_registry,
     patch_vllm_config,
@@ -35,6 +36,7 @@ from . import (
 _ORDERED_ADAPTERS = (
     patch_envs,
     patch_import_utils,
+    patch_layer_name,
     patch_nixl_utils,
     patch_engine_args,
     patch_compilation_config,
@@ -52,6 +54,8 @@ def register_platform_core_callbacks(
 
     registrations: list[ImportRegistration] = []
     for adapter in _ORDERED_ADAPTERS:
+        if adapter is patch_layer_name:
+            patch_layer_name.arm_partial_import_bridge()
         if adapter is patch_engine_args:
             # ``arg_utils`` itself can trigger the first platform discovery
             # before EngineArgs/AsyncEngineArgs are defined.  Arm its exact

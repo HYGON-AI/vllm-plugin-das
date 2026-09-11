@@ -256,18 +256,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
 
         return BoundManager
 
-    def synchronize(model_runner, input_batch):
-        assert events[-2:] == ["super.sample_tokens", "restore_for_sampling"]
-        assert model_runner is runner
-        synchronized_batches.append(input_batch)
-        return False
-
     monkeypatch.setattr(runner_module, "make_hcu_pcp_manager_cls", bind_manager)
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        synchronize,
-    )
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     assert runner.pcp_manager is None
@@ -294,7 +283,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
     assert state.input_batch is local_batch
     assert runner.execute_model_state.hidden_states is global_hidden
     assert runner.execute_model_state.input_batch is global_batch
-    assert synchronized_batches == [global_batch]
+    assert synchronized_batches == []
     assert events == [
         "super.initialize_kv_cache",
         "build_pcp_manager",
@@ -358,11 +347,6 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
             assert hidden_states is local_hidden
             return global_hidden, global_batch
 
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        lambda *args: False,
-    )
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     runner.pcp_manager = Manager()
     original_state = _ExecuteModelState(local_batch, local_hidden)
@@ -432,12 +416,6 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
         build_slots,
         raising=False,
     )
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        lambda *args: False,
-    )
-
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
     runner.pcp_manager = Manager()
     runner.speculator = object()
@@ -531,21 +509,10 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
     def unexpected_builder(*args):
         pytest.fail("PCP=1 selected an HCU PCP manager class")
 
-    def synchronize(model_runner, input_batch):
-        events.append("synchronize_pp_spec_draft_tokens")
-        assert model_runner is runner
-        assert input_batch is global_batch
-        return True
-
     monkeypatch.setattr(
         runner_module,
         "make_hcu_pcp_manager_cls",
         unexpected_builder,
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "synchronize_pp_spec_draft_tokens",
-        synchronize,
     )
 
     runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
@@ -590,7 +557,6 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
         "super.prepare_attn",
         "super.prepare_dummy_attn",
         "super.sample_tokens",
-        "synchronize_pp_spec_draft_tokens",
     ]
 
 

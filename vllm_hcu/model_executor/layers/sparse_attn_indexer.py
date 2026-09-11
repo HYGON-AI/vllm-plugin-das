@@ -721,7 +721,7 @@ if current_platform.is_rocm():
         k_cache_prefix: LayerNameType,
         kv_cache: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
         quant_block_size: int,
         scale_fmt: str | None,
@@ -754,7 +754,7 @@ if current_platform.is_rocm():
         k_cache_prefix: LayerNameType,
         kv_cache: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
         quant_block_size: int,
         scale_fmt: str | None,
@@ -934,11 +934,7 @@ class SparseAttnIndexer(CustomOp):
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
         if self.skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
-            from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
-                rocm_aiter_sparse_attn_indexer_native,
-            )
-
-            return rocm_aiter_sparse_attn_indexer_native(
+            torch.ops.vllm.hcu_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
                 self.k_cache.kv_cache,
@@ -952,8 +948,9 @@ class SparseAttnIndexer(CustomOp):
                 self.max_model_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
-                skip_k_cache_insert=self.skip_k_cache_insert,
+                self.skip_k_cache_insert,
             )
+            return self.topk_indices_buffer
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,

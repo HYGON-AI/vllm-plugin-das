@@ -689,6 +689,52 @@ def test_uneven_prefill_and_mtp_decode_keep_equal_collective_shapes() -> None:
             assert not torch.any(ownership[start:stop])
 
 
+def test_continued_prefill_keeps_rank0_decode_slot_positions() -> None:
+    """Uneven continued-prefill rows must not shift replicated decode slots."""
+
+    block_tables = _InMemoryBlockTables()
+    base_batch = _make_batch(
+        [
+            ("continued-prefill", [100, 101, 102], 11, True),
+            ("decode", [900, 901], 18, False),
+        ]
+    )
+    global_batch = replace(
+        base_batch,
+        num_draft_tokens=1,
+        num_draft_tokens_per_req=np.asarray([0, 1], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor([11, 11], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0, 1], dtype=torch.int32),
+        logits_indices=torch.tensor([3, 4], dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 0, 2], dtype=torch.int32),
+        cu_num_logits_np=np.asarray([0, 0, 2], dtype=np.int32),
+    )
+    managers, _ = _make_managers(block_tables=block_tables)
+    local_batches = [manager.partition_batch(global_batch) for manager in managers]
+    for manager, local in zip(managers, local_batches):
+        manager.prepare_attn(local)
+
+    rank0 = local_batches[0]
+    rank0_decode_row = rank0.req_ids.index("decode")
+    rank0_decode_start = int(rank0.query_start_loc_np[rank0_decode_row])
+    expected = torch.arange(
+        rank0_decode_start,
+        rank0_decode_start + 2,
+        dtype=torch.int64,
+    )
+    assert len({local.num_tokens for local in local_batches}) == 1
+    for local in local_batches:
+        decode_row = local.req_ids.index("decode")
+        decode_start = int(local.query_start_loc_np[decode_row])
+        decode_stop = int(local.query_start_loc_np[decode_row + 1])
+        ownership = local._vllm_hcu_pcp_replicated_token_mask
+        slot_indices = local._vllm_hcu_pcp_replicated_slot_indices
+        assert torch.all(ownership[decode_start:decode_stop])
+        torch.testing.assert_close(
+            slot_indices[decode_start:decode_stop], expected
+        )
+
+
 def test_uneven_prefill_padding_never_owns_a_kv_slot() -> None:
     """The virtual row must not overwrite the global request's first KV slot."""
 

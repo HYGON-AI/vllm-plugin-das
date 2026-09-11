@@ -265,6 +265,23 @@ def _gather_prefill_cache_inputs(
             "PCP replicated-token ownership length mismatch: "
             f"mask={replicated_mask.shape[0]}, local={local_num_tokens}"
         )
+        replicated_slot_indices = getattr(
+            metadata, "pcp_replicated_slot_indices", None
+        )
+        assert isinstance(replicated_slot_indices, torch.Tensor), (
+            "PCP replicated-token ownership requires rank-0 slot indices"
+        )
+        assert replicated_slot_indices.dtype == torch.int64, (
+            "PCP replicated slot indices must use int64 dtype"
+        )
+        assert replicated_slot_indices.ndim == 1, (
+            "PCP replicated slot indices must be one-dimensional"
+        )
+        assert replicated_slot_indices.shape[0] == local_num_tokens, (
+            "PCP replicated slot index length mismatch: "
+            f"indices={replicated_slot_indices.shape[0]}, "
+            f"local={local_num_tokens}"
+        )
         expected_slots = world_size * local_num_tokens
         assert slot_mapping.shape[0] == expected_slots, (
             "PCP ownership-aware cache gather requires exactly one "
@@ -292,7 +309,9 @@ def _gather_prefill_cache_inputs(
         )
         cache_slot_mapping = torch.cat(
             (
-                rank_slots[0, replicated_mask],
+                rank_slots[
+                    0, replicated_slot_indices[replicated_mask]
+                ],
                 rank_slots[:, partitioned_mask].flatten(),
             )
         )

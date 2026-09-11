@@ -6,9 +6,8 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 from types import ModuleType
-
-from vllm.logger import init_logger
 
 from ._common import (
     PatchCompatibilityError,
@@ -27,7 +26,7 @@ TARGETS = (
 _MARKER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_applied"
 _WRAPPER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_wrapper"
 _GROUPS_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_groups_wrapper"
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 _SUPPORTED_MODEL_TYPES = frozenset(
     {
         "qwen3_5_moe",

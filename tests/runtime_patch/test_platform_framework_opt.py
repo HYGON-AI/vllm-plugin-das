@@ -172,6 +172,9 @@ def _fake_scheduler_module():
         def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output):
             return None
 
+        def _update_after_schedule(self, scheduler_output):
+            return None
+
     for name in (
         "_select_waiting_queue_for_scheduling",
         "_is_blocked_waiting_status",
@@ -181,7 +184,6 @@ def _fake_scheduler_module():
         "_build_kv_connector_meta",
         "_inflight_prefill_reserved_blocks",
         "_make_cached_request_data",
-        "_update_after_schedule",
         "_preempt_request",
     ):
         setattr(Scheduler, name, lambda self, *args, **kwargs: None)
@@ -194,6 +196,60 @@ def test_multi_mtp_uses_existing_draft_token_ids_channel():
     assert patch_scheduler.apply_to_module(module) is True
     assert callable(module.Scheduler.update_draft_token_ids)
     assert callable(module.Scheduler.update_draft_token_ids_in_output)
+
+
+def test_pp_spec_decode_is_delayed_by_pipeline_depth():
+    module = _fake_scheduler_module()
+    assert patch_scheduler.apply_to_module(module) is True
+    request = SimpleNamespace(
+        is_prefill_chunk=False,
+        next_decode_eligible_step=0,
+    )
+    scheduler = object.__new__(module.Scheduler)
+    scheduler.use_v2_model_runner = True
+    scheduler.use_pp = True
+    scheduler.vllm_config = SimpleNamespace(speculative_config=object())
+    scheduler.current_step = 11
+    scheduler.parallel_config = SimpleNamespace(pipeline_parallel_size=8)
+    scheduler.requests = {"req": request}
+
+    scheduler._update_after_schedule(
+        SimpleNamespace(num_scheduled_tokens={"req": 1})
+    )
+
+    assert request.next_decode_eligible_step == 19
+
+
+@pytest.mark.parametrize(
+    ("use_pp", "speculative_config", "is_prefill_chunk"),
+    [(False, object(), False), (True, None, False), (True, object(), True)],
+)
+def test_pp_spec_decode_cadence_does_not_change_other_paths(
+    use_pp: bool,
+    speculative_config: object | None,
+    is_prefill_chunk: bool,
+):
+    module = _fake_scheduler_module()
+    assert patch_scheduler.apply_to_module(module) is True
+    request = SimpleNamespace(
+        is_prefill_chunk=is_prefill_chunk,
+        next_decode_eligible_step=7,
+    )
+    scheduler = object.__new__(module.Scheduler)
+    scheduler.use_v2_model_runner = True
+    scheduler.use_pp = use_pp
+    scheduler.vllm_config = SimpleNamespace(
+        speculative_config=speculative_config
+    )
+    scheduler.current_step = 11
+    scheduler.parallel_config = SimpleNamespace(pipeline_parallel_size=8)
+    scheduler.requests = {"req": request}
+
+    scheduler._update_after_schedule(
+        SimpleNamespace(num_scheduled_tokens={"req": 1})
+    )
+
+    assert request.next_decode_eligible_step == 7
 
 
 def test_qwen4_exp_mtp_group_is_not_modified_at_scheduler_boundary():

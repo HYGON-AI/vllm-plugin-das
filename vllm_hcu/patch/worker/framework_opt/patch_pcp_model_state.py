@@ -51,6 +51,7 @@ def _attach_pcp_cache_ownership(
     attn_metadata: dict[str, object],
     has_global_prefill: bool,
     replicated_token_mask: object | None = None,
+    replicated_slot_indices: object | None = None,
 ) -> None:
     """Keep PCP cache ownership separate from backend kernel classification."""
     visited: set[int] = set()
@@ -77,6 +78,12 @@ def _attach_pcp_cache_ownership(
                     metadata,
                     "pcp_replicated_token_mask",
                     replicated_token_mask,
+                )
+            if replicated_slot_indices is not None:
+                setattr(
+                    metadata,
+                    "pcp_replicated_slot_indices",
+                    replicated_slot_indices,
                 )
 
 
@@ -205,6 +212,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 getattr(
                     input_batch,
                     "_vllm_hcu_pcp_replicated_token_mask",
+                    None,
+                ),
+                getattr(
+                    input_batch,
+                    "_vllm_hcu_pcp_replicated_slot_indices",
                     None,
                 ),
             )

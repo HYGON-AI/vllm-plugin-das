@@ -1944,7 +1944,7 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
         k_cache_prefix="layer",
         kv_cache=torch.zeros((1, 2, 1), dtype=torch.float32),
         q_fp8=torch.zeros((4, 1, 1), dtype=torch.float32),
-        k=torch.zeros((4, 1), dtype=torch.float32),
+        k=None,
         weights=torch.ones((4, 1), dtype=torch.float32),
         quant_block_size=1,
         scale_fmt="e4m3",
