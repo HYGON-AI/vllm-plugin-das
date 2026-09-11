@@ -52,14 +52,25 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    # vllm 0.28.1 强制依赖 amd-quark==0.12.post1, 该版本元数据要求 Python>=3.11 (镜像为 3.10);
-    # quark 只服务 AMD 量化路径, HCU 不使用, 这里写入空发行版元数据让 pip 跳过该依赖.
+    # vllm 0.28.1 强制依赖 amd-quark==0.12.post1 (元数据要求 Python>=3.11, 镜像为 3.10)
+    # 和 tilelang==0.1.10 (内网源无此版本); quark 只服务 AMD 量化路径, tilelang 实际走下面的
+    # das-install 装内网最新版, 这里先写入空发行版元数据让 pip 解析 vllm 依赖时跳过这两个包.
     && SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
     && mkdir -p "${SITE_PACKAGES}/amd_quark-0.12.post1.dist-info" \
     && printf 'Metadata-Version: 2.1\nName: amd-quark\nVersion: 0.12.post1\n' \
         > "${SITE_PACKAGES}/amd_quark-0.12.post1.dist-info/METADATA" \
     && printf 'stub: quark is unused on HCU, see docker/Dockerfile\n' \
         > "${SITE_PACKAGES}/amd_quark-0.12.post1.dist-info/INSTALLER" \
+    # tilelang stub 带 RECORD, das-install 安装真实包时 pip 才能正常卸载它
+    && TL_STUB="${SITE_PACKAGES}/tilelang-0.1.10.dist-info" \
+    && mkdir -p "${TL_STUB}" \
+    && printf 'Metadata-Version: 2.1\nName: tilelang\nVersion: 0.1.10\n' > "${TL_STUB}/METADATA" \
+    && printf 'stub: superseded by das-install tilelang, see docker/Dockerfile\n' > "${TL_STUB}/INSTALLER" \
+    && printf '%s\n' \
+        'tilelang-0.1.10.dist-info/METADATA,,' \
+        'tilelang-0.1.10.dist-info/INSTALLER,,' \
+        'tilelang-0.1.10.dist-info/RECORD,,' \
+        > "${TL_STUB}/RECORD" \
     && pip install --no-cache-dir vllm==0.28.1 \
     && pip install --no-cache-dir --pre "vllm-hcu>0.28.0,<=0.28.1" \
     && pip cache purge
@@ -75,7 +86,6 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install aiter ${TORCH_TAG} \
     && pip install --no-cache-dir mooncake_transfer_engine \
     && das-install deep_ep ${TORCH_TAG} \
-    && das-install tilelang ${TORCH_TAG} \
     && das-install boltops ${TORCH_TAG} \
     && das-install causal_conv1d==1.5.4 ${TORCH_TAG} \
     && das-install flash_mla ${TORCH_TAG} \
@@ -83,6 +93,8 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install flash_kda ${TORCH_TAG} \
     && das-install vllm-router ${TORCH_TAG} \
     && das-install nixl ${TORCH_TAG} \
+    # tilelang 放最后: 安装真实包会替换上面 vLLM 层写的 0.1.10 stub, 之后不应再有触发 vllm 依赖解析的安装
+    && das-install tilelang ${TORCH_TAG} \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip cache purge
     
