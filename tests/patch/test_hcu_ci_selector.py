@@ -437,6 +437,30 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+def test_default_environment_lock_accepts_any_torch_2_11_0_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "dtk"
+    version_file = runtime_root / ".info" / "rocm_version"
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text("26.04\n", encoding="utf-8")
+    monkeypatch.setenv("ROCM_PATH", str(runtime_root))
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+
+    _check_environment_lock(
+        REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json",
+        versions={
+            "torch": "2.11.0+custom.build",
+            "vllm": "0.25.1+das.test",
+            "vllm-hcu": "0.25.1+test",
+            "aiter": "0.1.5",
+            "pytest": "9.1.1",
+        },
+        torch_hip="6.3.26093",
+    )
+
+
 def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
     config = _config()
     evalscope_jobs = {
