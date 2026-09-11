@@ -120,7 +120,17 @@ def inspect_vllm_compatibility() -> VllmCompatibility:
             reason=f"invalid vLLM distribution version: {exc}",
         )
 
-    compatible = parsed == expected
+    # Accept the frozen development artifact and vendor builds of the final
+    # release it became.  Local build metadata (DTK, Torch, timestamp, SHA)
+    # does not change the public vLLM release, but other prerelease or release
+    # versions must still fail closed.
+    compatible = parsed == expected or (
+        parsed.epoch == expected.epoch
+        and parsed.release == expected.release
+        and parsed.pre is None
+        and parsed.post is None
+        and parsed.dev is None
+    )
     if compatible:
         reason = "installed vLLM build matches the frozen OpenDAS artifact"
     else:
