@@ -4,18 +4,18 @@
 name: test-docker-image-daily
 
 # 由 docker-image (release-docker-image.yml) 构建并推送成功后作为 reusable workflow 被调用,
-# 传入本次构建的镜像名; 也可手动触发, 留空 docker_image 时回落 0.25.1-latest
+# 传入本次构建的镜像名; 也可手动触发, 留空 docker_image 时回落 0.28.1rc1.dev490-latest
 on:
   workflow_call:
     inputs:
       docker_image:
-        description: 待测试镜像完整路径, 例如 <site>/<ns>/vllm:0.25.1-ubuntu22.04-dtk2604-py3.10-<时间戳>
+        description: 待测试镜像完整路径, 例如 <site>/<ns>/vllm:0.28.1rc1.dev490-ubuntu22.04-dtk2604-py3.10-<时间戳>
         required: true
         type: string
   workflow_dispatch:
     inputs:
       docker_image:
-        description: 待测试镜像完整路径; 留空使用 vllm:0.25.1-latest
+        description: 待测试镜像完整路径; 留空使用 vllm:0.28.1rc1.dev490-latest
         required: false
         default: ""
         type: string
@@ -29,13 +29,13 @@ concurrency:
 
 env:
   PYPI_URL: ${{ vars.PYPI_URL }}
-  TEST_IMAGE: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
+  TEST_IMAGE: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.28.1rc1.dev490-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
 
 jobs:
   citest:
-    runs-on: nmz6
+    runs-on: bw1100
     container:
-      image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.25.1-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
+      image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.28.1rc1.dev490-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
       options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
