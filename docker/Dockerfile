@@ -59,6 +59,7 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
 ARG TORCH_VERSION
 RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && pip install --no-cache-dir torch==${TORCH_VERSION} torchvision \
+    && das-install triton==3.6.0 ${TORCH_TAG} \
     && das-install flash_attn ${TORCH_TAG} \
     && das-install lightop ${TORCH_TAG} \
     && das-install lmslim ${TORCH_TAG} \
