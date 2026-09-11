@@ -972,11 +972,10 @@ class SparseAttnIndexer(CustomOp):
             attn_metadata = get_forward_context().attn_metadata
             if isinstance(attn_metadata, dict):
                 layer_metadata = attn_metadata[self.k_cache.prefix]
-                slot_mapping = layer_metadata.slot_mapping[
-                    : layer_metadata.num_kv_actual_tokens
-                ]
-                cache_k = k[: slot_mapping.shape[0]]
                 pcp_world_size = effective_pcp_world_size(self.pcp_world_size)
+                num_kv_actual_tokens = layer_metadata.num_kv_actual_tokens
+                cache_k = k[:num_kv_actual_tokens]
+                slot_mapping = layer_metadata.slot_mapping
                 if pcp_world_size > 1:
                     metadata_world_size = int(
                         getattr(layer_metadata, "pcp_world_size", 1)
@@ -992,6 +991,8 @@ class SparseAttnIndexer(CustomOp):
                         slot_mapping,
                         layer_metadata,
                     )
+                else:
+                    slot_mapping = slot_mapping[:num_kv_actual_tokens]
                 # Boolean compaction (``cache_k[slot_mapping >= 0]``) creates a
                 # dynamic-shaped tensor and is forbidden during HIP graph
                 # capture. Keep the captured launch fixed-shape and let the HCU

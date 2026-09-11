@@ -522,3 +522,77 @@ a PCP configuration or Hy4 model-registration failure.
 
 The fail-closed configuration and sparse-backend capability changes are in
 commits `5682574` and `d1a47b6`, respectively.
+
+## PP2 + PCP4 + EP4 DeepEP/DeepGEMM validation (2026-09-11)
+
+The exact eight-HCU topology `PP=2, TP=1, PCP=4, EP=4` was validated in eager
+mode with DeepEP high-throughput, DeepGEMM, and FP8 E4M3 KV cache. Hy4 shares
+indexer state across layer groups, so the pipeline must be split at the full
+indexer boundary `41,37`; the default `39,39` split is intentionally rejected.
+
+```bash
+export PLUGIN_ROOT=/path/to/vllm-plugin-das
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KV_CACHE_LAYOUT=NHD
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=300
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=300
+export VLLM_PP_LAYER_PARTITION=41,37
+export PYTHONPATH="${PLUGIN_ROOT}"
+unset VLLM_USE_DEEP_GEMM
+unset VLLM_PLUGINS
+
+vllm serve /models/Hy4-preview-Channel-FP8-w8a8-v2 \
+  --served-model-name hy4-pp2-pcp4 \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 2 \
+  --prefill-context-parallel-size 4 \
+  --enable-expert-parallel \
+  --all2all-backend deepep_high_throughput \
+  --moe-backend deep_gemm \
+  --kv-cache-dtype fp8_e4m3 \
+  --enforce-eager \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 4096 \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}' \
+  --reasoning-parser hy_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hy_v4 \
+  --port 8000
+```
+
+All eight workers initialized as PP0/PP1 times PCP0-3/EP0-3. Runtime logs
+confirmed `DeepEPHTAll2AllManager`, `DeepEPHTPrepareAndFinalize`, and
+`DeepEPDeepGemmContiguousExperts with DeepGEMM HT path`. A short request and a
+3,049-token long-prefill request both returned HTTP 200 with assistant content
+`OK`.
+
+HumanEval used the first 32 ModelScope samples, request batch size 16,
+temperature zero, seed 42, and a 1,024-token output limit:
+
+```bash
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u http_proxy -u https_proxy \
+    NO_PROXY=127.0.0.1,localhost \
+    no_proxy=127.0.0.1,localhost \
+python -m evalscope.cli.cli eval \
+  --model hy4-pp2-pcp4 \
+  --model-id Hy4-preview-Channel-FP8-w8a8-v2-deepgemm-pp2-pcp4-ep4-fp8kv-no_think \
+  --api-url http://127.0.0.1:8000/v1 \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets humaneval \
+  --dataset-hub modelscope \
+  --limit 32 \
+  --eval-batch-size 16 \
+  --generation-config '{"batch_size":16,"max_tokens":1024,"temperature":0.0,"top_p":1.0,"seed":42,"timeout":1800.0,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \
+  --seed 42 \
+  --work-dir /models/evalscope_hy4_pp2_pcp4_deepgemm_humaneval32_20260911 \
+  --no-timestamp
+```
+
+The run completed all 32 requests in 266.43 seconds with no API or runtime
+errors. EvalScope reported `Accuracy=1.0` and `Pass@1=1.0` (32/32 correct),
+with mean per-request latency 98.273 seconds and mean output length 135 tokens.

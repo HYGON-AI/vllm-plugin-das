@@ -173,17 +173,26 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         execute_model_state = self.execute_model_state
         use_replicated_mtp_batch = False
         if self.pcp_manager is not None and execute_model_state is not None:
-            (
-                restored_hidden_states,
-                restored_input_batch,
-            ) = self.pcp_manager.restore_for_sampling(
-                execute_model_state.hidden_states
-            )
+            if execute_model_state.hidden_states is None:
+                restored_hidden_states = None
+                restored_input_batch = (
+                    self.pcp_manager.restore_batch_for_sampling()
+                )
+            else:
+                (
+                    restored_hidden_states,
+                    restored_input_batch,
+                ) = self.pcp_manager.restore_for_sampling(
+                    execute_model_state.hidden_states
+                )
             execute_model_state = execute_model_state._replace(
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,
             )
-            use_replicated_mtp_batch = getattr(self, "speculator", None) is not None
+            use_replicated_mtp_batch = (
+                restored_hidden_states is not None
+                and getattr(self, "speculator", None) is not None
+            )
             self.execute_model_state = execute_model_state
         input_batch = (
             None

@@ -830,6 +830,12 @@ class HcuPCPManager:
         gathered = self._pcp_group.all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
+    def restore_batch_for_sampling(self) -> InputBatch:
+        """Return the global batch required by PP sampling collectives."""
+
+        assert self._global_batch is not None
+        return self._global_batch
+
     def build_plan(self) -> PCPPlan | None:
         """Build the GQA attention plan for a sharded PCP+DCP prefill."""
 
@@ -942,8 +948,10 @@ class HcuPCPManager:
     ) -> tuple[torch.Tensor, InputBatch]:
         """Restore final hidden states and the exact saved global InputBatch."""
 
-        assert self._global_batch is not None
-        return self.restore_hidden_states(hidden_states), self._global_batch
+        return (
+            self.restore_hidden_states(hidden_states),
+            self.restore_batch_for_sampling(),
+        )
 
 
 def maybe_build_pcp_manager(

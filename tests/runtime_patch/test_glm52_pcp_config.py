@@ -127,6 +127,22 @@ def test_hy4_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+def test_hy4_mrv2_pp2_pcp4_eager_is_allowed(make_pcp_config) -> None:
+    """The validated eight-rank Hy4 pipeline topology must start."""
+
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        use_mla=True,
+        pp=2,
+        tp=1,
+        pcp=4,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 def test_hy4_pcp_allows_mooncake_producer_pd(make_pcp_config) -> None:
     """Mooncake kv_producer is the only PCP P/D path with replica dedup."""
 
@@ -355,7 +371,6 @@ def test_glm52_pcp_scope_rejects_unsupported_combinations(
     [
         ({"enable_expert_parallel": False}, "expert parallel"),
         ({"enforce_eager": False}, "eager"),
-        ({"pp": 2}, "pipeline parallel"),
         ({"dcp": 2}, "decode context parallel"),
         ({"dp": 2}, "data parallel"),
         (
@@ -379,6 +394,43 @@ def test_hy4_pcp_rejects_unsupported_combinations(
                 architecture="HYV4ForCausalLM",
                 pcp=2,
                 **override,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"pp": 3, "tp": 1, "pcp": 4},
+        {"pp": 2, "tp": 2, "pcp": 4},
+        {"pp": 2, "tp": 1, "pcp": 2},
+    ],
+)
+def test_hy4_pp_pcp_rejects_unvalidated_topologies(
+    make_pcp_config, override
+) -> None:
+    """PP+PCP must remain fail-closed outside PP2/TP1/PCP4."""
+
+    with pytest.raises(ValueError, match="PP=2, TP=1, and PCP=4"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="HYV4ForCausalLM",
+                **override,
+            )
+        )
+
+
+def test_hy4_pp_pcp_rejects_speculative_decoding(make_pcp_config) -> None:
+    """MTP has no validated combined PP+PCP execution contract."""
+
+    with pytest.raises(ValueError, match="does not support speculative"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="HYV4ForCausalLM",
+                pp=2,
+                tp=1,
+                pcp=4,
+                speculative=True,
             )
         )
 
