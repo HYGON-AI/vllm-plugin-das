@@ -53,7 +53,7 @@ def test_frozen_opendas_vllm_wheel_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    value = "0.28.1rc1.dev490+g7d5e12c72.das.7d5e12c.dtk2604"
+    value = "0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604"
     _install_version(monkeypatch, tmp_path, value)
 
     result = compatibility.ensure_vllm_compatible()
@@ -72,9 +72,9 @@ def test_frozen_opendas_vllm_wheel_is_accepted(
         "0.25.1+das.local",
         "0.28.0",
         "0.28.9",
-        "0.28.1rc1.dev490+g58ad1f3b",
-        "0.28.1rc1.dev490+g7d5e12c72.das.other.dtk2604",
-        "1!0.28.1rc1.dev490+g7d5e12c72.das.7d5e12c.dtk2604",
+        "0.28.1rc1.dev491+g58ad1f3b",
+        "0.28.1rc1.dev491+g462fdb097.das.other.dtk2604",
+        "1!0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604",
         "not a version",
     ),
 )
@@ -90,12 +90,12 @@ def test_unsupported_or_invalid_vllm_metadata_has_actionable_error(
 
     message = str(raised.value)
     assert (
-        "expected=0.28.1rc1.dev490+g7d5e12c72.das.7d5e12c.dtk2604"
+        "expected=0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604"
         in message
     )
     assert f"actual={value!r}" in message
     assert "upstream_sha=58ad1f3b8973b23943107b51230d594050b42ec3" in message
-    assert "opendas_sha=7d5e12c72491b4067ed03db1a789060efd84e1ee" in message
+    assert "opendas_sha=462fdb097c66b487ef4826e8009431c10fe88fb8" in message
     assert "vllm_hcu=" in message
     assert "vllm_location=" in message
     assert "vllm_hcu_location=" in message
@@ -122,11 +122,11 @@ def test_runtime_hcu_version_prefers_metadata_with_source_fallback(
     monkeypatch.setattr(
         hcu_version.importlib_metadata,
         "version",
-        lambda name: "0.28.1rc1.dev490+das.abcdef0.dtk2604",
+        lambda name: "0.28.1rc1.dev491+das.abcdef0.dtk2604",
     )
     assert (
         hcu_version.get_hcu_version()
-        == "0.28.1rc1.dev490+das.abcdef0.dtk2604"
+        == "0.28.1rc1.dev491+das.abcdef0.dtk2604"
     )
 
     def missing(name: str):
