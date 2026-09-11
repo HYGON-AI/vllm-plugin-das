@@ -445,7 +445,7 @@ def test_rocm_wo_a_cache_keeps_upstream_layout() -> None:
 def test_mhc_backend_switch_masks_aiter_only_when_hcu_option_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module(patch_mhc_backend.TARGET_MODULE, HAS_AITER_MHC=True)
+    module = _module(patch_mhc_backend.TARGET_MODULE, HAS_AITER_MHC=True, HAS_TILELANG_MHC=False)
     monkeypatch.setattr(
         "vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC",
         False,
@@ -528,3 +528,17 @@ def test_mhc_patch_rejects_missing_capability_flag() -> None:
 
     with pytest.raises(PatchCompatibilityError, match="HAS_AITER_MHC"):
         patch_mhc_backend.apply_to_module(module)
+
+
+@pytest.mark.parametrize("rocm,available,expected", [(True, False, False), (True, True, True), (False, False, True)])
+def test_mhc_tilelang_requires_hip_codegen(monkeypatch, rocm, available, expected):
+    module = _module(patch_mhc_backend.TARGET_MODULE,
+                     HAS_AITER_MHC=False, HAS_TILELANG_MHC=True)
+    module.current_platform = SimpleNamespace(is_rocm=lambda: rocm)
+    tvm = _module("tvm", ffi=SimpleNamespace(
+        get_global_func=lambda name, allow_missing: object() if available else None))
+    monkeypatch.setitem(sys.modules, "tilelang", _module("tilelang", tvm=tvm))
+    assert patch_mhc_backend.apply_to_module(module) is True
+    assert module.HAS_TILELANG_MHC is expected
+    assert module._vllm_hcu_original_has_tilelang_mhc is True
+    assert patch_mhc_backend.apply_to_module(module) is False
