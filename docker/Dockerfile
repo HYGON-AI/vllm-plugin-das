@@ -52,6 +52,7 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    && pip install --no-cache-dir amd-quark==0.12.post1 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir vllm==0.28.1 \
     && pip install --no-cache-dir --pre "vllm-hcu>0.28.0,<=0.28.1" \
     && pip cache purge
