@@ -25,14 +25,21 @@ TARGETS = (
     f"{TARGET_MODULE}.VllmConfig._validate_v2_model_runner",
     "vllm.config.model.ModelConfig.get_model_arch_config",
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
+    f"{TARGET_MODULE}.VllmConfig._maybe_enable_breakable_cudagraph",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
-_GLM5NEXT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+_HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "Glm5NextForCausalLM",
         "Glm5NextForConditionalGeneration",
         "Glm5NextMTPModel",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MTP",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeMTP",
     }
 )
 _REQUEST_CAPTURE_SIZES = (
@@ -53,23 +60,29 @@ def _normalize_hcu_model_runner(model_config: object) -> None:
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
 
-def _normalize_glm5next_breakable_cudagraph(vllm_config: object) -> None:
-    """Restore upstream's architecture opt-in for GLM5Next on HCU."""
+def _normalize_hcu_breakable_cudagraph(vllm_config: object) -> None:
+    """Restore upstream's graph-safe recurrent-model opt-ins on HCU."""
 
     if "VLLM_USE_BREAKABLE_CUDAGRAPH" in os.environ:
         return
     model_config = getattr(vllm_config, "model_config", None)
     architectures = set(getattr(model_config, "architectures", ()) or ())
-    if not architectures & _GLM5NEXT_BREAKABLE_CUDAGRAPH_ARCHITECTURES:
+    if not architectures & _HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES:
         return
     if bool(getattr(model_config, "enforce_eager", False)):
         return
-    compilation_config = getattr(vllm_config, "compilation_config", None)
-    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-    none_mode = getattr(type(cudagraph_mode), "NONE", None)
-    if cudagraph_mode is None or cudagraph_mode == none_mode:
-        return
     os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
+
+def _wrap_maybe_enable_breakable_cudagraph(maybe_enable: Any) -> Any:
+    """Opt HCU recurrent models into upstream breakable CUDA graphs."""
+
+    @functools.wraps(maybe_enable)
+    def hcu_maybe_enable(self) -> Any:
+        _normalize_hcu_breakable_cudagraph(self)
+        return maybe_enable(self)
+
+    return hcu_maybe_enable
 
 
 def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any:
@@ -249,7 +262,6 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
     _normalize_hcu_model_runner(vllm_config.model_config)
-    _normalize_glm5next_breakable_cudagraph(vllm_config)
 
     _validate_hcu_pcp_scope(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
@@ -444,6 +456,9 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(vllm_config, _MARKER, False):
         return False
 
+    maybe_enable_breakable = vars(vllm_config).get(
+        "_maybe_enable_breakable_cudagraph"
+    )
     with_hf_config = vars(vllm_config).get("with_hf_config")
     set_cudagraph_sizes = vars(vllm_config).get("_set_cudagraph_sizes")
     get_v2_unsupported_features = vars(vllm_config).get(
@@ -452,7 +467,8 @@ def apply_to_module(module: ModuleType) -> bool:
     validate_v2_model_runner = vars(vllm_config).get("_validate_v2_model_runner")
     get_model_arch_config = vars(model_config_class).get("get_model_arch_config")
     if (
-        not callable(with_hf_config)
+        not callable(maybe_enable_breakable)
+        or not callable(with_hf_config)
         or not callable(set_cudagraph_sizes)
         or not callable(get_v2_unsupported_features)
         or not callable(validate_v2_model_runner)
@@ -460,6 +476,12 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         raise PatchCompatibilityError(
             "required HCU VllmConfig compatibility methods are missing"
+        )
+    maybe_enable_signature = inspect.signature(maybe_enable_breakable)
+    if tuple(maybe_enable_signature.parameters) != ("self",):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[6]} has incompatible "
+            f"signature {maybe_enable_signature}"
         )
     model_arch_signature = inspect.signature(get_model_arch_config)
     if tuple(model_arch_signature.parameters) != ("self",):
@@ -602,6 +624,16 @@ def apply_to_module(module: ModuleType) -> bool:
                 return validate_v2_model_runner(self)
         return validate_v2_model_runner(self)
 
+    setattr(
+        vllm_config,
+        "_vllm_hcu_original_maybe_enable_breakable_cudagraph",
+        maybe_enable_breakable,
+    )
+    setattr(
+        vllm_config,
+        "_maybe_enable_breakable_cudagraph",
+        _wrap_maybe_enable_breakable_cudagraph(maybe_enable_breakable),
+    )
     setattr(vllm_config, "_vllm_hcu_original_with_hf_config", with_hf_config)
     setattr(vllm_config, "with_hf_config", hcu_with_hf_config)
     setattr(

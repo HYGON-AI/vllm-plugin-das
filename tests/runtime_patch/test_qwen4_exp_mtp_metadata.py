@@ -63,7 +63,13 @@ def test_qsa_draft_metadata_refresh_reuses_official_builder_in_place():
 
 @pytest.mark.parametrize(
     "model_type",
-    ["qwen4_exp", "qwen3_5_moe", "qwen3_5_moe_text"],
+    [
+        "qwen4_exp",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    ],
 )
 def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
     module = ModuleType(kv_groups_patch.TARGET_MODULE)
@@ -169,9 +175,15 @@ def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
     assert [group.is_eagle_group for group in groups] == [False, True]
 
 
-def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
+def test_scheduler_uses_hybrid_block_size_only_inside_upstream_mamba_split():
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
     module = ModuleType(scheduler_patch.TARGET_MODULE)
     observed_block_sizes = []
+
+    class MambaSpec:
+        def __init__(self, block_size):
+            self.block_size = block_size
 
     class Scheduler:
         def update_draft_token_ids(self, draft_token_ids):
@@ -198,11 +210,15 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
             observed_block_sizes.append(self.cache_config.block_size)
             return num_new_tokens - 1
 
+        def _update_after_schedule(self, scheduler_output):
+            del self, scheduler_output
+
     module.Scheduler = Scheduler
+    module.MambaSpec = MambaSpec
     original_init = Scheduler.__init__
     assert scheduler_patch.apply_to_module(module) is True
     assert scheduler_patch.apply_to_module(module) is False
-    assert Scheduler.__init__ is original_init
+    assert Scheduler.__init__ is not original_init
 
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True),
@@ -212,22 +228,33 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
     )
     groups = [
         SimpleNamespace(
-            layer_names=["model.layers.0.linear_attn"], is_eagle_group=False
+            layer_names=["model.layers.0.linear_attn"],
+            kv_cache_spec=SimpleNamespace(block_size=64),
+            is_eagle_group=False,
         ),
         SimpleNamespace(
-            layer_names=["mtp.layers.0.self_attn"], is_eagle_group=False
+            layer_names=["mtp.layers.0.self_attn"],
+            kv_cache_spec=UniformTypeKVCacheSpecs(
+                block_size=832,
+                kv_cache_specs={
+                    "mtp.layers.0.self_attn": MambaSpec(block_size=832),
+                    "mtp.layers.1.self_attn": MambaSpec(block_size=832),
+                },
+            ),
+            is_eagle_group=False,
         ),
     ]
     scheduler = module.Scheduler(
         config,
         SimpleNamespace(kv_cache_groups=groups),
         None,
-        576,
+        1664,
     )
 
     assert [group.is_eagle_group for group in groups] == [False, False]
     assert scheduler._mamba_block_aligned_split(object(), 128) == 127
-    assert observed_block_sizes == [64]
+    assert scheduler.block_size == 1664
+    assert observed_block_sizes == [832]
     assert scheduler.cache_config.block_size == 64
 
     no_mtp_config = SimpleNamespace(
@@ -240,9 +267,9 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
         no_mtp_config,
         SimpleNamespace(kv_cache_groups=groups),
         None,
-        576,
+        1664,
     )
 
     assert no_mtp_scheduler._mamba_block_aligned_split(object(), 128) == 127
-    assert observed_block_sizes == [64, 64]
+    assert observed_block_sizes == [832, 832]
     assert no_mtp_scheduler.cache_config.block_size == 64

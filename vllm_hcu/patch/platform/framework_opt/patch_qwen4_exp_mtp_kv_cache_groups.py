@@ -29,6 +29,8 @@ _GROUPS_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_groups_wrapper"
 logger = logging.getLogger(__name__)
 _SUPPORTED_MODEL_TYPES = frozenset(
     {
+        "qwen3_5",
+        "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
         "qwen4_exp",
