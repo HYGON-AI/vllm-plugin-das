@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Dependency-light vLLM distribution compatibility checks.
 
-The runtime integration is audited against the vLLM release series encoded by
-``vllm_hcu.version.__version_tuple__``.  Check the installed distribution
-metadata before any process-local patch registration so a mismatched wheel
+The runtime integration is audited against the vLLM release line encoded by
+``vllm_hcu.version.__vllm_target_version__``. Check the installed distribution
+metadata before any process-local patch registration so a mismatched release
 cannot leave a partially armed registry behind.
 """
 
@@ -120,21 +120,20 @@ def inspect_vllm_compatibility() -> VllmCompatibility:
             reason=f"invalid vLLM distribution version: {exc}",
         )
 
-    # Accept the frozen development artifact and vendor builds of the final
-    # release it became.  Local build metadata (DTK, Torch, timestamp, SHA)
-    # does not change the public vLLM release, but other prerelease or release
-    # versions must still fail closed.
-    compatible = parsed == expected or (
-        parsed.epoch == expected.epoch
-        and parsed.release == expected.release
-        and parsed.pre is None
-        and parsed.post is None
-        and parsed.dev is None
+    # A rolling vendor branch is compatible at the major.minor.patch release
+    # line. Pre/dev/post and local build metadata retain provenance without
+    # pinning the plugin to one OpenDAS wheel build.
+    release_line = ".".join(str(component) for component in expected.release)
+    compatible = (
+        parsed.epoch == expected.epoch and parsed.release == expected.release
     )
     if compatible:
-        reason = "installed vLLM build matches the frozen OpenDAS artifact"
+        reason = f"installed vLLM build matches supported release line {release_line}"
     else:
-        reason = "installed vLLM build does not match the frozen OpenDAS artifact"
+        reason = (
+            "installed vLLM build does not match supported release line "
+            f"{release_line}"
+        )
     return VllmCompatibility(
         expected_version=__vllm_target_version__,
         upstream_sha=__vllm_upstream_sha__,
