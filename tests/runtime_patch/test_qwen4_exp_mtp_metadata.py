@@ -169,7 +169,7 @@ def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
     assert [group.is_eagle_group for group in groups] == [False, True]
 
 
-def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
+def test_scheduler_uses_hybrid_block_size_only_inside_upstream_mamba_split():
     module = ModuleType(scheduler_patch.TARGET_MODULE)
     observed_block_sizes = []
 
@@ -197,6 +197,9 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
             del request
             observed_block_sizes.append(self.cache_config.block_size)
             return num_new_tokens - 1
+
+        def _update_after_schedule(self, scheduler_output):
+            del self, scheduler_output
 
     module.Scheduler = Scheduler
     original_init = Scheduler.__init__
@@ -227,7 +230,7 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
 
     assert [group.is_eagle_group for group in groups] == [False, False]
     assert scheduler._mamba_block_aligned_split(object(), 128) == 127
-    assert observed_block_sizes == [64]
+    assert observed_block_sizes == [576]
     assert scheduler.cache_config.block_size == 64
 
     no_mtp_config = SimpleNamespace(
@@ -244,5 +247,5 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
     )
 
     assert no_mtp_scheduler._mamba_block_aligned_split(object(), 128) == 127
-    assert observed_block_sizes == [64, 64]
+    assert observed_block_sizes == [576, 576]
     assert no_mtp_scheduler.cache_config.block_size == 64

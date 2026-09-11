@@ -162,6 +162,8 @@ def _fake_scheduler_module():
             type(self).observed_eagle_groups = [
                 group.is_eagle_group for group in kv_cache_config.kv_cache_groups
             ]
+            self.block_size = block_size
+            self.cache_config = SimpleNamespace(block_size=64)
 
         def schedule(self, throttle_prefills=False):
             return "official"
@@ -175,12 +177,14 @@ def _fake_scheduler_module():
         def _update_after_schedule(self, scheduler_output):
             return None
 
+        def _mamba_block_aligned_split(self, request, num_new_tokens, *args, **kwargs):
+            return None
+
     for name in (
         "_select_waiting_queue_for_scheduling",
         "_is_blocked_waiting_status",
         "_try_promote_blocked_waiting_request",
         "_try_schedule_encoder_inputs",
-        "_mamba_block_aligned_split",
         "_build_kv_connector_meta",
         "_inflight_prefill_reserved_blocks",
         "_make_cached_request_data",
