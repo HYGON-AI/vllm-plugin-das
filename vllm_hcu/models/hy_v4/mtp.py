@@ -27,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import MixtureOfExperts
+from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -501,7 +501,7 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
         return self.logits_processor(lm_head, projection_input)
 
 
-class HYV4MTP(nn.Module, MixtureOfExperts):
+class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
     """HY V4 native MTP draft model."""
 
     packed_modules_mapping = {
@@ -735,6 +735,12 @@ class HYV4MTP(nn.Module, MixtureOfExperts):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
+        if getattr(self.quant_config, "checkpoint_format", None) == "hy4_w4a8_v1":
+            from vllm_hcu.model_executor.layers.quantization.hyv4_native import (
+                adapt_native_weights,
+            )
+
+            weights = adapt_native_weights(weights)
         params_dict = dict(self.named_parameters())
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         loaded_params: set[str] = set()

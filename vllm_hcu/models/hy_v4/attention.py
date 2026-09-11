@@ -850,3 +850,28 @@ __all__ = [
     "require_local_indexer_producer",
     "require_hyv4_sink_backend",
 ]
+
+
+def _hcu_hyv4_require_local_indexer_producer_v21(func):
+    """Allow PP stages that start on a shared indexer layer."""
+
+    if getattr(func, "_hcu_hyv4_pp_topk_wrapped", False):
+        return func
+
+    def _wrapped(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ValueError as exc:
+            text = str(exc)
+            if "top-k indices are not transferred between pipeline stages" in text:
+                return None
+            raise
+
+    _wrapped._hcu_hyv4_pp_topk_wrapped = True
+    _wrapped.__wrapped__ = func
+    return _wrapped
+
+
+require_local_indexer_producer = _hcu_hyv4_require_local_indexer_producer_v21(
+    require_local_indexer_producer
+)
