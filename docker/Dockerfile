@@ -39,10 +39,11 @@ ARG AICC_URL
 ARG AICC_VERSION
 ENV AICC_VERSION=${AICC_VERSION}
 
-RUN wget -q "${AICC_URL}" -O /tmp/aicc.run && \
-    chmod +x /tmp/aicc.run && \
-    yes | /tmp/aicc.run --dtk_dir /opt/dtk && \
-    rm -f /tmp/aicc.run
+# 安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录
+RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
+    chmod +x /tmp/hcu_llvm_installer.sh && \
+    bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
+    rm -f /tmp/hcu_llvm_installer.sh
 
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
@@ -51,10 +52,8 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
     && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    && pip install --no-cache-dir vllm==${VLLM_VERSION} \
-    && pip install --no-cache-dir vllm-hcu==${VLLM_VERSION} \
-    && pip install --no-cache-dir -r /tmp/requirements-test.txt \
-    && pip install --no-cache-dir evalscope==1.9.1 pytest==9.1.1 \
+    && pip install --no-cache-dir vllm==0.28.1 \
+    && pip install --no-cache-dir vllm-hcu=="vllm-hcu>0.28.0,<=0.28.1" \
     && pip cache purge
 
 # ---layer--- torch + das 加速库
