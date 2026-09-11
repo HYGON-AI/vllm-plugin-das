@@ -459,6 +459,85 @@ def test_hy_v4_lightop_qk_fusion_writes_cache_before_topk(
     assert events[1][-1]["indexer_cache_layout"] == "NORMAL"
 
 
+def test_hy_v4_lightop_pcp_preserves_expanded_slots_for_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PCP must not truncate rank-ordered slots to the local K width."""
+
+    events: list[tuple[object, ...]] = []
+    fp8_dtype = torch.float8_e4m3fn
+    expanded_slots = torch.arange(8, dtype=torch.int64)
+    metadata = SimpleNamespace(
+        slot_mapping=expanded_slots,
+        num_kv_actual_tokens=2,
+        pcp_world_size=4,
+        num_decode_tokens=0,
+    )
+    local_k = torch.ones((2, 128), dtype=torch.bfloat16)
+    gathered_k = torch.ones((8, 128), dtype=torch.bfloat16)
+    fused_q = torch.ones((2, 3, 128), dtype=fp8_dtype)
+    fused_weights = torch.ones((2, 3), dtype=torch.float32)
+
+    def gather(k, slots, actual_metadata):
+        events.append(("gather", k, slots, actual_metadata))
+        torch.testing.assert_close(k, local_k)
+        assert slots is expanded_slots
+        assert actual_metadata is metadata
+        return gathered_k, expanded_slots
+
+    def quant_and_store(q, k, _cache, slots, _weights, **_kwargs):
+        events.append(("fuse", q, k, slots))
+        return fused_q, fused_weights
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse."
+        "rocm_aiter_sparse_attn_indexer_native",
+        lambda *args, **_kwargs: args[3],
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
+        get_forward_context=lambda: SimpleNamespace(
+            attn_metadata={"indexer": metadata}
+        ),
+        effective_pcp_world_size=lambda value: value,
+        maybe_gather_indexer_k=gather,
+        lightop_indexer_qk_quant_and_store=quant_and_store,
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_lightop_hy_v4_indexer=True,
+        skip_k_cache_insert=False,
+        pcp_world_size=4,
+        dcp_world_size=1,
+        k_cache=SimpleNamespace(
+            prefix="indexer",
+            kv_cache=torch.zeros((1, 8, 132), dtype=torch.uint8),
+        ),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=64,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 64), dtype=torch.int32),
+    )
+
+    assert forward_hip(
+        indexer,
+        torch.empty((2, 1)),
+        torch.ones((2, 3, 128), dtype=torch.bfloat16),
+        local_k,
+        torch.ones((2, 3), dtype=torch.bfloat16),
+    ) is fused_q
+    assert [event[0] for event in events] == ["gather", "fuse"]
+    torch.testing.assert_close(events[1][2], gathered_k)
+    torch.testing.assert_close(events[1][3], expanded_slots)
+
+
 def test_hy_v4_lightop_filters_negative_slots_on_idle_dp_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

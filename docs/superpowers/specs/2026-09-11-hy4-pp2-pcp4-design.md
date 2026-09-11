@@ -49,6 +49,12 @@ accepted only when all of these values match:
 - eager execution: enabled
 - speculative configuration: absent
 
+Hy4 shares indexer results across groups of layers. The default 39/39 split
+starts PP stage 1 on shared indexer layer 39, so the launch must set
+`VLLM_PP_LAYER_PARTITION=41,37`. Layer 41 is the closest balanced `full`
+indexer boundary and does not require transferring indexer top-k state across
+the PP boundary.
+
 Existing checks continue to reject LoRA, multimodal execution, KV offload,
 P/D disaggregation, lightly-CP, and HCU multi-layer MTP.
 
@@ -63,6 +69,8 @@ global batch, and delegate to upstream sampling.
 Live validation uses `/models/Hy4-preview-Channel-FP8-w8a8-v2` with:
 
 ```bash
+export VLLM_PP_LAYER_PARTITION=41,37
+
 --pipeline-parallel-size 2
 --tensor-parallel-size 1
 --prefill-context-parallel-size 4
