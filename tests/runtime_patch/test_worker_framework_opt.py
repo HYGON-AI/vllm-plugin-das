@@ -26,6 +26,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_base_device_communicator,
     patch_cuda_communicator,
     patch_dp_utils,
+    patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
@@ -1165,6 +1166,51 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
+def test_draft_speculator_sampling_inputs_copy_async_and_preserve_padding():
+    class _Buffer:
+        def copy_(self, other, *, non_blocking=False):
+            self.copied = (other, non_blocking)
+
+    class _IdxMapping:
+        def __getitem__(self, key):
+            return self
+
+        def copy_(self, other):
+            self.copied = other
+
+        def fill_(self, value):
+            self.filled = value
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.temperature = _Buffer()
+            self.seeds = _Buffer()
+            self.idx_mapping = _IdxMapping()
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            raise AssertionError("original should be wrapped")
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+    assert patch_draft_speculator_inputs.apply_to_module(module) is False
+
+    obj = DraftModelSpeculator()
+    temperature = object()
+    seeds = object()
+    idx_mapping = object()
+    temperature_buffer = obj.temperature
+    seeds_buffer = obj.seeds
+    obj._copy_request_inputs(2, idx_mapping, temperature, seeds)
+
+    assert obj.temperature is temperature_buffer
+    assert obj.seeds is seeds_buffer
+    assert obj.temperature.copied == (temperature, True)
+    assert obj.seeds.copied == (seeds, True)
+    assert obj.idx_mapping.copied is idx_mapping
+    assert obj.idx_mapping.filled == -1
+
+
 class _Buffer:
     def __init__(self, size, **kwargs):
         self.size = size
@@ -1877,13 +1923,15 @@ assert target_file.is_relative_to(target_root), (
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
-    patch_dp_utils, patch_eagle_utils, patch_forward_context,
+    patch_dp_utils, patch_draft_speculator_inputs, patch_eagle_utils,
+    patch_forward_context,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_eagle_utils,
+    patch_llm_base_proposer, patch_dp_utils, patch_draft_speculator_inputs,
+    patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
 for adapter in adapters:

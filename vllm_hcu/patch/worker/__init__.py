@@ -356,6 +356,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_eagle_utils"),
         feature="multi_layers_mtp",
     ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_draft_speculator_inputs"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
     _CallbackSpec(
