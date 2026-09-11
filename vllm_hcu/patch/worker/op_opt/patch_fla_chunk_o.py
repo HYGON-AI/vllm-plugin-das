@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Route the vLLM FLA chunk-output kernel through HCU providers."""
+"""Route the vLLM FLA chunk-output kernel through BoltOPs on HCU."""
 
 from __future__ import annotations
 
 import functools
 from types import ModuleType
-
-import torch
 
 from ._common import (
     already_applied,
@@ -15,7 +13,6 @@ from ._common import (
     require_callable,
     require_exact_signature,
 )
-from ._aiter_fla import make_aiter_fla_resolver
 from ._boltops_fla import make_boltops_gdn_resolver
 
 TARGET_MODULE = "vllm.third_party.flash_linear_attention.ops.chunk"
@@ -31,22 +28,6 @@ def _enabled() -> bool:
     return bool(
         henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
-    )
-
-
-def _use_aiter_hip(q, k, v, h, g, chunk_size) -> bool:
-    """Guard the shape and dtype contract of AITER's blockdim64 HIP kernel."""
-    tensors = (q, k, v, h)
-    return (
-        chunk_size == 64
-        and q.ndim == k.ndim == v.ndim == 4
-        and h.ndim == 5
-        and q.dtype == torch.bfloat16
-        and all(t.dtype == q.dtype for t in (k, v, h))
-        and all(t.is_contiguous() for t in tensors)
-        and q.shape[-1] == k.shape[-1] == v.shape[-1] == 128
-        and h.shape[-2:] == (128, 128)
-        and (g is None or g.is_contiguous())
     )
 
 
@@ -72,9 +53,6 @@ def apply_to_module(module: ModuleType) -> bool:
             "core_attn_out": None,
         },
     )
-    resolve_aiter = make_aiter_fla_resolver(
-        "chunk_fwd_o_vllm_hip_blockdim64"
-    )
     resolve_boltops = make_boltops_gdn_resolver("chunk_fwd_o")
 
     @functools.wraps(original)
@@ -95,54 +73,34 @@ def apply_to_module(module: ModuleType) -> bool:
                 q, k, v, h, g, scale, cu_seqlens, chunk_indices,
                 chunk_size, core_attn_out,
             )
-        provider_output = None
-        if _use_aiter_hip(q, k, v, h, g, chunk_size):
-            aiter_kernel = resolve_aiter()
-            if aiter_kernel is not None:
-                provider_output = aiter_kernel(
-                    q=q,
-                    k=k,
-                    v=v,
-                    h=h,
-                    g=g,
-                    g_gamma=None,
-                    scale=scale,
-                    cu_seqlens=cu_seqlens,
-                    chunk_size=chunk_size,
-                    chunk_indices=chunk_indices,
-                    use_exp2=False,
-                    transpose_state_layout=True,
-                    kernel_cfg=None,
-                )
-
-        if provider_output is None:
-            boltops_kernel = resolve_boltops()
-            if boltops_kernel is None:
-                return original(
-                    q, k, v, h, g, scale, cu_seqlens, chunk_indices,
-                    chunk_size, core_attn_out,
-                )
-            provider_output = boltops_kernel(
-                q=q,
-                k=k,
-                v=v,
-                h=h,
-                g=g,
-                g_gamma=None,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size,
-                chunk_indices=chunk_indices,
-                use_exp2=False,
-                transpose_state_layout=True,
-                kernel_cfg=None,
+        boltops_kernel = resolve_boltops()
+        if boltops_kernel is None:
+            return original(
+                q, k, v, h, g, scale, cu_seqlens, chunk_indices,
+                chunk_size, core_attn_out,
             )
+
+        boltops_output = boltops_kernel(
+            q=q,
+            k=k,
+            v=v,
+            h=h,
+            g=g,
+            g_gamma=None,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            use_exp2=False,
+            transpose_state_layout=True,
+            kernel_cfg=None,
+        )
         if core_attn_out is None:
-            return provider_output
+            return boltops_output
         if core_attn_out.numel() < v.numel():
             raise ValueError("core_attn_out is too small for HCU FLA chunk_o")
         out = core_attn_out[:v.numel()].view(*v.shape)
-        out.copy_(provider_output)
+        out.copy_(boltops_output)
         return out
 
     setattr(hcu_chunk_o, _WRAPPER, True)

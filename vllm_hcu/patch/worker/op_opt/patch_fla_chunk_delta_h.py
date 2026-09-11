@@ -7,6 +7,8 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+import torch
+
 from ._common import (
     already_applied,
     load_exact_module,
@@ -32,11 +34,13 @@ def _enabled() -> bool:
 
 
 def _use_boltops(k, u) -> bool:
-    """Use BoltOPs only for head ratios where it beats current vLLM FLA."""
-    return (
+    """Keep the prior provider except for the audited official-faster shape."""
+    return not (
         k.ndim == 4
         and u.ndim == 4
-        and u.shape[-2] <= 2 * k.shape[-2]
+        and k.dtype == u.dtype == torch.bfloat16
+        and k.shape[-2:] == (4, 128)
+        and u.shape[-2:] == (12, 128)
     )
 
 
