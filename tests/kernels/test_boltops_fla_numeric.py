@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""HCU numerical parity for the optional BoltOPs FLA chunk pipeline."""
+"""HCU numerical parity and routing for optional FLA providers."""
 
 from __future__ import annotations
+
+from types import ModuleType
 
 import pytest
 import torch
@@ -87,3 +89,105 @@ def test_boltops_chunk_pipeline_matches_official(
     torch.testing.assert_close(
         actual_state, expected_state, rtol=5e-2, atol=5e-3
     )
+
+
+def test_chunk_o_prefers_aiter_hip_and_preserves_output_buffer(monkeypatch):
+    from vllm_hcu.patch.worker.op_opt import patch_fla_chunk_o as adapter
+    from vllm_hcu.platforms import envs as henvs
+
+    calls = []
+
+    def original(
+        q,
+        k,
+        v,
+        h,
+        g=None,
+        scale=None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        chunk_size=64,
+        core_attn_out=None,
+    ):
+        calls.append("official")
+        return torch.zeros_like(v)
+
+    def aiter_kernel(**kwargs):
+        calls.append(("aiter", kwargs["transpose_state_layout"]))
+        return torch.ones_like(kwargs["v"])
+
+    module = ModuleType(adapter.TARGET_MODULE)
+    module.FLA_CHUNK_SIZE = 64
+    module.chunk_fwd_o = original
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(
+        adapter,
+        "make_aiter_fla_resolver",
+        lambda _name: lambda: aiter_kernel,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "make_boltops_gdn_resolver",
+        lambda _name: lambda: None,
+    )
+    assert adapter.apply_to_module(module) is True
+
+    q = torch.empty(1, 1, 2, 128, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty(1, 1, 4, 128, dtype=torch.bfloat16)
+    h = torch.empty(1, 1, 4, 128, 128, dtype=torch.bfloat16)
+    output_buffer = torch.empty(v.numel() + 8, dtype=v.dtype)
+    output = module.chunk_fwd_o(q, k, v, h, core_attn_out=output_buffer)
+
+    assert calls == [("aiter", True)]
+    assert output.data_ptr() == output_buffer.data_ptr()
+    torch.testing.assert_close(output, torch.ones_like(v))
+
+
+def test_chunk_h_uses_official_for_three_to_one_value_head_ratio(monkeypatch):
+    from vllm_hcu.patch.worker.op_opt import patch_fla_chunk_delta_h as adapter
+    from vllm_hcu.platforms import envs as henvs
+
+    calls = []
+
+    def original(
+        k,
+        w,
+        u,
+        g=None,
+        gk=None,
+        initial_state=None,
+        output_final_state=False,
+        chunk_size=64,
+        save_new_value=True,
+        cu_seqlens=None,
+        chunk_indices=None,
+        chunk_offsets=None,
+        use_exp2=False,
+    ):
+        calls.append("official")
+        return k, u, initial_state
+
+    def boltops_kernel(*args, **kwargs):
+        calls.append("boltops")
+        return args[0], args[2], kwargs["initial_state"]
+
+    module = ModuleType(adapter.TARGET_MODULE)
+    module.FLA_CHUNK_SIZE = 64
+    module.chunk_gated_delta_rule_fwd_h = original
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+    monkeypatch.setattr(
+        adapter,
+        "make_boltops_gdn_resolver",
+        lambda _name: lambda: boltops_kernel,
+    )
+    assert adapter.apply_to_module(module) is True
+
+    k = torch.empty(1, 1, 4, 128)
+    module.chunk_gated_delta_rule_fwd_h(k, k, torch.empty(1, 1, 12, 128))
+    assert calls == ["official"]
+
+    module.chunk_gated_delta_rule_fwd_h(k, k, torch.empty(1, 1, 8, 128))
+    assert calls == ["official", "boltops"]
