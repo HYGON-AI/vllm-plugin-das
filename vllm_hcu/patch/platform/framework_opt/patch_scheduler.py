@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Validate the upstream scheduler interfaces consumed by HCU patches."""
+"""Validate and adapt upstream scheduler interfaces consumed by HCU patches."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids_in_output",
     f"{TARGET_MODULE}.Scheduler.__init__",
     f"{TARGET_MODULE}.Scheduler._update_after_schedule",
+    f"{TARGET_MODULE}.Scheduler._mamba_block_aligned_split",
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
 
@@ -47,6 +48,35 @@ def _install_pp_spec_decode_cadence(scheduler: type) -> None:
                 request.next_decode_eligible_step = next_step
 
     scheduler._update_after_schedule = _update_after_schedule
+
+
+def _install_hybrid_mamba_split_block_size(scheduler: type) -> None:
+    """Run the official Mamba split with the hybrid scheduler block size.
+
+    HCU attention keeps ``cache_config.block_size`` at the 64-token vendor
+    kernel page, while official hybrid cache grouping may select a larger
+    scheduler block. The upstream split currently reads the former even though
+    ``Scheduler.block_size`` already contains the latter. Scope the correction
+    to the upstream call and restore the kernel page immediately afterwards.
+    """
+
+    original = scheduler._mamba_block_aligned_split
+
+    @functools.wraps(original)
+    def _mamba_block_aligned_split(self, request, num_new_tokens, *args, **kwargs):
+        cache_config = self.cache_config
+        kernel_block_size = cache_config.block_size
+        scheduler_block_size = self.block_size
+        if kernel_block_size == scheduler_block_size:
+            return original(self, request, num_new_tokens, *args, **kwargs)
+
+        cache_config.block_size = scheduler_block_size
+        try:
+            return original(self, request, num_new_tokens, *args, **kwargs)
+        finally:
+            cache_config.block_size = kernel_block_size
+
+    scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -85,7 +115,13 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[4],
         ("self", "scheduler_output"),
     )
+    require_signature_prefix(
+        require_callable(scheduler, "_mamba_block_aligned_split", TARGETS[5]),
+        TARGETS[5],
+        ("self", "request", "num_new_tokens"),
+    )
     _install_pp_spec_decode_cadence(scheduler)
+    _install_hybrid_mamba_split_block_size(scheduler)
     setattr(target, _MARKER, True)
     return True
 
