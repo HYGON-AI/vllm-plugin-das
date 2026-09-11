@@ -61,6 +61,10 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
             from .hyv4_w4a8 import HYV4W4A8Config
 
             return HYV4W4A8Config(config["conversion_manifest"])
+        if config.get("checkpoint_format") == "hy4_w4a8_v1":
+            from .hyv4_native import HYV4NativeW4A8Config
+
+            return HYV4NativeW4A8Config(config["checkpoint_index"])
         return cls()
 
     def get_quant_method(

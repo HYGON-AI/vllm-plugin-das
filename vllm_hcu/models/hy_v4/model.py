@@ -1083,6 +1083,13 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if getattr(getattr(self, "quant_config", None), "checkpoint_format", None) == "hy4_w4a8_v1":
+            from vllm_hcu.model_executor.layers.quantization.hyv4_native import (
+                adapt_native_weights,
+            )
+
+            # Normalize before AutoWeightsLoader dispatches lm_head/embed params.
+            weights = adapt_native_weights(weights)
         def _filter_weights(weights):
             for name, weight in weights:
                 # Exclude both model.layers.<N>.* and model.mtp_layers.<i>.*

@@ -735,6 +735,12 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
+        if getattr(self.quant_config, "checkpoint_format", None) == "hy4_w4a8_v1":
+            from vllm_hcu.model_executor.layers.quantization.hyv4_native import (
+                adapt_native_weights,
+            )
+
+            weights = adapt_native_weights(weights)
         params_dict = dict(self.named_parameters())
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         loaded_params: set[str] = set()
