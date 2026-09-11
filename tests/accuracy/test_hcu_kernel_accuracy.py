@@ -81,6 +81,398 @@ def _hcu_device() -> torch.device:
     return torch.device("cuda", 0)
 
 
+@pytest.mark.parametrize(
+    ("query_len", "causal"),
+    [(8, True), (7, False)],
+    ids=["target-verification", "dspark-drafter"],
+)
+def test_hcu_dspark_attention_matches_vendor_and_replays_in_cuda_graph(
+    query_len: int,
+    causal: bool,
+) -> None:
+    from flash_attn import flash_attn_varlen_func as vendor_varlen
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        _flash_attn_varlen_func_with_dspark_capture as hcu_varlen,
+    )
+
+    device = _hcu_device()
+    torch.manual_seed(42)
+    batch_size, q_heads, kv_heads, head_dim = 2, 16, 4, 128
+    q = torch.randn(
+        (batch_size * query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = torch.randn(
+        (4, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv.unbind(1)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_len,
+        query_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    seqused_k = torch.tensor(
+        [query_len, 128],
+        device=device,
+        dtype=torch.int32,
+    )
+    block_table = torch.tensor(
+        [[0, 1], [2, 3]],
+        device=device,
+        dtype=torch.int32,
+    )
+    q_descale = torch.tensor(1.0, device=device).expand(batch_size, kv_heads)
+    k_descale = torch.tensor(1.0, device=device).expand(batch_size, kv_heads)
+    v_descale = torch.tensor(1.0, device=device).expand(batch_size, kv_heads)
+    for scale in (q_descale, k_descale, v_descale):
+        assert scale.dtype == torch.float32
+        assert scale.stride() == (0, 0)
+        assert not scale.is_contiguous()
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen_q": query_len,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": 128,
+        "softmax_scale": head_dim**-0.5,
+        "causal": causal,
+        "window_size": (-1, -1),
+        "block_table": block_table,
+        "layout": "bshd",
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+    }
+    reference_out = torch.empty_like(q)
+    actual_out = torch.empty_like(q)
+
+    reference = vendor_varlen(out=reference_out, **common).clone()
+    actual = hcu_varlen(out=actual_out, **common).clone()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+
+    hcu_varlen(out=actual_out, **common)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        hcu_varlen(out=actual_out, **common)
+
+    # Change captured inputs in place and poison the prior output so this test
+    # fails if replay is a no-op or reuses the warmup result.
+    q.neg_()
+    actual_out.fill_(float("nan"))
+    graph.replay()
+    replay_reference = vendor_varlen(out=reference_out, **common).clone()
+    torch.cuda.synchronize(device)
+    replay = actual_out.clone()
+    assert not torch.isnan(replay).any().item()
+    torch.testing.assert_close(replay, replay_reference, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("query_len", "causal"),
+    [(8, True), (7, False)],
+    ids=["target-verification", "dspark-drafter"],
+)
+def test_hcu_dspark_flash_attention_forward_accepts_expanded_descales(
+    monkeypatch: pytest.MonkeyPatch,
+    query_len: int,
+    causal: bool,
+) -> None:
+    """Run expanded production descales through eager, capture, and replay."""
+    from flash_attn import flash_attn_varlen_func as vendor_varlen
+    from vllm_hcu.v1.attention.backends import flash_attn as hcu_flash_attn
+    from vllm_hcu.v1.attention.backends import fa_utils
+
+    monkeypatch.setattr(
+        hcu_flash_attn,
+        "_get_flash_attn_mode",
+        lambda: "varlen",
+    )
+    monkeypatch.setattr(fa_utils, "get_kv_cache_layout", lambda: "NHD")
+
+    device = _hcu_device()
+    torch.manual_seed(42)
+    batch_size, q_heads, kv_heads, head_dim = 2, 16, 4, 128
+    q = torch.randn(
+        (batch_size * query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key = torch.zeros(
+        (batch_size * query_len, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        (4, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv_cache.unbind(1)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_len,
+        query_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    seqused_k = torch.tensor(
+        [query_len, 128],
+        device=device,
+        dtype=torch.int32,
+    )
+    block_table = torch.tensor(
+        [[0, 1], [2, 3]],
+        device=device,
+        dtype=torch.int32,
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(1.0, device=device),
+        _k_scale=torch.tensor(1.0, device=device),
+        _v_scale=torch.tensor(1.0, device=device),
+    )
+    descale_shape = (batch_size, kv_heads)
+    q_descale = layer._q_scale.expand(descale_shape)
+    k_descale = layer._k_scale.expand(descale_shape)
+    v_descale = layer._v_scale.expand(descale_shape)
+    for scale in (q_descale, k_descale, v_descale):
+        assert scale.stride() == (0, 0)
+        assert not scale.is_contiguous()
+
+    metadata = SimpleNamespace(
+        num_actual_tokens=batch_size * query_len,
+        use_cascade=False,
+        query_start_loc=cu_seqlens_q,
+        seq_lens=seqused_k,
+        max_query_len=query_len,
+        max_seq_len=128,
+        block_table=block_table,
+        scheduler_metadata=None,
+        causal=causal,
+        sliding_window=None,
+    )
+    impl = object.__new__(hcu_flash_attn.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = 3
+    impl.attn_type = hcu_flash_attn.AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    impl.num_kv_heads = kv_heads
+    impl.supports_quant_query_input = True
+    impl.dcp_world_size = 1
+    impl.scale = head_dim**-0.5
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = 0.0
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+    assert hcu_flash_attn._get_flash_attn_mode() == "varlen"
+
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen_q": query_len,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": 128,
+        "softmax_scale": head_dim**-0.5,
+        "causal": causal,
+        "window_size": (-1, -1),
+        "block_table": block_table,
+        "layout": "bshd",
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+    }
+    reference_out = torch.empty_like(q)
+    actual_out = torch.empty_like(q)
+
+    reference = vendor_varlen(out=reference_out, **common).clone()
+    actual = impl.forward(
+        layer,
+        q,
+        key,
+        key,
+        kv_cache,
+        metadata,
+        actual_out,
+    ).clone()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+
+    impl.forward(layer, q, key, key, kv_cache, metadata, actual_out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        impl.forward(layer, q, key, key, kv_cache, metadata, actual_out)
+
+    q.neg_()
+    actual_out.fill_(float("nan"))
+    graph.replay()
+    replay_reference = vendor_varlen(out=reference_out, **common).clone()
+    torch.cuda.synchronize(device)
+    replay = actual_out.clone()
+    assert not torch.isnan(replay).any().item()
+    torch.testing.assert_close(replay, replay_reference, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 64, 73])
+def test_hcu_dspark_eager_drafter_avoids_static_kv_scratch(
+    batch_size: int,
+) -> None:
+    """Keep eager qlen=7 scratch proportional to used KV, not max context."""
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        _flash_attn_varlen_func_with_dspark_capture as hcu_varlen,
+    )
+
+    device = _hcu_device()
+    assert not torch.cuda.is_current_stream_capturing()
+    query_len, q_heads, kv_heads, head_dim = 7, 16, 4, 128
+    max_seqlen_k = 4096
+    used_seqlen_k = 64
+    q = torch.randn(
+        (batch_size * query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = torch.randn(
+        (batch_size, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv.unbind(1)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_len,
+        query_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    seqused_k = torch.full(
+        (batch_size,),
+        used_seqlen_k,
+        device=device,
+        dtype=torch.int32,
+    )
+    block_table = torch.zeros(
+        (batch_size, max_seqlen_k // 64),
+        device=device,
+        dtype=torch.int32,
+    )
+    block_table[:, 0] = torch.arange(batch_size, device=device)
+    scales = tuple(
+        torch.tensor(1.0, device=device).expand(batch_size, kv_heads)
+        for _ in range(3)
+    )
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen_q": query_len,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": max_seqlen_k,
+        "softmax_scale": head_dim**-0.5,
+        "causal": False,
+        "window_size": (-1, -1),
+        "block_table": block_table,
+        "layout": "bshd",
+        "q_descale": scales[0],
+        "k_descale": scales[1],
+        "v_descale": scales[2],
+    }
+
+    hcu_varlen(**common)
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    hcu_varlen(**common)
+    torch.cuda.synchronize(device)
+    peak_delta = torch.cuda.max_memory_allocated(device) - baseline
+
+    used_kv_bytes = (
+        2
+        * batch_size
+        * used_seqlen_k
+        * kv_heads
+        * head_dim
+        * q.element_size()
+    )
+    # Allow kernel workspace and allocator rounding while rejecting the old
+    # 512/584 MiB batch*max_seqlen_k allocation at batch sizes 64 and 73.
+    assert peak_delta < used_kv_bytes * 4 + 16 * 1024**2
+
+
+@pytest.mark.parametrize(
+    ("q_heads", "expected_paged_route"),
+    [(8, True), (9, False)],
+    ids=["flattened-head-limit", "above-flattened-head-limit"],
+)
+def test_hcu_dspark_paged_attention_head_limit_matches_vendor(
+    q_heads: int,
+    expected_paged_route: bool,
+) -> None:
+    from flash_attn import flash_attn_varlen_func as vendor_varlen
+    from vllm_hcu.v1.attention.backends.fa_utils import (
+        _flash_attn_varlen_func_with_dspark_capture as hcu_varlen,
+        _matches_dspark_attention_shape,
+    )
+
+    device = _hcu_device()
+    torch.manual_seed(42)
+    query_len, kv_heads, head_dim = 8, 1, 128
+    q = torch.randn(
+        (query_len, q_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = torch.randn(
+        (1, 2, 64, kv_heads, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k, v = kv.unbind(1)
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": torch.tensor(
+            [0, query_len], device=device, dtype=torch.int32
+        ),
+        "max_seqlen_q": query_len,
+        "seqused_k": torch.tensor([64], device=device, dtype=torch.int32),
+        "max_seqlen_k": 64,
+        "softmax_scale": head_dim**-0.5,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": torch.tensor([[0]], device=device, dtype=torch.int32),
+        "layout": "bshd",
+    }
+    reference_out = torch.empty_like(q)
+    actual_out = torch.empty_like(q)
+
+    assert (
+        _matches_dspark_attention_shape(
+            {**common, "out": actual_out},
+            query_len=query_len,
+            causal=True,
+        )
+        is expected_paged_route
+    )
+    reference = vendor_varlen(out=reference_out, **common).clone()
+    actual = hcu_varlen(out=actual_out, **common).clone()
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize(
     "cache_storage_dtype",
