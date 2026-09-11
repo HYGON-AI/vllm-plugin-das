@@ -108,37 +108,16 @@ class HcuQwen4ExpPLEInt8EmbeddingMethod(QuantizeMethodBase):
         raise NotImplementedError("PLE INT8 weights only support embedding lookup")
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
-
-    def dequantize(
-        self,
-        layer: nn.Module,
-        embeddings: torch.Tensor,
-        input_: torch.Tensor,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        ids = input_.long()
-        shard = layer.shard_indices
-        local = ids - shard.org_vocab_start_index
-        owned = (ids >= shard.org_vocab_start_index) & (
-            ids < shard.org_vocab_end_index
-        )
-        local = local.clamp(0, layer.weight_scale.shape[0] - 1)
-        scale = F.embedding(local, layer.weight_scale)
-        scale.masked_fill_(~owned.unsqueeze(-1), 0)
-        if layer.tp_size > 1:
-            from vllm.distributed import tensor_model_parallel_all_reduce
-
-            scale = tensor_model_parallel_all_reduce(scale)
-        # The checkpoint stores one scalar scale for each vocabulary row.  The
-        # lookup result is ``[..., embedding_dim]`` and the ``[..., 1]`` scale
-        # broadcasts over the embedding dimension, including batched lookups.
-        if embeddings.shape[:-1] != scale.shape[:-1]:
-            raise ValueError(
-                "PLE INT8 scale lookup shape does not match embedding output: "
-                f"{tuple(scale.shape)} vs {tuple(embeddings.shape)}"
-            )
-        return embeddings.to(output_dtype) * scale.to(output_dtype)
+        # ``VocabParallelEmbedding.forward`` invokes this method before its
+        # tensor-parallel all-reduce.  Return a supported floating-point dtype
+        # here; returning INT8 would make the communicator reject the tensor.
+        # ``input_`` is already masked to local indices by the base forward
+        # path for TP > 1, and that path clears non-owner rows immediately
+        # after this lookup.
+        embeddings = F.embedding(input_, layer.weight)
+        scales = F.embedding(input_, layer.weight_scale)
+        output_dtype = layer.params_dtype
+        return embeddings.to(output_dtype) * scales.to(output_dtype)
 
 
 def _make_storage_class(module: ModuleType, quant_config):
@@ -175,13 +154,6 @@ def _make_storage_class(module: ModuleType, quant_config):
                     except (AssertionError, AttributeError, RuntimeError):
                         pass
             super().__init__(*args, **kwargs)
-
-        def forward(self, input_):
-            raw = super().forward(input_)
-            method = self.quant_method
-            if not isinstance(method, HcuQwen4ExpPLEInt8EmbeddingMethod):
-                return raw
-            return method.dequantize(self, raw, input_, self.params_dtype)
 
     HcuPLEVocabParallelEmbedding.__name__ = "HcuPLEVocabParallelEmbedding"
     HcuPLEVocabParallelEmbedding.__qualname__ = "HcuPLEVocabParallelEmbedding"
