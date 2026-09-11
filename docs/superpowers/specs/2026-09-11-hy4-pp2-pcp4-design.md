@@ -10,7 +10,8 @@ with DeepEP high-throughput, DeepGEMM, and FP8 E4M3 KV cache.
 
 - Permit pipeline parallelism with PCP only for the exact Hy4 topology above.
 - Keep GLM-5.2, GQA, and every other PP+PCP topology fail-closed.
-- Keep PP+PCP speculative decoding disabled; MTP is a separate validation.
+- Permit built-in MTP with one or two speculative tokens on the exact Hy4
+  PP2+PCP4 topology; keep MTP3 and other speculative methods fail-closed.
 - Preserve the existing PCP=1, PP=1, and DeepEP communicator behavior.
 - Do not introduce a PP-boundary all-gather. Each PP stage keeps the same
   PCP-local virtual batch during model execution.
@@ -47,7 +48,7 @@ accepted only when all of these values match:
 - decode context parallel size: `1`
 - expert parallelism: enabled
 - eager execution: enabled
-- speculative configuration: absent
+- speculative configuration: absent, or built-in MTP with one or two tokens
 
 Hy4 shares indexer results across groups of layers. The default 39/39 split
 starts PP stage 1 on shared indexer layer 39, so the launch must set
@@ -60,11 +61,11 @@ P/D disaggregation, lightly-CP, and HCU multi-layer MTP.
 
 ## Validation
 
-CPU regression tests must prove that the exact Hy4 topology is accepted, that
-nearby Hy4 topologies and Hy4 PP+PCP+MTP are rejected, and that GLM/GQA PP+PCP
-remain rejected. A runner regression test must model a non-final PP rank with
-`hidden_states=None`, prove there is no PCP hidden-state gather, restore the
-global batch, and delegate to upstream sampling.
+CPU regression tests must prove that the exact Hy4 topology is accepted with
+target-only, MTP1, and MTP2, that nearby Hy4 topologies and MTP3 are rejected,
+and that GLM/GQA PP+PCP remain rejected. A runner regression test must model a
+non-final PP rank with `hidden_states=None`, prove there is no PCP hidden-state
+gather, restore the global batch, and delegate to upstream sampling.
 
 Live validation uses `/models/Hy4-preview-Channel-FP8-w8a8-v2` with:
 
@@ -79,8 +80,11 @@ export VLLM_PP_LAYER_PARTITION=41,37
 --moe-backend deep_gemm
 --kv-cache-dtype fp8_e4m3
 --enforce-eager
+# Optional validated MTP1/MTP2:
+--speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 ```
 
 Acceptance requires all eight workers to initialize, logs to show two PP
 stages with four PCP/EP ranks per stage, a successful short request and long
-prefill request, and exact HumanEval-32 correctness counts.
+prefill request, and exact HumanEval-32 correctness counts. MTP validation must
+also show nonzero drafted and accepted token metrics.

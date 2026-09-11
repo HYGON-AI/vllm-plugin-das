@@ -420,10 +420,13 @@ def test_hy4_pp_pcp_rejects_unvalidated_topologies(
         )
 
 
-def test_hy4_pp_pcp_rejects_speculative_decoding(make_pcp_config) -> None:
-    """MTP has no validated combined PP+PCP execution contract."""
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_hy4_pp_pcp_allows_validated_mtp_depths(
+    make_pcp_config, num_speculative_tokens: int
+) -> None:
+    """The exact Hy4 PP+PCP topology supports existing replicated PCP MTP."""
 
-    with pytest.raises(ValueError, match="does not support speculative"):
+    assert (
         patch_vllm_config._validate_hcu_pcp_scope(
             make_pcp_config(
                 architecture="HYV4ForCausalLM",
@@ -431,6 +434,50 @@ def test_hy4_pp_pcp_rejects_speculative_decoding(make_pcp_config) -> None:
                 tp=1,
                 pcp=4,
                 speculative=True,
+                speculative_method="mtp",
+                num_speculative_tokens=num_speculative_tokens,
+            )
+        )
+        is True
+    )
+
+
+def test_hy4_pp_pcp_rejects_unvalidated_mtp3(make_pcp_config) -> None:
+    """MTP3 stays fail-closed because PCP validates only one or two drafts."""
+
+    with pytest.raises(ValueError, match="one or two speculative tokens"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="HYV4ForCausalLM",
+                pp=2,
+                tp=1,
+                pcp=4,
+                speculative=True,
+                speculative_method="mtp",
+                num_speculative_tokens=3,
+            )
+        )
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_hy4_pp_pcp_rejects_pd_cross_product(
+    make_pcp_config, speculative: bool
+) -> None:
+    """Mooncake PCP producer support does not include PP2+PCP4."""
+
+    with pytest.raises(ValueError, match=r"PP\+PCP does not support P/D"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="HYV4ForCausalLM",
+                pp=2,
+                tp=1,
+                pcp=4,
+                speculative=speculative,
+                speculative_method="mtp",
+                num_speculative_tokens=2,
+                kv_transfer=True,
+                kv_connector="MooncakeConnector",
+                kv_role="kv_producer",
             )
         )
 
