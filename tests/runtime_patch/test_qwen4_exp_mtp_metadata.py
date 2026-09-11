@@ -182,6 +182,9 @@ def test_scheduler_leaves_qwen35_groups_and_block_size_to_upstream():
         ):
             del self, draft_token_ids, scheduler_output
 
+        def _update_after_schedule(self, scheduler_output):
+            del self, scheduler_output
+
         def __init__(
             self,
             vllm_config,
