@@ -1113,3 +1113,141 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+
+def _hcu_hyv4_resolve_topk_buffer(model):
+    """Return the live top-k buffer on this model or its inner module."""
+
+    buffer = getattr(model, "topk_indices_buffer", None)
+    if buffer is not None:
+        return buffer
+    inner = getattr(model, "model", None)
+    return getattr(inner, "topk_indices_buffer", None) if inner is not None else None
+
+
+def _hcu_hyv4_intermediate_dict(intermediate_tensors):
+    tensors = getattr(intermediate_tensors, "tensors", None)
+    if isinstance(tensors, dict):
+        return tensors
+    return intermediate_tensors
+
+
+def _hcu_hyv4_sync_topk_from_pp(model, intermediate_tensors):
+    """Copy incoming PP top-k into the local live buffer."""
+
+    if intermediate_tensors is None:
+        return
+    incoming = _hcu_hyv4_intermediate_dict(intermediate_tensors).get(
+        "topk_indices_buffer"
+    )
+    buffer = _hcu_hyv4_resolve_topk_buffer(model)
+    if incoming is None or buffer is None:
+        return
+    num_tokens = min(incoming.shape[0], buffer.shape[0])
+    buffer[:num_tokens].copy_(incoming[:num_tokens], non_blocking=True)
+
+
+def _hcu_hyv4_append_topk_to_pp(model, intermediate_tensors):
+    """Attach the live top-k buffer to outgoing PP tensors."""
+
+    if intermediate_tensors is None:
+        return
+    buffer = _hcu_hyv4_resolve_topk_buffer(model)
+    if buffer is None:
+        return
+    tensors = _hcu_hyv4_intermediate_dict(intermediate_tensors)
+    hidden = tensors.get("hidden_states")
+    num_tokens = hidden.shape[0] if hidden is not None else buffer.shape[0]
+    topk = buffer[:num_tokens]
+    try:
+        from vllm.forward_context import get_forward_context
+    except ImportError:
+        get_forward_context = None
+    if get_forward_context is not None:
+        try:
+            from vllm.forward_context import is_forward_context_available
+        except ImportError:
+            is_forward_context_available = lambda: True
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if getattr(ctx, "enable_lightly_cp", False):
+                from vllm.distributed.parallel_state import get_tp_group
+
+                topk = get_tp_group().all_gather(topk.contiguous(), dim=0)
+    tensors["topk_indices_buffer"] = topk.clone()
+
+
+def _hcu_hyv4_wrap_make_empty(orig_empty):
+    """Reserve a top-k slot in empty PP intermediate tensors."""
+
+    if getattr(orig_empty, "_hcu_hyv4_pp_topk_wrapped", False):
+        return orig_empty
+
+    def _wrapped(batch_size, dtype, device, *args, **kwargs):
+        result = orig_empty(batch_size, dtype, device, *args, **kwargs)
+        model = getattr(_wrapped, "_hcu_hyv4_owner", None)
+        buffer = _hcu_hyv4_resolve_topk_buffer(model) if model is not None else None
+        tensors = _hcu_hyv4_intermediate_dict(result)
+        if buffer is not None and "topk_indices_buffer" not in tensors:
+            import torch
+
+            tensors["topk_indices_buffer"] = torch.zeros(
+                (int(batch_size), int(buffer.shape[-1])),
+                dtype=torch.int32,
+                device=device,
+            )
+        return result
+
+    _wrapped._hcu_hyv4_pp_topk_wrapped = True
+    return _wrapped
+
+
+def _hcu_hyv4_wrap_forward(orig_forward):
+    """Copy top-k across PP stages around the original forward."""
+
+    if getattr(orig_forward, "_hcu_hyv4_pp_topk_wrapped", False):
+        return orig_forward
+
+    def _wrapped(self, *args, **kwargs):
+        from vllm.distributed.parallel_state import get_pp_group
+
+        intermediate = kwargs.get("intermediate_tensors")
+        if intermediate is None and len(args) >= 3:
+            intermediate = args[2]
+        if intermediate is not None and not get_pp_group().is_first_rank:
+            _hcu_hyv4_sync_topk_from_pp(self, intermediate)
+        output = orig_forward(self, *args, **kwargs)
+        if hasattr(output, "tensors") and not get_pp_group().is_last_rank:
+            _hcu_hyv4_append_topk_to_pp(self, output)
+        return output
+
+    _wrapped._hcu_hyv4_pp_topk_wrapped = True
+    return _wrapped
+
+
+def _hcu_hyv4_install_pp_topk(model):
+    """Install PP top-k hooks on empty-tensor factory and forward."""
+
+    orig_empty = getattr(model, "make_empty_intermediate_tensors", None)
+    if orig_empty is not None:
+        wrapped_empty = _hcu_hyv4_wrap_make_empty(orig_empty)
+        wrapped_empty._hcu_hyv4_owner = model
+        model.make_empty_intermediate_tensors = wrapped_empty
+
+    if not getattr(type(model).forward, "_hcu_hyv4_pp_topk_wrapped", False):
+        type(model).forward = _hcu_hyv4_wrap_forward(type(model).forward)
+
+
+import functools as _hcu_hyv4_functools
+
+_hcu_hyv4_orig_model_init = HYV4Model.__init__
+
+
+@_hcu_hyv4_functools.wraps(_hcu_hyv4_orig_model_init)
+def _hcu_hyv4_model_init(self, *args, **kwargs):
+    _hcu_hyv4_orig_model_init(self, *args, **kwargs)
+    _hcu_hyv4_install_pp_topk(self)
+
+
+HYV4Model.__init__ = _hcu_hyv4_model_init
+# Wrap HYV4Model.forward only; wrapping ForCausalLM again double-copies top-k.

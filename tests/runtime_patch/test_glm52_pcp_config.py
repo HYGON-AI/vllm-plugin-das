@@ -36,6 +36,9 @@ def _make_pcp_config(**overrides: object) -> object:
     hybrid = overrides.pop("hybrid", False)
     kv_offload = overrides.pop("kv_offload", False)
     kv_transfer = overrides.pop("kv_transfer", False)
+    kv_connector = overrides.pop("kv_connector", "MooncakeConnector")
+    kv_role = overrides.pop("kv_role", None)
+    kv_connector_extra_config = overrides.pop("kv_connector_extra_config", None)
     enable_lightly_cp = overrides.pop("enable_lightly_cp", False)
     enable_multi_layers_mtp = overrides.pop("enable_multi_layers_mtp", False)
     attention_backend = overrides.pop(
@@ -73,7 +76,13 @@ def _make_pcp_config(**overrides: object) -> object:
         lora_config=(SimpleNamespace() if lora else None),
         cache_config=SimpleNamespace(kv_offloading_size=(1.0 if kv_offload else None)),
         kv_transfer_config=(
-            SimpleNamespace(kv_connector="MooncakeConnector") if kv_transfer else None
+            SimpleNamespace(
+                kv_connector=kv_connector,
+                kv_role=kv_role,
+                kv_connector_extra_config=kv_connector_extra_config or {},
+            )
+            if kv_transfer
+            else None
         ),
         additional_config={
             "hcu": HcuFeatureConfig(
@@ -116,6 +125,43 @@ def test_hy4_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     )
 
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_hy4_pcp_allows_mooncake_producer_pd(make_pcp_config) -> None:
+    """Mooncake kv_producer is the only PCP P/D path with replica dedup."""
+
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        use_mla=True,
+        pcp=2,
+        tp=4,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        kv_transfer=True,
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_pcp_rejects_non_mooncake_producer_pd(make_pcp_config) -> None:
+    """Other connectors must stay rejected; they lack PCP rank0 send semantics."""
+
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        use_mla=True,
+        pcp=2,
+        tp=4,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        kv_transfer=True,
+        kv_connector="DuSwiftConnector",
+        kv_role="kv_producer",
+    )
+
+    with pytest.raises(ValueError, match="MooncakeConnector only"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
 def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config) -> None:
