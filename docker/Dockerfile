@@ -51,7 +51,8 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
     && pip install --no-cache-dir cupy \
-    && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    # vllm 0.28.1 钉 apache-tvm-ffi==0.1.10, 内网源只有 0.1.9/0.1.11, 从阿里源提前装 0.1.10
+    && pip install --no-cache-dir apache-tvm-ffi==0.1.10 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     # vllm 0.28.1 强制依赖 amd-quark==0.12.post1 (元数据要求 Python>=3.11, 镜像为 3.10)
     # 和 tilelang==0.1.10 (内网源无此版本); quark 只服务 AMD 量化路径, tilelang 实际走下面的
     # das-install 装内网最新版, 这里先写入空发行版元数据让 pip 解析 vllm 依赖时跳过这两个包.
