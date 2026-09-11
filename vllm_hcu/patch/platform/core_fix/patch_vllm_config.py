@@ -161,10 +161,6 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         vllm_config, "speculative_config", "VllmConfig"
     )
     if speculative_config is not None:
-        if hy4_pp_pcp:
-            raise ValueError(
-                "Hy4 PP+PCP does not support speculative decoding or MTP."
-            )
         if not use_mla:
             raise ValueError(
                 "FlashAttention PCP does not support speculative decoding or MTP."
@@ -202,6 +198,10 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             kv_transfer_config, "kv_connector", "KVTransferConfig"
         )
         if connector is not None:
+            if hy4_pp_pcp:
+                raise ValueError(
+                    "Hy4 PP+PCP does not support P/D disaggregation."
+                )
             # Replica-dedup send path exists only on MooncakeConnector.
             if connector != "MooncakeConnector":
                 raise ValueError(
