@@ -48,7 +48,6 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -651,7 +650,7 @@ class MooncakeXferMetadata(
     model_layer_end: int = -1
     xfer_head_rank: int = -1
     remote_pp_size: int = 1
-    # Consumer's VLLM_PP_LAYER_PARTITION; empty means default even split.
+    # Consumer partition; empty means even split. pp1 must still echo pp>1.
     pp_layer_partition: str = ""
 
 
@@ -1492,6 +1491,7 @@ class MooncakeConnectorWorker:
             logger.error(message)
             response = MooncakeXferResponse(
                 status=MooncakeXferResponseStatus.ERROR,
+                err_reqs=list(meta.req_blocks) or None,
                 err_msg=message,
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
@@ -1659,6 +1659,10 @@ class MooncakeConnectorWorker:
                                 send_meta,
                                 remote_tp_ranks,
                                 remote_pp_size=meta.remote_pp_size,
+                                remote_partition=getattr(
+                                    meta, "pp_layer_partition", ""
+                                )
+                                or "",
                             )
                     except Exception as e:
                         send_meta.sending -= 1
@@ -1768,24 +1772,27 @@ class MooncakeConnectorWorker:
         remote_pp_size: int,
         remote_partition: str | None = None,
     ) -> None:
-        """Reject custom PP partitions that cannot be verified.
+        """Validate P/D PP partitions before layer-overlap transfer.
 
-        Same-PP P/D with a matching partition (including both unset) keeps
-        the rank-pair path. Heterogeneous PP cannot map remote stages from
-        the local env, so any custom partition is fail-closed.
+        Same PP: strings must match (both empty = even split); rank-pair.
+        Hetero ppN↔pp1: custom partitions allowed; handshake strings must match.
+        Hetero with both PP sizes >1: reject custom partitions.
         """
         local = _normalize_pp_layer_partition(
             getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
         )
         remote_pp_size = max(int(remote_pp_size), 1)
-        same_pp = remote_pp_size == int(self.pp_size)
+        local_pp_size = int(self.pp_size)
+        same_pp = remote_pp_size == local_pp_size
+        # ppN↔pp1: both sides set the same partition string.
+        pp1_hetero = min(local_pp_size, remote_pp_size) == 1
         if remote_partition is None:
-            if same_pp or not local:
+            if same_pp or not local or pp1_hetero:
                 return
             raise RuntimeError(
                 "Mooncake heterogeneous PP does not support "
-                "VLLM_PP_LAYER_PARTITION; unset it so both sides use the "
-                "default even split."
+                "VLLM_PP_LAYER_PARTITION when both PP sizes are >1; "
+                "unset it so both sides use the default even split."
             )
         remote = _normalize_pp_layer_partition(remote_partition)
         if same_pp:
@@ -1796,26 +1803,46 @@ class MooncakeConnectorWorker:
                 "VLLM_PP_LAYER_PARTITION "
                 f"(local={local!r} remote={remote!r})."
             )
+        if pp1_hetero:
+            if local == remote:
+                return
+            raise RuntimeError(
+                "Mooncake heterogeneous PP (ppN↔pp1) requires matching "
+                "VLLM_PP_LAYER_PARTITION "
+                f"(local={local!r} remote={remote!r})."
+            )
         if local or remote:
             raise RuntimeError(
                 "Mooncake heterogeneous PP does not support "
-                "VLLM_PP_LAYER_PARTITION; unset it on both sides."
+                "VLLM_PP_LAYER_PARTITION when both PP sizes are >1; "
+                "unset it on both sides."
             )
 
-    def _count_overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
-        """How many consumer PP stages overlap this producer's layer range."""
+    def _count_overlapping_remote_pp_stages(
+        self,
+        remote_pp_size: int,
+        remote_partition: str | None = None,
+    ) -> int:
+        """How many remote PP stages overlap this producer's layer range."""
         remote_pp_size = max(int(remote_pp_size), 1)
-        self._reject_custom_partition_for_hetero_pp(remote_pp_size)
+        self._reject_custom_partition_for_hetero_pp(
+            remote_pp_size, remote_partition=remote_partition
+        )
         if remote_pp_size == 1 or self.pp_size <= 0:
             return remote_pp_size
         total_model_layers = self.model_config.get_total_num_hidden_layers()
-        p_start, p_end = get_pp_indices(
-            total_model_layers, self.pp_rank, self.pp_size
+        local_part = getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+        # Prefer the remote-reported partition after handshake.
+        remote_part = (
+            remote_partition if remote_partition is not None else local_part
+        )
+        p_start, p_end = _pp_stage_range(
+            total_model_layers, self.pp_rank, self.pp_size, local_part
         )
         overlap = 0
         for d_pp_rank in range(remote_pp_size):
-            d_start, d_end = get_pp_indices(
-                total_model_layers, d_pp_rank, remote_pp_size
+            d_start, d_end = _pp_stage_range(
+                total_model_layers, d_pp_rank, remote_pp_size, remote_part
             )
             if d_start >= p_end or p_start >= d_end:
                 continue
@@ -1827,8 +1854,11 @@ class MooncakeConnectorWorker:
         send_meta: SendBlockMeta,
         remote_tp_ranks: list[int],
         remote_pp_size: int = 1,
+        remote_partition: str | None = None,
     ):
-        pp_contacts = self._count_overlapping_remote_pp_stages(remote_pp_size)
+        pp_contacts = self._count_overlapping_remote_pp_stages(
+            remote_pp_size, remote_partition=remote_partition
+        )
         send_meta.need_send = len(remote_tp_ranks) * pp_contacts
         logger.debug(
             "Mooncake request %s will be served by %d consumer contacts "
@@ -2742,13 +2772,16 @@ class MooncakeConnectorWorker:
     def _pp_overlap_layer_range(
         self, *, remote_pp_rank: int, remote_pp_size: int
     ) -> tuple[int, int]:
+        """Layer overlap [start, end) with one remote PP stage."""
         self._reject_custom_partition_for_hetero_pp(remote_pp_size)
         total_model_layers = self.model_config.get_total_num_hidden_layers()
-        d_start, d_end = get_pp_indices(
-            total_model_layers, self.pp_rank, self.pp_size
+        # Local string describes both sides; pp=1 ignores it.
+        local_part = getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+        d_start, d_end = _pp_stage_range(
+            total_model_layers, self.pp_rank, self.pp_size, local_part
         )
-        p_start, p_end = get_pp_indices(
-            total_model_layers, remote_pp_rank, remote_pp_size
+        p_start, p_end = _pp_stage_range(
+            total_model_layers, remote_pp_rank, remote_pp_size, local_part
         )
         return max(d_start, p_start), min(d_end, p_end)
 
@@ -2867,10 +2900,64 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 
 def _normalize_pp_layer_partition(partition: str | None) -> str:
-    """Canonical comma-separated PP layer counts, or empty for even split."""
+    """Comma-separated layer counts, or empty for even split."""
     if not partition:
         return ""
     return ",".join(part.strip() for part in str(partition).split(",") if part.strip())
+
+
+def _pp_partition_sizes(
+    num_hidden_layers: int,
+    pp_size: int,
+    partition: str | None = None,
+) -> list[int]:
+    """Per-stage layer counts: custom string, else vLLM even split."""
+    normalized = _normalize_pp_layer_partition(partition)
+    if normalized:
+        try:
+            parts = [int(part) for part in normalized.split(",")]
+        except ValueError as err:
+            raise RuntimeError(
+                f"invalid VLLM_PP_LAYER_PARTITION {normalized!r}"
+            ) from err
+        if len(parts) != pp_size:
+            raise RuntimeError(
+                f"VLLM_PP_LAYER_PARTITION {normalized!r} length "
+                f"{len(parts)} does not match pp_size={pp_size}."
+            )
+        if sum(parts) != num_hidden_layers:
+            raise RuntimeError(
+                f"VLLM_PP_LAYER_PARTITION {normalized!r} sum "
+                f"{sum(parts)} does not match {num_hidden_layers} layers."
+            )
+        return parts
+    layers_per_partition = num_hidden_layers // pp_size
+    parts = [layers_per_partition] * pp_size
+    if remaining := num_hidden_layers % pp_size:
+        for i in range(2, remaining + 2):
+            parts[-i] += 1
+    return parts
+
+
+def _pp_stage_range(
+    num_hidden_layers: int,
+    pp_rank: int,
+    pp_size: int,
+    partition: str | None = None,
+) -> tuple[int, int]:
+    """PP stage [start, end). pp=1 covers all layers; uses `partition` only."""
+    pp_size = max(int(pp_size), 1)
+    pp_rank = int(pp_rank)
+    num_hidden_layers = int(num_hidden_layers)
+    if pp_size == 1:
+        return 0, num_hidden_layers
+    if not 0 <= pp_rank < pp_size:
+        raise RuntimeError(
+            f"pp_rank={pp_rank} is outside pp_size={pp_size}."
+        )
+    parts = _pp_partition_sizes(num_hidden_layers, pp_size, partition)
+    start = sum(parts[:pp_rank])
+    return start, start + parts[pp_rank]
 
 
 def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:

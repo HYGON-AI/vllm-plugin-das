@@ -851,13 +851,6 @@ def test_ttft_transfer_identity(mooncake):
     )
 
 
-def _even_pp_indices(num_hidden_layers, pp_rank, pp_size):
-    per = num_hidden_layers // pp_size
-    start = pp_rank * per
-    end = num_hidden_layers if pp_rank + 1 == pp_size else start + per
-    return start, end
-
-
 def test_noncanonical_pcp_skips_empty_alloc_send(mooncake):
     worker = object.__new__(mooncake.MooncakeConnectorWorker)
     worker.finished_sending_reqs = set()
@@ -919,7 +912,7 @@ def test_receive_kv_uses_layer_overlap_for_heterogeneous_pp(mooncake, monkeypatc
     worker._tp_size = {"engine": 1}
     worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
     worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
-    monkeypatch.setattr(mooncake, "get_pp_indices", _even_pp_indices)
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
     calls = []
 
     async def receive(
@@ -946,13 +939,67 @@ def test_receive_kv_uses_layer_overlap_for_heterogeneous_pp(mooncake, monkeypatc
     assert pull_meta.pull_tasks_count == 2
 
 
-def test_hetero_pp_rejects_custom_layer_partition(mooncake, monkeypatch):
+def test_hetero_pp_pp1_allows_matching_custom_layer_partition(
+    mooncake, monkeypatch
+):
+    """pp1↔pp2 with the same custom partition uses those stage ranges."""
     worker = _worker(mooncake, blocks_first=True)
     worker.pp_size = 1
     worker.pp_rank = 0
-    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "4,4")
-    with pytest.raises(RuntimeError, match="VLLM_PP_LAYER_PARTITION"):
-        worker._pp_overlap_layer_range(remote_pp_rank=0, remote_pp_size=2)
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    worker._reject_custom_partition_for_hetero_pp(
+        remote_pp_size=2, remote_partition="3,5"
+    )
+    assert worker._pp_overlap_layer_range(
+        remote_pp_rank=0, remote_pp_size=2
+    ) == (0, 3)
+    assert worker._pp_overlap_layer_range(
+        remote_pp_rank=1, remote_pp_size=2
+    ) == (3, 8)
+
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    worker._reject_custom_partition_for_hetero_pp(
+        remote_pp_size=1, remote_partition="3,5"
+    )
+    assert worker._pp_overlap_layer_range(
+        remote_pp_rank=0, remote_pp_size=1
+    ) == (0, 3)
+
+
+def test_hetero_pp_pp1_rejects_mismatched_custom_partition(
+    mooncake, monkeypatch
+):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    with pytest.raises(RuntimeError, match="matching"):
+        worker._reject_custom_partition_for_hetero_pp(
+            remote_pp_size=2, remote_partition="4,4"
+        )
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    with pytest.raises(RuntimeError, match="matching"):
+        worker._reject_custom_partition_for_hetero_pp(
+            remote_pp_size=2, remote_partition=""
+        )
+    worker.pp_size = 2
+    with pytest.raises(RuntimeError, match="matching"):
+        worker._reject_custom_partition_for_hetero_pp(
+            remote_pp_size=1, remote_partition=""
+        )
+
+
+def test_hetero_pp_both_gt1_rejects_custom_layer_partition(
+    mooncake, monkeypatch
+):
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    with pytest.raises(RuntimeError, match="both PP sizes are >1"):
+        worker._pp_overlap_layer_range(remote_pp_rank=0, remote_pp_size=4)
 
 
 def test_same_pp_allows_matching_custom_layer_partition(mooncake, monkeypatch):
@@ -1020,11 +1067,12 @@ def test_receive_kv_same_pp_keeps_custom_partition(mooncake, monkeypatch):
     assert calls == [("tp0-pp0", -1, -1)]
 
 
-def test_receive_kv_hetero_pp_rejects_custom_partition(mooncake, monkeypatch):
-    """Hetero PP + custom partition must finish the pull instead of raising."""
+def test_receive_kv_hetero_pp_uses_custom_partition(mooncake, monkeypatch):
+    """pp1 D pulls pp2 P by local custom stages, not even split."""
     worker = _worker(mooncake, blocks_first=True)
     worker.pp_size = 1
     worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
     failures = []
 
     def fail_pull(pull_metas, err_msg):
@@ -1034,15 +1082,116 @@ def test_receive_kv_hetero_pp_rejects_custom_partition(mooncake, monkeypatch):
     worker._tp_size = {"engine": 1}
     worker._remote_agents = {"engine": {0: {0: "tp0-pp0", 1: "tp0-pp1"}}}
     worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
-    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "4,4")
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    calls = []
+
+    async def receive(
+        worker_addr,
+        pull_metas,
+        *,
+        chunk_idx=None,
+        model_layer_start=-1,
+        model_layer_end=-1,
+    ):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+    pull_meta = SimpleNamespace(pull_tasks_count=0)
+    pull_metas = {"request": pull_meta}
+
+    async def run():
+        worker.receive_kv("engine", pull_metas)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert failures == []
+    assert calls == [("tp0-pp0", 0, 3), ("tp0-pp1", 3, 8)]
+    assert pull_meta.pull_tasks_count == 2
+
+
+def test_receive_kv_hetero_pp_d_pp2_uses_custom_partition(mooncake, monkeypatch):
+    """pp2 D slices its local stage from pp1 P without P's partition."""
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 8)
+    failures = []
+
+    def fail_pull(pull_metas, err_msg):
+        failures.append((pull_metas, err_msg))
+
+    worker._fail_pull_metas = fail_pull
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {"engine": {0: {0: "tp0-pp0"}}}
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
+    calls = []
+
+    async def receive(
+        worker_addr,
+        pull_metas,
+        *,
+        chunk_idx=None,
+        model_layer_start=-1,
+        model_layer_end=-1,
+    ):
+        calls.append((worker_addr, model_layer_start, model_layer_end))
+
+    worker.receive_kv_from_single_worker = receive
+    pull_meta = SimpleNamespace(pull_tasks_count=0)
+    pull_metas = {"request": pull_meta}
+
+    async def run():
+        worker.receive_kv("engine", pull_metas)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert failures == []
+    assert calls == [("tp0-pp0", 0, 3)]
+    assert pull_meta.pull_tasks_count == 1
+
+
+def test_receive_kv_hetero_pp_both_gt1_custom_partition_fail_closed(
+    mooncake, monkeypatch
+):
+    """Both PP sizes >1 plus a custom partition must finish the pull."""
+    worker = _worker(mooncake, blocks_first=True)
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    failures = []
+
+    def fail_pull(pull_metas, err_msg):
+        failures.append((pull_metas, err_msg))
+
+    worker._fail_pull_metas = fail_pull
+    worker._tp_size = {"engine": 1}
+    worker._remote_agents = {
+        "engine": {0: {0: "tp0-pp0", 1: "tp0-pp1", 2: "tp0-pp2", 3: "tp0-pp3"}}
+    }
+    worker.transfer_topo.handshake_target_ranks = lambda remote_tp_size: [0]
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "3,5")
     pull_metas = {"request": SimpleNamespace(pull_tasks_count=0)}
     worker.receive_kv("engine", pull_metas)
     assert len(failures) == 1
     assert failures[0][0] is pull_metas
-    assert "VLLM_PP_LAYER_PARTITION" in failures[0][1]
+    assert "both PP sizes are >1" in failures[0][1]
 
 
 def test_normalize_pp_layer_partition(mooncake):
     assert mooncake._normalize_pp_layer_partition(None) == ""
     assert mooncake._normalize_pp_layer_partition("3,5") == "3,5"
     assert mooncake._normalize_pp_layer_partition(" 3, 5 ") == "3,5"
+
+
+def test_pp_stage_range_matches_v21_pp1_and_custom(mooncake):
+    assert mooncake._pp_stage_range(8, 0, 1, "3,5") == (0, 8)
+    assert mooncake._pp_stage_range(8, 0, 2, "3,5") == (0, 3)
+    assert mooncake._pp_stage_range(8, 1, 2, "3,5") == (3, 8)
+    with pytest.raises(RuntimeError, match="does not match pp_size"):
+        mooncake._pp_stage_range(8, 0, 4, "3,5")
+    # Empty partition uses even split; 78/8 matches vLLM remainder.
+    assert mooncake._pp_partition_sizes(78, 8, None) == [9, 10, 10, 10, 10, 10, 10, 9]
+    assert mooncake._pp_stage_range(8, 0, 2, "") == (0, 4)
+    assert mooncake._pp_stage_range(8, 1, 2, None) == (4, 8)
