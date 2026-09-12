@@ -536,6 +536,137 @@ def checkpoint_model(monkeypatch):
     return outer
 
 
+@pytest.fixture
+def hyv4_fp8_checkpoint(checkpoint_model):
+    """Small real parameter tree with the target's three quantization owners."""
+    model = checkpoint_model
+    del model.model.norm
+    del model.model.hc_fn
+    layer = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([layer])
+    layer.self_attn = torch.nn.Module()
+    indexer = layer.self_attn.indexer = torch.nn.Module()
+    indexer.wk_weights_proj = torch.nn.Linear(64, 6, bias=False, dtype=torch.bfloat16)
+
+    def load_merged(param, value, shard_id):
+        start, count = [(0, 4), (4, 2)][shard_id]
+        assert value.shape == (count, 64)
+        with torch.no_grad():
+            param[start:start + count].copy_(value)
+
+    indexer.wk_weights_proj.weight.weight_loader = load_merged
+    indexer.wq_b = torch.nn.Module()
+    indexer.wq_b.weight = torch.nn.Parameter(
+        torch.ones(4, 64).to(torch.float8_e4m3fn), requires_grad=False)
+    indexer.wq_b.weight_scale = torch.nn.Parameter(torch.ones(4, 1))
+    layer.mlp = torch.nn.Module()
+    layer.mlp.gate = torch.nn.Linear(64, 4, bias=False, dtype=torch.float32)
+    layer.mlp.expert_bias = torch.nn.Parameter(torch.zeros(4))
+    return model
+
+
+def _hyv4_fp8_weights(model, scale, *, scale_name="weight_scale"):
+    prefix = "model.layers.0."
+    # Deliberately interleave the outer LM-head group between a weight and
+    # its scale: upstream AutoWeightsLoader invokes the inner loader twice.
+    return [
+        (prefix + "self_attn.indexer.wk.weight", torch.ones(4, 64).to(torch.float8_e4m3fn)),
+        ("lm_head.weight", torch.ones_like(model.lm_head.weight)),
+        (prefix + "mlp.router.gate.weight", torch.full((4, 64), 2.0).to(torch.float8_e4m3fn)),
+        (prefix + "self_attn.indexer.wk." + scale_name, scale),
+        (prefix + "mlp.router.gate." + scale_name, scale),
+        (prefix + "self_attn.indexer.weights_proj.weight_scale", torch.full((2, 1), 0.5)),
+        (prefix + "self_attn.indexer.weights_proj.weight", torch.full((2, 64), 6.0).to(torch.float8_e4m3fn)),
+        (prefix + "self_attn.indexer.wq_b.weight", torch.full((4, 64), 4.0).to(torch.float8_e4m3fn)),
+        (prefix + "self_attn.indexer.wq_b.weight_scale", torch.full((4, 1), 0.25)),
+        (prefix + "mlp.gate.e_score_correction_bias", torch.arange(4.0)),
+        ("model.mtp_layers.0.mlp.router.gate.weight_scale", torch.tensor(float("nan"))),
+    ]
+
+
+@pytest.mark.parametrize("layout", ["channel", "channel_column", "block", "raw_ue8m0", "mxfp8", "typed_ue8m0"])
+@pytest.mark.parametrize("scale_name", ["weight_scale", "weight_scale_inv"])
+def test_hyv4_fp8_loads_local_indexer_router_scales_without_touching_target(
+    hyv4_fp8_checkpoint, layout, scale_name,
+):
+    if layout.startswith("channel"):
+        scale = torch.tensor([0.5, 1.0, 2.0, 4.0])
+        expected = scale[:, None].expand(4, 64)
+        if layout == "channel_column":
+            scale = scale[:, None]
+    else:
+        scale = torch.tensor([[0.5, 1.0], [2.0, 4.0]])
+        expected = torch.tensor([[0.5] * 32 + [1.0] * 32] * 2
+                                + [[2.0] * 32 + [4.0] * 32] * 2)
+        if layout in ("raw_ue8m0", "typed_ue8m0", "mxfp8"):
+            scale = torch.tensor([[126, 127], [128, 129]], dtype=torch.uint8)
+        if layout == "mxfp8":
+            scale = scale.repeat_interleave(2, dim=0)
+        elif layout == "typed_ue8m0":
+            scale = scale.view(torch.float8_e8m0fnu)
+    model = hyv4_fp8_checkpoint
+    loaded = model.load_weights(iter(_hyv4_fp8_weights(model, scale, scale_name=scale_name)))
+    layer = model.model.layers[0]
+    actual = layer.self_attn.indexer.wk_weights_proj.weight
+    torch.testing.assert_close(actual[:4].float(), expected)
+    torch.testing.assert_close(actual[4:].float(), torch.full((2, 64), 3.0))
+    torch.testing.assert_close(layer.mlp.gate.weight, expected * 2)
+    torch.testing.assert_close(layer.mlp.expert_bias, torch.arange(4.0))
+    assert torch.isfinite(actual).all() and torch.isfinite(layer.mlp.gate.weight).all()
+    assert layer.self_attn.indexer.wq_b.weight.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(layer.self_attn.indexer.wq_b.weight.float(), torch.full((4, 64), 4.0))
+    torch.testing.assert_close(layer.self_attn.indexer.wq_b.weight_scale, torch.full((4, 1), 0.25))
+    assert loaded == set(dict(model.named_parameters()))
+    assert not hasattr(model.model, "_checkpoint_accounting")
+
+
+@pytest.mark.parametrize("missing", ["weight", "weight_scale"])
+def test_hyv4_fp8_incomplete_pair_fails_and_does_not_survive_reload(hyv4_fp8_checkpoint, missing):
+    model = hyv4_fp8_checkpoint
+    weights = _hyv4_fp8_weights(model, torch.ones(4, 1))
+    missing_name = "model.layers.0.self_attn.indexer.wk." + missing
+    with pytest.raises(RuntimeError, match="Incomplete HY V4 FP8"):
+        model.load_weights((name, value) for name, value in weights if name != missing_name)
+    assert not hasattr(model.model, "_checkpoint_accounting")
+    model.load_weights(iter(weights))
+
+
+def test_hyv4_fp8_duplicate_scale_alias_fails(hyv4_fp8_checkpoint):
+    model = hyv4_fp8_checkpoint
+    weights = _hyv4_fp8_weights(model, torch.ones(4, 1))
+    weights.insert(5, ("model.layers.0.self_attn.indexer.wk.weight_scale_inv", torch.ones(4, 1)))
+    with pytest.raises(RuntimeError, match="Duplicate HY V4"):
+        model.load_weights(iter(weights))
+
+
+def test_hyv4_fp8_scales_before_weights_preserves_fp32_router(hyv4_fp8_checkpoint):
+    model = hyv4_fp8_checkpoint
+    weights = _hyv4_fp8_weights(model, torch.full((4, 1), 1.0001))
+    model.load_weights(reversed(weights))
+    # The router must not round via BF16 when decoding its FP32 parameter.
+    torch.testing.assert_close(model.model.layers[0].mlp.gate.weight,
+                               torch.full((4, 64), 2.0002), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bad_weight", [torch.full((4, 64), float("nan")),
+                                      torch.full((4, 64), 448.0)])
+def test_hyv4_fp8_rejects_nonfinite_dequantized_weight(hyv4_fp8_checkpoint, bad_weight):
+    model = hyv4_fp8_checkpoint
+    weights = _hyv4_fp8_weights(model, torch.full((4, 1), 1e38))
+    weights[0] = (weights[0][0], bad_weight.to(torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="HY V4 FP8 dequantized weight must be finite"):
+        model.load_weights(iter(weights))
+
+
+@pytest.mark.parametrize("scale", [torch.ones(3), torch.ones(3, 2), torch.ones(1, 1, 1),
+                                 torch.full((4, 1), float("nan")),
+                                 torch.full((4, 1), -1.0),
+                                 torch.full((4, 1), 255, dtype=torch.uint8)])
+def test_hyv4_fp8_rejects_malformed_or_nonfinite_scale(hyv4_fp8_checkpoint, scale):
+    with pytest.raises(ValueError, match="HY V4 FP8"):
+        hyv4_fp8_checkpoint.load_weights(iter(_hyv4_fp8_weights(hyv4_fp8_checkpoint, scale)))
+
+
 def test_checkpoint_exact_accounting_across_interleaved_prefixes(checkpoint_model):
     weights = [
         ("model.norm.weight", torch.full((2, 2), 2.0)),

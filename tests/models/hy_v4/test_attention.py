@@ -29,6 +29,26 @@ from vllm_hcu.models.hy_v4.hcu_sparse import (
 )
 
 
+@pytest.mark.hcu
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_hyv4_group_fp8_quant_returns_values_and_fp32_scales(use_ue8m0):
+    from vllm_hcu.models.hy_v4.attention import per_token_group_quant_fp8
+
+    if not torch.cuda.is_available():
+        pytest.skip("a live HCU/ROCm device is required")
+    x = torch.linspace(-3, 3, 4 * 256, device="cuda").reshape(4, 256).bfloat16()
+    x[0].zero_()
+    q, scale = per_token_group_quant_fp8(x, group_size=128, use_ue8m0=use_ue8m0)
+    assert q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    assert scale.dtype == torch.float32 and scale.shape == (4, 2)
+    assert torch.isfinite(q.float()).all() and torch.isfinite(scale).all()
+    assert (scale > 0).all()
+    actual = q.float() * scale.repeat_interleave(128, dim=-1)
+    torch.testing.assert_close(actual, x.float(), rtol=0.08, atol=0.08)
+    if use_ue8m0:
+        torch.testing.assert_close(scale.log2(), scale.log2().round())
+
+
 @pytest.mark.parametrize("cache_dtype", ["fp8"])
 def test_hy_v4_rejects_accuracy_unsafe_kv_cache_dtype(
     cache_dtype: str,

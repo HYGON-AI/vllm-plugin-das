@@ -44,6 +44,14 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParameter
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+    dequant_mxfp8_to_bf16,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    scaled_dequantize,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -130,8 +138,106 @@ def _slice_sink_for_tp(
     return loaded_weight.narrow(0, tp_rank * local_heads, local_heads)
 
 
+def _dequantize_hyv4_fp8_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Decode HYV4 checkpoint scales before the current parameter loader runs."""
+    if weight.ndim != 2 or any(size <= 0 for size in weight.shape):
+        raise ValueError("HY V4 FP8 weight must be a nonempty matrix")
+    if scale.ndim == 1:
+        if scale.shape[0] != weight.shape[0]:
+            raise ValueError("HY V4 FP8 channel scale must have one value per row")
+        scale = scale.unsqueeze(-1)
+    if scale.ndim != 2 or any(size <= 0 for size in scale.shape):
+        raise ValueError("HY V4 FP8 scale must be a nonempty vector or matrix")
+    if any(w % s for w, s in zip(weight.shape, scale.shape)):
+        raise ValueError("HY V4 FP8 scale dimensions must divide the weight dimensions")
+
+    encoded_scale = scale
+    if scale.dtype in (torch.uint8, torch.float8_e8m0fnu):
+        scale = scale.view(torch.float8_e8m0fnu).float()
+    if not torch.isfinite(scale).all() or not (scale > 0).all():
+        raise ValueError("HY V4 FP8 scales must be finite and positive")
+    if (
+        out_dtype == torch.bfloat16
+        and encoded_scale.dtype == torch.uint8
+        and weight.shape[1] % MXFP8_BLOCK_SIZE == 0
+        and encoded_scale.shape == (weight.shape[0], weight.shape[1] // MXFP8_BLOCK_SIZE)
+    ):
+        result = dequant_mxfp8_to_bf16(weight, encoded_scale)
+    else:
+        result = scaled_dequantize(
+            weight,
+            scale,
+            group_shape=GroupShape(*(w // s for w, s in zip(weight.shape, scale.shape))),
+            out_dtype=out_dtype,
+        )
+    if not torch.isfinite(result).all():
+        raise ValueError("HY V4 FP8 dequantized weight must be finite")
+    return result
+
+
+_HYV4_FP8_LOCAL_PROJECTION = re.compile(
+    r"(?P<prefix>(?:model\.)?layers\.\d+\.)"
+    r"(?P<projection>self_attn\.indexer\.(?:wk|weights_proj)|mlp\.gate)\."
+    r"(?P<part>weight|weight_scale|weight_scale_inv)"
+)
+
+
+def _try_load_hyv4_fp8_projection(
+    model,
+    name: str,
+    tensor: torch.Tensor,
+    params_dict: dict[str, torch.nn.Parameter],
+    loaded_params: set[str],
+) -> bool:
+    """Pair only the unquantized indexer shards and FP32 router projections."""
+    match = _HYV4_FP8_LOCAL_PROJECTION.fullmatch(name)
+    if match is None:
+        return False
+    part = "weight" if match["part"] == "weight" else "scale"
+    if part == "weight" and tensor.dtype not in (
+        torch.float8_e4m3fn, torch.float8_e4m3fnuz,
+    ):
+        return False
+    projection = match["projection"]
+    shard_id = None
+    if projection != "mlp.gate":
+        shard_id = 0 if projection.endswith(".wk") else 1
+        projection = "self_attn.indexer.wk_weights_proj"
+    parameter_name = match["prefix"] + projection + ".weight"
+    if is_pp_missing_parameter(parameter_name, model):
+        return True
+    if parameter_name not in params_dict:
+        raise RuntimeError(f"Unknown HY V4 FP8 projection: {parameter_name}")
+    param = params_dict[parameter_name]
+    accounting = model._checkpoint_accounting
+    key = (parameter_name, shard_id)
+    piece = (key, part)
+    if piece in accounting.fp8_received or key[1] in accounting.received.get(key[0], set()):
+        raise RuntimeError(f"Duplicate HY V4 FP8 checkpoint piece: {name}")
+    accounting.fp8_received.add(piece)
+    pair = accounting.fp8_pending.setdefault(key, {})
+    pair[part] = tensor
+    if len(pair) != 2:
+        return True
+
+    dequantized = _dequantize_hyv4_fp8_weight(pair["weight"], pair["scale"], param.dtype)
+    accounting.record(parameter_name, shard_id)
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    if shard_id is None:
+        weight_loader(param, dequantized)
+    else:
+        weight_loader(param, dequantized, shard_id)
+    loaded_params.add(parameter_name)
+    del accounting.fp8_pending[key]
+    return True
+
+
 class _HYV4CheckpointAccounting:
-    """Track checkpoint slots without retaining checkpoint or parameter storage.
+    """Track checkpoint slots and retain only unmatched local FP8 pairs.
 
     A fused parameter is complete only after every projection and local expert
     has loaded. The outer loader shares this ledger across disjoint prefix
@@ -141,6 +247,8 @@ class _HYV4CheckpointAccounting:
     def __init__(self, model) -> None:
         self.expected: dict[str, set[object]] = {}
         self.received: dict[str, set[object]] = {}
+        self.fp8_pending: dict[tuple[str, int | None], dict[str, torch.Tensor]] = {}
+        self.fp8_received: set[tuple[tuple[str, int | None], str]] = set()
         num_experts = getattr(model.config, "num_experts", 0)
         for name, param in model.named_parameters():
             if isinstance(param, KVCacheScaleParameter):
@@ -172,6 +280,12 @@ class _HYV4CheckpointAccounting:
         received.update(slots)
 
     def validate(self, prefix: str = "") -> None:
+        if self.fp8_pending:
+            missing_parts = {
+                f"{prefix}{name} shard={shard}": sorted({"weight", "scale"} - pair.keys())
+                for (name, shard), pair in self.fp8_pending.items()
+            }
+            raise RuntimeError(f"Incomplete HY V4 FP8 projection pairs: {missing_parts}")
         missing = {
             prefix + name: sorted(map(str, slots - self.received.get(name, set())))
             for name, slots in self.expected.items()
@@ -621,6 +735,10 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             if is_skip_topk_indexer_weight(name, skip_topk_layers):
                 continue
             mapped_name = _rewrite_hyv4_weight_name(name)
+            if _try_load_hyv4_fp8_projection(
+                self, mapped_name, loaded_weight, params_dict, loaded_params,
+            ):
+                continue
             if mapped_name != name and mapped_name.endswith(".expert_bias"):
                 if is_pp_missing_parameter(mapped_name, self):
                     continue
