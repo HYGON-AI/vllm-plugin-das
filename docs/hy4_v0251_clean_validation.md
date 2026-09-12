@@ -1,27 +1,48 @@
 # HYV4 v0.25.1 clean integration validation
 
-This is the Task 10 execution protocol, prepared before real model runs.
+This contains the Task 10 execution protocol and Task 11 observed results.
 CPU tests establish contracts; they do not establish checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
-Task 11 must replace each state only after retaining its evidence.
+Each result state is updated only after retaining its evidence. The observed
+PP2/PCP4 correctness and static-loader failures mean this matrix is not an
+overall integration pass; DP8 also hits the recorded environment-capacity limit.
+
+Task 11 provenance capture began at 2026-09-12T21:11:05Z (the host renders
+local log timestamps as 2026-09-13 UTC+08:00), from candidate
+`d1dc00f31fba9e850d6e1c8f1ac8d14870afa5ad`. Artifacts are under
+`/models/validation-logs/hy4-v0251-clean-20260912T211105Z` and
+`/models/eval-results/hy4-v0251-clean-20260912T211105Z`.
+
+The provenance-review Minor is resolved: every launch captures
+`aiter=0.1.5+dtk2604.torch2110.2609021352.gab70b0`,
+`lightop=0.6.0+das.dtk2604`, and
+`deep-ep=1.1.0+dtk2604.torch2110.2609022105.gbb2ba6`.
+Model `config.json` SHA-256 is
+`d4a648cb09bb89f4b8778e60629e43618f1abb581ef3aa38bd67b2b2cd998441`;
+`model.safetensors.index.json` SHA-256 is
+`9cc56bfc4527ee64d6e2cf05d6c4eb7c2d658a6c7431bc52265cf90e93c8a715`.
+This host has no `ss`; the executable listener checks below use `psutil`.
 
 ## Hardware result matrix
 
 | Gate | State | Required evidence |
 | --- | --- | --- |
-| TP8 Channel-FP8 target, AITER, default graphs | not run | Roots, load, backend, graph capture, health, short/long chat, teardown |
-| TP8 MTP3, AITER, default graphs | not run | Target/draft capture, drafted/accepted tokens and acceptance by position |
-| TP8 MTP3, FP8 E4M3 KV, repeated prefix | not run | Three requests, rising cache hits, coherent output, healthy service |
-| PP2/TP1/PCP4/DP1/DCP1/EP4, DeepEP HT, DeepGEMM, eager | not run | Two stages, four stage-local ranks, short and 3000+ token prefill |
-| DP8/TP1/EP8, DeepEP HT, DeepGEMM | not run | All eight ranks, HTTP 200, correct backend and clean teardown |
-| DP8/EP8 static offline EPLB load | not run | Same plan digest on ranks, pre-load binding, zero post-load rearrangements |
-| HumanEval/0–31 target-only | not run | 32 predictions/reviews, accuracy, Pass@1, errors and lengths |
-| HumanEval/0–31 MTP3 | not run | Same tasks/options, per-task flips, accuracy and acceptance |
+| TP8 Channel-FP8 target, AITER, default graphs | PASS | 131 shards loaded; AITER configs; PIECEWISE/FULL capture; HTTP 200 short and 3×3145-token prompts; clean teardown |
+| TP8 MTP3, AITER, default graphs | PASS | Target/draft capture; HTTP 200; 114 drafted, 81 accepted tokens; clean teardown |
+| TP8 MTP3, FP8 E4M3 KV, repeated prefix | PASS | 3×3145-token prompts; hits 0/3008/6016; coherent output; HTTP 200; clean teardown |
+| PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | FAIL | Short chat correct; all three long outputs incoherent and length-truncated despite HTTP 200; clean teardown; DCP disabled/default |
+| DP8/TP1/EP8, DeepEP HT, DeepGEMM | FAIL — capacity | All eight ranks loaded; KV budget −0.7 GiB; no readiness; exit 1; clean teardown |
+| DP8/EP8 static offline EPLB load | FAIL — loader owner | All eight workers reject static pre-load binding before weights/KV; exit 1; clean teardown |
+| HumanEval/0–31 target-only | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors; all stop; clean teardown |
+| HumanEval/0–31 MTP3 | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors/flips; acceptance 93.03%; clean teardown |
 | Custom packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
 | Native packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
 | Two-node Mooncake P/D | not run | Two-node transfer and generation evidence |
 
 Custom/native W4A8 have no compatible checkpoint or hardware validation.
+DCP is not tested, per the updated Task 11 scope. A recorded
+`decode_context_parallel_size=1` is only the disabled/default setting;
+there are no DCP-specific tests, metrics, or expanded combinations.
 The supplied checkpoint is Channel-FP8, not a W4A8 substitute. Mooncake has
 no two-node runtime validation. Static SlimQuant EPLB, HYV4 dynamic/record
 EPLB, and MTP+PCP are unsupported. Generic offline record tests do not
@@ -65,7 +86,10 @@ print(sys.version, sys.executable)
 print(vllm.__file__, md.version("vllm"))
 print(vllm_hcu.__file__, md.version("vllm-hcu"))
 print(torch.__version__, torch.version.hip)
+for distribution in ("aiter", "lightop", "deep-ep"):
+    print(distribution, md.version(distribution))
 PY
+sha256sum "$MODEL/config.json" "$MODEL/model.safetensors.index.json"
 sha256sum /models/artifacts/hy4-v0251-clean/vllm-0.25.1+das185.dtk2604.torch2110.2608171710.g7b108a-cp310-cp310-linux_x86_64.whl
 cat /opt/dtk/.info/rocm_version
 git rev-parse HEAD origin/v0.25.1
@@ -128,7 +152,7 @@ blocked run. Do not stop another service.
 ```bash
 rocm-smi --showmeminfo vram --showuse | tee "$RUN_ROOT/${SERVED_MODEL:?}-memory-before.txt"
 ps -eo pid,ppid,pgid,user,stat,lstart,cmd --sort=start_time > "$RUN_ROOT/$SERVED_MODEL-processes-before.txt"
-ss -ltnp 'sport = :8000'
+python3 -c 'import psutil; print([(c.pid, c.laddr) for c in psutil.net_connections(kind="tcp") if c.status == "LISTEN" and c.laddr.port == 8000])'
 ```
 
 Use a dedicated interactive PTY for the server. In that PTY set
@@ -180,7 +204,9 @@ env -u VLLM_PLUGINS python3 -m vllm.entrypoints.cli.main serve "$MODEL" \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
-Exact PP2/TP1/PCP4/DP1/DCP1 with stage-local EP4, FP8 KV and eager execution.
+Exact PP2/TP1/PCP4/DP1 with stage-local EP4, FP8 KV and eager execution.
+The explicit decode-context size of 1 only records DCP disabled/default;
+DCP is not tested.
 There is no speculative configuration on this command.
 
 ```bash
@@ -281,7 +307,7 @@ while len(tokenizer.encode(prefix)) < 3100:
 for i in range(3):
     message = prefix + f"\nQuestion {i}: Name the city described above."
     messages = [dict(role="user", content=message)]
-    token_count = len(tokenizer.apply_chat_template(messages, tokenize=True,
+    token_count = len(tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False,
         add_generation_prompt=True, reasoning_effort="no_think"))
     assert 3000 <= token_count < 3800, token_count
     payload = dict(model=os.environ["SERVED_MODEL"], messages=messages,
@@ -410,7 +436,7 @@ the listening PID must be inspected and confirmed to be this run's
 `SERVED_MODEL` before setting `SERVICE_PID`.
 
 ```bash
-ss -ltnp 'sport = :8000'
+python3 -c 'import psutil; print([(c.pid, c.laddr) for c in psutil.net_connections(kind="tcp") if c.status == "LISTEN" and c.laddr.port == 8000])'
 # Set SERVICE_PID to the inspected listening PID, not a name-based match.
 read -r -p 'Inspected listening PID for this service: ' SERVICE_PID
 export SERVICE_PID
@@ -446,7 +472,7 @@ for row in json.loads(path.read_text()):
         pass
 assert not survivors, survivors
 PY
-ss -ltnp 'sport = :8000'
+python3 -c 'import psutil; print([(c.pid, c.laddr) for c in psutil.net_connections(kind="tcp") if c.status == "LISTEN" and c.laddr.port == 8000])'
 rocm-smi --showmeminfo vram --showuse | tee "$RUN_ROOT/$SERVED_MODEL-memory-after.txt"
 ps -eo pid,ppid,pgid,user,stat,lstart,cmd --sort=start_time \
   > "$RUN_ROOT/$SERVED_MODEL-processes-after.txt"
@@ -468,3 +494,202 @@ These are carried forward for final review; Task 10 does not claim fixes:
 - Task 9: linear weight-loader bound-owner introspection.
 - Inherited Torch/JIT deprecation warnings and installed plugin version metadata
   concern described above.
+
+## Task 11 observed runs
+
+### TP8 target, default graphs — PASS
+
+Evidence directory: `01b-target` under the validation-log root above.
+The service ran from 2026-09-12T21:13:04Z through 21:26:53Z, API PID 1017407.
+All eight TP workers loaded the 131-shard checkpoint. The log identifies
+`ChannelWiseTorchFP8ScaledMMLinearKernel`, the AITER FP8 MoE backend, and
+AITER `gfx938/fp8_w8a8/E=256,N=256,dtype=fp8_w8a8.json` configurations
+(including the bottom-layer variant). PIECEWISE and FULL graph capture
+completed; each worker reported 24 seconds and 0.28 GiB for capture.
+
+The final request batch in `requests-final/` returned HTTP 200 for health,
+models, metrics, short chat, and three long prompts. Short chat answered
+“Paris.” (34 prompt tokens, 3 output tokens). All long prompts had 3145
+tokens; outputs identified Paris with 2, 53 and 60 completion tokens, all
+with finish reason `stop`. Prefix-cache hits were 0, 3072 and 6144 after
+the three requests. Health remained HTTP 200. Full payloads, responses,
+headers and timing are retained, with `request-summary.json` aggregating them.
+
+The initial client-side long-prompt check counted the two keys of this
+Transformers build's default `BatchEncoding`; explicit `return_dict=False`
+corrected the token-count check. Its original evidence remains intact and
+the server configuration was unchanged. A preliminary wrapper attempt in
+`01-target` was stopped before worker initialization and is separately
+recorded in the Task 11 report; it is not a model failure.
+
+Ctrl-C was sent only to the owned foreground PTY at 21:26:51Z. The pinned
+runtime used its default abort shutdown, including its own process-manager
+cleanup. The command exited 0. `teardown.log` reports no owned PID/start-time
+survivors, no listener on port 8000, and all eight devices at 0% and 2 MiB.
+
+### TP8 MTP3, default graphs — PASS
+
+Evidence: `02-mtp3`; API PID 1056982; UTC 21:27:32–21:32:09 on
+2026-09-12. `HYV4MTPModel` resolved; all eight workers completed target
+PIECEWISE/FULL and speculator prefill/decode graph capture (42 seconds,
+0.88 GiB each). Channel-FP8 linear and AITER FP8 MoE selection were retained.
+Health, models, short chat, three 3145-token prompts and post-reuse health
+all returned HTTP 200. Outputs coherently identified Paris; completion
+lengths were 3, 2, 54 and 60, all `stop`.
+
+Final cumulative metrics: 38 drafts, 114 drafted tokens, 81 accepted tokens
+(71.05%); accepted by position 34/26/21, or 89.47%/68.42%/55.26% of drafts.
+These are cumulative counters, distinct from the service's interval rates.
+Prefix hits reached 6016. Ctrl-C targeted only this foreground PTY; exit 0,
+no owned process survivors or listener, and all eight cards back to 0%/2 MiB
+(`teardown.log`).
+
+### TP8 MTP3, FP8 KV and repeated prefix — PASS
+
+Evidence: `03-mtp3-fp8-kv`; API PID 1074407; UTC 21:32:32–21:36:30.
+The configuration retained TP8, AITER, MTP3 and default graphs and explicitly
+selected `fp8_e4m3` KV. Target/draft capture completed on all eight workers
+(41 seconds, 0.90 GiB each). All readiness, short, long-prefix and health
+checks returned HTTP 200. Long prompts were 3145 tokens each; outputs were
+Paris/Paris/a coherent Paris explanation (2/2/52 tokens, all `stop`). Prefix
+hits rose 0→3008→6016; no cache shape, dtype or slot error appeared.
+
+Final counters: 22 drafts, 66 drafted tokens, 36 accepted (54.55%); accepted
+by position 15/11/10 (68.18%/50.00%/45.45% of drafts). Short chat used 3 output
+tokens and stopped normally. Owned-PTY Ctrl-C at 21:36:27 was followed by
+exit 0 and `TEARDOWN_PASS`: no owned survivors/listener, eight cards 0%/2 MiB.
+
+### PP2+PCP4+EP4 eager — FAIL, long-prefill correctness
+
+Evidence: `04-pp2-pcp4`; API PID 1092968; UTC 21:36:56–21:41:27.
+The exact requested topology/backend ran: partition `41,37`, two PP stages,
+four stage-local PCP/EP workers each, TP1/DP1, DeepEP HT, DeepGEMM and FP8 KV.
+Logs name `DeepEPHTAll2AllManager` and
+`DeepEPDeepGemmContiguousExperts with DeepGEMM HT path`. All eight workers
+loaded; stage-0 workers reported 110.36 GiB, stage-1 workers 101.58 GiB.
+DCP was disabled/default and was not tested.
+
+Short chat correctly answered Paris (3 tokens, `stop`). All three long
+requests returned HTTP 200 but generated unrelated/repetitive mixed-language
+text, each 128 tokens with `finish_reason=length`; this is a correctness
+failure, not a passing service gate. Post-request health remained 200.
+`baseline-comparison.json` retains exact texts, hashes and usage and proves
+each corresponding request is identical to the successful TP8 baseline
+except the served-model name (same template kwargs, seed, temperature,
+128-token limit and 3145-token prompt). The three controlled suffixes are
+different from one another, but each matches its baseline counterpart.
+
+The launch partition and all eight PP/PCP/EP worker identities are recorded.
+No explicit NaN, collective, index/cache error, traceback or ERROR was found
+in the pre-shutdown log; this does not prove numerical intermediates are
+valid. Root cause is not established, and no implementation, topology or
+backend was changed. Owned-PTY Ctrl-C at 21:41:24 led to exit 0 and full
+`TEARDOWN_PASS` (no owned survivors/listener, eight cards 0%/2 MiB).
+
+### DP8+EP8 eager — FAIL, environment capacity
+
+Evidence: `05-dp8-ep8`; launcher PID 1110663; UTC 21:42:06–21:44:56.
+All eight DP/EP workers loaded 125.69 GiB each. DeepEP HT prepare/finalize
+and DeepGEMM HT experts were selected. At the required 0.95 GPU utilization,
+4096-token model/batch limits and 16 sequences, the log reports
+`Available KV cache memory: -0.7 GiB`, followed by
+`ValueError: No available memory for the cache blocks` on all eight engines.
+The service exited 1 before readiness; no model request was sent.
+
+This is the observed capacity limit for this exact checkpoint/environment,
+not evidence that DeepEP itself rejected the topology. No memory, batch,
+length or backend setting was changed. Runtime failure cleanup left no
+owned survivors/listener and all eight cards at 0%/2 MiB (`teardown.log`).
+The owned readiness helper was stopped by its verified exact PID after the
+service exited; its identity and SIGTERM are retained in `readiness-stop.json`.
+
+### DP8/EP8 static EPLB load — FAIL, implementation loader-owner guard
+
+Evidence: `06-static-eplb`; launcher PID 1132324; UTC 21:45:44–21:47:41.
+The retained synthetic identity map has 77×256 entries and SHA-256
+`4a37b1fe4de680fe0fd4d630156c07433052796828d0a1a1744b4892b70768e8`;
+current-loader schema validation passed in `static-map-preflight.log`.
+It is not a recorded or optimized map. The exact DP8 launch added only
+`--enable-eplb` and the documented static-load configuration.
+
+At 21:47:29 all eight workers raised
+`ValueError: Static EPLB parameter has an unsupported loader owner` from
+`bind_static_eplb_plan` (`static_eplb.py:252`), reached through the
+`initialize_model` pre-load hook. Thus binding failed before checkpoint
+weight loading and KV initialization; this is independent of the previous
+DP8 capacity failure. No ready service, HTTP inference, successful runtime
+plan binding, or zero-rearrangement evidence exists. The offending parameter
+identity is not logged, so a more specific root cause is unproven.
+
+The process exited 1 without an assistant-issued service signal. Teardown
+verified all 24 logged API/engine/worker PIDs absent, no owned identity
+survivors/listener, and eight cards 0%/2 MiB. No code or backend was changed.
+
+### HumanEval/0–31 target-only — PASS for this 32-task slice
+
+Fresh-service evidence: `07-humaneval-target`; PID 1144718. Evaluation
+results are in `target/` under the evaluation root; `target-summary.json`
+independently checks 32 unique predictions and 32 reviews for exactly tasks
+HumanEval/0 through HumanEval/31. Retained input JSONL SHA-256:
+`6906d173a121e247cc03340ec685d66019a6aa8949276a368b796b819540bc2c`.
+The dataset comes from openai/human-eval commit
+`6d43fb980f9fee3c892a914eda09951f772ad10d`; original compressed data is retained.
+
+EvalScope 1.9.1 ran at UTC 21:51:36–22:00:48 with fresh outputs, no_think,
+temperature/seed 0, max_tokens 2048 and batch size 1. Accuracy and Pass@1
+were both 1.0 (32/32). There were zero model/API errors or judge failures;
+all 32 finish reasons were `stop`. Output tokens: total 4328, mean 135.25,
+median 122.5, range 46–285. Per-task outputs, lengths and execution results
+are preserved in predictions/reviews and the independent summary.
+
+The fresh service retained TP8/AITER/default graphs and default KV, completed
+graph capture and returned HTTP 200 for pre/post checks. Ctrl-C targeted only
+its PTY; exit 0 and full process/listener/device teardown passed. This small
+slice is not a full HumanEval or general accuracy claim; MTP comparison follows.
+
+### HumanEval/0–31 MTP3 and comparison — PASS for this 32-task slice
+
+Fresh-service evidence: `08-humaneval-mtp3`; PID 1173421; UTC
+22:01:22–22:08:58. Target and draft graph capture completed under the same
+TP8/AITER/default-KV/default-graph conditions as the validated MTP3 smoke.
+EvalScope ran at 22:04:50–22:08:45 into fresh `mtp3/` results. Independent
+`mtp3-summary.json` and `comparison.json` verify the complete data below.
+
+| HumanEval/0–31 result | Target-only | MTP3 |
+| --- | ---: | ---: |
+| Unique predictions / reviews | 32 / 32 | 32 / 32 |
+| Accuracy / Pass@1 | 100% / 100% | 100% / 100% |
+| Model/API errors / judge failures | 0 / 0 | 0 / 0 |
+| Finish reason `stop` / length-limited | 32 / 0 | 32 / 0 |
+| Total output tokens | 4328 | 4409 |
+| Mean / median output tokens | 135.25 / 122.5 | 137.78125 / 125 |
+| Minimum–maximum output tokens | 46–285 | 47–299 |
+
+Both server logs contain exactly 32 chat HTTP-200 responses. Evaluation
+arguments differ only in served-model name and output directory; all retained
+user messages match after excluding EvalScope's internal generated message
+ID. Per-sample correctness flips: **0** (neither pass→fail nor fail→pass).
+Exact output text matches on 25/32 tasks; seven differ in text while both
+outputs pass. All 32 per-task comparisons, output hashes, lengths, finish
+reasons and judge results are retained; this is not a bitwise-output claim.
+
+MTP cumulative metrics began at zero: 1171 drafts, 3513 drafted tokens,
+3268 accepted tokens, overall acceptance 93.0259%. Accepted by positions
+0/1/2: 1149/1093/1026, corresponding to 98.1213%/93.3390%/87.6174% of drafts.
+These are full-evaluation counters, not interval-rate snapshots. Post-run
+metrics and health returned 200; owned-PTY Ctrl-C at 22:08:55 led to exit 0
+and `TEARDOWN_PASS` with no owned/logged survivors, no listener and eight
+cards 0%/2 MiB. These results do not close the independent distributed
+implementation failures, capacity blocker, W4A8 or Mooncake gaps above.
+
+## Task 11 closing checks
+
+Only this validation document changed in the tracked repository. Pinned-env
+`python3 -m compileall -q vllm_hcu tests`, `git diff --check`, and
+`git diff origin/v0.25.1 --check` returned 0. All 16 Bash command blocks passed
+`bash -n`. The final evidence audit rechecked launch roots/dependencies/hash
+provenance, the eleven matrix states, all owned/logged service PIDs, port 8000
+and all eight devices. Every service teardown passed; the final devices were
+0%/2 MiB. These static/evidence checks do not turn the three failed hardware
+rows into passes. Full details and historical setup/audit-helper corrections
+are retained in the Task 11 report and validation-log directory.
