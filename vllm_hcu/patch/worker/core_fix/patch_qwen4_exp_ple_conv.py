@@ -13,9 +13,10 @@ import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from ._common import PatchCompatibilityError, load_exact_module, require_class
+from ._common import PatchCompatibilityError, require_class
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.ple_layer"
+REPLACEMENT_MODULE = "vllm_hcu.models.qwen4_exp.amd.ple_layer"
 PATCH_ID = "worker.core_fix.qwen4_exp.ple_depthwise_conv1d"
 _MARKER = "_vllm_hcu_qwen4_exp_ple_conv_applied"
 _WRAPPER = "_vllm_hcu_qwen4_exp_ple_fallback_wrapper"
@@ -111,6 +112,10 @@ def _hcu_qwen4_exp_ple_ngram(
     query_start_loc: torch.Tensor,
     ngram_context: torch.Tensor,
     output: torch.Tensor,
+    current_ids_buffer: torch.Tensor,
+    current_rows_buffer: torch.Tensor,
+    successor_ids_buffer: torch.Tensor,
+    successor_rows_buffer: torch.Tensor,
     layer_name: str,
 ) -> None:
     from vllm.forward_context import get_forward_context
@@ -118,8 +123,31 @@ def _hcu_qwen4_exp_ple_ngram(
     ple = importlib.import_module(TARGET_MODULE)
     original_forward = getattr(ple, "_vllm_hcu_original_ngram_forward")
     owner = get_forward_context().no_compile_layers[layer_name]
+    ngram = owner.ple_embedding
+    if hasattr(ngram, "_hcu_prefetch_ids_buffer"):
+        if current_ids_buffer is not ngram._hcu_prefetch_ids_buffer:
+            raise RuntimeError(f"PLE current ids workspace mismatch for {layer_name}")
+        if current_rows_buffer is not ngram._hcu_prefetch_rows_buffer:
+            raise RuntimeError(f"PLE current rows workspace mismatch for {layer_name}")
+        successor = ngram._hcu_prefetch_successor
+        expected_ids = (
+            successor._hcu_prefetch_ids_buffer
+            if successor is not None
+            else ngram._hcu_prefetch_successor_ids_sentinel
+        )
+        expected_rows = (
+            successor._hcu_prefetch_rows_buffer
+            if successor is not None
+            else ngram._hcu_prefetch_successor_rows_sentinel
+        )
+        if successor_ids_buffer is not expected_ids:
+            raise RuntimeError(f"PLE successor ids workspace mismatch for {layer_name}")
+        if successor_rows_buffer is not expected_rows:
+            raise RuntimeError(
+                f"PLE successor rows workspace mismatch for {layer_name}"
+            )
     result = original_forward(
-        owner.ple_embedding,
+        ngram,
         input_ids,
         query_start_loc,
         ngram_context,
@@ -130,7 +158,12 @@ def _hcu_qwen4_exp_ple_ngram(
 direct_register_custom_op(
     op_name="hcu_qwen4_exp_ple_ngram",
     op_func=_hcu_qwen4_exp_ple_ngram,
-    mutates_args=["output"],
+    mutates_args=[
+        "output",
+        "current_rows_buffer",
+        "successor_ids_buffer",
+        "successor_rows_buffer",
+    ],
 )
 
 
@@ -139,6 +172,10 @@ def _run_ple_ngram_custom_op(
     query_start_loc,
     ngram_context,
     output,
+    current_ids_buffer,
+    current_rows_buffer,
+    successor_ids_buffer,
+    successor_rows_buffer,
     layer_name,
 ) -> None:
     torch.ops.vllm.hcu_qwen4_exp_ple_ngram(
@@ -146,13 +183,30 @@ def _run_ple_ngram_custom_op(
         query_start_loc,
         ngram_context,
         output,
+        current_ids_buffer,
+        current_rows_buffer,
+        successor_ids_buffer,
+        successor_rows_buffer,
         layer_name,
     )
 
 
+def _load_ple_module(module: ModuleType | None) -> ModuleType:
+    if module is None:
+        module = importlib.import_module(TARGET_MODULE)
+    if module.__name__ not in (TARGET_MODULE, REPLACEMENT_MODULE):
+        raise PatchCompatibilityError(
+            f"expected module {TARGET_MODULE} or {REPLACEMENT_MODULE}, "
+            f"got {module.__name__}"
+        )
+    return module
+
+
 def apply_to_module(module: ModuleType) -> bool:
-    ple = load_exact_module(TARGET_MODULE, module)
-    ple_class = require_class(ple, "Qwen4ExpPLELayer", f"{TARGET_MODULE}.Qwen4ExpPLELayer")
+    ple = _load_ple_module(module)
+    ple_class = require_class(
+        ple, "Qwen4ExpPLELayer", f"{TARGET_MODULE}.Qwen4ExpPLELayer"
+    )
     ngram_class = require_class(
         ple,
         "Qwen4ExpNGramEmbedding",
@@ -172,7 +226,9 @@ def apply_to_module(module: ModuleType) -> bool:
 
     functional = getattr(ple, "F", None)
     if functional is None or not callable(getattr(functional, "conv1d", None)):
-        raise PatchCompatibilityError(f"required target {TARGET_MODULE}.F.conv1d is missing")
+        raise PatchCompatibilityError(
+            f"required target {TARGET_MODULE}.F.conv1d is missing"
+        )
     fallback = getattr(ple_class, "_short_conv_fallback", None)
     if not callable(fallback) or tuple(inspect.signature(fallback).parameters) != (
         "self",
@@ -210,11 +266,36 @@ def apply_to_module(module: ModuleType) -> bool:
             dtype=self.ngram_embedding.params_dtype,
             device=input_ids.device,
         )
+        if hasattr(self, "_hcu_prefetch_ids_buffer"):
+            current_ids_buffer = self._hcu_prefetch_ids_buffer
+            current_rows_buffer = self._hcu_prefetch_rows_buffer
+            successor = self._hcu_prefetch_successor
+            successor_ids_buffer = (
+                successor._hcu_prefetch_ids_buffer
+                if successor is not None
+                else self._hcu_prefetch_successor_ids_sentinel
+            )
+            successor_rows_buffer = (
+                successor._hcu_prefetch_rows_buffer
+                if successor is not None
+                else self._hcu_prefetch_successor_rows_sentinel
+            )
+        else:
+            # PREFETCH=0 keeps the official PLE module. Preserve that path while
+            # satisfying the one stable custom-op schema with zero-sized tensors.
+            current_ids_buffer = input_ids.new_empty((0,), dtype=torch.int64)
+            current_rows_buffer = output.new_empty((0,))
+            successor_ids_buffer = input_ids.new_empty((0,), dtype=torch.int64)
+            successor_rows_buffer = output.new_empty((0,))
         _run_ple_ngram_custom_op(
             input_ids,
             query_start_loc,
             ngram_context,
             output,
+            current_ids_buffer,
+            current_rows_buffer,
+            successor_ids_buffer,
+            successor_rows_buffer,
             self.layer_name,
         )
         return output
@@ -232,7 +313,13 @@ def apply_to_module(module: ModuleType) -> bool:
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    return apply_to_module(load_exact_module(TARGET_MODULE, module))
+    return apply_to_module(_load_ple_module(module))
 
 
-__all__ = ["PATCH_ID", "TARGET_MODULE", "apply", "apply_to_module"]
+__all__ = [
+    "PATCH_ID",
+    "REPLACEMENT_MODULE",
+    "TARGET_MODULE",
+    "apply",
+    "apply_to_module",
+]

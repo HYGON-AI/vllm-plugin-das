@@ -11,6 +11,7 @@ is requested.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -73,6 +74,14 @@ _ATTENTION: tuple[_Entry, ...] = (
     ),
 )
 
+_QWEN4_EXP_PLE: tuple[_Entry, ...] = (
+    (
+        "module_exchange.qwen4_exp.ple_prefetch",
+        "vllm.models.qwen4_exp.amd.ple_layer",
+        "vllm_hcu.models.qwen4_exp.amd.ple_layer",
+    ),
+)
+
 _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
     _MODULAR_KERNEL,
     _BASE_LINEAR,
@@ -84,6 +93,19 @@ _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
 )
 
 _HCU_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _ple_prefetch_requested() -> bool:
+    return os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in (
+        "true",
+        "1",
+    )
+
+
+def _enabled_groups() -> tuple[tuple[_Entry, ...], ...]:
+    if _ple_prefetch_requested():
+        return (*_ALL_GROUPS, _QWEN4_EXP_PLE)
+    return _ALL_GROUPS
 
 
 def _validate_hcu_replacement_path(module_name: str) -> None:
@@ -177,6 +199,14 @@ def register_attention_exchanges(
     return _register_entries(_ATTENTION, coordinator)
 
 
+def register_qwen4_exp_ple_exchange(
+    coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
+) -> tuple[ImportRegistration, ...]:
+    if not _ple_prefetch_requested():
+        return ()
+    return _register_entries(_QWEN4_EXP_PLE, coordinator)
+
+
 def register_all_module_exchanges(
     coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
 ) -> tuple[ImportRegistration, ...]:
@@ -188,9 +218,10 @@ def register_all_module_exchanges(
         # official implementation before the HCU-owned alias is visible.
         # Nested group fences use the coordinator's RLock and keep this whole
         # inventory one atomic visibility unit.
-        _validate_entries(entry for group in _ALL_GROUPS for entry in group)
+        groups = _enabled_groups()
+        _validate_entries(entry for group in groups for entry in group)
         registrations: list[ImportRegistration] = []
-        for group in _ALL_GROUPS:
+        for group in groups:
             registrations.extend(_register_entries(group, coordinator))
         return tuple(registrations)
 
@@ -200,7 +231,7 @@ def module_exchange_names() -> tuple[tuple[str, str], ...]:
 
     return tuple(
         (canonical, replacement)
-        for group in _ALL_GROUPS
+        for group in _enabled_groups()
         for _, canonical, replacement in group
     )
 
@@ -213,4 +244,5 @@ __all__ = [
     "register_deep_gemm_exchanges",
     "register_deepseek_v4_exchanges",
     "register_modular_kernel_exchange",
+    "register_qwen4_exp_ple_exchange",
 ]

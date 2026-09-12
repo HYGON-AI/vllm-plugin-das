@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
+    VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -427,11 +428,19 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS", "False").lower() in
                     ("true", "1")),
 
-    # Offload the Qwen4Exp PLE INT8 ngram embedding table to CPU pinned memory.
-    # Uses an explicit host-to-device staging lookup (HCU lacks a native UVA
-    # view operator); trades PCIe lookup latency for GPU memory savings.
+    # Offload the Qwen4Exp PLE INT8 ngram embedding table to CPU pinned memory,
+    # trading a small lookup overhead for GPU memory savings. Prefers UVA
+    # zero-copy (get_cuda_view_from_cpu_tensor: device view over host pinned
+    # memory, no D2H sync, CUDA-graph compatible) and falls back to explicit
+    # host-to-device staging when the UVA operator is unavailable.
     "VLLM_HCU_PLE_CPU_OFFLOAD":
         lambda: (os.environ.get("VLLM_HCU_PLE_CPU_OFFLOAD", "False").lower() in
+                    ("true", "1")),
+
+    # Overlap Qwen4Exp PLE INT8 UVA lookup with preceding model compute. This
+    # is intentionally opt-in and does not enable FP8 or H2D-fallback prefetch.
+    "VLLM_HCU_PLE_PREFETCH_STREAM":
+        lambda: (os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in
                     ("true", "1")),
 }
 

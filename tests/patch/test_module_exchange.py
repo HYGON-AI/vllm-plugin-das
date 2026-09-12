@@ -25,6 +25,7 @@ from vllm_hcu.patch.module_exchange import (
     module_exchange_names,
     register_all_module_exchanges,
     register_modular_kernel_exchange,
+    register_qwen4_exp_ple_exchange,
 )
 from vllm_hcu.patch.runtime_state import PatchRegistry, PatchStatus
 
@@ -96,6 +97,36 @@ def test_exchange_inventory_arms_dependencies_before_canonical_consumers():
         assert all(order[dependency] < order[consumer] for dependency in required)
 
     assert "vllm.model_executor.parameter" not in order
+
+
+def test_qwen4_exp_ple_exchange_is_strictly_opt_in_and_lazy(monkeypatch):
+    canonical = "vllm.models.qwen4_exp.amd.ple_layer"
+    replacement = "vllm_hcu.models.qwen4_exp.amd.ple_layer"
+    monkeypatch.delitem(sys.modules, canonical, raising=False)
+    monkeypatch.delitem(sys.modules, replacement, raising=False)
+    coordinator = ExactImportCoordinator(registry=PatchRegistry())
+
+    monkeypatch.delenv("VLLM_HCU_PLE_PREFETCH_STREAM", raising=False)
+    assert register_qwen4_exp_ple_exchange(coordinator) == ()
+    assert (canonical, replacement) not in module_exchange_names()
+
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    registrations = register_qwen4_exp_ple_exchange(coordinator)
+    assert len(registrations) == 1
+    assert registrations[0].status == PatchStatus.ARMED.value
+    assert (canonical, replacement) in module_exchange_names()
+    assert canonical not in sys.modules
+    assert replacement not in sys.modules
+
+
+def test_qwen4_exp_ple_exchange_fails_if_canonical_was_imported(monkeypatch):
+    canonical = "vllm.models.qwen4_exp.amd.ple_layer"
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setitem(sys.modules, canonical, ModuleType(canonical))
+    coordinator = ExactImportCoordinator(registry=PatchRegistry())
+
+    with pytest.raises(LateModuleReplacementError, match="already imported"):
+        register_qwen4_exp_ple_exchange(coordinator)
 
 
 def test_deep_gemm_replacement_preserves_v0251_warmup_helper():

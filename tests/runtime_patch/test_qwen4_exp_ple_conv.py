@@ -77,7 +77,21 @@ def test_qwen4_exp_ngram_dynamic_preprocessing_is_behind_custom_op(monkeypatch):
     calls = []
     module, _, ngram_class = _target_module(calls)
 
-    def run(input_ids, query_start_loc, ngram_context, output, layer_name):
+    def run(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output,
+        current_ids_buffer,
+        current_rows_buffer,
+        successor_ids_buffer,
+        successor_rows_buffer,
+        layer_name,
+    ):
+        assert current_ids_buffer.numel() == 0
+        assert current_rows_buffer.numel() == 0
+        assert successor_ids_buffer.numel() == 0
+        assert successor_rows_buffer.numel() == 0
         calls.append(
             (
                 tuple(input_ids.shape),

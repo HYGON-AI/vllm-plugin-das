@@ -8,14 +8,14 @@ implementation intact and replaces only the module-local PLE storage class
 and its shard loader at worker startup.
 
 When VLLM_HCU_PLE_CPU_OFFLOAD=1 is set, the INT8 PLE weights are allocated
-in CPU pinned memory instead of GPU, and the embedding lookup uses an explicit
-H2D fallback path (HCU lacks native UVA operators). This reduces GPU memory
-usage at the cost of PCIe transfer latency during lookup.
+in CPU pinned memory instead of GPU. The lookup prefers the HCU UVA bridge and
+falls back to explicit H2D staging when that bridge is unavailable.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib
 import os
 import re
 from types import ModuleType
@@ -44,6 +44,7 @@ from ._common import (
 )
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.ple_layer"
+REPLACEMENT_MODULE = "vllm_hcu.models.qwen4_exp.amd.ple_layer"
 PATCH_ID = "worker.core_fix.qwen4_exp.ple_int8"
 TARGETS = (
     f"{TARGET_MODULE}.PLEVocabParallelEmbedding",
@@ -92,6 +93,18 @@ def _should_offload_ple_to_cpu() -> bool:
         )
 
 
+def _should_prefetch_ple() -> bool:
+    try:
+        from vllm_hcu.platforms import envs as henvs
+
+        return bool(henvs.VLLM_HCU_PLE_PREFETCH_STREAM)
+    except (ImportError, AttributeError):
+        return os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "0").lower() in (
+            "true",
+            "1",
+        )
+
+
 def _is_pin_memory_available() -> bool:
     """Check if pinned memory allocation is available on this platform."""
     try:
@@ -109,11 +122,13 @@ def _is_pin_memory_available() -> bool:
 
 def _is_uva_available() -> bool:
     """Check if UVA zero-copy operator is available at runtime."""
-    return hasattr(torch.ops._C, 'get_cuda_view_from_cpu_tensor')
+    return hasattr(torch.ops._C, "get_cuda_view_from_cpu_tensor")
 
 
 class HcuQwen4ExpPLEInt8EmbeddingMethod(QuantizeMethodBase):
     """INT8 PLE lookup with one BF16 scale for every vocabulary row."""
+
+    supports_prefetch = False
 
     def create_weights(
         self,
@@ -215,6 +230,8 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
     explicit H2D copies. Supports CUDA graph capture and prefetch streams.
     """
 
+    supports_prefetch = True
+
     def create_weights(
         self,
         layer: nn.Module,
@@ -271,6 +288,9 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
         weight_scale = getattr(layer, "weight_scale", None)
         if weight is None or weight_scale is None:
             return
+        # device_loading_context creates new CPU tensors after this method
+        # returns. Any view from an earlier load/reload must not survive it.
+        layer._hcu_uva_views = None
         offloaded_bytes = (
             weight.numel() * weight.element_size()
             + weight_scale.numel() * weight_scale.element_size()
@@ -282,6 +302,45 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
             tuple(weight.shape),
             tuple(weight_scale.shape),
         )
+
+    def prefetch_output_dtype(self, layer: nn.Module) -> torch.dtype:
+        if layer.params_dtype is not torch.bfloat16:
+            raise RuntimeError(
+                "Qwen4Exp PLE prefetch currently supports BF16 output only; "
+                f"got {layer.params_dtype}"
+            )
+        return torch.bfloat16
+
+    def prepare_prefetch(self, layer: nn.Module) -> None:
+        self._uva_view(layer)
+
+    @staticmethod
+    def is_prefetch_prepared(layer: nn.Module) -> bool:
+        return getattr(layer, "_hcu_uva_views", None) is not None
+
+    def prefetch_lookup_into(
+        self,
+        layer: nn.Module,
+        local_ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        weight_view, scale_view = self._uva_view(layer)
+        embeddings = F.embedding(local_ids, weight_view)
+        scales = F.embedding(local_ids, scale_view)
+        output.copy_(
+            embeddings.to(torch.bfloat16) * scales.to(torch.bfloat16)
+        )
+
+    def finalize_prefetched(
+        self,
+        layer: nn.Module,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        if layer.tp_size == 1:
+            return rows
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        return tensor_model_parallel_all_reduce(rows)
 
     @staticmethod
     def _uva_view(layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -316,6 +375,8 @@ class HcuQwen4ExpPLEInt8OffloadEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod
 
     This is the H2D fallback variant used when UVA is unavailable.
     """
+
+    supports_prefetch = False
 
     def create_weights(
         self,
@@ -449,6 +510,20 @@ def _make_storage_class(module: ModuleType, quant_config):
                     except (AssertionError, AttributeError, RuntimeError):
                         pass
             super().__init__(*args, **kwargs)
+            if _should_prefetch_ple():
+                method = self.quant_method
+                if not _should_offload_ple_to_cpu():
+                    logger.warning_once(
+                        "VLLM_HCU_PLE_PREFETCH_STREAM=1 requires "
+                        "VLLM_HCU_PLE_CPU_OFFLOAD=1; using inline PLE lookup"
+                    )
+                elif not getattr(method, "supports_prefetch", False):
+                    logger.warning_once(
+                        "Qwen4Exp PLE prefetch is unavailable for %s; using its "
+                        "existing inline behavior. This release supports INT8 "
+                        "UVA only; FP8 prefetch is future work.",
+                        type(method).__name__,
+                    )
 
     HcuPLEVocabParallelEmbedding.__name__ = "HcuPLEVocabParallelEmbedding"
     HcuPLEVocabParallelEmbedding.__qualname__ = "HcuPLEVocabParallelEmbedding"
@@ -558,11 +633,19 @@ def apply_to_module(module: ModuleType) -> bool:
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    return apply_to_module(load_exact_module(TARGET_MODULE, module))
+    if module is None:
+        module = importlib.import_module(TARGET_MODULE)
+    if module.__name__ not in (TARGET_MODULE, REPLACEMENT_MODULE):
+        raise PatchCompatibilityError(
+            f"expected module {TARGET_MODULE} or {REPLACEMENT_MODULE}, "
+            f"got {module.__name__}"
+        )
+    return apply_to_module(module)
 
 
 __all__ = [
     "PATCH_ID",
+    "REPLACEMENT_MODULE",
     "TARGET_MODULE",
     "apply",
     "apply_to_module",
