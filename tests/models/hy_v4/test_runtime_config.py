@@ -45,7 +45,7 @@ def test_hyv4_target_are_classified_as_mla() -> None:
     unrelated = SimpleNamespace(model_type="unrelated")
 
     assert _convertor(target).is_deepseek_mla() is True
-    assert _convertor(draft).is_deepseek_mla() is False
+    assert _convertor(draft).is_deepseek_mla() is True
     assert _convertor(unrelated).is_deepseek_mla() is False
 
 

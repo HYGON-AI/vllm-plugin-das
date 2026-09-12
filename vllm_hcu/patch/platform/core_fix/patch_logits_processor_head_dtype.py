@@ -102,7 +102,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hf_config = getattr(model_config, "hf_config", None)
         self.head_dtype = (
             model_config.head_dtype
-            if getattr(hf_config, "model_type", None) == "hy_v4"
+            if getattr(hf_config, "model_type", None) in ("hy_v4", "hy_v4_mtp")
             else None
         )
 

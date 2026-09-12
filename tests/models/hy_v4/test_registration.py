@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from transformers import AutoConfig
@@ -118,7 +119,7 @@ def test_hy_v4_disabled_fp32_lm_head_does_not_invent_head_dtype() -> None:
     assert getattr(config, "head_dtype", None) is None
 
 
-def test_hy_v4_registry_includes_target_architecture(monkeypatch) -> None:
+def test_hy_v4_registry_includes_target_and_mtp_architectures(monkeypatch) -> None:
     import vllm_hcu.models as models
 
     calls: list[tuple[str, str]] = []
@@ -135,7 +136,7 @@ def test_hy_v4_registry_includes_target_architecture(monkeypatch) -> None:
         "HYV4ForCausalLM",
         "vllm_hcu.models.hy_v4:HYV4ForCausalLM",
     ) in calls
-    assert not any(name == "HYV4MTPModel" for name, _ in calls)
+    assert ("HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP") in calls
 
 
 def test_config_registration_does_not_eagerly_import_model() -> None:
@@ -143,5 +144,18 @@ def test_config_registration_does_not_eagerly_import_model() -> None:
 import sys
 import vllm_hcu.models.hy_v4.config
 assert 'vllm_hcu.models.hy_v4.model' not in sys.modules
+assert 'vllm_hcu.models.hy_v4.mtp' not in sys.modules
 """
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_hy_v4_mtp_registry_resolves_lazy_native_class():
+    import vllm_hcu.models as models
+    from vllm_hcu.models.hy_v4 import HYV4MTP
+
+    models.register_model()
+    cls, architecture = models.ModelRegistry.resolve_model_cls(
+        ["HYV4MTPModel"], SimpleNamespace(model_impl="auto"),
+    )
+    assert cls is HYV4MTP
+    assert architecture == "HYV4MTPModel"

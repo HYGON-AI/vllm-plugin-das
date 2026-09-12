@@ -19,7 +19,7 @@ TARGET_MODULE = "vllm.transformers_utils.model_arch_config_convertor"
 PATCH_ID = "platform.core_fix.hy_v4_model_arch_config"
 TARGETS = (f"{TARGET_MODULE}.ModelArchConfigConvertorBase.is_deepseek_mla",)
 _MARKER = "_vllm_hcu_hy_v4_mla_config_applied"
-_MODEL_TYPES = frozenset({"hy_v4"})
+_MODEL_TYPES = frozenset({"hy_v4", "hy_v4_mtp"})
 
 
 def apply_to_module(module: ModuleType) -> bool:

@@ -180,7 +180,7 @@ def _dequantize_hyv4_fp8_weight(
 
 
 _HYV4_FP8_LOCAL_PROJECTION = re.compile(
-    r"(?P<prefix>(?:model\.)?layers\.\d+\.)"
+    r"(?P<prefix>(?:model\.)?layers\.\d+\.(?:mtp_block\.)?)"
     r"(?P<projection>self_attn\.indexer\.(?:wk|weights_proj)|mlp\.gate)\."
     r"(?P<part>weight|weight_scale|weight_scale_inv)"
 )

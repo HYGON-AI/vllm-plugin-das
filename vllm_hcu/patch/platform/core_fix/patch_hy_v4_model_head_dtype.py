@@ -19,7 +19,7 @@ TARGET_MODULE = "vllm.config.model"
 PATCH_ID = "platform.core_fix.hy_v4_model_head_dtype"
 TARGETS = (f"{TARGET_MODULE}.ModelConfig.head_dtype",)
 _MARKER = "_vllm_hcu_hy_v4_model_head_dtype_applied"
-_MODEL_TYPES = frozenset({"hy_v4"})
+_MODEL_TYPES = frozenset({"hy_v4", "hy_v4_mtp"})
 
 
 def apply_to_module(module: ModuleType) -> bool:
