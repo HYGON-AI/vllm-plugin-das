@@ -25,6 +25,7 @@ from typing import Literal
 
 from vllm_hcu.compatibility import ensure_vllm_compatible
 from vllm_hcu.patch.config import (
+    bind_hcu_eplb_config,
     HcuFeatureConfig,
     get_hcu_config,
 )
@@ -309,6 +310,11 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb")),
+    _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb_gate")),
+    _CallbackSpec(_adapter("framework_opt", "patch_offline_eplb")),
+    _CallbackSpec(_adapter("framework_opt", "patch_eplb_communicator")),
+    _CallbackSpec(_adapter("framework_opt", "patch_routing_simulator")),
     _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
@@ -779,6 +785,7 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         set_process_role("Worker")
         # This is both normalization and the spawn/unpickle boundary check.
         config = get_hcu_config(vllm_config)
+        bind_hcu_eplb_config(vllm_config)
         if HcuFeatureConfig.from_mapping(config.to_dict()) != config:
             raise RuntimeError("HCU feature sidecar failed its worker round-trip check")
         if vllm_config is not None:

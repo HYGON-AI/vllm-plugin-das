@@ -236,6 +236,22 @@ def _try_load_hyv4_fp8_projection(
     return True
 
 
+def _require_hyv4_static_plan(model):
+    from vllm_hcu.model_executor.layers.fused_moe.static_eplb import StaticEplbPlan
+    plan = getattr(model, "_vllm_hcu_static_eplb_plan", None)
+    if not isinstance(plan, StaticEplbPlan):
+        raise NotImplementedError("HYV4 EPLB requires a validated Task 7 static plan")
+    if (plan.num_logical_experts != model.num_logical_experts
+            or plan.num_physical_experts != model.num_physical_experts
+            or plan.num_redundant_experts != model.num_redundant_experts
+            or len(plan._map_values) != len(tuple(model.moe_layers))):
+        raise ValueError("HYV4 static EPLB metadata does not match the bound plan")
+    for index, layer in enumerate(model.moe_layers):
+        if getattr(layer.routed_experts, "_vllm_hcu_static_eplb_row", None) != plan.layer_map(index):
+            raise ValueError("HYV4 static EPLB layer does not match the bound plan")
+    return plan
+
+
 class _HYV4CheckpointAccounting:
     """Track checkpoint slots and retain only unmatched local FP8 pairs.
 
@@ -264,6 +280,10 @@ class _HYV4CheckpointAccounting:
                      if manager.map_global_to_local(i) >= 0]
                     if manager is not None else list(range(num_experts))
                 )
+                static_row = getattr(owner, "_vllm_hcu_static_eplb_row", None)
+                if static_row is not None:
+                    local = sorted({logical for physical, logical in enumerate(static_row)
+                                    if manager.map_global_to_local(physical) >= 0})
                 shards = ("w1", "w3") if parts[-1].startswith("w13_") else ("w2",)
                 slots = {(i, shard) for i in local for shard in shards}
             else:
@@ -561,7 +581,10 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
-        raise NotImplementedError("HYV4 EPLB activation is deferred to Task 7.")
+        plan = _require_hyv4_static_plan(self)
+        if (num_physical_experts != plan.num_physical_experts
+                or num_local_physical_experts != self.num_local_physical_experts):
+            raise ValueError("HYV4 static EPLB cannot change physical expert counts")
 
     def set_eplb_state(
         self,
@@ -569,7 +592,19 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
-        raise NotImplementedError("HYV4 EPLB activation is deferred to Task 7.")
+        plan = _require_hyv4_static_plan(self)
+        layers = len(plan._map_values)
+        logical = plan.num_logical_experts
+        if (not isinstance(expert_load_view, torch.Tensor)
+                or expert_load_view.shape != (layers, plan.num_physical_experts)
+                or not isinstance(logical_to_physical_map, torch.Tensor)
+                or logical_to_physical_map.ndim != 3
+                or logical_to_physical_map.shape[:2] != (layers, logical)
+                or not isinstance(logical_replica_count, torch.Tensor)
+                or logical_replica_count.shape != (layers, logical)):
+            raise ValueError("HYV4 static EPLB state does not match the bound plan")
+        MixtureOfExperts.set_eplb_state(self, expert_load_view,
+                                       logical_to_physical_map, logical_replica_count)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # (param_name, weight_name, expert_id, shard_id) for weights, fp8
@@ -994,6 +1029,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
             logical_to_physical_map,
             logical_replica_count,
         )
+        self.expert_weights = self.model.expert_weights
 
     def update_physical_experts_metadata(
         self,

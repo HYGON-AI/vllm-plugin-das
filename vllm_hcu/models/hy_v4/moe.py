@@ -81,7 +81,10 @@ class HYV4MoEFused(nn.Module):
             enable_eplb
             or vllm_config.parallel_config.eplb_config.num_redundant_experts
         ):
-            raise NotImplementedError("HYV4 EPLB activation is deferred to Task 7.")
+            if (not enable_eplb
+                    or not vllm_config.parallel_config.enable_expert_parallel
+                    or not getattr(vllm_config.parallel_config, "_vllm_hcu_expert_map_path", None)):
+                raise NotImplementedError("HYV4 EPLB requires Task 7 static direct loading")
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_group = get_ep_group().device_group
