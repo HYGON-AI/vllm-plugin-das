@@ -180,7 +180,31 @@ def require_local_indexer_producer(
             "Invalid HY V4 pipeline layer range: "
             f"[{start_layer}, {end_layer}) for {config.num_hidden_layers} layers."
         )
-    if start_layer in compute_skip_topk_layers(config):
+    skip_topk_layers = compute_skip_topk_layers(config)
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        has_local_producer = False
+        for layer_idx in range(start_layer, end_layer):
+            # Match HYV4MLAAttention construction: a declared "full"
+            # indexer on a dense attention layer does not create an indexer.
+            if (
+                layer_idx >= len(layer_types)
+                or layer_types[layer_idx] not in _SPARSE_LAYER_TYPES
+            ):
+                continue
+            if layer_idx not in skip_topk_layers:
+                has_local_producer = True
+            elif not has_local_producer:
+                raise ValueError(
+                    f"HY V4 shared sparse indexer layer {layer_idx} requires "
+                    "a preceding local 'full' sparse indexer producer in "
+                    f"pipeline layer range [{start_layer}, {end_layer})."
+                )
+        return
+
+    # Retain the conservative declared-pattern check for callers that do not
+    # supply attention layer types.
+    if start_layer in skip_topk_layers:
         raise ValueError(
             "HY V4 pipeline stage starts at shared indexer layer "
             f"{start_layer}, but top-k indices are not transferred between "

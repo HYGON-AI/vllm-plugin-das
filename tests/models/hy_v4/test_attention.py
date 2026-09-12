@@ -131,6 +131,41 @@ def test_pipeline_stage_must_start_with_a_local_full_indexer() -> None:
         require_local_indexer_producer(config, start_layer=0, end_layer=99)
 
 
+@pytest.mark.parametrize(
+    "layer_types,indexer_types,start_layer,end_layer,missing_producer",
+    [
+        (["full_attention", "sparse_attention", "sparse_attention"],
+         ["full", "shared", "shared"], 0, 3, True),
+        (["sparse_attention", "full_attention", "sparse_attention"],
+         ["full", "full", "shared"], 1, 3, True),
+        (["sparse_attention", "full_attention", "sparse_attention"],
+         ["full", "full", "shared"], 0, 3, False),
+        (["full_attention", "sparse_attention", "sparse_attention"],
+         ["full", "full", "shared"], 0, 3, False),
+        (["full_attention", "full_attention", "sparse_attention"],
+         ["full", "shared", "full"], 1, 3, False),
+        (["full_attention", "full_attention", "full_attention"],
+         ["full", "shared", "shared"], 1, 3, False),
+    ],
+)
+def test_mixed_dense_sparse_stage_requires_actual_local_indexer_producer(
+    layer_types, indexer_types, start_layer, end_layer, missing_producer,
+):
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=3,
+        indexer_types=indexer_types,
+        layer_types=layer_types,
+    )
+    if missing_producer:
+        with pytest.raises(ValueError, match="local.*full.*sparse.*producer"):
+            require_local_indexer_producer(
+                config, start_layer=start_layer, end_layer=end_layer)
+    else:
+        require_local_indexer_producer(
+            config, start_layer=start_layer, end_layer=end_layer)
+
+
 def test_sink_incapable_backend_fails_closed() -> None:
     class SinkIncapableSparseBackend:
         @classmethod

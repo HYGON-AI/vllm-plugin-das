@@ -68,7 +68,7 @@ def apply_to_module(module: ModuleType) -> bool:
     import torch
     import torch.nn.functional as F
 
-    from vllm.config import get_current_vllm_config
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
@@ -97,7 +97,8 @@ def apply_to_module(module: ModuleType) -> bool:
             logits_as_input,
             soft_cap,
         )
-        model_config = get_current_vllm_config().model_config
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
         self.head_dtype = (
             model_config.head_dtype

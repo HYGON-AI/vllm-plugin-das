@@ -151,3 +151,23 @@ def test_target_head_dtype_preserves_explicit_choice(head_dtype, expected):
     config.dtype = torch.bfloat16
     config.runner_type = "generate"
     assert config.head_dtype is expected
+
+
+def test_logits_processor_constructs_without_config_context():
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.model_executor.layers import logits_processor as logits_module
+
+    assert get_current_vllm_config_or_none() is None
+    processor_cls = logits_module.LogitsProcessor
+    original_init = getattr(
+        processor_cls, "_vllm_hcu_original_init", processor_cls.__init__)
+    baseline = object.__new__(processor_cls)
+    original_init(baseline, 64)
+    patch_logits_processor_head_dtype.apply_to_module(logits_module)
+
+    processor = processor_cls(64)
+
+    assert processor.vocab_size == baseline.vocab_size == 64
+    assert processor.org_vocab_size == baseline.org_vocab_size
+    assert processor.head_dtype is None
+    assert get_current_vllm_config_or_none() is None
