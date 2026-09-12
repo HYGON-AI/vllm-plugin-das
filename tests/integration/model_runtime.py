@@ -748,6 +748,34 @@ def _case_smoke(model_path: Path) -> dict[str, Any]:
     }
 
 
+def _case_hyv4_smoke(
+    model_path: Path, *, case: str, gpu_memory_utilization: float,
+) -> dict[str, Any]:
+    """TP8 graph smoke; cache hits and MTP acceptance need server metrics."""
+    from vllm import LLM
+
+    speculative = ({} if case == "hy-v4-smoke" else {
+        "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
+    })
+    llm = LLM(**_llm_kwargs(
+        model_path, enforce_eager=False, tensor_parallel_size=8,
+        moe_backend="aiter", enable_prefix_caching=True,
+        kv_cache_dtype="fp8_e4m3" if case == "hy-v4-fp8-kv-smoke" else "auto",
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=4096, max_num_batched_tokens=4096, max_num_seqs=4,
+        **speculative,
+    ))
+    prefix = "Paris is the capital of France. The Seine flows through Paris. " * 100
+    try:
+        rounds = [_generate_with_llm(
+            llm, prompts=[prefix + "Which city is the capital of France?"],
+            max_tokens=32, logprobs=None,
+        ) for _ in range(3)]
+    finally:
+        _shutdown_llm(llm)
+    return {"case": case, "rounds": rounds}
+
+
 def _case_graph_parity(model_path: Path) -> dict[str, Any]:
     eager = _generate(model_path, enforce_eager=True)
     graph = _generate(model_path, enforce_eager=False)
@@ -1704,6 +1732,9 @@ def _main(argv: list[str] | None = None) -> int:
             "tp-ep-smoke",
             "qwen35-mtp3-graph-parity",
             "deepseek-v4-dspark-smoke",
+            "hy-v4-smoke",
+            "hy-v4-mtp3-smoke",
+            "hy-v4-fp8-kv-smoke",
         ),
     )
     parser.add_argument("--model", required=True, type=Path)
@@ -1724,6 +1755,11 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.case == "smoke":
         payload = _case_smoke(args.model)
+    elif args.case in {"hy-v4-smoke", "hy-v4-mtp3-smoke", "hy-v4-fp8-kv-smoke"}:
+        payload = _case_hyv4_smoke(
+            args.model, case=args.case,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
     elif args.case == "graph-parity":
         payload = _case_graph_parity(args.model)
     elif args.case == "lora-switching":

@@ -25,6 +25,79 @@ MTP3_SELECTOR_NAMES = (
 )
 
 
+@pytest.mark.parametrize("case,mtp,kv", [
+    ("hy-v4-smoke", False, "auto"),
+    ("hy-v4-mtp3-smoke", True, "auto"),
+    ("hy-v4-fp8-kv-smoke", True, "fp8_e4m3"),
+])
+def test_hyv4_cli_runs_pinned_topology_and_repeated_prefix(
+    monkeypatch, capsys, case, mtp, kv,
+):
+    engines = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.prompts = []
+            self.stopped = False
+            engines.append(self)
+
+        def generate(self, prompts, sampling_params, **kwargs):
+            self.prompts.append(prompts)
+            assert sampling_params.temperature == 0
+            return [SimpleNamespace(
+                prompt_token_ids=[1] * 32,
+                outputs=[SimpleNamespace(token_ids=[2], text="Paris",
+                    finish_reason="stop", cumulative_logprob=None)],
+            ) for _ in prompts]
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FakeLLM))
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params",
+                        SimpleNamespace(SamplingParams=SimpleNamespace))
+    monkeypatch.setattr(model_runtime, "_shutdown_llm",
+                        lambda llm: setattr(llm, "stopped", True))
+    assert model_runtime._main([
+        case, "--model", "/models/Hy4-preview-Channel-FP8-w8a8",
+        "--gpu-memory-utilization", "0.95",
+    ]) == 0
+    engine, = engines
+    assert engine.kwargs["tensor_parallel_size"] == 8
+    assert engine.kwargs["moe_backend"] == "aiter"
+    assert engine.kwargs["enforce_eager"] is False
+    assert engine.kwargs["enable_prefix_caching"] is True
+    assert engine.kwargs["kv_cache_dtype"] == kv
+    assert engine.kwargs["gpu_memory_utilization"] == 0.95
+    assert engine.kwargs.get("speculative_config") == (
+        {"method": "mtp", "num_speculative_tokens": 3} if mtp else None
+    )
+    assert len(engine.prompts) == 3
+    assert engine.prompts[0] == engine.prompts[1] == engine.prompts[2]
+    assert len(engine.prompts[0][0]) > 4096
+    assert engine.stopped
+    payload = json.loads(capsys.readouterr().out.split(model_runtime.RESULT_PREFIX)[-1])
+    assert [round_[0]["text"] for round_ in payload["rounds"]] == ["Paris"] * 3
+    assert payload["case"] == case
+
+
+def test_hyv4_cli_shuts_down_after_generation_failure(monkeypatch):
+    events = []
+
+    class FailingLLM:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, *args, **kwargs):
+            raise RuntimeError("device generation failed")
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FailingLLM))
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params",
+                        SimpleNamespace(SamplingParams=SimpleNamespace))
+    monkeypatch.setattr(model_runtime, "_shutdown_llm", lambda llm: events.append("stop"))
+    with pytest.raises(RuntimeError, match="device generation failed"):
+        model_runtime._main(["hy-v4-smoke", "--model", "/models/fake"])
+    assert events == ["stop"]
+
+
 @pytest.mark.parametrize("resolved_mode", ["FULL", "FULL_DECODE_ONLY"])
 def test_mtp3_graph_cli_uses_worker_config_and_repeats_sequential_engines(
     monkeypatch, capsys, resolved_mode,
