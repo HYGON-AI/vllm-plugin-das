@@ -117,9 +117,9 @@ def test_hyv4_bound_state_delegates_to_current_protocol(tmp_path, checkpoint_mod
         model.update_physical_experts_metadata(8, 4)
 
 
-def test_hyv4_static_constructor_reaches_current_moe_owner(monkeypatch):
+def test_hyv4_static_constructor_reaches_current_moe_owner(monkeypatch, tmp_path):
     import vllm_hcu.models.hy_v4.moe as moe
-    from tests.models.hy_v4.test_moe import _hf_config, _vllm_config, _FakeGate, _FakeExperts, _FakeSharedExperts
+    from tests.models.hy_v4.test_moe import _hf_config, _vllm_config, _FakeGate, _FakeSharedExperts
     config = _vllm_config("triton")
     config.parallel_config._vllm_hcu_expert_map_path = "/tmp/map.json"
     monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -127,7 +127,49 @@ def test_hyv4_static_constructor_reaches_current_moe_owner(monkeypatch):
         device_group=SimpleNamespace(size=lambda: 2)))
     monkeypatch.setattr(moe, "GateLinear", lambda *args, **kwargs: _FakeGate())
     monkeypatch.setattr(moe, "HYV4FeedForward", lambda *args, **kwargs: _FakeSharedExperts())
-    experts = _FakeExperts()
-    monkeypatch.setattr(moe, "FusedMoE", lambda **kwargs: experts)
+    generic = GenericMoE()
+    experts = generic.moe_layers[0]
+    def factory(**kwargs):
+        experts.routed_experts.e_score_correction_bias = kwargs["e_score_correction_bias"]
+        return experts
+    monkeypatch.setattr(moe, "FusedMoE", factory)
     layer = moe.HYV4MoEFused(_hf_config(), vllm_config=config, enable_eplb=True)
     assert layer.experts is experts and layer.enable_eplb
+    owner = experts.routed_experts
+    bias = owner.e_score_correction_bias
+    assert bias is layer.expert_bias
+    assert getattr(bias, "weight_loader", None) is None
+    assert all(weight.untyped_storage() is not bias.untyped_storage()
+               for weight in owner.get_expert_weights())
+    print("REJECTED_PARAMETER=e_score_correction_bias TYPE=Parameter LOADER=None "
+          "LOADER_TYPE=NoneType LOADER_OWNER=None CURRENT_EXPERT_WEIGHT=False")
+    static_config, _ = config_and_map(tmp_path)
+    bind_static_eplb_plan(static_config, generic)
+    assert owner.e_score_correction_bias is layer.expert_bias
+
+
+@pytest.mark.parametrize("kind", ["target", "mtp"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_hyv4_static_router_bias_keeps_checkpoint_owner(tmp_path, checkpoint_model, monkeypatch, kind, rank):
+    model, rows = build_model(kind, checkpoint_model, monkeypatch, rank)
+    mlps = ([layer.mlp for layer in model.model.layers] if kind == "target"
+            else [layer.mtp_block.mlp for layer in model.model.layers.values()])
+    for mlp in mlps:
+        mlp.expert_bias = torch.nn.Parameter(torch.tensor([2., 3., 5.]))
+        mlp.experts.routed_experts.e_score_correction_bias = mlp.expert_bias
+    config, _ = config_and_map(tmp_path, key=type(model).__name__, rows=rows)
+    before = dict(model.named_parameters())
+    weights = weights_for(model, False)
+    bind_static_eplb_plan(config, model)
+    assert dict(model.named_parameters()).keys() == before.keys()
+    ledger = _HYV4CheckpointAccounting(model.model)
+    bias_names = [name for name in ledger.expected if name.endswith("expert_bias")]
+    assert len(bias_names) == len(mlps)
+    assert all(ledger.expected[name] == {None} for name in bias_names)
+    assert not any("e_score_correction_bias" in name for name in ledger.expected)
+    loaded = model.load_weights(iter(weights))
+    assert loaded == set(before)
+    for mlp in mlps:
+        assert mlp.expert_bias is mlp.experts.routed_experts.e_score_correction_bias
+        assert getattr(mlp.expert_bias, "weight_loader", None) is None
+        torch.testing.assert_close(mlp.expert_bias, torch.zeros(3))

@@ -1,11 +1,13 @@
 # HYV4 v0.25.1 clean integration validation
 
-This contains the Task 10 execution protocol and Task 11 observed results.
+This contains the Task 10 execution protocol, Task 11 observed results, and
+the focused Task 11A static-loader fix/rerun.
 CPU tests establish contracts; they do not establish checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
 Each result state is updated only after retaining its evidence. The observed
-PP2/PCP4 correctness and static-loader failures mean this matrix is not an
-overall integration pass; DP8 also hits the recorded environment-capacity limit.
+PP2/PCP4 correctness failure and DP8 memory failures mean this matrix is not
+an overall integration pass. Task 11A fixes the static loader-owner rejection,
+but its unchanged static rerun fails later during KV allocation.
 
 Task 11 provenance capture began at 2026-09-12T21:11:05Z (the host renders
 local log timestamps as 2026-09-13 UTC+08:00), from candidate
@@ -32,7 +34,7 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 | TP8 MTP3, FP8 E4M3 KV, repeated prefix | PASS | 3×3145-token prompts; hits 0/3008/6016; coherent output; HTTP 200; clean teardown |
 | PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | FAIL | Short chat correct; all three long outputs incoherent and length-truncated despite HTTP 200; clean teardown; DCP disabled/default |
 | DP8/TP1/EP8, DeepEP HT, DeepGEMM | FAIL — capacity | All eight ranks loaded; KV budget −0.7 GiB; no readiness; exit 1; clean teardown |
-| DP8/EP8 static offline EPLB load | FAIL — loader owner | All eight workers reject static pre-load binding before weights/KV; exit 1; clean teardown |
+| DP8/EP8 static offline EPLB load | FAIL — KV allocation OOM | Task 11A: owner rejection fixed; all eight ranks loaded 125.69 GiB; later KV allocation OOM; no readiness; exit 1; clean teardown |
 | HumanEval/0–31 target-only | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors; all stop; clean teardown |
 | HumanEval/0–31 MTP3 | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors/flips; acceptance 93.03%; clean teardown |
 | Custom packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
@@ -618,12 +620,77 @@ At 21:47:29 all eight workers raised
 `initialize_model` pre-load hook. Thus binding failed before checkpoint
 weight loading and KV initialization; this is independent of the previous
 DP8 capacity failure. No ready service, HTTP inference, successful runtime
-plan binding, or zero-rearrangement evidence exists. The offending parameter
-identity is not logged, so a more specific root cause is unproven.
+plan binding, or zero-rearrangement evidence exists for that Task 11 run.
+The offending parameter identity was not logged then; Task 11A establishes
+the source/owner reproduction below.
 
 The process exited 1 without an assistant-issued service signal. Teardown
 verified all 24 logged API/engine/worker PIDs absent, no owned identity
 survivors/listener, and eight cards 0%/2 MiB. No code or backend was changed.
+
+### Task 11A static-loader fix — PASS for binding/load; service FAIL at KV allocation
+
+Evidence root:
+`/models/validation-logs/hy4-static-eplb-fix-20260912T222135Z`.
+The sole production change selects loader-owning Parameters from current
+`RoutedExperts.get_expert_weights()` storage-sharing views. HYV4's
+`expert_bias` is registered again as `e_score_correction_bias`, with no
+`weight_loader`; the pinned owner explicitly excludes this router parameter
+from rearrangeable expert weights. Bias/global-state identity, values,
+loaders and checkpoint-ledger ownership remain unchanged. Actual expert
+weights still fail closed on foreign/unbound/missing loaders, now naming the
+rejected parameter. All targets are checked before cross-rank verification
+and publication. No backend owner or installed/model file was changed.
+
+Observed TDD: 10 failed/37 passed before the adapter edit, then 47 passed.
+Expanded owner suites: 375 passed. All 35 branch-changed Python test files,
+including helpers, ran unfiltered: 1,076 passed. The explicit pinned-root
+contract runner passed 2,160 tests (0 failures/errors/skips); doctor had
+7 PASS checks; compileall and diff checks were clean. The initial unfiltered
+attempt's missing legacy source-root environment variable is retained in
+`changed.log`; the identical full list passed in `changed-final.log` after
+setting `VLLM_V0251_SOURCE_ROOT` to the pinned root, without test changes.
+
+The foreground rerun (`static-rerun/service.typescript`) ran at UTC
+**2026-09-12 22:29:09–22:32:02**, PID/PGID **1223293**. It used baseline
+`7f68fac3bd6a2b0960e426ac96705e6325024572` plus the retained
+`candidate-source.diff`; the adapter SHA-256 was
+`f7309c268b2f52feba39fa0796d02f6245830551b4d2877b9e15a4293a2e1420`.
+`candidate-source.sha256` identifies all production/test inputs.
+`rerun-comparison.json` verifies the original Task 11 ARGV and recorded
+environment are identical. The 77×256 identity map and its hash are unchanged.
+Both preflight and launcher observed all eight cards free (0%/2 MiB), no
+service/listener was present, and the launcher reasserted pinned ABI,
+dependency versions, source roots and checkpoint hashes. DCP was not tested;
+size 1 remains disabled/default.
+
+Shard loading began at 22:30:54 and completed 131/131. At 22:31:34–35,
+**all DP/EP ranks 0–7** reported **125.69 GiB loaded** (43.67–44.08s).
+The old owner rejection occurred on zero ranks. DeepEP HT prepare/finalize
+and DeepGEMM HT experts were selected; EPLB initialized its
+`NixlEplbCommunicator`. This satisfies the focused loader-fix hardware gate.
+
+The service nevertheless failed before readiness. At 22:31:48, the profiler
+reported **88.18 GiB available KV memory** and engines planned
+**1,755,200–1,755,264 cache tokens**. All eight workers then raised
+`torch.OutOfMemoryError` while the pinned MRV2
+`gpu/attn_utils.py:186` called `torch.zeros` for a **1.07 GiB** KV tensor.
+Diagnostics simultaneously reported **133.75–134.82 GiB PyTorch allocated**
+and **88.59–89.30 GiB free**, on 143.98 GiB devices. This is a distinct
+KV-allocation/memory-accounting follow-up, **not** the earlier DP8
+`No available memory for the cache blocks`/−0.7 GiB failure. Its deeper cause
+is not established; communicator initialization preceding it does not prove
+causation. No memory limit, allocator, topology or backend was changed to
+hide the failure. There is no static-serving accuracy or runtime
+zero-rearrangement claim.
+
+All 17 bounded proxy-free health probes failed to connect; the service
+exited 1 naturally, with no assistant-issued service signal. The readiness
+helper exited on the owned process's disappearance. `teardown.log` verifies
+all 24 logged API/engine/worker PIDs and all saved owned process identities
+absent, no port-8000 listener, and every card at 0%/2 MiB. Raw traces for all
+eight KV-allocation failures are retained in `rerun-comparison.json` and the
+full typescript. The original Task 11 failure evidence is preserved.
 
 ### HumanEval/0–31 target-only — PASS for this 32-task slice
 

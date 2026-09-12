@@ -26,6 +26,7 @@ class GenericMoE(torch.nn.Module, MixtureOfExperts):
             owner = RoutedExperts.__new__(RoutedExperts)
             torch.nn.Module.__init__(owner)
             owner.layer_name = f"layers.{index}.experts"
+            owner.local_num_experts = 2
             owner.quant_config = None
             owner.quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
             torch.nn.Module.__init__(owner.quant_method)

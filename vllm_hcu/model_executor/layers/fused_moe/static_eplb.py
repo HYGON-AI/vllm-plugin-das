@@ -198,6 +198,14 @@ def _logical_model_mapping(original, logical_experts):
     return mapping
 
 
+def _expert_storage_key(weight):
+    # RoutedExperts returns flattened (and sometimes transposed scale) views,
+    # not the loader-owning Parameters. Storage objects also distinguish meta
+    # tensors, whose data_ptr values are all zero. No tensor copy is needed.
+    return (weight.untyped_storage(), weight.storage_offset(), weight.numel(),
+            weight.dtype)
+
+
 def bind_static_eplb_plan(vllm_config, model):
     """Attach rows to existing owners before their captured loaders run.
 
@@ -246,10 +254,16 @@ def bind_static_eplb_plan(vllm_config, model):
                 or experts.moe_config.num_experts != plan.num_physical_experts):
             raise ValueError("Static EPLB RoutedExperts count mismatch")
         parameters = []
-        for param in experts.parameters():
+        expert_storage = {_expert_storage_key(weight)
+                          for weight in experts.get_expert_weights()}
+        for name, param in experts.named_parameters():
+            # The current owner excludes router bias, global scales and other
+            # non-rearrangeable state. Preserve those checkpoint loaders.
+            if _expert_storage_key(param) not in expert_storage:
+                continue
             loader = getattr(param, "weight_loader", None)
             if getattr(loader, "__self__", None) is not experts:
-                raise ValueError("Static EPLB parameter has an unsupported loader owner")
+                raise ValueError(f"Static EPLB parameter {name!r} has an unsupported loader owner")
             parameters.append((param, loader.__func__))
         targets.append((experts, parameters))
     verify_static_plan_across_ep_ranks(plan)

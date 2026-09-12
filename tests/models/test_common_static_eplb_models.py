@@ -286,3 +286,91 @@ def test_direct_parameter_loader_rejects_unsplit_fused_tensor(tmp_path):
         owner.w2_weight.weight_loader(owner.w2_weight, torch.ones(3, 2, 2),
             "w2_weight", "w2", 0, return_success=True)
     assert torch.count_nonzero(owner.w2_weight) == 0
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_binding_uses_current_expert_views_and_preserves_nonexpert_state(tmp_path, monkeypatch, device):
+    model = GenericMoE()
+    config, _ = config_and_map(tmp_path)
+    originals = []
+    for layer in model.moe_layers:
+        owner = layer.routed_experts
+        for name, param in list(owner.named_parameters()):
+            shape = (2, 3, 4) if "weight_scale" in name else param.shape
+            value = torch.zeros(shape, device=device)
+            if "weight_scale" in name:
+                value = value.transpose(1, 2)
+            replacement = torch.nn.Parameter(value, requires_grad=False)
+            replacement.weight_loader = owner.weight_loader
+            setattr(owner, name, replacement)
+        # Current RoutedExperts owns this classification, including scalars.
+        for name in ("e_score_correction_bias", "w13_input_scale", "w2_input_scale",
+                     "hash_indices_table", "global_scalar"):
+            value = torch.tensor(7., device=device)
+            if name != "global_scalar":
+                value = value.expand(3)
+            param = torch.nn.Parameter(value, requires_grad=False)
+            if name == "w2_input_scale":
+                param.weight_loader = owner.weight_loader
+            owner.register_parameter(name, param)
+        originals.append({name: (param, getattr(param, "weight_loader", None),
+                                 param.clone()) for name, param in owner.named_parameters()})
+        views = list(owner.get_expert_weights())
+        assert len(views) == 4
+        assert all(view.untyped_storage() is not owner.e_score_correction_bias.untyped_storage()
+                   for view in views)
+
+    verified = []
+    def verify(plan):
+        for layer, original in zip(model.moe_layers, originals):
+            owner = layer.routed_experts
+            assert not hasattr(owner, "_vllm_hcu_static_eplb_row")
+            assert "get_expert_mapping" not in vars(owner)
+            for name, (param, loader, _) in original.items():
+                assert getattr(owner, name) is param
+                assert getattr(param, "weight_loader", None) is loader
+        assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+        verified.append(plan)
+    monkeypatch.setattr(api, "verify_static_plan_across_ep_ranks", verify)
+    plan = bind(config, model)
+    assert verified == [plan]
+    captured = []
+    for layer, original in zip(model.moe_layers, originals):
+        owner = layer.routed_experts
+        for name, (param, loader, value) in original.items():
+            assert getattr(owner, name) is param
+            if device == "cpu":
+                torch.testing.assert_close(param, value)
+            current = getattr(param, "weight_loader", None)
+            if name in {"w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"}:
+                assert current is not loader and current.__self__ is owner
+            else:
+                assert current is loader
+            captured.append((param, current))
+    assert bind(config, model) is plan
+    assert verified == [plan]
+    assert all(getattr(param, "weight_loader", None) is loader for param, loader in captured)
+
+
+@pytest.mark.parametrize("loader_kind", ["foreign", "unbound", "missing"])
+def test_binding_rejects_named_actual_expert_before_publication(tmp_path, monkeypatch, loader_kind):
+    model = GenericMoE()
+    config, _ = config_and_map(tmp_path)
+    owner = model.moe_layers[1].routed_experts
+    param = owner.w2_weight
+    if loader_kind == "missing":
+        del param.weight_loader
+    else:
+        param.weight_loader = (model.moe_layers[0].routed_experts.weight_loader
+                               if loader_kind == "foreign" else owner.weight_loader.__func__)
+    originals = [(p, getattr(p, "weight_loader", None)) for p in model.parameters()]
+    def must_not_publish(*args):
+        pytest.fail("invalid expert loader reached cross-rank publication boundary")
+    monkeypatch.setattr(api, "verify_static_plan_across_ep_ranks", must_not_publish)
+    with pytest.raises(ValueError, match="w2_weight.*unsupported loader owner"):
+        bind(config, model)
+    assert not hasattr(model, "_vllm_hcu_static_eplb_plan")
+    for layer in model.moe_layers:
+        assert not hasattr(layer.routed_experts, "_vllm_hcu_static_eplb_row")
+        assert "get_expert_mapping" not in vars(layer.routed_experts)
+    assert all(getattr(p, "weight_loader", None) is loader for p, loader in originals)
