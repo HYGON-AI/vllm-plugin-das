@@ -1067,6 +1067,11 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         seen_names: set[str] = set()
+        from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
+            adapt_checkpoint_weights,
+        )
+
+        weights = adapt_checkpoint_weights(self.quant_config, weights)
         def _filter_weights(weights):
             for name, weight in weights:
                 # Exclude both model.layers.<N>.* and model.mtp_layers.<i>.*

@@ -63,6 +63,15 @@ def _remap_mtp_quant_exclusions(quant_config, mtp_start_layer_idx, num_mtp_layer
     if quant_config is None:
         return None
     result = copy.copy(quant_config)
+    if getattr(quant_config, "checkpoint_format", None) in (
+        "hy4-w4a8-custom-v1", "hy4_w4a8_v1",
+    ):
+        from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8 import HYV4W4A8Config
+
+        if isinstance(quant_config, HYV4W4A8Config):
+            result.quantized_modules = quant_config.remap_mtp_modules(
+                mtp_start_layer_idx, num_mtp_layers,
+            )
     for attr in ("ignore", "ignored_layers", "exclude_modules"):
         patterns = getattr(quant_config, attr, None)
         if not patterns:
@@ -432,6 +441,11 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
         return self.sampler(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
+            adapt_checkpoint_weights,
+        )
+
+        weights = adapt_checkpoint_weights(self.quant_config, weights)
         params_dict = dict(self.named_parameters())
         tied_head_name = f"model.layers.{self.config.num_hidden_layers}.shared_head.head.weight"
 

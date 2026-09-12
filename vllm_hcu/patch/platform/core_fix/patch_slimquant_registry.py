@@ -39,6 +39,12 @@ def apply_to_module(module: ModuleType) -> bool:
             "HCU SlimQuant facade registry no longer matches the audited names"
         )
 
+    from vllm_hcu.model_executor.layers.quantization.hyv4_w4a8_weights import (
+        HYV4W4A8Facade,
+    )
+
+    facades = {**SLIMQUANT_FACADES, "slimquant_w4a8": HYV4W4A8Facade}
+
     register = getattr(quantization, "register_quantization_config", None)
     methods = getattr(quantization, "QUANTIZATION_METHODS", None)
     if not callable(register) or not isinstance(methods, list):
@@ -52,7 +58,7 @@ def apply_to_module(module: ModuleType) -> bool:
             "vLLM customized quantization registry has incompatible type"
         )
 
-    for name, facade in SLIMQUANT_FACADES.items():
+    for name, facade in facades.items():
         if name in methods:
             existing = customized.get(name) if isinstance(customized, dict) else None
             if existing is facade:
