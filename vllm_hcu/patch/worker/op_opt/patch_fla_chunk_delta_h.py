@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Route the vLLM FLA chunk-state kernel through BoltOPs on HCU."""
+"""Route supported vLLM FLA chunk-state shapes through BoltOPs on HCU."""
 
 from __future__ import annotations
 
 import functools
 from types import ModuleType
+
+import torch
 
 from ._common import (
     already_applied,
@@ -28,6 +30,17 @@ def _enabled() -> bool:
     return bool(
         henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
+    )
+
+
+def _use_boltops(k, u) -> bool:
+    """Keep the prior provider except for the audited official-faster shape."""
+    return not (
+        k.ndim == 4
+        and u.ndim == 4
+        and k.dtype == u.dtype == torch.bfloat16
+        and k.shape[-2:] == (4, 128)
+        and u.shape[-2:] == (12, 128)
     )
 
 
@@ -78,7 +91,7 @@ def apply_to_module(module: ModuleType) -> bool:
         chunk_offsets=None,
         use_exp2=False,
     ):
-        if not _enabled():
+        if not _enabled() or not _use_boltops(k, u):
             return original(
                 k, w, u, g, gk, initial_state, output_final_state,
                 chunk_size, save_new_value, cu_seqlens, chunk_indices,
