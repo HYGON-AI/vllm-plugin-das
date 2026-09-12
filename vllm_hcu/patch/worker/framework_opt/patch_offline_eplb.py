@@ -67,19 +67,26 @@ def apply_to_module(module):
     target = load_exact_module(TARGET_MODULE, module)
     cls = target.EplbState
     originals = tuple(getattr(cls, name) for name in ("add_model", "step", "rearrange"))
-    if getattr(target, _MARKER, False):
-        if not all(getattr(value, _MARKER, False) for value in originals):
+    originals += (target._commit_eplb_maps, target.rearrange_expert_weights_inplace)
+    installed = getattr(target, _MARKER, None)
+    if installed:
+        if (not isinstance(installed, tuple) or len(installed) != len(originals)
+                or any(current is not wrapper for current, wrapper in zip(originals, installed))):
             raise PatchCompatibilityError("Static EPLB state marker is stale")
         return False
-    original_add, original_step, original_rearrange = originals
-    original_commit = target._commit_eplb_maps
-    original_transfer = target.rearrange_expert_weights_inplace
+    original_add, original_step, original_rearrange, original_commit, original_transfer = originals
     require_exact_signature(original_add, TARGETS[0], positional=("self", "model", "model_config"))
     require_exact_signature(original_step, TARGETS[1],
         positional=("self", "is_dummy", "is_profile", "log_stats"),
         defaults=dict(is_dummy=False, is_profile=False, log_stats=False))
     require_exact_signature(original_rearrange, TARGETS[2],
         positional=("self", "is_profile", "rank_mapping"),
+        defaults=dict(is_profile=False, rank_mapping=None))
+    require_exact_signature(original_commit, TARGETS[3],
+        positional=("model_state", "new_physical_to_logical_map"))
+    require_exact_signature(original_transfer, TARGETS[4], positional=(
+        "old_global_expert_indices", "new_global_expert_indices", "expert_weights",
+        "expert_buffer", "ep_group", "communicator", "is_profile", "rank_mapping"),
         defaults=dict(is_profile=False, rank_mapping=None))
 
     @functools.wraps(original_add)
@@ -109,13 +116,17 @@ def apply_to_module(module):
         state._hcu_offline_model_key = resolve_offline_eplb_model_key(model, self.parallel_config)
         if plan is not None:
             original_commit(state, plan.physical_to_logical_map)
-            if getattr(self.parallel_config, "_vllm_hcu_eplb_static_dispatch_policy", "nearest") == "locality_fair":
-                from vllm_hcu.model_executor.layers.fused_moe.eplb_dispatch import build_locality_fair_replica_order
-                group = target.get_ep_group().device_group
-                ordered = build_locality_fair_replica_order(state.logical_to_physical_map,
-                    ep_rank=group.rank(), ep_size=group.size(), num_nodes=target.get_node_count(),
-                    num_physical_experts=plan.num_physical_experts)
-                state.logical_to_physical_map.copy_(ordered)
+            from vllm_hcu.model_executor.layers.fused_moe.eplb_dispatch import (
+                build_locality_fair_replica_order, build_nearest_replica_order,
+            )
+            policy = getattr(self.parallel_config, "_vllm_hcu_eplb_static_dispatch_policy", "nearest")
+            order = {"nearest": build_nearest_replica_order,
+                     "locality_fair": build_locality_fair_replica_order}[policy]
+            group = target.get_ep_group().device_group
+            ordered = order(state.logical_to_physical_map,
+                ep_rank=group.rank(), ep_size=group.size(), num_nodes=target.get_node_count(),
+                num_physical_experts=plan.num_physical_experts)
+            state.logical_to_physical_map.copy_(ordered)
             self.is_async = False
             if self.should_record_tensor is not None:
                 self.should_record_tensor.fill_(False)
@@ -168,12 +179,16 @@ def apply_to_module(module):
                 num_logical_experts=model.num_logical_experts,
                 num_redundant_experts=model.num_redundant_experts)
 
-    for name, wrapper in zip(("add_model", "step", "rearrange"), (add, step, rearrange)):
+    wrappers = (add, step, rearrange, commit, transfer)
+    for wrapper in wrappers:
         setattr(wrapper, _MARKER, True)
+    for name, wrapper in zip(("add_model", "step", "rearrange"), wrappers[:3]):
         setattr(cls, name, wrapper)
     target._commit_eplb_maps = commit
     target.rearrange_expert_weights_inplace = transfer
-    setattr(target, _MARKER, True)
+    # Retain exact identities: functools.wraps copies boolean markers, so a
+    # marker alone cannot prove that the guarded mutation hooks remain installed.
+    setattr(target, _MARKER, wrappers)
     return True
 
 

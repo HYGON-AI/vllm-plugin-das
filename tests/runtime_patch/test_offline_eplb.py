@@ -35,7 +35,9 @@ def setup_state(tmp_path, monkeypatch, mode="static"):
     monkeypatch.setattr(upstream, "get_eplb_group", lambda: group)
     monkeypatch.setattr(upstream, "get_node_count", lambda: 1)
     monkeypatch.setattr(upstream, "create_eplb_communicator", lambda **kwargs: object())
-    def no_transfer(*args, **kwargs):
+    def no_transfer(old_global_expert_indices, new_global_expert_indices,
+                    expert_weights, expert_buffer, ep_group, communicator,
+                    is_profile=False, rank_mapping=None):
         pytest.fail("expert weights rearranged")
     monkeypatch.setattr(upstream, "rearrange_expert_weights_inplace", no_transfer)
     api.apply_to_module(upstream)
@@ -210,6 +212,23 @@ def test_static_state_applies_locality_order_to_current_maps(tmp_path, monkeypat
     assert model.moe_layers[0].eplb_state.logical_to_physical_map[1, :2].tolist() == [3, 1]
 
 
+@pytest.mark.parametrize("policy", [None, "nearest"])
+def test_static_nearest_prefers_local_replica_over_lower_remote_id(tmp_path, monkeypatch, policy):
+    _, upstream, state, model, config, _ = setup_state(tmp_path, monkeypatch)
+    if policy is not None:
+        state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = policy
+    group = SimpleNamespace(world_size=2, rank_in_group=1,
+        device_group=SimpleNamespace(rank=lambda: 1, size=lambda: 2))
+    monkeypatch.setattr(upstream, "get_ep_group", lambda: group)
+    state.add_model(model, config)
+    live = state.model_states["test"]
+    # Current router's token-zero hash selects column zero, not the EP rank.
+    assert live.logical_to_physical_map[0, 1, :2].tolist() == [3, 1]
+    assert live.logical_to_physical_map[1, 2, :2].tolist() == [3, 0]
+    assert model.moe_layers[1].eplb_state.logical_to_physical_map[2, 0].item() == 3
+    assert live.physical_to_logical_map.tolist() == [[0, 1, 2, 1], [2, 0, 1, 2]]
+
+
 def test_gloo_communicator_needs_no_device_profile_reservation(monkeypatch):
     import vllm.distributed.eplb.eplb_communicator as module
     name = "vllm_hcu.patch.worker.framework_opt.patch_eplb_communicator"
@@ -236,3 +255,62 @@ def test_worker_eplb_sidecar_survives_object_and_dict_transport(as_dict):
     parallel = config["parallel_config"] if as_dict else vars(config.parallel_config)
     assert parallel["_vllm_hcu_expert_map_path"] == "/tmp/map.json"
     assert parallel["_vllm_hcu_eplb_static_dispatch_policy"] == "locality_fair"
+
+
+def offline_adapter_target():
+    """Isolate installation tests while preserving the pinned hook signatures."""
+    import inspect
+    from types import ModuleType
+    import vllm.distributed.eplb.eplb_state as upstream
+    api = adapter()
+    target = ModuleType(api.TARGET_MODULE)
+    target.EplbState = type("EplbState", (), {
+        name: inspect.unwrap(getattr(upstream.EplbState, name))
+        for name in ("add_model", "step", "rearrange")})
+    for name in ("_commit_eplb_maps", "rearrange_expert_weights_inplace"):
+        setattr(target, name, inspect.unwrap(getattr(upstream, name)))
+    return api, target
+
+
+def offline_hooks(target):
+    return [(target.EplbState, name) for name in ("add_model", "step", "rearrange")] + [
+        (target, name) for name in ("_commit_eplb_maps", "rearrange_expert_weights_inplace")]
+
+
+@pytest.mark.parametrize("name", ["_commit_eplb_maps", "rearrange_expert_weights_inplace"])
+def test_offline_rejects_incompatible_mutation_signature_before_install(name):
+    api, target = offline_adapter_target()
+    def incompatible(unexpected):
+        pytest.fail("incompatible hook executed")
+    setattr(target, name, incompatible)
+    originals = [getattr(owner, hook) for owner, hook in offline_hooks(target)]
+    with pytest.raises(RuntimeError, match="signature"):
+        api.apply_to_module(target)
+    assert all(getattr(owner, hook) is original for (owner, hook), original
+               in zip(offline_hooks(target), originals))
+
+
+@pytest.mark.parametrize("name", ["_commit_eplb_maps", "rearrange_expert_weights_inplace"])
+def test_offline_rejects_reverted_mutation_hook_on_reentry(name):
+    api, target = offline_adapter_target()
+    original = getattr(target, name)
+    api.apply_to_module(target)
+    setattr(target, name, original)
+    with pytest.raises(RuntimeError, match="stale|identity"):
+        api.apply_to_module(target)
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_offline_rejects_replaced_hook_even_with_copied_marker(index):
+    import functools
+    api, target = offline_adapter_target()
+    api.apply_to_module(target)
+    assert api.apply_to_module(target) is False
+    owner, name = offline_hooks(target)[index]
+    installed = getattr(owner, name)
+    @functools.wraps(installed)
+    def replacement(*args, **kwargs):
+        pytest.fail("replaced mutation hook executed")
+    setattr(owner, name, replacement)
+    with pytest.raises(RuntimeError, match="stale|identity"):
+        api.apply_to_module(target)

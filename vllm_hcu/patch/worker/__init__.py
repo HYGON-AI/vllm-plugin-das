@@ -312,6 +312,7 @@ _CUDA_VALIDATION_ID = (
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb")),
     _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb_gate")),
+    _CallbackSpec(_adapter("framework_opt", "patch_static_expert_mapping")),
     _CallbackSpec(_adapter("framework_opt", "patch_offline_eplb")),
     _CallbackSpec(_adapter("framework_opt", "patch_eplb_communicator")),
     _CallbackSpec(_adapter("framework_opt", "patch_routing_simulator")),

@@ -130,14 +130,21 @@ def test_fingerprints_disagree_before_binding(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("architecture", ["deepseek", "qwen3"])
 def test_current_generic_causal_lm_auto_loader_loads_two_maps(tmp_path, architecture):
-    from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV2Model
     from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
     cls = DeepseekV2ForCausalLM if architecture == "deepseek" else Qwen3MoeForCausalLM
     model = cls.__new__(cls)
     torch.nn.Module.__init__(model)
     generic = GenericMoE(1)
-    model.model = torch.nn.Module()
+    if architecture == "deepseek":
+        model.model = DeepseekV2Model.__new__(DeepseekV2Model)
+        torch.nn.Module.__init__(model.model)
+        model.model.config = SimpleNamespace(n_routed_experts=3, n_shared_experts=0)
+        model.model.use_mha = False
+        model.model.num_redundant_experts = 1
+    else:
+        model.model = torch.nn.Module()
     model.model.layers = torch.nn.ModuleList()
     runners = []
     for item in generic.moe_layers:
@@ -155,14 +162,22 @@ def test_current_generic_causal_lm_auto_loader_loads_two_maps(tmp_path, architec
                  "num_redundant_experts", "num_expert_groups", "expert_weights"):
         setattr(model, name, getattr(generic, name))
     config, _ = config_and_map(tmp_path, key=type(model).__name__)
+    owner_state = [(runner.routed_experts.quant_method,
+                    runner.routed_experts.expert_map_manager) for runner in runners]
     bind(config, model)
     checkpoint = [(f"model.layers.{layer}.mlp.experts.{logical}.{projection}.weight",
                    torch.full((2, 2), logical + 1.))
                   for layer in range(2) for logical in range(3)
                   for projection in ("gate_proj", "up_proj", "down_proj")]
-    model.load_weights(iter(checkpoint))
+    loaded = model.load_weights(iter(checkpoint))
+    if architecture == "deepseek":
+        assert all(f"model.layers.{index}.mlp.experts.routed_experts.w2_weight" in loaded
+                   for index in range(2))
     assert runners[0].routed_experts.w2_weight[:, 0, 0].tolist() == [3., 2.]
     assert runners[1].routed_experts.w2_weight[:, 0, 0].tolist() == [2., 3.]
+    for runner, (method, manager) in zip(runners, owner_state):
+        assert runner.routed_experts.quant_method is method
+        assert runner.routed_experts.expert_map_manager is manager
 
 
 def test_legacy_model_mapping_does_not_emit_initial_redundant_ids(tmp_path):
@@ -176,6 +191,17 @@ def test_legacy_model_mapping_does_not_emit_initial_redundant_ids(tmp_path):
     config, _ = config_and_map(tmp_path)
     bind(config, model)
     assert {row[2] for row in model.get_expert_mapping()} == {0, 1, 2}
+
+
+def test_inline_mapping_preserves_dynamic_redundancy_without_static_plan():
+    from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+    from vllm_hcu.patch.worker.framework_opt import patch_static_expert_mapping
+    patch_static_expert_mapping.apply()
+    mapping = fused_moe_make_expert_params_mapping(
+        GenericMoE(), "gate_proj", "down_proj", "up_proj", 3, 1)
+    assert {row[2] for row in mapping} == {0, 1, 2, 3}
+    assert {row[1] for row in mapping if row[2] == 3} == {
+        "experts.0.gate_proj.", "experts.0.down_proj.", "experts.0.up_proj."}
 
 
 def test_static_shared_experts_keep_current_aiter_physical_tail(tmp_path):

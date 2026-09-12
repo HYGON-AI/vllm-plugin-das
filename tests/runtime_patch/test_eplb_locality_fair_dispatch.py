@@ -51,3 +51,16 @@ def test_invalid_replica_maps(order, mapping):
     with pytest.raises(ValueError):
         order(torch.tensor(mapping), ep_rank=0, ep_size=4, num_nodes=2,
               num_physical_experts=4)
+
+
+def test_nearest_orders_gpu_then_node_then_remote_with_stable_ties():
+    from vllm_hcu.model_executor.layers.fused_moe import eplb_dispatch
+    assert hasattr(eplb_dispatch, "build_nearest_replica_order"), "nearest ordering missing"
+    mapping = torch.tensor([[[0, 4, 7, -1], [0, 4, 5, -1], [0, 1, -1, -1]]])
+    original = mapping.clone()
+    result = eplb_dispatch.build_nearest_replica_order(mapping, ep_rank=3,
+        ep_size=4, num_nodes=2, num_physical_experts=8)
+    assert result.tolist() == [[[7, 4, 0, -1], [4, 5, 0, -1], [0, 1, -1, -1]]]
+    assert torch.equal(mapping, original)
+    assert torch.equal(result, eplb_dispatch.build_nearest_replica_order(result,
+        ep_rank=3, ep_size=4, num_nodes=2, num_physical_experts=8))

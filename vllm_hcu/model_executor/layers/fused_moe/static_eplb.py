@@ -253,10 +253,16 @@ def bind_static_eplb_plan(vllm_config, model):
             parameters.append((param, loader.__func__))
         targets.append((experts, parameters))
     verify_static_plan_across_ep_ranks(plan)
+    # Legacy inner loaders build mappings inline instead of asking their
+    # get_expert_mapping method. The shared static entry point owns that seam.
+    from vllm_hcu.patch.worker.framework_opt.patch_static_expert_mapping import apply
+    apply()
     owners = [model]
+    expert_owners = {experts for experts, _ in targets}
     for name in ("model", "language_model"):
         inner = getattr(model, name, None)
-        if inner is not None and inner is not model and getattr(inner, "moe_layers", None) is model.moe_layers:
+        if (isinstance(inner, torch.nn.Module) and inner is not model
+                and {owner for owner in inner.modules() if isinstance(owner, RoutedExperts)} == expert_owners):
             owners.append(inner)
     for index, (experts, parameters) in enumerate(targets):
         experts._vllm_hcu_static_eplb_row = plan.layer_map(index)

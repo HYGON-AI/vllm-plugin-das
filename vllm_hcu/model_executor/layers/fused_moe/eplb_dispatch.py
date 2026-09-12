@@ -19,24 +19,14 @@ def _choose_least_assigned(
     return min(shuffled, key=assignment_counts.__getitem__)
 
 
-def build_locality_fair_replica_order(
+def _validated_replica_map(
     logical_to_physical_map: torch.Tensor,
     *,
     ep_rank: int,
     ep_size: int,
     num_nodes: int,
     num_physical_experts: int,
-    seed: int = 42,
-    layer_offset: int = 0,
 ) -> torch.Tensor:
-    """Put a locality-fair primary replica first for one source EP rank.
-
-    vLLM hashes token positions into replica columns. Each EP rank receives a
-    different cyclic ordering, so every hash column remains balanced across
-    source ranks while column zero preserves GPU/node locality for decode.
-    The three-pass assignment follows SGLang-DAS commit 1cc92e0d.
-    """
-
     if not isinstance(logical_to_physical_map, torch.Tensor):
         raise TypeError("logical_to_physical_map must be a torch.Tensor")
     if logical_to_physical_map.ndim != 3:
@@ -68,7 +58,6 @@ def build_locality_fair_replica_order(
             "num_physical_experts must be divisible by ep_size, got "
             f"{num_physical_experts} and {ep_size}"
         )
-    source_device = logical_to_physical_map.device
     result = logical_to_physical_map.detach().to(device="cpu").clone()
     invalid_ids = (result < -1) | (result >= num_physical_experts)
     if torch.any(invalid_ids):
@@ -83,6 +72,65 @@ def build_locality_fair_replica_order(
             f"logical expert {logical_expert_id} in layer {layer_id} "
             "has no physical replicas"
         )
+    return result
+
+
+def build_nearest_replica_order(
+    logical_to_physical_map: torch.Tensor,
+    *,
+    ep_rank: int,
+    ep_size: int,
+    num_nodes: int,
+    num_physical_experts: int,
+) -> torch.Tensor:
+    """Order replicas by same GPU, same node, then remote; break ties by ID.
+
+    The current router hashes into columns without knowing the source rank.
+    In particular, token zero selects column zero, so nearest must install a
+    rank-local ordering instead of relying on ascending global physical IDs.
+    """
+    result = _validated_replica_map(logical_to_physical_map, ep_rank=ep_rank,
+        ep_size=ep_size, num_nodes=num_nodes, num_physical_experts=num_physical_experts)
+    num_local_experts = num_physical_experts // ep_size
+    ranks_per_node = ep_size // num_nodes
+
+    def locality(physical_id):
+        rank = physical_id // num_local_experts
+        distance = 0 if rank == ep_rank else (
+            1 if rank // ranks_per_node == ep_rank // ranks_per_node else 2)
+        return distance, physical_id
+
+    for layer in result:
+        for row in layer:
+            candidates = [int(value) for value in row.tolist() if value >= 0]
+            if len(candidates) != len(set(candidates)):
+                raise ValueError("logical expert has duplicate physical replicas")
+            row.fill_(-1)
+            row[:len(candidates)] = torch.tensor(sorted(candidates, key=locality), dtype=row.dtype)
+    return result.to(device=logical_to_physical_map.device)
+
+
+def build_locality_fair_replica_order(
+    logical_to_physical_map: torch.Tensor,
+    *,
+    ep_rank: int,
+    ep_size: int,
+    num_nodes: int,
+    num_physical_experts: int,
+    seed: int = 42,
+    layer_offset: int = 0,
+) -> torch.Tensor:
+    """Put a locality-fair primary replica first for one source EP rank.
+
+    vLLM hashes token positions into replica columns. Each EP rank receives a
+    different cyclic ordering, so every hash column remains balanced across
+    source ranks while column zero preserves GPU/node locality for decode.
+    The three-pass assignment follows SGLang-DAS commit 1cc92e0d.
+    """
+    result = _validated_replica_map(logical_to_physical_map, ep_rank=ep_rank,
+        ep_size=ep_size, num_nodes=num_nodes, num_physical_experts=num_physical_experts)
+    source_device = logical_to_physical_map.device
+    replica_counts = (result >= 0).sum(dim=-1)
     num_local_experts = num_physical_experts // ep_size
     num_gpus_per_node = ep_size // num_nodes
     num_node_experts = num_local_experts * num_gpus_per_node
@@ -163,4 +211,4 @@ def build_locality_fair_replica_order(
     return result.to(device=source_device)
 
 
-__all__ = ["build_locality_fair_replica_order"]
+__all__ = ["build_locality_fair_replica_order", "build_nearest_replica_order"]
