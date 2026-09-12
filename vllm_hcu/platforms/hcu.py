@@ -60,6 +60,7 @@ def _load_hcu_management_api() -> ModuleType | None:
 
 try:
     import vllm._C  # noqa: F401
+    import vllm._C_stable_libtorch  # noqa: F401  # Register UVA zero-copy ops
 except ImportError as e:
     logger.warning("Failed to import from vllm._C with %r", e)
 
