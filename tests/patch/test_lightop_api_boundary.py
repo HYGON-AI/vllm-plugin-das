@@ -37,6 +37,19 @@ ALLOWED_TOP_LEVEL = {
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant"),
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant_ep"),
 }
+AUDITED_NON_PUBLIC_IMPORTS = {
+    (
+        "vllm_hcu/model_executor/layers/quantization/"
+        "lightop_marlin_moe_compat.py",
+        "lightop",
+        "envs",
+    ),
+    (
+        "vllm_hcu/v1/attention/ops/lightop_kpool_topk_transform.py",
+        "lightop.fuse_topk_transform",
+        "fast_kpool_topk_transform_fused",
+    ),
+}
 
 
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
@@ -62,9 +75,25 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.category_aliases: dict[str, str] = {}
         self.used: set[tuple[str, str]] = set()
         self.allowed_calls: list[tuple[str, str, int]] = []
+        self.audited_non_public_imports: set[tuple[str, str, str]] = set()
         self.violations: list[str] = []
         self._violation_keys: set[tuple[int, str]] = set()
         self._functions: list[str] = []
+
+    def _is_audited_non_public_import(
+        self,
+        module: str,
+        symbol: str,
+    ) -> bool:
+        key = (
+            self.relative_path,
+            module,
+            symbol,
+        )
+        if key not in AUDITED_NON_PUBLIC_IMPORTS:
+            return False
+        self.audited_non_public_imports.add(key)
+        return True
 
     def _violate(self, node: ast.AST, detail: str) -> None:
         line = getattr(node, "lineno", 1)
@@ -148,7 +177,10 @@ class _LightOpVisitor(ast.NodeVisitor):
             for alias in node.names:
                 if alias.name in PUBLIC_CATEGORIES:
                     self.category_aliases[alias.asname or alias.name] = alias.name
-                else:
+                elif not self._is_audited_non_public_import(
+                    module,
+                    alias.name,
+                ):
                     self._violate(
                         node,
                         f"moved top-level LightOp import {alias.name!r}",
@@ -158,7 +190,15 @@ class _LightOpVisitor(ast.NodeVisitor):
             if suffix in {"op", "gemmopt"}:
                 self._violate(node, f"obsolete LightOp namespace {module!r}")
             elif suffix not in PUBLIC_CATEGORIES:
-                self._violate(node, f"non-public LightOp module {module!r}")
+                for alias in node.names:
+                    if not self._is_audited_non_public_import(
+                        module,
+                        alias.name,
+                    ):
+                        self._violate(
+                            node,
+                            f"non-public LightOp module {module!r}",
+                        )
             else:
                 for alias in node.names:
                     if alias.name == "*":
@@ -459,9 +499,16 @@ def _activation_resolver_is_exact(tree: ast.Module) -> bool:
     )
 
 
-def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
+def _scan(
+    root: Path,
+) -> tuple[
+    list[str],
+    set[tuple[str, str]],
+    set[tuple[str, str, str]],
+]:
     violations: list[str] = []
     used: set[tuple[str, str]] = set()
+    audited_non_public_imports: set[tuple[str, str, str]] = set()
     allowed_calls: list[tuple[str, str, int]] = []
     owner_tree: ast.Module | None = None
     repository = root.parent
@@ -473,6 +520,9 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
         visitor.visit(tree)
         violations.extend(visitor.violations)
         used.update(visitor.used)
+        audited_non_public_imports.update(
+            visitor.audited_non_public_imports
+        )
         allowed_calls.extend(visitor.allowed_calls)
         if relative_path == CLAMP_OWNER:
             owner_tree = tree
@@ -496,7 +546,7 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
             "categorized lookup"
         )
 
-    return sorted(violations), used
+    return sorted(violations), used, audited_non_public_imports
 
 
 def scan_lightop_imports(root: Path) -> list[str]:
@@ -540,8 +590,64 @@ def installed_public_exports(
 
 
 def test_production_uses_public_lightop_categories_only() -> None:
-    violations = scan_lightop_imports(REPOSITORY / "vllm_hcu")
+    violations, _, audited_non_public_imports = _scan(
+        REPOSITORY / "vllm_hcu"
+    )
     assert violations == []
+    assert audited_non_public_imports == AUDITED_NON_PUBLIC_IMPORTS
+
+
+def test_scanner_limits_non_public_imports_to_audited_owner_and_symbol(
+    tmp_path: Path,
+) -> None:
+    root = _write_mutation_owner(tmp_path)
+    audited = {
+        path: (module, symbol)
+        for path, module, symbol in AUDITED_NON_PUBLIC_IMPORTS
+    }
+    for relative_path, (module, symbol) in audited.items():
+        owner = tmp_path / relative_path
+        owner.parent.mkdir(parents=True, exist_ok=True)
+        owner.write_text(f"from {module} import {symbol}\n", encoding="utf-8")
+
+    assert scan_lightop_imports(root) == []
+
+    mutation = root / "non_public_mutation.py"
+    mutation.write_text(
+        "from lightop import envs\n"
+        "from lightop.fuse_topk_transform import "
+        "fast_kpool_topk_transform_fused\n",
+        encoding="utf-8",
+    )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "moved top-level LightOp import 'envs'" in item
+        for item in violations
+    )
+    assert any(
+        "non-public LightOp module 'lightop.fuse_topk_transform'" in item
+        for item in violations
+    )
+
+    for relative_path, (module, _symbol) in audited.items():
+        owner = tmp_path / relative_path
+        owner.write_text(
+            f"from {module} import wrong_symbol\n",
+            encoding="utf-8",
+        )
+
+    violations = scan_lightop_imports(root)
+
+    assert any(
+        "moved top-level LightOp import 'wrong_symbol'" in item
+        for item in violations
+    )
+    assert any(
+        "non-public LightOp module 'lightop.fuse_topk_transform'" in item
+        for item in violations
+    )
 
 
 def _write_mutation_owner(
