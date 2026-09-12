@@ -294,7 +294,16 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
-        self.indexer_op = SparseAttnIndexer(
+        indexer_cls = SparseAttnIndexer
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            # PCP metadata carries rank-ordered global cache slots. The V32
+            # owner gathers matching K before computing top-k for local Q.
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                V32SparseAttnIndexer,
+            )
+
+            indexer_cls = V32SparseAttnIndexer
+        self.indexer_op = indexer_cls(
             self.k_cache,
             self.quant_block_size,
             self.scale_fmt,

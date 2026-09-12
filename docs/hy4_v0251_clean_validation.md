@@ -1,13 +1,15 @@
 # HYV4 v0.25.1 clean integration validation
 
 This contains the Task 10 execution protocol, Task 11 observed results, and
-the focused Task 11A static-loader fix/rerun.
+the focused Task 11A static-loader fix/rerun and Task 11B PCP fix/rerun.
 CPU tests establish contracts; they do not establish checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
-Each result state is updated only after retaining its evidence. The observed
-PP2/PCP4 correctness failure and DP8 memory failures mean this matrix is not
-an overall integration pass. Task 11A fixes the static loader-owner rejection,
-but its unchanged static rerun fails later during KV allocation.
+Each result state is updated only after retaining its evidence. Task 11B fixes
+the PP2/PCP4 correctness failure and passes its original exact gate. DP8 memory
+failures mean this matrix is still not an overall integration pass. Task 11A
+fixes the static loader-owner rejection, but its unchanged static rerun fails
+later during KV allocation. The separate plain-PP diagnostic stall below
+remains unresolved.
 
 Task 11 provenance capture began at 2026-09-12T21:11:05Z (the host renders
 local log timestamps as 2026-09-13 UTC+08:00), from candidate
@@ -32,7 +34,7 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 | TP8 Channel-FP8 target, AITER, default graphs | PASS | 131 shards loaded; AITER configs; PIECEWISE/FULL capture; HTTP 200 short and 3×3145-token prompts; clean teardown |
 | TP8 MTP3, AITER, default graphs | PASS | Target/draft capture; HTTP 200; 114 drafted, 81 accepted tokens; clean teardown |
 | TP8 MTP3, FP8 E4M3 KV, repeated prefix | PASS | 3×3145-token prompts; hits 0/3008/6016; coherent output; HTTP 200; clean teardown |
-| PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | FAIL | Short chat correct; all three long outputs incoherent and length-truncated despite HTTP 200; clean teardown; DCP disabled/default |
+| PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | PASS — Task 11B | Original short + three 3145-token requests correct, HTTP 200/stop; exact 41,37/FP8 KV topology; health 200; clean teardown; DCP disabled/default |
 | DP8/TP1/EP8, DeepEP HT, DeepGEMM | FAIL — capacity | All eight ranks loaded; KV budget −0.7 GiB; no readiness; exit 1; clean teardown |
 | DP8/EP8 static offline EPLB load | FAIL — KV allocation OOM | Task 11A: owner rejection fixed; all eight ranks loaded 125.69 GiB; later KV allocation OOM; no readiness; exit 1; clean teardown |
 | HumanEval/0–31 target-only | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors; all stop; clean teardown |
@@ -760,3 +762,78 @@ and all eight devices. Every service teardown passed; the final devices were
 0%/2 MiB. These static/evidence checks do not turn the three failed hardware
 rows into passes. Full details and historical setup/audit-helper corrections
 are retained in the Task 11 report and validation-log directory.
+
+## Task 11B PCP long-prefill diagnosis
+
+Baseline `7205e8d71f173ecce5175a1947779495eec77065`; pinned ABI, checkpoint,
+max length 4096 and original `41,37` partition were preserved. Artifacts:
+`/models/validation-logs/hy4-pp-pcp-quality-20260912T224350Z`.
+The directory suffix is an identifier; authoritative UTC starts are in the
+service logs, beginning at 2026-09-12T22:42:01Z. DCP is not tested; size 1
+remains disabled/default. These controls are diagnostic, not substitute gates.
+
+| Diagnostic | Observation |
+| --- | --- |
+| Exact PP2/TP1/PCP4/EP4, DeepEP HT/DeepGEMM/FP8/eager | Cold sampled prompts of 34–2106 tokens correct; 2310/2802/3150 and original 3145 fail with repetitive 128-token/length outputs. Warm cache shifts the observed transition. |
+| PP2/TP4, PCP1, no EP | Cold sampled prompts through 2802 correct; 3150 stalls after 127 generated tokens. PP0 waits on executor queue; PP1 waits on PP receive. This separate runtime stall is inconclusive for long quality, not a pass or a fixed issue. |
+| PP1/TP2/PCP4/EP8, same backends | Reproduces the cold 2310+ failure; PP transfer and stage 41 boundary are not necessary for it. |
+| Exact PP/PCP topology, AITER MoE only | Original short correct; all three original 3145-token prompts fail with 128/length. DeepGEMM alone is not necessary for failure. |
+| Real CPU PCP planner/restore | Four ranks at 34/2106/2310/3145, cached 498 and decode preserve token ordering/restore. |
+| Standalone gfx938 MQA/top-k | 52 sampled real-layout rows, max absolute reference-logit error 0.00048828125, top-k overlap 1.0, invalid indices 0. |
+| Read-only runtime owner/cache observer | All 8 workers select base `SparseAttnIndexer.forward_hip`; 336 indexer calls/1008 sampled rows expose missing cache keys, max own-K/cache error 5.0. |
+
+Root cause: HYV4 constructed the base indexer rather than the existing
+PCP-aware V32 owner. The base receives local K with global rank-ordered cache
+slots and omits the PCP K/slot gather. Short contexts mask the problem because
+top-k 2048 selects every valid token; longer contexts require correct key scores.
+The change selects the existing V32 owner only for PCP>1, through the canonical
+module exchange; PCP1 dispatch, PP transport, layer ownership, metadata
+algorithms, kernels and MoE policies are unchanged.
+
+The first observer filtered V32 only and therefore captured no indexer rows;
+it is retained as an explicitly corrected diagnostic, not numerical evidence.
+All diagnostic services exited 0 with full 8-device/process/port teardown.
+For the plain-PP stalled request and deliberately interrupted first-observer
+request, only identity-verified task-owned curl clients were terminated after
+owned-PTY shutdown; no unrelated process was signalled. Raw failed/transient
+checks and subsequent complete teardown evidence are retained.
+
+Constructed-Indexer regression: corrected behavioral RED 17 failed/4 passed;
+GREEN 21 passed. Tests use real model construction, HIP dispatch and PCP gather,
+doubling only accelerator allocation/kernel leaves in an isolated process.
+
+### Original exact post-fix gate — PASS
+
+Evidence: `06-exact-final/` under the Task 11B artifact root. Foreground service
+PID/PGID 1389576 ran at 2026-09-12T23:27:55Z–23:31:25Z. Its complete ARGV is
+identical to the original failing run: PP2/TP1/PCP4/DP1, stage-local EP4,
+`41,37`, DeepEP HT, DeepGEMM, FP8 E4M3 KV, eager, max length 4096 and memory
+utilization 0.95. No diagnostic hooks or backend/topology substitutions.
+All eight worker ranks and source partition `[0,41)`/`[41,78)` are verified.
+
+| Original request | Prompt tokens | Completion tokens | Finish | Reviewed output |
+| --- | ---: | ---: | --- | --- |
+| Short | 34 | 3 | stop | `Paris.` |
+| Prefix 0 | 3145 | 2 | stop | `Paris` |
+| Prefix 1 | 3145 | 2 | stop | `Paris` |
+| Prefix 2 | 3145 | 60 | stop | Correctly identifies Paris and coherently explains the source text. |
+
+All four requests returned HTTP 200 and match their corresponding retained
+TP8 requests exactly except served-model name. The three original long cases
+retain their original question ordinals; this is not a claim that their
+request bodies are identical to one another. Full raw text, request/response
+hashes, token counts and comparison are in `baseline-comparison.json` and
+`acceptance-audit.json`. This is correctness evidence, not bitwise output parity.
+Post-reuse health returned 200; no NaN/collective/index/cache errors were found.
+Owned-PTY Ctrl-C at 23:31:23Z led to exit 0. `teardown.log` verifies no saved
+or logged PIDs, no port 8000 listener, and all eight devices at 0%/2 MiB.
+DCP remains disabled/default and was not tested.
+
+Final gates: focused 21 passed; neighbors 692 passed; all 36 changed Python
+test modules unfiltered, 1097 passed; complete pinned contract 2160 passed;
+CI selector 70 passed; doctor 7 PASS/49 callbacks. The initially missing new
+test-module CI registration was observed RED, added as one literal entry and
+verified by the full selector and contract rerun. Compileall and diff checks
+pass. Remaining DP8/static-KV capacity failures, the plain-PP diagnostic stall,
+W4A8/Mooncake hardware gaps, unsupported modes and deferred review observations
+are unchanged; this focused pass is not an overall integration pass.
