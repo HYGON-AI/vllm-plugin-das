@@ -1216,6 +1216,31 @@ def rocm_aiter_sparse_attn_indexer_fake(
     return topk_indices_buffer
 
 
+def _indexer_cache_as_hipc_view(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Restore the physical page axis expected by the HIPC indexer kernels.
+
+    vLLM may expose the official KV-cache backing as a collapsed
+    ``[num_blocks, 1, packed_dim]`` view while retaining a full physical page
+    in the block stride. HIPC derives its page size from ``size(1)``, so recover
+    that axis without copying. Do not reinterpret regular or padded views.
+    """
+    if kv_cache.ndim < 3 or kv_cache.size(1) != 1:
+        return kv_cache
+
+    block_stride = kv_cache.stride(0)
+    token_stride = kv_cache.stride(1)
+    if token_stride <= 0 or block_stride <= token_stride:
+        return kv_cache
+    if block_stride % token_stride != 0:
+        return kv_cache
+
+    block_size = block_stride // token_stride
+    return kv_cache.as_strided(
+        size=(kv_cache.size(0), block_size, *kv_cache.shape[2:]),
+        stride=(block_stride, token_stride, *kv_cache.stride()[2:]),
+    )
+
+
 def rocm_aiter_sparse_attn_indexer_native(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -1269,6 +1294,7 @@ def rocm_aiter_sparse_attn_indexer_native(
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
     device = hidden_states.device if k is None else k.device
+    kv_cache = _indexer_cache_as_hipc_view(kv_cache)
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
