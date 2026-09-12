@@ -280,6 +280,9 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
                 vllm_config.scheduler_config.max_num_batched_tokens, config.index_topk,
                 dtype=torch.int32, device=current_platform.device_type,
             )
+        # Keep the embedding canonical in named_parameters when the head is
+        # tied, matching the target's strict checkpoint accounting.
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleDict({
             str(self.mtp_start_layer_idx): HYV4MultiTokenPredictorLayer(
                 config, f"{prefix}.layers.{self.mtp_start_layer_idx}",
@@ -288,10 +291,13 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
                 topk_indices_buffer=self.topk_indices_buffer,
             ),
         })
+        if config.tie_word_embeddings:
+            self.layers[str(self.mtp_start_layer_idx)].shared_head.head.weight = (
+                self.embed_tokens.weight
+            )
         self.requires_topk_indices_buffer = any(
             layer.mtp_block.self_attn.is_sparse for layer in self.layers.values()
         )
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.spec_step_idx = 0
         self.expert_weights = []
@@ -427,11 +433,16 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
+        tied_head_name = f"model.layers.{self.config.num_hidden_layers}.shared_head.head.weight"
 
         def draft_weights():
             for name, value in weights:
                 name = _rewrite_mtp_weight_name(name, self.config.num_hidden_layers)
                 if name is None:
+                    continue
+                # Like the target, a tied checkpoint loads the canonical
+                # embedding and ignores optional serialized head aliases.
+                if self.config.tie_word_embeddings and name == tied_head_name:
                     continue
                 name, value = _prepare_mtp_fp8_expert_scale(self.quant_config, name, value)
                 name = _normalize_mtp_fused_expert_name(name, params_dict)

@@ -70,6 +70,106 @@ def _weights():
             ("model.norm.weight", torch.tensor(float("nan")))]
 
 
+def _constructed_tied_draft(monkeypatch):
+    """Keep the native constructor, vocab/head modules and strict loader."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers import vocab_parallel_embedding
+    from vllm.model_executor.models import utils
+
+    mtp = _mtp()
+    monkeypatch.setattr(utils, "_model_to_pp_missing_layer_names", {})
+    for module in (target_module, vocab_parallel_embedding):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+
+    class Block(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.block_type = "feedforward"
+            self.self_attn = SimpleNamespace(is_sparse=False)
+
+    # Decoder kernels are unrelated to the embedding/head allocation boundary.
+    monkeypatch.setattr(mtp, "HYV4DecoderLayer", Block)
+    config = HYV4Config(num_hidden_layers=2, hidden_size=2, vocab_size=4,
+                       n_routed_experts=0, tie_word_embeddings=True,
+                       pad_token_id=0, bos_token_id=1, eos_token_id=2)
+    current = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=config)),
+        quant_config=None, cache_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+    )
+    with set_current_vllm_config(VllmConfig()):
+        return mtp.HYV4MTP(vllm_config=current)
+
+
+def _tied_weights():
+    return [(name, value) for name, value in _weights()
+            if name != "lm_head.weight" and ".mlp." not in name]
+
+
+@pytest.mark.parametrize("head_aliases", [
+    (), ("lm_head.weight",), ("model.mtp_layers.0.shared_head.head.weight",),
+    ("model.layers.2.shared_head.head.weight",),
+    ("lm_head.weight", "model.mtp_layers.0.shared_head.head.weight",
+     "model.layers.2.shared_head.head.weight"),
+])
+@pytest.mark.parametrize("head_first", [False, True])
+def test_mtp_tied_checkpoint_loads_without_requiring_head(head_aliases, head_first, monkeypatch):
+    draft = _constructed_tied_draft(monkeypatch)
+    embedding = draft.model.embed_tokens.weight
+    pointer = embedding.data_ptr()
+    weights = _tied_weights()
+    aliases = [(name, torch.full((4, 2), 9.0)) for name in head_aliases]
+    loaded = draft.load_weights(iter(aliases + weights if head_first else weights + aliases))
+    assert loaded == set(dict(draft.named_parameters()))
+    assert "model.embed_tokens.weight" in loaded
+    assert "model.layers.2.shared_head.head.weight" not in loaded
+    head = draft.model.layers["2"].shared_head.head
+    assert head.weight is embedding
+    assert head.weight.data_ptr() == pointer
+    torch.testing.assert_close(embedding[:4], torch.full((4, 2), 2.0))
+    assert not hasattr(draft, "_checkpoint_accounting")
+
+
+def test_mtp_tied_checkpoint_still_requires_canonical_embedding(monkeypatch):
+    draft = _constructed_tied_draft(monkeypatch)
+    weights = [(name, value) for name, value in _tied_weights()
+               if name != "model.embed_tokens.weight"]
+    weights.append(("lm_head.weight", torch.ones(4, 2)))
+    with pytest.raises(RuntimeError, match="Missing HY V4 checkpoint.*model.embed_tokens.weight"):
+        draft.load_weights(iter(weights))
+    assert not hasattr(draft, "_checkpoint_accounting")
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_mtp_tied_checkpoint_preserves_pinned_eagle_pp_embedding_ownership(pp_size, monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils
+
+    draft = _constructed_tied_draft(monkeypatch)
+    draft.load_weights(iter(_tied_weights()))
+    own_embed = draft.model.embed_tokens
+    own_pointer = own_embed.weight.data_ptr()
+    assert draft.model.layers["2"].shared_head.head.weight is own_embed.weight
+    target = nn.Module()
+    target.model = nn.Module()
+    target.model.embed_tokens = nn.Embedding(4, 2)
+    target.lm_head = nn.Linear(2, 4, bias=False)
+    target.lm_head.weight = target.model.embed_tokens.weight
+    monkeypatch.setattr(utils, "get_model", lambda **kwargs: draft)
+    monkeypatch.setattr(utils, "get_pp_group", lambda: SimpleNamespace(world_size=pp_size))
+    loaded = utils.load_eagle_model(target, SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object())))
+    assert loaded.model.layers["2"].shared_head.head is target.lm_head
+    assert loaded.lm_head is target.lm_head
+    assert loaded.model.embed_tokens is (target.model.embed_tokens if pp_size == 1 else own_embed)
+    if pp_size == 2:
+        assert loaded.model.embed_tokens.weight.data_ptr() == own_pointer
+        assert own_pointer != target.model.embed_tokens.weight.data_ptr()
+        torch.testing.assert_close(loaded.model.embed_tokens.weight[:4], torch.full((4, 2), 2.0))
+    else:
+        assert loaded.model.embed_tokens.weight is loaded.lm_head.weight
+
+
 @pytest.mark.parametrize("layout", ["mtp_layers", "nextn_layers"])
 def test_mtp_checkpoint_loads_complete_draft_and_ignores_target(layout, monkeypatch):
     model = _minimal_draft(_mtp(), monkeypatch)
