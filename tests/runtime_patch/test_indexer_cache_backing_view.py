@@ -21,6 +21,7 @@ def test_collapsed_indexer_cache_restores_physical_page_axis():
     assert restored.shape == (3, 64, 132)
     assert restored.stride() == (64 * 132, 132, 1)
     assert restored.data_ptr() == collapsed.data_ptr()
+    assert collapsed.shape == (3, 1, 132)
 
 
 def test_regular_indexer_cache_is_not_reinterpreted():
