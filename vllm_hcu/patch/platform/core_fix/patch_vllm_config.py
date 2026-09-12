@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 from types import ModuleType
 from typing import Any
 
@@ -68,13 +69,19 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    is_hyv4 = architectures == ["HYV4ForCausalLM"]
+    if "HYV4MTPModel" in architectures:
+        raise ValueError("HYV4 PCP does not support HYV4MTPModel.")
+    if "HYV4ForCausalLM" in architectures and not is_hyv4:
+        raise ValueError("HYV4 PCP requires exactly architecture HYV4ForCausalLM.")
+    if use_mla and not (is_glm52 or is_hyv4):
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "HCU MLA PCP only supports GLM-5.2 architecture "
+            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
         )
-    if is_glm52 and not use_mla:
-        raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    mla_model = "HYV4" if is_hyv4 else "GLM-5.2"
+    if (is_glm52 or is_hyv4) and not use_mla:
+        raise ValueError(f"{mla_model} PCP requires MLA or sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -94,17 +101,45 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError(
             "FlashAttention PCP does not support hybrid KV cache groups."
         )
-    if _require_hcu_pcp_attribute(
+    pp_size = _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1:
-        raise ValueError("HCU PCP does not support pipeline parallelism.")
+    )
+    if pp_size != 1:
+        if not is_hyv4:
+            raise ValueError("HCU PCP does not support pipeline parallelism.")
+        expected = {
+            "pipeline_parallel_size": 2,
+            "tensor_parallel_size": 1,
+            "prefill_context_parallel_size": 4,
+            "data_parallel_size": 1,
+            "decode_context_parallel_size": 1,
+            "enable_expert_parallel": True,
+        }
+        if (
+            any(
+                _require_hcu_pcp_attribute(parallel_config, name, "ParallelConfig")
+                != value
+                for name, value in expected.items()
+            )
+            or not _require_hcu_pcp_attribute(
+                model_config, "enforce_eager", "ModelConfig"
+            )
+            or os.environ.get("VLLM_PP_LAYER_PARTITION") != "41,37"
+        ):
+            raise ValueError(
+                "Hy4 PP2+PCP4 requires PP=2, TP=1, PCP=4, DP=1, DCP=1, "
+                "expert parallelism, eager execution, and "
+                "VLLM_PP_LAYER_PARTITION=41,37."
+            )
     dcp_size = int(
         _require_hcu_pcp_attribute(
             parallel_config, "decode_context_parallel_size", "ParallelConfig"
         )
     )
     if use_mla and dcp_size != 1:
-        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+        raise ValueError(
+            f"{mla_model} PCP does not support decode context parallelism."
+        )
     if not use_mla and dcp_size != 1:
         raise ValueError(
             "FlashAttention PCP does not support decode context parallelism."
@@ -116,15 +151,17 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires expert parallelism.")
+        raise ValueError(f"{mla_model} PCP requires expert parallelism.")
     if use_mla and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        raise ValueError(f"{mla_model} PCP requires eager execution without graphs.")
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
     if speculative_config is not None:
+        if is_hyv4:
+            raise ValueError("HYV4 PCP does not support speculative decoding or MTP.")
         if not use_mla:
             raise ValueError(
                 "FlashAttention PCP does not support speculative decoding or MTP."
@@ -157,9 +194,13 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     kv_transfer_config = _require_hcu_pcp_attribute(
         vllm_config, "kv_transfer_config", "VllmConfig"
     )
-    if kv_transfer_config is not None and _require_hcu_pcp_attribute(
-        kv_transfer_config, "kv_connector", "KVTransferConfig"
-    ) is not None:
+    if kv_transfer_config is not None and (
+        is_hyv4
+        or _require_hcu_pcp_attribute(
+            kv_transfer_config, "kv_connector", "KVTransferConfig"
+        )
+        is not None
+    ):
         raise ValueError("HCU PCP does not support P/D disaggregation.")
 
     feature_config = get_hcu_config(vllm_config)
@@ -167,7 +208,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:
         if use_mla:
-            raise ValueError("GLM-5.2 PCP does not support HCU multi-layer MTP.")
+            raise ValueError(f"{mla_model} PCP does not support HCU multi-layer MTP.")
         raise ValueError("FlashAttention PCP does not support multi-layer MTP.")
 
 

@@ -52,7 +52,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
     ``out *= exp(lse) / (exp(lse) + exp(sink))``.
     """
 
-    supports_pcp: bool = False
+    supports_pcp: bool = True
 
     def __init__(
         self,

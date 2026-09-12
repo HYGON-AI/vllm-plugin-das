@@ -89,6 +89,162 @@ def make_pcp_config():
     return _make_pcp_config
 
 
+@pytest.fixture
+def make_hyv4_pp2_pcp4_config(monkeypatch, make_pcp_config):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "41,37")
+
+    def make_config(**overrides):
+        values = dict(architecture="HYV4ForCausalLM", pp=2, tp=1, pcp=4)
+        values.update(overrides)
+        return make_pcp_config(**values)
+
+    return make_config
+
+
+def test_hyv4_pp2_pcp4_exact_target_only_topology_is_allowed(
+    make_hyv4_pp2_pcp4_config,
+) -> None:
+    assert patch_vllm_config._validate_hcu_pcp_scope(
+        make_hyv4_pp2_pcp4_config()
+    ) is True
+
+
+@pytest.mark.parametrize("override", [
+    {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 3}, {"pcp": 8},
+    {"dp": 2}, {"dcp": 2}, {"enable_expert_parallel": False},
+    {"enforce_eager": False},
+])
+def test_hyv4_pp2_pcp4_rejects_nearby_topologies(
+    make_hyv4_pp2_pcp4_config, override,
+) -> None:
+    with pytest.raises(ValueError, match="Hy4 PP2.*PCP4"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_hyv4_pp2_pcp4_config(**override)
+        )
+
+
+@pytest.mark.parametrize("partition", [None, "", "39,39", "40,38", "41, 37", "37,41"])
+def test_hyv4_pp2_pcp4_requires_exact_layer_partition(
+    make_hyv4_pp2_pcp4_config, monkeypatch, partition,
+) -> None:
+    config = make_hyv4_pp2_pcp4_config()
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION")
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    with pytest.raises(ValueError, match="VLLM_PP_LAYER_PARTITION=41,37"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("architecture,use_mla", [
+    ("HYV4MTPModel", True), ("GlmMoeDsaForCausalLM", True),
+    ("DeepseekV2ForCausalLM", True), ("Qwen3ForCausalLM", False),
+    ("HYV4ForCausalLM", False),
+])
+def test_hyv4_pp2_pcp4_does_not_authorize_other_architectures(
+    make_hyv4_pp2_pcp4_config, architecture, use_mla,
+) -> None:
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_hyv4_pp2_pcp4_config(architecture=architecture, use_mla=use_mla)
+        )
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+@pytest.mark.parametrize("override,message", [
+    ({"speculative": True}, "speculative"),
+    ({"speculative": True, "speculative_method": "eagle"}, "speculative"),
+    ({"kv_transfer": True}, "P/D disaggregation"),
+    ({"use_v2": False}, "Model Runner V2"),
+    ({"lora": True}, "LoRA"),
+    ({"multimodal": True}, "multimodal"),
+    ({"kv_offload": True}, "KV offload"),
+    ({"enable_lightly_cp": True}, "lightly-CP"),
+    ({"enable_multi_layers_mtp": True}, "multi-layer MTP"),
+])
+def test_hyv4_pcp_keeps_unvalidated_features_rejected(
+    make_hyv4_pp2_pcp4_config, pp, override, message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_hyv4_pp2_pcp4_config(pp=pp, **override)
+        )
+
+
+@pytest.mark.parametrize("pcp,tp", [(2, 4), (4, 1), (8, 1)])
+def test_hyv4_pp1_target_only_uses_existing_mla_pcp_ep_scope(
+    make_pcp_config, monkeypatch, pcp, tp,
+) -> None:
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    assert patch_vllm_config._validate_hcu_pcp_scope(
+        make_pcp_config(architecture="HYV4ForCausalLM", pcp=pcp, tp=tp)
+    ) is True
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+@pytest.mark.parametrize("use_mla", [False, True])
+def test_hyv4_mtp_architecture_is_never_a_pcp_target(
+    make_hyv4_pp2_pcp4_config, pp, use_mla,
+) -> None:
+    with pytest.raises(ValueError, match="HYV4MTPModel"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_hyv4_pp2_pcp4_config(
+                architecture="HYV4MTPModel", pp=pp, use_mla=use_mla,
+            )
+        )
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+def test_hyv4_pcp_rejects_incomplete_pd_configuration(
+    make_hyv4_pp2_pcp4_config, pp,
+) -> None:
+    config = make_hyv4_pp2_pcp4_config(pp=pp)
+    config.kv_transfer_config = SimpleNamespace(kv_connector=None)
+    with pytest.raises(ValueError, match="P/D disaggregation"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("use_mla", [False, True])
+def test_hyv4_pcp_rejects_ambiguous_architecture_lists(
+    make_hyv4_pp2_pcp4_config, use_mla,
+) -> None:
+    config = make_hyv4_pp2_pcp4_config(pp=1, use_mla=use_mla)
+    config.model_config.architectures = ["HYV4ForCausalLM", "Qwen3ForCausalLM"]
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("override,message", [
+    ({"dcp": 2}, "decode context"), ({"dp": 2}, "data parallel"),
+    ({"enable_expert_parallel": False}, "expert parallel"),
+    ({"enforce_eager": False}, "eager"), ({"use_mla": False}, "MLA"),
+])
+def test_hyv4_pp1_preserves_existing_mla_pcp_restrictions(
+    make_hyv4_pp2_pcp4_config, override, message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_hyv4_pp2_pcp4_config(pp=1, **override)
+        )
+
+
+def test_hyv4_pp2_pcp4_removes_only_audited_upstream_rejection(
+    make_hyv4_pp2_pcp4_config,
+) -> None:
+    module = _make_vllm_module()
+    patch_vllm_config.apply_to_module(module)
+    config = _as_fake_vllm_config(module, make_hyv4_pp2_pcp4_config())
+    assert config._get_v2_model_runner_unsupported_features() == []
+    config._validate_v2_model_runner()
+
+    config.parallel_config.tensor_parallel_size = 2
+    assert config._get_v2_model_runner_unsupported_features() == [
+        "prefill context parallelism"
+    ]
+    with pytest.raises(ValueError, match="prefill context parallelism"):
+        config._validate_v2_model_runner()
+
+
 def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     """Removing the accepted GLM PCP branch must reject this configuration."""
 

@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import inspect
 import sys
 import textwrap
 from dataclasses import dataclass
+from pathlib import Path
 from types import FunctionType, ModuleType, SimpleNamespace
 from typing import NamedTuple
 
@@ -275,9 +277,11 @@ def test_pcp_runner_rejects_multiple_resolved_kv_cache_groups(
     assert events == []
 
 
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
 def test_pcp_runner_replaces_immutable_execute_model_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
+    is_last_pp_rank: bool,
 ) -> None:
     """v0.25.1 stores execution state in an immutable NamedTuple."""
 
@@ -298,6 +302,7 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
         lambda *args: False,
     )
     runner = runner_module.HcuGPUModelRunnerV2(_config(2), "hcu:0")
+    runner.is_last_pp_rank = is_last_pp_rank
     runner.pcp_manager = Manager()
     original_state = _ExecuteModelState(local_batch, local_hidden)
     runner.execute_model_state = original_state
@@ -311,6 +316,141 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     assert runner.execute_model_state is not original_state
     assert runner.execute_model_state.input_batch is global_batch
     assert runner.execute_model_state.hidden_states is global_hidden
+
+
+def test_hyv4_nonfinal_pp_stage_restores_batch_without_hidden_gather(
+    pcp_runner_module,
+) -> None:
+    """A PCP all-gather of None must never precede the upstream PP receive."""
+    runner_module, events = pcp_runner_module
+    global_batch = SimpleNamespace(req_ids=["prefill", "decode"])
+    local_batch = SimpleNamespace(req_ids=["decode", "prefill", "prefill"])
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            pytest.fail("non-final PP stage tried to restore hidden states")
+
+        def restore_hidden_states(self, hidden_states):
+            pytest.fail("non-final PP stage tried to gather hidden states")
+
+        def restore_global_batch(self):
+            events.append("restore_global_batch")
+            return global_batch
+
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.is_last_pp_rank = False
+    runner.num_speculative_steps = 0
+    runner.pcp_manager = Manager()
+    original_state = _ExecuteModelState(local_batch, None)
+    runner.execute_model_state = original_state
+    runner.expected_batch = global_batch
+    runner.expected_hidden = None
+
+    assert runner.sample_tokens("grammar") == "sampled"
+    assert runner.execute_model_state.input_batch.req_ids == ["prefill", "decode"]
+    assert runner.execute_model_state.hidden_states is None
+    assert original_state.input_batch is local_batch
+    assert events == ["super.__init__", "restore_global_batch", "super.sample_tokens"]
+
+
+def test_hyv4_final_pp_stage_does_not_silently_take_batch_only_path(
+    pcp_runner_module,
+) -> None:
+    runner_module, _ = pcp_runner_module
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            assert hidden_states is None
+            raise RuntimeError("final hidden states missing")
+
+        def restore_global_batch(self):
+            pytest.fail("final PP stage bypassed final-hidden restoration")
+
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = Manager()
+    runner.execute_model_state = _ExecuteModelState(object(), None)
+    with pytest.raises(RuntimeError, match="final hidden states missing"):
+        runner.sample_tokens("grammar")
+
+
+@pytest.mark.parametrize("all_decode_next", [False, True])
+def test_hyv4_nonfinal_pp_restore_feeds_current_upstream_receive(
+    pcp_runner_module, monkeypatch, all_decode_next,
+) -> None:
+    """Run the pinned sample body through receive and its request-state update."""
+    import vllm
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    runner_module, _ = pcp_runner_module
+    source = Path(vllm.__file__).parent / "v1/worker/gpu/model_runner.py"
+    tree = ast.parse(source.read_text())
+    owner = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GPUModelRunner"
+    )
+    sample = next(
+        node for node in owner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens"
+    )
+    sample.decorator_list = []  # No accelerator inference/EPLB wrapper on CPU.
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(sample)
+    namespace = {"ModelRunnerOutput": ModelRunnerOutput}
+    exec(compile(module, str(source), "exec"), namespace)
+    monkeypatch.setattr(
+        runner_module.GPUModelRunner, "sample_tokens", namespace["sample_tokens"]
+    )
+
+    global_batch = SimpleNamespace(
+        req_ids=["prefill", "decode"], idx_mapping=torch.tensor([3, 7])
+    )
+    local_batch = SimpleNamespace(
+        req_ids=["decode", "prefill", "prefill"], idx_mapping=torch.tensor([7, 3, 3])
+    )
+    events = []
+
+    def restore_global_batch():
+        events.append("restore_batch")
+        return global_batch
+
+    def receive(batch):
+        assert batch is global_batch and batch.idx_mapping.tolist() == [3, 7]
+        events.append("receive")
+        return all_decode_next
+
+    def update_computed(batch):
+        assert batch is global_batch
+        events.append("computed")
+
+    def update_model(mapping, offset):
+        assert mapping.tolist() == [3, 7] and offset == 0
+        events.append("model_state")
+
+    def post_forward(finished):
+        assert finished == {"finished"}
+        events.append("post_forward")
+        return None
+
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "cpu")
+    runner.is_last_pp_rank = False
+    runner.num_speculative_steps = 0
+    runner.pcp_manager = SimpleNamespace(
+        restore_global_batch=restore_global_batch,
+        restore_for_sampling=lambda *_: pytest.fail("non-final hidden gather"),
+    )
+    runner.pp_handler = SimpleNamespace(receive=receive)
+    runner.postprocess_num_computed_tokens = update_computed
+    runner.model_state = SimpleNamespace(postprocess_state=update_model)
+    runner.kv_connector = SimpleNamespace(post_forward=post_forward)
+    runner.execute_model_state = _MTPExecuteModelState(
+        local_batch, None, None, None, None, {"finished"},
+    )
+    runner.sample_tokens(grammar_output=None)
+    assert runner.execute_model_state is None
+    assert events == ["restore_batch", "receive", "computed"] + (
+        [] if all_decode_next else ["model_state"]
+    ) + ["post_forward"]
 
 
 def test_pcp_mtp_rebuilds_global_drafter_attention_state(

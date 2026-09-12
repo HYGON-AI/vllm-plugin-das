@@ -213,6 +213,37 @@ def test_hcu_backend_advertises_sink_support() -> None:
     assert require_hyv4_sink_backend(HYV4FlashMLASparseBackend) is HYV4FlashMLASparseBackend
 
 
+def test_hyv4_sparse_backend_passes_current_pcp_capability_gate(monkeypatch):
+    from vllm.v1.worker import cp_utils
+
+    impl = object.__new__(HYV4FlashMLASparseBackend.get_impl_cls())
+    monkeypatch.setattr(cp_utils, "get_layers_from_vllm_config", lambda *args: {
+        "model.layers.41.self_attn.attn": SimpleNamespace(impl=impl),
+    })
+    cp_utils.check_attention_cp_compatibility(SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4, decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+    ))
+
+
+def test_hyv4_pp2_pcp4_partition_retains_a_local_full_indexer_producer():
+    config = SimpleNamespace(
+        index_topk=64, num_hidden_layers=78,
+        layer_types=["sparse_attention"] * 78,
+        indexer_types=["full"] + ["shared"] * 40 + ["full"] + ["shared"] * 36,
+    )
+    require_local_indexer_producer(config, start_layer=0, end_layer=41)
+    require_local_indexer_producer(config, start_layer=41, end_layer=78)
+    with pytest.raises(ValueError, match="local.*full.*sparse.*producer"):
+        require_local_indexer_producer(config, start_layer=40, end_layer=78)
+    config.layer_types[41] = "full_attention"
+    with pytest.raises(ValueError, match="local.*full.*sparse.*producer"):
+        require_local_indexer_producer(config, start_layer=41, end_layer=78)
+
+
 def test_sink_prefill_requires_sparse_mqa_impl_without_global_config_flag() -> None:
     _require_sparse_mqa_backend(HYV4FlashMLASparseBackend)
 
