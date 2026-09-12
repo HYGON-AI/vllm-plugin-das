@@ -221,7 +221,11 @@ class HYV4ReasoningExtractor:
                 content = delta_text[end_index + len(self.end_token) :]
                 return ReasoningDelta(reasoning=reasoning, content=content or None)
             else:
-                return ReasoningDelta(reasoning=delta_text, content=None)
+                _, start_token, reasoning = delta_text.partition(self.start_token)
+                return ReasoningDelta(
+                    reasoning=reasoning if start_token else delta_text,
+                    content=None,
+                )
         else:
             # HYV4: <think> was injected at the end of the prompt, so it never
             # appears in the output. Treat the stream as reasoning until

@@ -96,6 +96,38 @@ def test_reasoning_streaming_splits_end_marker_from_content() -> None:
     assert delta == {"reasoning": "", "content": "答案"}
 
 
+def test_reasoning_streaming_matches_nonstreaming_with_explicit_start() -> None:
+    extractor = HYV4ReasoningExtractor(
+        {THINK_START: THINK_START_ID, THINK_END: THINK_END_ID},
+        SUFFIX,
+        thinking=True,
+    )
+    first_text = f"{THINK_START}analysis"
+    output = f"{first_text}{THINK_END}answer"
+    first = extractor.extract_reasoning_streaming(
+        "",
+        first_text,
+        first_text,
+        [],
+        [THINK_START_ID, 1],
+        [THINK_START_ID, 1],
+    )
+    second = extractor.extract_reasoning_streaming(
+        first_text,
+        output,
+        f"{THINK_END}answer",
+        [THINK_START_ID, 1],
+        [THINK_START_ID, 1, THINK_END_ID, 2],
+        [THINK_END_ID, 2],
+    )
+
+    streamed = (
+        "".join(delta["reasoning"] or "" for delta in (first, second)),
+        "".join(delta["content"] or "" for delta in (first, second)),
+    )
+    assert streamed == extractor.extract_reasoning(output) == ("analysis", "answer")
+
+
 def test_tool_parser_coerces_schema_values_and_preserves_content() -> None:
     vocabulary = _tool_vocabulary()
     tokenizer = FakeTokenizer(vocabulary)

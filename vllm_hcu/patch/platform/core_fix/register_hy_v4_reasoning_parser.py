@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import ModuleType
 
 from ._common import (
@@ -37,20 +38,40 @@ def _get_manager(module: ModuleType) -> type:
             "required HCU patch target "
             "vllm.reasoning.ReasoningParserManager.lazy_parsers is incompatible"
         )
+    reasoning_parsers = getattr(manager, "reasoning_parsers", None)
+    if not isinstance(reasoning_parsers, dict):
+        raise PatchCompatibilityError(
+            "required HCU patch target "
+            "vllm.reasoning.ReasoningParserManager.reasoning_parsers is incompatible"
+        )
     return manager
+
+
+def _validate_owners(manager: type) -> None:
+    existing_eager = manager.reasoning_parsers.get(_PARSER_NAME)
+    if existing_eager is not None:
+        parser_module = sys.modules.get(_PARSER_MODULE)
+        expected_eager = getattr(parser_module, _PARSER_CLASS, None)
+        if existing_eager is not expected_eager:
+            raise PatchCompatibilityError(
+                f"reasoning parser {_PARSER_NAME!r} is already registered as "
+                f"{existing_eager!r}"
+            )
+
+    existing_lazy = manager.lazy_parsers.get(_PARSER_NAME)
+    if existing_lazy is not None and existing_lazy != _EXPECTED:
+        raise PatchCompatibilityError(
+            f"reasoning parser {_PARSER_NAME!r} is already registered as "
+            f"{existing_lazy!r}"
+        )
 
 
 def apply_to_module(module: ModuleType) -> bool:
     reasoning_module = load_exact_module(TARGET_MODULE, module)
     manager = _get_manager(reasoning_module)
+    _validate_owners(manager)
     if getattr(manager, _MARKER, False):
         return False
-
-    existing = manager.lazy_parsers.get(_PARSER_NAME)
-    if existing is not None and existing != _EXPECTED:
-        raise PatchCompatibilityError(
-            f"reasoning parser {_PARSER_NAME!r} is already registered as {existing!r}"
-        )
 
     register = require_callable(
         manager,
@@ -70,6 +91,7 @@ def apply_to_module(module: ModuleType) -> bool:
 def apply(module: ModuleType | None = None) -> bool:
     reasoning_module = load_exact_module(TARGET_MODULE, module)
     manager = _get_manager(reasoning_module)
+    _validate_owners(manager)
     return apply_once(
         patch_id=PATCH_ID,
         targets=TARGETS,
