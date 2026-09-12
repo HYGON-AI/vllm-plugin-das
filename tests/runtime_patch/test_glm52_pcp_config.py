@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.vllm import VllmConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_hcu.patch.config import HcuFeatureConfig
@@ -179,6 +180,62 @@ def test_hyv4_pp1_target_only_uses_existing_mla_pcp_ep_scope(
     assert patch_vllm_config._validate_hcu_pcp_scope(
         make_pcp_config(architecture="HYV4ForCausalLM", pcp=pcp, tp=tp)
     ) is True
+
+
+@pytest.mark.parametrize("pcp,tp", [(2, 4), (4, 1), (8, 1)])
+def test_hyv4_pd_allows_only_mooncake_producer_pcp(make_pcp_config, pcp, tp):
+    config = make_pcp_config(architecture="HYV4ForCausalLM", pcp=pcp, tp=tp)
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector", kv_role="kv_producer",
+        kv_buffer_device="cpu",
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+@pytest.mark.parametrize("role", ["kv_consumer", "kv_both", None, "prefill"])
+def test_hyv4_pd_rejects_nonproducer_pcp(make_pcp_config, role):
+    config = make_pcp_config(architecture="HYV4ForCausalLM")
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MooncakeConnector", kv_role=role,
+        kv_connector_module_path=None,
+    )
+    with pytest.raises(ValueError, match="P/D disaggregation"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("connector,module_path", [
+    ("OtherConnector", None), (None, None),
+    ("MooncakeConnector", "custom.connector"), ("MooncakeConnector", ""),
+])
+def test_hyv4_pd_rejects_unknown_or_custom_producer_connector(
+    make_pcp_config, connector, module_path,
+):
+    config = make_pcp_config(architecture="HYV4ForCausalLM")
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector=connector, kv_role="kv_producer",
+        kv_connector_module_path=module_path, kv_buffer_device="cpu",
+    )
+    with pytest.raises(ValueError, match="P/D disaggregation"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("pp", [2, 3])
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer", "kv_both"])
+def test_hyv4_pp_pcp_pd_is_rejected(make_hyv4_pp2_pcp4_config, pp, role):
+    config = make_hyv4_pp2_pcp4_config(pp=pp)
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector", kv_role=role, kv_buffer_device="cpu",
+    )
+    with pytest.raises(ValueError, match="PP.*PCP.*P/D"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+def test_hyv4_pd_consumer_without_pcp_preserves_existing_validation(make_pcp_config):
+    config = make_pcp_config(architecture="HYV4ForCausalLM", pcp=1)
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer", kv_buffer_device="cpu",
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is False
 
 
 @pytest.mark.parametrize("pp", [1, 2])

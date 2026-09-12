@@ -104,6 +104,11 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     pp_size = _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
     )
+    kv_transfer_config = _require_hcu_pcp_attribute(
+        vllm_config, "kv_transfer_config", "VllmConfig"
+    )
+    if is_hyv4 and pp_size != 1 and kv_transfer_config is not None:
+        raise ValueError("HYV4 PP + PCP + P/D disaggregation is not supported.")
     if pp_size != 1:
         if not is_hyv4:
             raise ValueError("HCU PCP does not support pipeline parallelism.")
@@ -191,9 +196,6 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     ) is not None:
         raise ValueError("HCU PCP does not support KV offload.")
 
-    kv_transfer_config = _require_hcu_pcp_attribute(
-        vllm_config, "kv_transfer_config", "VllmConfig"
-    )
     if kv_transfer_config is not None and (
         is_hyv4
         or _require_hcu_pcp_attribute(
@@ -201,7 +203,18 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
         is not None
     ):
-        raise ValueError("HCU PCP does not support P/D disaggregation.")
+        # kv_role is the validated KVTransferConfig role, not kv_rank or a
+        # connector-name heuristic. kv_both includes a consumer and is excluded.
+        if not (
+            is_hyv4
+            and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnector"
+            and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+            and getattr(kv_transfer_config, "kv_connector_module_path", "") is None
+        ):
+            raise ValueError(
+                "HCU PCP P/D disaggregation requires HYV4 PP1 with the registered "
+                "MooncakeConnector and kv_role='kv_producer'."
+            )
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:

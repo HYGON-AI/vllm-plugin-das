@@ -43,10 +43,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -140,6 +142,41 @@ class TransferRegion:
     block_len: int
     kv_block_len: int
     group_index: int = 0
+
+
+def _normalize_pp_layer_partition(
+    partition: str, num_layers: int, pp_size: int
+) -> tuple[int, ...]:
+    """Validate an explicit partition without mutating the process environment."""
+    parts = partition.split(",")
+    if any(re.fullmatch(r"[0-9]+", part.strip()) is None for part in parts):
+        raise ValueError("Mooncake PP partition requires comma-separated layer counts.")
+    counts = tuple(int(part.strip()) for part in parts)
+    if len(counts) != pp_size or any(count <= 0 for count in counts):
+        raise ValueError("Mooncake PP partition requires one positive count per stage.")
+    if sum(counts) != num_layers:
+        raise ValueError("Mooncake PP partition must sum to the model layer count.")
+    return counts
+
+
+def _get_pp_stage_layer_range(
+    num_layers: int, pp_rank: int, pp_size: int
+) -> tuple[int, int]:
+    """Resolve a checked stage range using the current PP group rank."""
+    if (
+        any(type(value) is not int for value in (num_layers, pp_rank, pp_size))
+        or pp_size <= 0
+        or num_layers < pp_size
+        or not 0 <= pp_rank < pp_size
+    ):
+        raise ValueError("Mooncake PP requires positive stage sizes and a valid rank.")
+    partition = envs.VLLM_PP_LAYER_PARTITION
+    if partition is None:
+        # Keep upstream's default layer distribution authoritative.
+        return get_pp_indices(num_layers, pp_rank, pp_size)
+    counts = _normalize_pp_layer_partition(partition, num_layers, pp_size)
+    start = sum(counts[:pp_rank])
+    return start, start + counts[pp_rank]
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -333,6 +370,15 @@ def _validate_asymmetric_region_lengths(
         )
 
     if producer_cache_replicated:
+        for idx, (local_region, remote_region) in enumerate(
+            zip(local_regions, remote_regions)
+        ):
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Mooncake replicated KV region length mismatch at "
+                    f"region {idx}: local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
         return None
 
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
@@ -565,8 +611,10 @@ def _validate_phase1_kv_cache_config(
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
-        return bool(is_dense())
-    return None
+        is_dense = is_dense()
+    if is_dense is None or isinstance(is_dense, bool):
+        return is_dense
+    raise ValueError("Mooncake tensor dense flag must be bool or None.")
 
 
 class MooncakeXferMetadata(
@@ -1173,6 +1221,15 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self._pp_layer_range = (
+            _get_pp_stage_layer_range(
+                self.model_config.get_total_num_hidden_layers(),
+                self.pp_rank,
+                self.pp_size,
+            )
+            if self.pp_size > 1
+            else None
+        )
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[
@@ -1937,6 +1994,12 @@ class MooncakeConnectorWorker:
                     layer_name,
                 )
                 continue
+            if self._pp_layer_range is not None:
+                start, end = self._pp_layer_range
+                if not start <= layer_index < end:
+                    raise ValueError(
+                        f"Mooncake layer {layer_name} is outside PP stage [{start}, {end})."
+                    )
             if isinstance(cache_or_caches, tuple):
                 if len(cache_or_caches) != 2 or not all(
                     isinstance(cache, torch.Tensor) for cache in cache_or_caches
@@ -2505,6 +2568,17 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
+    kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
+    if kv_role not in ("kv_producer", "kv_both"):
+        return False
+    if parallel_config.prefill_context_parallel_size > 1:
+        if kv_role != "kv_producer":
+            return False
+        pcp_group = get_pcp_group()
+        # GroupCoordinator.rank is global. Never use local_rank or a fallback
+        # that assumes rank zero when the distributed group is unavailable.
+        if pcp_group.rank != 0 or not pcp_group.is_first_rank:
+            return False
     # Only the TP=0, PP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
