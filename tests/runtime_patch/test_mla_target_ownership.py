@@ -468,6 +468,49 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     assert module.split_calls[-1] == (warmup, 3, True, True)
 
 
+def test_mla_split_preserves_decode_fast_path_for_padded_full_graph():
+    adapter = _adapter()
+    module = _fake_mla_module(adapter, [])
+
+    def split_decodes_and_prefills(
+        common_attn_metadata,
+        decode_threshold=1,
+        require_uniform=False,
+        treat_short_extends_as_decodes=True,
+    ):
+        del require_uniform
+        query_lens = (
+            common_attn_metadata.query_start_loc_cpu[1:]
+            - common_attn_metadata.query_start_loc_cpu[:-1]
+        )
+        if (
+            common_attn_metadata.max_query_len <= decode_threshold
+            and treat_short_extends_as_decodes
+        ):
+            return (
+                common_attn_metadata.num_reqs,
+                0,
+                common_attn_metadata.num_actual_tokens,
+                0,
+            )
+        is_prefill = query_lens > decode_threshold
+        if not treat_short_extends_as_decodes:
+            is_prefill |= common_attn_metadata.is_prefilling
+        return (0, 0, 0, int(is_prefill.sum().item()))
+
+    module.split_decodes_and_prefills = split_decodes_and_prefills
+    assert adapter.apply_to_module(module) is True
+    common = SimpleNamespace(
+        query_start_loc_cpu=torch.arange(9, dtype=torch.int32),
+        is_prefilling=torch.zeros(7, dtype=torch.bool),
+        max_query_len=1,
+        num_reqs=8,
+        num_actual_tokens=8,
+    )
+
+    assert module.split_decodes_and_prefills(common) == (8, 0, 8, 0)
+
+
 def test_mla_pcp_disables_rank_local_sparse_mha_prefill():
     adapter = _adapter()
     module = _fake_mla_module(adapter, [])

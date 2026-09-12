@@ -289,9 +289,18 @@ def apply_to_module(module: ModuleType) -> bool:
         # Preserve the target vLLM decode classification in that case, while
         # retaining HCU's prefix-hit short-extend policy for real requests.
         del treat_short_extends_as_decodes
-        hcu_treat_short_extends_as_decodes = (
-            getattr(common_attn_metadata, "is_prefilling", None) is None
+        is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
+        # Official MRV2 builds this mask from a NumPy array on CPU.  FULL
+        # graphs can pad query rows, but are dispatched only for uniform
+        # decode batches (has_prefill=False); mixed batches use unpadded
+        # PIECEWISE metadata.  Inspect the zero-copy NumPy view so the decode
+        # hot path neither allocates a torch scalar nor synchronizes HCU.
+        has_prefill = (
+            False
+            if is_prefilling is None
+            else bool(is_prefilling.numpy().any())
         )
+        hcu_treat_short_extends_as_decodes = not has_prefill
         return split_batch(
             common_attn_metadata,
             decode_threshold,
