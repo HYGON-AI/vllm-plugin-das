@@ -251,3 +251,196 @@ def test_real_target_and_mtp_expert_packing_scales_and_ledger(tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="Duplicate"):
         model.load_weights(iter(weights + pieces + [pieces[0]]))
     assert not hasattr(inner, "_checkpoint_accounting")
+
+
+def _scale_config(tmp_path, native):
+    import json
+    if not native:
+        return module("hyv4_w4a8").HYV4W4A8Config(str(manifest(tmp_path, ["model.projection.weight"])))
+    path = tmp_path / "hy4-checkpoint.index.json"
+    path.write_text(json.dumps({"format": "hy4_w4a8_v1", "complete": True,
+        "parameters": {"model.projection.weight": {"kind": "quantized"}}}))
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
+    return module("hyv4_native").HYV4NativeW4A8Config(str(path))
+
+
+def _scale_linear(tmp_path, monkeypatch, native, kind="row", rank=0):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import compressed_tensors_w8a8_int8 as scheme
+    tp = 1 if kind == "row" else 2
+    for owner in (parameter, linear):
+        monkeypatch.setattr(owner, "get_tensor_model_parallel_rank", lambda: rank)
+        monkeypatch.setattr(owner, "get_tensor_model_parallel_world_size", lambda: tp)
+    monkeypatch.setattr(scheme, "init_int8_linear_kernel", lambda **kwargs: SimpleNamespace())
+    config = _scale_config(tmp_path, native)
+    kwargs = dict(bias=False, params_dtype=torch.bfloat16, quant_config=config, prefix="model.projection")
+    if kind == "row":
+        layer = linear.RowParallelLinear(4, 2, **kwargs)
+    elif kind == "column":
+        layer = linear.ColumnParallelLinear(4, 4, **kwargs)
+    elif kind == "merged":
+        layer = linear.MergedColumnParallelLinear(4, [4, 6], **kwargs)
+    else:
+        layer = linear.QKVParallelLinear(4, 2, 4, 1, **kwargs)
+    layer.weight_scale.data.fill_(7)
+    return config, layer
+
+
+SCALE_ALIASES = [(False, "weight.scale"), (False, "weight_scale"),
+                 (True, "weight.scale"), (True, "weight_scale"),
+                 (True, "weight_scale.weight")]
+
+
+@pytest.mark.parametrize("native,alias", SCALE_ALIASES)
+@pytest.mark.parametrize("bad", ["nan", "inf", "zero", "negative", "fp16", "int32",
+                                 "short", "long", "rank", "columns"])
+def test_linear_scale_alias_rejects_before_real_owner_mutation(tmp_path, monkeypatch, native, alias, bad):
+    config, layer = _scale_linear(tmp_path, monkeypatch, native)
+    value = torch.full((2, 1), .5)
+    if bad in ("nan", "inf", "zero", "negative"):
+        value[0, 0] = {"nan": float("nan"), "inf": float("inf"), "zero": 0, "negative": -1}[bad]
+    elif bad in ("fp16", "int32"):
+        value = value.to(torch.float16 if bad == "fp16" else torch.int32)
+    elif bad == "short":
+        value = torch.ones(1, 1)
+    elif bad == "long":
+        value = torch.ones(3, 1)
+    elif bad == "rank":
+        value = torch.ones(1, 2, 1)
+    else:
+        value = torch.ones(2, 2)
+    if not native and alias == "weight.scale" and value.ndim == 2 and value.shape[1] == 1:
+        value = value.squeeze(-1)
+    with pytest.raises(ValueError, match="HYV4.*scale"):
+        for name, scale in config.adapt_weights([("model.projection." + alias, value)]):
+            assert name == "model.projection.weight_scale"
+            layer.weight_scale.weight_loader(layer.weight_scale, scale)
+    torch.testing.assert_close(layer.weight_scale, torch.full((2, 1), 7.))
+
+
+@pytest.mark.parametrize("native,alias", SCALE_ALIASES)
+def test_linear_scale_alias_valid_real_owner_control(tmp_path, monkeypatch, native, alias):
+    config, layer = _scale_linear(tmp_path, monkeypatch, native)
+    value = torch.tensor([[.5], [.25]])
+    if not native and alias == "weight.scale":
+        value = value.squeeze(-1)
+    for _, scale in config.adapt_weights([("model.projection." + alias, value)]):
+        layer.weight_scale.weight_loader(layer.weight_scale, scale)
+    torch.testing.assert_close(layer.weight_scale, torch.tensor([[.5], [.25]]))
+
+
+@pytest.mark.parametrize("kind,shard,rows,want", [
+    ("column", None, 4, [3, 4]),
+    ("merged", 0, 4, [3, 4, 7, 7, 7]),
+    ("merged", 1, 6, [7, 7, 4, 5, 6]),
+    ("merged", (0, 1), 10, [3, 4, 8, 9, 10]),
+    ("merged", None, 10, [3, 4, 8, 9, 10]),
+    ("qkv", "q", 8, [5, 6, 7, 8, 7, 7, 7, 7]),
+    ("qkv", "k", 2, [7, 7, 7, 7, 1, 2, 7, 7]),
+    ("qkv", "v", 2, [7, 7, 7, 7, 7, 7, 1, 2]),
+    ("qkv", None, 12, [5, 6, 7, 8, 9, 10, 11, 12]),
+])
+@pytest.mark.parametrize("delta", [0, 1, -1])
+def test_linear_scale_extent_respects_current_tp_and_fused_projection(tmp_path, monkeypatch, kind, shard, rows, want, delta):
+    _, layer = _scale_linear(tmp_path, monkeypatch, False, kind=kind, rank=1)
+    value = torch.arange(1, rows + delta + 1, dtype=torch.float32)[:, None]
+    args = () if kind == "column" else (shard,)
+    if delta:
+        before = layer.weight_scale.clone()
+        with pytest.raises(ValueError, match="HYV4.*scale"):
+            layer.weight_scale.weight_loader(layer.weight_scale, value, *args)
+        torch.testing.assert_close(layer.weight_scale, before)
+    else:
+        layer.weight_scale.weight_loader(layer.weight_scale, value, *args)
+        torch.testing.assert_close(layer.weight_scale[:, 0], torch.tensor(want, dtype=torch.float32))
+
+
+def _scale_experts(tmp_path, native, tp=1, rank=0, padded=False):
+    from tests.models.static_eplb_test_utils import GenericMoE
+    owner = GenericMoE(0).moe_layers[0].routed_experts
+    owner.moe_config.tp_rank = rank
+    owner.moe_config.tp_size = tp
+    owner.moe_config.moe_parallel_config.tp_size = tp
+    owner.moe_config.hidden_dim_unpadded = 4
+    owner.moe_config.intermediate_size_per_partition_unpadded = 2
+    del owner.quant_method
+    config = _scale_config(tmp_path, native)
+    owner.quant_method = module("hyv4_w4a8").HYV4W4A8MoEMethod(config, owner.moe_config)
+    owner.quant_method.create_weights(owner, 2, 6 if padded else 4,
+        4 if padded else 2, torch.bfloat16, weight_loader=owner.weight_loader)
+    return config, owner
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("shard", ["w1", "w3", "w2"])
+@pytest.mark.parametrize("bad", ["short", "long", "columns", "rank"])
+def test_expert_scale_extent_rejects_before_real_owner_mutation(tmp_path, native, tp, shard, bad):
+    _, owner = _scale_experts(tmp_path, native, tp=tp)
+    name = "w2_weight_scale" if shard == "w2" else "w13_weight_scale"
+    param = getattr(owner, name)
+    rows = 4 if shard == "w2" else 2 * tp
+    value = torch.full((rows, 1), .5)
+    if bad == "short":
+        value = value[:-1]
+    elif bad == "long":
+        value = torch.full((rows + 1, 1), .5)
+    elif bad == "columns":
+        value = value.expand(rows, 2)
+    else:
+        value = value.unsqueeze(0)
+    before = param.clone()
+    with pytest.raises(ValueError, match="HYV4.*scale"):
+        param.weight_loader(param, value, name, shard, 0, return_success=True)
+    torch.testing.assert_close(param, before)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("shard", ["w1", "w3", "w2"])
+def test_expert_scale_valid_tp_and_declared_padding(tmp_path, native, tp, rank, padded, shard):
+    _, owner = _scale_experts(tmp_path, native, tp, rank, padded)
+    name = "w2_weight_scale" if shard == "w2" else "w13_weight_scale"
+    param = getattr(owner, name)
+    rows = 4 if shard == "w2" else 2 * tp
+    source = torch.arange(1, rows + 1, dtype=torch.float32)[:, None]
+    param.weight_loader(param, source, name, shard, 0, return_success=True)
+    expected = torch.ones_like(param)
+    start = 0 if shard != "w3" else (4 if padded else 2)
+    expected[0, start:start + (4 if shard == "w2" else 2)] = (
+        source if shard == "w2" else source[rank * 2:rank * 2 + 2]) / 16
+    torch.testing.assert_close(param, expected)
+    # Explicit padding does not authorize arbitrary short or padded source
+    # channel counts; the serialized projection has its declared logical size.
+    if padded:
+        before = param.clone()
+        with pytest.raises(ValueError, match="HYV4.*scale"):
+            param.weight_loader(param, torch.ones(rows + 1, 1), name, shard, 0)
+        torch.testing.assert_close(param, before)
+
+
+@pytest.mark.parametrize("parameter,shard", [("w13_weight_scale", "w2"),
+                                            ("w2_weight_scale", "w1")])
+def test_expert_scale_wrong_projection_fails_before_owner(tmp_path, parameter, shard):
+    _, owner = _scale_experts(tmp_path, True)
+    param = getattr(owner, parameter)
+    before = param.clone()
+    with pytest.raises(ValueError, match="HYV4.*scale"):
+        param.weight_loader(param, torch.ones(4, 1), parameter, shard, 0)
+    torch.testing.assert_close(param, before)
+
+
+@pytest.mark.parametrize("field,shard", [("hidden_dim_unpadded", "w2"),
+    ("intermediate_size_per_partition_unpadded", "w1")])
+@pytest.mark.parametrize("invalid", [None, 0, 9])
+def test_expert_scale_invalid_declared_extent_is_not_allocation_fallback(tmp_path, field, shard, invalid):
+    _, owner = _scale_experts(tmp_path, True)
+    setattr(owner.moe_config, field, invalid)
+    name = "w2_weight_scale" if shard == "w2" else "w13_weight_scale"
+    param = getattr(owner, name)
+    before = param.clone()
+    with pytest.raises(ValueError, match="HYV4.*scale"):
+        param.weight_loader(param, torch.ones(4 if shard == "w2" else 2, 1), name, shard, 0)
+    torch.testing.assert_close(param, before)

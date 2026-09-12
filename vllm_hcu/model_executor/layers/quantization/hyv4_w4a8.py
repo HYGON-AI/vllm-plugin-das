@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import torch
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase, MergedColumnParallelLinear, QKVParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 from .slimquant_w4a8 import (
@@ -77,6 +80,33 @@ class HYV4W4A8LinearMethod(SlimQuantW4A8Int8LinearMethod):
             return load_weight(param, unpack_int4(to_aiter_packing(weight)), *args, **kwargs)
 
         layer.weight.weight_loader = load_int4
+        load_scale = layer.weight_scale.weight_loader
+
+        def load_channel_scale(param, value, *args, **kwargs):
+            # Validate after name normalization, including retained/canonical
+            # aliases, and before the owner can narrow or mutate a fused shard.
+            validate_channel_scale(value, "linear")
+            shard = kwargs.get("loaded_shard_id", args[0] if args else None)
+            if isinstance(layer, QKVParallelLinear):
+                layer.validate_shard_id(shard)
+                sizes = [layer.total_num_heads * layer.head_size,
+                         layer.total_num_kv_heads * layer.head_size,
+                         layer.total_num_kv_heads * layer.v_head_size]
+                # KV replication expands allocation, not serialized channels.
+                channels = sum(sizes) if shard is None else sizes["qkv".index(shard)]
+            elif isinstance(layer, MergedColumnParallelLinear):
+                layer.validate_shard_id(shard)
+                shards = (range(len(layer.output_sizes)) if shard is None
+                          else shard if isinstance(shard, tuple) else (shard,))
+                channels = sum(layer.output_sizes[index] for index in shards)
+            else:
+                channels = output_size
+            if value.shape != (channels, 1):
+                raise ValueError(f"HYV4 linear scale requires shape {(channels, 1)}, "
+                                 f"got {tuple(value.shape)}")
+            return load_scale(param, value, *args, **kwargs)
+
+        layer.weight_scale.weight_loader = load_channel_scale
 
 
 class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
@@ -93,12 +123,34 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
         super().create_weights(layer, num_experts, hidden_size,
                                intermediate_size_per_partition, params_dtype, **extra_weight_attrs)
 
-        def wrap(parameter, scale):
+        def wrap(parameter, name):
             load = parameter.weight_loader
 
             def load_piece(param, value, *args, **kwargs):
-                if scale:
+                if name.endswith("_scale"):
                     validate_channel_scale(value, "expert")
+                    shard = kwargs.get("shard_id", args[1] if len(args) > 1 else None)
+                    if shard is None:
+                        expected = tuple(param.shape)
+                    else:
+                        down = name == "w2_weight_scale"
+                        if shard not in (("w2",) if down else ("w1", "w3")):
+                            raise ValueError(f"HYV4 expert scale {name} cannot load {shard}")
+                        allocated = hidden_size if down else intermediate_size_per_partition
+                        field = ("hidden_dim_unpadded" if down else
+                                 "intermediate_size_per_partition_unpadded")
+                        # Only declared logical padding permits a smaller
+                        # checkpoint. Missing metadata uses allocation; invalid
+                        # metadata must not silently take that fallback.
+                        channels = getattr(layer.moe_config, field, allocated)
+                        if type(channels) is not int or not 0 < channels <= allocated:
+                            raise ValueError(f"HYV4 expert scale has invalid {field}: {channels}")
+                        if not down:
+                            channels *= layer.moe_config.moe_parallel_config.tp_size
+                        expected = (channels, 1)
+                    if value.shape != expected:
+                        raise ValueError(f"HYV4 expert scale requires shape {expected}, "
+                                         f"got {tuple(value.shape)}")
                     value = value / 16.0
                 else:
                     value = to_aiter_packing(value)
@@ -110,4 +162,4 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             parameter.weight_loader = load_piece
 
         for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
-            wrap(getattr(layer, name), name.endswith("_scale"))
+            wrap(getattr(layer, name), name)
