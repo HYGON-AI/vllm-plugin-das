@@ -153,6 +153,39 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
                                          f"got {tuple(value.shape)}")
                     value = value / 16.0
                 else:
+                    # The target loader splits fused checkpoints into the
+                    # same per-expert projection ABI before reaching here.
+                    # Prove the complete serialized extent before the generic
+                    # owner's TP slicing/padding-tolerant copy can accept it.
+                    shard = kwargs.get("shard_id", args[1] if len(args) > 1 else None)
+                    down = name == "w2_weight"
+                    if shard not in (("w2",) if down else ("w1", "w3")):
+                        raise ValueError(f"HYV4 packed expert {name} cannot load {shard}")
+                    if value.dtype != torch.uint8 or value.ndim != 2:
+                        raise ValueError("HYV4 packed expert requires rank-2 UINT8")
+                    dimensions = []
+                    for field, allocated in (
+                        ("hidden_dim_unpadded", hidden_size),
+                        ("intermediate_size_per_partition_unpadded",
+                         intermediate_size_per_partition),
+                    ):
+                        logical = getattr(layer.moe_config, field, allocated)
+                        if type(logical) is not int or not 0 < logical <= allocated:
+                            raise ValueError(f"HYV4 packed expert has invalid {field}: {logical}")
+                        dimensions.append(logical)
+                    hidden, intermediate = dimensions
+                    tp = layer.moe_config.moe_parallel_config.tp_size
+                    if type(tp) is not int or tp <= 0:
+                        raise ValueError(f"HYV4 packed expert has invalid tp_size: {tp}")
+                    # Row-parallel INT4 must also divide on a byte boundary
+                    # locally; an even global extent alone is insufficient.
+                    if (intermediate if down else hidden) % 2:
+                        raise ValueError("HYV4 packed expert requires an even logical input dimension per TP rank")
+                    expected = ((hidden, intermediate * tp // 2) if down
+                                else (intermediate * tp, hidden // 2))
+                    if value.shape != expected:
+                        raise ValueError(f"HYV4 packed expert {shard} requires shape {expected}, "
+                                         f"got {tuple(value.shape)}")
                     value = to_aiter_packing(value)
                 return load(param, value, *args, **kwargs)
 

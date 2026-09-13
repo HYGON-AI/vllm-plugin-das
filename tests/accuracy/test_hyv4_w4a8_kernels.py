@@ -63,28 +63,34 @@ def test_linear_inherits_current_owner_and_loads_signed_int8(tmp_path, monkeypat
 
 @pytest.mark.parametrize("backend", ["aiter", "triton"])
 def test_moe_load_converts_nibbles_and_scale_before_current_dispatch(tmp_path, monkeypatch, backend):
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from tests.models.static_eplb_test_utils import GenericMoE
     from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8AiterMoEMethod
     from vllm_hcu.model_executor.layers.quantization import compressed_tensors_moe_runtime as runtime
     config = module("hyv4_w4a8").HYV4W4A8Config(str(manifest(tmp_path)))
-    layer = object.__new__(RoutedExperts)
-    torch.nn.Module.__init__(layer)
-    layer.moe_config = SimpleNamespace(moe_backend=backend, experts_per_token=2,
-                                      in_dtype=torch.float32)
-    layer.expert_map_manager = SimpleNamespace(expert_map=None, expert_mask=None)
+    layer = GenericMoE(0).moe_layers[0].routed_experts
+    layer.moe_config.moe_backend = backend
+    layer.moe_config.experts_per_token = 2
+    layer.moe_config.in_dtype = torch.float32
     method = config.get_quant_method(layer, "model.layers.1.mlp.experts.routed_experts")
     assert isinstance(method, SlimQuantW4A8Int8AiterMoEMethod)
     assert method.apply.__func__ is SlimQuantW4A8Int8AiterMoEMethod.apply
     assert method.process_weights_after_loading.__func__ is SlimQuantW4A8Int8AiterMoEMethod.process_weights_after_loading
     assert not method.supports_eplb
-    method.create_weights(layer, 2, 2, 2, torch.bfloat16, weight_loader=copy_loader)
+    del layer.quant_method
+    layer.quant_method = method
+    method.create_weights(layer, 2, 2, 2, torch.bfloat16, weight_loader=layer.weight_loader)
     packed13 = torch.tensor([[[0x11], [0x11], [0x22], [0x22]], [[0xff], [0xff], [0x11], [0x11]]], dtype=torch.uint8)
     packed2 = torch.tensor([[[0x11], [0x11]], [[0x11], [0x11]]], dtype=torch.uint8)
     for name, value in (("w13_weight", packed13), ("w2_weight", packed2),
                         ("w13_weight_scale", torch.full((2, 4, 1), .5)),
                         ("w2_weight_scale", torch.full((2, 2, 1), .25))):
         param = getattr(layer, name)
-        param.weight_loader(param, value)
+        for expert in range(2):
+            if name.startswith("w13"):
+                for shard, piece in zip(("w1", "w3"), value[expert].chunk(2, dim=0)):
+                    param.weight_loader(param, piece, name, shard, expert)
+            else:
+                param.weight_loader(param, value[expert], name, "w2", expert)
     torch.testing.assert_close(layer.w13_weight_scale, torch.full((2, 4, 1), 1/32))
     qconfig = method.get_fused_moe_quant_config(layer)
     torch.testing.assert_close(qconfig.w1_scale, torch.full((2, 4, 1), .5))
