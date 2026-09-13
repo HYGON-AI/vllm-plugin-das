@@ -110,7 +110,26 @@ def apply_to_module(module):
             verify_static_plan_across_ep_ranks(plan)
         if load_path or record_path:
             model.num_moe_layers = len(tuple(model.moe_layers))
-        original_add(self, model, model_config)
+        if plan is not None:
+            # Static direct-load never transfers weights. Keep the official
+            # state/buffer ABI, but avoid NIXL's eager registration of every
+            # layer (which corrupts HCU free-memory accounting). The official
+            # Gloo owner allocates transfer staging only if a transfer executes.
+            # This local construction policy also applies to explicit transfer
+            # preferences; restore them for every other model/call, even on error.
+            eplb_config = self.parallel_config.eplb_config
+            communicator = eplb_config.communicator
+            if communicator not in ("torch_nccl", "torch_gloo", "nixl", "pynccl"):
+                raise PatchCompatibilityError(
+                    "Static EPLB communicator is unresolved or unsupported"
+                )
+            try:
+                eplb_config.communicator = "torch_gloo"
+                original_add(self, model, model_config)
+            finally:
+                eplb_config.communicator = communicator
+        else:
+            original_add(self, model, model_config)
         state = self.model_states[model_config.compute_hash()]
         state._hcu_offline_record_path = record_path
         state._hcu_offline_model_key = resolve_offline_eplb_model_key(model, self.parallel_config)

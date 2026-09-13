@@ -66,6 +66,126 @@ def test_static_add_commits_two_maps_without_weight_rearrange(tmp_path, monkeypa
     assert not state.is_async
 
 
+@pytest.mark.parametrize("configured_backend", ["nixl", "pynccl", "torch_nccl", "torch_gloo"])
+def test_static_state_uses_real_nonregistering_owner_only_after_plan_verification(
+    tmp_path, monkeypatch, configured_backend,
+):
+    import vllm.distributed.eplb.eplb_communicator as communicators
+
+    api, upstream, state, model, config, _ = setup_state(tmp_path, monkeypatch)
+    state.parallel_config.eplb_config.communicator = configured_backend
+    verified = []
+
+    def verify(plan):
+        # The original preference must remain visible until cross-rank validation.
+        assert state.parallel_config.eplb_config.communicator == configured_backend
+        assert plan is model._vllm_hcu_static_eplb_plan
+        verified.append(plan.fingerprint())
+
+    def create(**kwargs):
+        assert verified == [model._vllm_hcu_static_eplb_plan.fingerprint()]
+        return communicators.create_eplb_communicator(**kwargs)
+
+    monkeypatch.setattr(api, "verify_static_plan_across_ep_ranks", verify)
+    monkeypatch.setattr(upstream, "create_eplb_communicator", create)
+    monkeypatch.setattr(communicators, "is_local_first_rank", lambda: False)
+    state.add_model(model, config)
+
+    live = state.model_states["test"]
+    assert type(live.communicator) is communicators.TorchDistGlooStagedEplbCommunicator
+    assert state.parallel_config.eplb_config.communicator == configured_backend
+    assert live.physical_to_logical_map.tolist() == [[0, 1, 2, 1], [2, 0, 1, 2]]
+    assert live.expert_buffer and all(isinstance(x, torch.Tensor) for x in live.expert_buffer)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("static execution reached a weight-transfer consumer")
+
+    for name in ("add_send", "add_recv", "execute", "set_transfer_context", "set_stream"):
+        monkeypatch.setattr(live.communicator, name, forbidden)
+    monkeypatch.setattr(type(live.communicator), "needs_profile_buffer_reservation",
+                        property(forbidden))
+    monkeypatch.setattr(upstream, "compute_hash_cached", lambda value: value.compute_hash())
+    state.prepare_forward(config, 7)
+    assert live.num_unpadded_tokens_tensors[0].item() == 7
+    before = (state.expert_rearrangement_step, state.expert_load_window_step)
+    for kwargs in ({}, {"is_dummy": True}, {"is_profile": True}, {"log_stats": True}):
+        assert state.step(**kwargs) is None
+    assert state.rearrange(is_profile=True) is None
+    assert state.rearrange() is None
+    state.start_async_loop()
+    state.drain_async()
+    assert before == (state.expert_rearrangement_step, state.expert_load_window_step)
+    assert not live.communicator._ops
+
+
+def test_static_communicator_preference_restored_when_current_add_raises(tmp_path, monkeypatch):
+    _, upstream, state, model, config, _ = setup_state(tmp_path, monkeypatch)
+    state.parallel_config.eplb_config.communicator = "nixl"
+
+    def fail_create(**kwargs):
+        assert kwargs["backend"] == "torch_gloo"
+        raise RuntimeError("controlled current-add failure")
+
+    monkeypatch.setattr(upstream, "create_eplb_communicator", fail_create)
+    with pytest.raises(RuntimeError, match="controlled current-add failure"):
+        state.add_model(model, config)
+    assert state.parallel_config.eplb_config.communicator == "nixl"
+    assert not state.model_states
+
+
+def test_static_validation_failure_never_changes_communicator(tmp_path, monkeypatch):
+    api, upstream, state, model, config, _ = setup_state(tmp_path, monkeypatch)
+    state.parallel_config.eplb_config.communicator = "nixl"
+
+    def reject(plan):
+        assert state.parallel_config.eplb_config.communicator == "nixl"
+        raise ValueError("cross-rank disagreement")
+
+    monkeypatch.setattr(api, "verify_static_plan_across_ep_ranks", reject)
+    monkeypatch.setattr(upstream, "create_eplb_communicator",
+                        lambda **kwargs: pytest.fail("factory before verification"))
+    with pytest.raises(ValueError, match="cross-rank disagreement"):
+        state.add_model(model, config)
+    assert state.parallel_config.eplb_config.communicator == "nixl"
+    assert not state.model_states
+
+
+@pytest.mark.parametrize("unresolved_backend", [None, "foreign"])
+def test_static_state_rejects_unresolved_or_unknown_transfer_owner(tmp_path, monkeypatch, unresolved_backend):
+    _, _, state, model, config, _ = setup_state(tmp_path, monkeypatch)
+    state.parallel_config.eplb_config.communicator = unresolved_backend
+    with pytest.raises(RuntimeError, match="communicator.*resolved|communicator.*unsupported"):
+        state.add_model(model, config)
+    assert state.parallel_config.eplb_config.communicator == unresolved_backend
+    assert not state.model_states
+
+
+@pytest.mark.parametrize("mode", ["dynamic", "record"])
+@pytest.mark.parametrize("backend", ["nixl", "pynccl", "torch_nccl", "torch_gloo"])
+def test_nonstatic_current_factory_keeps_explicit_communicator(tmp_path, monkeypatch, mode, backend):
+    import vllm.distributed.eplb.eplb_communicator as communicators
+
+    _, upstream, state, model, config, _ = setup_state(tmp_path, monkeypatch, mode)
+    state.parallel_config.eplb_config.communicator = backend
+    monkeypatch.setattr(communicators, "is_local_first_rank", lambda: False)
+
+    def create(**kwargs):
+        assert kwargs["backend"] == backend
+        return communicators.create_eplb_communicator(**kwargs)
+
+    monkeypatch.setattr(upstream, "create_eplb_communicator", create)
+    # CPU fixtures intentionally retain the real factory's CUDA-only rejection.
+    if backend in ("nixl", "pynccl"):
+        with pytest.raises(RuntimeError, match="cuda-like|unavailable"):
+            state.add_model(model, config)
+    else:
+        state.add_model(model, config)
+        wanted = (communicators.TorchDistGlooStagedEplbCommunicator if backend == "torch_gloo"
+                  else communicators.TorchDistNcclEplbCommunicator)
+        assert type(state.model_states["test"].communicator) is wanted
+    assert state.parallel_config.eplb_config.communicator == backend
+
+
 @pytest.mark.parametrize("kwargs", [{}, {"is_dummy": True}, {"is_profile": True}, {"log_stats": True}])
 def test_static_step_is_noop(tmp_path, monkeypatch, kwargs):
     _, _, state, model, config, _ = setup_state(tmp_path, monkeypatch)

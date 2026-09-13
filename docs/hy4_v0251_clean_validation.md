@@ -1,14 +1,15 @@
 # HYV4 v0.25.1 clean integration validation
 
 This contains the Task 10 execution protocol, Task 11 observed results, and
-the focused Task 11A static-loader fix/rerun and Task 11B PCP fix/rerun.
+the focused Task 11A static-loader, Task 11B PCP, and Task 11C static-memory fixes/reruns.
 CPU tests establish contracts; they do not establish checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
 Each result state is updated only after retaining its evidence. Task 11B fixes
 the PP2/PCP4 correctness failure and passes its original exact gate. DP8 memory
 failures mean this matrix is still not an overall integration pass. Task 11A
-fixes the static loader-owner rejection, but its unchanged static rerun fails
-later during KV allocation. The separate plain-PP diagnostic stall below
+fixes the static loader-owner rejection; Task 11C removes the false KV budget
+and changes the exact static gate to an early, safe capacity failure.
+The separate plain-PP diagnostic stall below
 remains unresolved.
 
 Task 11 provenance capture began at 2026-09-12T21:11:05Z (the host renders
@@ -36,7 +37,8 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 | TP8 MTP3, FP8 E4M3 KV, repeated prefix | PASS | 3×3145-token prompts; hits 0/3008/6016; coherent output; HTTP 200; clean teardown |
 | PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | PASS — Task 11B | Original short + three 3145-token requests correct, HTTP 200/stop; exact 41,37/FP8 KV topology; health 200; clean teardown; DCP disabled/default |
 | DP8/TP1/EP8, DeepEP HT, DeepGEMM | FAIL — capacity | All eight ranks loaded; KV budget −0.7 GiB; no readiness; exit 1; clean teardown |
-| DP8/EP8 static offline EPLB load | FAIL — KV allocation OOM | Task 11A: owner rejection fixed; all eight ranks loaded 125.69 GiB; later KV allocation OOM; no readiness; exit 1; clean teardown |
+| DP8/EP8 static offline EPLB load, exact 0.95/4096 gate | SAFE CAPACITY FAIL — Task 11C | All eight ranks loaded 125.69 GiB; positive 3.19 GiB non-torch and 8.62 GiB peak; KV −0.71 GiB; rejected before cache allocation; zero NIXL registration/late OOM; exit 1; clean teardown |
+| DP8/EP8 static offline EPLB, constrained batch tokens 2048 | PASS — constrained Task 11C | Model length 4096/0.95/max sequences 16 unchanged; all-rank map/fingerprint/Gloo owner and zero rearrangement; observed and no-observer 36-request runs pass; final teardown passes after one owned-worker cleanup described below |
 | HumanEval/0–31 target-only | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors; all stop; clean teardown |
 | HumanEval/0–31 MTP3 | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors/flips; acceptance 93.03%; clean teardown |
 | Custom packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
@@ -837,3 +839,152 @@ verified by the full selector and contract rerun. Compileall and diff checks
 pass. Remaining DP8/static-KV capacity failures, the plain-PP diagnostic stall,
 W4A8/Mooncake hardware gaps, unsupported modes and deferred review observations
 are unchanged; this focused pass is not an overall integration pass.
+
+## Task 11C static EPLB memory diagnosis
+
+Baseline `eff75c6f2062cf69c30847a2ea4f80324424c719`; evidence root:
+`/models/validation-logs/hy4-static-memory-20260912T234254Z`.
+The unchanged static DP8/EP8 command with a read-only call/return observer
+reproduced the late KV OOM on all eight ranks (`01-observed`). At NIXL/RIXL
+`_init_registered_buffers`, reported free memory increased by **88.890625 GiB**
+while the device index, total memory and PyTorch allocated/reserved/peak
+counters stayed unchanged. For device 2, free memory jumped from 10.597656
+to 99.488281 GiB with 123.865174 GiB still allocated by PyTorch.
+
+The resulting negative non-PyTorch increase inflated the KV budget. Device 0
+reported weights 125.689453 GiB, activation peak increase 8.619878 GiB,
+non-PyTorch increase −85.703125 GiB and approximately 88.18 GiB available KV.
+Ordinary DP8 under the identical observer (`02-plain-observed`) had no
+registration jump: device 1 reported a positive 3.179688 GiB non-PyTorch
+increase, an 8.620533 GiB activation increase and a −756469760-byte KV budget.
+Both diagnostic services exited 1 naturally and passed complete teardown.
+`diagnosis.json` retains all 16 rank records and raw snapshots;
+`diagnosis-audit.log` verifies their formulas and registration boundaries.
+
+The static adapter now selects the **official Gloo staged communicator** only
+while constructing an already-validated direct-load state. Its constructor
+does not register all expert weights or allocate transfer staging; static
+step/rearrange guards make transfer execution unreachable. The official state,
+one-layer expert buffers, maps and shared tensors are retained. No fake
+communicator, state-constructor copy, memory clamp or guessed margin is used.
+Even an explicit static transfer preference uses this construction policy;
+its original value is restored in `finally`. Unresolved/unknown preferences
+fail closed. Nonstatic, dynamic and record configurations retain their
+original communicator, including explicit choices. This does not fix generic
+dynamic/record NIXL device accounting or authorize HYV4 dynamic/record mode.
+NIXL/UCX functionality is not added or accepted in this scope; no dynamic
+NIXL repair or runtime validation is performed. The pinned generic implementation
+is retained untouched. Registration observations above are causal diagnostics,
+and the post-fix zero-registration check validates only the static Gloo path.
+
+The observer records scalar counters and CPU plan metadata without replacing
+methods, synchronizing devices or retaining tensors. Instrumented diagnostics
+and no-observer acceptance runs are recorded separately. DCP remains disabled
+by default and is not tested.
+
+### Exact static post-fix gate — SAFE CAPACITY FAIL
+
+`03-exact-final/`: no observer, original exact ARGV, PID/PGID 1489731,
+2026-09-13T00:51:12Z–00:54:00Z. All eight ranks load the supplied weights
+and report non-KV usage 137.5 GiB: weights 125.69 GiB, activation increase
+8.62 GiB, positive non-torch increase 3.19 GiB. Requested memory remains
+136.78 GiB (143.984375 × 0.95); returned KV budget is −0.71 GiB.
+The unchanged parent formula preserves all positive reservations, rejects
+before KV allocation and never late-OOMs. This is not a serving PASS.
+The actual communicator is official Gloo; NIXL/UCX registration log count
+is zero. No memory clamp, explicit KV override or EP weight filtering.
+Natural exit 1; no assistant-issued service signal. `teardown.log` confirms
+no saved/logged processes or port-8000 listener, all eight cards 0%/2 MiB.
+
+Only after this genuine capacity result, a separate bounded runtime probe
+reduces `max-num-batched-tokens` from 4096 to 2048. Model length 4096,
+max sequences 16, utilization 0.95, map, DP8/TP1/EP8 topology, DeepEP HT,
+DeepGEMM, FP8 KV and eager mode remain unchanged. Its result is recorded
+separately; it cannot replace the failed exact resource gate.
+
+### Constrained static semantics (2048 batch tokens)
+
+`04-constrained-observed/`: PID/PGID 1510994, UTC 00:54:11–01:01:06,
+readiness 00:57:42. Instrumented evidence verifies all eight bound 77×256
+identity maps and the same original SHA-256/fingerprint, official Gloo state,
+disabled async and no pending/rebalanced state. Each rank has 146 static
+step calls and 148–150 model-execution calls. Actual upstream rearrangements,
+weight moves and communicator transfers are **zero on every rank**.
+CPU bound-row values and GPU shape metadata are observed; the observer does
+not copy GPU map values or synchronize devices. The real map-commit owner
+is covered by the behavioral tests and coherent distributed inference.
+
+All eight raw profiles have nonnegative snapshots/non-torch/peak terms and
+KV budgets 2,978,983,936–2,982,719,488 bytes, each no greater than requested
+minus weights minus the measured positive peak/non-torch reservations.
+Reported model usage is 125.53 GiB, peak 5.29–5.30 GiB and non-torch 3.18 GiB;
+55,168–55,296 cache tokens are available. The official one-layer expert
+buffer (1,209,270,272 bytes per rank) remains allocated; no ABI was removed.
+
+Short and original three 3145-token prompts returned coherent Paris answers,
+completion lengths 3/2/55/59, all HTTP 200/stop. Another 32 concurrent short
+requests all returned 200/stop; every rank executed real scheduled work.
+Health returned 200 after reuse. `runtime-audit.json` contains every text,
+hash, token count, full rank profile and counters. No NIXL/UCX registration,
+NaN, illegal access or OOM was observed. Owned-PTY Ctrl-C exited 0, followed
+by `TEARDOWN_PASS` (no owned/logged PIDs/listener, all cards 0%/2 MiB).
+
+The corresponding uninstrumented foreground command, after the pinned
+environment/map setup and clean-device checks above, is:
+
+```bash
+env -u VLLM_PLUGINS python3 -m vllm.entrypoints.cli.main serve "$MODEL" \
+  --host 127.0.0.1 --port 8000 --trust-remote-code --enable-prefix-caching \
+  --gpu-memory-utilization 0.95 --max-model-len 4096 --max-num-seqs 16 \
+  --max-num-batched-tokens 2048 \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}' \
+  --reasoning-parser hy_v4 --enable-auto-tool-choice --tool-call-parser hy_v4 \
+  --seed 0 --served-model-name hy4-v0251-static-eplb \
+  --tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel \
+  --all2all-backend deepep_high_throughput --moe-backend deep_gemm \
+  --kv-cache-dtype fp8_e4m3 --enforce-eager --enable-eplb \
+  --eplb-config "$EPLB_CONFIG"
+```
+
+This is the first bounded resource candidate, not an exhaustive search for
+the largest possible batch budget. The no-observer rerun is recorded below.
+
+### No-observer constrained rerun — PASS, with shutdown cleanup concern
+
+`05-constrained-final/`: PID/PGID 1541953, UTC 01:01:15–01:05:16,
+readiness 01:04:03. No diagnostic extension or artifact import path. The
+complete ARGV differs from the exact gate only in batch tokens 4096→2048;
+all 36 request bodies match the instrumented run exactly. All eight ranks
+report normal positive profiles and approximately 2.78 GiB KV. The actual
+Gloo owner initializes; NIXL/UCX registration remains zero.
+
+Short and original three 3145-token requests return 200/stop with completion
+lengths 3/2/53/55; every answer coherently identifies Paris. Another 32 short
+requests return 200/stop, and post-reuse health/metrics return 200. Full texts,
+hashes, usage and observed/final differences are in `constrained-comparison.json`
+and each run's `runtime-audit.json`. This is not bitwise parity or performance
+evidence; instrumented all-rank state/counters and uninstrumented serving
+results are deliberately separate.
+
+Owned-PTY Ctrl-C at 01:05:11 led to parent exit 0, but the first teardown
+failed: one DP6 worker remained and emitted shutdown TCPStore reset/broken-pipe
+warnings. Its exact saved PID 1551995, creation time 1789261352.96, PGID 1541953
+and command were checked before each signal. A targeted SIGTERM at 01:05:50
+did not exit within ten seconds; targeted SIGKILL at 01:06:00 removed only
+that owned worker. No unrelated PID/group was signalled. The original
+`teardown.log` failure and `owned-dp6-cleanup.log` are retained; this manual
+cleanup remains a shutdown concern, not an automatic graceful-exit claim.
+
+After all regression processes finished, `teardown-final.log` was regenerated
+for all five Task 11C services at 01:11:36 UTC: no owned/logged processes,
+no port-8000 listener, every card 0%/2 MiB. No further model was launched.
+
+Final source gates: 50 focused owner tests; 810 neighbors; all 36 changed
+Python modules unfiltered, 1113 tests; complete pinned contract 2176 tests
+with zero failures/errors/skips; CI selector 70 tests; doctor 7 PASS/49 callbacks.
+Compileall, both diff checks and 17 Bash-block syntax checks pass. All 1970
+pinned Python/shared-library hashes, candidate production/test hashes, model
+config/index hashes and checkpoint size/mtime records remain unchanged.
+The two exact DP8 capacity gates, separate plain-PP stall, cleanup concern,
+W4A8/Mooncake gaps, unsupported modes and deferred observations remain open.
+DCP and NIXL/UCX functionality are not tested/accepted by this work.
