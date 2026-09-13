@@ -70,6 +70,7 @@ def test_native_target_retained_names_and_strict_ledger(tmp_path, checkpoint_mod
 def test_native_mtp_retained_names_keep_target_filter_and_ledger(tmp_path, monkeypatch):
     model = _minimal_draft(_mtp(), monkeypatch)
     model.quant_config = module("hyv4_native").HYV4NativeW4A8Config(str(native_index(tmp_path)))
+    model.checkpoint_quant_config = model.quant_config
     weights = [(name + ".weight", value) for name, value in _weights()]
     assert model.load_weights(iter(weights)) == set(dict(model.named_parameters()))
     with pytest.raises(RuntimeError, match="Duplicate"):

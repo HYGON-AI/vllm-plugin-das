@@ -180,6 +180,8 @@ def test_real_target_and_mtp_packed_linear_loading(tmp_path, monkeypatch, checkp
             quant_config=config, prefix="model.projection", disable_tp=True)
         model.model.projection = layer
     model.quant_config = config
+    if draft:
+        model.checkpoint_quant_config = config
     packed = torch.tensor([[0x87, 0x10], [0xf2, 0x43]], dtype=torch.uint8)
     if native:
         weights = [(key + ".weight", value) for key, value in weights]
@@ -229,6 +231,8 @@ def test_real_target_and_mtp_expert_packing_scales_and_ledger(tmp_path, monkeypa
         prefix = "model.mlp.experts"
     mlp.experts = experts
     model.quant_config = config
+    if draft:
+        model.checkpoint_quant_config = config
     inner.config.num_experts = 3
     inner.num_redundant_experts = 1
     inner.get_expert_mapping = lambda: RoutedExperts.build_expert_params_mapping("gate_proj", "down_proj", "up_proj", 3)

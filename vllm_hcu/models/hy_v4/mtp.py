@@ -277,6 +277,9 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
         self.config = config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = 1
+        # Serialized names still follow the target's explicit format when the
+        # draft executes unquantized. Never use this owner for draft allocation.
+        self.checkpoint_quant_config = vllm_config.quant_config
         self.quant_config = _remap_mtp_quant_exclusions(
             _create_mtp_quant_config(config, vllm_config.quant_config),
             self.mtp_start_layer_idx, 1,
@@ -399,6 +402,7 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
         )
         self.config = self.model.config
         self.quant_config = self.model.quant_config
+        self.checkpoint_quant_config = self.model.checkpoint_quant_config
         self.sampler = Sampler()
         for name in (
             "expert_weights", "num_moe_layers", "num_expert_groups",
@@ -445,7 +449,7 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
             adapt_checkpoint_weights,
         )
 
-        weights = adapt_checkpoint_weights(self.quant_config, weights)
+        weights = adapt_checkpoint_weights(self.checkpoint_quant_config, weights)
         params_dict = dict(self.named_parameters())
         tied_head_name = f"model.layers.{self.config.num_hidden_layers}.shared_head.head.weight"
 

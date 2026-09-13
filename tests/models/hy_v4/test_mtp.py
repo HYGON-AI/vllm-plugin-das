@@ -31,6 +31,7 @@ def _minimal_draft(mtp, monkeypatch):
     model.config = HYV4Config(num_hidden_layers=2, n_routed_experts=0, num_attention_heads=4)
     model.config.num_experts = 0
     model.quant_config = None
+    model.checkpoint_quant_config = None
     model.num_redundant_experts = 0
     model.model = nn.Module()
     model.model.embed_tokens = nn.Embedding(4, 2)
@@ -70,15 +71,16 @@ def _weights():
             ("model.norm.weight", torch.tensor(float("nan")))]
 
 
-def _constructed_tied_draft(monkeypatch):
+def _constructed_tied_draft(monkeypatch, *, source=None, algo=None, tied=True, with_mlp=False, shared_mlp=False, decoder=None):
     """Keep the native constructor, vocab/head modules and strict loader."""
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers import vocab_parallel_embedding
+    from vllm.model_executor.layers import linear, vocab_parallel_embedding
+    from vllm.model_executor import parameter
     from vllm.model_executor.models import utils
 
     mtp = _mtp()
     monkeypatch.setattr(utils, "_model_to_pp_missing_layer_names", {})
-    for module in (target_module, vocab_parallel_embedding):
+    for module in (target_module, vocab_parallel_embedding, linear, parameter):
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
         monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
 
@@ -87,15 +89,26 @@ def _constructed_tied_draft(monkeypatch):
             super().__init__()
             self.block_type = "feedforward"
             self.self_attn = SimpleNamespace(is_sparse=False)
+            if with_mlp:
+                # Keep the actual merged-linear allocation and shard loader.
+                assert kwargs["quant_config"] is None
+                self.mlp = nn.Module()
+                dense = self.mlp
+                if shared_mlp:
+                    dense = self.mlp.shared_experts = nn.Module()
+                dense.gate_up_proj = linear.MergedColumnParallelLinear(
+                    2, [2, 2], bias=False, quant_config=kwargs["quant_config"],
+                    prefix=kwargs["prefix"] + (".mlp.shared_experts" if shared_mlp else ".mlp") + ".gate_up_proj")
 
     # Decoder kernels are unrelated to the embedding/head allocation boundary.
-    monkeypatch.setattr(mtp, "HYV4DecoderLayer", Block)
+    monkeypatch.setattr(mtp, "HYV4DecoderLayer", decoder or Block)
     config = HYV4Config(num_hidden_layers=2, hidden_size=2, vocab_size=4,
-                       n_routed_experts=0, tie_word_embeddings=True,
+                       n_routed_experts=0, tie_word_embeddings=tied, mtp_quant_algo=algo,
                        pad_token_id=0, bos_token_id=1, eos_token_id=2)
     current = SimpleNamespace(
         speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=config)),
-        quant_config=None, cache_config=None,
+        quant_config=source, cache_config=None,
+        parallel_config=SimpleNamespace(enable_eplb=False),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
     )
     with set_current_vllm_config(VllmConfig()):
@@ -105,6 +118,185 @@ def _constructed_tied_draft(monkeypatch):
 def _tied_weights():
     return [(name, value) for name, value in _weights()
             if name != "lm_head.weight" and ".mlp." not in name]
+
+
+def _native_unquantized_draft(tmp_path, monkeypatch, algo, tied=False, shared_mlp=False):
+    from tests.accuracy.test_hyv4_native_format import native_index
+    from vllm_hcu.model_executor.layers.quantization.hyv4_native import HYV4NativeW4A8Config
+    source = HYV4NativeW4A8Config(str(native_index(tmp_path)))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("source-format config reached an execution method/cache mapper")
+
+    monkeypatch.setattr(source, "get_quant_method", forbidden)
+    monkeypatch.setattr(source, "get_cache_scale_mapper", forbidden)
+    draft = _constructed_tied_draft(monkeypatch, source=source, algo=algo,
+                                    tied=tied, with_mlp=True, shared_mlp=shared_mlp)
+    return source, draft
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+def test_native_mtp_unquantized_load_normalizes_retained_source_names(tmp_path, monkeypatch, algo):
+    source, draft = _native_unquantized_draft(tmp_path, monkeypatch, algo)
+    assert draft.quant_config is None and draft.model.quant_config is None
+    dtype = torch.bfloat16 if algo == "BF16" else torch.float16
+    weights = [(name + ".weight", value.to(dtype)) for name, value in _weights()]
+    # Put a draft norm first so RED proves the unnormalized retained name
+    # reaches the real strict loader, rather than only a missing source field.
+    weights.sort(key=lambda item: "enorm" not in item[0])
+    for _ in range(2):
+        assert draft.load_weights(iter(weights)) == set(dict(draft.named_parameters()))
+        assert not hasattr(draft, "_checkpoint_accounting")
+    assert draft.checkpoint_quant_config is source
+    assert draft.model.checkpoint_quant_config is source
+    layer = draft.model.layers["2"]
+    assert layer.shared_head.head.quant_config is None
+    assert type(layer.mtp_block.mlp.gate_up_proj.quant_method).__name__ == "UnquantizedLinearMethod"
+    torch.testing.assert_close(layer.enorm.weight, torch.full((2,), 4.))
+    torch.testing.assert_close(layer.eh_proj.weight, torch.full((2, 4), 5.))
+    torch.testing.assert_close(layer.mtp_block.mlp.gate_up_proj.weight,
+                               torch.tensor([[6., 6.], [6., 6.], [7., 7.], [7., 7.]]))
+    torch.testing.assert_close(layer.shared_head.head.weight[:4], torch.full((4, 2), 3.))
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+@pytest.mark.parametrize("head_aliases", [(), ("lm_head.weight",),
+    ("model.mtp_layers.0.shared_head.head.weight",),
+    ("model.layers.2.shared_head.head.weight",),
+    ("lm_head.weight", "model.mtp_layers.0.shared_head.head.weight",
+     "model.layers.2.shared_head.head.weight")])
+@pytest.mark.parametrize("head_first", [False, True])
+def test_native_mtp_unquantized_tied_heads_keep_canonical_embedding(tmp_path, monkeypatch, algo, head_aliases, head_first):
+    source, draft = _native_unquantized_draft(tmp_path, monkeypatch, algo, tied=True)
+    embedding = draft.model.embed_tokens.weight
+    pointer = embedding.data_ptr()
+    weights = [(name + ".weight", value) for name, value in _weights() if name != "lm_head.weight"]
+    aliases = [(name + ".weight", torch.full((4, 2), 9.)) for name in head_aliases]
+    for _ in range(2):
+        loaded = draft.load_weights(iter(aliases + weights if head_first else weights + aliases))
+        assert loaded == set(dict(draft.named_parameters()))
+        assert "model.layers.2.shared_head.head.weight" not in loaded
+        assert draft.model.layers["2"].shared_head.head.weight is embedding
+        assert embedding.data_ptr() == pointer
+        torch.testing.assert_close(embedding[:4], torch.full((4, 2), 2.))
+    assert draft.quant_config is None
+    assert draft.checkpoint_quant_config is source
+    with pytest.raises(RuntimeError, match="Missing HY V4 checkpoint.*model.embed_tokens.weight"):
+        draft.load_weights(iter(aliases + [(name, value) for name, value in weights
+                               if name != "model.embed_tokens.weight.weight"]))
+    assert not hasattr(draft, "_checkpoint_accounting")
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+@pytest.mark.parametrize("bad", ["duplicate", "missing", "unknown", "extra_mtp", "malformed_layer", "extra_storage_suffix"])
+def test_native_mtp_unquantized_strict_errors_and_reload_cleanup(tmp_path, monkeypatch, algo, bad):
+    _, draft = _native_unquantized_draft(tmp_path, monkeypatch, algo)
+    weights = [(name + ".weight", value) for name, value in _weights()]
+    broken = list(weights)
+    if bad == "duplicate":
+        broken.append(("model.layers.2.enorm.weight.weight", torch.ones(2)))
+        match = "Duplicate HY V4"
+    elif bad == "missing":
+        broken = [(name, value) for name, value in broken if "mlp.up_proj" not in name]
+        match = "Missing HY V4"
+    else:
+        name = {"unknown": "model.mtp_layers.0.unknown.weight.weight",
+                "extra_mtp": "model.mtp_layers.1.enorm.weight.weight",
+                "malformed_layer": "model.mtp_layers.bad.enorm.weight.weight",
+                "extra_storage_suffix": "model.mtp_layers.0.enorm.weight.weight.weight"}[bad]
+        broken.append((name, torch.ones(2)))
+        match = "Unknown HY V4|exactly one checkpoint MTP"
+    with pytest.raises((ValueError, RuntimeError), match=match):
+        draft.load_weights(iter(broken))
+    assert not hasattr(draft, "_checkpoint_accounting")
+    assert draft.load_weights(iter(weights)) == set(dict(draft.named_parameters()))
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+def test_native_mtp_source_config_only_selects_stream_adapter(tmp_path, monkeypatch, algo):
+    from vllm_hcu.model_executor.layers.quantization import hyv4_w4a8_weights
+    source, draft = _native_unquantized_draft(tmp_path, monkeypatch, algo)
+    assert draft.checkpoint_quant_config is source
+    assert draft.model.checkpoint_quant_config is source
+    real_adapter = hyv4_w4a8_weights.adapt_checkpoint_weights
+    selected = []
+
+    def adapt(config, weights):
+        selected.append(config)
+        return real_adapter(config, weights)
+
+    monkeypatch.setattr(hyv4_w4a8_weights, "adapt_checkpoint_weights", adapt)
+    weights = [(name + ".weight", value) for name, value in _weights()]
+    assert draft.load_weights(iter(weights)) == set(dict(draft.named_parameters()))
+    assert selected == [source]
+    assert draft.quant_config is None and draft.model.quant_config is None
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+@pytest.mark.parametrize("kind", ["custom", "ordinary", "none"])
+def test_mtp_unquantized_source_neighbors_preserve_canonical_stream(tmp_path, monkeypatch, algo, kind):
+    from tests.models.hy_v4.test_custom_w4a8 import manifest, module
+    source = (module("hyv4_w4a8").HYV4W4A8Config(str(manifest(tmp_path))) if kind == "custom"
+              else SimpleNamespace(checkpoint_format="hy4_w4a8_v1") if kind == "ordinary" else None)
+    draft = _constructed_tied_draft(monkeypatch, source=source, algo=algo, tied=False, with_mlp=True)
+    assert draft.quant_config is None
+    assert draft.load_weights(iter(_weights())) == set(dict(draft.named_parameters()))
+    assert draft.checkpoint_quant_config is source
+    if kind == "custom":
+        with pytest.raises(ValueError, match="identity input_scale"):
+            draft.load_weights(iter(_weights() + [("model.norm.input_scale", torch.tensor([2.]))]))
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+def test_native_mtp_unquantized_fused_and_shared_gate_up(tmp_path, monkeypatch, algo, shared, fused):
+    _, draft = _native_unquantized_draft(tmp_path, monkeypatch, algo, shared_mlp=shared)
+    weights = _weights()
+    expected = torch.tensor([[6., 6.], [6., 6.], [7., 7.], [7., 7.]])
+    if fused:
+        weights = [(name, value) for name, value in weights if ".mlp." not in name]
+        weights.append(("model.mtp_layers.0.mlp.gate_up_proj.weight", expected))
+    if shared:
+        weights = [(name.replace(".mlp.", ".mlp.shared_experts."), value) for name, value in weights]
+    # Also exercise the canonical nextn layer alias after native normalization.
+    weights = [(name.replace("model.mtp_layers.0.", "model.layers.2.") + ".weight", value)
+               for name, value in weights]
+    assert draft.load_weights(iter(weights)) == set(dict(draft.named_parameters()))
+    mlp = draft.model.layers["2"].mtp_block.mlp
+    dense = mlp.shared_experts if shared else mlp
+    torch.testing.assert_close(dense.gate_up_proj.weight, expected)
+
+
+@pytest.mark.parametrize("algo", ["BF16", "FP16"])
+def test_native_mtp_source_never_reaches_decoder_moe_allocation(tmp_path, monkeypatch, algo):
+    from tests.accuracy.test_hyv4_native_format import native_index
+    from vllm_hcu.model_executor.layers.quantization.hyv4_native import HYV4NativeW4A8Config
+    source = HYV4NativeW4A8Config(str(native_index(tmp_path)))
+    allocations = []
+
+    class Attention(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            allocations.append(("attention", kwargs["quant_config"]))
+            self.is_sparse = False
+
+    class MoE(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            allocations.append(("moe", kwargs["quant_config"]))
+            self.experts = nn.Module()
+
+    # Supplemental allocation-boundary probe: retain the real predictor,
+    # predictor layer and decoder, replacing only accelerator allocators.
+    monkeypatch.setattr(target_module, "HYV4MLAAttention", Attention)
+    monkeypatch.setattr(target_module, "HYV4MoEFused", MoE)
+    draft = _constructed_tied_draft(monkeypatch, source=source, algo=algo,
+                                    decoder=target_module.HYV4DecoderLayer)
+    assert allocations == [("attention", None), ("moe", None)]
+    assert draft.model.layers["2"].shared_head.head.quant_config is None
+    assert draft.quant_config is None
+    assert draft.checkpoint_quant_config is source
 
 
 @pytest.mark.parametrize("head_aliases", [
