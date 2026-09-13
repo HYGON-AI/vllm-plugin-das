@@ -162,10 +162,10 @@ class HcuQwen4ExpPLEInt8EmbeddingMethod(QuantizeMethodBase):
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         # ``VocabParallelEmbedding.forward`` invokes this method before its
-        # tensor-parallel all-reduce.  Return a supported floating-point dtype
+        # embedding-parallel all-reduce. Return a supported floating-point dtype
         # here; returning INT8 would make the communicator reject the tensor.
         # ``input_`` is already masked to local indices by the base forward
-        # path for TP > 1, and that path clears non-owner rows immediately
+        # path for ETP > 1, and that path clears non-owner rows immediately
         # after this lookup.
         embeddings = F.embedding(input_, layer.weight)
         scales = F.embedding(input_, layer.weight_scale)
@@ -189,8 +189,8 @@ def _pinned_int8_lookup(
 
     Only the looked-up rows cross the PCIe bus, not the whole table.  The base
     ``VocabParallelEmbedding.forward`` has already clamped ``ids`` into the
-    local TP range and will zero non-owner rows *after* this call, so no bounds
-    handling or TP communication happens here.
+    local ETP range and will zero non-owner rows *after* this call, so no bounds
+    handling or ETP communication happens here.
 
     ``ids`` may be N-D (e.g. ``[num_tokens, ngram_heads]``); the row axis is
     flattened for the gather and restored on the output.
@@ -292,7 +292,7 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
             + weight_scale.numel() * weight_scale.element_size()
         )
         logger.info_once(
-            "Qwen4Exp PLE INT8 UVA offload active: %.3f MiB per TP rank "
+            "Qwen4Exp PLE INT8 UVA offload active: %.3f MiB per ETP rank "
             "(weight=%s, weight_scale=%s, zero-copy device views)",
             offloaded_bytes / (1024**2),
             tuple(weight.shape),
@@ -334,9 +334,9 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
     ) -> torch.Tensor:
         if layer.tp_size == 1:
             return rows
-        from vllm.distributed import tensor_model_parallel_all_reduce
-
-        return tensor_model_parallel_all_reduce(rows)
+        if layer.parallel_group is None:
+            raise RuntimeError("PLE ETP parallel group is not initialized")
+        return layer.parallel_group.all_reduce(rows)
 
     @staticmethod
     def _uva_view(layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -436,7 +436,7 @@ class HcuQwen4ExpPLEInt8OffloadEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod
             + weight_scale.numel() * weight_scale.element_size()
         )
         logger.info_once(
-            "Qwen4Exp PLE INT8 CPU offload active: %.3f MiB per TP rank "
+            "Qwen4Exp PLE INT8 CPU offload active: %.3f MiB per ETP rank "
             "(weight=%s, weight_scale=%s)",
             offloaded_bytes / (1024**2),
             tuple(weight.shape),
@@ -447,7 +447,7 @@ class HcuQwen4ExpPLEInt8OffloadEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod
         # ``layer.weight``/``layer.weight_scale`` live on CPU pinned memory.
         # Gather-on-host, stage the narrow slices to the accelerator, then
         # dequantize to BF16 there so the base forward's ``masked_fill_`` and
-        # TP all-reduce receive a device-resident floating-point tensor.
+        # the ETP all-reduce receives a device-resident floating-point tensor.
         return _pinned_int8_lookup(
             layer.weight,
             layer.weight_scale,

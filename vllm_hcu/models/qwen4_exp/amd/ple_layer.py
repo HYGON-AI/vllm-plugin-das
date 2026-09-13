@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""HCU mirror of Qwen4Exp PLE with opt-in INT8 UVA prefetch support.
+"""HCU Qwen4Exp PLE with ETP and opt-in INT8 UVA prefetch support.
 
 Upstream source: vLLM commit 4574da606553cad5c22448d498f144630a23641e
 Upstream SHA256: 8bb2e441dad2e9f3c8686bc48aa95001e5adc81b91199cc68b2e4bbe9eb69292
@@ -44,6 +44,7 @@ def _verify_upstream_source() -> None:
 _verify_upstream_source()
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import get_dp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -68,6 +69,15 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
 from vllm_hcu.models.qwen4_exp.engram import cpu_offload_enabled
 from vllm_hcu.platforms import envs as hcu_envs
+
+try:
+    from vllm.distributed import get_etp_group
+except ImportError:
+
+    def get_etp_group():
+        raise RuntimeError(
+            "Qwen4Exp embedding_across_dp requires a vLLM wheel with ETP support"
+        )
 
 
 _PREFETCH_METHODS = (
@@ -296,11 +306,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
+        etp_group = get_etp_group()
         self.ngram_embedding = PLEVocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
+            parallel_group=etp_group,
+        )
+        tp_size = get_tp_group().world_size
+        if self.ngram_embedding.tp_size % tp_size:
+            raise ValueError(
+                "ETP size must be divisible by TP size, but got "
+                f"ETP={self.ngram_embedding.tp_size} and TP={tp_size}"
+            )
+        self.etp_data_parallel_size = self.ngram_embedding.tp_size // tp_size
+        self.data_parallel_rank = int(
+            get_current_vllm_config().parallel_config.data_parallel_rank
         )
         self.max_total_tokens = max_total_tokens
         self._hcu_prefetch_successor: Qwen4ExpNGramEmbedding | None = None
@@ -310,11 +332,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._hcu_prefetch_enabled = _prefetch_method_enabled(method)
         if self._hcu_prefetch_enabled:
             output_dtype = _prefetch_output_dtype(method, self.ngram_embedding)
+            max_etp_tokens = max_total_tokens * self.etp_data_parallel_size
             ids_buffer = torch.empty(
-                (max_total_tokens, self.ngram_heads), dtype=torch.int64
+                (max_etp_tokens, self.ngram_heads), dtype=torch.int64
             )
             rows_buffer = torch.empty(
-                (max_total_tokens, embedding_dim), dtype=output_dtype
+                (max_etp_tokens, embedding_dim), dtype=output_dtype
             )
             self._hcu_prefetch_stream = torch.cuda.Stream()
             self._hcu_prefetch_event = torch.cuda.Event()
@@ -481,6 +504,59 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             prepare(self.ngram_embedding)
         self._hcu_prefetch_prepared = True
 
+    def _get_dp_gather_slot(self, local_num_tokens: int) -> tuple[int, int]:
+        """Return the padded DP slot size and this rank's slot offset."""
+        if self.etp_data_parallel_size == 1:
+            return local_num_tokens, 0
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            raise RuntimeError("ETP spanning DP requires DP token metadata")
+        group_start = (self.data_parallel_rank // self.etp_data_parallel_size) * (
+            self.etp_data_parallel_size
+        )
+        group_end = group_start + self.etp_data_parallel_size
+        token_counts = dp_metadata.num_tokens_across_dp_cpu.tolist()
+        group_counts = token_counts[group_start:group_end]
+        if len(group_counts) != self.etp_data_parallel_size:
+            raise RuntimeError(
+                "ETP DP token metadata does not cover this embedding group: "
+                f"need ranks [{group_start}, {group_end}), got "
+                f"{len(token_counts)} entries"
+            )
+        slot_size = max(group_counts)
+        if local_num_tokens > slot_size:
+            raise RuntimeError(
+                "local PLE token count exceeds its ETP DP gather slot: "
+                f"local={local_num_tokens}, slot={slot_size}"
+            )
+        return slot_size, get_dp_group().rank_in_group * slot_size
+
+    def _gather_dp_ids(
+        self,
+        ngram_ids: torch.Tensor,
+        slot_size: int,
+    ) -> torch.Tensor:
+        """Pad non-uniform DP inputs and gather IDs for the ETP lookup."""
+        if self.etp_data_parallel_size == 1:
+            return ngram_ids
+        if ngram_ids.shape[0] < slot_size:
+            padding = ngram_ids.new_zeros(
+                slot_size - ngram_ids.shape[0], ngram_ids.shape[1]
+            )
+            ngram_ids = torch.cat((ngram_ids, padding), dim=0)
+        return get_dp_group().all_gather(ngram_ids, dim=0)
+
+    def _select_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        local_num_tokens: int,
+        slot_offset: int,
+    ) -> torch.Tensor:
+        """Select this DP rank's real rows after the ETP reduction."""
+        if self.etp_data_parallel_size == 1:
+            return embeddings
+        return embeddings.narrow(0, slot_offset, local_num_tokens)
+
     def _start_prefetch_impl(
         self,
         input_ids: torch.Tensor,
@@ -531,6 +607,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_ids = self.compute_ngram_ids(
                     input_ids, query_start_loc, ngram_context
                 )
+                slot_size, _ = self._get_dp_gather_slot(num_tokens)
+                gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+                gathered_num_tokens = gathered_ids.shape[0]
+                if gathered_num_tokens > self._hcu_prefetch_ids_buffer.shape[0]:
+                    raise ValueError(
+                        "PLE ETP prefetch gathered "
+                        f"{gathered_num_tokens} tokens, but its workspace supports "
+                        f"at most {self._hcu_prefetch_ids_buffer.shape[0]}"
+                    )
                 embedding = self.ngram_embedding
                 input_mask = None
                 if embedding.tp_size > 1:
@@ -539,7 +624,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     )
 
                     local_ids, input_mask = get_masked_input_and_mask(
-                        ngram_ids,
+                        gathered_ids,
                         embedding.shard_indices.org_vocab_start_index,
                         embedding.shard_indices.org_vocab_end_index,
                         embedding.shard_indices.num_org_vocab_padding,
@@ -547,11 +632,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         embedding.shard_indices.added_vocab_end_index,
                     )
                 else:
-                    local_ids = ngram_ids
-                ids = self._hcu_prefetch_ids_buffer[:num_tokens]
+                    local_ids = gathered_ids
+                ids = self._hcu_prefetch_ids_buffer[:gathered_num_tokens]
                 ids.copy_(local_ids)
-                rows = self._hcu_prefetch_rows_buffer[:num_tokens].view(
-                    num_tokens, self.ngram_heads, self.head_dim
+                rows = self._hcu_prefetch_rows_buffer[:gathered_num_tokens].view(
+                    gathered_num_tokens, self.ngram_heads, self.head_dim
                 )
                 embedding.quant_method.prefetch_lookup_into(embedding, ids, rows)
                 if input_mask is not None:
@@ -570,10 +655,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         event = self._hcu_prefetch_event
         assert event is not None
         torch.cuda.current_stream().wait_event(event)
-        rows = self._hcu_prefetch_rows_buffer[:num_tokens]
+        slot_size, slot_offset = self._get_dp_gather_slot(num_tokens)
+        gathered_num_tokens = slot_size * self.etp_data_parallel_size
+        rows = self._hcu_prefetch_rows_buffer[:gathered_num_tokens]
         try:
-            return self.ngram_embedding.quant_method.finalize_prefetched(
+            embeddings = self.ngram_embedding.quant_method.finalize_prefetched(
                 self.ngram_embedding, rows
+            )
+            return self._select_embeddings(
+                embeddings, num_tokens, slot_offset
             )
         finally:
             self._hcu_prefetch_pending = False
@@ -1331,7 +1421,12 @@ def qwen4_exp_amd_ple_ngram_embedding(
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
-    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    owner = layer.ple_embedding
+    local_num_tokens = ngram_ids.shape[0]
+    slot_size, slot_offset = owner._get_dp_gather_slot(local_num_tokens)
+    gathered_ids = owner._gather_dp_ids(ngram_ids, slot_size)
+    result = owner.ngram_embedding(gathered_ids).flatten(-2)
+    result = owner._select_embeddings(result, local_num_tokens, slot_offset)
     output.copy_(result)
 
 
