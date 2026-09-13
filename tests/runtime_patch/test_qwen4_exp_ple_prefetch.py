@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """CPU-side contract tests for Qwen4Exp PLE prefetch orchestration."""
 
-from contextlib import nullcontext
+import ast
 import importlib
+import inspect
+import os
+from contextlib import nullcontext
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import vllm
 
 from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_ple_int8 as int8_patch
 from vllm_hcu.patch.worker.core_fix import (
@@ -17,6 +22,14 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_qwen4_exp_ple_prefetch as model_patch,
 )
 from vllm_hcu.platforms import envs as hcu_envs
+
+
+TARGET_VLLM_ROOT = Path(
+    os.environ.get(
+        "VLLM_SOURCE_ROOT",
+        Path(vllm.__file__).resolve().parents[1],
+    )
+).resolve()
 
 
 @pytest.fixture(scope="module")
@@ -346,12 +359,60 @@ def _ngram(name: str, calls: list[str]):
     return ngram
 
 
+def _target_model_method(name: str) -> ast.FunctionDef:
+    source = TARGET_VLLM_ROOT / "vllm/models/qwen4_exp/amd/model.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    model_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Qwen4ExpModel"
+    )
+    return next(
+        node
+        for node in model_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def test_model_patch_contract_matches_target_vllm_source():
+    init = _target_model_method("__init__")
+    assert [argument.arg for argument in init.args.args] == ["self"]
+    assert [argument.arg for argument in init.args.kwonlyargs] == [
+        "vllm_config",
+        "prefix",
+    ]
+    assert init.args.vararg is None
+    assert init.args.kwarg is None
+    assert init.args.kw_defaults[0] is None
+    assert isinstance(init.args.kw_defaults[1], ast.Constant)
+    assert init.args.kw_defaults[1].value == ""
+
+    forward = _target_model_method("forward")
+    assert [argument.arg for argument in forward.args.args] == [
+        "self",
+        "input_ids",
+        "positions",
+        "intermediate_tensors",
+        "inputs_embeds",
+        "query_start_loc",
+        "ngram_context",
+        "deepstack_input_embeds",
+    ]
+    assert forward.args.vararg is None
+    assert forward.args.kwarg is None
+    assert len(forward.args.defaults) == 5
+    assert all(
+        isinstance(default, ast.Constant) and default.value is None
+        for default in forward.args.defaults
+    )
+
+
 def test_model_callback_binds_isolated_chains_and_fires_first(monkeypatch):
     calls = []
 
     class Model:
-        def __init__(self, *args, vllm_config=None, prefix="", **kwargs):
-            del args, vllm_config, prefix, kwargs
+        def __init__(self, *, vllm_config, prefix=""):
+            del vllm_config, prefix
             self.start_layer = 0
             self.end_layer = 3
             first = _ngram("first", calls)
@@ -411,8 +472,10 @@ def test_model_callback_binds_isolated_chains_and_fires_first(monkeypatch):
         ),
     )
 
+    init_signature = inspect.signature(Model.__init__)
     assert model_patch.apply_to_module(module) is True
     assert model_patch.apply_to_module(module) is False
+    assert inspect.signature(Model.__init__) == init_signature
     first_model = Model(vllm_config=object())
     second_model = Model(vllm_config=object())
 
@@ -437,9 +500,57 @@ def test_model_callback_binds_isolated_chains_and_fires_first(monkeypatch):
     assert calls[-2:] == ["prepare:first", "prepare:second"]
 
 
+def test_model_callback_validates_before_custom_op_registration(monkeypatch):
+    registrations = []
+
+    class Model:
+        def __init__(self, vllm_config, prefix=""):
+            del vllm_config, prefix
+
+        def forward(
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            query_start_loc=None,
+            ngram_context=None,
+            deepstack_input_embeds=None,
+        ):
+            del (
+                self,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                query_start_loc,
+                ngram_context,
+                deepstack_input_embeds,
+            )
+
+    module = ModuleType(model_patch.TARGET_MODULE)
+    module.Qwen4ExpModel = Model
+    module.Qwen4ExpForCausalLM = type("CausalModel", (), {})
+    module.Qwen4ExpForConditionalGeneration = type("ConditionalModel", (), {})
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setattr(
+        model_patch,
+        "_ensure_custom_op_registered",
+        lambda: registrations.append("registered"),
+    )
+
+    with pytest.raises(
+        model_patch.PatchCompatibilityError, match="incompatible signature"
+    ):
+        model_patch.apply_to_module(module)
+
+    assert registrations == []
+    assert not hasattr(module, model_patch._MODULE_MARKER)
+
+
 def test_model_callback_is_noop_when_prefetch_is_disabled(monkeypatch):
     class Model:
-        def __init__(self, *args, vllm_config=None, prefix="", **kwargs):
+        def __init__(self, *, vllm_config, prefix=""):
             pass
 
         def forward(

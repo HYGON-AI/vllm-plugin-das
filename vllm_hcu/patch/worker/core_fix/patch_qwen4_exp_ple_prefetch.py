@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import functools
-import inspect
 import os
 from types import ModuleType
 from weakref import WeakSet
@@ -14,7 +13,13 @@ import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from ._common import PatchCompatibilityError, load_exact_module, require_class
+from ._common import (
+    PatchCompatibilityError,
+    load_exact_module,
+    require_class,
+    require_exact_signature,
+    require_model_init,
+)
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.model"
 PATCH_ID = "worker.core_fix.qwen4_exp.ple_prefetch_stream"
@@ -139,18 +144,10 @@ def _bind_model_ple_chain(model) -> tuple[object, ...]:
     return tuple(local)
 
 
-def _require_signature(function, target: str, names: tuple[str, ...]) -> None:
-    if not callable(function) or tuple(inspect.signature(function).parameters) != names:
-        raise PatchCompatibilityError(
-            f"required target {target} has an incompatible signature"
-        )
-
-
 def apply_to_module(module: ModuleType) -> bool:
     model_module = load_exact_module(TARGET_MODULE, module)
     if not _requested():
         return False
-    _ensure_custom_op_registered()
 
     model_class = require_class(
         model_module, "Qwen4ExpModel", f"{TARGET_MODULE}.Qwen4ExpModel"
@@ -165,21 +162,16 @@ def apply_to_module(module: ModuleType) -> bool:
         "Qwen4ExpForConditionalGeneration",
         f"{TARGET_MODULE}.Qwen4ExpForConditionalGeneration",
     )
-    init = vars(model_class).get("__init__")
+    init = require_model_init(model_class, TARGETS[0])
     forward = vars(model_class).get("forward")
     process_weights = vars(causal_class).get("process_weights_after_loading")
     conditional_process_weights = vars(conditional_class).get(
         "process_weights_after_loading"
     )
-    _require_signature(
-        init,
-        TARGETS[0],
-        ("self", "args", "vllm_config", "prefix", "kwargs"),
-    )
-    _require_signature(
+    require_exact_signature(
         forward,
         TARGETS[1],
-        (
+        positional=(
             "self",
             "input_ids",
             "positions",
@@ -189,6 +181,13 @@ def apply_to_module(module: ModuleType) -> bool:
             "ngram_context",
             "deepstack_input_embeds",
         ),
+        defaults={
+            "intermediate_tensors": None,
+            "inputs_embeds": None,
+            "query_start_loc": None,
+            "ngram_context": None,
+            "deepstack_input_embeds": None,
+        },
     )
     if getattr(model_module, _MODULE_MARKER, False):
         if not all(
@@ -218,15 +217,13 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         raise PatchCompatibilityError("refusing a partial Qwen4Exp PLE prefetch patch")
 
+    # Register only after every audited Python target has passed validation.
+    # Custom operators cannot be unregistered if a later compatibility check fails.
+    _ensure_custom_op_registered()
+
     @functools.wraps(init)
-    def hcu_init(self, *args, vllm_config=None, prefix="", **kwargs):
-        init(
-            self,
-            *args,
-            vllm_config=vllm_config,
-            prefix=prefix,
-            **kwargs,
-        )
+    def hcu_init(self, *, vllm_config, prefix=""):
+        init(self, vllm_config=vllm_config, prefix=prefix)
         _bind_model_ple_chain(self)
 
     @functools.wraps(forward)
