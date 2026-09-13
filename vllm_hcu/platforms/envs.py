@@ -428,11 +428,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS", "False").lower() in
                     ("true", "1")),
 
-    # Offload the Qwen4Exp PLE INT8 ngram embedding table to CPU pinned memory,
-    # trading a small lookup overhead for GPU memory savings. Prefers UVA
-    # zero-copy (get_cuda_view_from_cpu_tensor: device view over host pinned
-    # memory, no D2H sync, CUDA-graph compatible) and falls back to explicit
-    # host-to-device staging when the UVA operator is unavailable.
+    # Compatibility fallback for Qwen4Exp PLE INT8 CPU offload when the target
+    # VllmConfig has no EngramConfig. An explicit EngramConfig.cpu_offload value
+    # takes precedence. Prefers UVA zero-copy and falls back to explicit H2D
+    # staging when the UVA operator is unavailable.
     "VLLM_HCU_PLE_CPU_OFFLOAD":
         lambda: (os.environ.get("VLLM_HCU_PLE_CPU_OFFLOAD", "False").lower() in
                     ("true", "1")),

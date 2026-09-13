@@ -9,7 +9,6 @@ Upstream SHA256: 8bb2e441dad2e9f3c8686bc48aa95001e5adc81b91199cc68b2e4bbe9eb6929
 
 import hashlib
 import math
-import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
@@ -67,10 +66,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
-
-
-def _environment_flag(name: str) -> bool:
-    return os.environ.get(name, "False").lower() in ("true", "1")
+from vllm_hcu.models.qwen4_exp.engram import cpu_offload_enabled
+from vllm_hcu.platforms import envs as hcu_envs
 
 
 _PREFETCH_METHODS = (
@@ -84,8 +81,8 @@ logger = init_logger(__name__)
 
 def _prefetch_method_enabled(method: object) -> bool:
     return bool(
-        _environment_flag("VLLM_HCU_PLE_PREFETCH_STREAM")
-        and _environment_flag("VLLM_HCU_PLE_CPU_OFFLOAD")
+        hcu_envs.VLLM_HCU_PLE_PREFETCH_STREAM
+        and cpu_offload_enabled()
         and getattr(method, "supports_prefetch", False)
     )
 

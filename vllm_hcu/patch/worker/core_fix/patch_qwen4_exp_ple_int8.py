@@ -7,9 +7,11 @@ an unquantized ``PLEVocabParallelEmbedding``.  This patch keeps that model
 implementation intact and replaces only the module-local PLE storage class
 and its shard loader at worker startup.
 
-When VLLM_HCU_PLE_CPU_OFFLOAD=1 is set, the INT8 PLE weights are allocated
-in CPU pinned memory instead of GPU. The lookup prefers the HCU UVA bridge and
-falls back to explicit H2D staging when that bridge is unavailable.
+When EngramConfig.cpu_offload is enabled, the INT8 PLE weights are allocated
+in CPU pinned memory instead of GPU. The legacy VLLM_HCU_PLE_CPU_OFFLOAD
+environment variable remains a fallback when EngramConfig is omitted. The
+lookup prefers the HCU UVA bridge and falls back to explicit H2D staging when
+that bridge is unavailable.
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
 )
+
+from vllm_hcu.models.qwen4_exp.engram import cpu_offload_enabled
 
 logger = init_logger(__name__)
 
@@ -81,16 +85,8 @@ def _is_compressed_tensors_int8(quant_config, prefix: str) -> bool:
 
 
 def _should_offload_ple_to_cpu() -> bool:
-    """Check if PLE CPU offload is enabled via VLLM_HCU_PLE_CPU_OFFLOAD."""
-    try:
-        from vllm_hcu.platforms import envs as henvs
-
-        return bool(henvs.VLLM_HCU_PLE_CPU_OFFLOAD)
-    except (ImportError, AttributeError):
-        return os.environ.get("VLLM_HCU_PLE_CPU_OFFLOAD", "0").lower() in (
-            "true",
-            "1",
-        )
+    """Resolve PLE CPU offload from EngramConfig or the HCU legacy flag."""
+    return cpu_offload_enabled()
 
 
 def _should_prefetch_ple() -> bool:
@@ -514,7 +510,8 @@ def _make_storage_class(module: ModuleType, quant_config):
                 method = self.quant_method
                 if not _should_offload_ple_to_cpu():
                     logger.warning_once(
-                        "VLLM_HCU_PLE_PREFETCH_STREAM=1 requires "
+                        "VLLM_HCU_PLE_PREFETCH_STREAM=1 requires PLE CPU "
+                        "offload via --engram-config.cpu_offload=true or "
                         "VLLM_HCU_PLE_CPU_OFFLOAD=1; using inline PLE lookup"
                     )
                 elif not getattr(method, "supports_prefetch", False):

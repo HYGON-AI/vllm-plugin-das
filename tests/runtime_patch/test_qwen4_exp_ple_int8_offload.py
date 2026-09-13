@@ -3,16 +3,71 @@
 """CPU-side tests for the Qwen4Exp PLE INT8 CPU-offload lookup path.
 
 These tests run on CPU only (no accelerator required): they verify the
-dequantization numerics, N-D id handling, and env-var-driven method
-selection.  The device staging in ``_pinned_int8_lookup`` is a no-op when the
-ids already live on CPU, so the same code path is exercised.
+dequantization numerics, N-D id handling, and config-driven method selection.
+The device staging in ``_pinned_int8_lookup`` is a no-op when the ids already
+live on CPU, so the same code path is exercised.
 """
 
+import ast
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
+import vllm
+
+from vllm.config import set_current_vllm_config
 
 from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_ple_int8 as patch
+
+
+TARGET_VLLM_ROOT = Path(
+    os.environ.get(
+        "VLLM_SOURCE_ROOT",
+        Path(vllm.__file__).resolve().parents[1],
+    )
+).resolve()
+
+
+def _target_class(relative_path, class_name):
+    source = TARGET_VLLM_ROOT / relative_path
+    if not source.is_file():
+        pytest.skip(f"target vLLM source is unavailable: {source}")
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+
+
+def test_target_vllm_exposes_engram_cpu_offload_cli_contract():
+    engram = _target_class("vllm/config/engram.py", "EngramConfig")
+    assert any(
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "cpu_offload"
+        for node in engram.body
+    )
+
+    engine_args = _target_class("vllm/engine/arg_utils.py", "EngineArgs")
+    assert any(
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "engram_config"
+        for node in engine_args.body
+    )
+    add_cli_args = next(
+        node
+        for node in engine_args.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "add_cli_args"
+    )
+    assert any(
+        isinstance(node, ast.Constant) and node.value == "--engram-config"
+        for node in ast.walk(add_cli_args)
+    )
 
 
 def _make_table(rows: int, dim: int):
@@ -26,6 +81,24 @@ def _reference(weight, weight_scale, ids, dtype):
     embeddings = torch.nn.functional.embedding(ids, weight)
     scales = torch.nn.functional.embedding(ids, weight_scale)
     return embeddings.to(dtype) * scales.to(dtype)
+
+
+def _int8_quant_config(prefix):
+    weight_quant = SimpleNamespace(type="int", num_bits=8, strategy="channel")
+    return SimpleNamespace(
+        get_name=lambda: "compressed-tensors",
+        target_scheme_map={prefix: {"weights": weight_quant}},
+    )
+
+
+def _storage_class(quant_config):
+    class BaseEmbedding:
+        def __init__(self, *args, **kwargs):
+            del args
+            self.quant_method = kwargs["quant_method"]
+
+    module = SimpleNamespace(PLEVocabParallelEmbedding=BaseEmbedding)
+    return patch._make_storage_class(module, quant_config)
 
 
 def test_pinned_lookup_matches_gpu_resident_dequant_1d():
@@ -81,13 +154,61 @@ def test_offload_method_is_subclass_for_loader_isinstance():
     )
 
 
-def test_offload_toggle_reads_env(monkeypatch):
+def test_offload_toggle_falls_back_to_hcu_environment(monkeypatch):
     monkeypatch.delenv("VLLM_HCU_PLE_CPU_OFFLOAD", raising=False)
     assert patch._should_offload_ple_to_cpu() is False
     monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
     assert patch._should_offload_ple_to_cpu() is True
     monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "0")
     assert patch._should_offload_ple_to_cpu() is False
+
+
+@pytest.mark.parametrize(
+    ("configured", "legacy"),
+    ((False, "1"), (True, "0")),
+)
+def test_explicit_engram_config_takes_precedence(
+    monkeypatch, configured, legacy
+):
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", legacy)
+    vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=configured)
+    )
+
+    with set_current_vllm_config(vllm_config):
+        assert patch._should_offload_ple_to_cpu() is configured
+
+
+def test_missing_engram_config_uses_hcu_environment(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
+
+    with set_current_vllm_config(SimpleNamespace(engram_config=None)):
+        assert patch._should_offload_ple_to_cpu() is True
+
+
+@pytest.mark.parametrize(
+    ("configured", "legacy", "expected_method"),
+    (
+        (False, "1", patch.HcuQwen4ExpPLEInt8EmbeddingMethod),
+        (True, "0", patch.HcuQwen4ExpPLEInt8OffloadEmbeddingMethod),
+    ),
+)
+def test_explicit_engram_config_controls_storage_method(
+    monkeypatch, configured, legacy, expected_method
+):
+    prefix = "model.layers.0.ple.ple_embedding.ngram_embedding"
+    storage_class = _storage_class(_int8_quant_config(prefix))
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", legacy)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: False)
+    vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=configured),
+        quant_config=None,
+    )
+
+    with set_current_vllm_config(vllm_config):
+        embedding = storage_class(prefix=prefix, params_dtype=torch.bfloat16)
+
+    assert isinstance(embedding.quant_method, expected_method)
 
 
 def test_create_weights_allocates_on_cpu():
@@ -130,8 +251,6 @@ def test_create_weights_allocates_on_cpu():
 
 
 # --- UVA zero-copy variant ---------------------------------------------------
-
-import pytest
 
 _UVA_AVAILABLE = patch._is_uva_available()
 _needs_uva = pytest.mark.skipif(

@@ -13,6 +13,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 import vllm
+from vllm.config import set_current_vllm_config
 
 from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_ple_int8 as int8_patch
 from vllm_hcu.patch.worker.core_fix import (
@@ -72,6 +73,23 @@ def test_prefetch_gate_is_int8_uva_only(monkeypatch, ple_layer):
     monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
     monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "0")
     assert ple_layer._prefetch_method_enabled(_capable_method()) is False
+
+
+def test_prefetch_gate_honors_explicit_engram_offload(monkeypatch, ple_layer):
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
+    disabled = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=False)
+    )
+    with set_current_vllm_config(disabled):
+        assert ple_layer._prefetch_method_enabled(_capable_method()) is False
+
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "0")
+    enabled = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=True)
+    )
+    with set_current_vllm_config(enabled):
+        assert ple_layer._prefetch_method_enabled(_capable_method()) is True
 
 
 def test_incomplete_claimed_capability_fails_fast(ple_layer):
