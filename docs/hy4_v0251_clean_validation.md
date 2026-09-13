@@ -1,9 +1,10 @@
-# HYV4 v0.25.1 clean integration validation
+# HYV4 v0.25.1 clean integration validation — through Task 15
 
 This contains the Task 10 execution protocol, Task 11 observed results, and
 the focused Task 11A static-loader, Task 11B PCP, Task 11C static-memory,
-and Task 13 exact PP2/PCP4 native MTP3 fixes/reruns.
-CPU tests establish contracts; they do not establish checkpoint loading,
+Task 13 exact PP2/PCP4 native MTP3 fixes/reruns, and Tasks 14/15 reviewed
+packed-extent/native-MTP source-format loader fixes.
+CPU tests establish loader contracts; they do not establish full-checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
 Each result state is updated only after retaining its evidence. Task 11B fixes
 the PP2/PCP4 correctness failure and passes its original exact gate. DP8 memory
@@ -12,6 +13,12 @@ fixes the static loader-owner rejection; Task 11C removes the false KV budget
 and changes the exact static gate to an early, safe capacity failure.
 The separate plain-PP diagnostic stall below
 remains unresolved.
+
+Both former Important findings addressed by Tasks 14/15 are resolved; their
+independent reviews are APPROVED with no unresolved Critical/Important findings.
+Parser review findings remain non-blocking Minors. Historical failures below
+retain their original evidence and are not substituted for the final status.
+These CPU/loader fixes do not close any unrun hardware gate or capacity limit.
 
 Task 11 provenance capture began at 2026-09-12T21:11:05Z (the host renders
 local log timestamps as 2026-09-13 UTC+08:00), from candidate
@@ -45,6 +52,7 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 | HumanEval/0–31 MTP3 | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors/flips; acceptance 93.03%; clean teardown |
 | Custom packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
 | Native packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
+| Native BF16/FP16 MTP checkpoint/device | not run | Compatible native retained checkpoint and device inference evidence |
 | Two-node Mooncake P/D | not run | Two-node transfer and generation evidence |
 
 Custom/native W4A8 have no compatible checkpoint or hardware validation.
@@ -60,9 +68,24 @@ configuration; all neighboring HYV4 speculative PCP configurations remain
 fail-closed. Generic offline record tests do not
 authorize HYV4 record-mode serving. Do not replace failures by changing the
 model, backend, topology, quantization, or graph mode.
-Separate merge blockers remain: packed W4A8 expert extent validation and
-native BF16/FP16 MTP source-format adaptation. This checkpoint has
-`mtp_quant_algo=None`; Task 13 does not fix or validate those paths.
+Tasks 14/15 resolve packed W4A8 expert extent validation and native BF16/FP16
+MTP source-format adaptation at the CPU/loader-contract level, as recorded
+separately below. This checkpoint has `mtp_quant_algo=None`; Task 13's device
+run does not validate either format path. NIXL/UCX functionality is excluded,
+not added or newly accepted; the pinned generic implementation remains intact.
+
+## Reviewed CPU/loader-contract results
+
+| Contract | Final state | Evidence boundary |
+| --- | --- | --- |
+| Complete custom/native packed expert extents — Task 14 | PASS; independent APPROVED | 366 focused, 1065 related regression; selector 70; registered 18-module contract 926; no W4A8 hardware claim |
+| Native BF16/FP16 MTP source-format adaptation — Task 15 | PASS; independent APPROVED | 52 focused, 219 required regression; portable contract 2223 with 173 standard HCU deselections; selector 70; no native checkpoint/device run |
+
+These are separate from the hardware matrix. Their two former Important
+findings are closed, not remaining merge blockers. Non-blocking parser Minors,
+DP8 capacity failures, the plain-PP stall/shutdown concerns, W4A8/Mooncake
+hardware gaps and other deferred observations remain; DCP and NIXL/UCX remain
+excluded. Exact chronology, commits and evidence follow in Tasks 14/15 below.
 
 ## Pinned environment
 
@@ -525,6 +548,8 @@ These are carried forward for final review; Task 10 does not claim fixes:
 - Task 7: record-file publication lacks parent-directory fsync.
 - Task 8: explicit Mooncake layer-count boundaries 78/41/77 need coverage review.
 - Task 9: linear weight-loader bound-owner introspection.
+- Parser review findings remain non-blocking Minors, not merge blockers;
+  Tasks 14/15 do not claim parser fixes.
 - Inherited Torch/JIT deprecation warnings and installed plugin version metadata
   concern described above.
 
@@ -1095,9 +1120,10 @@ no extra process signals: no owned/logged PIDs or port 8000 listener and all
 eight cards 0%/2 MiB. Both initial and final teardown records are preserved;
 the shutdown warning is not represented as a warning-free exit.
 
-NIXL/UCX and DCP are not tested or newly accepted. W4A8 extent validation,
-native BF16/FP16 MTP source-format adaptation and parser review Minors remain
-separate merge blockers/triage items. Prior DP8 capacity failures, plain-PP
+NIXL/UCX and DCP are not tested or newly accepted. At Task 13's close, W4A8
+extent validation and native BF16/FP16 MTP source-format adaptation were still
+open; Tasks 14/15 below subsequently resolve those CPU/loader findings.
+Parser findings remain non-blocking Minors. Prior DP8 capacity failures, plain-PP
 stall, W4A8/Mooncake hardware gaps and other deferred observations remain.
 
 Final Task 13 verification: all 36 branch-changed Python test modules
@@ -1109,3 +1135,71 @@ library hashes and checkpoint config/index hashes plus full file size/mtime
 manifest remain unchanged. Post-test checks reconfirm all five Task 13
 service lifecycles have no remaining owned/logged PID or listener and all
 eight cards 0%/2 MiB.
+
+## Task 14 packed expert extent validation — PASS, reviewed
+
+Commits `5b49a46` (`fix(hy4): validate packed expert extents`) and `4605330`
+(`test(hy4): register packed extent contract coverage`); independent review:
+APPROVED, no unresolved Critical/Important findings for this fix. Artifacts:
+`/models/validation-logs/hy4-packed-extent-20260913-task14`.
+
+The original real target loader accepted gate/up shape `(1, 2)` instead of
+`(2, 2)` and down shape `(3, 1)` instead of `(4, 1)`. Its strict ledger returned
+complete while part of the destination retained sentinel `85`. Initial RED
+was 286 failed/64 passed; the six custom/native gate/up/down reproductions all
+showed `strict_complete=True` with sentinel remainder. The general loader's
+padding-tolerant copy was not itself an explicit-format extent validator.
+
+The HYV4 adapter now validates complete logical serialized extents before
+nibble conversion/delegation, using declared unpadded dimensions and TP size,
+not merely the rank-local padded parameter shape. Existing SlimQuant, AITER,
+RoutedExperts, TP slicing and post-load ownership are unchanged. This is
+piece-level pre-mutation validation, **not whole-stream transactional rollback**:
+earlier valid pieces may already have been loaded when a later piece fails.
+
+Final CPU evidence: 366 focused tests passed; the unfiltered related regression
+passed 1065. Independent review caught the initially missing literal CI
+registration (selector RED: 1 failed/69 passed); the follow-up commit enables
+the whole module with no filter. Selector then passed 70, and all 18 enabled
+`hy4-contract` modules passed 926 through the pinned `--suite full` runner.
+Doctor had 7 PASS/49 callbacks; compileall and diff checks passed. Commands and
+exact results are retained in the Task 14 report and artifact logs, including
+`green-final-matrix.log`, `regression.log`, `ci-review-green.log` and
+`ci-review-registered-contract.log`.
+
+The supplied checkpoint is Channel-FP8. Custom/native packed W4A8 hardware
+remains **not run**; CPU loader/byte checks are not kernel or serving evidence.
+
+## Task 15 native BF16/FP16 MTP source format — PASS, reviewed
+
+Commit `4bcd18d` (`fix(hy4): preserve native MTP source format`); independent
+review: APPROVED, no unresolved Critical/Important findings for this fix.
+Artifacts: `/models/validation-logs/hy4-native-mtp-source-20260913-task15`.
+
+The old implementation correctly selected runtime `quant_config=None` for
+BF16/FP16 but also used that value to choose checkpoint adaptation. Native
+retained double suffixes therefore reached the real strict loader unchanged,
+for example `model.layers.2.enorm.weight.weight`. Initial focused RED had 42
+failures. The fix retains the original source-format config separately and
+uses it only for stream adaptation. BF16/FP16 runtime config remains exactly
+`None`; the source config is not used for Linear/MoE/head quantization,
+post-load conversion or the runtime cache-scale mapper.
+
+Final focused tests passed 52, including real constructor/loader and strict
+ledger evidence for untied/tied heads, canonical embedding storage identity,
+optional head aliases, split/fused/shared gate-up and repeated-load cleanup.
+The required unfiltered regression passed 219. The explicit pinned portable
+contract passed 2223 with 173 standard HCU-marker deselections; selector passed
+70. The command was `python tools/run_patch_tests.py --suite contract
+--vllm-source /models/.installs/vllm-0.25.1-das185-g7b108a-hy4-clean -- --tb=short`,
+launched with `env -u VLLM_PLUGINS` and the pinned environment above.
+Doctor had 7 PASS/49 callbacks; compileall and diff checks passed. Exact
+commands/results are retained in the Task 15 report and `green-focused-final.log`,
+`required-regression-green.log`, `contract.log` and `ci-selector-final.log`.
+
+No native BF16/FP16 checkpoint/device run was performed. These tests load
+synthetic retained floating-point MTP weights; they do not promise conversion
+of serialized INT4 MTP weights to unquantized execution. Hardware `not run`
+rows and all capacity, plain-PP stall/shutdown, Mooncake, parser Minor and
+packaging/warning limitations above remain unchanged. DCP and NIXL/UCX remain
+excluded and were not added or accepted by these fixes.
