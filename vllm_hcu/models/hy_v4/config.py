@@ -2,9 +2,36 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
+import importlib
+
 from huggingface_hub.dataclasses import strict
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
+
+
+_OFFICIAL_TRANSFORMERS_CONFIG = (
+    "transformers.models.hy_v4.configuration_hy_v4",
+    "HYV4Config",
+)
+
+
+def _is_official_transformers_config(config_class: object) -> bool:
+    if not (
+        isinstance(config_class, type)
+        and issubclass(config_class, PreTrainedConfig)
+        and (config_class.__module__, config_class.__name__)
+        == _OFFICIAL_TRANSFORMERS_CONFIG
+        and getattr(config_class, "model_type", None) == "hy_v4"
+    ):
+        return False
+    try:
+        official_module = importlib.import_module(_OFFICIAL_TRANSFORMERS_CONFIG[0])
+    except ImportError:
+        return False
+    return (
+        getattr(official_module, _OFFICIAL_TRANSFORMERS_CONFIG[1], None)
+        is config_class
+    )
 
 
 @strict
@@ -129,7 +156,11 @@ def register_hy_v4_config() -> None:
     existing_transformers = (
         CONFIG_MAPPING[model_type] if model_type in CONFIG_MAPPING else None
     )
-    if existing_transformers is not None and existing_transformers is not HYV4Config:
+    if (
+        existing_transformers is not None
+        and existing_transformers is not HYV4Config
+        and not _is_official_transformers_config(existing_transformers)
+    ):
         raise RuntimeError(
             "Transformers config "
             f"{model_type!r} has a different owner: {existing_transformers!r}"

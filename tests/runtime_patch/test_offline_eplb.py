@@ -268,10 +268,15 @@ def test_engine_args_strips_eplb_fields_to_sidecar():
 
 def test_real_engine_args_cli_preserves_official_validation_and_sidecar(monkeypatch):
     import vllm.engine.arg_utils as module
+    import vllm.platforms
+    from vllm.platforms.cpu import CpuPlatform
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm_hcu.patch.config import get_hcu_config
     from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
+    cpu_platform = CpuPlatform()
+    monkeypatch.setattr(vllm.platforms, "_current_platform", cpu_platform)
+    monkeypatch.setattr(module, "current_platform", cpu_platform)
     for owner in (module.EngineArgs, module.AsyncEngineArgs):
         for name in ("__init__", "from_cli_args", "add_cli_args", "create_engine_config",
                      "_vllm_hcu_original_init", "_vllm_hcu_original_from_cli_args",

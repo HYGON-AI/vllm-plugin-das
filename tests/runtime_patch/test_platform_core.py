@@ -181,6 +181,7 @@ def test_apply_to_module_runs_inside_coordinator_without_reentrant_registry(
 def test_nixl_utils_uses_nixl_for_hcu(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.delitem(sys.modules, "nixl", raising=False)
     probes: list[str] = []
 
     def find_spec(package_name):

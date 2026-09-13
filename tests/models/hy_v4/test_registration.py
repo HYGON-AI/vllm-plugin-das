@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from transformers import AutoConfig
@@ -54,6 +54,70 @@ def test_register_hy_v4_config_rejects_different_transformers_owner(
     registry: dict[str, object] = {}
     monkeypatch.setattr(vllm_config, "_CONFIG_REGISTRY", registry)
     monkeypatch.setitem(CONFIG_MAPPING._extra_content, "hy_v4", ForeignConfig)
+
+    with pytest.raises(RuntimeError, match="Transformers.*different owner"):
+        register_hy_v4_config()
+
+    assert registry == {}
+
+
+def test_register_hy_v4_config_replaces_official_transformers_owner(
+    monkeypatch,
+) -> None:
+    from vllm.transformers_utils import config as vllm_config
+
+    official_config = type(
+        "HYV4Config",
+        (PreTrainedConfig,),
+        {
+            "__module__": "transformers.models.hy_v4.configuration_hy_v4",
+            "model_type": "hy_v4",
+        },
+    )
+    registry: dict[str, object] = {}
+    monkeypatch.setattr(vllm_config, "_CONFIG_REGISTRY", registry)
+    monkeypatch.setattr(
+        CONFIG_MAPPING,
+        "_extra_content",
+        {"hy_v4": official_config},
+    )
+    official_module = ModuleType(official_config.__module__)
+    official_module.HYV4Config = official_config
+    monkeypatch.setitem(sys.modules, official_module.__name__, official_module)
+
+    register_hy_v4_config()
+
+    assert registry == {"hy_v4": HYV4Config}
+    assert CONFIG_MAPPING["hy_v4"] is HYV4Config
+
+
+def test_register_hy_v4_config_rejects_spoofed_official_owner(
+    monkeypatch,
+) -> None:
+    from vllm.transformers_utils import config as vllm_config
+
+    def config_class() -> type[PreTrainedConfig]:
+        return type(
+            "HYV4Config",
+            (PreTrainedConfig,),
+            {
+                "__module__": "transformers.models.hy_v4.configuration_hy_v4",
+                "model_type": "hy_v4",
+            },
+        )
+
+    exported_config = config_class()
+    spoofed_config = config_class()
+    official_module = ModuleType(exported_config.__module__)
+    official_module.HYV4Config = exported_config
+    registry: dict[str, object] = {}
+    monkeypatch.setattr(vllm_config, "_CONFIG_REGISTRY", registry)
+    monkeypatch.setattr(
+        CONFIG_MAPPING,
+        "_extra_content",
+        {"hy_v4": spoofed_config},
+    )
+    monkeypatch.setitem(sys.modules, official_module.__name__, official_module)
 
     with pytest.raises(RuntimeError, match="Transformers.*different owner"):
         register_hy_v4_config()
