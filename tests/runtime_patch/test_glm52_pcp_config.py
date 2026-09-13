@@ -110,6 +110,108 @@ def test_hyv4_pp2_pcp4_exact_target_only_topology_is_allowed(
     ) is True
 
 
+def _native_hyv4_mtp_config(make_config, **overrides):
+    config = make_config(speculative=True, num_speculative_tokens=3, **overrides)
+    config.model_config.hf_config = SimpleNamespace(num_nextn_predict_layers=1)
+    config.model_config.model = "native-hyv4"
+    config.speculative_config.draft_model_config = SimpleNamespace(
+        architectures=["HYV4MTPModel"], model="native-hyv4",
+        hf_config=SimpleNamespace(num_nextn_predict_layers=1, n_predict=1),
+    )
+    config.parallel_config.all2all_backend = "deepep_high_throughput"
+    config.parallel_config.enable_eplb = False
+    config.kernel_config = SimpleNamespace(moe_backend="deep_gemm")
+    config.cache_config.cache_dtype = "fp8_e4m3"
+    return config
+
+
+def test_hyv4_exact_pp2_pcp4_native_mtp3_is_allowed(make_hyv4_pp2_pcp4_config):
+    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+    assert config.model_config.architectures == ["HYV4ForCausalLM"]
+    assert config.speculative_config.draft_model_config.architectures == ["HYV4MTPModel"]
+
+
+def test_hyv4_mtp3_revalidation_accepts_current_sparse_cache_canonicalization(
+    make_hyv4_pp2_pcp4_config,
+):
+    from vllm_hcu.models.hy_v4.attention import _normalize_hy_v4_kv_cache_dtype
+    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+    # Native draft attention consumes the same CacheConfig and canonicalizes
+    # its public E4M3 alias before initialize_kv_cache builds the PCP manager.
+    config.cache_config.cache_dtype = _normalize_hy_v4_kv_cache_dtype(
+        config.cache_config.cache_dtype, use_sparse=True)
+    assert config.cache_config.cache_dtype == "fp8_ds_mla"
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+@pytest.mark.parametrize("override", [
+    {"pp": 1}, {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 8},
+    {"dp": 2}, {"dcp": 2}, {"enable_expert_parallel": False},
+    {"enforce_eager": False}, {"use_v2": False}, {"lora": True},
+    {"multimodal": True}, {"kv_offload": True}, {"kv_transfer": True},
+    {"enable_multi_layers_mtp": True}, {"speculative_method": "eagle"},
+    {"architecture": "HYV4MTPModel"},
+])
+def test_hyv4_mtp3_neighbors_stay_closed(make_hyv4_pp2_pcp4_config, override):
+    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config, **override)
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("path,value", [
+    ("speculative_config.num_speculative_tokens", 1),
+    ("speculative_config.num_speculative_tokens", 2),
+    ("speculative_config.num_speculative_tokens", 4),
+    ("speculative_config.draft_model_config.architectures", ["UnknownDraft"]),
+    ("speculative_config.draft_model_config.model", "separate-checkpoint"),
+    ("speculative_config.draft_model_config.hf_config.n_predict", 2),
+    ("model_config.hf_config.num_nextn_predict_layers", 2),
+    ("parallel_config.enable_eplb", True),
+    ("parallel_config.all2all_backend", "deepep_low_latency"),
+    ("kernel_config.moe_backend", "aiter"),
+    ("cache_config.cache_dtype", "auto"),
+])
+def test_hyv4_mtp3_exact_native_contract_is_required(
+    make_hyv4_pp2_pcp4_config, path, value,
+):
+    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+    owner = config
+    parts = path.split(".")
+    for part in parts[:-1]:
+        owner = getattr(owner, part)
+    setattr(owner, parts[-1], value)
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("hcu", [
+    {"expert_map_path": "/static.json", "eplb_disable_rearrange": True},
+    {"expert_map_path": "/load.json"},
+    {"expert_map_record_path": "/record.json"},
+    {"eplb_disable_rearrange": True},
+])
+def test_hyv4_mtp3_eplb_sidecars_stay_closed(make_hyv4_pp2_pcp4_config, hcu):
+    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+    config.additional_config["hcu"].update(hcu)
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("partition", [None, "", "39,39", "41, 37", "37,41"])
+def test_hyv4_mtp3_requires_exact_partition(
+    make_hyv4_pp2_pcp4_config, monkeypatch, partition,
+):
+    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION")
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
 @pytest.mark.parametrize("override", [
     {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 3}, {"pcp": 8},
     {"dp": 2}, {"dcp": 2}, {"enable_expert_parallel": False},

@@ -453,6 +453,120 @@ def test_hyv4_nonfinal_pp_restore_feeds_current_upstream_receive(
     ) + ["post_forward"]
 
 
+@pytest.mark.parametrize("is_last", [False, True])
+@pytest.mark.parametrize("proposal_fails", [False, True])
+def test_hyv4_pp2_mtp3_current_sample_body_restores_and_synchronizes(
+    pcp_runner_module, monkeypatch, is_last, proposal_fails,
+):
+    """Run the installed sample body, not a substitute that simply returns."""
+    import contextlib
+    import vllm
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    adapter, _ = pcp_runner_module
+    source = Path(vllm.__file__).parent / "v1/worker/gpu/model_runner.py"
+    owner = next(n for n in ast.parse(source.read_text()).body
+                 if isinstance(n, ast.ClassDef) and n.name == "GPUModelRunner")
+    sample = next(n for n in owner.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "sample_tokens")
+    sample.decorator_list = []  # CPU probe excludes accelerator/EPLB decorators.
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(sample)
+    ns = {"ModelRunnerOutput": ModelRunnerOutput,
+          "AsyncOutput": lambda **kw: SimpleNamespace(**kw)}
+    exec(compile(module, str(source), "exec"), ns)
+    monkeypatch.setattr(adapter.GPUModelRunner, "sample_tokens", ns["sample_tokens"])
+
+    events = []
+    batch = SimpleNamespace(req_ids=["b", "a"], num_reqs=2,
+                            idx_mapping=torch.tensor([3, 1]),
+                            query_start_loc=torch.tensor([0, 1, 2]))
+    hidden = torch.ones(2, 4)
+    drafts = torch.tensor([[101, 102, 103], [201, 202, 203]])
+    runner = adapter.HcuGPUModelRunnerV2(_config(4), "cpu")
+    runner.is_last_pp_rank = is_last
+    runner.num_speculative_steps = 3
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.zeros(5, 3, dtype=torch.int64),
+        all_token_ids=SimpleNamespace(gpu=None),
+        num_computed_tokens=SimpleNamespace(gpu=None),
+        prompt_len=SimpleNamespace(np=None), last_sampled_tokens=None,
+        next_prefill_tokens=None)
+    runner.pcp_manager = SimpleNamespace(
+        restore_for_sampling=lambda h: (events.append("restore_hidden") or hidden, batch),
+        restore_global_batch=lambda: events.append("restore_batch") or batch,
+        prepare_global_attn=lambda: events.append("global_slots") or ("blocks", "slots"))
+    def prepare(*args):
+        assert pcp.effective_pcp_world_size(4) == 1
+        assert args[0] is batch and args[2:4] == ("blocks", "slots")
+        events.append("global_metadata")
+        return "global_metadata"
+    runner.model_state = SimpleNamespace(prepare_attn=prepare)
+    runner.kv_cache_config = "cache"
+    runner.attn_groups = "groups"
+    monkeypatch.setattr(adapter, "build_slot_mappings_by_layer",
+                        lambda slots, cache: {"draft": slots})
+    class Stream:
+        def wait_stream(self, other): pass
+        def synchronize(self): events.append("draft_complete")
+    def sample_broadcast(ids, *args):
+        assert ids.shape == (2, 4)
+        assert ids[:, 0].tolist() == [11, 21]
+        events.append("target_width4")
+    runner.pp_handler = SimpleNamespace(
+        is_last_rank=is_last, last_rank=4, max_sample_len=4,
+        broadcast=sample_broadcast,
+        receive=lambda b: events.append("target_width4") or True,
+        broadcast_stream=Stream(), main_stream=object(), broadcast_group="pp")
+    adapter.install_fixed_width_pp_sample_broadcast(runner)
+    monkeypatch.setattr(adapter.torch.cuda, "stream", lambda _: contextlib.nullcontext())
+    def broadcast(ids, *, src, group):
+        assert src == 4 and group == "pp" and ids.shape == (2, 3)
+        events.append("draft_width3")
+        if is_last:
+            torch.testing.assert_close(ids, drafts)
+        else:
+            ids.copy_(drafts)
+    monkeypatch.setattr(adapter.torch.distributed, "broadcast", broadcast)
+    def propose(*args, **kwargs):
+        assert args[0] is batch and args[1] == "global_metadata"
+        assert args[2] == {"draft": "slots"} and args[3] is hidden
+        assert pcp.effective_pcp_world_size(4) == 1
+        events.append("propose")
+        if proposal_fails:
+            raise RuntimeError("proposal failure")
+        return drafts
+    runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=propose) if is_last else None
+    runner.sample = lambda *args: (SimpleNamespace(sampled_token_ids=torch.tensor([[11], [21]])),
+                                  torch.ones(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32))
+    runner.prompt_logprobs_worker = SimpleNamespace(compute_prompt_logprobs=lambda *args: {})
+    runner.model = SimpleNamespace(compute_logits=None)
+    runner.main_stream = runner.output_copy_stream = object()
+    runner.sampler = SimpleNamespace(sampling_states=SimpleNamespace(
+        temperature=SimpleNamespace(gpu=None), seeds=SimpleNamespace(gpu=None)))
+    runner.postprocess_sampled = lambda *args: events.append("postprocess")
+    runner.postprocess_num_computed_tokens = lambda b: events.append("computed")
+    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=lambda *args: None)
+    runner.kv_connector = SimpleNamespace(post_forward=lambda _: None)
+    runner.execute_model_state = _MTPExecuteModelState(
+        object(), "local_metadata", "local_slots",
+        hidden if is_last else None, None, set())
+    if is_last and proposal_fails:
+        with pytest.raises(RuntimeError, match="proposal failure"):
+            runner.sample_tokens(None)
+        assert "draft_width3" not in events
+    else:
+        runner.sample_tokens(None)
+        torch.testing.assert_close(runner.req_states.draft_tokens[batch.idx_mapping], drafts)
+        assert events.index("target_width4") < events.index("draft_width3")
+        assert events[-1] == "draft_complete"
+    assert runner.execute_model_state is None
+    assert pcp.effective_pcp_world_size(4) == 4
+    assert ("propose" in events) is is_last
+    assert events[0] == ("restore_hidden" if is_last else "restore_batch")
+
+
 def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,

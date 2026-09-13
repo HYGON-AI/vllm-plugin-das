@@ -44,6 +44,66 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         ) from exc
 
 
+def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
+    """Admit only the audited PP2/PCP4 checkpoint-native replicated MTP3."""
+    parallel = vllm_config.parallel_config
+    speculative = vllm_config.speculative_config
+    if (
+        parallel.pipeline_parallel_size != 2
+        or speculative.method != "mtp"
+        or speculative.num_speculative_tokens != 3
+    ):
+        raise ValueError(
+            "HYV4 PCP speculative decoding requires exact PP2+PCP4 native MTP3."
+        )
+    # The caller already checks topology, eager, MRV2 and the 41,37 partition.
+    # Draft construction must retain the target checkpoint and its single
+    # native layer; a registered draft architecture alone is insufficient.
+    target = vllm_config.model_config
+    draft = _require_hcu_pcp_attribute(
+        speculative, "draft_model_config", "SpeculativeConfig"
+    )
+    if draft is None:
+        raise ValueError("HYV4 PCP MTP3 requires a native draft model config.")
+    target_hf = _require_hcu_pcp_attribute(target, "hf_config", "ModelConfig")
+    draft_hf = _require_hcu_pcp_attribute(draft, "hf_config", "ModelConfig")
+    if (
+        _require_hcu_pcp_attribute(draft, "architectures", "ModelConfig")
+        != ["HYV4MTPModel"]
+        or _require_hcu_pcp_attribute(draft, "model", "ModelConfig")
+        != _require_hcu_pcp_attribute(target, "model", "ModelConfig")
+        or getattr(target_hf, "num_nextn_predict_layers", None) != 1
+        or getattr(draft_hf, "num_nextn_predict_layers", None) != 1
+        or getattr(draft_hf, "n_predict", None) != 1
+    ):
+        raise ValueError(
+            "HYV4 PCP MTP3 requires exactly one checkpoint-native draft layer."
+        )
+    kernel = _require_hcu_pcp_attribute(vllm_config, "kernel_config", "VllmConfig")
+    if (
+        _require_hcu_pcp_attribute(parallel, "all2all_backend", "ParallelConfig")
+        != "deepep_high_throughput"
+        or _require_hcu_pcp_attribute(kernel, "moe_backend", "KernelConfig")
+        != "deep_gemm"
+        # Sparse MLA canonicalizes the E4M3 alias during native draft loading.
+        # PCP-manager initialization revalidates that same resolved config.
+        or _require_hcu_pcp_attribute(
+            vllm_config.cache_config, "cache_dtype", "CacheConfig"
+        ) not in ("fp8_e4m3", "fp8_ds_mla")
+    ):
+        raise ValueError(
+            "HYV4 PCP MTP3 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
+        )
+    feature_cfg = get_hcu_config(vllm_config)
+    if (
+        _require_hcu_pcp_attribute(parallel, "enable_eplb", "ParallelConfig")
+        or feature_cfg.expert_map_path
+        or feature_cfg.expert_map_record_path
+        or feature_cfg.eplb_disable_rearrange
+    ):
+        raise ValueError("HYV4 PCP MTP3 does not support EPLB.")
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -166,7 +226,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     if speculative_config is not None:
         if is_hyv4:
-            raise ValueError("HYV4 PCP does not support speculative decoding or MTP.")
+            _require_hyv4_pcp_mtp_contract(vllm_config)
         if not use_mla:
             raise ValueError(
                 "FlashAttention PCP does not support speculative decoding or MTP."
@@ -181,7 +241,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             "num_speculative_tokens",
             "SpeculativeConfig",
         )
-        if num_speculative_tokens not in (1, 2):
+        if not is_hyv4 and num_speculative_tokens not in (1, 2):
             raise ValueError(
                 "GLM-5.2 PCP+MTP requires one or two speculative tokens."
             )

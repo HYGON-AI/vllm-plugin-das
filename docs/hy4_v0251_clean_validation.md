@@ -1,7 +1,8 @@
 # HYV4 v0.25.1 clean integration validation
 
 This contains the Task 10 execution protocol, Task 11 observed results, and
-the focused Task 11A static-loader, Task 11B PCP, and Task 11C static-memory fixes/reruns.
+the focused Task 11A static-loader, Task 11B PCP, Task 11C static-memory,
+and Task 13 exact PP2/PCP4 native MTP3 fixes/reruns.
 CPU tests establish contracts; they do not establish checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
 Each result state is updated only after retaining its evidence. Task 11B fixes
@@ -36,6 +37,7 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 | TP8 MTP3, AITER, default graphs | PASS | Target/draft capture; HTTP 200; 114 drafted, 81 accepted tokens; clean teardown |
 | TP8 MTP3, FP8 E4M3 KV, repeated prefix | PASS | 3×3145-token prompts; hits 0/3008/6016; coherent output; HTTP 200; clean teardown |
 | PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | PASS — Task 11B | Original short + three 3145-token requests correct, HTTP 200/stop; exact 41,37/FP8 KV topology; health 200; clean teardown; DCP disabled/default |
+| Exact PP2/TP1/PCP4/DP1/EP4 + native MTP3 | PASS — Task 13 | No-observer exact 41,37/eager/HT/DeepGEMM/FP8 command; short + three identical 3145-token requests and concurrent short/long all match target-only; 18 drafted/8 accepted, positions 3/3/2; health 200 and clean teardown; shutdown warning retained below |
 | DP8/TP1/EP8, DeepEP HT, DeepGEMM | FAIL — capacity | All eight ranks loaded; KV budget −0.7 GiB; no readiness; exit 1; clean teardown |
 | DP8/EP8 static offline EPLB load, exact 0.95/4096 gate | SAFE CAPACITY FAIL — Task 11C | All eight ranks loaded 125.69 GiB; positive 3.19 GiB non-torch and 8.62 GiB peak; KV −0.71 GiB; rejected before cache allocation; zero NIXL registration/late OOM; exit 1; clean teardown |
 | DP8/EP8 static offline EPLB, constrained batch tokens 2048 | PASS — constrained Task 11C | Model length 4096/0.95/max sequences 16 unchanged; all-rank map/fingerprint/Gloo owner and zero rearrangement; observed and no-observer 36-request runs pass; final teardown passes after one owned-worker cleanup described below |
@@ -48,12 +50,19 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 Custom/native W4A8 have no compatible checkpoint or hardware validation.
 DCP is not tested, per the updated Task 11 scope. A recorded
 `decode_context_parallel_size=1` is only the disabled/default setting;
-there are no DCP-specific tests, metrics, or expanded combinations.
+there are no DCP hardware runs, metrics, or expanded runtime combinations.
+Configuration rejection tests do not establish DCP runtime support.
 The supplied checkpoint is Channel-FP8, not a W4A8 substitute. Mooncake has
-no two-node runtime validation. Static SlimQuant EPLB, HYV4 dynamic/record
-EPLB, and MTP+PCP are unsupported. Generic offline record tests do not
+no two-node runtime validation. Static SlimQuant EPLB and HYV4 dynamic/record
+EPLB are unsupported. MTP+PCP is supported only for the exact Task 13
+PP2/TP1/PCP4/DP1/EP4/41,37/eager/DeepEP HT/DeepGEMM/FP8/native-MTP3
+configuration; all neighboring HYV4 speculative PCP configurations remain
+fail-closed. Generic offline record tests do not
 authorize HYV4 record-mode serving. Do not replace failures by changing the
 model, backend, topology, quantization, or graph mode.
+Separate merge blockers remain: packed W4A8 expert extent validation and
+native BF16/FP16 MTP source-format adaptation. This checkpoint has
+`mtp_quant_algo=None`; Task 13 does not fix or validate those paths.
 
 ## Pinned environment
 
@@ -225,6 +234,24 @@ env -u VLLM_PLUGINS VLLM_PP_LAYER_PARTITION=41,37 \
   --decode-context-parallel-size 1 --enable-expert-parallel \
   --all2all-backend deepep_high_throughput --moe-backend deep_gemm \
   --kv-cache-dtype fp8_e4m3 --enforce-eager
+```
+
+After complete PID/port/device teardown, the exact Task 13 MTP3 command
+adds only the speculative configuration to the preceding PP2/PCP4 launch.
+Run in the same foreground-owned PTY lifecycle; do not leave both services
+running. DCP remains disabled/default and NIXL/UCX is excluded.
+
+```bash
+export SERVED_MODEL=hy4-v0251-pp2-pcp4
+env -u VLLM_PLUGINS VLLM_PP_LAYER_PARTITION=41,37 \
+  python3 -m vllm.entrypoints.cli.main serve "$MODEL" \
+  "${common[@]}" --served-model-name "$SERVED_MODEL" \
+  --pipeline-parallel-size 2 --tensor-parallel-size 1 \
+  --prefill-context-parallel-size 4 --data-parallel-size 1 \
+  --decode-context-parallel-size 1 --enable-expert-parallel \
+  --all2all-backend deepep_high_throughput --moe-backend deep_gemm \
+  --kv-cache-dtype fp8_e4m3 --enforce-eager \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
 Representative DP8/TP1/EP8 (run separately from static EPLB):
@@ -988,3 +1015,97 @@ config/index hashes and checkpoint size/mtime records remain unchanged.
 The two exact DP8 capacity gates, separate plain-PP stall, cleanup concern,
 W4A8/Mooncake gaps, unsupported modes and deferred observations remain open.
 DCP and NIXL/UCX functionality are not tested/accepted by this work.
+
+## Task 13 exact PP2/PCP4/EP4 native MTP3
+
+Baseline `354bd1e230b3d6801f8ac15df7ad4a5f257a94a7`; artifacts:
+`/models/validation-logs/hy4-pp-pcp-mtp-20260913T030102Z`.
+The pinned installation/checkpoint and all original serving parameters stay
+unchanged. This is one narrow supported topology, not general PCP speculation.
+The new configuration contract requires the same checkpoint, one native MTP
+layer, exactly three draft tokens, the exact target/draft architectures,
+DeepEP HT/DeepGEMM/FP8 and no EPLB. Existing PP/TP/PCP/DP/partition, MRV2,
+eager, LoRA, multimodal, offload, P/D and multi-layer sidecar guards remain.
+PCP1/TP8 MTP3 and GLM PCP MTP1/2 retain their prior paths.
+
+The baseline `01-baseline-rejection` reproduced the expected configuration
+rejection before weights, exit 1, clean teardown. Initial RED was one exact
+acceptance failure with 186 passing controls. Actual pinned sampling-method
+CPU probes also passed: global PCP batch/attention/slot restoration,
+last-stage proposal under replicated scope, exception restoration, and
+real width-3 draft IDs at shuffled request slots on earlier stages.
+Constructed HYV4 V32 indexers on all four ranks use effective PCP1 inside
+the replicated draft scope, preserve shared top-k and do not gather again.
+
+The first diagnostic observer failed on its own positional-argument
+assumption during a keyword profile call; its log is retained as an observer
+defect, not a model failure. Corrected `02b-observed` exposed a candidate
+validation issue: native sparse draft loading canonicalizes public
+`fp8_e4m3` to internal `fp8_ds_mla`, then PCP-manager initialization
+revalidates the same config. A second focused RED reproduced that rejection;
+recognizing the existing canonical FP8 layout gives 146 config tests passing.
+No attention/model/runner/PCP/DeepEP/loader implementation was changed.
+The launch still requests `fp8_e4m3`; this is not a precision/backend change.
+
+Successful `02c-observed` retains all-eight-rank evidence:
+
+- PP0 ranks 0–3 own layers [0,41), no speculator.
+- PP1 ranks 4–7 own layers [41,78), native `MTPSpeculator` with layer 78
+  only; stage-local EP groups are [0,1,2,3] and [4,5,6,7], 64 local experts.
+- On each last-stage rank, target/draft/indexer/MLA top-k pointers are equal.
+  The constructed indexer remains the current `V32SparseAttnIndexer`.
+- Proposal metadata and effective PCP width are 1; scope exit restores 4.
+- Each PP pair has matching sampled [N,4], counts [2,N], draft [N,3]
+  collectives and non-placeholder draft IDs, including N=2 mixed requests.
+  Local request allocator indices differ across stages; each side uses its
+  own mapping. The initial analyzer's invalid cross-stage slot-equality
+  assertion and corrected wire-payload audit are both retained.
+
+Observer execution SHA-256:
+`68308869ded884ddb2f00867f0e236455bc2f03a86d5a8584ddbe837cbeb9364`
+(`task13_observer_executed.py`). It records bounded scalar/CPU values,
+preserves calls/results, and samples draft IDs after the owner's existing
+stream synchronization. The worktree observer was removed before acceptance.
+
+### Exact uninstrumented acceptance
+
+`03-exact-final`: foreground PID/PGID 1667106, start 03:18:27 UTC,
+readiness 200 at 03:20:39 UTC. ARGV comparison proves the only addition to
+the accepted Task 11B target-only command is native MTP3. No worker extension,
+observer source or observer import is present. All eight cards were 0%/2 MiB
+before launch.
+
+The original short prompt plus three **byte-identical**, tokenizer-verified
+3145-token requests and concurrent short/long controls all return HTTP
+200/`stop`. Short output `Paris.`, every long output `Paris`; all six
+match the retained target-only control text exactly. The identical request
+SHA-256 is `963996620b60d947ea011ddf49746ea597c3c8f7c7fdff82813d04fadefaa9df`.
+Raw requests/responses/headers, token counts, text hashes and control
+comparisons are in `quality-summary.json` and `acceptance-summary.json`.
+Final metrics: 18 drafted, 8 accepted, accepted positions 0/1/2 = 3/3/2;
+prefix hits 0→3072→6144→9216. Health remains 200 after the requests.
+These short completions establish functionality, not broad accuracy or
+throughput; no new HumanEval or other benchmark score is claimed.
+
+The pre-shutdown audit finds no runtime exception, NaN/OOM, cache/index error
+or collective mismatch. Owned PTY Ctrl-C at 03:21:24 UTC closes the service.
+The API output handler logs `EngineDeadError` during shutdown. The first
+teardown poll catches workers still exiting; a subsequent check passes with
+no extra process signals: no owned/logged PIDs or port 8000 listener and all
+eight cards 0%/2 MiB. Both initial and final teardown records are preserved;
+the shutdown warning is not represented as a warning-free exit.
+
+NIXL/UCX and DCP are not tested or newly accepted. W4A8 extent validation,
+native BF16/FP16 MTP source-format adaptation and parser review Minors remain
+separate merge blockers/triage items. Prior DP8 capacity failures, plain-PP
+stall, W4A8/Mooncake hardware gaps and other deferred observations remain.
+
+Final Task 13 verification: all 36 branch-changed Python test modules
+unfiltered, 1164 passed; HYV4/MTP/PCP/PP/GLM/DeepEP/DeepGEMM neighbors,
+796 passed; explicit pinned contract, 2223 tests with zero failures/errors/
+skips; CI selector 70 passed; doctor 7 PASS/49 callbacks. Compileall, target
+diff check, 77-file AST and 18 Bash-block checks pass. All 1970 pinned source/
+library hashes and checkpoint config/index hashes plus full file size/mtime
+manifest remain unchanged. Post-test checks reconfirm all five Task 13
+service lifecycles have no remaining owned/logged PID or listener and all
+eight cards 0%/2 MiB.

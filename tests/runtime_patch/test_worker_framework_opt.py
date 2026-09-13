@@ -2020,6 +2020,40 @@ def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
     ]
 
 
+@pytest.mark.parametrize("is_last", [False, True])
+def test_pp_mtp_rejects_oversized_sample_before_broadcast(is_last):
+    from vllm_hcu.v1.hcu_model_runner_v2 import install_fixed_width_pp_sample_broadcast
+    calls = []
+    handler = SimpleNamespace(is_last_rank=is_last, max_sample_len=4,
+                              broadcast=lambda *args: calls.append(args))
+    runner = SimpleNamespace(pp_handler=handler)
+    assert install_fixed_width_pp_sample_broadcast(runner) is is_last
+    if is_last:
+        payload = torch.arange(10).reshape(2, 5)
+        before = payload.clone()
+        with pytest.raises(ValueError, match="width exceeds"):
+            handler.broadcast(payload)
+        torch.testing.assert_close(payload, before)
+        assert calls == []
+
+
+@pytest.mark.parametrize("is_last", [False, True])
+def test_pp_mtp_missing_rank_metadata_fails_without_request_mutation(monkeypatch, is_last):
+    from vllm_hcu.v1 import hcu_model_runner_v2 as owner
+    handler = SimpleNamespace(is_last_rank=is_last, broadcast_group=object(),
+        main_stream=object(), broadcast_stream=SimpleNamespace(wait_stream=lambda _: None))
+    runner = SimpleNamespace(pp_handler=handler, num_speculative_steps=3, device="cpu",
+        req_states=SimpleNamespace(draft_tokens=torch.full((4, 3), 17, dtype=torch.int64)))
+    batch = SimpleNamespace(num_reqs=2, idx_mapping=torch.tensor([3, 1]))
+    before = runner.req_states.draft_tokens.clone()
+    monkeypatch.setattr(owner.torch.cuda, "stream", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(owner.torch.distributed, "broadcast",
+                        lambda *a, **kw: pytest.fail("missing source rank must not broadcast"))
+    with pytest.raises(AttributeError, match="last_rank"):
+        owner.synchronize_pp_spec_draft_tokens(runner, batch)
+    torch.testing.assert_close(runner.req_states.draft_tokens, before)
+
+
 def test_hyv4_mtp_pinned_speculator_keeps_owned_sampling_buffer_addresses():
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator

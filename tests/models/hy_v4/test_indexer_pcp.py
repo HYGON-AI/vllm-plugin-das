@@ -208,6 +208,31 @@ def test_constructed_hyv4_indexer_decode_is_replicated_without_gather(
         assert [c[0] for c in calls] == ["write", "isolated"]
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_constructed_hyv4_mtp_indexer_uses_global_batch_without_pcp_gather(
+    monkeypatch, rank, isolated_results, request,
+):
+    if not CHILD:
+        return _assert_isolated(isolated_results, request)
+    def forbidden_gather(*args, **kwargs):
+        pytest.fail("replicated MTP must not gather global K/slots again")
+    group = SimpleNamespace(world_size=4, rank_in_group=rank,
+                            all_gather=forbidden_gather)
+    metadata = SimpleNamespace(pcp_world_size=1, num_decode_tokens=0,
+                               slot_mapping=torch.arange(5))
+    inputs = (torch.zeros(5, 8), torch.zeros(5, 1, 128), torch.ones(5, 128),
+              torch.ones(5, 1))
+    indexer, calls, shared_topk = _constructed_indexer(
+        monkeypatch, 4, metadata, torch.zeros(5, 128), inputs, group)
+    assert indexer.indexer_op.topk_indices_buffer is shared_topk
+    with pcp.replicated_mtp_batch_scope():
+        assert pcp.effective_pcp_world_size(4) == 1
+        assert indexer(inputs[0], torch.zeros(5, 8), torch.arange(5), None) is shared_topk
+    assert pcp.effective_pcp_world_size(4) == 4
+    assert calls == [("isolated", False)]
+    assert indexer.topk_indices_buffer is shared_topk
+
+
 def test_constructed_hyv4_indexer_rejects_pcp_metadata_mismatch(
     monkeypatch, isolated_results, request,
 ):
