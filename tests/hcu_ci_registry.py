@@ -99,6 +99,12 @@ register_hcu_ci(
 
 register_hcu_ci(
     job="hy4-contract",
+    target="tests/models/hy_v4/test_packed_expert_extent.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
     target="tests/models/hy_v4/test_registration.py",
     est_time=60,
 )
