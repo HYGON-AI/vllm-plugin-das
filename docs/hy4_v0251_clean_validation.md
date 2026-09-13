@@ -1,9 +1,12 @@
-# HYV4 v0.25.1 clean integration validation — through Task 15
+# HYV4 v0.25.1 clean integration validation — through Task 16
 
 This contains the Task 10 execution protocol, Task 11 observed results, and
 the focused Task 11A static-loader, Task 11B PCP, Task 11C static-memory,
 Task 13 exact PP2/PCP4 native MTP3 fixes/reruns, and Tasks 14/15 reviewed
 packed-extent/native-MTP source-format loader fixes.
+Task 16 adds HumanEval/0–31 accuracy evidence for the exact
+PP2/PCP4/EP4/MTP3 high-throughput topology and a constrained
+DP8/EP8/MTP3 fixed DeepEP low-latency topology.
 CPU tests establish loader contracts; they do not establish full-checkpoint loading,
 accelerator arithmetic, graph correctness, distributed serving, or accuracy.
 Each result state is updated only after retaining its evidence. Task 11B fixes
@@ -45,11 +48,13 @@ This host has no `ss`; the executable listener checks below use `psutil`.
 | TP8 MTP3, FP8 E4M3 KV, repeated prefix | PASS | 3×3145-token prompts; hits 0/3008/6016; coherent output; HTTP 200; clean teardown |
 | PP2/TP1/PCP4/DP1/EP4, DeepEP HT, DeepGEMM, eager | PASS — Task 11B | Original short + three 3145-token requests correct, HTTP 200/stop; exact 41,37/FP8 KV topology; health 200; clean teardown; DCP disabled/default |
 | Exact PP2/TP1/PCP4/DP1/EP4 + native MTP3 | PASS — Task 13 | No-observer exact 41,37/eager/HT/DeepGEMM/FP8 command; short + three identical 3145-token requests and concurrent short/long all match target-only; 18 drafted/8 accepted, positions 3/3/2; health 200 and clean teardown; shutdown warning retained below |
+| Exact PP2/TP1/PCP4/DP1/EP4 + native MTP3 HumanEval/0–31 | PASS — Task 16 | Fixed DeepEP HT/DeepGEMM; 32/32, Pass@1 100%, zero errors/flips versus TP8 MTP3; MTP acceptance 93.04%; clean teardown |
 | DP8/TP1/EP8, DeepEP HT, DeepGEMM | FAIL — capacity | All eight ranks loaded; KV budget −0.7 GiB; no readiness; exit 1; clean teardown |
+| DP8/TP1/EP8 + native MTP3, fixed DeepEP LL | PASS — constrained Task 16 | Fixed `deepep_low_latency`/masked DeepGEMM LL; 256 scheduled tokens and explicit 512-MiB FP8 KV per device; 32/32, Pass@1 100%, zero errors/flips versus TP8 MTP3; MTP acceptance 92.89%; clean teardown after exact owned-worker cleanup |
 | DP8/EP8 static offline EPLB load, exact 0.95/4096 gate | SAFE CAPACITY FAIL — Task 11C | All eight ranks loaded 125.69 GiB; positive 3.19 GiB non-torch and 8.62 GiB peak; KV −0.71 GiB; rejected before cache allocation; zero NIXL registration/late OOM; exit 1; clean teardown |
 | DP8/EP8 static offline EPLB, constrained batch tokens 2048 | PASS — constrained Task 11C | Model length 4096/0.95/max sequences 16 unchanged; all-rank map/fingerprint/Gloo owner and zero rearrangement; observed and no-observer 36-request runs pass; final teardown passes after one owned-worker cleanup described below |
-| HumanEval/0–31 target-only | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors; all stop; clean teardown |
-| HumanEval/0–31 MTP3 | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors/flips; acceptance 93.03%; clean teardown |
+| TP8 HumanEval/0–31 target-only | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors; all stop; clean teardown |
+| TP8 HumanEval/0–31 MTP3 | PASS | 32 predictions/reviews; Accuracy=Pass@1=100%; 0 errors/flips; acceptance 93.03%; clean teardown |
 | Custom packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
 | Native packed W4A8 | not run | Compatible checkpoint and device numerical/runtime evidence |
 | Native BF16/FP16 MTP checkpoint/device | not run | Compatible native retained checkpoint and device inference evidence |
@@ -1203,3 +1208,65 @@ of serialized INT4 MTP weights to unquantized execution. Hardware `not run`
 rows and all capacity, plain-PP stall/shutdown, Mooncake, parser Minor and
 packaging/warning limitations above remain unchanged. DCP and NIXL/UCX remain
 excluded and were not added or accepted by these fixes.
+
+## Task 16 MTP3 parallel-topology accuracy — PASS
+
+Frozen candidate `154f6f26ad8e16ca0302ce17cfaa7d3193f681c1` was tested
+with the same pinned vLLM wheel, plugin source, DTK/Torch stack and
+Channel-FP8 checkpoint hashes recorded above. Artifacts are under
+`/models/validation-logs/hy4-parallel-accuracy-20260913T041153Z` and
+`/models/eval-results/hy4-parallel-accuracy-20260913T041153Z`. Both services
+used native MTP3, FP8 E4M3 KV, eager execution and DeepGEMM. Per the updated
+scope, no same-topology target-only service was run; correctness was compared
+to the retained TP8 MTP3 HumanEval/0–31 reference. DCP and NIXL/UCX were not
+run or enabled.
+
+The high-throughput service used exact PP2/TP1/PCP4/DP1 with stage-local EP4,
+layer partition 41,37 and fixed `deepep_high_throughput`. Logs select
+`DeepEPHTAll2AllManager` and the contiguous DeepGEMM HT path. All 32
+predictions and reviews passed (Accuracy and Pass@1 100%), with no API errors,
+all stop reasons, and no correctness flip versus TP8 MTP3. It produced 4,430
+output tokens. MTP counters recorded 1,174 drafts, 3,522 draft tokens and
+3,277 accepted tokens (93.04%); accepted positions 0/1/2 were
+1,145/1,101/1,031. Exact generated text matched TP8 MTP3 on 26/32 tasks.
+
+The low-latency service kept exact DP8/TP1/EP8 and explicitly fixed
+`--all2all-backend deepep_low_latency`; it never used `deepep_auto`. Logs
+select `DeepEPLLAll2AllManager`, `DeepEPLLPrepareAndFinalize`, and
+`DeepEPDeepGemmMaskedExperts with DeepGEMM LL path`. Capacity diagnosis was
+retained rather than hidden:
+
+- At 512 scheduled tokens and utilization 0.9, the profiling dummy run OOMed
+  after loading 133.17 GiB per device.
+- At 256 scheduled tokens and utilization 0.9, profiling completed but the
+  utilization budget yielded no KV blocks.
+- At 256 tokens and utilization 0.95, measured KV availability was
+  −3.14 GiB; utilization 0.98 was then rejected at startup because only
+  138.2–138.45/143.98 GiB was free after API/communication contexts.
+- The accepted constrained launch therefore used 256 scheduled tokens,
+  utilization 0.95 and the supported explicit
+  `--kv-cache-memory-bytes 536870912`. Each DP rank received a 9,792-token
+  FP8 KV cache, sufficient for 2.39 concurrent 4,096-token requests.
+
+The accepted DP8/EP8 LL run completed 32/32 predictions and reviews with
+Accuracy and Pass@1 100%, zero model/API errors and all stop reasons. There
+was no correctness flip versus TP8 MTP3 or the high-throughput run. It
+produced 4,451 output tokens. All eight engines had nonzero MTP counters;
+totals were 1,181 drafts, 3,543 draft tokens and 3,291 accepted tokens
+(92.89%), with accepted positions 0/1/2 of 1,149/1,110/1,032. Exact text
+matched TP8 MTP3 on 24/32 tasks and the high-throughput run on 26/32.
+
+The EvalScope batch-1 observations were 9.3983 seconds and 14.73 output
+tokens/s for high-throughput, and 7.6343 seconds and 18.22 output tokens/s for
+low-latency. These are accuracy-run observations with slightly different
+output lengths, not a controlled throughput or latency benchmark.
+
+Both final service logs contain exactly 32 chat-completion HTTP 200 responses,
+no runtime ERROR/traceback/CUDA-OOM/NaN before shutdown, and health 200 after
+evaluation. The high-throughput service passed owned PID/listener/device
+teardown directly. DP8 shutdown closed the API/engine parents and port, but
+five pre-recorded worker PIDs remained in NCCL heartbeat cleanup after an
+additional ten seconds and ignored SIGTERM; only those PID-and-create-time
+matched workers were SIGKILLed. No broad PID/group signal was used. The final
+check passed with no owned process or port-8000 listener and all eight cards at
+0%/2 MiB. This remains a shutdown-cleanup concern, not a graceful-exit claim.
