@@ -1,0 +1,153 @@
+"""Differential checks against the installed vLLM runner's actual methods."""
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace as NS
+
+import numpy as np
+import pytest
+import torch
+from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
+from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.utils import CpuGpuBuffer
+import vllm
+
+from vllm_hcu.v1 import omni_input_prepare as feature
+
+
+def load_methods(path, class_name, names):
+    tree = ast.parse(path.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert {n.name for n in methods} == set(names)
+    namespace = {'torch': torch, 'np': np, 'PIN_MEMORY': False,
+                 'MRotaryEmbedding': MRotaryEmbedding,
+                 'length_from_prompt_token_ids_or_embeds': length_from_prompt_token_ids_or_embeds}
+    module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
+                             *methods], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
+    return namespace
+
+
+NATIVE = Path(vllm.__file__).parent / 'v1/worker/gpu_model_runner.py'
+METHODS = load_methods(NATIVE, 'GPUModelRunner',
+                       ['_calc_mrope_positions', '_get_positions'])
+CALC = METHODS['_calc_mrope_positions']
+GET = METHODS['_get_positions']
+
+
+def buffer(enabled, tokens=129, device='cpu'):
+    if enabled:
+        return feature.TokenMajorMropeBuffer(tokens, device=torch.device(device), pin_memory=False)
+    return CpuGpuBuffer(3, tokens, dtype=torch.int64, device=torch.device(device), pin_memory=False)
+
+
+@pytest.mark.parametrize('mode', ['prefill', 'decode', 'cross_boundary', 'reordered'])
+def test_position_calculation_matches_original(mode):
+    requests = {}
+    for i in range(4):
+        values = torch.arange(3 * 20).view(3, 20) + 100 * i
+        requests[str(i)] = NS(prompt_token_ids=list(range(20)), prompt_embeds=None,
+                              mrope_positions=values, mrope_position_delta=7 * i)
+    ids = list(requests)
+    if mode == 'reordered':
+        ids.reverse()
+    computed = np.array({'prefill': [0, 3, 5, 7], 'decode': [21, 30, 25, 39],
+                         'cross_boundary': [18, 19, 17, 22], 'reordered': [2, 22, 18, 8]}[mode])
+    scheduled = {rid: i + 2 for i, rid in enumerate(ids)}
+    output = NS(num_scheduled_tokens=scheduled)
+    runners = [NS(mrope_positions=buffer(enabled), requests=requests,
+                  input_batch=NS(req_ids=ids, num_computed_tokens_cpu=computed),
+                  uses_mrope=True, uses_xdrope_dim=0) for enabled in (False, True)]
+    for runner in runners:
+        CALC(runner, output)
+    torch.testing.assert_close(runners[0].mrope_positions.cpu, runners[1].mrope_positions.cpu)
+    assert runners[1].mrope_positions.cpu.stride() == (1, 3)
+    assert np.shares_memory(runners[1].mrope_positions.np, runners[1].mrope_positions.flat_cpu.numpy())
+
+
+@pytest.mark.parametrize('index', [0, 1, 64, 128, torch.tensor([0, 2, 127, 128]), slice(3, 8)])
+def test_existing_get_positions_and_dummy_slot(index):
+    logical = torch.arange(3 * 129).view(3, 129)
+    runners = []
+    for enabled in (False, True):
+        buf = buffer(enabled)
+        buf.cpu.copy_(logical)
+        # This is the unchanged native _prepare_inputs expression.
+        buf.gpu[:, :129].copy_(buf.cpu[:, :129], non_blocking=True)
+        runners.append(NS(uses_mrope=True, uses_xdrope_dim=0, mrope_positions=buf))
+    torch.testing.assert_close(GET(runners[0], index), GET(runners[1], index))
+
+
+def test_partial_flat_copy_preserves_padding():
+    buf = buffer(True)
+    buf.flat_gpu.fill_(-1)
+    buf.cpu[:, :5] = torch.arange(15).view(3, 5)
+    result = buf.copy_to_gpu(5)
+    assert result.shape == (3, 5)
+    torch.testing.assert_close(result, buf.cpu[:, :5])
+    assert torch.all(buf.gpu[:, 5:] == -1)
+    buf.gpu[:, :2].fill_(99)
+    buf.copy_to_cpu(2)
+    assert torch.all(buf.cpu[:, :2] == 99)
+
+
+
+@pytest.mark.parametrize('custom,mrope', [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_independent_opt_in_flags(monkeypatch, custom, mrope):
+    for name, value in [('VLLM_HCU_USE_CUSTOM_OPS', custom), ('VLLM_HCU_1D_MROPE', mrope)]:
+        monkeypatch.setenv(name, str(value))
+    monkeypatch.setattr(feature, 'PIN_MEMORY', False)
+    original = buffer(False)
+    runner = NS(model_config=NS(model_arch='Qwen3OmniMoeForConditionalGeneration',
+        model_stage='thinker', async_chunk=False, is_encoder_decoder=False),
+        vllm_config=NS(additional_config={'user_marker': 'preserved'}),
+        speculative_config=None, uses_mrope=True, max_num_tokens=128,
+        device=torch.device('cpu'), mrope_positions=original)
+    result = feature.initialize_omni_input_prepare(runner)
+    assert isinstance(runner.mrope_positions, feature.TokenMajorMropeBuffer) == bool(custom and mrope)
+    assert result is None
+    assert runner.vllm_config.additional_config == {
+        'user_marker': 'preserved',
+        'hcu_omni_mrope_layout': 'token_major_v1' if custom and mrope else 'channel_major_v1'}
+    if not custom or not mrope:
+        assert runner.mrope_positions is original
+
+
+@pytest.mark.parametrize('key,value', [('model_stage', 'talker'), ('model_arch', 'Other'),
+                                     ('async_chunk', True), ('is_encoder_decoder', True)])
+def test_unsupported_configs_rejected_before_mutation(monkeypatch, key, value):
+    monkeypatch.setenv('VLLM_HCU_USE_CUSTOM_OPS', '1')
+    monkeypatch.setenv('VLLM_HCU_1D_MROPE', '1')
+    config = NS(model_arch='Qwen3OmniMoeForConditionalGeneration', model_stage='thinker',
+                async_chunk=False, is_encoder_decoder=False)
+    setattr(config, key, value)
+    runner = NS(model_config=config, speculative_config=None)
+    with pytest.raises(ValueError):
+        feature.initialize_omni_input_prepare(runner)
+    assert not hasattr(runner, 'mrope_positions')
+
+
+def test_layout_separates_real_vllm_and_aot_cache_keys(monkeypatch):
+    from vllm.config import VllmConfig
+    from vllm.compilation.caching import aot_compile_hash_factors
+
+    monkeypatch.setenv('VLLM_HCU_USE_CUSTOM_OPS', '1')
+    monkeypatch.setattr(feature, 'PIN_MEMORY', False)
+    keys = []
+    for enabled in (False, True, False):
+        monkeypatch.setenv('VLLM_HCU_1D_MROPE', str(int(enabled)))
+        config = VllmConfig()
+        original_extra = {'user_option': {'value': 123}}
+        config.additional_config = original_extra
+        runner = NS(model_config=NS(model_arch='Qwen3OmniMoeForConditionalGeneration',
+            model_stage='thinker', async_chunk=False, is_encoder_decoder=False),
+            vllm_config=config, speculative_config=None, uses_mrope=True,
+            max_num_tokens=128, device=torch.device('cpu'), mrope_positions=buffer(False))
+        feature.initialize_omni_input_prepare(runner)
+        keys.append((config.compute_hash(), aot_compile_hash_factors(config)))
+        assert original_extra == {'user_option': {'value': 123}}
+    assert keys[0][0] != keys[1][0]
+    assert keys[0][1] != keys[1][1]
+    assert keys[0] == keys[2]
