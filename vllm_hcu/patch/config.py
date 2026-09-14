@@ -23,6 +23,10 @@ _FEATURE_FIELDS = (
     "deepep_auto",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "expert_map_path",
+    "expert_map_record_path",
+    "eplb_disable_rearrange",
+    "eplb_static_dispatch_policy",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:5]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -69,8 +73,22 @@ class HcuFeatureConfig:
     deepep_auto: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    expert_map_path: str | None = None
+    expert_map_record_path: str | None = None
+    eplb_disable_rearrange: bool = False
+    eplb_static_dispatch_policy: str = "nearest"
 
     def __post_init__(self) -> None:
+        for name in ("expert_map_path", "expert_map_record_path"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"HCU {name} must be a nonempty path string")
+        if self.expert_map_path and self.expert_map_record_path:
+            raise ValueError("expert_map_path and expert_map_record_path are mutually exclusive")
+        if type(self.eplb_disable_rearrange) is not bool:
+            raise TypeError("eplb_disable_rearrange must be bool")
+        if self.eplb_static_dispatch_policy not in ("nearest", "locality_fair"):
+            raise ValueError("unsupported eplb_static_dispatch_policy")
         for name in _BOOLEAN_FIELDS:
             value = getattr(self, name)
             if not isinstance(value, bool):
@@ -189,6 +207,26 @@ def get_hcu_config(vllm_config: object | None) -> HcuFeatureConfig:
     """
 
     return _config_from_payload(_read_additional_config(vllm_config))
+
+
+def bind_hcu_eplb_config(vllm_config: object) -> None:
+    """Restore offline EPLB controls on a worker's deserialized parallel config."""
+    if isinstance(vllm_config, Mapping):
+        parallel = vllm_config.get("parallel_config")
+    else:
+        if not hasattr(vllm_config, "additional_config"):
+            return
+        parallel = getattr(vllm_config, "parallel_config", None)
+    if parallel is None:
+        return
+    config = get_hcu_config(vllm_config)
+    for name in ("expert_map_path", "expert_map_record_path", "eplb_disable_rearrange",
+                 "eplb_static_dispatch_policy"):
+        attribute = f"_vllm_hcu_{name}"
+        if isinstance(parallel, MutableMapping):
+            parallel[attribute] = getattr(config, name)
+        else:
+            setattr(parallel, attribute, getattr(config, name))
 
 
 def write_hcu_config(

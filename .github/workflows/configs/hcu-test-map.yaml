@@ -29,6 +29,15 @@
     "deepseek-gsm8k"
   ],
   "jobs": {
+    "hy4-contract": {
+      "runner": "bw18",
+      "arch": "gfx936",
+      "cards": 1,
+      "suite": "full",
+      "pytest_args": [],
+      "timeout_minutes": 30,
+      "requirements": []
+    },
     "accuracy-gfx936": {
       "runner": "bw18",
       "arch": "gfx936",
@@ -450,6 +459,7 @@
     }
   },
   "nightly_jobs": [
+    {"job": "hy4-contract", "timeout_minutes": 30},
     {"job": "accuracy-gfx936", "timeout_minutes": 45},
     {"job": "accuracy-gfx938", "timeout_minutes": 45},
     {"job": "contract-hcu-gfx936", "timeout_minutes": 60},
@@ -474,6 +484,17 @@
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
+    "hy4-contract": {
+      "patterns": [
+        "vllm_hcu/**hy_v4*",
+        "vllm_hcu/**hyv4*",
+        "tests/**hy_v4*",
+        "tests/**hyv4*",
+        "tests/integration/model_runtime.py",
+        "tests/integration/test_model_runtime_cli.py"
+      ],
+      "jobs": ["hy4-contract"]
+    },
     "ci": {
       "patterns": [
         ".github/workflows/**",

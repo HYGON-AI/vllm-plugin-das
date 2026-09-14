@@ -55,6 +55,10 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "deepep_auto": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
+                "expert_map_path": None,
+                "expert_map_record_path": None,
+                "eplb_disable_rearrange": False,
+                "eplb_static_dispatch_policy": "nearest",
             }
         }
     }

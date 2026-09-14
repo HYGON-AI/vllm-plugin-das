@@ -2020,6 +2020,139 @@ def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
     ]
 
 
+@pytest.mark.parametrize("is_last", [False, True])
+def test_pp_mtp_rejects_oversized_sample_before_broadcast(is_last):
+    from vllm_hcu.v1.hcu_model_runner_v2 import install_fixed_width_pp_sample_broadcast
+    calls = []
+    handler = SimpleNamespace(is_last_rank=is_last, max_sample_len=4,
+                              broadcast=lambda *args: calls.append(args))
+    runner = SimpleNamespace(pp_handler=handler)
+    assert install_fixed_width_pp_sample_broadcast(runner) is is_last
+    if is_last:
+        payload = torch.arange(10).reshape(2, 5)
+        before = payload.clone()
+        with pytest.raises(ValueError, match="width exceeds"):
+            handler.broadcast(payload)
+        torch.testing.assert_close(payload, before)
+        assert calls == []
+
+
+@pytest.mark.parametrize("is_last", [False, True])
+def test_pp_mtp_missing_rank_metadata_fails_without_request_mutation(monkeypatch, is_last):
+    from vllm_hcu.v1 import hcu_model_runner_v2 as owner
+    handler = SimpleNamespace(is_last_rank=is_last, broadcast_group=object(),
+        main_stream=object(), broadcast_stream=SimpleNamespace(wait_stream=lambda _: None))
+    runner = SimpleNamespace(pp_handler=handler, num_speculative_steps=3, device="cpu",
+        req_states=SimpleNamespace(draft_tokens=torch.full((4, 3), 17, dtype=torch.int64)))
+    batch = SimpleNamespace(num_reqs=2, idx_mapping=torch.tensor([3, 1]))
+    before = runner.req_states.draft_tokens.clone()
+    monkeypatch.setattr(owner.torch.cuda, "stream", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(owner.torch.distributed, "broadcast",
+                        lambda *a, **kw: pytest.fail("missing source rank must not broadcast"))
+    with pytest.raises(AttributeError, match="last_rank"):
+        owner.synchronize_pp_spec_draft_tokens(runner, batch)
+    torch.testing.assert_close(runner.req_states.draft_tokens, before)
+
+
+def test_hyv4_mtp_pinned_speculator_keeps_owned_sampling_buffer_addresses():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    obj = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL)),
+        temperature=torch.zeros(4), seeds=torch.zeros(4, dtype=torch.int64),
+        idx_mapping=torch.zeros(4, dtype=torch.int32), draft_logits=torch.zeros(4, 2, 8),
+    )
+    pointers = [obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr()]
+    for temperature, seeds, indices in [([0., .5, 1., 1.5], [11, 22, 33, 44], [2, 0]),
+                                         ([1., 0., .5, 2.], [44, 33, 22, 11], [1])]:
+        temp = torch.tensor(temperature)
+        seed = torch.tensor(seeds)
+        idx = torch.tensor(indices, dtype=torch.int32)
+        DraftModelSpeculator._copy_request_inputs(obj, len(indices), idx, temp, seed)
+        assert [obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr()] == pointers
+        assert obj.temperature.data_ptr() != temp.data_ptr()
+        assert obj.seeds.data_ptr() != seed.data_ptr()
+        assert obj.temperature.tolist() == temperature
+        assert obj.seeds.tolist() == seeds
+        assert obj.idx_mapping.tolist() == indices + [-1] * (4 - len(indices))
+
+
+def test_hyv4_mtp_graph_replay_reads_updated_owned_sampling_buffers():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires HCU graph capture")
+    obj = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)),
+        temperature=torch.zeros(4, device="cuda"), seeds=torch.zeros(4, dtype=torch.int64, device="cuda"),
+        idx_mapping=torch.zeros(4, dtype=torch.int32, device="cuda"), draft_logits=None,
+    )
+    output = torch.empty(4, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.add(obj.temperature, obj.seeds, out=output)
+    pointers = (obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr())
+    for temp, seed in [(0.5, 11), (1.5, 23)]:
+        DraftModelSpeculator._copy_request_inputs(obj, 1, torch.tensor([2], dtype=torch.int32, device="cuda"),
+            torch.full((4,), temp, device="cuda"), torch.full((4,), seed, dtype=torch.int64, device="cuda"))
+        graph.replay()
+        assert output.tolist() == [temp + seed] * 4
+        assert (obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr()) == pointers
+
+
+def test_hyv4_mtp_plain_pp_retains_pinned_broadcast_payloads(monkeypatch):
+    """Exercise PPHandler itself; only the distributed transport is replaced."""
+    from collections import deque
+    from vllm.v1.worker.gpu.pp_utils import PPHandler
+    from vllm_hcu.v1.hcu_model_runner_v2 import install_fixed_width_pp_sample_broadcast
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires HCU streams")
+    sender, receiver = object.__new__(PPHandler), object.__new__(PPHandler)
+    for handler in (sender, receiver):
+        handler.last_rank = 1
+        handler.max_sample_len = 4
+        handler.device = torch.device("cuda")
+        handler.main_stream = torch.cuda.current_stream()
+        handler.broadcast_stream = torch.cuda.Stream()
+        handler.broadcast_group = object()
+        handler.req_idx_gen_np = np.zeros(4, dtype=np.int32)
+        handler.queue = deque([None])
+    receiver.broadcast_group = sender.broadcast_group
+    sender.is_last_rank, receiver.is_last_rank = True, False
+    runner = SimpleNamespace(pp_handler=sender)
+    install_fixed_width_pp_sample_broadcast(runner)
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([2], device="cuda"),
+        idx_mapping_np=np.array([2]), num_computed_tokens_np=np.array([3]),
+        prefill_len_np=np.array([3]), max_seq_len_np=np.array([10]),
+        num_scheduled_tokens=np.array([1]))
+    payloads = []
+    def send(tensor, *, src, group):
+        assert src == 1 and group is sender.broadcast_group
+        payloads.append(tensor.clone())
+    monkeypatch.setattr(torch.distributed, "broadcast", send)
+    sender.broadcast(torch.tensor([[41]], device="cuda"), torch.tensor([1], device="cuda", dtype=torch.int32),
+                     torch.tensor([0], device="cuda", dtype=torch.int32), batch)
+    sender.broadcast_stream.synchronize()
+    saved = list(payloads)
+    def receive(tensor, *, src, group):
+        assert src == 1 and group is receiver.broadcast_group
+        tensor.copy_(payloads.pop(0))
+    monkeypatch.setattr(torch.distributed, "broadcast", receive)
+    assert receiver.receive(batch) is True
+    output = receiver.get_prev_sampled_outputs()
+    assert not payloads
+    assert saved[0].tolist() == [[41, 0, 0, 0]]
+    assert saved[1].tolist() == [[1], [0]]
+    assert output["sampled_tokens"].tolist() == [[41, 0, 0, 0]]
+    assert output["num_sampled"].tolist() == [1]
+    assert output["num_rejected"].tolist() == [0]
+    assert output["idx_mapping"].tolist() == [2]
+
+
 def _fake_ubatch_module() -> ModuleType:
     @dataclasses.dataclass
     class UBatchSlice:

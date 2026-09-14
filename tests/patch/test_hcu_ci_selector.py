@@ -91,6 +91,52 @@ def test_selector_configuration_is_valid() -> None:
     assert "single-node-topology" in jobs
 
 
+@pytest.mark.parametrize("path", [
+    "vllm_hcu/models/hy_v4/model.py",
+    "vllm_hcu/patch/platform/core_fix/patch_hy_v4_mtp_config.py",
+    "vllm_hcu/reasoning/hy_v4_reasoning_parser.py",
+    "vllm_hcu/model_executor/layers/quantization/hyv4_native.py",
+    "tests/models/hy_v4/test_mtp.py",
+    "tests/hy_v4/test_parsers.py",
+    "tests/accuracy/test_hyv4_native_format.py",
+    "tests/integration/model_runtime.py",
+])
+def test_hyv4_changes_route_to_complete_portable_contract_job(path):
+    assert "hy4-contract" in _selected_job_ids(path)
+
+
+def test_hyv4_registry_runs_complete_modules_without_hardware_claims():
+    jobs = validate_config(_config())
+    assert "hy4-contract" in jobs
+    job = jobs["hy4-contract"]
+    assert job["suite"] == "full"
+    assert job["pytest_args"] == []
+    assert job["requirements"] == []
+    targets = {item.target for item in parse_registry()
+               if item.job == "hy4-contract" and item.disabled is None}
+    required = {path.relative_to(REPOSITORY).as_posix()
+                for directory in ("tests/models/hy_v4", "tests/hy_v4")
+                for path in (REPOSITORY / directory).glob("test_*.py")}
+    required.update({
+        "tests/accuracy/test_hyv4_native_format.py",
+        "tests/accuracy/test_hyv4_w4a8_kernels.py",
+        "tests/integration/models/test_hy_v4_smoke.py",
+        "tests/integration/test_model_runtime_cli.py",
+    })
+    assert required <= targets
+    assert all("::" not in target for target in targets)
+
+
+def test_registry_can_be_collected_without_runtime_imports():
+    result = subprocess.run(
+        [sys.executable, "-c", "import runpy, sys; "
+         "runpy.run_path('tests/hcu_ci_registry.py'); "
+         "assert 'vllm' not in sys.modules; assert 'torch' not in sys.modules"],
+        cwd=REPOSITORY, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_full_matrix_contains_every_enabled_registered_job() -> None:
     config = _config()
     matrix = build_matrix(config, profile="full")
