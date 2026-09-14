@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 from types import ModuleType
 from weakref import WeakSet
@@ -18,7 +19,6 @@ from ._common import (
     load_exact_module,
     require_class,
     require_exact_signature,
-    require_model_init,
 )
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.model"
@@ -40,6 +40,62 @@ def _requested() -> bool:
         "true",
         "1",
     )
+
+
+def _is_torch_compile_init(function) -> bool:
+    """Return whether *function* is vLLM's compile-support init wrapper.
+
+    ``@support_torch_compile`` replaces a model constructor at runtime.  The
+    source constructor remains keyword-only, but the installed wrapper exposes
+    ``*args``/``**kwargs`` so it can support a broader set of model classes.
+    Keep this check structural and local to this patch instead of weakening the
+    shared constructor contract used by unrelated HCU patches.
+    """
+
+    try:
+        parameters = tuple(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if tuple(parameter.name for parameter in parameters) != (
+        "self",
+        "args",
+        "vllm_config",
+        "prefix",
+        "kwargs",
+    ):
+        return False
+    return (
+        parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and parameters[1].kind is inspect.Parameter.VAR_POSITIONAL
+        and parameters[2].kind is inspect.Parameter.KEYWORD_ONLY
+        and parameters[2].default is None
+        and parameters[3].kind is inspect.Parameter.KEYWORD_ONLY
+        and parameters[3].default == ""
+        and parameters[4].kind is inspect.Parameter.VAR_KEYWORD
+    )
+
+
+def _require_model_init_compatible(owner: type, target: str):
+    """Validate a raw or ``support_torch_compile``-wrapped model init."""
+
+    function = vars(owner).get("__init__")
+    if not callable(function):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {target} is missing"
+        )
+
+    try:
+        require_exact_signature(
+            function,
+            target,
+            positional=("self",),
+            keyword_only=("vllm_config", "prefix"),
+            defaults={"prefix": ""},
+        )
+    except PatchCompatibilityError as raw_error:
+        if not _is_torch_compile_init(function):
+            raise raw_error
+    return function
 
 
 def _prefetch_owner(layer_name: str):
@@ -162,7 +218,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "Qwen4ExpForConditionalGeneration",
         f"{TARGET_MODULE}.Qwen4ExpForConditionalGeneration",
     )
-    init = require_model_init(model_class, TARGETS[0])
+    init = _require_model_init_compatible(model_class, TARGETS[0])
     forward = vars(model_class).get("forward")
     process_weights = vars(causal_class).get("process_weights_after_loading")
     conditional_process_weights = vars(conditional_class).get(
@@ -222,8 +278,14 @@ def apply_to_module(module: ModuleType) -> bool:
     _ensure_custom_op_registered()
 
     @functools.wraps(init)
-    def hcu_init(self, *, vllm_config, prefix=""):
-        init(self, vllm_config=vllm_config, prefix=prefix)
+    def hcu_init(self, *args, vllm_config=None, prefix="", **kwargs):
+        init(
+            self,
+            *args,
+            vllm_config=vllm_config,
+            prefix=prefix,
+            **kwargs,
+        )
         _bind_model_ple_chain(self)
 
     @functools.wraps(forward)
