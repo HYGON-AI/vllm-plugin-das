@@ -38,6 +38,9 @@ TARGETS = (
 )
 _MARKER = "_vllm_hcu_scheduler_contract_validated"
 HCU_SCHEDULER_PATH = "vllm_hcu.v1.core.sched.scheduler.HcuScheduler"
+HCU_ASYNC_SCHEDULER_PATH = "vllm_hcu.v1.core.sched.scheduler.HcuAsyncScheduler"
+OMNI_HCU_SCHEDULER_PATH = "vllm_omni.core.sched.omni_hcu_scheduler.OmniHcuScheduler"
+OMNI_HCU_ASYNC_SCHEDULER_PATH = "vllm_omni.core.sched.omni_hcu_scheduler.OmniHcuAsyncScheduler"
 UPSTREAM_SCHEDULER_PATH = f"{TARGET_MODULE}.Scheduler"
 
 
@@ -112,7 +115,9 @@ def select_hcu_scheduler(vllm_config: object) -> bool:
             "vllm_config.scheduler_config.scheduler_cls is missing"
         )
     selected = scheduler_config.scheduler_cls
-    if selected not in (None, UPSTREAM_SCHEDULER_PATH, HCU_SCHEDULER_PATH):
+    if selected not in (None, UPSTREAM_SCHEDULER_PATH, HCU_SCHEDULER_PATH,
+                        HCU_ASYNC_SCHEDULER_PATH, OMNI_HCU_SCHEDULER_PATH,
+                        OMNI_HCU_ASYNC_SCHEDULER_PATH):
         raise RuntimeError(
             "split-P/D requires HcuScheduler but another scheduler_cls was selected: "
             f"{selected!r}"
@@ -123,6 +128,12 @@ def select_hcu_scheduler(vllm_config: object) -> bool:
             "vllm_config.scheduler_config.async_scheduling is missing"
         )
     async_scheduling = scheduler_config.async_scheduling
+    if selected in (HCU_ASYNC_SCHEDULER_PATH, OMNI_HCU_ASYNC_SCHEDULER_PATH):
+        if async_scheduling is not True:
+            raise RuntimeError("The selected HCU async scheduler requires async_scheduling=True")
+        # Resolve the class lazily as usual. Its constructor validates the
+        # supported execution/cache configuration before accepting requests.
+        return False
     if async_scheduling is True:
         # vLLM v0.25.1 resolves its default async policy before invoking
         # Platform.check_and_update_config().  HcuScheduler intentionally
@@ -143,7 +154,7 @@ def select_hcu_scheduler(vllm_config: object) -> bool:
             "vllm_config.scheduler_config.async_scheduling must be bool or None"
         )
 
-    if selected == HCU_SCHEDULER_PATH:
+    if selected in (HCU_SCHEDULER_PATH, OMNI_HCU_SCHEDULER_PATH):
         return False
     # A qualified string is the public lazy selection form supported by vLLM.
     # Resolving it here would import the full scheduler/model stack during
