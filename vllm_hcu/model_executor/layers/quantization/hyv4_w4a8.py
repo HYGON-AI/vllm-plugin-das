@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from vllm.model_executor.layers.linear import (
     LinearBase, MergedColumnParallelLinear, QKVParallelLinear,
-    UnquantizedLinearMethod,
+    RowParallelLinear, UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
@@ -19,6 +19,85 @@ from .hyv4_w4a8_weights import (
     CHECKPOINT_FORMAT, adapt_weights, read_quantized_modules,
     to_aiter_packing, validate_channel_scale, validate_metadata,
 )
+
+
+_INT4_VALUES_PER_BYTE = 2
+
+
+def _validate_packed_linear_extent(
+    layer,
+    weight,
+    *,
+    input_size_per_partition,
+    input_size,
+    output_size,
+    expected_tp_size,
+    expected_tp_rank,
+    shard_id,
+):
+    if weight.dtype != torch.uint8 or weight.ndim != 2:
+        raise ValueError("HYV4 linear requires rank-2 UINT8 checkpoint packing")
+
+    if type(input_size) is not int or input_size <= 0:
+        raise ValueError(f"HYV4 linear weight has invalid input_size: {input_size}")
+    if input_size % _INT4_VALUES_PER_BYTE:
+        raise ValueError("HYV4 linear weight requires an even checkpoint input size")
+
+    tp_size = getattr(layer, "tp_size", 1)
+    tp_rank = getattr(layer, "tp_rank", 0)
+    if type(tp_size) is not int or tp_size <= 0:
+        raise ValueError(f"HYV4 linear weight has invalid tp_size: {tp_size}")
+    if type(tp_rank) is not int or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"HYV4 linear weight has invalid tp_rank: {tp_rank}")
+    if isinstance(layer, RowParallelLinear) and input_size % tp_size:
+        raise ValueError(
+            "HYV4 linear weight input_size must be divisible by tp_size"
+        )
+    if (tp_size, tp_rank) != (expected_tp_size, expected_tp_rank):
+        raise ValueError(
+            "HYV4 linear weight TP metadata changed after allocation: "
+            f"expected size/rank {(expected_tp_size, expected_tp_rank)}, "
+            f"got {(tp_size, tp_rank)}"
+        )
+    expected_partition = (
+        input_size // tp_size if isinstance(layer, RowParallelLinear)
+        else input_size
+    )
+    if input_size_per_partition != expected_partition:
+        raise ValueError(
+            "HYV4 linear weight has inconsistent TP input partition: "
+            f"expected {expected_partition}, got {input_size_per_partition}"
+        )
+
+    if isinstance(layer, QKVParallelLinear):
+        layer.validate_shard_id(shard_id)
+        sizes = {
+            "q": layer.total_num_heads * layer.head_size,
+            "k": layer.total_num_kv_heads * layer.head_size,
+            "v": layer.total_num_kv_heads * layer.v_head_size,
+        }
+        channels = sum(sizes.values()) if shard_id is None else sizes[shard_id]
+    elif isinstance(layer, MergedColumnParallelLinear):
+        layer.validate_shard_id(shard_id)
+        if isinstance(shard_id, tuple) and not shard_id:
+            raise ValueError("HYV4 linear weight requires a nonempty shard tuple")
+        shards = (
+            range(len(layer.output_sizes)) if shard_id is None
+            else shard_id if isinstance(shard_id, tuple)
+            else (shard_id,)
+        )
+        channels = sum(layer.output_sizes[index] for index in shards)
+    else:
+        if shard_id is not None:
+            raise ValueError(f"HYV4 linear weight cannot load shard {shard_id!r}")
+        channels = output_size
+
+    expected = (channels, input_size // _INT4_VALUES_PER_BYTE)
+    if tuple(weight.shape) != expected:
+        raise ValueError(
+            "HYV4 linear weight requires packed shape "
+            f"{expected}, got {tuple(weight.shape)}"
+        )
 
 
 class HYV4W4A8Config(SlimQuantW4A8Int8Config):
@@ -73,10 +152,21 @@ class HYV4W4A8LinearMethod(SlimQuantW4A8Int8LinearMethod):
         super().create_weights(layer, input_size_per_partition, output_partition_sizes,
                                input_size, output_size, params_dtype, **extra_weight_attrs)
         load_weight = layer.weight.weight_loader
+        expected_tp_size = getattr(layer, "tp_size", 1)
+        expected_tp_rank = getattr(layer, "tp_rank", 0)
 
         def load_int4(param, weight, *args, **kwargs):
-            if weight.dtype != torch.uint8 or weight.ndim != 2:
-                raise ValueError("HYV4 linear requires rank-2 UINT8 checkpoint packing")
+            shard = kwargs.get("loaded_shard_id", args[0] if args else None)
+            _validate_packed_linear_extent(
+                layer,
+                weight,
+                input_size_per_partition=input_size_per_partition,
+                input_size=input_size,
+                output_size=output_size,
+                expected_tp_size=expected_tp_size,
+                expected_tp_rank=expected_tp_rank,
+                shard_id=shard,
+            )
             return load_weight(param, unpack_int4(to_aiter_packing(weight)), *args, **kwargs)
 
         layer.weight.weight_loader = load_int4

@@ -274,11 +274,20 @@ def _scale_config(tmp_path, native):
     return module("hyv4_native").HYV4NativeW4A8Config(str(path))
 
 
-def _scale_linear(tmp_path, monkeypatch, native, kind="row", rank=0):
+def _scale_linear(
+    tmp_path,
+    monkeypatch,
+    native,
+    kind="row",
+    rank=0,
+    tp=None,
+    input_size=4,
+    output_sizes=None,
+):
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes import compressed_tensors_w8a8_int8 as scheme
-    tp = 1 if kind == "row" else 2
+    tp = (1 if kind == "row" else 2) if tp is None else tp
     for owner in (parameter, linear):
         monkeypatch.setattr(owner, "get_tensor_model_parallel_rank", lambda: rank)
         monkeypatch.setattr(owner, "get_tensor_model_parallel_world_size", lambda: tp)
@@ -286,13 +295,17 @@ def _scale_linear(tmp_path, monkeypatch, native, kind="row", rank=0):
     config = _scale_config(tmp_path, native)
     kwargs = dict(bias=False, params_dtype=torch.bfloat16, quant_config=config, prefix="model.projection")
     if kind == "row":
-        layer = linear.RowParallelLinear(4, 2, **kwargs)
+        layer = linear.RowParallelLinear(input_size, 2, **kwargs)
     elif kind == "column":
-        layer = linear.ColumnParallelLinear(4, 4, **kwargs)
+        layer = linear.ColumnParallelLinear(input_size, 4, **kwargs)
     elif kind == "merged":
-        layer = linear.MergedColumnParallelLinear(4, [4, 6], **kwargs)
+        layer = linear.MergedColumnParallelLinear(
+            input_size,
+            [4, 6] if output_sizes is None else output_sizes,
+            **kwargs,
+        )
     else:
-        layer = linear.QKVParallelLinear(4, 2, 4, 1, **kwargs)
+        layer = linear.QKVParallelLinear(input_size, 2, 4, 1, **kwargs)
     layer.weight_scale.data.fill_(7)
     return config, layer
 
@@ -364,6 +377,316 @@ def test_linear_scale_extent_respects_current_tp_and_fused_projection(tmp_path, 
     else:
         layer.weight_scale.weight_loader(layer.weight_scale, value, *args)
         torch.testing.assert_close(layer.weight_scale[:, 0], torch.tensor(want, dtype=torch.float32))
+
+
+PACKED_LINEAR_LAYOUTS = [
+    ("row", 1, 0, None, 4, (2, 2)),
+    ("row", 2, 1, None, 8, (2, 4)),
+    ("column", 1, 0, None, 4, (4, 2)),
+    ("column", 2, 1, None, 4, (4, 2)),
+    ("merged", 2, 1, 0, 4, (4, 2)),
+    ("merged", 2, 1, 1, 4, (6, 2)),
+    ("merged", 2, 1, (0, 1), 4, (10, 2)),
+    ("merged", 2, 1, None, 4, (10, 2)),
+    ("qkv", 2, 1, "q", 4, (8, 2)),
+    ("qkv", 2, 1, "k", 4, (2, 2)),
+    ("qkv", 2, 1, "v", 4, (2, 2)),
+    ("qkv", 2, 1, None, 4, (12, 2)),
+]
+
+PACKED_DISTINCT_ROWS = [
+    [0x21, 0x43],
+    [0x65, 0x07],
+    [0xEF, 0xCD],
+    [0xAB, 0x89],
+    [0x32, 0x54],
+    [0x76, 0x10],
+    [0xDE, 0xBC],
+    [0x9A, 0xF8],
+    [0x43, 0x65],
+    [0x07, 0x21],
+    [0xCD, 0xAB],
+    [0x89, 0xEF],
+]
+UNPACKED_DISTINCT_ROWS = [
+    [1, 2, 3, 4],
+    [5, 6, 7, 0],
+    [-1, -2, -3, -4],
+    [-5, -6, -7, -8],
+    [2, 3, 4, 5],
+    [6, 7, 0, 1],
+    [-2, -3, -4, -5],
+    [-6, -7, -8, -1],
+    [3, 4, 5, 6],
+    [7, 0, 1, 2],
+    [-3, -4, -5, -6],
+    [-7, -8, -1, -2],
+]
+
+
+@pytest.mark.parametrize(
+    "kind,tp,rank,shard,input_size,expected",
+    PACKED_LINEAR_LAYOUTS,
+)
+@pytest.mark.parametrize("axis,delta", [(0, -1), (0, 1), (1, -1), (1, 1)])
+def test_linear_packed_extent_rejects_before_owner_mutation(
+    tmp_path,
+    monkeypatch,
+    kind,
+    tp,
+    rank,
+    shard,
+    input_size,
+    expected,
+    axis,
+    delta,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind=kind,
+        rank=rank,
+        tp=tp,
+        input_size=input_size,
+    )
+    bad_shape = list(expected)
+    bad_shape[axis] += delta
+    value = torch.full(bad_shape, 0x11, dtype=torch.uint8)
+    before = layer.weight.clone()
+    args = () if shard is None else (shard,)
+
+    with pytest.raises(ValueError, match="HYV4.*linear.*weight.*shape"):
+        layer.weight.weight_loader(layer.weight, value, *args)
+
+    torch.testing.assert_close(layer.weight, before)
+
+
+@pytest.mark.parametrize(
+    "rank,expected",
+    [
+        (0, [[1, 2, 3, 4], [2, 1, 4, 3]]),
+        (1, [[5, 6, 7, -8], [6, 5, -8, 7]]),
+    ],
+)
+def test_row_packed_weight_loads_exact_tp_input_slice(
+    tmp_path,
+    monkeypatch,
+    rank,
+    expected,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind="row",
+        rank=rank,
+        tp=2,
+        input_size=8,
+    )
+    packed = torch.tensor(
+        [[0x21, 0x43, 0x65, 0x87], [0x12, 0x34, 0x56, 0x78]],
+        dtype=torch.uint8,
+    )
+
+    layer.weight.weight_loader(layer.weight, packed)
+
+    torch.testing.assert_close(layer.weight, torch.tensor(expected, dtype=torch.int8))
+
+
+@pytest.mark.parametrize(
+    "rank,expected",
+    [
+        (0, UNPACKED_DISTINCT_ROWS[:2]),
+        (1, UNPACKED_DISTINCT_ROWS[2:4]),
+    ],
+)
+def test_column_packed_weight_loads_exact_tp_output_slice(
+    tmp_path,
+    monkeypatch,
+    rank,
+    expected,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind="column",
+        rank=rank,
+        tp=2,
+    )
+    packed = torch.tensor(PACKED_DISTINCT_ROWS[:4], dtype=torch.uint8)
+
+    layer.weight.weight_loader(layer.weight, packed)
+
+    torch.testing.assert_close(layer.weight, torch.tensor(expected, dtype=torch.int8))
+
+
+@pytest.mark.parametrize(
+    "rank,row_indices",
+    [(0, [0, 1, 4, 5, 6]), (1, [2, 3, 7, 8, 9])],
+)
+def test_merged_packed_shards_load_exact_tp_output_offsets(
+    tmp_path,
+    monkeypatch,
+    rank,
+    row_indices,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind="merged",
+        rank=rank,
+        tp=2,
+    )
+    first = torch.tensor(PACKED_DISTINCT_ROWS[:4], dtype=torch.uint8)
+    second = torch.tensor(PACKED_DISTINCT_ROWS[4:10], dtype=torch.uint8)
+
+    layer.weight.weight_loader(layer.weight, first, loaded_shard_id=0)
+    layer.weight.weight_loader(layer.weight, second, loaded_shard_id=1)
+
+    expected = torch.tensor(
+        [UNPACKED_DISTINCT_ROWS[index] for index in row_indices],
+        dtype=torch.int8,
+    )
+    torch.testing.assert_close(layer.weight, expected)
+
+
+def test_merged_packed_tuple_loads_exact_nonfull_subset(
+    tmp_path,
+    monkeypatch,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind="merged",
+        rank=1,
+        tp=2,
+        output_sizes=[4, 6, 8],
+    )
+    layer.weight.data.fill_(99)
+    packed = torch.tensor(PACKED_DISTINCT_ROWS[:10], dtype=torch.uint8)
+
+    layer.weight.weight_loader(layer.weight, packed, loaded_shard_id=(0, 1))
+
+    expected = torch.tensor(
+        [
+            *[UNPACKED_DISTINCT_ROWS[index] for index in [2, 3, 7, 8, 9]],
+            *[[99, 99, 99, 99]] * 4,
+        ],
+        dtype=torch.int8,
+    )
+    torch.testing.assert_close(layer.weight, expected)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("fused", [False, True])
+def test_qkv_packed_weight_preserves_tp_and_kv_replication(
+    tmp_path,
+    monkeypatch,
+    rank,
+    fused,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind="qkv",
+        rank=rank,
+        tp=2,
+    )
+    packed = torch.tensor(PACKED_DISTINCT_ROWS, dtype=torch.uint8)
+    if fused:
+        layer.weight.weight_loader(layer.weight, packed)
+    else:
+        layer.weight.weight_loader(
+            layer.weight,
+            packed[:8],
+            loaded_shard_id="q",
+        )
+        layer.weight.weight_loader(
+            layer.weight,
+            packed[8:10],
+            loaded_shard_id="k",
+        )
+        layer.weight.weight_loader(
+            layer.weight,
+            packed[10:12],
+            loaded_shard_id="v",
+        )
+
+    q_rows = range(0, 4) if rank == 0 else range(4, 8)
+    expected = torch.tensor(
+        [UNPACKED_DISTINCT_ROWS[index] for index in [*q_rows, 8, 9, 10, 11]],
+        dtype=torch.int8,
+    )
+    torch.testing.assert_close(layer.weight, expected)
+
+
+@pytest.mark.parametrize(
+    "kind,tp,input_size",
+    [("row", 2, 6), ("column", 1, 3), ("merged", 1, 3), ("qkv", 1, 3)],
+)
+def test_linear_packed_weight_rejects_odd_input_partition(
+    tmp_path,
+    monkeypatch,
+    kind,
+    tp,
+    input_size,
+):
+    with pytest.raises(ValueError, match="HYV4 INT4 requires an even"):
+        _scale_linear(
+            tmp_path,
+            monkeypatch,
+            False,
+            kind=kind,
+            tp=tp,
+            input_size=input_size,
+        )
+
+
+@pytest.mark.parametrize(
+    "kind,updates,shape,error",
+    [
+        ("row", {"tp_size": 0}, (2, 4), "tp_size"),
+        ("row", {"tp_size": True}, (2, 4), "tp_size"),
+        ("row", {"tp_rank": 2}, (2, 4), "tp_rank"),
+        ("row", {"tp_rank": True}, (2, 4), "tp_rank"),
+        ("row", {"tp_size": 3}, (2, 4), "divisible"),
+        ("row", {"tp_rank": 0}, (2, 4), "changed after allocation"),
+        ("column", {"tp_size": 1, "tp_rank": 0}, (4, 4), "changed after allocation"),
+        ("merged", {"tp_size": 1, "tp_rank": 0}, (10, 4), "changed after allocation"),
+        ("qkv", {"tp_size": 1, "tp_rank": 0}, (12, 4), "changed after allocation"),
+    ],
+)
+def test_linear_packed_weight_rejects_invalid_tp_metadata(
+    tmp_path,
+    monkeypatch,
+    kind,
+    updates,
+    shape,
+    error,
+):
+    _, layer = _scale_linear(
+        tmp_path,
+        monkeypatch,
+        False,
+        kind=kind,
+        rank=1,
+        tp=2,
+        input_size=8,
+    )
+    for field, value in updates.items():
+        setattr(layer, field, value)
+    weight = torch.full(shape, 0x11, dtype=torch.uint8)
+    before = layer.weight.clone()
+
+    with pytest.raises(ValueError, match=f"HYV4.*{error}"):
+        layer.weight.weight_loader(layer.weight, weight)
+
+    torch.testing.assert_close(layer.weight, before)
 
 
 def _scale_experts(tmp_path, native, tp=1, rank=0, padded=False):
