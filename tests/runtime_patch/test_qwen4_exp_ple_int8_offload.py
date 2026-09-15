@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""CPU-side tests for the Qwen4Exp PLE INT8 CPU-offload lookup path.
-
-These tests run on CPU only (no accelerator required): they verify the
-dequantization numerics, N-D id handling, and config-driven method selection.
-The device staging in ``_pinned_int8_lookup`` is a no-op when the ids already
-live on CPU, so the same code path is exercised.
-"""
+"""Tests for the Qwen4Exp PLE INT8 UVA CPU-offload path."""
 
 import ast
 import os
@@ -101,57 +95,51 @@ def _storage_class(quant_config):
     return patch._make_storage_class(module, quant_config)
 
 
-def test_pinned_lookup_matches_gpu_resident_dequant_1d():
-    weight, weight_scale = _make_table(32, 16)
-    ids = torch.tensor([0, 5, 31, 5, 0], dtype=torch.long)
+def test_uva_post_load_keeps_parameter_storage_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.model_loader import utils as loader_utils
 
-    got = patch._pinned_int8_lookup(weight, weight_scale, ids, torch.bfloat16)
-    want = _reference(weight, weight_scale, ids, torch.bfloat16)
+    layer = torch.nn.Module()
+    layer.quant_method = patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.empty((4, 3), dtype=torch.int8), requires_grad=False),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(
+            torch.empty((4, 1), dtype=torch.bfloat16), requires_grad=False
+        ),
+    )
+    model = torch.nn.Module()
+    model.embedding = layer
+    weight_ptr = layer.weight.data_ptr()
+    scale_ptr = layer.weight_scale.data_ptr()
+    staged_modules = []
 
-    assert got.shape == (5, 16)
-    assert got.dtype == torch.bfloat16
-    assert torch.equal(got, want)
+    def track_staging(module, target_device):
+        staged_modules.append((module, target_device))
+        return pytest.fail("CPU-offloaded PLE must not enter device staging")
 
-
-def test_pinned_lookup_preserves_ngram_2d_shape():
-    # ids arrive as [num_tokens, ngram_heads]; row axis is flattened for the
-    # gather and restored on the output as [num_tokens, ngram_heads, dim].
-    weight, weight_scale = _make_table(64, 8)
-    ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
-
-    got = patch._pinned_int8_lookup(weight, weight_scale, ids, torch.bfloat16)
-    want = _reference(weight, weight_scale, ids, torch.bfloat16)
-
-    assert got.shape == (2, 3, 8)
-    assert torch.equal(got, want)
-
-
-def test_offload_method_embedding_matches_resident_method():
-    weight, weight_scale = _make_table(48, 12)
-    ids = torch.tensor([2, 2, 47, 0], dtype=torch.long)
-
-    resident = patch.HcuQwen4ExpPLEInt8EmbeddingMethod()
-    offload = patch.HcuQwen4ExpPLEInt8OffloadEmbeddingMethod()
-    layer = SimpleNamespace(
-        weight=weight,
-        weight_scale=weight_scale,
-        params_dtype=torch.bfloat16,
+    monkeypatch.setattr(loader_utils, "device_loading_context", track_staging)
+    monkeypatch.setattr(loader_utils, "maybe_retie_word_embeddings", lambda *args: None)
+    monkeypatch.setattr(
+        loader_utils, "release_device_memory_under_pressure", lambda *args: None
     )
 
-    resident_out = resident.embedding(layer, ids)
-    offload_out = offload.embedding(layer, ids)
-
-    assert torch.equal(resident_out, offload_out)
-
-
-def test_offload_method_is_subclass_for_loader_isinstance():
-    # The ngram loader gates INT8 shard routing on isinstance against the
-    # resident method; the offload method must remain a subclass so offloaded
-    # runs still route scale shards correctly.
-    assert issubclass(
-        patch.HcuQwen4ExpPLEInt8OffloadEmbeddingMethod,
-        patch.HcuQwen4ExpPLEInt8EmbeddingMethod,
+    loader_utils.process_weights_after_loading(
+        model,
+        SimpleNamespace(quantization=None),
+        torch.device("cuda"),
     )
+
+    assert layer.quant_method.requires_device_loading is False
+    assert layer.weight.device.type == "cpu"
+    assert layer.weight_scale.device.type == "cpu"
+    assert layer.weight.data_ptr() == weight_ptr
+    assert layer.weight_scale.data_ptr() == scale_ptr
+    assert staged_modules == []
 
 
 def test_offload_toggle_falls_back_to_hcu_environment(monkeypatch):
@@ -186,32 +174,56 @@ def test_missing_engram_config_uses_hcu_environment(monkeypatch):
         assert patch._should_offload_ple_to_cpu() is True
 
 
-@pytest.mark.parametrize(
-    ("configured", "legacy", "expected_method"),
-    (
-        (False, "1", patch.HcuQwen4ExpPLEInt8EmbeddingMethod),
-        (True, "0", patch.HcuQwen4ExpPLEInt8OffloadEmbeddingMethod),
-    ),
-)
-def test_explicit_engram_config_controls_storage_method(
-    monkeypatch, configured, legacy, expected_method
-):
+def test_explicit_disabled_engram_config_uses_resident_method(monkeypatch):
     prefix = "model.layers.0.ple.ple_embedding.ngram_embedding"
     storage_class = _storage_class(_int8_quant_config(prefix))
-    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", legacy)
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
     monkeypatch.setattr(patch, "_is_uva_available", lambda: False)
     vllm_config = SimpleNamespace(
-        engram_config=SimpleNamespace(cpu_offload=configured),
+        engram_config=SimpleNamespace(cpu_offload=False),
         quant_config=None,
     )
 
     with set_current_vllm_config(vllm_config):
         embedding = storage_class(prefix=prefix, params_dtype=torch.bfloat16)
 
-    assert isinstance(embedding.quant_method, expected_method)
+    assert isinstance(
+        embedding.quant_method, patch.HcuQwen4ExpPLEInt8EmbeddingMethod
+    )
 
 
-def test_create_weights_allocates_on_cpu():
+def test_cpu_offload_requires_uva_operator(monkeypatch):
+    prefix = "model.layers.0.ple.ple_embedding.ngram_embedding"
+    storage_class = _storage_class(_int8_quant_config(prefix))
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: False)
+    vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=True),
+        quant_config=None,
+    )
+
+    with set_current_vllm_config(vllm_config):
+        with pytest.raises(RuntimeError, match="CPU offload requires the HCU UVA"):
+            storage_class(prefix=prefix, params_dtype=torch.bfloat16)
+
+
+def test_cpu_offload_selects_uva_method(monkeypatch):
+    prefix = "model.layers.0.ple.ple_embedding.ngram_embedding"
+    storage_class = _storage_class(_int8_quant_config(prefix))
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=True),
+        quant_config=None,
+    )
+
+    with set_current_vllm_config(vllm_config):
+        embedding = storage_class(prefix=prefix, params_dtype=torch.bfloat16)
+
+    assert isinstance(
+        embedding.quant_method, patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod
+    )
+
+
+def test_uva_create_weights_allocates_on_cpu():
     import vllm.distributed.parallel_state as ps
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -230,7 +242,7 @@ def test_create_weights_allocates_on_cpu():
             )
             initialize_model_parallel(tensor_model_parallel_size=1)
 
-        method = patch.HcuQwen4ExpPLEInt8OffloadEmbeddingMethod()
+        method = patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
         layer = torch.nn.Module()
         method.create_weights(
             layer,
@@ -262,8 +274,8 @@ _needs_cuda = pytest.mark.skipif(
 
 
 def test_uva_method_is_subclass_for_loader_isinstance():
-    # Same isinstance gate as the offload variant: the ngram loader routes INT8
-    # scale shards by isinstance against the resident method.
+    # The ngram loader routes INT8 scale shards by isinstance against the
+    # resident method, so the UVA method must remain its subclass.
     assert issubclass(
         patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod,
         patch.HcuQwen4ExpPLEInt8EmbeddingMethod,

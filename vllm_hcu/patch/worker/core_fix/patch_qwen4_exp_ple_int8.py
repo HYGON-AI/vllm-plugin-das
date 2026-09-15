@@ -10,8 +10,8 @@ and its shard loader at worker startup.
 When EngramConfig.cpu_offload is enabled, the INT8 PLE weights are allocated
 in CPU pinned memory instead of GPU. The legacy VLLM_HCU_PLE_CPU_OFFLOAD
 environment variable remains a fallback when EngramConfig is omitted. The
-lookup prefers the HCU UVA bridge and falls back to explicit H2D staging when
-that bridge is unavailable.
+offload path requires the HCU UVA bridge and fails during model initialization
+when that bridge is unavailable.
 """
 
 from __future__ import annotations
@@ -173,51 +173,6 @@ class HcuQwen4ExpPLEInt8EmbeddingMethod(QuantizeMethodBase):
         return embeddings.to(output_dtype) * scales.to(output_dtype)
 
 
-def _pinned_int8_lookup(
-    weight_cpu: torch.Tensor,
-    weight_scale_cpu: torch.Tensor,
-    ids: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """INT8 pinned-host lookup with explicit H2D staging (Phase 2/3 fallback).
-
-    Gathers the requested rows on the host side from the CPU pinned INT8 table
-    and BF16 per-row scales, stages the *narrow* gathered slices to the
-    accelerator, and dequantizes there:
-
-        output[row, d] = float(weight[id, d]) * float(weight_scale[id, 0])
-
-    Only the looked-up rows cross the PCIe bus, not the whole table.  The base
-    ``VocabParallelEmbedding.forward`` has already clamped ``ids`` into the
-    local ETP range and will zero non-owner rows *after* this call, so no bounds
-    handling or ETP communication happens here.
-
-    ``ids`` may be N-D (e.g. ``[num_tokens, ngram_heads]``); the row axis is
-    flattened for the gather and restored on the output.
-    """
-    device = ids.device
-    id_shape = tuple(ids.shape)
-    flat_ids = ids.reshape(-1)
-
-    # Host-side gather. ``weight_cpu`` is pinned CPU memory; indexing it
-    # requires host-resident indices, so move ids to CPU first. This D2H sync
-    # is the source of the fallback's added latency and blocks CUDA graph
-    # capture (tracked for the native HCU UVA bridge in a later phase).
-    host_ids = flat_ids.to(device="cpu", dtype=torch.long)
-    gathered_weight = weight_cpu.index_select(0, host_ids)
-    gathered_scale = weight_scale_cpu.index_select(0, host_ids)
-
-    # Stage the narrow gathered slices to the accelerator. Pin the staging
-    # source when possible so the H2D copy can overlap.
-    if gathered_weight.device != device:
-        gathered_weight = gathered_weight.to(device=device, non_blocking=True)
-        gathered_scale = gathered_scale.to(device=device, non_blocking=True)
-
-    embedding_dim = weight_cpu.shape[1]
-    output = gathered_weight.to(output_dtype) * gathered_scale.to(output_dtype)
-    return output.reshape(*id_shape, embedding_dim)
-
-
 class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
     """INT8 PLE lookup with UVA zero-copy from CPU pinned memory.
 
@@ -227,6 +182,10 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
     """
 
     supports_prefetch = True
+    # The PLE tables are already in their final pinned-host representation.
+    # Post-load only invalidates cached UVA views and records diagnostics, so
+    # staging the complete tables on the accelerator is unnecessary.
+    requires_device_loading = False
 
     def create_weights(
         self,
@@ -242,8 +201,8 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
         weight_loader = extra_weight_attrs["weight_loader"]
         rows = sum(output_partition_sizes)
         pin = _is_pin_memory_available()
-        # Allocate on CPU pinned memory, then wrap with UVA views in
-        # process_weights_after_loading
+        # Allocate directly in CPU pinned memory. UVA views are created lazily
+        # after weight loading, either by prepare_prefetch or the first lookup.
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
@@ -275,17 +234,13 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # NOTE: This runs inside ``device_loading_context`` where params are
-        # transiently on the accelerator, then restored to CPU pinned memory.
-        # ``get_cuda_view_from_cpu_tensor`` only accepts CPU pinned input, so we
-        # cannot create the UVA view here. The view is created lazily on the
-        # first ``embedding`` call, when ``layer.weight`` is back on CPU pinned.
+        # This runs in place while the parameters remain in pinned CPU memory.
+        # Recreate the view after every load/reload so it cannot reference stale
+        # storage if an external loader replaced either parameter.
         weight = getattr(layer, "weight", None)
         weight_scale = getattr(layer, "weight_scale", None)
         if weight is None or weight_scale is None:
             return
-        # device_loading_context creates new CPU tensors after this method
-        # returns. Any view from an earlier load/reload must not survive it.
         layer._hcu_uva_views = None
         offloaded_bytes = (
             weight.numel() * weight.element_size()
@@ -361,101 +316,6 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
         return embeddings.to(output_dtype) * scales.to(output_dtype)
 
 
-class HcuQwen4ExpPLEInt8OffloadEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
-    """INT8 PLE lookup with the weight table offloaded to CPU pinned memory.
-
-    Identical numerics to :class:`HcuQwen4ExpPLEInt8EmbeddingMethod`; the only
-    differences are (1) ``weight``/``weight_scale`` are allocated on CPU pinned
-    memory rather than the ambient accelerator device, and (2) ``embedding``
-    gathers rows on the host and stages them to the accelerator.
-
-    This is the H2D fallback variant used when UVA is unavailable.
-    """
-
-    supports_prefetch = False
-
-    def create_weights(
-        self,
-        layer: nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        del input_size, output_size, params_dtype
-        weight_loader = extra_weight_attrs["weight_loader"]
-        rows = sum(output_partition_sizes)
-        pin = _is_pin_memory_available()
-        # Explicitly allocate on CPU (pinned when possible), overriding the
-        # ambient ``with target_device:`` context used during model init. This
-        # keeps the table off the accelerator; ``device_loading_context`` moves
-        # it to the device only transiently for post-load processing and then
-        # restores it to CPU pinned memory.
-        layer.register_parameter(
-            "weight",
-            ModelWeightParameter(
-                data=torch.empty(
-                    rows,
-                    input_size_per_partition,
-                    dtype=torch.int8,
-                    device="cpu",
-                    pin_memory=pin,
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-        layer.register_parameter(
-            "weight_scale",
-            ChannelQuantScaleParameter(
-                data=torch.empty(
-                    rows,
-                    1,
-                    dtype=torch.bfloat16,
-                    device="cpu",
-                    pin_memory=pin,
-                ),
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # Runs inside ``device_loading_context``: params are temporarily on the
-        # accelerator here, then restored to CPU pinned memory afterwards. Log
-        # the offloaded footprint for verification (Phase 8 memory accounting).
-        weight = getattr(layer, "weight", None)
-        weight_scale = getattr(layer, "weight_scale", None)
-        if weight is None or weight_scale is None:
-            return
-        offloaded_bytes = (
-            weight.numel() * weight.element_size()
-            + weight_scale.numel() * weight_scale.element_size()
-        )
-        logger.info_once(
-            "Qwen4Exp PLE INT8 CPU offload active: %.3f MiB per ETP rank "
-            "(weight=%s, weight_scale=%s)",
-            offloaded_bytes / (1024**2),
-            tuple(weight.shape),
-            tuple(weight_scale.shape),
-        )
-
-    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        # ``layer.weight``/``layer.weight_scale`` live on CPU pinned memory.
-        # Gather-on-host, stage the narrow slices to the accelerator, then
-        # dequantize to BF16 there so the base forward's ``masked_fill_`` and
-        # the ETP all-reduce receives a device-resident floating-point tensor.
-        return _pinned_int8_lookup(
-            layer.weight,
-            layer.weight_scale,
-            input_,
-            layer.params_dtype,
-        )
-
-
 def _make_storage_class(module: ModuleType, quant_config):
     base = module.PLEVocabParallelEmbedding
     if getattr(base, _CLASS_MARKER, False):
@@ -480,20 +340,14 @@ def _make_storage_class(module: ModuleType, quant_config):
             )
             if use_int8:
                 if _should_offload_ple_to_cpu():
-                    # Prefer UVA zero-copy when available (§11.6 validation)
-                    if _is_uva_available():
-                        kwargs["quant_method"] = (
-                            HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+                    if not _is_uva_available():
+                        raise RuntimeError(
+                            "Qwen4Exp PLE INT8 CPU offload requires the HCU UVA "
+                            "operator torch.ops._C.get_cuda_view_from_cpu_tensor, "
+                            "but it is unavailable. Install a compatible "
+                            "vLLM/vllm-plugin-das build or disable PLE CPU offload."
                         )
-                    else:
-                        # Fallback to explicit H2D when UVA op is missing
-                        logger.warning_once(
-                            "UVA zero-copy unavailable, using H2D fallback "
-                            "(blocks CUDA graph capture)"
-                        )
-                        kwargs["quant_method"] = (
-                            HcuQwen4ExpPLEInt8OffloadEmbeddingMethod()
-                        )
+                    kwargs["quant_method"] = HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
                 else:
                     kwargs["quant_method"] = HcuQwen4ExpPLEInt8EmbeddingMethod()
                 if kwargs.get("params_dtype") is None:

@@ -430,14 +430,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Compatibility fallback for Qwen4Exp PLE INT8 CPU offload when the target
     # VllmConfig has no EngramConfig. An explicit EngramConfig.cpu_offload value
-    # takes precedence. Prefers UVA zero-copy and falls back to explicit H2D
-    # staging when the UVA operator is unavailable.
+    # takes precedence. CPU offload requires the HCU UVA operator.
     "VLLM_HCU_PLE_CPU_OFFLOAD":
         lambda: (os.environ.get("VLLM_HCU_PLE_CPU_OFFLOAD", "False").lower() in
                     ("true", "1")),
 
     # Overlap Qwen4Exp PLE INT8 UVA lookup with preceding model compute. This
-    # is intentionally opt-in and does not enable FP8 or H2D-fallback prefetch.
+    # is intentionally opt-in and does not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         lambda: (os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in
                     ("true", "1")),

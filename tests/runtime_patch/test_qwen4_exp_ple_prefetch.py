@@ -63,9 +63,6 @@ def test_prefetch_gate_is_int8_uva_only(monkeypatch, ple_layer):
     assert ple_layer._prefetch_method_enabled(_capable_method()) is True
     assert ple_layer._prefetch_method_enabled(SimpleNamespace()) is False
     assert int8_patch.HcuQwen4ExpPLEInt8EmbeddingMethod.supports_prefetch is False
-    assert (
-        int8_patch.HcuQwen4ExpPLEInt8OffloadEmbeddingMethod.supports_prefetch is False
-    )
     assert int8_patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod.supports_prefetch is True
 
     monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "0")
