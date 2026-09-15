@@ -68,6 +68,8 @@ if TYPE_CHECKING:
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
+    VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
+    VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -424,6 +426,19 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Enable request-count-oriented cudagraph capture buckets up to request size 256.
     "VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS":
         lambda: (os.environ.get("VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS", "False").lower() in
+                    ("true", "1")),
+
+    # Compatibility fallback for Qwen4Exp PLE INT8 CPU offload when the target
+    # VllmConfig has no EngramConfig. An explicit EngramConfig.cpu_offload value
+    # takes precedence. CPU offload requires the HCU UVA operator.
+    "VLLM_HCU_PLE_CPU_OFFLOAD":
+        lambda: (os.environ.get("VLLM_HCU_PLE_CPU_OFFLOAD", "False").lower() in
+                    ("true", "1")),
+
+    # Overlap Qwen4Exp PLE INT8 UVA lookup with preceding model compute. This
+    # is intentionally opt-in and does not enable FP8 prefetch.
+    "VLLM_HCU_PLE_PREFETCH_STREAM":
+        lambda: (os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in
                     ("true", "1")),
 }
 

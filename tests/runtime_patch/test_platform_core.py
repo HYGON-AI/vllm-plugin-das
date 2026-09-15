@@ -7,12 +7,13 @@ import logging
 import os
 import re
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.platform.core_fix import (
+    patch_engram_config,
     patch_envs,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
@@ -45,6 +46,125 @@ def _clear_vllm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in tuple(os.environ):
         if name.startswith("VLLM_"):
             monkeypatch.delenv(name, raising=False)
+
+
+def _engram_module() -> tuple[ModuleType, type]:
+    class FakeEngramConfig:
+        def verify_model_config(self, model_config):
+            from vllm.platforms import current_platform
+
+            supported_architectures = {
+                "Qwen4ExpForCausalLM",
+                "Qwen4ExpForConditionalGeneration",
+            }
+            if (
+                model_config is None
+                or model_config.architecture not in supported_architectures
+                or not current_platform.is_cuda()
+                or not getattr(model_config.hf_text_config, "ple_layer_ids", None)
+            ):
+                raise ValueError("unsupported Engram configuration")
+
+    return (
+        _module(patch_engram_config.TARGET_MODULE, EngramConfig=FakeEngramConfig),
+        FakeEngramConfig,
+    )
+
+
+def _install_fake_platform(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cuda: bool,
+    cuda_alike: bool,
+) -> None:
+    platform_module = _module(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_cuda=lambda: cuda,
+            is_cuda_alike=lambda: cuda_alike,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platform_module)
+
+
+def _model_config(
+    architecture: str = "Qwen4ExpForConditionalGeneration",
+    ple_layer_ids: list[int] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        architecture=architecture,
+        hf_text_config=SimpleNamespace(
+            ple_layer_ids=[1] if ple_layer_ids is None else ple_layer_ids
+        ),
+    )
+
+
+def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module, engram_config = _engram_module()
+    original = engram_config.verify_model_config
+    _install_fake_platform(monkeypatch, cuda=False, cuda_alike=True)
+
+    assert patch_engram_config.apply(module) is True
+    assert patch_engram_config.apply(module) is False
+    engram_config().verify_model_config(_model_config())
+
+    wrapped = engram_config.verify_model_config
+    assert wrapped.__wrapped__ is original
+    assert engram_config._vllm_hcu_original_verify_model_config is original
+    record = PATCH_REGISTRY.get(patch_engram_config.PATCH_ID)
+    assert record is not None and record.status is PatchStatus.APPLIED
+    assert record.targets == patch_engram_config.TARGETS
+
+
+@pytest.mark.parametrize(
+    ("cuda", "cuda_alike", "model_config"),
+    [
+        (False, False, _model_config()),
+        (False, True, _model_config("UnsupportedArchitecture")),
+        (False, True, _model_config(ple_layer_ids=[])),
+        (False, True, None),
+    ],
+)
+def test_engram_config_preserves_upstream_rejections(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda: bool,
+    cuda_alike: bool,
+    model_config: SimpleNamespace | None,
+):
+    module, engram_config = _engram_module()
+    _install_fake_platform(monkeypatch, cuda=cuda, cuda_alike=cuda_alike)
+    patch_engram_config.apply(module)
+
+    with pytest.raises(ValueError, match="unsupported Engram configuration"):
+        engram_config().verify_model_config(model_config)
+
+
+def test_engram_config_rejects_signature_and_source_contract_drift():
+    class BadSignature:
+        def verify_model_config(self, model_config, extra=None):
+            return None
+
+    bad_signature = _module(
+        patch_engram_config.TARGET_MODULE,
+        EngramConfig=BadSignature,
+    )
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_engram_config.apply(bad_signature)
+
+    PATCH_REGISTRY.reset_for_tests()
+
+    class BadContract:
+        def verify_model_config(self, model_config):
+            return None
+
+    bad_contract = _module(
+        patch_engram_config.TARGET_MODULE,
+        EngramConfig=BadContract,
+    )
+    with pytest.raises(PatchCompatibilityError, match="incompatible source contract"):
+        patch_engram_config.apply(bad_contract)
 
 
 def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
