@@ -749,7 +749,8 @@ def test_partition_pads_each_rank_to_equal_width_and_remaps_logits() -> None:
         ).tolist()
 
 
-def test_restore_returns_global_token_and_request_order() -> None:
+@pytest.mark.parametrize("pcp_size", [2, 4])
+def test_restore_returns_global_token_and_request_order(pcp_size: int) -> None:
     """Rank-order concatenation without the global mapping must scramble output."""
 
     global_batch = _make_batch(
@@ -759,7 +760,7 @@ def test_restore_returns_global_token_and_request_order() -> None:
             ("b", list(range(200, 209)), 9, True),
         ]
     )
-    managers, groups = _make_managers()
+    managers, groups = _make_managers(pcp_size)
     local_batches = [manager.partition_batch(global_batch) for manager in managers]
     local_hidden = [
         local.input_ids.to(torch.float32).unsqueeze(1)
@@ -775,6 +776,29 @@ def test_restore_returns_global_token_and_request_order() -> None:
         sampled_hidden, sampled_batch = manager.restore_for_sampling(local)
         assert sampled_hidden[:, 0].tolist() == expected.tolist()
         assert sampled_batch is global_batch
+
+
+def test_hyv4_pcp_batch_only_restore_requires_a_partitioned_batch() -> None:
+    managers, groups = _make_managers(4)
+    for manager, group in zip(managers, groups):
+        with pytest.raises(RuntimeError, match="global batch.*not prepared"):
+            manager.restore_global_batch()
+        assert group.collective_calls == 0
+
+
+def test_hyv4_pcp_batch_only_restore_preserves_exact_latest_global_batch() -> None:
+    managers, groups = _make_managers(4)
+    for global_batch in (
+        _make_batch([("prefill", list(range(101, 108)), 7, True),
+                     ("decode", [501], 20, False)]),
+        _make_batch([("decode", [502], 21, False)]),
+    ):
+        snapshot = _snapshot_batch(global_batch)
+        for manager, group in zip(managers, groups):
+            manager.partition_batch(global_batch)
+            assert manager.restore_global_batch() is global_batch
+            _assert_batch_matches_snapshot(global_batch, snapshot)
+            assert group.collective_calls == 0
 
 
 def test_dummy_slots_are_invalid_without_touching_real_block_tables() -> None:

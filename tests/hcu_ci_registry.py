@@ -9,8 +9,124 @@ partitioning; update it from observed job artifacts when runtimes drift.
 
 from __future__ import annotations
 
-# This source is intentionally not imported. The CI control plane parses these
-# calls as literals, so adding imports or runtime-generated values is forbidden.
+# The CI control plane parses calls as literals; runtime-generated metadata is
+# forbidden. The no-op keeps explicit pytest collection safe without imports.
+def register_hcu_ci(
+    *, job: str, target: str, est_time: float, disabled: str | None = None,
+) -> None:
+    """Registration data is consumed by the static AST reader, not at import."""
+
+
+# Portable HYV4 contracts run in full on the existing provisioned runner.
+# These registrations do not claim checkpoint or accelerator validation.
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/accuracy/test_hyv4_native_format.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/accuracy/test_hyv4_w4a8_kernels.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/hy_v4/test_parsers.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/hy_v4/test_registration.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/integration/models/test_hy_v4_smoke.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_attention.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_custom_w4a8.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_eplb.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_hc.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_indexer_pcp.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_moe.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_mtp.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_mtp_config.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_packed_expert_extent.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_registration.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_runtime_config.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/hy_v4/test_weight_loading.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/integration/test_model_runtime_cli.py",
+    est_time=60,
+)
+
 
 
 register_hcu_ci(

@@ -173,12 +173,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         execute_model_state = self.execute_model_state
         use_replicated_mtp_batch = False
         if self.pcp_manager is not None and execute_model_state is not None:
-            (
-                restored_hidden_states,
-                restored_input_batch,
-            ) = self.pcp_manager.restore_for_sampling(
-                execute_model_state.hidden_states
-            )
+            if (
+                execute_model_state.hidden_states is None
+                and not self.is_last_pp_rank
+            ):
+                # Upstream PP receive consumes the global request batch. This
+                # stage produced IntermediateTensors, so there is no final
+                # hidden-state tensor to gather across its PCP group.
+                restored_hidden_states = None
+                restored_input_batch = self.pcp_manager.restore_global_batch()
+            else:
+                (
+                    restored_hidden_states,
+                    restored_input_batch,
+                ) = self.pcp_manager.restore_for_sampling(
+                    execute_model_state.hidden_states
+                )
             execute_model_state = execute_model_state._replace(
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,

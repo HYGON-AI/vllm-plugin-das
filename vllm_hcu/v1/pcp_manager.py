@@ -937,6 +937,13 @@ class HcuPCPManager:
             ctx=context_plan,
         )
 
+    def restore_global_batch(self) -> InputBatch:
+        """Return the saved step batch without gathering non-final PP outputs."""
+
+        if self._global_batch is None:
+            raise RuntimeError("PCP global batch is not prepared")
+        return self._global_batch
+
     def restore_for_sampling(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, InputBatch]:

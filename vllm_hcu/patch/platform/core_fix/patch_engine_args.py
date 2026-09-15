@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass as official_dataclass
@@ -45,6 +46,12 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_custom_sp",
     "enable_multi_layers_mtp",
 )
+_HCU_EPLB_FIELDS = {
+    "expert_map_path": "expert_map_path",
+    "expert_map_record_path": "expert_map_record_path",
+    "disable_rearrange": "eplb_disable_rearrange",
+    "static_dispatch_policy": "eplb_static_dispatch_policy",
+}
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
@@ -116,6 +123,13 @@ def _normalise_constructor_kwargs(
         for name in _HCU_BOOLEAN_KWARGS
         if name in kwargs
     }
+    eplb_payload = kwargs.get("eplb_config")
+    if isinstance(eplb_payload, Mapping):
+        official_eplb = dict(eplb_payload)
+        for public, sidecar in _HCU_EPLB_FIELDS.items():
+            if public in official_eplb:
+                updates[sidecar] = official_eplb.pop(public)
+        kwargs["eplb_config"] = official_eplb
     # Bind after removing HCU-only keywords so positional official arguments
     # (especially additional_config) participate in normalization instead of
     # being overwritten by a default sidecar after construction.
@@ -523,6 +537,30 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_add_cli_args(parser):
         result = add_cli_args(parser)
         for action in getattr(result, "_actions", ()):
+            if getattr(action, "dest", None) == "eplb_config":
+                original_type = action.type
+                if not callable(original_type):
+                    raise PatchCompatibilityError("--eplb-config has no audited parser")
+
+                def parse_eplb(value):
+                    try:
+                        payload = json.loads(value)
+                    except (TypeError, ValueError):
+                        return original_type(value)
+                    if not isinstance(payload, dict) or not _HCU_EPLB_FIELDS.keys() & payload.keys():
+                        return original_type(value)
+                    official = {key: item for key, item in payload.items()
+                                if key not in _HCU_EPLB_FIELDS}
+                    # Keep upstream validation (including unknown official keys).
+                    # The constructor then moves only HCU fields to the sidecar.
+                    original_type(json.dumps(official))
+                    HcuFeatureConfig.from_mapping({sidecar: payload[public]
+                        for public, sidecar in _HCU_EPLB_FIELDS.items() if public in payload})
+                    return payload
+
+                action.type = parse_eplb
+                break
+        for action in getattr(result, "_actions", ()):
             if getattr(action, "dest", None) != "all2all_backend":
                 continue
             choices = getattr(action, "choices", None)
@@ -547,6 +585,9 @@ def apply_to_module(module: ModuleType) -> bool:
         feature_config = _normalise_existing_engine_args(self)
         config = create_engine_config(self, *args, **kwargs)
         set_hcu_config(config, feature_config)
+        for public, sidecar in _HCU_EPLB_FIELDS.items():
+            attribute = f"_vllm_hcu_{sidecar}"
+            setattr(config.parallel_config, attribute, getattr(feature_config, sidecar))
         if get_hcu_config(config) != feature_config:
             raise PatchCompatibilityError(
                 "VllmConfig did not retain the normalized HCU feature sidecar"

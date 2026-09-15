@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+# 定时调度器: 周期性触发各分支的 docker-image 构建工作流。
+# 镜像构建本身 (release-docker-image.yml) 只保留 workflow_dispatch 手动触发。
+
+name: docker-image-scheduler
+
+on:
+  schedule:
+    # 北京时间每天 22:30 (UTC 14:30)
+    - cron: '30 14 * * *'
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: 要触发镜像构建的分支, 逗号分隔
+        required: false
+        default: v0.25.1,v0.28.1-dev
+        type: string
+      run_test:
+        description: 触发构建时传递给 docker-image 的 run_test 参数
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  # gh workflow run 需要 actions:write; GITHUB_TOKEN 触发的 workflow_dispatch 例外地会真正运行
+  actions: write
+
+concurrency:
+  group: docker-image-scheduler
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    # 与 docker-image 构建任务同类的自托管节点, 需要能访问内网 Harbor 与 gh CLI
+    runs-on: bw1100
+    env:
+      REPO: ${{ github.repository }}
+      BRANCHES: ${{ inputs.branches || 'v0.25.1,v0.28.1-dev' }}
+      # 定时触发一律强制跑 citest
+      RUN_TEST: ${{ (github.event_name == 'schedule' || inputs.run_test != false) && 'true' || 'false' }}
+    steps:
+      - name: 触发各分支镜像构建
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          failed=()
+          IFS=',' read -ra branch_list <<< "$BRANCHES"
+          for branch in "${branch_list[@]}"; do
+            branch="$(echo "$branch" | xargs)"
+            [[ -z "$branch" ]] && continue
+            echo "触发 ${branch} 分支的镜像构建..."
+            if ! gh workflow run docker-image \
+                --repo "$REPO" \
+                --ref "$branch" \
+                -f run_test="$RUN_TEST"; then
+              failed+=("$branch")
+            fi
+          done
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            echo "以下分支触发失败: ${failed[*]}" >&2
+            exit 1
+          fi

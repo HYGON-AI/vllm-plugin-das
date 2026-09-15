@@ -331,6 +331,91 @@ def test_v32_hcu_indexer_impl_advertises_pcp_capability():
     assert _load_v32_sparse_indexer_class().supports_pcp is True
 
 
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("gfx938", [False, True])
+def test_hyv4_pcp4_indexer_keeps_slots_and_local_topk_order(
+    monkeypatch, rank, gfx938,
+):
+    """Cache gathers must not reorder Q/top-k or repeat replicated decode writes."""
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    rank_k = [torch.tensor(values, dtype=torch.float32).reshape(3, 1) for values in (
+        [500, 100, 107], [500, 101, 106], [500, 102, 105], [500, 103, 104],
+    )]
+    slots = torch.tensor([50, 10, 17, -1, 11, 16, -1, 12, 15, -1, 13, 14])
+    metadata = SimpleNamespace(
+        slot_mapping=slots, pcp_world_size=4, num_decode_tokens=1, num_prefills=2,
+    )
+    events = []
+
+    def gather(tensor, dim=0):
+        assert dim == 0
+        if tensor.ndim == 2:
+            torch.testing.assert_close(tensor, rank_k[rank][1:])
+            events.append("gather_k")
+            return torch.cat([values[1:] for values in rank_k])
+        torch.testing.assert_close(tensor, slots.reshape(4, 3)[rank, 1:])
+        events.append("gather_slots")
+        return slots.reshape(4, 3)[:, 1:].reshape(-1)
+
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: SimpleNamespace(
+        rank_in_group=rank, world_size=4, all_gather=gather,
+    ))
+    cache = {}
+
+    def cache_insert(k, actual_cache, cache_slots, *args):
+        assert actual_cache is cache
+        assert k[:, 0].tolist() == [500, 100, 107, 101, 106, 102, 105, 103, 104]
+        assert cache_slots.tolist() == [50, 10, 17, 11, 16, 12, 15, 13, 14]
+        actual_cache.update(zip(cache_slots.tolist(), k[:, 0].tolist()))
+        events.append("cache")
+
+    local_k = rank_k[rank]
+    q = local_k.clone()
+    hidden_states = local_k + 1000
+    weights = torch.ones_like(local_k)
+    topk_buffer = torch.full((5, 2), -77, dtype=torch.int32)
+    storage = topk_buffer.data_ptr()
+
+    def hcu_op(*args):
+        assert args[0] is hidden_states
+        assert args[3] is q
+        assert args[4] is local_k
+        assert args[5] is weights
+        assert args[-2] is topk_buffer
+        assert args[-1] is True
+        assert events == ["gather_k", "gather_slots", "cache"]
+        # Deterministic local query result; the custom-op/kernel is the hardware
+        # boundary. Only local rows can be published to the shared stage buffer.
+        topk_buffer[:3] = q.to(torch.int32).expand(3, 2)
+        events.append("topk")
+        return topk_buffer
+
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=SimpleNamespace(Tensor=torch.Tensor,
+            ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op))),
+        effective_pcp_world_size=pcp.effective_pcp_world_size,
+        get_forward_context=lambda: SimpleNamespace(attn_metadata={"indexer": metadata}),
+        maybe_gather_indexer_k=pcp.maybe_gather_indexer_k,
+        ops=SimpleNamespace(indexer_k_quant_and_cache=cache_insert),
+        on_gfx938=lambda: gfx938,
+        indexer_k_bf16_cache_triton=cache_insert,
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False, pcp_world_size=4, skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
+        quant_block_size=128, scale_fmt="e8m0", topk_tokens=2, head_dim=128,
+        max_model_len=64, max_total_seq_len=64, topk_indices_buffer=topk_buffer,
+    )
+    result = forward_hip(indexer, hidden_states, q, local_k, weights)
+    assert result is topk_buffer and result.data_ptr() == storage
+    assert result[:, 0].tolist() == rank_k[rank][:, 0].tolist() + [-77, -77]
+    assert cache == {50: 500, 10: 100, 11: 101, 12: 102, 13: 103,
+                     14: 104, 15: 105, 16: 106, 17: 107}
+    assert events == ["gather_k", "gather_slots", "cache", "topk"]
+
+
 def test_indexer_metadata_adapter_propagates_pcp_world_size():
     adapter = importlib.import_module(
         "vllm_hcu.patch.worker.op_opt.patch_mla_indexer"

@@ -57,6 +57,7 @@ def _worker(
     worker.tp_rank = 0
     worker.tp_size = 2
     worker.finished_recving_reqs = set()
+    worker._pp_layer_range = None
     return worker
 
 
@@ -737,7 +738,9 @@ def test_bootstrap_launch_is_owned_by_designated_tp_pp_dp_rank(
         mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=pp_rank)
     )
     config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
         parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
             local_engines_only=local_only,
             data_parallel_rank_local=dp_local,
             data_parallel_index=dp_index,
@@ -827,3 +830,247 @@ def test_ttft_transfer_identity(mooncake):
     assert mooncake.transfer_id_from_req(req_id, {"transfer_id": "explicit"}) == (
         "explicit"
     )
+
+
+@pytest.mark.parametrize("partition", ["41,37", " 41, 37 "])
+def test_mooncake_custom_pp_partition_and_stage_ranges(mooncake, monkeypatch, partition):
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", partition)
+    assert mooncake._normalize_pp_layer_partition(partition, 78, 2) == (41, 37)
+    assert mooncake._get_pp_stage_layer_range(78, 0, 2) == (0, 41)
+    assert mooncake._get_pp_stage_layer_range(78, 1, 2) == (41, 78)
+
+
+@pytest.mark.parametrize("partition", [
+    "", "41", "41,37,0", "41,,37", "41,36", "-1,79", "0,78",
+    "41.0,37", "+41,37", "True,37",
+])
+def test_mooncake_invalid_pp_partition_is_rejected(mooncake, monkeypatch, partition):
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", partition)
+    with pytest.raises(ValueError, match="partition"):
+        mooncake._get_pp_stage_layer_range(78, 0, 2)
+
+
+@pytest.mark.parametrize("layers,rank,size", [
+    (0, 0, 1), (78, -1, 2), (78, 2, 2), (78, 0, 0),
+    (1, 0, 2), (78, True, 2), (78.0, 0, 2),
+])
+def test_mooncake_invalid_pp_range_is_rejected(mooncake, monkeypatch, layers, rank, size):
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+    with pytest.raises(ValueError, match="PP"):
+        mooncake._get_pp_stage_layer_range(layers, rank, size)
+
+
+def test_mooncake_default_pp_ranges_keep_upstream_distribution(mooncake, monkeypatch):
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", None)
+    assert mooncake._get_pp_stage_layer_range(78, 0, 1) == (0, 78)
+    assert [mooncake._get_pp_stage_layer_range(10, rank, 4) for rank in range(4)] == [
+        (0, 2), (2, 5), (5, 8), (8, 10),
+    ]
+
+
+def test_mooncake_pp_registration_rejects_foreign_stage_layer(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker._pp_layer_range = (41, 78)
+    name = "model.layers.40.self_attn"
+    worker._layer_specs[name] = object()
+    worker._layer_group_indices[name] = 0
+    with pytest.raises(ValueError, match="stage.*41.*78"):
+        worker.register_kv_caches({name: torch.zeros((2, 2, 1, 2, 2))})
+    assert worker.engine.calls == []
+
+
+@pytest.mark.parametrize("local_tp,remote_tp", [(1, 1), (2, 4), (4, 2)])
+@pytest.mark.parametrize("local_payload,remote_payload", [(8, 4), (4, 8)])
+def test_mooncake_replicated_regions_reject_mismatched_lengths(
+    mooncake, local_tp, remote_tp, local_payload, remote_payload,
+):
+    local, remote = _single_group_regions(
+        mooncake, local_payload=local_payload, remote_payload=remote_payload,
+    )
+    error = mooncake._validate_asymmetric_region_lengths(
+        local, remote, local_tp, remote_tp, True,
+    )
+    assert error is not None and "replicated" in error
+
+
+@pytest.mark.parametrize("local_tp,remote_tp,local_payload,remote_payload,replicated", [
+    (1, 1, 8, 8, False), (4, 2, 4, 8, False), (2, 4, 8, 4, False),
+    (1, 1, 8, 8, True), (4, 2, 8, 8, True), (2, 4, 8, 8, True),
+])
+def test_mooncake_valid_asymmetric_region_lengths(
+    mooncake, local_tp, remote_tp, local_payload, remote_payload, replicated,
+):
+    local, remote = _single_group_regions(
+        mooncake, local_payload=local_payload, remote_payload=remote_payload,
+    )
+    assert mooncake._validate_asymmetric_region_lengths(
+        local, remote, local_tp, remote_tp, replicated,
+    ) is None
+
+
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize("callable_flag", [True, False])
+def test_mooncake_dense_flag_accepts_boolean_properties_and_methods(
+    mooncake, flag, callable_flag,
+):
+    tensor = SimpleNamespace(
+        is_non_overlapping_and_dense=(lambda: flag) if callable_flag else flag,
+    )
+    assert mooncake._get_tensor_dense_flag(tensor) is flag
+
+
+@pytest.mark.parametrize("flag", [1, "false", lambda: "true"])
+def test_mooncake_dense_flag_rejects_truthy_non_booleans(mooncake, flag):
+    with pytest.raises(ValueError, match="dense.*bool"):
+        mooncake._get_tensor_dense_flag(SimpleNamespace(is_non_overlapping_and_dense=flag))
+
+
+def test_mooncake_dense_flag_missing_is_unknown(mooncake):
+    assert mooncake._get_tensor_dense_flag(SimpleNamespace()) is None
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer", "kv_both", None])
+def test_hyv4_producer_only_pcp_launches_one_bootstrap_per_global_first_rank(
+    mooncake, monkeypatch, role,
+):
+    from vllm.distributed import parallel_state
+
+    # GroupCoordinator.rank is global; each PCP group is strided across TP.
+    group = object.__new__(parallel_state.GroupCoordinator)
+    monkeypatch.setattr(parallel_state, "_PCP", group)
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_rank", lambda: group.rank % 2)
+    monkeypatch.setattr(mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0))
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4, local_engines_only=False,
+            data_parallel_index=0,
+        ),
+    )
+    owners = []
+    for global_rank in range(8):
+        group.rank = global_rank
+        group.ranks = [0, 2, 4, 6] if global_rank % 2 == 0 else [1, 3, 5, 7]
+        group.rank_in_group = global_rank // 2
+        if mooncake.should_launch_bootstrap_server(config):
+            owners.append(global_rank)
+    assert owners == ([0] if role == "kv_producer" else [])
+
+
+@pytest.mark.parametrize("role,expected", [
+    ("kv_producer", True), ("kv_both", True), ("kv_consumer", False), (None, False),
+])
+def test_mooncake_pp1_bootstrap_preserves_sending_roles(mooncake, monkeypatch, role, expected):
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0))
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1, local_engines_only=False,
+            data_parallel_index=0,
+        ),
+    )
+    assert mooncake.should_launch_bootstrap_server(config) is expected
+
+
+@pytest.fixture
+def constructed_mooncake_workers(mooncake, monkeypatch):
+    """Run the real constructor; replace device/network/thread startup only."""
+    from vllm.config.kv_transfer import KVTransferConfig
+    from vllm.distributed import parallel_state
+
+    group = object.__new__(parallel_state.GroupCoordinator)
+    group.rank = 0
+    group.ranks = [0, 1, 2, 3]
+    group.rank_in_group = 0
+    monkeypatch.setattr(parallel_state, "_PCP", group)
+    pp_group = SimpleNamespace(rank_in_group=0)
+    monkeypatch.setattr(mooncake, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(mooncake, "current_platform", SimpleNamespace(set_device=lambda _: None))
+    monkeypatch.setattr(mooncake, "get_ip", lambda: "127.0.0.1")
+    backend = SimpleNamespace(
+        get_name=lambda: "TEST_MLA", get_kv_cache_shape=lambda **_: (1, 16, 1),
+    )
+    monkeypatch.setattr(mooncake, "get_current_attn_backends", lambda _: [backend])
+    monkeypatch.setattr(mooncake, "select_common_block_size", lambda size, _: size)
+    monkeypatch.setattr(mooncake, "get_kv_cache_layout", lambda: "HND")
+    monkeypatch.setattr(mooncake.threading.Thread, "start", lambda _: None)
+
+    class Engine:
+        def initialize(self, *args):
+            return 0
+
+        def get_rpc_port(self):
+            return 1234
+
+    launches = []
+
+    class Bootstrap:
+        def __init__(self, host, port):
+            self.rank = group.rank
+
+        def start(self):
+            launches.append(self.rank)
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(mooncake, "TransferEngine", Engine)
+    monkeypatch.setattr(mooncake, "MooncakeBootstrapServer", Bootstrap)
+    workers = []
+
+    def make(*, role="kv_producer", pp_size=1, pp_rank=0, pcp_size=4):
+        pp_group.rank_in_group = pp_rank
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                use_mla=True, get_total_num_kv_heads=lambda: 1,
+                get_total_num_hidden_layers=lambda: 78,
+            ),
+            cache_config=SimpleNamespace(block_size=16),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="MooncakeConnector", kv_role=role, kv_buffer_device="cpu",
+            ),
+            parallel_config=SimpleNamespace(
+                rank=0, tensor_parallel_size=1, pipeline_parallel_size=pp_size,
+                prefill_context_parallel_size=pcp_size, local_engines_only=False,
+                data_parallel_index=0, data_parallel_rank_local=0,
+                nnodes_within_dp=1, data_parallel_master_ip="127.0.0.1",
+            ),
+        )
+        cache_config = SimpleNamespace(
+            has_mamba_layers=False,
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=object(), layer_names=[])],
+        )
+        worker = mooncake.MooncakeConnectorWorker(config, "test-engine", cache_config)
+        workers.append(worker)
+        return worker
+
+    yield make, group, launches
+    for worker in workers:
+        worker.shutdown()
+        worker.shutdown = lambda: None
+        for loop_name in ("sender_loop", "receiver_loop"):
+            if hasattr(worker, loop_name):
+                getattr(worker, loop_name).close()
+
+
+def test_hyv4_worker_construction_starts_bootstrap_once(constructed_mooncake_workers):
+    make, group, launches = constructed_mooncake_workers
+    for role in ("kv_producer", "kv_consumer"):
+        for rank in range(4):
+            group.rank = rank
+            group.rank_in_group = rank
+            make(role=role)
+    assert launches == [0]
+
+
+def test_mooncake_worker_constructs_stage_range_from_pp_group(
+    mooncake, monkeypatch, constructed_mooncake_workers,
+):
+    monkeypatch.setattr(mooncake.envs, "VLLM_PP_LAYER_PARTITION", "41,37")
+    make, _, _ = constructed_mooncake_workers
+    worker = make(role="kv_consumer", pp_size=2, pp_rank=1, pcp_size=1)
+    assert worker._pp_layer_range == (41, 78)
