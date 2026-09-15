@@ -660,9 +660,11 @@ class HCUPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        # TODO: ROCm still sets block_size in check_and_update_config.
-        # Move that logic here so block_size is chosen by the backend.
-        pass
+        # Preserve the backend-specific block size selected in
+        # check_and_update_config, then let vLLM align hybrid attention/Mamba
+        # cache pages. Skipping the shared alignment grossly overestimates the
+        # Mamba cache for long-context hybrid models.
+        super().update_block_size_for_backend(vllm_config)
 
 
     @classmethod
