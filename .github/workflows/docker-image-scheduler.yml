@@ -39,7 +39,8 @@ jobs:
     env:
       REPO: ${{ github.repository }}
       BRANCHES: ${{ inputs.branches || 'v0.25.1,v0.28.1-dev' }}
-      RUN_TEST: ${{ (inputs.run_test == false) && 'false' || 'true' }}
+      # 定时触发一律强制跑 citest
+      RUN_TEST: ${{ (github.event_name == 'schedule' || inputs.run_test != false) && 'true' || 'false' }}
     steps:
       - name: 触发各分支镜像构建
         env:

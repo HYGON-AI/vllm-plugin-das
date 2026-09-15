@@ -39,6 +39,12 @@ RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp
     bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
     rm -f /tmp/hcu_llvm_installer.sh
 
+# 从 nightly 归档拉取 26.04 最新 blas cut 包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk)
+RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh" -O /tmp/dtk_blas_cut_installer.sh && \
+    chmod +x /tmp/dtk_blas_cut_installer.sh && \
+    bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
+    rm -f /tmp/dtk_blas_cut_installer.sh
+
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \

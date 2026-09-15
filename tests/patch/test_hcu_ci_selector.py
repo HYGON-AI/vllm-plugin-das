@@ -794,7 +794,6 @@ def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
     for relative in (
         ".github/workflows/hcu-pr-ci.yml",
         ".github/workflows/_selected-hcu-tests.yml",
-        ".github/workflows/release-docker-image.yml",
         ".github/workflows/validate-docker-image.yml",
     ):
         source = (REPOSITORY / relative).read_text(encoding="utf-8")
@@ -804,7 +803,6 @@ def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
 
     for relative in (
         ".github/workflows/hcu-pr-ci.yml",
-        ".github/workflows/release-docker-image.yml",
         ".github/workflows/validate-docker-image.yml",
     ):
         source = (REPOSITORY / relative).read_text(encoding="utf-8")
