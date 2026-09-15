@@ -8,17 +8,22 @@ decode without changing backend behavior for other models.
 """
 
 from dataclasses import replace
+import os
 from typing import cast
 
 import regex as re
 import torch
+import torch.distributed as dist
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pcp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
@@ -390,6 +395,165 @@ class HYV4MLAAttentionLayer(MLAAttention):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
+_LINEAR_GATE_PCP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD"
+_linear_gate_pcp_shard_logged = False
+
+
+def linear_gate_pcp_shard_enabled() -> bool:
+    """Return whether gated MLA linear_gate PCP sharding is enabled."""
+    return os.environ.get(_LINEAR_GATE_PCP_SHARD_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+class PCPShardedGateLinear(ColumnParallelLinear):
+    """PCP-shard ``linear_gate`` using K sharding.
+
+    ``k_shard`` slices the weight input dimension. An all-to-all sends each
+    destination rank its K slice for every token, producing
+    ``[global_tokens, K/PCP]`` before a partial GEMM and token reduce-scatter.
+    reduce-scatter is the fused equivalent of all-reduce followed by
+    redistribution to each token-owning PCP rank.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        pcp_group = get_pcp_group()
+        self.pcp_rank = pcp_group.rank_in_group
+        self.pcp_size = pcp_group.world_size
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size != 1:
+            raise ValueError(
+                "linear_gate PCP sharding requires tensor_parallel_size == 1 "
+                f"(TP already shards linear_gate); got tp_size={tp_size}. "
+                f"Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+            )
+        if self.pcp_size <= 1:
+            raise ValueError(
+                "linear_gate PCP sharding requires prefill_context_parallel_size > 1; got "
+                f"pcp_size={self.pcp_size}. Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+            )
+        shard_dim = input_size
+        if shard_dim % self.pcp_size != 0:
+            raise ValueError(
+                f"linear_gate k_shard dimension {shard_dim} is not divisible "
+                f"by pcp_size {self.pcp_size}."
+            )
+        self.gate_full_input_size = input_size
+        self.gate_output_size = output_size
+        self.gate_shard_input_size = input_size // self.pcp_size
+        local_input_size = self.gate_shard_input_size
+        local_output_size = output_size
+        super().__init__(
+            local_input_size,
+            local_output_size,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=True,
+        )
+        if self.is_quantization:
+            raise ValueError(
+                "linear_gate PCP sharding only supports unquantized gate "
+                f"weights; layer {prefix} resolved quantized method "
+                f"{self.quant_method.__class__.__name__}."
+            )
+        expected_weight_numel = local_input_size * local_output_size
+        if self.weight.numel() != expected_weight_numel:
+            raise RuntimeError(
+                f"linear_gate k_shard allocated {self.weight.numel()} weight "
+                f"elements; expected {expected_weight_numel} for local shape "
+                f"[{local_output_size}, {local_input_size}]"
+            )
+        global _linear_gate_pcp_shard_logged
+        if not _linear_gate_pcp_shard_logged:
+            _linear_gate_pcp_shard_logged = True
+            logger.info(
+                "HY V4 linear_gate PCP K sharding enabled: PCP=%d, "
+                "full weight=[%d, %d], local weight=[%d, %d].",
+                self.pcp_size,
+                self.gate_output_size,
+                self.gate_full_input_size,
+                self.gate_output_size,
+                self.gate_shard_input_size,
+            )
+
+    def _narrow_to_pcp_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        """Slice this PCP rank's input columns from the full checkpoint weight."""
+        if loaded_weight.dim() == 2 and loaded_weight.shape == (
+            self.gate_output_size,
+            self.gate_full_input_size,
+        ):
+            return loaded_weight.narrow(
+                1,
+                self.pcp_rank * self.gate_shard_input_size,
+                self.gate_shard_input_size,
+            )
+        raise ValueError(
+            "linear_gate PCP sharding expected the full checkpoint weight of "
+            f"shape [{self.gate_output_size}, {self.gate_full_input_size}], got "
+            f"{tuple(loaded_weight.shape)}."
+        )
+
+    def weight_loader(self, param, loaded_weight: torch.Tensor):
+        super().weight_loader(param, self._narrow_to_pcp_shard(loaded_weight))
+
+    def weight_loader_v2(self, param, loaded_weight: torch.Tensor):
+        super().weight_loader_v2(param, self._narrow_to_pcp_shard(loaded_weight))
+
+    def _linear(self, hidden: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        if weight.dim() != 2:
+            raise RuntimeError(f"unexpected linear_gate weight rank: {weight.dim()}")
+        if weight.shape[0] == hidden.shape[-1]:
+            return torch.matmul(hidden, weight)
+        if weight.shape[1] == hidden.shape[-1]:
+            return torch.nn.functional.linear(hidden, weight)
+        raise RuntimeError(
+            "linear_gate PCP sharding found an unexpected weight layout "
+            f"{tuple(weight.shape)} for input width {hidden.shape[-1]}"
+        )
+
+    def _local_k_slice(self, hidden: torch.Tensor) -> torch.Tensor:
+        start = self.pcp_rank * self.gate_shard_input_size
+        return hidden.narrow(-1, start, self.gate_shard_input_size).contiguous()
+
+    def _forward_k_shard(self, input_: torch.Tensor) -> torch.Tensor:
+        pcp_group = get_pcp_group()
+        local_tokens = input_.shape[0]
+        # For destination rank r, send K slice r of every local token. The
+        # receive layout is source-rank-major, which is global token order.
+        send = input_.reshape(
+            local_tokens, self.pcp_size, self.gate_shard_input_size
+        ).transpose(0, 1).contiguous()
+        received = torch.empty_like(send)
+        dist.all_to_all_single(
+            received.view(-1),
+            send.view(-1),
+            group=pcp_group.device_group,
+        )
+        partial = self._linear(
+            received.view(self.pcp_size * local_tokens, self.gate_shard_input_size)
+        )
+        # Equivalent to all-reduce(partial) followed by selecting this rank's
+        # token rows, but avoids materializing the full reduced output.
+        return pcp_group.reduce_scatter(partial.contiguous(), dim=0)
+
+    def forward(self, input_):
+        output = self._forward_k_shard(input_)
+        if not self.return_bias:
+            return output
+        return output, None
 
 class HYV4MLAAttention(nn.Module):
     """Multi-head latent attention with optional sparse lightning indexer.
@@ -603,13 +767,21 @@ class HYV4MLAAttention(nn.Module):
                 self.gate_projection_size_per_head = self.v_head_dim
             else:
                 raise ValueError(f"Unknown gating type: {config.gating_type}")
-            self.linear_gate = ColumnParallelLinear(
-                self.hidden_size,
-                self.num_heads * self.gate_projection_size_per_head,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.linear_gate",
-            )
+            if linear_gate_pcp_shard_enabled():
+                self.linear_gate = PCPShardedGateLinear(
+                    self.hidden_size,
+                    self.num_heads * self.gate_projection_size_per_head,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.linear_gate",
+                )
+            else:
+                self.linear_gate = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_heads * self.gate_projection_size_per_head,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.linear_gate",
+                )
         else:
             self.linear_gate = None
         self.prefix = prefix
