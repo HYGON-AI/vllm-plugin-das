@@ -111,7 +111,12 @@ def test_hyv4_pp2_pcp4_exact_target_only_topology_is_allowed(
 
 
 def _native_hyv4_mtp_config(make_config, **overrides):
-    config = make_config(speculative=True, num_speculative_tokens=3, **overrides)
+    values = {
+        "speculative": True,
+        "num_speculative_tokens": 3,
+    }
+    values.update(overrides)
+    config = make_config(**values)
     config.model_config.hf_config = SimpleNamespace(num_nextn_predict_layers=1)
     config.model_config.model = "native-hyv4"
     config.speculative_config.draft_model_config = SimpleNamespace(
@@ -142,6 +147,21 @@ def test_hyv4_exact_pp2_pcp4_native_mtp2_is_allowed(
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize("num_speculative_tokens", [2, 3])
+def test_hyv4_pp1_native_mtp2_and_mtp3_are_allowed(
+    make_pcp_config, num_speculative_tokens,
+):
+    config = _native_hyv4_mtp_config(
+        make_pcp_config,
+        architecture="HYV4ForCausalLM",
+        pp=1,
+        tp=1,
+        pcp=8,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 def test_hyv4_mtp3_revalidation_accepts_current_sparse_cache_canonicalization(
     make_hyv4_pp2_pcp4_config,
 ):
@@ -157,7 +177,7 @@ def test_hyv4_mtp3_revalidation_accepts_current_sparse_cache_canonicalization(
 
 
 @pytest.mark.parametrize("override", [
-    {"pp": 1}, {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 8},
+    {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 8},
     {"dp": 2}, {"dcp": 2}, {"enable_expert_parallel": False},
     {"enforce_eager": False}, {"use_v2": False}, {"lora": True},
     {"multimodal": True}, {"kv_offload": True}, {"kv_transfer": True},

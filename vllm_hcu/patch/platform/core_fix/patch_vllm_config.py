@@ -45,12 +45,9 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
 
 
 def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
-    """Admit only checkpoint-native replicated MTP with two or three tokens."""
+    """Admit checkpoint-native replicated MTP with two or three tokens."""
     parallel = vllm_config.parallel_config
     speculative = vllm_config.speculative_config
-    # Pipeline depth is validated by the caller's topology check, which admits
-    # PP1 and the audited PP2+PCP4 layout. This contract only covers the
-    # speculative dimension.
     if (
         speculative.method != "mtp"
         or speculative.num_speculative_tokens not in (2, 3)
@@ -80,7 +77,7 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
         or getattr(draft_hf, "n_predict", None) != 1
     ):
         raise ValueError(
-            "HYV4 PCP MTP3 requires exactly one checkpoint-native draft layer."
+            "HYV4 PCP MTP requires exactly one checkpoint-native draft layer."
         )
     kernel = _require_hcu_pcp_attribute(vllm_config, "kernel_config", "VllmConfig")
     if (
@@ -95,7 +92,7 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
         ) not in ("fp8_e4m3", "fp8_ds_mla")
     ):
         raise ValueError(
-            "HYV4 PCP MTP3 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
+            "HYV4 PCP MTP requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
         )
     feature_cfg = get_hcu_config(vllm_config)
     if (
@@ -104,7 +101,7 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
         or feature_cfg.expert_map_record_path
         or feature_cfg.eplb_disable_rearrange
     ):
-        raise ValueError("HYV4 PCP MTP3 does not support EPLB.")
+        raise ValueError("HYV4 PCP MTP does not support EPLB.")
 
 
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
