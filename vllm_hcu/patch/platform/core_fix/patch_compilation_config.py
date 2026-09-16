@@ -196,6 +196,9 @@ def apply_to_module(module: ModuleType) -> bool:
         if getattr(self, "use_inductor_graph_partition", False):
             return result
 
+        if getattr(getattr(self, "mode", None), "name", None) != "VLLM_COMPILE":
+            return result
+
         cudagraph_mode = getattr(self, "cudagraph_mode", None)
         has_piecewise = getattr(cudagraph_mode, "has_piecewise_cudagraphs", None)
         if not callable(has_piecewise) or not has_piecewise():

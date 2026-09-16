@@ -357,12 +357,14 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         "hidden": 7168,
         "num_ranks": 8,
         "num_experts": 256,
+        "num_topk": 8,
     }
     assert calls[-1] == {
         "num_max_dispatch_tokens_per_rank": 32,
         "hidden": 7168,
         "num_ranks": 8,
         "num_experts": 256,
+        "num_topk": 8,
     }
     assert kwargs == {
         "group": "group",
@@ -383,6 +385,28 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         num_local_experts=32,
     ) == kwargs
     assert len(calls) == 32
+
+
+def test_deep_ep_low_latency_hint_tracks_model_topk(monkeypatch):
+    calls = []
+
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            calls.append(kwargs)
+            return kwargs['num_max_dispatch_tokens_per_rank'] * kwargs['num_topk']
+
+    monkeypatch.setitem(sys.modules, 'deep_ep', SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPLLAll2AllManager('group', 'tcp')
+    manager._vllm_hcu_ll_num_topk = 16
+    kwargs = manager._make_all2all_kwargs(4, 3584, 8, 896, 112)
+    assert kwargs['num_rdma_bytes'] == 64
+    assert all(call['num_topk'] == 16 for call in calls)
+    manager._vllm_hcu_ll_num_topk = 8
+    assert manager._make_all2all_kwargs(4, 3584, 8, 896, 112)['num_rdma_bytes'] == 32
+    assert len(calls) == 8
 
 
 def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
@@ -448,6 +472,7 @@ def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
         "hidden": 256,
         "num_ranks": 2,
         "num_experts": 16,
+        "num_topk": 8,
     }
     assert manager._make_all2all_kwargs(
         max_num_tokens_per_dp_rank=512,
@@ -1496,14 +1521,28 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert prepared.num_kv_actual_tokens == 5
 
 
-def test_proposer_registers_hcu_spec_decode_metadata_once() -> None:
+def test_proposer_registers_hcu_spec_decode_metadata_once(monkeypatch) -> None:
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_kernel_import(name, *args, **kwargs):
+        if name == "flash_attn" or name in {
+            "vllm_hcu.v1.attention.backends.flash_attn",
+            "vllm_hcu.v1.attention.backends.fa_utils",
+        }:
+            raise AssertionError("metadata registration imported optional FA kernels")
+        return original_import(name, *args, **kwargs)
+
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         FlashMLASparseMetadata,
     )
     from vllm_hcu.v1.spec_decode import proposer_runtime
-    from vllm_hcu.v1.attention.backends.flash_attn import (
+    from vllm_hcu.v1.attention.backends.flash_attn_metadata import (
         FlashAttentionMetadata,
     )
+
+    monkeypatch.setattr(builtins, "__import__", reject_kernel_import)
 
     proposer = SimpleNamespace(allowed_attn_types=(str,))
     config = _proposer_config()
@@ -1575,7 +1614,7 @@ def test_proposer_allows_triton_fallback_when_flash_attn_is_missing(
     assert proposer.allowed_attn_types[0] is str
 
 
-def test_proposer_propagates_flash_attention_symbol_errors(
+def test_proposer_propagates_flash_attention_metadata_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import builtins
@@ -1585,8 +1624,8 @@ def test_proposer_propagates_flash_attention_symbol_errors(
     original_import = builtins.__import__
 
     def import_with_incompatible_flash_attention(name, *args, **kwargs):
-        if name == "vllm_hcu.v1.attention.backends.flash_attn":
-            raise ImportError("cannot import name 'hg_flash_attn_varlen_func'")
+        if name == "vllm_hcu.v1.attention.backends.flash_attn_metadata":
+            raise ImportError("cannot import name 'FlashAttentionMetadata'")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -1595,7 +1634,7 @@ def test_proposer_propagates_flash_attention_symbol_errors(
         import_with_incompatible_flash_attention,
     )
 
-    with pytest.raises(ImportError, match="hg_flash_attn_varlen_func"):
+    with pytest.raises(ImportError, match="FlashAttentionMetadata"):
         proposer_runtime.initialize_proposer(
             SimpleNamespace(),
             SimpleNamespace(allowed_attn_types=(str,)),

@@ -10,7 +10,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -25,6 +25,10 @@ from tqdm import tqdm
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphWrapper,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationMode,
@@ -145,8 +149,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheSpecKind,
     KVQuantMode,
     MambaSpec,
+    get_kv_cache_spec_kind,
     SlidingWindowSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
@@ -232,6 +238,9 @@ if TYPE_CHECKING:
 import vllm_hcu.platforms.envs as henvs 
 from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.patch.worker.framework_opt.patch_slot_mapping_modes import (
+    set_slot_mapping_groups_without_slots,
+)
 
 logger = init_logger(__name__)
 
@@ -3236,7 +3245,9 @@ class GPUModelRunner(
     def get_model(self) -> nn.Module:
         if not hasattr(self, "model"):
             raise ValueError("Cannot get model before model has been initialized")
-        if isinstance(self.model, (CUDAGraphWrapper, UBatchWrapper)):
+        if isinstance(
+            self.model, (CUDAGraphWrapper, UBatchWrapper, BreakableCUDAGraphWrapper)
+        ):
             # get raw model out of the cudagraph wrapper.
             return self.model.unwrap()
         return self.model
@@ -5064,10 +5075,32 @@ class GPUModelRunner(
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
-                model_loader = get_model_loader(self.load_config)
-                self.model = model_loader.load_model(
-                    vllm_config=self.vllm_config, model_config=self.model_config
-                )
+                    model_loader = get_model_loader(self.load_config)
+                    self.model = model_loader.load_model(
+                        vllm_config=self.vllm_config,
+                        model_config=self.model_config,
+                    )
+                else:
+                    model_loader = get_model_loader(self.load_config)
+                    from vllm_hcu.runtime_compat.kimi_k3_loading import (
+                        is_kimi_k3_config,
+                        preload_before_weight_loading,
+                    )
+
+                    def preload(model):
+                        self.model = model
+                        self._preload_unquantized_gemm_kernels()
+
+                    loading_context = (
+                        preload_before_weight_loading(model_loader, preload)
+                        if is_kimi_k3_config(self.vllm_config)
+                        else nullcontext()
+                    )
+                    with loading_context:
+                        self.model = model_loader.load_model(
+                            vllm_config=self.vllm_config,
+                            model_config=self.model_config,
+                        )
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -5162,6 +5195,10 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+        else:
+            # dummy/fake weights: nothing slow to stream, so warm after build
+            # (as before) to keep the fake/smoke path cold-start free.
+            self._preload_unquantized_gemm_kernels()
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -5199,6 +5236,12 @@ class GPUModelRunner(
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         if (
+            is_breakable_cudagraph_enabled()
+            and cudagraph_mode != CUDAGraphMode.NONE
+            and not self.parallel_config.use_ubatching
+        ):
+            self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
+        elif (
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
         ):
@@ -5216,6 +5259,93 @@ class GPUModelRunner(
                 )
 
         get_offloader().post_init()
+
+    @torch.inference_mode()
+    def _preload_unquantized_gemm_kernels(self) -> None:
+        """Warm HCU BF16 GEMM kernels BEFORE real checkpoint weights are streamed.
+
+        Runs right after the model architecture is built (weights may still be
+        empty or meta). The warmup only needs each parameter's shape/dtype, so
+        it launches each unique BF16 dense GEMM with its own dummy device
+        tensors. Doing this before the (slow) weight load means any
+        HIPBLAS/Tensile problem on these shapes surfaces immediately instead of
+        after the load, and profile_run reuses the warmed kernels (no cold-start
+        lm_head logits GEMM).
+        """
+        from vllm_hcu.runtime_compat.kimi_k3_loading import is_kimi_k3_config
+
+        if not is_kimi_k3_config(self.vllm_config):
+            return
+        print("HCU GEMM preload entered", flush=True)
+        model = self.model
+        max_tokens = max(1, int(self.max_num_tokens))
+        m_values = sorted(
+            m
+            for m in {
+                1,
+                8,
+                32,
+                128,
+                512,
+                1024,
+                max(1, int(self.max_num_reqs)),
+                min(max_tokens, 4096),
+            }
+            if 1 <= m <= max_tokens
+        )
+
+        shapes: dict[tuple[int, int], torch.dtype] = {}
+        for module in model.modules():
+            weight = getattr(module, "weight", None)
+            if not isinstance(weight, torch.Tensor):
+                continue
+            cls = type(module).__name__
+            is_head = cls.endswith("LMHead") or cls in (
+                "VocabParallelEmbedding",
+                "ParallelEmbedding",
+            )
+            # Include HCU linear GEMM modules and the lm_head / embeddings
+            # (their profile-time logits GEMM otherwise cold-starts with
+            # HIPBLAS_STATUS_INTERNAL_ERROR). Shapes are enough; values are not.
+            if not (is_head or hasattr(module, "quant_method")):
+                continue
+            if weight.ndim != 2 or weight.dtype != torch.bfloat16:
+                continue
+            shapes.setdefault(
+                (int(weight.shape[0]), int(weight.shape[1])), weight.dtype
+            )
+
+        if not shapes:
+            logger.info("HCU GEMM preload found no BF16 dense weights")
+            print("HCU GEMM preload found no BF16 dense weights", flush=True)
+            return
+
+        logger.info(
+            "Eagerly preloading %d BF16 GEMM shapes over M=%s before weight load",
+            len(shapes),
+            m_values,
+        )
+        device = self.device
+        warmed = 0
+        for (dim0, dim1), dtype in shapes.items():
+            # dummy weight on the worker device: kernel selection depends on
+            # shape/dtype/layout, not on the checkpoint values.
+            w = torch.empty((dim0, dim1), dtype=dtype, device=device)
+            for m in m_values:
+                input_dim = dim0 if henvs.VLLM_USE_NN else dim1
+                x = torch.empty((m, input_dim), dtype=dtype, device=device)
+                if henvs.VLLM_USE_NN:
+                    output = torch.matmul(x, w)
+                else:
+                    output = torch.nn.functional.linear(x, w)
+                del output, x
+                torch.accelerator.synchronize()
+                warmed += 1
+            del w
+
+        torch.accelerator.empty_cache()
+        logger.info("Finished eager HCU GEMM preload: %d GEMM launches", warmed)
+        print(f"HCU GEMM preload finished: {warmed} launches", flush=True)
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -6220,6 +6350,7 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -6279,7 +6410,10 @@ class GPUModelRunner(
         # Use a temporary pool for profiling to avoid fragmentation in the main pool.
         profiling_pool = current_platform.graph_pool_handle()
         original_pools: dict[int, Any] = {}
-        for instance in list(CUDAGraphWrapper._all_instances):
+        for instance in (
+            list(CUDAGraphWrapper._all_instances)
+            + list(BreakableCUDAGraphWrapper._all_instances)
+        ):
             original_pools[id(instance)] = instance.graph_pool
             instance.graph_pool = profiling_pool
 
@@ -6330,7 +6464,11 @@ class GPUModelRunner(
 
         set_cudagraph_capturing_enabled(False)
         CUDAGraphWrapper.clear_all_graphs()
-        for instance in list(CUDAGraphWrapper._all_instances):
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+        for instance in (
+            list(CUDAGraphWrapper._all_instances)
+            + list(BreakableCUDAGraphWrapper._all_instances)
+        ):
             if id(instance) in original_pools:
                 instance.graph_pool = original_pools[id(instance)]
         for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
@@ -6794,11 +6932,22 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        groups_without_slot_mapping = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
+            # Mamba/GDN groups keep recurrent state and address their block
+            # table through state_indices, so a per-token slot mapping is both
+            # unused and a wasted kernel launch. Upstream vLLM expresses this
+            # as SlotMappingMode.NONE; on this vLLM version the index is
+            # reported to the block-table adapter instead.
+            if (
+                get_kv_cache_spec_kind(kv_cache_group.kv_cache_spec)
+                == KVCacheSpecKind.MAMBA
+            ):
+                groups_without_slot_mapping.append(len(block_sizes))
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
@@ -6831,6 +6980,9 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
+            )
+            set_slot_mapping_groups_without_slots(
+                self.input_batch.block_table, groups_without_slot_mapping
             )
 
         assert self._init_block_sizes == block_sizes, (

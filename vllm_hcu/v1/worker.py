@@ -7,10 +7,11 @@ import gc
 import torch
 import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
+from vllm import envs
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.utils.torch_utils import set_random_seed
-from vllm.utils.mem_utils import MemorySnapshot, format_gib
-from vllm.config import VllmConfig, CacheConfig
+from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.config import CUDAGraphMode, VllmConfig, CacheConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
@@ -80,6 +81,99 @@ class HcuGPUWorker(Worker):
         from vllm_hcu.patch.worker import validate_worker_patches
 
         validate_worker_patches(require_applied=True)
+
+    @torch.inference_mode()
+    def determine_available_memory(self) -> int:
+        """Use reference memory accounting for HCU/CuMem allocations."""
+        print(
+            f"HCU memory profiling entered: rank={self.rank} device={self.device}",
+            flush=True,
+        )
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            self.model_runner.profile_run()
+            logger.info(
+                "Initial free memory %s GiB, reserved %s GiB for KV cache",
+                format_gib(self.init_snapshot.free_memory),
+                format_gib(kv_cache_memory_bytes),
+            )
+            return self._reserve_mm_ipc_gpu_memory(kv_cache_memory_bytes)
+
+        with memory_profiling(
+            self.init_snapshot,
+            weights_memory=int(self.model_runner.model_memory_usage),
+        ) as profile_result:
+            self.model_runner.profile_run()
+            profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
+                "allocated_bytes.all.peak", 0
+            )
+            cudagraph_memory_estimate = 0
+            if (
+                current_platform.is_cuda()
+                and self.vllm_config.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            ):
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+
+        profile_result.torch_peak_increase = (
+            profile_torch_peak - profile_result.before_profile.torch_peak
+        )
+        current_allocated = torch.accelerator.memory_stats(self.device).get(
+            "allocated_bytes.all.current", 0
+        )
+        total_consumed = (
+            self.init_snapshot.free_memory - profile_result.after_profile.free_memory
+        )
+        transient_peak_headroom = profile_torch_peak - current_allocated
+        profile_result.non_kv_cache_memory = (
+            total_consumed + transient_peak_headroom
+        )
+
+        cudagraph_memory_estimate_applied = (
+            cudagraph_memory_estimate
+            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            else 0
+        )
+        self.non_torch_memory = profile_result.non_torch_increase
+        self.peak_activation_memory = profile_result.torch_peak_increase
+        self.cudagraph_memory_estimate = cudagraph_memory_estimate
+        self.total_consumed = total_consumed
+
+        free_gpu_memory = profile_result.after_profile.free_memory
+        assert self.init_snapshot.free_memory >= free_gpu_memory, (
+            "Error in memory profiling. "
+            f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
+            f"current free memory {format_gib(free_gpu_memory)} GiB."
+        )
+        self.available_kv_cache_memory_bytes = (
+            self.requested_memory
+            - profile_result.non_kv_cache_memory
+            - cudagraph_memory_estimate_applied
+        )
+        memory_summary = (
+            "HCU memory profile: "
+            f"rank={self.rank} device={self.device} "
+            f"init_free={format_gib(self.init_snapshot.free_memory)} GiB "
+            f"after_free={format_gib(profile_result.after_profile.free_memory)} GiB "
+            f"weights={format_gib(self.model_runner.model_memory_usage)} GiB "
+            f"non_torch_increase={format_gib(profile_result.non_torch_increase)} GiB "
+            f"torch_peak_increase={format_gib(profile_result.torch_peak_increase)} GiB "
+            f"total_consumed={format_gib(total_consumed)} GiB "
+            f"transient_peak_headroom={format_gib(transient_peak_headroom)} GiB "
+            f"non_kv_cache_memory={format_gib(profile_result.non_kv_cache_memory)} GiB "
+            f"cudagraph_estimate={format_gib(cudagraph_memory_estimate)} GiB "
+            f"requested={format_gib(self.requested_memory)} GiB "
+            f"available_kv={format_gib(self.available_kv_cache_memory_bytes)} GiB"
+        )
+        logger.info(memory_summary)
+        print(memory_summary, flush=True)
+        logger.debug(profile_result)
+        logger.info(
+            "Available KV cache memory: %s GiB",
+            format_gib(self.available_kv_cache_memory_bytes),
+        )
+        return self._reserve_mm_ipc_gpu_memory(
+            int(self.available_kv_cache_memory_bytes)
+        )
 
     def compile_or_warm_up_model(self):
         if (

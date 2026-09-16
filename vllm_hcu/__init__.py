@@ -47,9 +47,13 @@ def _apply_platform_preserving_role() -> None:
     """
 
     from vllm_hcu.patch import PATCH_REGISTRY, apply_platform_patches
+    from vllm_hcu.runtime_compat.dynamo_metrics import (
+        install_dynamo_metrics_compat,
+    )
     from vllm_hcu.patch.runtime_state import set_process_role
 
     role = PATCH_REGISTRY.process_role()
+    install_dynamo_metrics_compat()
     apply_platform_patches()
     set_process_role(role)
 

@@ -2334,6 +2334,66 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     )
 
 
+def test_mla_attention_wrapper_preserves_short_extend_policy():
+    adapter = _adapter("patch_mla_attention")
+    calls = []
+
+    def split_batch(common_attn_metadata, decode_threshold=1,
+                    require_uniform=False, treat_short_extends_as_decodes=True):
+        calls.append((common_attn_metadata, decode_threshold, require_uniform,
+                      treat_short_extends_as_decodes))
+        return treat_short_extends_as_decodes
+
+    class MLAAttention:
+        def __init__(self, num_heads, scale, qk_nope_head_dim, qk_rope_head_dim,
+                     v_head_dim, q_lora_rank, kv_lora_rank, kv_b_proj,
+                     cache_config=None, quant_config=None, prefix="",
+                     attn_backend=None, use_sparse=False, indexer=None,
+                     topk_indices_buffer=None, **extra_impl_args):
+            pass
+
+        def forward(self, q, kv_c_normed, k_pe, output_shape=None):
+            pass
+
+        def forward_impl(self, q, k_c_normed, k_pe, kv_cache, attn_metadata,
+                         output, output_scale=None, output_block_scale=None,
+                         quant_group_size=None, quant_scale_ue8m0=None,
+                         quant_col_major=None, quant_tma_aligned=None):
+            pass
+
+        def process_weights_after_loading(self, act_dtype):
+            pass
+
+        def get_kv_cache_spec(self, vllm_config):
+            return None
+
+    class MLACommonMetadata:
+        def __init__(self, num_actual_tokens):
+            self.num_actual_tokens = num_actual_tokens
+
+    class MLACommonMetadataBuilder:
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return SimpleNamespace()
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        MLAAttention=MLAAttention,
+        MLACommonMetadata=MLACommonMetadata,
+        MLACommonMetadataBuilder=MLACommonMetadataBuilder,
+        split_decodes_and_prefills=split_batch,
+        get_forward_context=lambda: None,
+        _encode_layer_name=lambda name: name,
+        torch=torch,
+    )
+    assert adapter.apply_to_module(module)
+
+    common = SimpleNamespace(is_prefilling=torch.tensor([True]))
+    assert module.split_decodes_and_prefills(
+        common, decode_threshold=128, treat_short_extends_as_decodes=True
+    ) is True
+    assert calls[-1] == (common, 128, False, True)
+
+
 def test_mla_forward_slices_kv_with_independent_token_count():
     from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 

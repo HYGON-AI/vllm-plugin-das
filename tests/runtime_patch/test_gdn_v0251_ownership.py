@@ -21,7 +21,7 @@ from vllm_hcu.patch.worker.op_opt._common import PatchCompatibilityError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
+    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm")
 ).resolve()
 # Prefer a checkout-local environment when one exists.  Source-only target
 # checkouts use the current interpreter's matching binary-extension view.

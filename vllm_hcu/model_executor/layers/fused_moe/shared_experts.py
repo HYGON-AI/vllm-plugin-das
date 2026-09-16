@@ -194,8 +194,16 @@ class SharedExperts(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> bool:
-        return (
+        hcu_stream_opt_in = (
             current_platform.is_cuda_alike()
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and (
+                henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE
+                or henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+            )
+        )
+        return (
+            (current_platform.is_cuda() or hcu_stream_opt_in)
             and self._stream is not None
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD

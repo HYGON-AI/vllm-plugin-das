@@ -20,6 +20,7 @@ from vllm_hcu.patch.runtime_callbacks import (
     apply_base_linear_parameter,
     apply_fp8_scaled_mm,
     apply_hcu_lora_column_parallel,
+    apply_kimi_k25_qkv_layout,
     apply_kimi_k25_vision_prompt,
     apply_qwen35_lora_cudagraph,
     apply_weight_debug_skip,
@@ -54,6 +55,10 @@ EXPECTED_ORDER = (
         "runtime_method.kimi_k25_vision_prompt",
         "vllm.model_executor.models.kimi_k25",
     ),
+    (
+        "runtime_method.kimi_k25_qkv_layout",
+        "vllm.model_executor.models.kimi_k25_vit",
+    ),
 )
 
 EXPECTED_IMPLEMENTATIONS = {
@@ -80,6 +85,10 @@ EXPECTED_IMPLEMENTATIONS = {
     "kimi": (
         "vllm_hcu.runtime_compat.kimi_k25_vision_prompt",
         "install_kimi_k25_vision_prompt_compat",
+    ),
+    "kimi_qkv": (
+        "vllm_hcu.runtime_compat.kimi_k25_vit",
+        "install_kimi_k25_qkv_layout_compat",
     ),
 }
 
