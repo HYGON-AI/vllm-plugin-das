@@ -98,6 +98,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 None,
             )
         ):
+            if getattr(self, "embedding_across_dp", False):
+                raise ValueError(
+                    "HCU Qwen4Exp PLE does not support "
+                    "engram_config.embedding_across_dp; use the default "
+                    "TP-sharded embedding with embedding_across_dp=false"
+                )
             return None
         return verify_model_config(self, model_config)
 

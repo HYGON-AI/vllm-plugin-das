@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
@@ -165,7 +166,7 @@ class HcuQwen4ExpPLEInt8EmbeddingMethod(QuantizeMethodBase):
         # embedding-parallel all-reduce. Return a supported floating-point dtype
         # here; returning INT8 would make the communicator reject the tensor.
         # ``input_`` is already masked to local indices by the base forward
-        # path for ETP > 1, and that path clears non-owner rows immediately
+        # path for TP > 1, and that path clears non-owner rows immediately
         # after this lookup.
         embeddings = F.embedding(input_, layer.weight)
         scales = F.embedding(input_, layer.weight_scale)
@@ -247,7 +248,7 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
             + weight_scale.numel() * weight_scale.element_size()
         )
         logger.info_once(
-            "Qwen4Exp PLE INT8 UVA offload active: %.3f MiB per ETP rank "
+            "Qwen4Exp PLE INT8 UVA offload active: %.3f MiB per TP rank "
             "(weight=%s, weight_scale=%s, zero-copy device views)",
             offloaded_bytes / (1024**2),
             tuple(weight.shape),
@@ -289,9 +290,7 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
     ) -> torch.Tensor:
         if layer.tp_size == 1:
             return rows
-        if layer.parallel_group is None:
-            raise RuntimeError("PLE ETP parallel group is not initialized")
-        return layer.parallel_group.all_reduce(rows)
+        return tensor_model_parallel_all_reduce(rows)
 
     @staticmethod
     def _uva_view(layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
