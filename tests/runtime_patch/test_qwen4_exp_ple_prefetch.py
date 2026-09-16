@@ -115,6 +115,24 @@ def test_uva_lookup_into_buffer_matches_embedding():
     assert method.finalize_prefetched(layer, output.flatten(-2)) is not None
 
 
+def test_uva_finalize_reduces_over_tensor_parallel_group(monkeypatch):
+    calls = []
+
+    def all_reduce(rows):
+        calls.append(rows.clone())
+        return rows + 7
+
+    rows = torch.arange(12).reshape(2, 6)
+    layer = SimpleNamespace(tp_size=4)
+    method = int8_patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+    monkeypatch.setattr(int8_patch, "tensor_model_parallel_all_reduce", all_reduce)
+    result = method.finalize_prefetched(layer, rows)
+
+    assert len(calls) == 1
+    assert torch.equal(calls[0], rows)
+    assert torch.equal(result, rows + 7)
+
+
 def test_uva_post_process_invalidates_view_from_previous_storage():
     method = int8_patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
     layer = SimpleNamespace(
@@ -513,6 +531,68 @@ def test_model_callback_binds_isolated_chains_and_fires_first(monkeypatch):
     assert calls[-2:] == ["prepare:first", "prepare:second"]
     ConditionalModel(second_model).process_weights_after_loading()
     assert calls[-2:] == ["prepare:first", "prepare:second"]
+
+
+def test_model_callback_accepts_torch_compile_wrapped_init(monkeypatch):
+    class Model:
+        def raw_init(self, *, vllm_config, prefix=""):
+            del vllm_config, prefix
+            self.start_layer = 0
+            self.end_layer = 0
+            self.layers = []
+
+        def forward(
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            query_start_loc=None,
+            ngram_context=None,
+            deepstack_input_embeds=None,
+        ):
+            del (
+                self,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                query_start_loc,
+                ngram_context,
+                deepstack_input_embeds,
+            )
+
+    def compile_init(
+        self,
+        *args,
+        vllm_config=None,
+        prefix="",
+        **kwargs,
+    ):
+        Model.raw_init(
+            self,
+            *args,
+            vllm_config=vllm_config,
+            prefix=prefix,
+            **kwargs,
+        )
+
+    Model.__init__ = compile_init
+    module = ModuleType(model_patch.TARGET_MODULE)
+    module.Qwen4ExpModel = Model
+    module.Qwen4ExpForCausalLM = type("CausalModel", (), {})
+    module.Qwen4ExpForConditionalGeneration = type("ConditionalModel", (), {})
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setattr(model_patch, "_ensure_custom_op_registered", lambda: None)
+
+    init_signature = inspect.signature(Model.__init__)
+    assert model_patch.apply_to_module(module) is True
+    assert model_patch.apply_to_module(module) is False
+    assert inspect.signature(Model.__init__) == init_signature
+
+    model = Model(vllm_config=object())
+    assert model._vllm_hcu_local_ple_chain == ()
+    assert model._vllm_hcu_first_local_ple is None
 
 
 def test_model_callback_validates_before_custom_op_registration(monkeypatch):

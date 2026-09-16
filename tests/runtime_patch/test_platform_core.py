@@ -118,6 +118,19 @@ def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     assert record.targets == patch_engram_config.TARGETS
 
 
+def test_engram_config_rejects_hcu_cross_dp_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module, engram_config = _engram_module()
+    _install_fake_platform(monkeypatch, cuda=False, cuda_alike=True)
+    patch_engram_config.apply(module)
+
+    config = engram_config()
+    config.embedding_across_dp = True
+    with pytest.raises(ValueError, match="does not support.*embedding_across_dp"):
+        config.verify_model_config(_model_config())
+
+
 @pytest.mark.parametrize(
     ("cuda", "cuda_alike", "model_config"),
     [

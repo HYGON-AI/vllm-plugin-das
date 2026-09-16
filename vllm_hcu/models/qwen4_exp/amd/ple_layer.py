@@ -1337,7 +1337,6 @@ def qwen4_exp_amd_ple_ngram_embedding(
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
     owner = layer.ple_embedding
-    local_num_tokens = ngram_ids.shape[0]
     result = owner.ngram_embedding(ngram_ids).flatten(-2)
     output.copy_(result)
 
