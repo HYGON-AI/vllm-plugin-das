@@ -660,11 +660,19 @@ class HCUPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        # Preserve the backend-specific block size selected in
-        # check_and_update_config, then let vLLM align hybrid attention/Mamba
-        # cache pages. Skipping the shared alignment grossly overestimates the
-        # Mamba cache for long-context hybrid models.
-        super().update_block_size_for_backend(vllm_config)
+        """Align hybrid KV-cache pages without reselecting HCU block size."""
+        model_config = vllm_config.model_config
+        if model_config is None or not model_config.is_hybrid:
+            return
+
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        if backend_cls is None:
+            raise RuntimeError(
+                "HCU hybrid KV-cache alignment failed: no non-SSM "
+                "attention backend was found after model initialization."
+            )
+
+        cls._align_hybrid_block_size(vllm_config, backend_cls)
 
 
     @classmethod
