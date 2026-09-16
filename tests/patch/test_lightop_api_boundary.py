@@ -743,6 +743,11 @@ def test_scanner_records_literal_category_getattr(tmp_path: Path) -> None:
 def test_installed_category_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
     env = dict(os.environ)
+    if env.get("VLLM_HCU_KIMI_HT_SITU_BACKEND") == "triton":
+        # Explicit temporary Kimi backend does not execute native SiTU.
+        # Strict/default LightOp runs must still require this export, and
+        # all other categorized operations remain mandatory in both modes.
+        used.discard(("lightop.activation", "fuse_situ_mul_quant"))
     env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
     env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     result = subprocess.run(

@@ -386,7 +386,8 @@ def test_w4a8_contiguous_packs_once_without_replacing_canonical_parameters(
 
     monkeypatch.setattr(module, "pack_w4a8_moe_hipc_weight", pack)
 
-    experts = object.__new__(module.DeepEPDeepGemmW4A8ContiguousExperts)
+    expert_class = module.DeepEPDeepGemmW4A8ContiguousExperts
+    experts = object.__new__(expert_class)
     experts._deepgemm_w13 = None
     experts._deepgemm_w2 = None
     experts.process_weights_after_loading(layer)
@@ -403,7 +404,7 @@ def test_w4a8_contiguous_packs_once_without_replacing_canonical_parameters(
     )
 
     replacement = object.__new__(
-        module.DeepEPDeepGemmW4A8ContiguousExperts
+        expert_class
     )
     replacement._deepgemm_w13 = None
     replacement._deepgemm_w2 = None
@@ -412,6 +413,29 @@ def test_w4a8_contiguous_packs_once_without_replacing_canonical_parameters(
     assert len(packed) == 2
     assert replacement._deepgemm_w13 is experts._deepgemm_w13
     assert replacement._deepgemm_w2 is experts._deepgemm_w2
+
+
+def test_kimi_ht_packing_releases_raw_weight_storage(monkeypatch):
+    import weakref
+    import gc
+    from vllm_hcu.model_executor.layers.quantization import kimi_k3_ht_runtime as module
+    layer = _make_w4a8_expert_layer()
+    raw_w13, raw_w2 = weakref.ref(layer.w13_weight), weakref.ref(layer.w2_weight)
+    calls = []
+    def pack(weight):
+        calls.append(tuple(weight.shape))
+        return weight.clone()
+    monkeypatch.setattr(module, "pack_w4a8_moe_hipc_weight", pack, raising=False)
+    expert = object.__new__(module.KimiK3HTExperts)
+    expert.process_weights_after_loading(layer)
+    gc.collect()
+    assert raw_w13() is None and raw_w2() is None
+    assert expert._deepgemm_w13 is layer.w13_weight
+    assert expert._deepgemm_w2 is layer.w2_weight
+    replacement = object.__new__(module.KimiK3HTExperts)
+    replacement.process_weights_after_loading(layer)
+    assert len(calls) == 2
+    assert replacement._deepgemm_w13 is expert._deepgemm_w13
 
 
 def test_w4a8_contiguous_rejects_invalid_channel_scale_before_packing(

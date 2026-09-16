@@ -599,6 +599,9 @@ def _make_vllm_module() -> ModuleType:
                 raise AssertionError("legacy GQA DCP head constraint")
 
     class VllmConfig:
+        def __post_init__(self) -> None:
+            return None
+
         def with_hf_config(self, hf_config: object, architectures=None):
             del hf_config, architectures
             return self
@@ -724,8 +727,8 @@ def test_model_arch_config_signature_drift_names_exact_target() -> None:
     with pytest.raises(PatchCompatibilityError) as error:
         patch_vllm_config.apply_to_module(module)
 
-    assert patch_vllm_config.TARGETS[4] in str(error.value)
-    assert patch_vllm_config.TARGETS[2] not in str(error.value)
+    assert "vllm.config.model.ModelConfig.get_model_arch_config" in str(error.value)
+    assert "VllmConfig._get_v2_model_runner_unsupported_features" not in str(error.value)
 
 
 class _LifecycleCompilationConfig:

@@ -72,6 +72,15 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ),
         ("platform.core_fix.hcu_config.vllm", "vllm.config.vllm"),
         (
+            "platform.core_fix.kimi_k3.config_registry",
+            "vllm.transformers_utils.config",
+        ),
+        (
+            "platform.core_fix.kimi_k3.model_config",
+            "vllm.model_executor.models.config",
+        ),
+        ("platform.core_fix.kimi_k3_mtp_config", "vllm.config.speculative"),
+        (
             "platform.core_fix.hcu_config.slimquant_registry",
             "vllm.model_executor.layers.quantization",
         ),
@@ -242,6 +251,11 @@ def test_platform_publishes_worker_and_platform_replacements_in_one_batch(
     )
     monkeypatch.setattr(
         platform_dispatcher,
+        "register_kimi_k3_callbacks",
+        after_batch("kimi-k3"),
+    )
+    monkeypatch.setattr(
+        platform_dispatcher,
         "register_runtime_method_callbacks",
         after_batch("runtime"),
     )
@@ -260,6 +274,7 @@ def test_platform_publishes_worker_and_platform_replacements_in_one_batch(
         "batch-exit",
         "platform-core",
         "tokenizer",
+        "kimi-k3",
         "runtime",
         "platform-framework",
         "drain",
@@ -284,9 +299,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 49,
+        "count": 59,
         "replacements": 11,
-        "callbacks": 38,
+        "callbacks": 48,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

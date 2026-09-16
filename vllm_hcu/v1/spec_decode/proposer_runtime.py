@@ -38,16 +38,13 @@ def initialize_proposer(
             if FlashMLASparseMetadata not in proposer.allowed_attn_types:
                 proposer.allowed_attn_types += (FlashMLASparseMetadata,)
 
-        try:
-            from vllm_hcu.v1.attention.backends.flash_attn import (
-                FlashAttentionMetadata,
-            )
-        except ModuleNotFoundError as exc:
-            if exc.name != "flash_attn":
-                raise
-        else:
-            if FlashAttentionMetadata not in allowed_attn_types:
-                proposer.allowed_attn_types += (FlashAttentionMetadata,)
+        # Type registration must not initialize an unused attention backend.
+        # The backend itself still checks its native ABI when it is selected.
+        from vllm_hcu.v1.attention.backends.flash_attn_metadata import (
+            FlashAttentionMetadata,
+        )
+        if FlashAttentionMetadata not in proposer.allowed_attn_types:
+            proposer.allowed_attn_types += (FlashAttentionMetadata,)
 
     proposer.enable_multi_layers_mtp = config.enable_multi_layers_mtp
     proposer.enable_lightly_cp = config.enable_lightly_cp

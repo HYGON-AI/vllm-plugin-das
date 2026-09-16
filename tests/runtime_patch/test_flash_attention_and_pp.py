@@ -55,6 +55,15 @@ def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("vllm_hcu.v1.attention.backends.flash_attn")
 
 
+def test_flash_attention_backend_reexports_lightweight_metadata(monkeypatch):
+    from vllm_hcu.v1.attention.backends.flash_attn_metadata import (
+        FlashAttentionMetadata,
+    )
+
+    backend = _load_hcu_flash_attention_module(monkeypatch)
+    assert backend.FlashAttentionMetadata is FlashAttentionMetadata
+
+
 def _load_hcu_fa_utils_module(
     monkeypatch: pytest.MonkeyPatch,
     *,

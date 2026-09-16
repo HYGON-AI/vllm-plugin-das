@@ -25,6 +25,7 @@ TARGETS = (
     f"{TARGET_MODULE}.SpecDecodeBaseProposer._maybe_share_lm_head",
     f"{TARGET_MODULE}.SpecDecodeBaseProposer._pad_for_sequence_parallelism",
     f"{TARGET_MODULE}.SpecDecodeBaseProposer._determine_batch_execution_and_padding",
+    f"{TARGET_MODULE}.SpecDecodeBaseProposer.model_returns_tuple",
 )
 _MARKER = "_vllm_hcu_base_proposer_applied"
 _WRAPPER = "_vllm_hcu_base_proposer_wrapper"
@@ -42,6 +43,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (proposer_class, "propose", TARGETS[1], _WRAPPER),
         (proposer_class, "prepare_inputs_padded", TARGETS[2], _WRAPPER),
         (proposer_class, "_maybe_share_lm_head", TARGETS[3], _WRAPPER),
+        (proposer_class, "model_returns_tuple", TARGETS[6], _WRAPPER),
         (
             proposer_class,
             "_determine_batch_execution_and_padding",
@@ -63,6 +65,8 @@ def apply_to_module(module: ModuleType) -> bool:
             f"audited target vLLM API {TARGETS[4]} unexpectedly already exists"
         )
 
+    original_returns_tuple = require_callable(proposer_class, "model_returns_tuple", TARGETS[6])
+    require_exact_signature(original_returns_tuple, TARGETS[6], positional=("self",))
     original_init = require_callable(proposer_class, "__init__", TARGETS[0])
     require_exact_signature(
         original_init,
@@ -247,6 +251,16 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_determine,
     ):
         setattr(function, _WRAPPER, True)
+    @functools.wraps(original_returns_tuple)
+    def hcu_model_returns_tuple(self):
+        if self.method == "mtp" and "KimiK3MTPModel" in (
+            self.draft_model_config.hf_config.architectures or []
+        ):
+            return True
+        return original_returns_tuple(self)
+
+    setattr(hcu_model_returns_tuple, _WRAPPER, True)
+    setattr(proposer_class, "model_returns_tuple", hcu_model_returns_tuple)
     setattr(proposer_class, "_vllm_hcu_original_init", original_init)
     setattr(proposer_class, "_vllm_hcu_original_propose", original_propose)
     setattr(
