@@ -99,16 +99,21 @@ def _model_config(
     )
 
 
+@pytest.mark.parametrize("prefetch_enabled", ("0", "1"))
 def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     monkeypatch: pytest.MonkeyPatch,
+    prefetch_enabled: str,
 ):
     module, engram_config = _engram_module()
     original = engram_config.verify_model_config
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", prefetch_enabled)
     _install_fake_platform(monkeypatch, cuda=False, cuda_alike=True)
 
     assert patch_engram_config.apply(module) is True
     assert patch_engram_config.apply(module) is False
-    engram_config().verify_model_config(_model_config())
+    config = engram_config()
+    config.embedding_across_dp = False
+    config.verify_model_config(_model_config())
 
     wrapped = engram_config.verify_model_config
     assert wrapped.__wrapped__ is original
@@ -118,10 +123,13 @@ def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     assert record.targets == patch_engram_config.TARGETS
 
 
+@pytest.mark.parametrize("prefetch_enabled", ("0", "1"))
 def test_engram_config_rejects_hcu_cross_dp_embedding(
     monkeypatch: pytest.MonkeyPatch,
+    prefetch_enabled: str,
 ):
     module, engram_config = _engram_module()
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", prefetch_enabled)
     _install_fake_platform(monkeypatch, cuda=False, cuda_alike=True)
     patch_engram_config.apply(module)
 
