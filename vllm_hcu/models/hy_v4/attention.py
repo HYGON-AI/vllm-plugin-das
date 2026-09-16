@@ -531,23 +531,59 @@ class PCPShardedGateLinear(ColumnParallelLinear):
     def _forward_k_shard(self, input_: torch.Tensor) -> torch.Tensor:
         pcp_group = get_pcp_group()
         local_tokens = input_.shape[0]
-        # For destination rank r, send K slice r of every local token. The
-        # receive layout is source-rank-major, which is global token order.
-        send = input_.reshape(
-            local_tokens, self.pcp_size, self.gate_shard_input_size
-        ).transpose(0, 1).contiguous()
-        received = torch.empty_like(send)
-        dist.all_to_all_single(
-            received.view(-1),
-            send.view(-1),
-            group=pcp_group.device_group,
-        )
-        partial = self._linear(
-            received.view(self.pcp_size * local_tokens, self.gate_shard_input_size)
-        )
-        # Equivalent to all-reduce(partial) followed by selecting this rank's
-        # token rows, but avoids materializing the full reduced output.
-        return pcp_group.reduce_scatter(partial.contiguous(), dim=0)
+        if local_tokens > 4096:
+            block_tokens = 4096
+            output = None
+            for start in range(0, local_tokens, block_tokens):
+                end = min(start + block_tokens, local_tokens)
+                current_tokens = end - start
+                # For destination rank r, send K slice r of this rank-local token
+                # block. The receive layout is source-rank-major global token order.
+                send = input_[start:end].reshape(
+                    current_tokens, self.pcp_size, self.gate_shard_input_size
+                ).transpose(0, 1).contiguous()
+                received = torch.empty_like(send)
+                dist.all_to_all_single(
+                    received.view(-1),
+                    send.view(-1),
+                    group=pcp_group.device_group,
+                )
+                partial = self._linear(
+                    received.view(
+                        self.pcp_size * current_tokens,
+                        self.gate_shard_input_size,
+                    )
+                )
+                # Equivalent to all-reduce(partial) followed by selecting this
+                # rank's token rows. Blocking bounds the unreduced gate activation.
+                block_output = pcp_group.reduce_scatter(partial.contiguous(), dim=0)
+                if output is None:
+                    output = block_output.new_empty(
+                        (local_tokens, self.gate_output_size)
+                    )
+                output[start:end].copy_(block_output)
+
+            if output is None:
+                return input_.new_empty((0, self.gate_output_size))
+            return output
+        else:
+            # For destination rank r, send K slice r of every local token. The
+            # receive layout is source-rank-major, which is global token order.
+            send = input_.reshape(
+                local_tokens, self.pcp_size, self.gate_shard_input_size
+            ).transpose(0, 1).contiguous()
+            received = torch.empty_like(send)
+            dist.all_to_all_single(
+                received.view(-1),
+                send.view(-1),
+                group=pcp_group.device_group,
+            )
+            partial = self._linear(
+                received.view(self.pcp_size * local_tokens, self.gate_shard_input_size)
+            )
+            # Equivalent to all-reduce(partial) followed by selecting this rank's
+            # token rows, but avoids materializing the full reduced output.
+            return pcp_group.reduce_scatter(partial.contiguous(), dim=0)
 
     def forward(self, input_):
         output = self._forward_k_shard(input_)

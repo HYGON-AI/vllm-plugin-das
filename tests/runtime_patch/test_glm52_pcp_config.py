@@ -132,6 +132,16 @@ def test_hyv4_exact_pp2_pcp4_native_mtp3_is_allowed(make_hyv4_pp2_pcp4_config):
     assert config.speculative_config.draft_model_config.architectures == ["HYV4MTPModel"]
 
 
+def test_hyv4_exact_pp2_pcp4_native_mtp2_is_allowed(
+    make_hyv4_pp2_pcp4_config,
+):
+    config = _native_hyv4_mtp_config(
+        make_hyv4_pp2_pcp4_config,
+        num_speculative_tokens=2,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 def test_hyv4_mtp3_revalidation_accepts_current_sparse_cache_canonicalization(
     make_hyv4_pp2_pcp4_config,
 ):
@@ -162,7 +172,6 @@ def test_hyv4_mtp3_neighbors_stay_closed(make_hyv4_pp2_pcp4_config, override):
 
 @pytest.mark.parametrize("path,value", [
     ("speculative_config.num_speculative_tokens", 1),
-    ("speculative_config.num_speculative_tokens", 2),
     ("speculative_config.num_speculative_tokens", 4),
     ("speculative_config.draft_model_config.architectures", ["UnknownDraft"]),
     ("speculative_config.draft_model_config.model", "separate-checkpoint"),
