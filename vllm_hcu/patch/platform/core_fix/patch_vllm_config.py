@@ -45,17 +45,20 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
 
 
 def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
-    """Admit only the audited PP2/PCP4 checkpoint-native replicated MTP3."""
+    """Admit only checkpoint-native replicated MTP with two or three tokens."""
     parallel = vllm_config.parallel_config
     speculative = vllm_config.speculative_config
-    # if (
-    #     parallel.pipeline_parallel_size != 2
-    #     or speculative.method != "mtp"
-    #     or speculative.num_speculative_tokens != 3
-    # ):
-    #     raise ValueError(
-    #         "HYV4 PCP speculative decoding requires exact PP2+PCP4 native MTP3."
-    #     )
+    # Pipeline depth is validated by the caller's topology check, which admits
+    # PP1 and the audited PP2+PCP4 layout. This contract only covers the
+    # speculative dimension.
+    if (
+        speculative.method != "mtp"
+        or speculative.num_speculative_tokens not in (2, 3)
+    ):
+        raise ValueError(
+            "HYV4 PCP speculative decoding requires checkpoint-native MTP "
+            "with two or three speculative tokens."
+        )
     # The caller already checks topology, eager, MRV2 and the 41,37 partition.
     # Draft construction must retain the target checkpoint and its single
     # native layer; a registered draft architecture alone is insufficient.
@@ -64,7 +67,7 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
         speculative, "draft_model_config", "SpeculativeConfig"
     )
     if draft is None:
-        raise ValueError("HYV4 PCP MTP3 requires a native draft model config.")
+        raise ValueError("HYV4 PCP MTP requires a native draft model config.")
     target_hf = _require_hcu_pcp_attribute(target, "hf_config", "ModelConfig")
     draft_hf = _require_hcu_pcp_attribute(draft, "hf_config", "ModelConfig")
     if (
