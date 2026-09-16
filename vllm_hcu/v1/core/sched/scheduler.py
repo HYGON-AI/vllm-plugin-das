@@ -813,6 +813,10 @@ class HcuScheduler(_upstream.Scheduler):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def _hcu_steady_decode_fallback_reason(self) -> str | None:
+        """Optional adapter veto, checked before any scheduling/KV mutation."""
+        return None
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not henvs.VLLM_HCU_USE_PD_SPLIT:
             return super().schedule(throttle_prefills=throttle_prefills)

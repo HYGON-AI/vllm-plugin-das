@@ -14,6 +14,7 @@ from tests.runtime_patch import test_split_pd_scheduler_v0251 as existing
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.core.sched.scheduler import PauseState
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.v1.core.sched.scheduler import HcuAsyncScheduler, HcuScheduler
 from vllm_hcu.v1.core.sched.steady_decode_scheduler import (
@@ -30,10 +31,6 @@ def make_scheduler(cls=HcuAsyncScheduler, *, max_seqs=4, policy="fcfs", blocks=1
         config.scheduler_config.max_num_seqs = max_seqs
         config.scheduler_config.policy = policy
         config.model_config.max_model_len = 256
-        config.model_config.model_stage = "thinker"
-        config.model_config.engine_output_type = "text"
-        config.model_config.stage_id = 0
-        config.model_config.async_chunk = False
         config.parallel_config.tensor_parallel_size = 1
         config.parallel_config.distributed_executor_backend = "mp"
         config.max_concurrent_batches = (
@@ -256,3 +253,48 @@ def test_fastpath_rejects_disabled_split_pd(monkeypatch):
     monkeypatch.setattr(henvs, 'VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH', True)
     with pytest.raises(ValueError, match='requires VLLM_HCU_USE_PD_SPLIT=1'):
         make_scheduler()
+
+
+@pytest.mark.parametrize("pause", [PauseState.PAUSED_ALL, PauseState.PAUSED_NEW])
+def test_paused_fastpath_falls_back_without_mutation(pause):
+    scheduler = primed()
+    scheduler.set_pause_state(pause)
+    before = state(scheduler)
+    assert try_steady_decode_schedule(scheduler) is None
+    assert scheduler._vllm_hcu_steady_decode_last_reason == "paused"
+    assert state(scheduler) == before
+
+
+@pytest.mark.parametrize("capacity_bound", [False, True])
+@pytest.mark.parametrize("throttle", [False, True])
+def test_throttle_preserves_full_scheduler_capacity_state(capacity_bound, throttle):
+    full = primed()
+    fast = primed()
+    full.prefill_capacity_bound = fast.prefill_capacity_bound = capacity_bound
+    expected = full.schedule(throttle_prefills=throttle)
+    actual = try_steady_decode_schedule(fast, throttle_prefills=throttle)
+    assert asdict(actual) == asdict(expected)
+    assert state(full) == state(fast)
+
+
+def test_full_running_batch_preserves_skipped_waiting_queue():
+    full = primed()
+    fast = primed()
+    for scheduler in (full, fast):
+        waiting_request = request("waiting")
+        scheduler.add_request(waiting_request)
+        scheduler.skipped_waiting.add_request(scheduler.waiting.pop_request())
+    expected = full.schedule()
+    actual = try_steady_decode_schedule(fast)
+    assert asdict(actual) == asdict(expected)
+    assert state(full) == state(fast)
+
+
+def test_downstream_veto_precedes_scheduling_mutation(monkeypatch):
+    scheduler = primed()
+    before = state(scheduler)
+    monkeypatch.setattr(scheduler, "_hcu_steady_decode_fallback_reason", lambda: "adapter_busy")
+    assert try_steady_decode_schedule(scheduler) is None
+    assert scheduler._vllm_hcu_steady_decode_last_reason == "adapter_busy"
+    assert scheduler._vllm_hcu_steady_decode_state is None
+    assert state(scheduler) == before

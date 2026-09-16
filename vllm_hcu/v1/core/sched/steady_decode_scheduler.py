@@ -102,19 +102,7 @@ def _scheduler_reason(scheduler) -> str | None:
         running
     ) != scheduler.max_num_running_reqs:
         return "waiting_admission"
-    # Omni's wrapper still runs on every step; its coordinator must not have
-    # pending side effects that a one-token schedule could accidentally hide.
-    for name in (
-        "chunk_transfer_adapter",
-        "input_coordinator",
-        "pending_stop_after_extraction",
-        "active_kv_transfers",
-        "requests_needing_kv_transfer",
-        "waiting_for_transfer_free",
-    ):
-        if getattr(scheduler, name, None):
-            return "omni_transfer"
-    return None
+    return scheduler._hcu_steady_decode_fallback_reason()
 
 
 def _request_eligible(request, max_model_len: int) -> bool:

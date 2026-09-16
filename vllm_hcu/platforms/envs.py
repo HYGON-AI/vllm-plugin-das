@@ -415,7 +415,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Guarded steady decode scheduling; opt-in on a supported async scheduler.
     "VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH":
         lambda: _environment_flag(os.environ.get("VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH", "0")),
-    # Opt-in Qwen3-Omni input preparation; also gated by USE_CUSTOM_OPS.
+    # Opt-in token-major M-RoPE storage; also gated by USE_CUSTOM_OPS.
     "VLLM_HCU_1D_MROPE":
         lambda: _environment_flag(os.environ.get("VLLM_HCU_1D_MROPE", "0")),
 
