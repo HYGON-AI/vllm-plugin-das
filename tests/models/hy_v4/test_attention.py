@@ -285,6 +285,66 @@ def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
     return impl
 
 
+def test_mtp_topk_union_stats_reports_per_request_reuse() -> None:
+    topk_indices = torch.tensor(
+        [
+            [1, 2, 3, -1],
+            [2, 3, 4, -1],
+            [1, 4, 5, -1],
+            [1, 2, 5, -1],
+            [10, 11, -1, -1],
+            [10, 12, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    query_start_loc = torch.tensor([0, 4, 6], dtype=torch.int32)
+
+    valid_counts, union_sizes = hcu_sparse._mtp_topk_union_stats(
+        topk_indices, query_start_loc
+    )
+
+    assert valid_counts == [12, 4]
+    assert union_sizes == [5, 3]
+
+
+def test_mtp_topk_union_stats_rejects_invalid_request_boundaries() -> None:
+    with pytest.raises(ValueError, match="query_start_loc"):
+        hcu_sparse._mtp_topk_union_stats(
+            torch.zeros(4, 8, dtype=torch.int32),
+            torch.tensor([1, 5], dtype=torch.int32),
+        )
+
+
+def test_mtp_topk_union_profiler_skips_then_records(monkeypatch) -> None:
+    impl = _bare_impl(None)
+    impl._mtp_topk_profile_steps = 1
+    impl._mtp_topk_profile_skip_steps = 1
+    impl.topk_indices_buffer = torch.tensor(
+        [[1, 2], [2, 3], [1, 3], [1, 2]], dtype=torch.int32
+    )
+    metadata = SimpleNamespace(
+        max_query_len=4,
+        num_actual_tokens=4,
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+    )
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        hcu_sparse.logger,
+        "info",
+        lambda _message, *args: logged.append(args),
+    )
+
+    impl._maybe_profile_mtp_topk_union(metadata)
+    assert logged == []
+    assert impl._mtp_topk_profile_skip_steps == 0
+
+    impl._maybe_profile_mtp_topk_union(metadata)
+    assert logged == [("unknown", [4], [8], [3], 8 / 3)]
+    assert impl._mtp_topk_profile_steps == 0
+
+
 def test_sink_padding_uses_negative_infinity() -> None:
     sinks = torch.arange(4, dtype=torch.float32)
     impl = _bare_impl(sinks)
