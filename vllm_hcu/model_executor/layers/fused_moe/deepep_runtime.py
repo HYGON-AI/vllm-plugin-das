@@ -597,18 +597,22 @@ def ll_prepare_async(
             if block_k is None and quant_config.per_act_token_quant
             else module.DEEPEP_QUANT_BLOCK_SIZE
         )
-    if getattr(self, "_vllm_hcu_clean_low_latency_buffer", False):
+    layout = (self.max_tokens_per_rank, hidden_size, num_experts, quant_group_size)
+    buffer_layout = (id(self.buffer), layout)
+    track_layout = hasattr(self, "_hcu_ll_cleaned_buffer_layout")
+    # Upstream owns the dynamic HT/LL policy. Kimi additionally initializes
+    # its dedicated buffer once, and again when its buffer or layout changes.
+    if getattr(self, "_vllm_hcu_clean_low_latency_buffer", False) or (
+        track_layout and self._hcu_ll_cleaned_buffer_layout != buffer_layout
+    ):
         cleanup = getattr(self.buffer, "clean_low_latency_buffer", None)
         if not callable(cleanup):
             raise RuntimeError(
                 "HCU DeepEP LL buffer does not expose clean_low_latency_buffer"
             )
-        cleanup(
-            self.max_tokens_per_rank,
-            hidden_size,
-            num_experts,
-            quant_group_size,
-        )
+        cleanup(*layout)
+        if track_layout:
+            self._hcu_ll_cleaned_buffer_layout = buffer_layout
     try:
         if use_hcu_api:
             result = self.buffer.low_latency_dispatch(

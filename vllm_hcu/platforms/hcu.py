@@ -234,6 +234,7 @@ class HCUPlatform(Platform):
         "online",
         # "gpt_oss_mxfp4",
         "slimquant_w4a8",
+        "kimi_k3_w4a8",
         "slimquant_w4a8_marlin", 
         "slimquant_compressed_tensors_marlin",
     ]
@@ -408,9 +409,26 @@ class HCUPlatform(Platform):
     
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
-        return True
+        # Enable HCU P2P by default, with an explicit RCCL/NCCL opt-out.
+        return henvs.VLLM_HCU_USE_CUSTOM_ALLREDUCE
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        from vllm.config.kernel import IrOpPriorityConfig
+        from vllm_hcu.runtime_compat.kimi_k3_loading import is_kimi_k3_config
+
+        if not is_kimi_k3_config(vllm_config):
+            return super().get_default_ir_op_priority(vllm_config)
+
+        # HCU Kimi runs may request torch.compile but fall back at runtime.
+        # Prefer the same ROCm C kernels used by the source path rather than
+        # selecting native decomposition solely from the requested mode.
+        default = ["vllm_c", "native"]
+        return IrOpPriorityConfig.with_default(
+            default, rms_norm=default, fused_add_rms_norm=default
+        )
     
     @classmethod
     def device_count(cls) -> int:
