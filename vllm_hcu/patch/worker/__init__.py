@@ -213,6 +213,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
