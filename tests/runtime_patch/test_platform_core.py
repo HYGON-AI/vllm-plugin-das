@@ -188,14 +188,8 @@ def test_engram_config_rejects_signature_and_source_contract_drift():
         patch_engram_config.apply(bad_contract)
 
 
-def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-):
+def test_envs_defaults_aiter_moe_off(monkeypatch: pytest.MonkeyPatch):
     _clear_vllm_environment(monkeypatch)
-    logger = logging.getLogger("test.hcu.envs")
-
-    def original_validate(hard_fail):
-        raise AssertionError("the upstream validator should have been replaced")
 
     module = _module(
         patch_envs.TARGET_MODULE,
@@ -203,8 +197,7 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
             "VLLM_KNOWN": lambda: "known",
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
         },
-        validate_environ=original_validate,
-        logger=logger,
+        logger=logging.getLogger("test.hcu.envs"),
     )
 
     assert patch_envs.apply(module) is True
@@ -214,31 +207,46 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
     monkeypatch.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
     assert getter() is True
 
-    monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
-    monkeypatch.setenv("VLLM_KNOWN", "1")
-    module.validate_environ(hard_fail=True)
-
-    monkeypatch.setenv("VLLM_NOT_HCU", "1")
-    with pytest.raises(ValueError, match="VLLM_NOT_HCU"):
-        module.validate_environ(hard_fail=True)
-    monkeypatch.delenv("VLLM_NOT_HCU")
-    monkeypatch.setenv("VLLM_HCU", "1")
-    with caplog.at_level(logging.WARNING, logger="test.hcu.envs"):
-        module.validate_environ(hard_fail=False)
-    assert "VLLM_HCU" in caplog.text
-
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.APPLIED
 
 
-def test_envs_rejects_signature_drift_and_latches_failure():
+def test_hcu_platform_validate_environ_allows_only_hcu_namespace(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    _clear_vllm_environment(monkeypatch)
+    # Production resolves the HCU platform class from the vLLM plugin hook, so
+    # vLLM is always initialized first; importing the platform module on its
+    # own would re-enter vLLM's own import.
+    import vllm  # noqa: F401
+    from vllm_hcu.platforms.hcu import HCUPlatform
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
+    for name in hcu_envs.hcu_vllm_environment_variables:
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+
+    HCUPlatform.validate_environ(hard_fail=True)
+
+    monkeypatch.setenv("VLLM_NOT_HCU", "1")
+    with pytest.raises(ValueError, match="VLLM_NOT_HCU"):
+        HCUPlatform.validate_environ(hard_fail=True)
+    monkeypatch.delenv("VLLM_NOT_HCU")
+
+    monkeypatch.setenv("VLLM_HCU", "1")
+    with caplog.at_level(logging.WARNING, logger="vllm_hcu.platforms.hcu"):
+        HCUPlatform.validate_environ(hard_fail=False)
+    assert "VLLM_HCU" in caplog.text
+
+
+def test_envs_rejects_missing_aiter_moe_target():
     module = _module(
         patch_envs.TARGET_MODULE,
-        environment_variables={"VLLM_ROCM_USE_AITER_MOE": lambda: True},
-        validate_environ=lambda: None,
+        environment_variables={},
         logger=logging.getLogger("test.hcu.bad_envs"),
     )
-    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+    with pytest.raises(PatchCompatibilityError, match="VLLM_ROCM_USE_AITER_MOE"):
         patch_envs.apply(module)
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.FAILED

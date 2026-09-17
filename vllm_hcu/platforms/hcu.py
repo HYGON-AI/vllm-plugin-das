@@ -256,6 +256,35 @@ class HCUPlatform(Platform):
         pass
 
     @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        """Allow the HCU namespace through the official environment check.
+
+        vLLM main owns unknown-``VLLM_*`` validation at this platform
+        boundary.  The HCU plugin owns ``VLLM_HCU_*`` variables (plus the
+        HCU-specific ``VLLM_USE_NN``/``VLLM_USE_OPT_CAT`` switches) that are
+        not part of ``vllm.envs.environment_variables``, so delegate the
+        remaining names to the official implementation unchanged.
+        """
+
+        from vllm import envs as _vllm_envs
+
+        known = getattr(_vllm_envs, "environment_variables", {})
+        hcu_names = set(henvs.hcu_vllm_environment_variables)
+        for env in os.environ:
+            if (
+                not env.startswith("VLLM_")
+                or env in known
+                or env in hcu_names
+                or env.startswith("VLLM_HCU_")
+            ):
+                continue
+            if hard_fail:
+                raise ValueError(
+                    f"Unknown vLLM environment variable detected: {env}"
+                )
+            logger.warning("Unknown vLLM environment variable detected: %s", env)
+
+    @classmethod
     def get_valid_backends(
         cls,
         device_capability: DeviceCapability,
