@@ -56,11 +56,11 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
     # Draft construction must retain the target checkpoint and its single
     # native layer; a registered draft architecture alone is insufficient.
     target = vllm_config.model_config
-    draft = _require_hcu_pcp_attribute(
-        speculative, "draft_model_config", "SpeculativeConfig"
-    )
+    draft = getattr(speculative, "draft_model_config", None)
     if draft is None:
-        raise ValueError("HYV4 PCP MTP requires a native draft model config.")
+        raise ValueError(
+            "HYV4 PCP speculative decoding requires a native MTP draft model config."
+        )
     target_hf = _require_hcu_pcp_attribute(target, "hf_config", "ModelConfig")
     draft_hf = _require_hcu_pcp_attribute(draft, "hf_config", "ModelConfig")
     if (
