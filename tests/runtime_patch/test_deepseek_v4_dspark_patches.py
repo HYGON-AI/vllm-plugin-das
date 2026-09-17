@@ -486,6 +486,28 @@ def test_hcu_aiter_mhc_exposes_main_delayed_batch_heuristic() -> None:
     assert rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1_000_000) is True
 
 
+def test_mhc_backend_rejects_partial_aiter_delayed_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module(
+        patch_mhc_backend.TARGET_MODULE,
+        HAS_AITER_MHC=True,
+        HAS_TILELANG_MHC=False,
+    )
+    monkeypatch.setattr(
+        "vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC",
+        True,
+    )
+    monkeypatch.setattr(
+        patch_mhc_backend,
+        "_aiter_mhc_runtime_complete",
+        lambda _module: False,
+    )
+
+    assert patch_mhc_backend.apply_to_module(module) is True
+    assert module.HAS_AITER_MHC is False
+
+
 def test_load_weights_rejects_stale_patch_marker() -> None:
     class DeepseekV4Model:
         _vllm_hcu_deepseek_v4_load_weights_applied = True

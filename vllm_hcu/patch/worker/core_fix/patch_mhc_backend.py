@@ -23,6 +23,30 @@ def _tilelang_runtime_available() -> bool:
     return True
 
 
+def _aiter_mhc_runtime_complete(mhc) -> bool:
+    """Check the AITER mHC surface required by vLLM main.
+
+    Main's ``MHCPreDelayedOp`` uses both the batch-size heuristic and the
+    delayed operator.  Older HCU AITER wrappers may expose the ordinary mHC
+    methods but not this delayed pair; advertising partial support causes a
+    profile-time AttributeError.  In that case the official native fallback
+    is the correctness path.
+    """
+
+    try:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        return all(
+            callable(getattr(rocm_aiter_ops, name, None))
+            for name in (
+                "mhc_pre_delayed",
+                "mhc_fused_post_pre_delayed_prefers_unfused",
+            )
+        )
+    except Exception:
+        return False
+
+
 def apply_to_module(module: ModuleType) -> bool:
     mhc = load_exact_module(TARGET_MODULE, module)
     if getattr(mhc, _MARKER, False):
@@ -55,7 +79,11 @@ def apply_to_module(module: ModuleType) -> bool:
     # the first profile run.
     mhc._vllm_hcu_original_has_aiter_mhc = has_aiter_mhc
     mhc._vllm_hcu_original_has_tilelang_mhc = has_tilelang_mhc
-    mhc.HAS_AITER_MHC = bool(has_aiter_mhc and henvs.VLLM_HCU_USE_AITER_MHC)
+    mhc.HAS_AITER_MHC = bool(
+        has_aiter_mhc
+        and henvs.VLLM_HCU_USE_AITER_MHC
+        and _aiter_mhc_runtime_complete(mhc)
+    )
     mhc.HAS_TILELANG_MHC = bool(
         has_tilelang_mhc and _tilelang_runtime_available()
     )
