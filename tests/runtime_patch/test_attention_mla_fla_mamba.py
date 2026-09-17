@@ -1649,27 +1649,32 @@ def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
 def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
     adapter = _adapter("patch_mla_indexer")
 
-    def split_chunks(seq_lens_cpu, query_lens_cpu, workspace_size,
-                     max_logits_bytes, request_offset=0):
-        return [(slice(0, 1), slice(0, 0)), (slice(1, 2), slice(0, 2))]
-
     def split_batch(common_attn_metadata, decode_threshold=1,
                     require_uniform=False, treat_short_extends_as_decodes=True):
         return treat_short_extends_as_decodes
 
     class Builder:
+        @staticmethod
+        def _split_indexer_prefill_chunks(
+            compressed_seq_lens_cpu,
+            prefill_query_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+            request_offset=0,
+        ):
+            return [(slice(0, 1), slice(0, 0)), (slice(1, 2), slice(0, 2))]
+
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             return SimpleNamespace(decode=None)
 
     module = _module(
         adapter.TARGET_MODULE,
-        split_indexer_prefill_chunks=split_chunks,
         split_decodes_and_prefills=split_batch,
         DeepseekV32IndexerMetadataBuilder=Builder,
         current_platform=SimpleNamespace(is_rocm=lambda: False),
     )
     adapter.apply_to_module(module)
-    chunks = module.split_indexer_prefill_chunks(None, None, 1, 1)
+    chunks = Builder._split_indexer_prefill_chunks(None, None, 1, 1)
     assert chunks == [(slice(1, 2), slice(0, 2))]
     common = SimpleNamespace(
         is_prefilling=torch.tensor([True]), num_actual_tokens=2,

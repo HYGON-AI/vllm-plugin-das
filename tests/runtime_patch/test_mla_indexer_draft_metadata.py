@@ -19,15 +19,6 @@ def _patched_split(monkeypatch: pytest.MonkeyPatch):
     calls: list[bool] = []
     target = ModuleType(TARGET_MODULE)
 
-    def split_indexer_prefill_chunks(
-        seq_lens_cpu,
-        query_lens_cpu,
-        workspace_size,
-        max_logits_bytes,
-        request_offset=0,
-    ):
-        return []
-
     def split_decodes_and_prefills(
         common_attn_metadata,
         decode_threshold=1,
@@ -40,10 +31,19 @@ def _patched_split(monkeypatch: pytest.MonkeyPatch):
         return (1, 0, 1, 0)
 
     class DeepseekV32IndexerMetadataBuilder:
+        @staticmethod
+        def _split_indexer_prefill_chunks(
+            compressed_seq_lens_cpu,
+            prefill_query_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+            request_offset=0,
+        ):
+            return []
+
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             return SimpleNamespace()
 
-    target.split_indexer_prefill_chunks = split_indexer_prefill_chunks
     target.split_decodes_and_prefills = split_decodes_and_prefills
     target.DeepseekV32IndexerMetadataBuilder = DeepseekV32IndexerMetadataBuilder
     monkeypatch.setitem(sys.modules, TARGET_MODULE, target)
@@ -79,15 +79,6 @@ def test_metadata_scope_controls_pcp_width_during_indexer_build(
     observed_world_sizes: list[int] = []
     target = ModuleType(TARGET_MODULE)
 
-    def split_indexer_prefill_chunks(
-        seq_lens_cpu,
-        query_lens_cpu,
-        workspace_size,
-        max_logits_bytes,
-        request_offset=0,
-    ):
-        return []
-
     def split_decodes_and_prefills(
         common_attn_metadata,
         decode_threshold=1,
@@ -100,13 +91,22 @@ def test_metadata_scope_controls_pcp_width_during_indexer_build(
         def __init__(self) -> None:
             self.pcp_world_size = 2
 
+        @staticmethod
+        def _split_indexer_prefill_chunks(
+            compressed_seq_lens_cpu,
+            prefill_query_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+            request_offset=0,
+        ):
+            return []
+
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             observed_world_sizes.append(self.pcp_world_size)
             if getattr(common_attn_metadata, "fail", False):
                 raise RuntimeError("metadata build failed")
             return SimpleNamespace()
 
-    target.split_indexer_prefill_chunks = split_indexer_prefill_chunks
     target.split_decodes_and_prefills = split_decodes_and_prefills
     target.DeepseekV32IndexerMetadataBuilder = DeepseekV32IndexerMetadataBuilder
     monkeypatch.setitem(sys.modules, TARGET_MODULE, target)
