@@ -111,6 +111,7 @@ def test_linear_gate_pcp_sharding_flag_remains_independent(monkeypatch) -> None:
     assert linear_gate_pcp_shard_enabled() is True
 
 
+def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
     spec = MLAAttentionSpec(
         block_size=64,
         num_kv_heads=1,

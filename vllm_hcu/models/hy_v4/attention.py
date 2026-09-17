@@ -413,16 +413,15 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def linear_gate_pcp_shard_enabled() -> bool:
-    """Return whether gated MLA linear_gate PCP sharding is enabled."""
+    """Return whether gated MLA linear_gate PCP sharding is disabled."""
     return _env_flag(_LINEAR_GATE_PCP_SHARD_ENV, False)
 
 
 def linear_gate_pcp_chunking_enabled() -> bool:
     """Return whether large linear_gate PCP inputs should be chunked.
 
-    Chunking defaults to enabled to preserve the original bounded-memory path.
-    Set ``VLLM_HCU_LINEAR_GATE_PCP_CHUNKING=0`` to use one collective for the
-    whole local token batch.
+    Chunking defaults to disabled. Set
+    ``VLLM_HCU_LINEAR_GATE_PCP_CHUNKING=1`` to enable chunked collectives.
     """
     return _env_flag(_LINEAR_GATE_PCP_CHUNK_ENV, False)
 
