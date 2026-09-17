@@ -445,7 +445,11 @@ def test_rocm_wo_a_cache_keeps_upstream_layout() -> None:
 def test_mhc_backend_switch_masks_aiter_only_when_hcu_option_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module(patch_mhc_backend.TARGET_MODULE, HAS_AITER_MHC=True)
+    module = _module(
+        patch_mhc_backend.TARGET_MODULE,
+        HAS_AITER_MHC=True,
+        HAS_TILELANG_MHC=True,
+    )
     monkeypatch.setattr(
         "vllm_hcu.platforms.envs.VLLM_HCU_USE_AITER_MHC",
         False,
@@ -453,7 +457,26 @@ def test_mhc_backend_switch_masks_aiter_only_when_hcu_option_is_off(
 
     assert patch_mhc_backend.apply_to_module(module) is True
     assert module.HAS_AITER_MHC is False
+    assert module.HAS_TILELANG_MHC is False
     assert patch_mhc_backend.apply_to_module(module) is False
+
+
+def test_mhc_backend_keeps_importable_tilelang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module(
+        patch_mhc_backend.TARGET_MODULE,
+        HAS_AITER_MHC=False,
+        HAS_TILELANG_MHC=True,
+    )
+    monkeypatch.setattr(
+        patch_mhc_backend,
+        "_tilelang_runtime_available",
+        lambda: True,
+    )
+
+    assert patch_mhc_backend.apply_to_module(module) is True
+    assert module.HAS_TILELANG_MHC is True
 
 
 def test_load_weights_rejects_stale_patch_marker() -> None:
