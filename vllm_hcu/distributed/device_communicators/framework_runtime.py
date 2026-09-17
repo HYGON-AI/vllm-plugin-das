@@ -36,7 +36,7 @@ def make_deep_ep_ht_kwargs(manager: object, envs: object) -> dict[str, Any]:
 
     return {
         "group": manager.cpu_group,
-        "num_nvl_bytes": _HT_NVL_BUFFER_BYTES,
+        "num_nvl_bytes": envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024,
         "num_rdma_bytes": num_rdma_bytes,
         "low_latency_mode": False,
         "num_qps_per_rank": num_qps_per_rank,
