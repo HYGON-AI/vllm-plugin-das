@@ -413,7 +413,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def linear_gate_pcp_shard_enabled() -> bool:
-    """Return whether gated MLA linear_gate PCP sharding is disabled."""
+    """Return whether gated MLA linear_gate PCP sharding is enabled."""
     return _env_flag(_LINEAR_GATE_PCP_SHARD_ENV, False)
 
 
