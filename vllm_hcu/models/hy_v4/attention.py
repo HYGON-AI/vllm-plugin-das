@@ -396,17 +396,56 @@ class HYV4MLAAttentionLayer(MLAAttention):
         )
 
 _LINEAR_GATE_PCP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD"
+_LINEAR_GATE_PCP_CHUNK_ENV = "VLLM_HCU_LINEAR_GATE_PCP_CHUNKING"
+_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV = "VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS"
+_LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS = 4096
 _linear_gate_pcp_shard_logged = False
 
 
-def linear_gate_pcp_shard_enabled() -> bool:
-    """Return whether gated MLA linear_gate PCP sharding is enabled."""
-    return os.environ.get(_LINEAR_GATE_PCP_SHARD_ENV, "0").strip().lower() in (
+def _env_flag(name: str, default: bool) -> bool:
+    default_value = "1" if default else "0"
+    return os.environ.get(name, default_value).strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def linear_gate_pcp_shard_enabled() -> bool:
+    """Return whether gated MLA linear_gate PCP sharding is enabled."""
+    return _env_flag(_LINEAR_GATE_PCP_SHARD_ENV, False)
+
+
+def linear_gate_pcp_chunking_enabled() -> bool:
+    """Return whether large linear_gate PCP inputs should be chunked.
+
+    Chunking defaults to enabled to preserve the original bounded-memory path.
+    Set ``VLLM_HCU_LINEAR_GATE_PCP_CHUNKING=0`` to use one collective for the
+    whole local token batch.
+    """
+    return _env_flag(_LINEAR_GATE_PCP_CHUNK_ENV, False)
+
+
+def linear_gate_pcp_block_tokens() -> int:
+    """Return the positive local-token block size for linear_gate PCP."""
+    raw_value = os.environ.get(
+        _LINEAR_GATE_PCP_BLOCK_TOKENS_ENV,
+        str(_LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS),
+    ).strip()
+    try:
+        block_tokens = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV} must be a positive integer; "
+            f"got {raw_value!r}."
+        ) from exc
+    if block_tokens <= 0:
+        raise ValueError(
+            f"{_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV} must be a positive integer; "
+            f"got {block_tokens}."
+        )
+    return block_tokens
 
 
 class PCPShardedGateLinear(ColumnParallelLinear):
@@ -531,8 +570,9 @@ class PCPShardedGateLinear(ColumnParallelLinear):
     def _forward_k_shard(self, input_: torch.Tensor) -> torch.Tensor:
         pcp_group = get_pcp_group()
         local_tokens = input_.shape[0]
-        if local_tokens > 4096:
-            block_tokens = 4096
+        chunking_enabled = linear_gate_pcp_chunking_enabled()
+        block_tokens = linear_gate_pcp_block_tokens() if chunking_enabled else local_tokens
+        if chunking_enabled and local_tokens > block_tokens:
             output = None
             for start in range(0, local_tokens, block_tokens):
                 end = min(start + block_tokens, local_tokens)

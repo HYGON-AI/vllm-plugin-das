@@ -20,6 +20,9 @@ from vllm_hcu.models.hy_v4.attention import (
     is_skip_topk_indexer_weight,
     require_local_indexer_producer,
     require_hyv4_sink_backend,
+    linear_gate_pcp_block_tokens,
+    linear_gate_pcp_chunking_enabled,
+    linear_gate_pcp_shard_enabled,
 )
 
 
@@ -86,7 +89,28 @@ def test_hy_v4_preserves_native_kv_cache_dtype(cache_dtype: str) -> None:
     )
 
 
-def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
+def test_linear_gate_pcp_chunking_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_CHUNKING", "0")
+    assert linear_gate_pcp_chunking_enabled() is False
+
+
+def test_linear_gate_pcp_block_tokens_is_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS", "1024")
+    assert linear_gate_pcp_block_tokens() == 1024
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+def test_linear_gate_pcp_rejects_invalid_block_tokens(monkeypatch, value) -> None:
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS", value)
+    with pytest.raises(ValueError, match="positive integer"):
+        linear_gate_pcp_block_tokens()
+
+
+def test_linear_gate_pcp_sharding_flag_remains_independent(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+    assert linear_gate_pcp_shard_enabled() is True
+
+
     spec = MLAAttentionSpec(
         block_size=64,
         num_kv_heads=1,
