@@ -127,6 +127,11 @@ def test_channel_fp8_schema_is_detected() -> None:
     assert patch_deepseek_v41_channel_fp8._is_channel_fp8_quant_config(
         CHANNEL_FP8_QUANT_CONFIG
     )
+    normalized_config = dict(CHANNEL_FP8_QUANT_CONFIG)
+    normalized_config["quant_method"] = "deepseek_v4_fp8"
+    assert patch_deepseek_v41_channel_fp8._is_channel_fp8_quant_config(
+        normalized_config
+    )
     assert not patch_deepseek_v41_channel_fp8._is_channel_fp8_quant_config(
         BLOCK_FP8_QUANT_CONFIG
     )

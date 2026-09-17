@@ -92,7 +92,7 @@ def _is_channel_fp8_quant_config(config: object) -> bool:
 
     return (
         isinstance(config, dict)
-        and config.get("quant_method") == "fp8"
+        and config.get("quant_method") in ("fp8", "deepseek_v4_fp8")
         and bool(config.get("is_per_channel"))
         and config.get("weight_block_size") is None
         and config.get("activation_scheme", "dynamic") == "dynamic"
