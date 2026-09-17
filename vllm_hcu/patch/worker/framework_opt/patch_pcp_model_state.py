@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Attach HCU PCP plans to vLLM 0.28 attention metadata."""
+"""Attach HCU PCP plans to the audited vLLM main attention metadata."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ TARGETS = (
 _MARKER = "_vllm_hcu_pcp_model_state_applied"
 _WRAPPER = "_vllm_hcu_pcp_model_state_wrapper"
 _V028_PREPARE_ATTN_SOURCE_SHA256 = (
-    "10d3722dbbed9652003fbc634b5183d344d5b9464bef8e2bcf35a615cae324c6"
+    "6179ceee8a42f7ae4906bdc55b5fc02b53155d4ba18d555504839974eb20f9a4"
 )
 
 
@@ -154,7 +154,7 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} no longer matches the "
-            "audited v0.28 metadata path"
+            "audited vLLM main metadata path"
         )
 
     @functools.wraps(original_prepare_attn)
