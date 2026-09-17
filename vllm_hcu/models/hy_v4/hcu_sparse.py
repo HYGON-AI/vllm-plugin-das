@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.models.hy_v4.fp8_kv_dequant import gather_dequantize_fp8_ds_mla_cache
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
@@ -91,6 +93,13 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        # MTP width: query rows per request in a decode batch. LightOp's gather
+        # groups ``num_tokens`` rows into requests with this stride, so MTP3
+        # (num_speculative_tokens == 3) passes 3 and plain decoding passes 1.
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        self.tokens_per_request = int(
+            getattr(speculative_config, "num_speculative_tokens", 0) or 0
+        ) or 1
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -179,7 +188,15 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # The fp8 FlashMLA kernel hardcodes DeepSeek's fp8_ds_mla geometry
+        # (pe_dim == 64). When VLLM_HCU_HYV4_FP8_KV_DEQUANT is set, dequantize
+        # the fp8 KV cache to BF16 and run the BF16 sparse kernel instead. In
+        # HY V4's mixed-batch mode this interception point handles both prefill
+        # and decode tokens, so the env var covers both paths.
+        if henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT:
+            return self._dequant_bf16_attn(q, kv_c_and_k_pe_cache, topk_indices)
+
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
         padded_num_heads = self.fp8_decode_padded_heads
@@ -213,6 +230,48 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             out = out[:, :, :actual_num_heads, :]
 
         return out, lse
+
+    def _dequant_bf16_attn(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dequantize the fp8 KV cache to BF16 and run the BF16 sparse kernel.
+
+        Replaces the fp8 FlashMLA kernel (which hardcodes the fp8_ds_mla
+        geometry) with the geometry-agnostic BF16 sparse kernel. In HY V4's
+        mixed-batch mode this runs for prefill and decode tokens alike, so both
+        paths go through ``flash_mla_sparse_fwd`` on the upconverted cache.
+
+        Only the ``num_tokens * topk`` slots the sparse kernel actually reads are
+        dequantized, into a compact ``(num_tokens * topk, head_size)`` BF16
+        buffer, and ``topk_indices`` (already converted to global cache slots,
+        with -1 marking invalid entries) is remapped to that buffer's rows.
+        Both ``topk`` and ``num_tokens`` are fixed per step, so the buffer shape
+        is fixed and the decode path stays CUDA-graph-capturable.
+        ``flash_mla_sparse_fwd`` handles the -1 indices natively.
+        """
+        num_tokens_b, seq_len, num_heads, head_dim = q.shape
+        rope_dim = self.head_size - self.kv_lora_rank
+
+        # Flatten tokens; indices are already global cache slots.
+        q_flat = q.reshape(num_tokens_b * seq_len, num_heads, head_dim)
+        idx_flat = topk_indices.reshape(num_tokens_b * seq_len, -1)
+
+        # Gather + dequantize only the selected slots; remap indices to the
+        # compact buffer's rows.
+        kv_bf16, new_idx = gather_dequantize_fp8_ds_mla_cache(
+            kv_c_and_k_pe_cache,
+            idx_flat,
+            self.kv_lora_rank,
+            rope_dim,
+            self.tokens_per_request,
+        )
+
+        out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
+        out = out.reshape(num_tokens_b, seq_len, num_heads, out.shape[-1])
+        return out, None
 
     def _bf16_flash_mla_kernel(
         self,
