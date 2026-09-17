@@ -53,7 +53,7 @@ def test_frozen_opendas_vllm_wheel_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    value = "0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604"
+    value = "0.29.1rc0.dev283+g4c349cf634.das.4c349cf.dtk2604"
     _install_version(monkeypatch, tmp_path, value)
 
     result = compatibility.ensure_vllm_compatible()
@@ -67,15 +67,15 @@ def test_frozen_opendas_vllm_wheel_is_accepted(
 @pytest.mark.parametrize(
     "value",
     (
-        "0.28.1",
-        "0.28.1+das.vendor.dtk2604",
-        "0.28.1rc1.dev491+g58ad1f3b",
-        "0.28.1rc1.dev999+gdeadbee.das.vendor.dtk2604",
-        "0.28.1rc2",
-        "0.28.1.post1",
+        "0.29.1",
+        "0.29.1+das.vendor.dtk2604",
+        "0.29.1rc0.dev283+gde24e519",
+        "0.29.1rc0.dev999+gdeadbee.das.vendor.dtk2604",
+        "0.29.1rc1",
+        "0.29.1.post1",
     ),
 )
-def test_v0281_release_line_accepts_rolling_vendor_builds(
+def test_v0291_release_line_accepts_rolling_vendor_builds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     value: str,
@@ -87,7 +87,7 @@ def test_v0281_release_line_accepts_rolling_vendor_builds(
     assert result.compatible
     assert result.actual_version == value
     assert result.reason == (
-        "installed vLLM build matches supported release line 0.28.1"
+        "installed vLLM build matches supported release line 0.29.1"
     )
 
 
@@ -97,9 +97,10 @@ def test_v0281_release_line_accepts_rolling_vendor_builds(
         "0.20.2",
         "0.22.0",
         "0.25.1+das.local",
-        "0.28.0",
-        "0.28.9",
-        "1!0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604",
+        "0.28.1",
+        "0.29.0",
+        "0.29.9",
+        "1!0.29.1rc0.dev283+g4c349cf634.das.4c349cf.dtk2604",
         "not a version",
     ),
 )
@@ -115,12 +116,12 @@ def test_unsupported_or_invalid_vllm_metadata_has_actionable_error(
 
     message = str(raised.value)
     assert (
-        "expected=0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604"
+        "expected=0.29.1rc0.dev283+g4c349cf634.das.4c349cf.dtk2604"
         in message
     )
     assert f"actual={value!r}" in message
-    assert "upstream_sha=58ad1f3b8973b23943107b51230d594050b42ec3" in message
-    assert "opendas_sha=462fdb097c66b487ef4826e8009431c10fe88fb8" in message
+    assert "upstream_sha=de24e5190820cc6640f2d55295405f228fffbc41" in message
+    assert "opendas_sha=4c349cf6340fac8f1643476af9c2fb5e4b3252d6" in message
     assert "vllm_hcu=" in message
     assert "vllm_location=" in message
     assert "vllm_hcu_location=" in message
@@ -147,11 +148,11 @@ def test_runtime_hcu_version_prefers_metadata_with_source_fallback(
     monkeypatch.setattr(
         hcu_version.importlib_metadata,
         "version",
-        lambda name: "0.28.1rc1.dev491+das.abcdef0.dtk2604",
+        lambda name: "0.29.1rc0.dev283+das.abcdef0.dtk2604",
     )
     assert (
         hcu_version.get_hcu_version()
-        == "0.28.1rc1.dev491+das.abcdef0.dtk2604"
+        == "0.29.1rc0.dev283+das.abcdef0.dtk2604"
     )
 
     def missing(name: str):
