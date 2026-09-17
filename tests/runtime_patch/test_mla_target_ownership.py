@@ -433,8 +433,8 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     assert instance.forward_impl(*args) == "target-v0.25.1"
     assert target_calls == [(instance, args)]
     common = SimpleNamespace(is_prefilling=torch.tensor([True]))
-    assert module.split_decodes_and_prefills(common, 3, True, True) is False
-    assert module.split_calls == [(common, 3, True, False)]
+    assert module.split_decodes_and_prefills(common, 3, True, True) is True
+    assert module.split_calls == [(common, 3, True, True)]
     warmup = SimpleNamespace(is_prefilling=None)
     assert module.split_decodes_and_prefills(warmup, 3, True, True) is True
     assert module.split_calls[-1] == (warmup, 3, True, True)

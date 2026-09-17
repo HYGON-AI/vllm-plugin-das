@@ -17,7 +17,7 @@ class HcuTritonMLABackend(TritonMLABackend):
         "fp8_e4m3",
         "fp8_e5m2",
     ]
-    
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA"

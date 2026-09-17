@@ -12,6 +12,7 @@ from vllm_hcu.patch.module_exchange import register_all_module_exchanges
 from vllm_hcu.patch.runtime_callbacks import register_runtime_method_callbacks
 from vllm_hcu.patch.runtime_state import detect_process_role, set_process_role
 from vllm_hcu.patch.tokenizer_callbacks import register_tokenizer_callbacks
+from vllm_hcu.patch.kimi_k3_callbacks import register_kimi_k3_callbacks
 
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
@@ -110,6 +111,7 @@ def apply_platform_patches() -> None:
             register_all_module_exchanges(IMPORT_COORDINATOR)
         register_platform_core_callbacks(IMPORT_COORDINATOR)
         register_tokenizer_callbacks(IMPORT_COORDINATOR)
+        register_kimi_k3_callbacks(IMPORT_COORDINATOR)
         register_runtime_method_callbacks(IMPORT_COORDINATOR)
         _register_platform_framework_callbacks()
         # Some targets can recursively trigger platform discovery while their

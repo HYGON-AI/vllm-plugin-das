@@ -223,6 +223,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
+    _CallbackSpec(_adapter("core_fix", "patch_kimi_k3_model")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_dflash_nn_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
@@ -324,6 +325,11 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_pcp_model_state"),
+    ),
+    # v0.25.1 has no SlotMappingMode, so MultiGroupBlockTable launches the
+    # slot-mapping kernel once per KV cache group even for Mamba/GDN groups.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_slot_mapping_modes"),
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_dp_utils"),

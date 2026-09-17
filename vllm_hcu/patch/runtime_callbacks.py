@@ -194,6 +194,29 @@ def apply_kimi_k25_vision_prompt(module: ModuleType) -> None:
         )
 
 
+def apply_kimi_k25_qkv_layout(module: ModuleType) -> None:
+    target = "vllm.model_executor.models.kimi_k25_vit"
+    module = require_exact_module(module, target)
+    require_type(module, "MoonViTEncoderLayer", f"{target}.MoonViTEncoderLayer")
+    require_type(module, "MoonViT3dEncoder", f"{target}.MoonViT3dEncoder")
+    require_type(module, "MoonViT3dPretrainedModel", f"{target}.MoonViT3dPretrainedModel")
+    require_type(
+        module,
+        "KimiK25MultiModalProjector",
+        f"{target}.KimiK25MultiModalProjector",
+    )
+    require_callable(module, "mm_projector_forward", f"{target}.mm_projector_forward")
+    function = _load_runtime_callable(
+        "vllm_hcu.runtime_compat.kimi_k25_vit",
+        "install_kimi_k25_qkv_layout_compat",
+    )
+    function(module)
+    if not getattr(module, "_hcu_kimi_k25_qkv_layout_patch_applied", False):
+        raise Stage3CompatibilityError(
+            "Kimi K2.5 QKV-layout runtime patch did not apply"
+        )
+
+
 # Explicit order preserves ``patch_module_class_function`` behavior while each
 # callback remains dormant until its own exact target is imported.
 _ORDERED_CALLBACKS: tuple[
@@ -266,6 +289,16 @@ _ORDERED_CALLBACKS: tuple[
             "KimiK25DummyInputsBuilder.get_dummy_text",
         ),
     ),
+    (
+        "runtime_method.kimi_k25_qkv_layout",
+        "vllm.model_executor.models.kimi_k25_vit",
+        apply_kimi_k25_qkv_layout,
+        (
+            "vllm.model_executor.models.kimi_k25_vit.MoonViTEncoderLayer",
+            "vllm.model_executor.models.kimi_k25_vit.MoonViT3dEncoder",
+            "vllm.model_executor.models.kimi_k25_vit.MoonViT3dPretrainedModel",
+        ),
+    ),
 )
 
 
@@ -297,6 +330,7 @@ __all__ = [
     "apply_fp8_scaled_mm",
     "apply_hcu_lora_column_parallel",
     "apply_kimi_k25_vision_prompt",
+    "apply_kimi_k25_qkv_layout",
     "apply_qwen35_lora_cudagraph",
     "apply_weight_debug_skip",
     "register_runtime_method_callbacks",
