@@ -3325,6 +3325,22 @@ class rocm_aiter_ops:
         )
         return next_residual, post_mix, comb_mix, layer_input
 
+    @staticmethod
+    def mhc_fused_post_pre_delayed_prefers_unfused(num_tokens: int) -> bool:
+        """Match vLLM main's delayed mHC batch-size heuristic."""
+
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            threshold = {
+                "gfx950": 1024,
+                "gfx942": 128,
+                "gfx1250": 1024,
+            }.get(get_gfx_runtime(), 1024)
+        except Exception:
+            threshold = 1024
+        return num_tokens >= threshold
+
 
 # ---------------------------------------------------------------------------
 # HCU v0.25.1 integration.  Keep this immediately before the sole registration

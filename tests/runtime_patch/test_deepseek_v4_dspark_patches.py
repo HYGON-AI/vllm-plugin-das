@@ -479,6 +479,13 @@ def test_mhc_backend_keeps_importable_tilelang(
     assert module.HAS_TILELANG_MHC is True
 
 
+def test_hcu_aiter_mhc_exposes_main_delayed_batch_heuristic() -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.aiter_ops import rocm_aiter_ops
+
+    assert rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(0) is False
+    assert rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1_000_000) is True
+
+
 def test_load_weights_rejects_stale_patch_marker() -> None:
     class DeepseekV4Model:
         _vllm_hcu_deepseek_v4_load_weights_applied = True
