@@ -719,7 +719,120 @@ def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
 
     schema = torch.ops.vllm.hcu_sparse_attn_indexer.default._schema
     assert len(schema.returns) == 0
-    assert "Tensor? k" in str(schema)
+    schema_text = str(schema)
+    assert "Tensor? k" in schema_text
+    assert "Tensor(a14!)? candidate_blocks=None" in schema_text
+    assert "candidate_block_size=0" in schema_text
+    assert "candidate_write=False" in schema_text
+
+
+def test_hcu_sparse_indexer_forwards_v41_candidate_contract() -> None:
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)),
+    )
+    namespace = {
+        "torch": fake_torch,
+        "rocm_aiter_ops": SimpleNamespace(is_enabled=lambda: False),
+        "_encode_layer_name": lambda value: value,
+    }
+    exec(compile(module, "sparse_indexer_candidate_forward_hip", "exec"), namespace)
+
+    candidate_blocks = torch.tensor([[3, 7]], dtype=torch.int32)
+    topk_buffer = object()
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        skip_k_cache_insert=True,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=512,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=163840,
+        topk_indices_buffer=topk_buffer,
+        candidate_blocks=candidate_blocks,
+        candidate_block_size=8,
+        candidate_write=True,
+    )
+
+    result = namespace["forward_hip"](
+        indexer, object(), torch.ones(1, 1), None, object()
+    )
+
+    assert result is topk_buffer
+    assert len(calls) == 1
+    assert calls[0][-3] is candidate_blocks
+    assert calls[0][-2:] == (8, True)
+
+
+@pytest.mark.parametrize("candidate_write", [False, True])
+def test_hcu_candidate_policy_runs_before_token_topk(
+    monkeypatch: pytest.MonkeyPatch, candidate_write: bool
+) -> None:
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        sparse,
+        "_select_candidate_blocks",
+        lambda *args: calls.append(("select", *args)),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "_apply_candidate_mask",
+        lambda *args: calls.append(("mask", *args)),
+    )
+    logits = torch.empty(2, 16)
+    starts = torch.tensor([0, 0])
+    ends = torch.tensor([16, 16])
+    candidates = torch.empty(2, 4, dtype=torch.int32)
+
+    sparse._apply_candidate_policy(
+        logits,
+        starts,
+        ends,
+        candidates,
+        8,
+        candidate_write,
+        row_repeat=2,
+    )
+
+    assert len(calls) == 1
+    expected = "select" if candidate_write else "mask"
+    assert calls[0][0] == expected
+    assert calls[0][1] is logits
+    assert calls[0][2] is starts
+    assert calls[0][3] is ends
+    if candidate_write:
+        assert calls[0][4:] == (4, 8, candidates, 2)
+    else:
+        assert calls[0][4:] == (candidates, 8, 2)
 
 
 def test_sparse_indexer_non_aiter_fallback_stays_opaque(monkeypatch):

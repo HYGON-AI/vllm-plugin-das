@@ -731,6 +731,9 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ) -> None:
         rocm_aiter_sparse_attn_indexer_native(
             hidden_states,
@@ -747,6 +750,9 @@ if current_platform.is_rocm():
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert=skip_k_cache_insert,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+            candidate_write=candidate_write,
         )
 
     def hcu_sparse_attn_indexer_fake(
@@ -764,8 +770,11 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ) -> None:
-        del skip_k_cache_insert
+        del skip_k_cache_insert, candidate_blocks, candidate_block_size, candidate_write
         rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,
@@ -787,7 +796,7 @@ if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="hcu_sparse_attn_indexer",
         op_func=hcu_sparse_attn_indexer,
-        mutates_args=["kv_cache", "topk_indices_buffer"],
+        mutates_args=["kv_cache", "topk_indices_buffer", "candidate_blocks"],
         fake_impl=hcu_sparse_attn_indexer_fake,
         dispatch_key=current_platform.dispatch_key,
         tags=(torch._C.Tag.cudagraph_unsafe,),
@@ -820,6 +829,9 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -833,6 +845,11 @@ class SparseAttnIndexer(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         self.compress_ratio = compress_ratio
+        # DeepSeek V4.1 two-level selection: the candidate source writes its
+        # top blocks here; downstream indexers mask logits to those blocks.
+        self.candidate_blocks = candidate_blocks
+        self.candidate_block_size = candidate_block_size
+        self.candidate_write = candidate_write
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
@@ -934,7 +951,7 @@ class SparseAttnIndexer(CustomOp):
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
         if self.skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
-            torch.ops.vllm.hcu_sparse_attn_indexer(
+            args = (
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
                 self.k_cache.kv_cache,
@@ -950,9 +967,19 @@ class SparseAttnIndexer(CustomOp):
                 self.topk_indices_buffer,
                 self.skip_k_cache_insert,
             )
+            candidate_blocks = getattr(self, "candidate_blocks", None)
+            if candidate_blocks is None:
+                torch.ops.vllm.hcu_sparse_attn_indexer(*args)
+            else:
+                torch.ops.vllm.hcu_sparse_attn_indexer(
+                    *args,
+                    candidate_blocks,
+                    self.candidate_block_size,
+                    self.candidate_write,
+                )
             return self.topk_indices_buffer
         if rocm_aiter_ops.is_enabled():
-            return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
+            args = (
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
                 self.k_cache.kv_cache,
@@ -966,7 +993,18 @@ class SparseAttnIndexer(CustomOp):
                 self.max_model_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
+            )
+            candidate_blocks = getattr(self, "candidate_blocks", None)
+            if candidate_blocks is None:
+                return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
+                    *args, skip_k_cache_insert=self.skip_k_cache_insert
+                )
+            return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
+                *args,
                 skip_k_cache_insert=self.skip_k_cache_insert,
+                candidate_blocks=candidate_blocks,
+                candidate_block_size=self.candidate_block_size,
+                candidate_write=self.candidate_write,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "
@@ -1033,7 +1071,7 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
                 # The complete cache write is explicit above.  Keep the
                 # existing HCU custom op for local Q/top-k work only.
                 skip_k_cache_insert = True
-        torch.ops.vllm.hcu_sparse_attn_indexer(
+        args = (
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
             self.k_cache.kv_cache,
@@ -1049,4 +1087,14 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             self.topk_indices_buffer,
             skip_k_cache_insert,
         )
+        candidate_blocks = getattr(self, "candidate_blocks", None)
+        if candidate_blocks is None:
+            torch.ops.vllm.hcu_sparse_attn_indexer(*args)
+        else:
+            torch.ops.vllm.hcu_sparse_attn_indexer(
+                *args,
+                candidate_blocks,
+                self.candidate_block_size,
+                self.candidate_write,
+            )
         return self.topk_indices_buffer
