@@ -11,8 +11,8 @@
 
 import torch
 
-from bolt_ops.fla.kda import chunk_kda_fwd_intra
-from bolt_ops.fla.gdn import chunk_gated_delta_rule_fwd_h
+from boltops.fla.kda import chunk_kda_fwd_intra
+from boltops.fla.gdn import chunk_gated_delta_rule_fwd_h
 from vllm.model_executor.layers.fla.ops.cumsum import chunk_local_cumsum
 from vllm.model_executor.layers.fla.ops.index import prepare_chunk_indices
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
@@ -193,9 +193,9 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Delegate the W/U/`kg` reconstruction kernel to bolt_ops.
-    from bolt_ops.fla.kda import recompute_w_u_fwd as impl
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+    # Delegate the W/U/`kg` reconstruction kernel to boltops.
+    from boltops.fla.kda import recompute_w_u_fwd as impl
 
     return impl(
         k,
@@ -340,8 +340,8 @@ def chunk_gla_fwd_o_gk(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
 ):
-    # Delegate the chunk-output kernel to bolt_ops.
-    from bolt_ops.fla.kda import chunk_gla_fwd_o_gk as impl
+    # Delegate the chunk-output kernel to boltops.
+    from boltops.fla.kda import chunk_gla_fwd_o_gk as impl
 
     return impl(
         q,
@@ -496,8 +496,8 @@ def fused_kda_gate_chunk_cumsum(
     chunk_size: int = FLA_CHUNK_SIZE,
     output_dtype: torch.dtype | None = torch.float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Delegate the fused gate + chunk-cumsum kernel to bolt_ops.
-    from bolt_ops.fla.kda import fused_kda_gate_chunk_cumsum as impl
+    # Delegate the fused gate + chunk-cumsum kernel to boltops.
+    from boltops.fla.kda import fused_kda_gate_chunk_cumsum as impl
 
     return impl(
         raw_g,
