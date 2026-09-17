@@ -20,8 +20,11 @@ PATCH_ID = "platform.core_fix.engram_config.hcu"
 TARGETS = (f"{TARGET_MODULE}.EngramConfig.verify_model_config",)
 _MARKER = "_vllm_hcu_engram_config_patch_applied"
 _ORIGINAL = "_vllm_hcu_original_verify_model_config"
+# Fail closed for an architecture this adapter has not been reviewed against;
+# official main owns the architecture-to-field mapping used below.
 _SUPPORTED_ARCHITECTURES = frozenset(
     {
+        "DeepseekV41ForCausalLM",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
     }
@@ -33,16 +36,20 @@ _REQUIRED_CODE_NAMES = frozenset(
         "is_cuda",
     }
 )
-_REQUIRED_CODE_CONSTANTS = frozenset(
-    {
-        "Qwen4ExpForCausalLM",
-        "Qwen4ExpForConditionalGeneration",
-        "ple_layer_ids",
-    }
-)
 
 
-def _require_audited_contract(verify_model_config: object) -> None:
+def _require_audited_contract(
+    verify_model_config: object,
+    engram_module: ModuleType,
+) -> None:
+    """Validate the official Engram contract this adapter relies on.
+
+    Official main validates Engram through the module-level
+    ``_NGRAM_LAYER_FIELDS`` mapping plus ``model_has_engram_layers`` instead of
+    hard-coding one model family, so the adapter checks the mapping and the
+    helper rather than byte-code constants.
+    """
+
     code = getattr(verify_model_config, "__code__", None)
     if code is None:
         raise PatchCompatibilityError(
@@ -50,12 +57,32 @@ def _require_audited_contract(verify_model_config: object) -> None:
         )
 
     missing_names = _REQUIRED_CODE_NAMES.difference(code.co_names)
-    missing_constants = _REQUIRED_CODE_CONSTANTS.difference(code.co_consts)
-    if missing_names or missing_constants:
-        missing = sorted((*missing_names, *missing_constants))
+    if missing_names:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} has incompatible source "
-            f"contract; missing {missing}"
+            f"contract; missing {sorted(missing_names)}"
+        )
+
+    layer_fields = getattr(engram_module, "_NGRAM_LAYER_FIELDS", None)
+    if not isinstance(layer_fields, dict):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}._NGRAM_LAYER_FIELDS "
+            "is missing"
+        )
+    undeclared = sorted(
+        architecture
+        for architecture in _SUPPORTED_ARCHITECTURES
+        if architecture not in layer_fields
+    )
+    if undeclared:
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}._NGRAM_LAYER_FIELDS "
+            f"does not declare {undeclared}"
+        )
+    if not callable(getattr(engram_module, "model_has_engram_layers", None)):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGET_MODULE}.model_has_engram_layers "
+            "is missing"
         )
 
 
@@ -81,7 +108,9 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[0],
         ("self", "model_config"),
     )
-    _require_audited_contract(verify_model_config)
+    _require_audited_contract(verify_model_config, engram_module)
+
+    has_engram_layers = getattr(engram_module, "model_has_engram_layers")
 
     @functools.wraps(verify_model_config)
     def hcu_verify_model_config(self, model_config: object | None) -> None:
@@ -92,15 +121,11 @@ def apply_to_module(module: ModuleType) -> bool:
             and model_config is not None
             and getattr(model_config, "architecture", None)
             in _SUPPORTED_ARCHITECTURES
-            and getattr(
-                getattr(model_config, "hf_text_config", None),
-                "ple_layer_ids",
-                None,
-            )
+            and bool(has_engram_layers(model_config))
         ):
             if getattr(self, "embedding_across_dp", False):
                 raise ValueError(
-                    "HCU Qwen4Exp PLE does not support "
+                    "HCU Engram does not support "
                     "engram_config.embedding_across_dp; use the default "
                     "TP-sharded embedding with embedding_across_dp=false"
                 )

@@ -48,25 +48,47 @@ def _clear_vllm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name, raising=False)
 
 
+_NGRAM_LAYER_FIELDS = {
+    "DeepseekV41ForCausalLM": "engram_layer_ids",
+    "Qwen4ExpForCausalLM": "ple_layer_ids",
+    "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
+}
+
+
+def _model_has_engram_layers(model_config) -> bool:
+    if model_config is None:
+        return False
+    field = _NGRAM_LAYER_FIELDS.get(model_config.architecture)
+    if field is None:
+        return False
+    return bool(getattr(model_config.hf_text_config, field, None))
+
+
 def _engram_module() -> tuple[ModuleType, type]:
     class FakeEngramConfig:
         def verify_model_config(self, model_config):
             from vllm.platforms import current_platform
 
-            supported_architectures = {
-                "Qwen4ExpForCausalLM",
-                "Qwen4ExpForConditionalGeneration",
-            }
+            field = (
+                _NGRAM_LAYER_FIELDS.get(model_config.architecture)
+                if model_config is not None
+                else None
+            )
             if (
                 model_config is None
-                or model_config.architecture not in supported_architectures
+                or field is None
                 or not current_platform.is_cuda()
-                or not getattr(model_config.hf_text_config, "ple_layer_ids", None)
+                or not getattr(model_config.hf_text_config, field, None)
             ):
                 raise ValueError("unsupported Engram configuration")
 
     return (
-        _module(patch_engram_config.TARGET_MODULE, EngramConfig=FakeEngramConfig),
+        _module(
+            patch_engram_config.TARGET_MODULE,
+            EngramConfig=FakeEngramConfig,
+            _NGRAM_LAYER_FIELDS=dict(_NGRAM_LAYER_FIELDS),
+            model_has_engram_layers=_model_has_engram_layers,
+        ),
         FakeEngramConfig,
     )
 
@@ -90,19 +112,30 @@ def _install_fake_platform(
 def _model_config(
     architecture: str = "Qwen4ExpForConditionalGeneration",
     ple_layer_ids: list[int] | None = None,
+    engram_layer_ids: list[int] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         architecture=architecture,
         hf_text_config=SimpleNamespace(
-            ple_layer_ids=[1] if ple_layer_ids is None else ple_layer_ids
+            ple_layer_ids=[1] if ple_layer_ids is None else ple_layer_ids,
+            engram_layer_ids=engram_layer_ids,
         ),
     )
 
 
 @pytest.mark.parametrize("prefetch_enabled", ("0", "1"))
+@pytest.mark.parametrize(
+    ("architecture", "layer_ids"),
+    (
+        ("Qwen4ExpForConditionalGeneration", {"ple_layer_ids": [1]}),
+        ("DeepseekV41ForCausalLM", {"engram_layer_ids": [1, 14]}),
+    ),
+)
 def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     monkeypatch: pytest.MonkeyPatch,
     prefetch_enabled: str,
+    architecture: str,
+    layer_ids: dict,
 ):
     module, engram_config = _engram_module()
     original = engram_config.verify_model_config
@@ -113,7 +146,7 @@ def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     assert patch_engram_config.apply(module) is False
     config = engram_config()
     config.embedding_across_dp = False
-    config.verify_model_config(_model_config())
+    config.verify_model_config(_model_config(architecture, **layer_ids))
 
     wrapped = engram_config.verify_model_config
     assert wrapped.__wrapped__ is original
@@ -145,6 +178,7 @@ def test_engram_config_rejects_hcu_cross_dp_embedding(
         (False, False, _model_config()),
         (False, True, _model_config("UnsupportedArchitecture")),
         (False, True, _model_config(ple_layer_ids=[])),
+        (False, True, _model_config("DeepseekV41ForCausalLM")),
         (False, True, None),
     ],
 )
@@ -186,6 +220,45 @@ def test_engram_config_rejects_signature_and_source_contract_drift():
     )
     with pytest.raises(PatchCompatibilityError, match="incompatible source contract"):
         patch_engram_config.apply(bad_contract)
+
+    PATCH_REGISTRY.reset_for_tests()
+
+    class MissingMapping:
+        def verify_model_config(self, model_config):
+            from vllm.platforms import current_platform
+
+            return (
+                current_platform.is_cuda()
+                and model_config.architecture
+                and model_config.hf_text_config
+            )
+
+    bad_mapping = _module(
+        patch_engram_config.TARGET_MODULE,
+        EngramConfig=MissingMapping,
+    )
+    with pytest.raises(PatchCompatibilityError, match="_NGRAM_LAYER_FIELDS"):
+        patch_engram_config.apply(bad_mapping)
+
+    PATCH_REGISTRY.reset_for_tests()
+
+    class MissingHelper:
+        def verify_model_config(self, model_config):
+            from vllm.platforms import current_platform
+
+            return (
+                current_platform.is_cuda()
+                and model_config.architecture
+                and model_config.hf_text_config
+            )
+
+    bad_helper = _module(
+        patch_engram_config.TARGET_MODULE,
+        EngramConfig=MissingHelper,
+        _NGRAM_LAYER_FIELDS=dict(_NGRAM_LAYER_FIELDS),
+    )
+    with pytest.raises(PatchCompatibilityError, match="model_has_engram_layers"):
+        patch_engram_config.apply(bad_helper)
 
 
 def test_envs_defaults_aiter_moe_off(monkeypatch: pytest.MonkeyPatch):
