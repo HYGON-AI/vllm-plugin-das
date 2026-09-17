@@ -130,25 +130,21 @@ def _native_hyv4_mtp_config(make_config, **overrides):
     return config
 
 
-def test_hyv4_exact_pp2_pcp4_native_mtp3_is_allowed(make_hyv4_pp2_pcp4_config):
-    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4, 8])
+def test_hyv4_pp2_pcp4_native_mtp_accepts_any_token_depth(
+    make_hyv4_pp2_pcp4_config, num_speculative_tokens,
+):
+    config = _native_hyv4_mtp_config(
+        make_hyv4_pp2_pcp4_config,
+        num_speculative_tokens=num_speculative_tokens,
+    )
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
     assert config.model_config.architectures == ["HYV4ForCausalLM"]
     assert config.speculative_config.draft_model_config.architectures == ["HYV4MTPModel"]
 
 
-def test_hyv4_exact_pp2_pcp4_native_mtp2_is_allowed(
-    make_hyv4_pp2_pcp4_config,
-):
-    config = _native_hyv4_mtp_config(
-        make_hyv4_pp2_pcp4_config,
-        num_speculative_tokens=2,
-    )
-    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
-
-
-@pytest.mark.parametrize("num_speculative_tokens", [2, 3])
-def test_hyv4_pp1_native_mtp2_and_mtp3_are_allowed(
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4, 8])
+def test_hyv4_pp1_native_mtp_accepts_any_token_depth(
     make_pcp_config, num_speculative_tokens,
 ):
     config = _native_hyv4_mtp_config(
@@ -191,8 +187,6 @@ def test_hyv4_mtp3_neighbors_stay_closed(make_hyv4_pp2_pcp4_config, override):
 
 
 @pytest.mark.parametrize("path,value", [
-    ("speculative_config.num_speculative_tokens", 1),
-    ("speculative_config.num_speculative_tokens", 4),
     ("speculative_config.draft_model_config.architectures", ["UnknownDraft"]),
     ("speculative_config.draft_model_config.model", "separate-checkpoint"),
     ("speculative_config.draft_model_config.hf_config.n_predict", 2),
