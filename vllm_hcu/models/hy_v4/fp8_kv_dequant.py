@@ -69,6 +69,7 @@ def gather_dequantize_fp8_ds_mla_cache(
     topk_indices: torch.Tensor,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    tokens_per_request: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dequantize only the topk-selected ``fp8_ds_mla`` slots to a compact BF16.
 
@@ -85,6 +86,11 @@ def gather_dequantize_fp8_ds_mla_cache(
             (``block * block_size + pos``), with -1 marking unfilled entries.
         kv_lora_rank: NoPE dim (512 for HY V4).
         qk_rope_head_dim: RoPE dim (64 for HY V4).
+        tokens_per_request: Query rows each request contributes in this batch,
+            i.e. the MTP width (``speculative_config.num_speculative_tokens``,
+            so MTP3 -> 3) and 1 when MTP is off. LightOp uses it to group rows
+            back into requests, matching ``q``'s
+            ``(num_requests * tokens_per_request, topk)`` layout.
 
     Returns:
         ``(kv_bf16, new_indices)`` where ``kv_bf16`` is BF16
@@ -121,6 +127,8 @@ def gather_dequantize_fp8_ds_mla_cache(
     cache_seqlens = torch.full(
         (num_tokens,), topk, dtype=torch.int32, device=kv_cache.device
     )
-    gather(cache_u8, idx32, gathered, cache_seqlens, compact_indices)
+    gather(
+        cache_u8, idx32, gathered, cache_seqlens, compact_indices, tokens_per_request
+    )
 
     return gathered.reshape(num_tokens * topk, out_dim), compact_indices

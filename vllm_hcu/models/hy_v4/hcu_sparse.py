@@ -93,6 +93,13 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        # MTP width: query rows per request in a decode batch. LightOp's gather
+        # groups ``num_tokens`` rows into requests with this stride, so MTP3
+        # (num_speculative_tokens == 3) passes 3 and plain decoding passes 1.
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        self.tokens_per_request = int(
+            getattr(speculative_config, "num_speculative_tokens", 0) or 0
+        ) or 1
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -255,7 +262,11 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # Gather + dequantize only the selected slots; remap indices to the
         # compact buffer's rows.
         kv_bf16, new_idx = gather_dequantize_fp8_ds_mla_cache(
-            kv_c_and_k_pe_cache, idx_flat, self.kv_lora_rank, rope_dim
+            kv_c_and_k_pe_cache,
+            idx_flat,
+            self.kv_lora_rank,
+            rope_dim,
+            self.tokens_per_request,
         )
 
         out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
