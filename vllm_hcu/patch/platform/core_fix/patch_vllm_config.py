@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import os
 from types import ModuleType
 from typing import Any
@@ -48,6 +49,50 @@ _REQUEST_CAPTURE_SIZES = (
     *range(40, 65, 4),
     *range(72, 257, 8),
 )
+
+_DSV41_ARCHITECTURE = "DeepseekV41ForCausalLM"
+_LOGGER = logging.getLogger(__name__)
+
+
+def _disable_dsv41_aiter_cudagraph(vllm_config: object) -> bool:
+    """Keep the HCU AITER sparse-indexer path out of replayable graphs.
+
+    The AITER indexer consumes process-local per-step attention metadata.  The
+    HCU Model Runner V2 path currently runs with ``CompilationMode.NONE`` and
+    therefore cannot honor the legacy splitting boundary for this custom op;
+    both FULL and PIECEWISE capture replay stale indexer state.  The reference
+    HCU indexer (AITER disabled) remains graph-compatible, so scope this
+    correctness fallback to DSV4.1 with AITER enabled.
+    """
+
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    if _DSV41_ARCHITECTURE not in architectures:
+        return False
+
+    from vllm import envs as vllm_envs
+
+    if not bool(getattr(vllm_envs, "VLLM_ROCM_USE_AITER", False)):
+        return False
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        raise PatchCompatibilityError(
+            "DSV4.1 AITER graph guard requires compilation_config"
+        )
+
+    from vllm.config.compilation import CUDAGraphMode
+
+    if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+        return False
+
+    compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    _LOGGER.warning(
+        "Disabling CUDA Graphs for %s on HCU while AITER sparse indexer "
+        "requires a replay-unsafe per-step metadata path.",
+        _DSV41_ARCHITECTURE,
+    )
+    return True
 
 
 def _normalize_hcu_model_runner(model_config: object) -> None:
@@ -279,6 +324,7 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     set_hcu_config(vllm_config, feature_config)
 
     feature_config = bind_hcu_config(vllm_config)
+    _disable_dsv41_aiter_cudagraph(vllm_config)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     model_config = getattr(vllm_config, "model_config", None)
     kernel_config = getattr(vllm_config, "kernel_config", None)

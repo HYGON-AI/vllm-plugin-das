@@ -2064,6 +2064,11 @@ class rocm_aiter_ops:
                 mutates_args=["topk_indices_buffer"],
                 fake_impl=rocm_aiter_sparse_attn_indexer_fake,
                 dispatch_key=current_platform.dispatch_key,
+                # The indexer consumes per-step attention metadata and writes
+                # the shared top-k buffer.  Capturing it in a replayable graph
+                # freezes those addresses/values; split it just like the HCU
+                # fallback indexer below.
+                tags=(torch._C.Tag.cudagraph_unsafe,),
             )
 
             direct_register_custom_op(

@@ -39,6 +39,42 @@ from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    ("architecture", "aiter_enabled", "should_disable"),
+    (
+        ("DeepseekV41ForCausalLM", True, True),
+        ("DeepseekV41ForCausalLM", False, False),
+        ("Qwen4ExpForCausalLM", True, False),
+    ),
+)
+def test_dsv41_aiter_cudagraph_guard_is_narrow_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    aiter_enabled: bool,
+    should_disable: bool,
+) -> None:
+    from vllm import envs as vllm_envs
+    from vllm.config.compilation import CUDAGraphMode
+
+    monkeypatch.setattr(vllm_envs, "VLLM_ROCM_USE_AITER", aiter_enabled)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=(architecture,)),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+
+    changed = patch_vllm_config._disable_dsv41_aiter_cudagraph(config)
+    assert changed is should_disable
+    expected = (
+        CUDAGraphMode.NONE
+        if should_disable
+        else CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert config.compilation_config.cudagraph_mode == expected
+    assert patch_vllm_config._disable_dsv41_aiter_cudagraph(config) is False
 TARGET_VLLM_ROOT = Path(
     os.environ.get(
         "VLLM_HCU_TARGET_ROOT",
@@ -693,10 +729,14 @@ def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() ->
         8,
     )
     assert config.splitting_calls == 1
-    assert config.splitting_ops[-1:] == ["vllm::hcu_sparse_attn_indexer"]
+    assert config.splitting_ops[-2:] == [
+        "vllm::hcu_sparse_attn_indexer",
+        "vllm::rocm_aiter_sparse_attn_indexer",
+    ]
 
     config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
     assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
+    assert config.splitting_ops.count("vllm::rocm_aiter_sparse_attn_indexer") == 1
 
 
 def test_compilation_adapter_disables_cudagraph_for_dp_deepep_auto() -> None:
@@ -722,6 +762,7 @@ def test_compilation_adapter_defers_to_inductor_unsafe_tags() -> None:
 
     config.set_splitting_ops_for_v1("allgather_reducescatter")
     assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
+    assert "vllm::rocm_aiter_sparse_attn_indexer" not in config.splitting_ops
 
 
 def test_compilation_adapter_skips_non_piecewise_cudagraphs() -> None:
@@ -732,6 +773,7 @@ def test_compilation_adapter_skips_non_piecewise_cudagraphs() -> None:
 
     config.set_splitting_ops_for_v1("allgather_reducescatter")
     assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
+    assert "vllm::rocm_aiter_sparse_attn_indexer" not in config.splitting_ops
 
 
 def test_compilation_adapter_requires_finalized_splitting_ops_list() -> None:

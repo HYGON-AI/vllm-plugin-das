@@ -24,6 +24,7 @@ TARGETS = (
 _MARKER = "_vllm_hcu_compilation_cudagraph_patch_applied"
 _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS = (
     "vllm::hcu_sparse_attn_indexer",
+    "vllm::rocm_aiter_sparse_attn_indexer",
 )
 _BOUND_CONFIGS_LOCK = threading.RLock()
 _BOUND_CONFIGS: dict[
