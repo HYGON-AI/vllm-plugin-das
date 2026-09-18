@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_USE_LIGHTOP_MASK_TOPK: bool = False
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
@@ -297,6 +298,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, use LightOp top_k_per_row kernels for sparse MLA prefill/decode indices.
     "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
+                    ("true", "1")),
+
+    # If set, use LightOp mask-aware sparse Page-MQA + TopK for HCU DSA decode.
+    "VLLM_HCU_USE_LIGHTOP_MASK_TOPK":
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MASK_TOPK", "False").lower() in
                     ("true", "1")),
 
     # If use AITER MHC impl, please set True

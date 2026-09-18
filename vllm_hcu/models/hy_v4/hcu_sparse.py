@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.config import get_current_vllm_config
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.models.hy_v4.fp8_kv_dequant import gather_dequantize_fp8_ds_mla_cache
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -96,7 +97,9 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # MTP width: query rows per request in a decode batch. LightOp's gather
         # groups ``num_tokens`` rows into requests with this stride, so MTP3
         # (num_speculative_tokens == 3) passes 3 and plain decoding passes 1.
-        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        speculative_config = getattr(
+            get_current_vllm_config(), "speculative_config", None
+        )
         self.tokens_per_request = int(
             getattr(speculative_config, "num_speculative_tokens", 0) or 0
         ) or 1

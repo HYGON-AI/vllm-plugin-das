@@ -347,3 +347,181 @@ def test_sparse_mla_topk_helpers_use_categorized_attention_kernels(
 
     assert len(prefill_calls) == 1
     assert len(decode_calls) == 1
+
+
+def _enable_sparse_mask_route(monkeypatch: pytest.MonkeyPatch):
+    runtime = _runtime()
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_LIGHTOP_MASK_TOPK", True)
+    runtime._lightop_sparse_mask_topk_ops.cache_clear()
+    return runtime
+
+
+def test_sparse_mask_route_respects_opt_in_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_LIGHTOP_MASK_TOPK", False)
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_sparse_mask_topk_ops",
+        lambda: pytest.fail("LightOp APIs probed while route is disabled"),
+    )
+
+    q = torch.zeros((1, 1, 32, 128), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.zeros((1, 64, 1, 132), dtype=torch.uint8)
+    weights = torch.zeros((1, 32), dtype=torch.float32)
+    seq_lens = torch.tensor([12], dtype=torch.int32)
+    block_table = torch.zeros((1, 1), dtype=torch.int32)
+
+    assert runtime._lightop_mask_topk_decode(
+        q, kv_cache, weights, seq_lens, block_table, 1, 1, 2048, 64, False
+    ) is None
+
+
+def test_sparse_mask_route_pairs_plain_producer_and_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    calls: list[str] = []
+
+    def producer(*args, **kwargs):
+        calls.append("producer")
+        assert args[0].shape == (2, 1, 32, 128)
+        assert args[4].shape == (2, 1)
+        return torch.zeros((2, 64)), torch.zeros((2, 4), dtype=torch.int16)
+
+    def grouped(*_args, **_kwargs):
+        pytest.fail("grouped producer used for ordinary decode")
+
+    def consumer(**kwargs):
+        calls.append("consumer")
+        assert kwargs["page_table_size_1"].is_contiguous()
+        assert torch.equal(
+            kwargs["page_table_size_1"][0],
+            torch.arange(64, dtype=torch.int32),
+        )
+        assert torch.equal(
+            kwargs["cu_seqlens_q"],
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+        )
+        return torch.full((2, 2048), 7, dtype=torch.int32)
+
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_sparse_mask_topk_ops",
+        lambda: (producer, grouped, consumer),
+    )
+    q = torch.zeros((2, 1, 32, 128), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.zeros((1, 64, 1, 132), dtype=torch.uint8)
+    weights = torch.zeros((2, 32), dtype=torch.float32)
+    seq_lens = torch.tensor([12, 20], dtype=torch.int32)
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+
+    result = runtime._lightop_mask_topk_decode(
+        q,
+        kv_cache,
+        weights,
+        seq_lens,
+        block_table,
+        2,
+        1,
+        2048,
+        64,
+        False,
+    )
+
+    assert result is not None
+    assert torch.equal(result, torch.full((2, 2048), 7, dtype=torch.int32))
+    assert calls == ["producer", "consumer"]
+
+
+def test_sparse_mask_route_uses_grouped_producer_for_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    calls: list[str] = []
+
+    def producer(*_args, **_kwargs):
+        pytest.fail("plain producer used for grouped decode")
+
+    def grouped(*args, **kwargs):
+        calls.append("grouped")
+        assert args[0].shape == (6, 1, 32, 128)
+        assert args[4].shape == (6, 1)
+        assert kwargs["group_size"] == 3
+        return torch.zeros((6, 64)), torch.zeros((6, 4), dtype=torch.int16)
+
+    def consumer(**kwargs):
+        calls.append("consumer")
+        assert kwargs["lengths"].shape == (6,)
+        assert torch.equal(
+            kwargs["cu_seqlens_q"],
+            torch.arange(7, dtype=torch.int32),
+        )
+        return torch.zeros((6, 2048), dtype=torch.int32)
+
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_sparse_mask_topk_ops",
+        lambda: (producer, grouped, consumer),
+    )
+    q = torch.zeros((2, 3, 32, 128), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.zeros((1, 64, 1, 132), dtype=torch.uint8)
+    weights = torch.zeros((6, 32), dtype=torch.float32)
+    seq_lens = torch.tensor([12, 20], dtype=torch.int32)
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+
+    result = runtime._lightop_mask_topk_decode(
+        q,
+        kv_cache,
+        weights,
+        seq_lens,
+        block_table,
+        2,
+        3,
+        2048,
+        64,
+        False,
+    )
+
+    assert result is not None
+    assert result.shape == (6, 2048)
+    assert calls == ["grouped", "consumer"]
+
+
+def test_sparse_mask_route_falls_back_for_unsupported_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    calls = 0
+
+    def ops():
+        nonlocal calls
+        calls += 1
+        return (lambda *_args, **_kwargs: None,) * 3
+
+    monkeypatch.setattr(runtime, "_lightop_sparse_mask_topk_ops", ops)
+    q = torch.zeros((2, 1, 8, 128), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.zeros((1, 64, 1, 132), dtype=torch.uint8)
+    weights = torch.zeros((2, 8), dtype=torch.float32)
+    seq_lens = torch.tensor([12, 20], dtype=torch.int32)
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+
+    result = runtime._lightop_mask_topk_decode(
+        q,
+        kv_cache,
+        weights,
+        seq_lens,
+        block_table,
+        2,
+        1,
+        2048,
+        64,
+        False,
+    )
+
+    assert result is None
+    assert calls == 0

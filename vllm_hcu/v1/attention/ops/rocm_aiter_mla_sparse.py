@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
@@ -26,6 +27,9 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMeta
 import vllm_hcu.platforms.envs as henvs 
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
+
+
+logger = init_logger(__name__)
 
 
 lightop_attention = None
@@ -1062,6 +1066,199 @@ def _use_lightop_sparse_mla_topk() -> bool:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _lightop_sparse_mask_topk_ops():
+    """Return the paired LightOp sparse-MQA and mask-TopK functions."""
+    try:
+        from lightop.attention import fast_topk_transform_sparse_mask_fused
+        from lightop.gemmopt import (
+            page_mqa_logits_sparse_mask,
+            page_mqa_logits_sparse_mask_grouped,
+        )
+    except (AttributeError, ImportError, OSError):
+        return None
+
+    operations = (
+        page_mqa_logits_sparse_mask,
+        page_mqa_logits_sparse_mask_grouped,
+        fast_topk_transform_sparse_mask_fused,
+    )
+    if not all(callable(operation) for operation in operations):
+        return None
+    return operations
+
+
+def _lightop_mask_topk_decode_metadata(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    topk_tokens: int,
+    max_model_len: int,
+    requires_padding: bool,
+):
+    """Build the paired sparse-Page-MQA inputs, or return ``None``.
+
+    The producer consumes page-size-64 cache pages and returns logits whose
+    columns are request-local logical token positions. The consumer needs a
+    page-size-1 table to transform those columns; an identity table preserves
+    the logical index contract used by vLLM's downstream sparse MLA kernels.
+    """
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
+        and current_platform.is_rocm()
+        and on_gfx938()
+        and not requires_padding
+        and topk_tokens == 2048
+        and next_n in (1, 3, 4, 5)
+        and batch_size > 0
+        and max_model_len > 0
+    ):
+        return None
+
+    if (
+        q.dim() != 4
+        or tuple(q.shape[:2]) != (batch_size, next_n)
+        or q.shape[2:] != (32, 128)
+        or q.dtype != torch.float8_e4m3fn
+        or not q.is_contiguous()
+        or kv_cache.dtype != torch.uint8
+        or kv_cache.dim() != 4
+        or tuple(kv_cache.shape[1:]) != (64, 1, 132)
+        or not kv_cache.is_contiguous()
+        or weights.dim() != 2
+        or weights.shape != (batch_size * next_n, 32)
+        or weights.dtype != torch.float32
+        or not weights.is_contiguous()
+        or block_table.dim() != 2
+        or block_table.shape[0] != batch_size
+        or block_table.shape[1] * 64 != max_model_len
+        or block_table.dtype != torch.int32
+        or not block_table.is_contiguous()
+    ):
+        return None
+
+    operations = _lightop_sparse_mask_topk_ops()
+    if operations is None:
+        return None
+    producer, grouped_producer, consumer = operations
+
+    rows = batch_size * next_n
+    if seq_lens.dim() == 2:
+        if tuple(seq_lens.shape) != (batch_size, next_n):
+            return None
+        context_lens = seq_lens.reshape(rows)
+    elif seq_lens.dim() == 1:
+        if seq_lens.shape[0] == batch_size:
+            context_lens = _decode_row_ends_from_seq_lens(
+                seq_lens, next_n, rows
+            )
+        elif seq_lens.shape[0] == rows:
+            context_lens = seq_lens
+        else:
+            return None
+    else:
+        return None
+    if context_lens.dtype != torch.int32 or not context_lens.is_contiguous():
+        context_lens = context_lens.to(dtype=torch.int32).contiguous()
+
+    q_rows = q.reshape(rows, 1, q.shape[2], q.shape[3])
+    expanded_block_table = block_table.repeat_interleave(next_n, dim=0)
+    if next_n == 1:
+        producer_fn = producer
+        producer_kwargs = {}
+    else:
+        producer_fn = grouped_producer
+        producer_kwargs = {"group_size": next_n}
+
+    # The consumer uses one page-size-1 entry per logical token. It is not the
+    # physical cache page table passed to the producer.
+    page_table_size_1 = torch.arange(
+        max_model_len, dtype=torch.int32, device=q.device
+    ).repeat(rows, 1)
+    cu_seqlens_q = torch.arange(
+        rows + 1, dtype=torch.int32, device=q.device
+    )
+    return (
+        producer_fn,
+        consumer,
+        q_rows,
+        context_lens,
+        expanded_block_table,
+        page_table_size_1,
+        cu_seqlens_q,
+        producer_kwargs,
+    )
+
+
+def _lightop_mask_topk_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    topk_tokens: int,
+    max_model_len: int,
+    requires_padding: bool,
+) -> torch.Tensor | None:
+    """Run sparse Page-MQA and its mandatory mask-aware TopK consumer."""
+    metadata = _lightop_mask_topk_decode_metadata(
+        q, kv_cache, weights, seq_lens, block_table, batch_size, next_n,
+        topk_tokens, max_model_len, requires_padding,
+    )
+    if metadata is None:
+        return None
+    (
+        producer,
+        consumer,
+        q_rows,
+        context_lens,
+        expanded_block_table,
+        page_table_size_1,
+        cu_seqlens_q,
+        producer_kwargs,
+    ) = metadata
+    try:
+        logits, nonzero_mask = producer(
+            q_rows,
+            kv_cache,
+            weights,
+            context_lens,
+            expanded_block_table,
+            None,
+            max_model_len,
+            clean_logits=True,
+            num_warps=4,
+            **producer_kwargs,
+        )
+        topk_indices = consumer(
+            score=logits,
+            nonzero_mask=nonzero_mask,
+            lengths=context_lens,
+            page_table_size_1=page_table_size_1,
+            cu_seqlens_q=cu_seqlens_q,
+            topk=topk_tokens,
+        )
+        logger.info_once(
+            "Using LightOp sparse Page-MQA producer and "
+            "fast_topk_transform_sparse_mask_fused consumer "
+            f"(group_size={producer_kwargs.get('group_size', 1)})."
+        )
+        return topk_indices
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.warning_once(
+            "LightOp sparse mask TopK failed; falling back to dense MQA/TopK: "
+            f"{exc}"
+        )
+        return None
+
+
 def _lightop_topk_indices_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -1402,28 +1599,41 @@ def rocm_aiter_sparse_attn_indexer_native(
             else decode_metadata.seq_lens
         )
 
-        if v4_fp8_fallback:
-            # Q was packed above; apply the identical layout to head weights.
-            decode_weights = weights[:num_padded_tokens]
-            if decode_metadata.requires_padding:
-                decode_weights = pack_seq_triton(
-                    weights[:num_decode_tokens], decode_lens
-                ).reshape(num_padded_tokens, -1)
-            logits = fp8_paged_mqa_logits_torch(
-                padded_q_fp8_decode_tokens, kv_cache,
-                decode_weights, seq_lens,
-                decode_metadata.block_table, max_model_len,
-            )
-        else:
-            logits = rocm_fp8_paged_mqa_logits(
-                padded_q_fp8_decode_tokens,
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-            )
+        mask_topk = _lightop_mask_topk_decode(
+            padded_q_fp8_decode_tokens,
+            kv_cache,
+            weights[:num_padded_tokens],
+            seq_lens,
+            decode_metadata.block_table,
+            batch_size,
+            next_n,
+            topk_tokens,
+            max_model_len,
+            decode_metadata.requires_padding,
+        )
+        if mask_topk is None:
+            if v4_fp8_fallback:
+                # Q was packed above; apply the identical layout to head weights.
+                decode_weights = weights[:num_padded_tokens]
+                if decode_metadata.requires_padding:
+                    decode_weights = pack_seq_triton(
+                        weights[:num_decode_tokens], decode_lens
+                    ).reshape(num_padded_tokens, -1)
+                logits = fp8_paged_mqa_logits_torch(
+                    padded_q_fp8_decode_tokens, kv_cache,
+                    decode_weights, seq_lens,
+                    decode_metadata.block_table, max_model_len,
+                )
+            else:
+                logits = rocm_fp8_paged_mqa_logits(
+                    padded_q_fp8_decode_tokens,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                )
 
         # A padded decode batch has more kernel rows than actual decode
         # tokens.  Do not point those extra rows at the shared output buffer:
@@ -1435,7 +1645,9 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.requires_padding,
         )
 
-        if use_lightop_sparse_mla_topk:
+        if mask_topk is not None:
+            topk_indices.copy_(mask_topk)
+        elif use_lightop_sparse_mla_topk:
             _lightop_topk_indices_decode(
                 logits, seq_lens, next_n, topk_indices, topk_tokens
             )
