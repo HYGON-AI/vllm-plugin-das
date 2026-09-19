@@ -190,6 +190,24 @@ and average output throughput of 9.67 tokens/s for this eight-sample
 correctness run; these figures are observational and are not an A/B
 performance comparison.
 
+The eight-card TP2/DCP2/DP4/EP8 follow-up also started with
+`DeepEPLLAll2AllManager` and `DeepEPDeepGemmMaskedExperts`. In this topology,
+the DCP rank is the TP rank within each two-rank DP replica and the EP ranks
+span all eight workers. DeepEP LL sizes its RDMA allocation from
+`max_num_batched_tokens`: the model-specific size hint is 48.750 GiB per rank
+at 8192 tokens, which cannot fit after the TP2 weights are loaded, while the
+256-token hint is 1.523 GiB. The accepted recipe therefore keeps
+`max_model_len=8192` with chunked prefill and sets
+`max_num_batched_tokens=256`.
+
+With that capacity, all four API ranks became ready, eight concurrent smoke
+requests returned HTTP 200, and no runtime or collective errors were logged.
+EvalScope again executed exactly `HumanEval/0` through `HumanEval/7`: all
+eight predictions and reviews completed, Accuracy was 100%, and Pass@1 was
+100%. This sequential eight-sample correctness run observed mean latency of
+15.023 seconds and average output throughput of 8.75 tokens/s. It does not
+measure the aggregate throughput benefit of four-way data parallel serving.
+
 ## Delivery
 
 The implementation and tests will be committed on

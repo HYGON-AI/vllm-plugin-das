@@ -487,3 +487,57 @@ git push -u origin feat/hy4-lightop-mask-topk-adapt
 ```
 
 Expected: the existing remote MR branch advances to the verified local HEAD.
+
+### Task 6: Validate TP2 DCP2 DP4 EP8 DeepEP Low-Latency
+
+**Files:**
+- Create locally, do not commit: `_smoke_dcp2_dp4_ep8_ll.sh`
+- Create locally, do not commit: `_dcp2_dp4_ep8_ll_256.log`
+- Create locally, do not commit: `_humaneval8_dcp2_dp4_ep8_ll_20260919/`
+
+- [x] **Step 1: Confirm the eight-card rank mapping**
+
+Use TP2 and DP4 so the physical world size remains eight. DCP2 divides each
+TP2 replica and EP spans all eight ranks. Confirm worker names cover
+`DP0..3`, `TP0..1`, `DCP0..1`, and `EP0..7`.
+
+- [x] **Step 2: Bound the DeepEP LL communication capacity**
+
+The initial `max_num_batched_tokens=8192` attempt loaded all weights, then
+RocSHMEM rejected the 48.750-GiB-per-rank RDMA allocation. This is a capacity
+configuration failure rather than a DCP correctness failure. Keep
+`max_model_len=8192` and use chunked prefill with
+`max_num_batched_tokens=256`, whose model-specific RDMA hint is 1.523 GiB.
+
+- [x] **Step 3: Start and smoke the supported configuration**
+
+```bash
+VLLM_HCU_USE_CUSTOM_FLASH_ATTN=1 \
+VLLM_HCU_HYV4_FP8_KV_DEQUANT=1 \
+VLLM_HCU_USE_LIGHTOP_MASK_TOPK=1 \
+vllm serve /models/Hy4-preview-Channel-FP8-w8a8 \
+  --served-model-name hy4-dcp2-dp4-ep8-ll \
+  --trust-remote-code --dtype bfloat16 -q compressed-tensors \
+  --tensor-parallel-size 2 --decode-context-parallel-size 2 \
+  --data-parallel-size 4 --enable-expert-parallel \
+  --all2all-backend deepep_low_latency --moe-backend deep_gemm \
+  --kv-cache-dtype fp8_ds_mla --block-size 64 --max-model-len 8192 \
+  --max-num-seqs 8 --max-num-batched-tokens 256 \
+  --gpu-memory-utilization 0.90 --enable-prefix-caching --port 20118
+```
+
+Observed: four API ranks and eight workers became ready, the expected DeepEP
+LL and masked DeepGEMM paths were selected, and eight concurrent requests
+returned HTTP 200 without runtime or collective errors.
+
+- [x] **Step 4: Run and inspect HumanEval 8**
+
+Use the Task 5 EvalScope command with the new model name, port, and work
+directory. Observed: exactly eight predictions and eight reviews for
+`HumanEval/0` through `HumanEval/7`, no errors, Accuracy 100%, Pass@1 100%,
+mean latency 15.023 seconds, and average output throughput 8.75 tokens/s.
+
+- [x] **Step 5: Stop the owned process group and release the devices**
+
+Observed: all API, engine, and worker processes exited and all eight devices
+returned to the 2-MiB idle baseline.
