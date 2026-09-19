@@ -469,7 +469,7 @@ git log --oneline 4692b9e..HEAD
 
 Expected: implementation, tests, design, and plan commits are present; no Aiter operator change is present; evaluation artifacts remain untracked.
 
-- [ ] **Step 5: Push the stacked branch**
+- [x] **Step 5: Push the stacked branch**
 
 ```bash
 git push -u origin feat/hy4-lightop-mask-topk-adapt
