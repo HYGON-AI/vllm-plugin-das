@@ -86,6 +86,32 @@ def w4a8_hipc_weight_scales(
     return w1_scale / factor, w2_scale / factor
 
 
+def _cached_w4a8_hipc_weight_scales(
+    quant_config: FusedMoEQuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cache static HIPC scales and refresh them after in-place reloads."""
+
+    w1_scale = quant_config.w1_scale
+    w2_scale = quant_config.w2_scale
+    if w1_scale is None or w2_scale is None:
+        raise RuntimeError("SlimQuant W4A8 DeepGEMM requires weight scales")
+    signature = (
+        id(w1_scale),
+        w1_scale._version,
+        id(w2_scale),
+        w2_scale._version,
+        _w4a8_hipc_implicit_scale_factor(),
+    )
+    cached = getattr(quant_config, "_hcu_w4a8_hipc_scales", None)
+    if cached is None or cached[0] != signature:
+        cached = (
+            signature,
+            w4a8_hipc_weight_scales(w1_scale, w2_scale),
+        )
+        setattr(quant_config, "_hcu_w4a8_hipc_scales", cached)
+    return cached[1]
+
+
 def fuse_silu_mul_quant(*args, **kwargs):
     from lightop.activation import fuse_silu_mul_quant as lightop_fuse_silu_mul_quant
 
@@ -233,8 +259,7 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         return {}
 
     def _hipc_weight_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.w1_scale is not None and self.w2_scale is not None
-        return w4a8_hipc_weight_scales(self.w1_scale, self.w2_scale)
+        return _cached_w4a8_hipc_weight_scales(self.quant_config)
 
     def workspace_shapes(
         self,
@@ -382,8 +407,7 @@ class DeepEPDeepGemmW4A8BatchedExperts(BatchedDeepGemmExperts):
         logger.info_once("Using SlimQuant W4A8 masked N32 HIPC DeepGEMM experts.")
 
     def _hipc_weight_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.w1_scale is not None and self.w2_scale is not None
-        return w4a8_hipc_weight_scales(self.w1_scale, self.w2_scale)
+        return _cached_w4a8_hipc_weight_scales(self.quant_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Cache N32 views derived from canonical checkpoint parameters."""

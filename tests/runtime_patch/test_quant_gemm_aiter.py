@@ -4480,6 +4480,48 @@ def test_slimquant_w4a8_deepep_auto_rejects_missing_ll_lightop(
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_fixed_ll_does_not_require_ht_only_operators(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+    noop = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            pack_w4a8_moe_hipc_weight=noop,
+            view_w4a8_moe_hipc_weight_n32_layout=noop,
+            m_grouped_w4a8_gemm_nt_masked_hipc=noop,
+        ),
+    )
+    _install_lightop_activation(
+        monkeypatch,
+        fuse_silu_mul_quant_ep=noop,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="deep_gemm",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_low_latency",
+            use_deepep_auto_kernels=False,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        ),
+    )
+
+    try:
+        assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
+    finally:
+        deepep_runtime._require_slimquant_w4a8_hipc_runtime.cache_clear()
+
+
+@pytest.mark.hcu
 @pytest.mark.parametrize(
     (
         "dp_size",

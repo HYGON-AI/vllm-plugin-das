@@ -1102,6 +1102,7 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
             self.ll_experts._deepgemm_w2 = (
                 runtime.view_w4a8_moe_hipc_weight_n32_layout(w2).detach()
             )
+        runtime._cached_w4a8_hipc_weight_scales(self.quant_config)
 
     @staticmethod
     def _supports_quant_scheme(

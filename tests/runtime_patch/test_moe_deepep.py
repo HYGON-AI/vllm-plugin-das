@@ -3332,7 +3332,13 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
         experts.ll_experts = object.__new__(
             runtime.DeepEPDeepGemmW4A8MaskedExperts
         )
+    quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 128, 1), 16.0),
+        w2_scale=torch.full((1, 64, 1), 32.0),
+    )
+    experts.quant_config = quant_config
     for child in {experts.ht_experts, experts.ll_experts}:
+        child.quant_config = quant_config
         child._deepgemm_w13 = None
         child._deepgemm_w2 = None
     return experts
@@ -3442,6 +3448,41 @@ def test_slimquant_w4a8_auto_packs_original_storage_once_for_role(
         assert experts.ht_experts._deepgemm_w2.untyped_storage().data_ptr() == (
             experts.ll_experts._deepgemm_w2.untyped_storage().data_ptr()
         )
+
+
+def test_slimquant_w4a8_auto_postload_caches_corrected_scales_by_generation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    _install_in_place_w4a8_packers(monkeypatch)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def correct_scales(w1_scale: torch.Tensor, w2_scale: torch.Tensor):
+        calls.append((w1_scale, w2_scale))
+        return w1_scale / 16.0, w2_scale / 16.0
+
+    monkeypatch.setattr(runtime, "w4a8_hipc_weight_scales", correct_scales)
+    experts = _slimquant_w4a8_auto_experts(True)
+    layer = _slimquant_w4a8_auto_layer()
+
+    experts.process_weights_after_loading(layer)
+    first = experts.ll_experts._hipc_weight_scales()
+    second = experts.ll_experts._hipc_weight_scales()
+
+    assert len(calls) == 1
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    torch.testing.assert_close(first[0], torch.ones_like(first[0]))
+    torch.testing.assert_close(first[1], torch.full_like(first[1], 2.0))
+
+    experts.quant_config.w1_scale.add_(16.0)
+    refreshed = experts.ll_experts._hipc_weight_scales()
+    assert len(calls) == 2
+    assert refreshed[0] is not first[0]
+    torch.testing.assert_close(refreshed[0], torch.full_like(refreshed[0], 2.0))
 
 
 def test_slimquant_w4a8_auto_is_idempotent_across_state_dict_and_sleep_restore(

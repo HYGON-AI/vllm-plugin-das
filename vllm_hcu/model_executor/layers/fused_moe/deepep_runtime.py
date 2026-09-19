@@ -16,19 +16,22 @@ import inspect
 from vllm.platforms import current_platform
 
 
-@functools.lru_cache(maxsize=1)
-def _require_slimquant_w4a8_hipc_runtime() -> None:
+@functools.lru_cache(maxsize=2)
+def _require_slimquant_w4a8_hipc_runtime(
+    fixed_use_low_latency: bool,
+) -> None:
+    deepgemm_ops = [
+        "pack_w4a8_moe_hipc_weight",
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        "m_grouped_w4a8_gemm_nt_masked_hipc",
+    ]
+    activation_ops = ["fuse_silu_mul_quant_ep"]
+    if not fixed_use_low_latency:
+        deepgemm_ops.append("m_grouped_w4a8_gemm_nt_contiguous_hipc")
+        activation_ops.append("fuse_silu_mul_quant")
     required_ops = {
-        "deepgemm": (
-            "pack_w4a8_moe_hipc_weight",
-            "view_w4a8_moe_hipc_weight_n32_layout",
-            "m_grouped_w4a8_gemm_nt_contiguous_hipc",
-            "m_grouped_w4a8_gemm_nt_masked_hipc",
-        ),
-        "lightop.activation": (
-            "fuse_silu_mul_quant",
-            "fuse_silu_mul_quant_ep",
-        ),
+        "deepgemm": tuple(deepgemm_ops),
+        "lightop.activation": tuple(activation_ops),
     }
     missing: list[str] = []
     for module_name, op_names in required_ops.items():
@@ -44,7 +47,7 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
         )
     if missing:
         raise RuntimeError(
-            "SlimQuant W4A8 deepep_auto requires HIPC DeepGEMM/LightOP "
+            "SlimQuant W4A8 DeepEP requires HIPC DeepGEMM/LightOP "
             f"operators; missing {', '.join(missing)}"
         )
 
@@ -141,7 +144,9 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         raise RuntimeError(
             "SlimQuant W4A8 DeepEP requires the HCU ROCm runtime"
         )
-    _require_slimquant_w4a8_hipc_runtime()
+    _require_slimquant_w4a8_hipc_runtime(
+        fixed_use_low_latency=all2all_backend == "deepep_low_latency"
+    )
     return True
 
 
