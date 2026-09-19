@@ -146,16 +146,17 @@ git commit -m "fix: validate DeepEP runtime patches after warmup"
 ### Task 2: Return Correct HY V4 DCP Output and LSE
 
 **Files:**
+- Modify: `vllm_hcu/models/hy_v4/attention.py`
 - Modify: `vllm_hcu/models/hy_v4/hcu_sparse.py`
 - Test: `tests/models/hy_v4/test_attention.py`
 
 **Interfaces:**
 - Consumes: `get_dcp_group().all_gather(tensor, dim=0)`, `triton_filter_and_convert_dcp_index(..., return_valid_counts=True)`, `gather_dequantize_fp8_ds_mla_cache(...)`, and `flash_mla_sparse_fwd(...) -> (output, auxiliary, lse)`.
-- Produces: `HYV4FlashMLASparseImpl.can_return_lse_for_decode = True`; `_dcp_sinks: torch.Tensor | None`; `process_weights_after_loading(act_dtype: torch.dtype) -> None`; `_bf16_flash_mla_kernel_with_lse(...) -> tuple[torch.Tensor, torch.Tensor]`; and `forward_mqa(...) -> tuple[torch.Tensor, torch.Tensor | None]`.
+- Produces: `HYV4MLAAttentionLayer.process_weights_after_loading(act_dtype: torch.dtype) -> None` forwards to the backend after MLA projection preparation; `HYV4FlashMLASparseImpl.can_return_lse_for_decode = True`; `_dcp_sinks: torch.Tensor | None`; backend `process_weights_after_loading(act_dtype: torch.dtype) -> None`; `_bf16_flash_mla_kernel_with_lse(...) -> tuple[torch.Tensor, torch.Tensor]`; and `forward_mqa(...) -> tuple[torch.Tensor, torch.Tensor | None]`.
 
 - [ ] **Step 1: Write failing sink-gather and DCP capability tests**
 
-Make `_bare_impl` initialize `dcp_world_size`, `dcp_rank`, `kv_cache_dtype`, `head_size`, `kv_lora_rank`, `tokens_per_request`, and `_dcp_sinks`. Add tests that assert the class advertises LSE support, `process_weights_after_loading` invokes its parent then all-gathers a four-head local sink to eight heads once for DCP2, and `_sinks_for_query` chooses the gathered layout for an eight-head query.
+Make `_bare_impl` initialize `dcp_world_size`, `dcp_rank`, `kv_cache_dtype`, `head_size`, `kv_lora_rank`, `tokens_per_request`, and `_dcp_sinks`. Add tests that assert the class advertises LSE support, the HY V4 MLA layer invokes the selected backend hook after its parent post-load processing, the backend hook invokes its parent then all-gathers a four-head local sink to eight heads once for DCP2, and `_sinks_for_query` chooses the gathered layout for an eight-head query.
 
 Assert the DCP kernel sink is normalized:
 
@@ -196,7 +197,10 @@ Expected: failures because the HY V4 subclass does not yet advertise LSE, gather
 
 - [ ] **Step 5: Implement sink gathering and runtime layout selection**
 
-Initialize `_dcp_sinks = None`, advertise `can_return_lse_for_decode = True`, and override the weight hook:
+Override the HY V4 MLA layer's weight hook to call `super()` and then
+`self.impl.process_weights_after_loading(act_dtype)`. Initialize
+`_dcp_sinks = None`, advertise `can_return_lse_for_decode = True`, and override
+the backend weight hook:
 
 ```python
 def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:

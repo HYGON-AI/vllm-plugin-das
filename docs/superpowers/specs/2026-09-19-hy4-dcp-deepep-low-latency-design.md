@@ -39,8 +39,10 @@ For DCP decode, the implementation will:
 2. Convert the shared logical sparse TopK indices into rank-local physical
    cache slots with `triton_filter_and_convert_dcp_index`, requesting a valid
    count for every query row.
-3. Use the post-weight-load attention hook to all-gather each rank's local
-   attention-sink shard once across the DCP group. The gathered sink order
+3. Have the HY V4 MLA layer invoke its selected backend's post-weight-load
+   hook after preparing MLA projections, then use that backend hook to
+   all-gather each rank's local attention-sink shard once across the DCP group.
+   The gathered sink order
    matches the rank-ordered query-head all-gather performed by vLLM, avoiding
    a collective in every decode layer invocation. Before the DCP kernel call,
    subtract `log(dcp_world_size)` from each gathered sink logit. Every DCP
