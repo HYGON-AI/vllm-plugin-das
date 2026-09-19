@@ -517,7 +517,9 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     monkeypatch.setattr(
         worker_dispatcher,
         "validate_worker_patches",
-        lambda *, require_applied: events.append(("validate", require_applied)),
+        lambda *, require_applied, phase: events.append(
+            ("validate", require_applied, phase)
+        ),
     )
 
     def parent_init(self, **kwargs):
@@ -554,10 +556,90 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     ]
 
     worker.load_model(load_dummy_weights=True)
-    assert events[-2:] == [("parent_load", True), ("validate", True)]
+    assert events[-2:] == [
+        ("parent_load", True),
+        ("validate", True, "model_load"),
+    ]
     assert str(inspect.signature(worker_module.HcuGPUWorker.load_model)) == (
         "(self, *, load_dummy_weights: bool = False) -> None"
     )
+
+
+def test_worker_drains_and_terminal_validates_after_successful_warmup(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+):
+    from vllm_hcu.patch import import_coordinator, worker as worker_dispatcher
+
+    worker_module = cpu_safe_hcu_worker_module
+    events: list[object] = []
+
+    class FakeCoordinator:
+        def drain_ready_callbacks(self):
+            events.append("drain")
+
+    monkeypatch.setattr(
+        import_coordinator,
+        "IMPORT_COORDINATOR",
+        FakeCoordinator(),
+    )
+    monkeypatch.setattr(
+        worker_dispatcher,
+        "validate_worker_patches",
+        lambda *, require_applied, phase: events.append(
+            ("validate", require_applied, phase)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module.Worker,
+        "compile_or_warm_up_model",
+        lambda self: events.append("parent_warmup") or "warmup-result",
+        raising=False,
+    )
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.use_v2_model_runner = False
+
+    assert worker.compile_or_warm_up_model() == "warmup-result"
+    assert events == [
+        "parent_warmup",
+        "drain",
+        ("validate", True, "runtime"),
+    ]
+
+
+def test_worker_does_not_validate_after_failed_warmup(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+):
+    from vllm_hcu.patch import import_coordinator, worker as worker_dispatcher
+
+    worker_module = cpu_safe_hcu_worker_module
+
+    class FakeCoordinator:
+        def drain_ready_callbacks(self):
+            pytest.fail("callback drain ran after failed warmup")
+
+    monkeypatch.setattr(
+        import_coordinator,
+        "IMPORT_COORDINATOR",
+        FakeCoordinator(),
+    )
+    monkeypatch.setattr(
+        worker_dispatcher,
+        "validate_worker_patches",
+        lambda **kwargs: pytest.fail("validation ran after failed warmup"),
+    )
+    monkeypatch.setattr(
+        worker_module.Worker,
+        "compile_or_warm_up_model",
+        lambda self: (_ for _ in ()).throw(RuntimeError("warmup failed")),
+        raising=False,
+    )
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.use_v2_model_runner = False
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        worker.compile_or_warm_up_model()
 
 
 @pytest.mark.parametrize(

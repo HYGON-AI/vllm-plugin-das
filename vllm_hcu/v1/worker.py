@@ -80,7 +80,7 @@ class HcuGPUWorker(Worker):
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
 
-        validate_worker_patches(require_applied=True)
+        validate_worker_patches(require_applied=True, phase="model_load")
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -186,8 +186,16 @@ class HcuGPUWorker(Worker):
             )
 
             with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
-                return super().compile_or_warm_up_model()
-        return super().compile_or_warm_up_model()
+                result = super().compile_or_warm_up_model()
+        else:
+            result = super().compile_or_warm_up_model()
+
+        from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+        from vllm_hcu.patch.worker import validate_worker_patches
+
+        IMPORT_COORDINATOR.drain_ready_callbacks()
+        validate_worker_patches(require_applied=True, phase="runtime")
+        return result
 
     def init_device(self):
         if self.device_config.device_type == "cuda":

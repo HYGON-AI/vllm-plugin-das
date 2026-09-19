@@ -388,6 +388,11 @@ class Indexer(nn.Module):
 class HYV4MLAAttentionLayer(MLAAttention):
     """Attach the quantization mode omitted by vLLM 0.25.1 MLA specs."""
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Prepare MLA projections, then run the selected backend's hook."""
+        super().process_weights_after_loading(act_dtype)
+        self.impl.process_weights_after_loading(act_dtype)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         return replace(

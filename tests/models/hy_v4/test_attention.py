@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
+import math
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 
-from vllm_hcu.models.hy_v4 import hcu_sparse
+from vllm_hcu.models.hy_v4 import fp8_kv_dequant, hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
     HYV4MLAAttentionLayer,
     Indexer,
@@ -132,6 +134,32 @@ def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
     assert resolved.page_size_bytes == 64 * 656
 
 
+def test_hy_v4_mla_layer_runs_backend_post_load_hook(monkeypatch) -> None:
+    events: list[object] = []
+
+    def fake_layer_process(self, act_dtype):
+        events.append(("layer", self, act_dtype))
+
+    class FakeImpl:
+        def process_weights_after_loading(self, act_dtype):
+            events.append(("impl", self, act_dtype))
+
+    monkeypatch.setattr(
+        MLAAttention,
+        "process_weights_after_loading",
+        fake_layer_process,
+    )
+    layer = object.__new__(HYV4MLAAttentionLayer)
+    layer.impl = FakeImpl()
+
+    layer.process_weights_after_loading(torch.bfloat16)
+
+    assert events == [
+        ("layer", layer, torch.bfloat16),
+        ("impl", layer.impl, torch.bfloat16),
+    ]
+
+
 def test_full_and_shared_indexer_pattern() -> None:
     config = SimpleNamespace(
         index_topk=64,
@@ -235,6 +263,7 @@ def test_hcu_backend_advertises_sink_support() -> None:
     assert HYV4FlashMLASparseBackend.is_sparse()
     assert HYV4FlashMLASparseBackend.get_name() == "FLASHMLA_SPARSE"
     assert impl_cls is HYV4FlashMLASparseImpl
+    assert impl_cls.can_return_lse_for_decode is True
     assert require_hyv4_sink_backend(HYV4FlashMLASparseBackend) is HYV4FlashMLASparseBackend
 
 
@@ -303,11 +332,191 @@ def test_sink_validation_rejects_kernel_incompatible_layouts(
 def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
     impl = object.__new__(HYV4FlashMLASparseImpl)
     impl.sinks = sinks
+    impl._dcp_sinks = None
     impl.num_heads = 4
     impl.prefill_padding = 64
     impl.fp8_decode_padded_heads = 64
     impl.softmax_scale = 0.5
+    impl.dcp_world_size = 1
+    impl.dcp_rank = 0
+    impl.kv_cache_dtype = "auto"
+    impl.head_size = 576
+    impl.kv_lora_rank = 512
+    impl.tokens_per_request = 1
     return impl
+
+
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "expected"),
+    [(None, 1), (0, 1), (3, 4)],
+)
+def test_tokens_per_request_includes_current_decode_token(
+    num_speculative_tokens: int | None,
+    expected: int,
+) -> None:
+    speculative_config = (
+        None
+        if num_speculative_tokens is None
+        else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+
+    assert hcu_sparse._tokens_per_request(speculative_config) == expected
+
+
+def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def lightop_gather(
+        cache,
+        indices,
+        output,
+        valid_lengths,
+        compact_indices,
+        tokens_per_request,
+    ):
+        calls.append(
+            (
+                cache,
+                indices,
+                output,
+                valid_lengths,
+                compact_indices,
+                tokens_per_request,
+            )
+        )
+        output.fill_(2)
+        compact_indices.copy_(
+            torch.arange(indices.numel(), dtype=torch.int32).view_as(indices)
+        )
+
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_resolve_lightop_gather",
+        lambda: lightop_gather,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_gather_dequantize_fp8_ds_mla_kernel",
+        pytest.fail,
+    )
+    cache = torch.zeros((2, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor(
+        [[0, 1], [2, 3], [4, 5], [6, -1]], dtype=torch.int64
+    )
+
+    output, compact_indices = (
+        fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+            cache,
+            indices,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            tokens_per_request=4,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].dtype == torch.int32
+    assert calls[0][3].tolist() == [2, 2, 2, 2]
+    assert calls[0][5] == 4
+    assert output.shape == (8, 576)
+    assert output.eq(2).all()
+    torch.testing.assert_close(
+        compact_indices,
+        torch.arange(8, dtype=torch.int32).view(4, 2),
+    )
+
+
+def test_fp8_kv_dequant_falls_back_when_lightop_gather_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launches: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            assert grid == (4,)
+
+            def launch(*args, **kwargs):
+                launches.append((args, kwargs))
+                args[2].fill_(3)
+
+            return launch
+
+    monkeypatch.setattr(fp8_kv_dequant, "_resolve_lightop_gather", lambda: None)
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_gather_dequantize_fp8_ds_mla_kernel",
+        FakeKernel(),
+    )
+    cache = torch.zeros((1, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor([[3, -1], [7, 8]], dtype=torch.int64)
+
+    output, compact_indices = (
+        fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+            cache,
+            indices,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            tokens_per_request=4,
+        )
+    )
+
+    assert len(launches) == 1
+    assert launches[0][0][1].dtype == torch.int32
+    assert output.shape == (4, 576)
+    assert output.eq(3).all()
+    torch.testing.assert_close(
+        compact_indices,
+        torch.tensor([[0, -1], [2, 3]], dtype=torch.int32),
+    )
+
+
+def test_dcp_gathers_sink_once_after_weights_load(monkeypatch) -> None:
+    sinks = torch.arange(4, dtype=torch.float32)
+    impl = _bare_impl(sinks)
+    impl.dcp_world_size = 2
+    events: list[object] = []
+
+    def fake_parent_process(self, act_dtype):
+        events.append(("parent", self, act_dtype))
+
+    class FakeDcpGroup:
+        def all_gather(self, tensor, dim):
+            events.append(("gather", tensor, dim))
+            return torch.cat((tensor, tensor + 10), dim=dim)
+
+    monkeypatch.setattr(
+        hcu_sparse.FlashMLASparseImpl,
+        "process_weights_after_loading",
+        fake_parent_process,
+    )
+    monkeypatch.setattr(hcu_sparse, "get_dcp_group", lambda: FakeDcpGroup())
+
+    impl.process_weights_after_loading(torch.bfloat16)
+
+    assert events == [
+        ("parent", impl, torch.bfloat16),
+        ("gather", sinks, 0),
+    ]
+    assert impl._dcp_sinks is not None
+    torch.testing.assert_close(
+        impl._dcp_sinks,
+        torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=torch.float32),
+    )
+
+    padded = impl._sinks_for_query(
+        torch.zeros(2, 8, 576),
+        head_dim=1,
+        kernel_heads=64,
+    )
+    assert padded is not None
+    torch.testing.assert_close(
+        padded[:8],
+        impl._dcp_sinks - math.log(2),
+    )
+    assert torch.isneginf(padded[8:]).all()
 
 
 def test_sink_padding_uses_negative_infinity() -> None:
@@ -333,7 +542,11 @@ def test_bf16_prefill_forwards_live_sink(monkeypatch) -> None:
     def fake_sparse_fwd(q, kv, indices, scale, attn_sink=None, topk_length=None):
         del kv, indices, scale, topk_length
         captured["attn_sink"] = attn_sink
-        return (torch.zeros(q.shape[0], q.shape[1], 512),)
+        return (
+            torch.zeros(q.shape[0], q.shape[1], 512),
+            torch.empty(0),
+            torch.zeros(q.shape[0], q.shape[1]),
+        )
 
     monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", fake_sparse_fwd)
     impl._bf16_flash_mla_kernel(
@@ -356,11 +569,174 @@ def test_sink_changes_softmax_denominator_with_torch_reference(monkeypatch):
         # softmax gives output 4 / (1 + exp(sink)).
         scores = torch.stack([torch.zeros_like(attn_sink), attn_sink], dim=-1)
         value_weights = torch.softmax(scores, dim=-1)[:, 0]
-        return (4 * value_weights[None, :, None].expand(q.shape[0], -1, 512),)
+        return (
+            4 * value_weights[None, :, None].expand(q.shape[0], -1, 512),
+            torch.empty(0),
+            torch.zeros(q.shape[0], q.shape[1]),
+        )
     monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", reference_kernel)
     actual = impl._bf16_flash_mla_kernel(
         torch.zeros(1, 4, 576), torch.zeros(1, 576), torch.zeros(1, 1, dtype=torch.int32))
     torch.testing.assert_close(actual[0, :, 0], torch.tensor([2.0, 1.0, 4.0, 2.0]))
+
+
+def test_bf16_dcp_kernel_preserves_and_slices_lse(monkeypatch) -> None:
+    impl = _bare_impl(torch.arange(4, dtype=torch.float32))
+    impl.dcp_world_size = 2
+    impl._dcp_sinks = torch.arange(8, dtype=torch.float32)
+    captured: dict[str, torch.Tensor | None] = {}
+
+    def fake_sparse_fwd(q, kv, indices, scale, attn_sink=None, topk_length=None):
+        del kv, indices, scale, topk_length
+        captured["attn_sink"] = attn_sink
+        return (
+            torch.arange(q.shape[0] * q.shape[1] * 3, dtype=torch.float32).view(
+                q.shape[0], q.shape[1], 3
+            ),
+            torch.empty(0),
+            torch.arange(q.shape[0] * q.shape[1], dtype=torch.float32).view(
+                q.shape[0], q.shape[1]
+            ),
+        )
+
+    monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", fake_sparse_fwd)
+    output, lse = impl._bf16_flash_mla_kernel_with_lse(
+        q=torch.zeros(2, 8, 576),
+        kv_c_and_k_pe_cache=torch.zeros(8, 576),
+        topk_indices=torch.zeros(2, 4, dtype=torch.int32),
+        topk_length=torch.tensor([4, 2], dtype=torch.int32),
+    )
+
+    assert output.shape == (2, 8, 3)
+    assert lse.shape == (2, 8)
+    assert captured["attn_sink"] is not None
+    raw_lse = torch.arange(2 * 64, dtype=torch.float32).view(2, 64)[:, :8]
+    normalized_sink = impl._dcp_sinks - math.log(2)
+    torch.testing.assert_close(
+        lse,
+        torch.logaddexp(raw_lse, normalized_sink.view(1, -1)),
+    )
+    torch.testing.assert_close(
+        captured["attn_sink"][:8],
+        normalized_sink,
+    )
+
+
+def test_bf16_dcp_kernel_rejects_missing_lse(monkeypatch) -> None:
+    impl = _bare_impl(torch.arange(4, dtype=torch.float32))
+
+    def fake_sparse_fwd(q, *args, **kwargs):
+        del args, kwargs
+        return torch.zeros(q.shape[0], q.shape[1], 3), torch.empty(0), None
+
+    monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", fake_sparse_fwd)
+    with pytest.raises(RuntimeError, match="did not return LSE"):
+        impl._bf16_flash_mla_kernel_with_lse(
+            q=torch.zeros(2, 4, 576),
+            kv_c_and_k_pe_cache=torch.zeros(8, 576),
+            topk_indices=torch.zeros(2, 4, dtype=torch.int32),
+        )
+
+
+def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None:
+    impl = _bare_impl(torch.arange(4, dtype=torch.float32))
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 1
+    impl.kv_cache_dtype = "fp8_ds_mla"
+    impl._dcp_sinks = torch.arange(8, dtype=torch.float32)
+    impl.topk_indices_buffer = torch.tensor(
+        [[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.int32
+    )
+    localized_indices = torch.tensor(
+        [[112, 113, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32
+    )
+    topk_length = torch.tensor([2, 0], dtype=torch.int32)
+    calls: dict[str, object] = {}
+
+    def fake_filter(req_ids, block_table, indices, **kwargs):
+        calls["filter"] = (req_ids, block_table, indices, kwargs)
+        return localized_indices, topk_length
+
+    def fake_dequant(cache, indices, kv_lora_rank, rope_dim, tokens_per_request):
+        calls["dequant"] = (
+            cache,
+            indices,
+            kv_lora_rank,
+            rope_dim,
+            tokens_per_request,
+        )
+        return torch.zeros(8, 576), torch.tensor(
+            [[0, 1, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32
+        )
+
+    kernel_output = torch.arange(48, dtype=torch.float32).view(2, 8, 3)
+    kernel_lse = torch.arange(16, dtype=torch.float32).view(2, 8)
+
+    def fake_kernel(self, q, cache, indices, topk_length=None):
+        calls["kernel"] = (q, cache, indices, topk_length)
+        return kernel_output.clone(), kernel_lse.clone()
+
+    monkeypatch.setattr(hcu_sparse, "triton_filter_and_convert_dcp_index", fake_filter)
+    monkeypatch.setattr(
+        hcu_sparse,
+        "gather_dequantize_fp8_ds_mla_cache",
+        fake_dequant,
+    )
+    impl._bf16_flash_mla_kernel_with_lse = MethodType(fake_kernel, impl)
+    q = torch.zeros(2, 8, 576)
+    fp8_cache = torch.zeros(16, 656, dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[7], [11]], dtype=torch.int32),
+        block_size=64,
+        cp_kv_cache_interleave_size=1,
+    )
+
+    output, lse = impl.forward_mqa(q, fp8_cache, metadata, object())
+
+    filter_call = calls["filter"]
+    assert filter_call[3] == {
+        "dcp_size": 2,
+        "dcp_rank": 1,
+        "cp_kv_cache_interleave_size": 1,
+        "BLOCK_SIZE": 64,
+        "NUM_TOPK_TOKENS": 4,
+        "return_valid_counts": True,
+    }
+    assert calls["dequant"][1] is localized_indices
+    assert calls["kernel"][3] is topk_length
+    torch.testing.assert_close(output[0], kernel_output[0])
+    torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
+    torch.testing.assert_close(lse[0], kernel_lse[0])
+    torch.testing.assert_close(lse[1], kernel_lse[1])
+
+    impl.sinks = None
+    impl._dcp_sinks = None
+    _, sink_free_lse = impl.forward_mqa(q, fp8_cache, metadata, object())
+    assert torch.isneginf(sink_free_lse[1]).all()
+
+
+def test_dcp_size_one_delegates_to_upstream_forward(monkeypatch) -> None:
+    impl = _bare_impl(torch.arange(4, dtype=torch.float32))
+    expected = (torch.ones(1, 4, 3), None)
+    calls: list[tuple[object, ...]] = []
+
+    def fake_parent_forward(self, q, cache, metadata, layer):
+        calls.append((self, q, cache, metadata, layer))
+        return expected
+
+    monkeypatch.setattr(
+        hcu_sparse.FlashMLASparseImpl,
+        "forward_mqa",
+        fake_parent_forward,
+    )
+    q = torch.zeros(1, 4, 576)
+    cache = torch.zeros(2, 576)
+    metadata = object()
+    layer = object()
+
+    assert impl.forward_mqa(q, cache, metadata, layer) is expected
+    assert calls == [(impl, q, cache, metadata, layer)]
 
 
 def test_fp8_decode_forwards_live_sink(monkeypatch) -> None:
