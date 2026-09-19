@@ -51,6 +51,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _tokens_per_request(speculative_config: object | None) -> int:
+    """Return decode rows per request, including the current token."""
+    num_speculative_tokens = int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    )
+    return num_speculative_tokens + 1 if num_speculative_tokens > 0 else 1
+
+
 class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
     """FlashMLA sparse impl that applies HY V4's per-head learnable sink.
 
@@ -102,14 +110,13 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         self.sinks = sinks
         self._dcp_sinks: torch.Tensor | None = None
         # MTP width: query rows per request in a decode batch. LightOp's gather
-        # groups ``num_tokens`` rows into requests with this stride, so MTP3
-        # (num_speculative_tokens == 3) passes 3 and plain decoding passes 1.
+        # groups ``num_tokens`` rows into requests with this stride. MTP3 has
+        # three speculative rows plus the current decode row, so it passes 4;
+        # plain decoding passes 1.
         speculative_config = getattr(
             get_current_vllm_config(), "speculative_config", None
         )
-        self.tokens_per_request = int(
-            getattr(speculative_config, "num_speculative_tokens", 0) or 0
-        ) or 1
+        self.tokens_per_request = _tokens_per_request(speculative_config)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Prepare MLA weights and gather static sink shards for DCP."""

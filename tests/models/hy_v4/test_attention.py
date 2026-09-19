@@ -346,6 +346,23 @@ def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
     return impl
 
 
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "expected"),
+    [(None, 1), (0, 1), (3, 4)],
+)
+def test_tokens_per_request_includes_current_decode_token(
+    num_speculative_tokens: int | None,
+    expected: int,
+) -> None:
+    speculative_config = (
+        None
+        if num_speculative_tokens is None
+        else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+
+    assert hcu_sparse._tokens_per_request(speculative_config) == expected
+
+
 def test_dcp_gathers_sink_once_after_weights_load(monkeypatch) -> None:
     sinks = torch.arange(4, dtype=torch.float32)
     impl = _bare_impl(sinks)
