@@ -8,6 +8,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 
 from vllm_hcu.models.hy_v4 import hcu_sparse
@@ -106,6 +107,32 @@ def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
 
     assert resolved.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
     assert resolved.page_size_bytes == 64 * 656
+
+
+def test_hy_v4_mla_layer_runs_backend_post_load_hook(monkeypatch) -> None:
+    events: list[object] = []
+
+    def fake_layer_process(self, act_dtype):
+        events.append(("layer", self, act_dtype))
+
+    class FakeImpl:
+        def process_weights_after_loading(self, act_dtype):
+            events.append(("impl", self, act_dtype))
+
+    monkeypatch.setattr(
+        MLAAttention,
+        "process_weights_after_loading",
+        fake_layer_process,
+    )
+    layer = object.__new__(HYV4MLAAttentionLayer)
+    layer.impl = FakeImpl()
+
+    layer.process_weights_after_loading(torch.bfloat16)
+
+    assert events == [
+        ("layer", layer, torch.bfloat16),
+        ("impl", layer.impl, torch.bfloat16),
+    ]
 
 
 def test_full_and_shared_indexer_pattern() -> None:
