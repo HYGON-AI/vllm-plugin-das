@@ -42,7 +42,11 @@ For DCP decode, the implementation will:
 3. Use the post-weight-load attention hook to all-gather each rank's local
    attention-sink shard once across the DCP group. The gathered sink order
    matches the rank-ordered query-head all-gather performed by vLLM, avoiding
-   a collective in every decode layer invocation.
+   a collective in every decode layer invocation. Before the DCP kernel call,
+   subtract `log(dcp_world_size)` from each gathered sink logit. Every DCP
+   rank includes the virtual sink in its local softmax denominator, so this
+   adjustment makes the later cross-rank LSE reduction count the sink exactly
+   once instead of once per rank.
 4. For `fp8_ds_mla`, gather and dequantize only those rank-local selected
    slots into the compact BF16 cache already used by HY V4. For BF16 cache,
    use the local cache directly.
@@ -91,7 +95,8 @@ Unit tests will cover:
 
 - HY V4 advertises decode LSE support.
 - DCP gathers the loaded local sink shards once in rank order and uses the
-  gathered values for the corresponding gathered query heads.
+  gathered values for the corresponding gathered query heads, adjusted by
+  `-log(dcp_world_size)` during DCP attention.
 - DCP localizes sparse indices, forwards valid lengths, preserves attention
   sinks, and returns the real kernel LSE.
 - Empty local TopK rows produce zero output and negative-infinity LSE.
