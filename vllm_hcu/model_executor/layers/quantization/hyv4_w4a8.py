@@ -332,6 +332,16 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             )
         del shared_experts, shared_experts_input, kwargs
         from aiter.ops.triton.fused_moe import fused_experts_impl
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+            resolve_aiter_expert_maps,
+        )
+
+        global_num_experts = getattr(
+            layer, "global_num_experts", layer.w13_weight.size(0)
+        )
+        native_expert_map, _ = resolve_aiter_expert_maps(
+            getattr(layer, "expert_map", None), global_num_experts
+        )
 
         return fused_experts_impl(
             x.contiguous(),
@@ -342,10 +352,8 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             output_dtype=x.dtype,
             use_int4_w4a8=True,
             per_channel_quant=True,
-            global_num_experts=getattr(
-                layer, "global_num_experts", layer.w13_weight.size(0)
-            ),
-            expert_map=getattr(layer, "expert_map", None),
+            global_num_experts=global_num_experts,
+            expert_map=native_expert_map,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             activation="silu",

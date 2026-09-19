@@ -196,6 +196,13 @@ def test_native_aiter_moe_keeps_raw_packed_layout_and_uses_int4_triton(
 
     fused_moe.fused_experts_impl = fake_fused_experts_impl
     monkeypatch.setitem(sys.modules, "aiter.ops.triton.fused_moe", fused_moe)
+    native_expert_map = torch.tensor([0, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
+    layer._expert_map = native_expert_map
+    layer.expert_mask = expert_mask
+    layer.rocm_aiter_fmoe_enabled = True
+    layer.global_num_experts = 2
     x = torch.ones(1, 2)
     topk_weights = torch.tensor([[0.75, 0.25]])
     topk_ids = torch.tensor([[0, 1]])
@@ -213,6 +220,7 @@ def test_native_aiter_moe_keeps_raw_packed_layout_and_uses_int4_triton(
     assert call["kwargs"]["per_channel_quant"] is True
     assert call["kwargs"]["w1_scale"] is layer.w13_weight_scale
     assert call["kwargs"]["w2_scale"] is layer.w2_weight_scale
+    assert call["kwargs"]["expert_map"] is native_expert_map
 
 
 @pytest.mark.parametrize("native", [False, True])

@@ -2237,18 +2237,19 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
         events.append("gather")
 
     monkeypatch.setattr(sparse, "cp_gather_indexer_k_quant_cache_triton", gather)
-    monkeypatch.setattr(
-        sparse,
-        "fp8_mqa_logits_torch",
-        lambda *args: pytest.fail("packed gfx936 cache used the fallback logits"),
-    )
-
     def logits(q, kv, weights, starts, ends):
         del q, kv, weights, starts, ends
         events.append("logits")
         return torch.zeros((1, 1), dtype=torch.float32)
 
-    monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", logits)
+    monkeypatch.setattr(sparse, "fp8_mqa_logits_torch", logits)
+    monkeypatch.setattr(
+        sparse,
+        "rocm_fp8_mqa_logits",
+        lambda *args: pytest.fail(
+            "packed gfx936 cache dropped its per-key dequant scale"
+        ),
+    )
     monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
     monkeypatch.setattr(
         sparse,
@@ -2459,8 +2460,12 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
         del q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
         return torch.zeros((1, 1), dtype=torch.float32)
 
-    def fake_decode_logits(*args, **kwargs):
-        del args, kwargs
+    def fake_decode_logits(q, kv, decode_weights, *args, **kwargs):
+        del q, kv, args, kwargs
+        torch.testing.assert_close(
+            decode_weights,
+            torch.tensor([[10.0], [-777.0], [20.0], [30.0]]),
+        )
         return torch.zeros((4, 4), dtype=torch.float32)
 
     monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", fake_prefill_logits)
@@ -2469,8 +2474,12 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     )
 
     def fake_pack(x, lengths):
-        del x
-        return torch.zeros((2, 2, 1), dtype=torch.float32)
+        assert lengths.tolist() == [1, 2]
+        packed = torch.full((2, 2, *x.shape[1:]), -777.0, dtype=x.dtype)
+        packed[0, 0] = x[0]
+        packed[1, 0] = x[1]
+        packed[1, 1] = x[2]
+        return packed
 
     def fake_unpack(packed, lengths):
         assert tuple(packed.shape) == (2, 2, 1)
@@ -2519,7 +2528,7 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
         kv_cache=torch.zeros((1, 2, 1), dtype=torch.float32),
         q_fp8=torch.zeros((4, 1, 1), dtype=torch.float32),
         k=torch.zeros((4, 1), dtype=torch.float32),
-        weights=torch.ones((4, 1), dtype=torch.float32),
+        weights=torch.tensor([[10.0], [20.0], [30.0], [40.0]]),
         quant_block_size=1,
         scale_fmt="e4m3",
         topk_tokens=1,

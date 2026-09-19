@@ -1309,7 +1309,15 @@ def rocm_aiter_sparse_attn_indexer_native(
                     chunk.cu_seq_lens,
                 )
 
-            logits = rocm_fp8_mqa_logits(
+            # LightOp's non-gfx938 path does not consume the packed cache's
+            # per-key scale. Keep the bounded Torch implementation for this
+            # layout so key ranking uses the checkpoint dequant multipliers.
+            logits_fn = (
+                fp8_mqa_logits_torch
+                if use_fp8_cache and current_platform.is_rocm() and not on_gfx938()
+                else rocm_fp8_mqa_logits
+            )
+            logits = logits_fn(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32)),
                 weights[chunk.token_start : chunk.token_end],
@@ -1368,10 +1376,16 @@ def rocm_aiter_sparse_attn_indexer_native(
             else decode_metadata.seq_lens
         )
 
+        decode_weights = weights[:num_padded_tokens]
+        if decode_metadata.requires_padding:
+            decode_weights = pack_seq_triton(
+                weights[:num_decode_tokens], decode_lens
+            ).reshape(num_padded_tokens, -1)
+
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
-            weights[:num_padded_tokens],
+            decode_weights,
             seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
