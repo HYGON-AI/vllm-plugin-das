@@ -29,13 +29,15 @@
 
 **Files:**
 - Modify: `vllm_hcu/patch/worker/__init__.py`
+- Modify: `vllm_hcu/patch/worker/framework_opt/patch_base_communicator_pcp.py`
 - Modify: `vllm_hcu/v1/worker.py`
 - Test: `tests/patch/test_worker_dispatcher.py`
 - Test: `tests/patch/test_plugin_lifecycle.py`
+- Test: `tests/runtime_patch/test_patch_base_communicator_pcp.py`
 
 **Interfaces:**
 - Consumes: `ExactImportCoordinator.registrations()`, `IMPORT_COORDINATOR.drain_ready_callbacks()`, and the existing `validate_worker_patches(require_applied=True, coordinator=None)` API.
-- Produces: `validate_worker_patches(require_applied: bool = True, *, phase: Literal["model_load", "runtime"] = "runtime", coordinator: ExactImportCoordinator | None = None) -> None`; `HcuGPUWorker.load_model()` validates phase `"model_load"`; `HcuGPUWorker.compile_or_warm_up_model()` drains callbacks and validates phase `"runtime"` only after upstream warmup succeeds.
+- Produces: `validate_worker_patches(require_applied: bool = True, *, phase: Literal["model_load", "runtime"] = "runtime", coordinator: ExactImportCoordinator | None = None) -> None`; `HcuGPUWorker.load_model()` validates phase `"model_load"`; `HcuGPUWorker.compile_or_warm_up_model()` drains callbacks and validates phase `"runtime"` only after upstream warmup succeeds; the base communicator enables explicit DeepEP when either PCP or DCP is greater than one with EP and DP1.
 
 - [ ] **Step 1: Write failing dispatcher phase tests**
 
@@ -125,12 +127,20 @@ validate_worker_patches(require_applied=True, phase="runtime")
 return result
 ```
 
+Extend `patch_base_communicator_pcp.hcu_init` to read both
+`prefill_context_parallel_size` and `decode_context_parallel_size`, and set
+`use_all2all = True` for an EP communicator when either size exceeds one and
+the explicit backend is `deepep_high_throughput` or `deepep_low_latency`.
+Add a DCP2/PCP1/DP1 positive test and retain the negative test where both CP
+sizes equal one.
+
 - [ ] **Step 5: Run dispatcher and lifecycle tests**
 
 Run:
 
 ```bash
-pytest -q tests/patch/test_worker_dispatcher.py tests/patch/test_plugin_lifecycle.py
+pytest -q tests/patch/test_worker_dispatcher.py tests/patch/test_plugin_lifecycle.py \
+  tests/runtime_patch/test_patch_base_communicator_pcp.py
 ```
 
 Expected: all tests pass.
@@ -138,8 +148,11 @@ Expected: all tests pass.
 - [ ] **Step 6: Commit the lifecycle change**
 
 ```bash
-git add vllm_hcu/patch/worker/__init__.py vllm_hcu/v1/worker.py \
-  tests/patch/test_worker_dispatcher.py tests/patch/test_plugin_lifecycle.py
+git add vllm_hcu/patch/worker/__init__.py \
+  vllm_hcu/patch/worker/framework_opt/patch_base_communicator_pcp.py \
+  vllm_hcu/v1/worker.py tests/patch/test_worker_dispatcher.py \
+  tests/patch/test_plugin_lifecycle.py \
+  tests/runtime_patch/test_patch_base_communicator_pcp.py
 git commit -m "fix: validate DeepEP runtime patches after warmup"
 ```
 

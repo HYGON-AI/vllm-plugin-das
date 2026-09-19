@@ -24,7 +24,10 @@ callback for vLLM's all-to-all module. The callback may legitimately remain
 armed until distributed initialization or warmup loads that module, but the
 worker currently requires every terminal callback immediately after model
 loading. This rejects a valid lazy callback before the lifecycle reaches the
-point that consumes it.
+point that consumes it. The existing HCU communicator gate also enables
+DeepEP for PCP+EP with DP1, but not for DCP+EP with DP1. In the requested
+TP8/DCP2/EP8 topology that leaves `use_all2all` false, so the CUDA communicator
+never imports the all-to-all module or constructs the requested DeepEP manager.
 
 ## DCP Attention Design
 
@@ -75,6 +78,12 @@ warmup completion. Model-load validation will continue to require all patches
 whose target modules must be loaded while constructing the model, while
 allowing only the DeepEP runtime all-to-all callback to remain armed.
 
+The context-parallel communicator gate will treat either PCP greater than one
+or DCP greater than one as a reason to enable the explicit DeepEP backend for
+an EP communicator when upstream left it disabled. This makes CUDA
+communicator construction import and patch the real all-to-all manager before
+it is instantiated.
+
 After `compile_or_warm_up_model` completes, the worker will drain callbacks
 whose imports have finished and run full terminal validation. At this point a
 configured DeepEP backend must have loaded and patched the all-to-all runtime;
@@ -108,6 +117,8 @@ Unit tests will cover:
 - FP8 DCP uses the compact gather/dequantization path rather than the native
   FP8 FlashMLA geometry.
 - Model-load validation defers only the enabled DeepEP runtime callback.
+- DCP+EP with DP1 enables the configured DeepEP all-to-all manager just as the
+  existing PCP+EP path does.
 - Post-warmup validation drains ready callbacks and rejects a DeepEP callback
   that is still not applied.
 
