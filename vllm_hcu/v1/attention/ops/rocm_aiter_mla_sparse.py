@@ -1202,19 +1202,10 @@ def rocm_aiter_sparse_attn_indexer_native(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    # V4 writes packed FP8+scale pages in its compressor and passes k=None.
-    # All non-gfx938 HCU devices otherwise select the V3.2 BF16 path,
-    # which cannot consume these pages. Keep this compatibility fallback
-    # scoped to packed V4 caches, rather than changing V3.2 dispatch.
-    v4_fp8_fallback = (
-        current_platform.is_rocm() and not on_gfx938()
-        and skip_k_cache_insert and kv_cache.dtype == torch.uint8
-    )
-    fp8_dtype = (
-        current_platform.fp8_dtype()
-        if not current_platform.is_rocm() or on_gfx938() or v4_fp8_fallback
-        else (k.dtype if k is not None else hidden_states.dtype)
-    )
+    # HYV4 uses packed FP8+scale pages on gfx936 as well as gfx938. Select the
+    # reader and writer from the cache storage instead of the device generation.
+    use_fp8_cache = kv_cache.dtype == torch.uint8
+    fp8_dtype = current_platform.fp8_dtype() if use_fp8_cache else kv_cache.dtype
     from vllm import _custom_ops as ops
     from vllm.utils.torch_utils import _resolve_layer_name
 
@@ -1255,8 +1246,16 @@ def rocm_aiter_sparse_attn_indexer_native(
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
     if not skip_k_cache_insert:
-        if not current_platform.is_rocm() or on_gfx938():
+        if not current_platform.is_rocm():
             ops.indexer_k_quant_and_cache(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
+        elif use_fp8_cache:
+            indexer_k_quant_and_cache_triton(
                 k,
                 kv_cache,
                 slot_mapping,
@@ -1269,13 +1268,6 @@ def rocm_aiter_sparse_attn_indexer_native(
                 kv_cache,
                 slot_mapping,
             )
-            # indexer_k_quant_and_cache_triton(
-            #     k,
-            #     kv_cache,
-            #     slot_mapping,
-            #     quant_block_size,
-            #     scale_fmt,
-            # )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
@@ -1292,39 +1284,22 @@ def rocm_aiter_sparse_attn_indexer_native(
                 device=device,
                 dtype=torch.uint8,
             )
-            if v4_fp8_fallback:
-                # Fixed-size GPU gather; sequence boundaries remain device data.
-                page_size = kv_cache.shape[1]
-                pages = kv_cache.view(kv_cache.shape[0], -1)
-                offsets = torch.arange(chunk.total_seq_lens, device=kv_cache.device)
-                seq = torch.searchsorted(chunk.cu_seq_lens[1:].contiguous(), offsets, right=True)
-                # The CPU allocation length is an upper bound during async
-                # speculation. Mask before indexing the exact device tables:
-                # searchsorted returns num_reqs for the inactive tail.
-                active = offsets < chunk.cu_seq_lens[-1]
-                seq = torch.where(active, seq, 0)
-                local = torch.where(active, offsets - chunk.cu_seq_lens[seq], 0)
-                page_ids = torch.where(
-                    active, chunk.block_table[seq, local // page_size], 0
-                ).long()
-                values = pages[:, :page_size * head_dim].reshape(-1, page_size, head_dim)
-                scales = pages[:, page_size * head_dim:].reshape(-1, page_size, 4)
-                # Gather bytes before viewing FP8 for HIP indexing compatibility.
-                value_bytes = values[page_ids, local % page_size]
-                scale_bytes = scales[page_ids, local % page_size]
-                # Zero inactive output bytes as well: page 0 may contain stale
-                # data, including NaNs. Mask uint8 before interpreting FP8.
-                value_bytes.masked_fill_(~active[:, None], 0)
-                scale_bytes.masked_fill_(~active[:, None], 0)
-                k_fp8.copy_(value_bytes.contiguous().view(fp8_dtype))
-                k_scale.copy_(scale_bytes)
-            elif not current_platform.is_rocm() or on_gfx938():
+            if not current_platform.is_rocm():
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_fp8,
                     k_scale,
                     chunk.block_table,
                     chunk.cu_seq_lens,
+                )
+            elif use_fp8_cache:
+                cp_gather_indexer_k_quant_cache_triton(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
                 )
             else:
                 cp_gather_indexer_k_bf16_cache_triton(
@@ -1333,17 +1308,8 @@ def rocm_aiter_sparse_attn_indexer_native(
                     chunk.block_table,
                     chunk.cu_seq_lens,
                 )
-                # cp_gather_indexer_k_quant_cache_triton(
-                #     kv_cache,
-                #     k_fp8,
-                #     k_scale,
-                #     chunk.block_table,
-                #     chunk.cu_seq_lens,
-                #     token_to_seq=chunk.token_to_seq,
-                # )
 
-            logits_fn = fp8_mqa_logits_torch if v4_fp8_fallback else rocm_fp8_mqa_logits
-            logits = logits_fn(
+            logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32)),
                 weights[chunk.token_start : chunk.token_end],
@@ -1402,28 +1368,15 @@ def rocm_aiter_sparse_attn_indexer_native(
             else decode_metadata.seq_lens
         )
 
-        if v4_fp8_fallback:
-            # Q was packed above; apply the identical layout to head weights.
-            decode_weights = weights[:num_padded_tokens]
-            if decode_metadata.requires_padding:
-                decode_weights = pack_seq_triton(
-                    weights[:num_decode_tokens], decode_lens
-                ).reshape(num_padded_tokens, -1)
-            logits = fp8_paged_mqa_logits_torch(
-                padded_q_fp8_decode_tokens, kv_cache,
-                decode_weights, seq_lens,
-                decode_metadata.block_table, max_model_len,
-            )
-        else:
-            logits = rocm_fp8_paged_mqa_logits(
-                padded_q_fp8_decode_tokens,
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-            )
+        logits = rocm_fp8_paged_mqa_logits(
+            padded_q_fp8_decode_tokens,
+            kv_cache,
+            weights[:num_padded_tokens],
+            seq_lens,
+            decode_metadata.block_table,
+            decode_metadata.schedule_metadata,
+            max_model_len=max_model_len,
+        )
 
         # A padded decode batch has more kernel rows than actual decode
         # tokens.  Do not point those extra rows at the shared output buffer:
