@@ -17,6 +17,8 @@
 - Preserve the existing DCP-size-one HY V4 path and public return shapes.
 - Keep feature-off terminal callbacks eligible to remain armed.
 - Full runtime validation after warmup must fail closed for enabled callbacks that are armed, skipped, or failed.
+- FlashMLA's raw sparse LSE excludes `attn_sink`; fold the normalized sink into
+  the returned DCP LSE with `torch.logaddexp`.
 - DCP empty local sparse rows return zero output. They return negative-infinity
   LSE without a sink and preserve normalized sink LSE when a sink is present.
 - Count the virtual attention sink exactly once across DCP ranks by subtracting `log(dcp_world_size)` from each rank's sink logit.
@@ -180,7 +182,7 @@ torch.testing.assert_close(captured["attn_sink"][:8], expected)
 
 - [ ] **Step 2: Write failing BF16 kernel LSE tests**
 
-Change fake sparse kernels to return `(output, torch.empty(0), lse)`. Test `_bf16_flash_mla_kernel_with_lse` with a gathered eight-head query and 64-head kernel padding; assert both output and LSE are sliced to eight heads. Make the fake return `None` for LSE and assert `RuntimeError("did not return LSE")`.
+Change fake sparse kernels to return `(output, torch.empty(0), lse)`. Test `_bf16_flash_mla_kernel_with_lse` with a gathered eight-head query and 64-head kernel padding; assert output is sliced to eight heads and returned LSE equals `torch.logaddexp(raw_lse, normalized_sink)`. Make the fake return `None` for LSE and assert `RuntimeError("did not return LSE")`.
 
 - [ ] **Step 3: Write failing FP8 DCP forward tests**
 
@@ -228,7 +230,7 @@ Make `_sinks_for_query` select `_dcp_sinks` when its length matches the runtime 
 
 - [ ] **Step 6: Preserve BF16 kernel LSE and runtime head counts**
 
-Add `_bf16_flash_mla_kernel_with_lse` and base padding on `q.shape[1]`, rather than `self.num_heads`, because vLLM gathers DCP query heads before this call. Capture output and LSE from positions zero and two of `flash_mla_sparse_fwd`, reject a null LSE, and slice both to the runtime head count. Keep `_bf16_flash_mla_kernel` as a tensor-only wrapper for existing inherited callers:
+Add `_bf16_flash_mla_kernel_with_lse` and base padding on `q.shape[1]`, rather than `self.num_heads`, because vLLM gathers DCP query heads before this call. Capture output and LSE from positions zero and two of `flash_mla_sparse_fwd`, reject a null LSE, slice both to the runtime head count, and use `torch.logaddexp` to add the normalized sink to LSE because FlashMLA only applies it to output. Keep `_bf16_flash_mla_kernel` as a tensor-only wrapper for existing inherited callers:
 
 ```python
 def _bf16_flash_mla_kernel(self, *args, **kwargs) -> torch.Tensor:

@@ -17,7 +17,10 @@ implementation. It does not advertise decode LSE support and always returns a
 null LSE. DCP requires every attention rank to return its local output and the
 matching softmax LSE so vLLM can combine partial attention results with a
 numerically stable cross-rank reduction. The existing HY V4 FP8-to-BF16 path
-also discards the LSE returned by `flash_mla_sparse_fwd`.
+also discards the LSE returned by `flash_mla_sparse_fwd`. FlashMLA applies an
+attention sink to its output denominator but explicitly leaves the sink out of
+its returned LSE, so the DCP path must reconstruct the effective denominator
+LSE rather than forwarding that raw value unchanged.
 
 Second, `worker.framework_opt.communicator.deep_ep_runtime` is an import-time
 callback for vLLM's all-to-all module. The callback may legitimately remain
@@ -56,7 +59,9 @@ For DCP decode, the implementation will:
    slots into the compact BF16 cache already used by HY V4. For BF16 cache,
    use the local cache directly.
 5. Invoke the sink-aware HY V4 BF16 sparse FlashMLA wrapper with the local
-   TopK lengths and preserve both its output and LSE.
+   TopK lengths and preserve its output and raw LSE. When a sink is active,
+   compute `logaddexp(raw_lse, normalized_sink)` so the LSE describes the same
+   denominator already applied to the kernel output.
 6. Set output to zero for ranks whose local TopK row is empty. Without an
    attention sink, set LSE to negative infinity to provide the common DCP
    reduction identity. With an attention sink, preserve the kernel LSE: the
@@ -111,7 +116,8 @@ Unit tests will cover:
   gathered values for the corresponding gathered query heads, adjusted by
   `-log(dcp_world_size)` during DCP attention.
 - DCP localizes sparse indices, forwards valid lengths, preserves attention
-  sinks, and returns the real kernel LSE.
+  sinks, and returns an effective LSE that includes the kernel's documented
+  sink denominator adjustment.
 - Empty local TopK rows produce zero output; their LSE is negative infinity
   without a sink and the normalized sink LSE when a sink is present.
 - FP8 DCP uses the compact gather/dequantization path rather than the native
