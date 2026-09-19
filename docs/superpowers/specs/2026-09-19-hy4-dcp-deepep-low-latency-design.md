@@ -10,7 +10,7 @@ the rejected direct Aiter paged-MQA optimization.
 
 ## Current Failures
 
-Two independent startup failures block this configuration.
+Three independent correctness and startup failures block this configuration.
 
 First, `HYV4FlashMLASparseImpl` inherits the upstream sparse FlashMLA
 implementation. It does not advertise decode LSE support and always returns a
@@ -31,6 +31,35 @@ point that consumes it. The existing HCU communicator gate also enables
 DeepEP for PCP+EP with DP1, but not for DCP+EP with DP1. In the requested
 TP8/DCP2/EP8 topology that leaves `use_all2all` false, so the CUDA communicator
 never imports the all-to-all module or constructs the requested DeepEP manager.
+
+Third, the HCU sparse-indexer entry point does not receive the DCP rank,
+world size, or cache interleave. Each rank therefore selects only its local
+TopK candidates and leaves rank-local token IDs in the shared buffer. The
+attention backend expects global logical token IDs and localizes them for its
+rank, so treating these local IDs as global IDs reads the wrong KV rows and
+produces invalid decode output.
+
+## DCP Sparse-Indexer Design
+
+Each DCP rank will keep its existing local logits and local TopK calculation.
+It will pack each candidate's score and global logical token ID, all-gather
+those compact candidate lists across the DCP group, and select the final
+global TopK. This is exact because a candidate in the global TopK must also be
+in its owning rank's local TopK. The exchange is limited to
+`dcp_world_size * topk_tokens` candidates per query rather than the complete
+logit row.
+
+The existing CUDA path will continue using its CuTeDSL stable selector. HCU
+will use device-side PyTorch gather, all-gather, and TopK operations because
+CuTeDSL is unavailable on the platform. Prefill score lookup accounts for
+each row's packed sequence offset. Token IDs are converted with the configured
+cache interleave so the attention backend can apply its existing DCP
+localization.
+
+The fused LightOp mask-TopK decode route returns indices without their scores,
+so DCP decode will use the existing logits-producing HCU route before the
+global merge. DCP size one retains the LightOp route and existing custom-op
+schema. This change does not introduce a direct Aiter paged-MQA operator.
 
 ## DCP Attention Design
 
@@ -122,6 +151,8 @@ Unit tests will cover:
   without a sink and the normalized sink LSE when a sink is present.
 - FP8 DCP uses the compact gather/dequantization path rather than the native
   FP8 FlashMLA geometry.
+- HCU DCP exchanges local indexer scores and token IDs and chooses the correct
+  global TopK for decode; the rank/interleave mapping is covered separately.
 - Model-load validation defers only the enabled DeepEP runtime callback.
 - DCP+EP with DP1 enables the configured DeepEP all-to-all manager just as the
   existing PCP+EP path does.
@@ -139,6 +170,16 @@ The final accuracy check will run the same eight HumanEval samples used by the
 current TP8 baseline. The acceptance target is 8/8 correct and Pass@1 100%.
 Focused runtime and model tests, Python compilation, and diff whitespace
 checks must also pass before committing and pushing the branch.
+
+## Validation Result
+
+The exact TP8/DCP2/EP8 configuration started with
+`DeepEPLLAll2AllManager`, completed a deterministic multi-token decode, and
+shut down cleanly. EvalScope executed `HumanEval/0` through `HumanEval/7` with
+8/8 successful requests, Accuracy 100%, and Pass@1 100%. The observed mean
+latency was 38.118 seconds and average output throughput was 3.5 tokens/s for
+this eight-sample correctness run; these figures are observational and are not
+an A/B performance comparison.
 
 ## Delivery
 
