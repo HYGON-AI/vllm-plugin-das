@@ -393,9 +393,6 @@ def test_sparse_mask_route_pairs_plain_producer_and_consumer(
         assert args[4].shape == (2, 1)
         return torch.zeros((2, 64)), torch.zeros((2, 4), dtype=torch.int16)
 
-    def grouped(*_args, **_kwargs):
-        pytest.fail("grouped producer used for ordinary decode")
-
     def consumer(**kwargs):
         calls.append("consumer")
         assert kwargs["page_table_size_1"].is_contiguous()
@@ -412,7 +409,7 @@ def test_sparse_mask_route_pairs_plain_producer_and_consumer(
     monkeypatch.setattr(
         runtime,
         "_lightop_sparse_mask_topk_ops",
-        lambda: (producer, grouped, consumer),
+        lambda: (producer, consumer),
     )
     q = torch.zeros((2, 1, 32, 128), dtype=torch.float8_e4m3fn)
     kv_cache = torch.zeros((1, 64, 1, 132), dtype=torch.uint8)
@@ -438,20 +435,17 @@ def test_sparse_mask_route_pairs_plain_producer_and_consumer(
     assert calls == ["producer", "consumer"]
 
 
-def test_sparse_mask_route_uses_grouped_producer_for_mtp(
+def test_sparse_mask_route_uses_public_plain_producer_for_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _enable_sparse_mask_route(monkeypatch)
     calls: list[str] = []
 
-    def producer(*_args, **_kwargs):
-        pytest.fail("plain producer used for grouped decode")
-
-    def grouped(*args, **kwargs):
-        calls.append("grouped")
+    def producer(*args, **kwargs):
+        calls.append("producer")
         assert args[0].shape == (6, 1, 32, 128)
         assert args[4].shape == (6, 1)
-        assert kwargs["group_size"] == 3
+        assert "group_size" not in kwargs
         return torch.zeros((6, 64)), torch.zeros((6, 4), dtype=torch.int16)
 
     def consumer(**kwargs):
@@ -466,7 +460,7 @@ def test_sparse_mask_route_uses_grouped_producer_for_mtp(
     monkeypatch.setattr(
         runtime,
         "_lightop_sparse_mask_topk_ops",
-        lambda: (producer, grouped, consumer),
+        lambda: (producer, consumer),
     )
     q = torch.zeros((2, 3, 32, 128), dtype=torch.float8_e4m3fn)
     kv_cache = torch.zeros((1, 64, 1, 132), dtype=torch.uint8)
@@ -489,7 +483,7 @@ def test_sparse_mask_route_uses_grouped_producer_for_mtp(
 
     assert result is not None
     assert result.shape == (6, 2048)
-    assert calls == ["grouped", "consumer"]
+    assert calls == ["producer", "consumer"]
 
 
 def test_sparse_mask_route_falls_back_for_unsupported_layout(
@@ -501,7 +495,7 @@ def test_sparse_mask_route_falls_back_for_unsupported_layout(
     def ops():
         nonlocal calls
         calls += 1
-        return (lambda *_args, **_kwargs: None,) * 3
+        return (lambda *_args, **_kwargs: None,) * 2
 
     monkeypatch.setattr(runtime, "_lightop_sparse_mask_topk_ops", ops)
     q = torch.zeros((2, 1, 8, 128), dtype=torch.float8_e4m3fn)

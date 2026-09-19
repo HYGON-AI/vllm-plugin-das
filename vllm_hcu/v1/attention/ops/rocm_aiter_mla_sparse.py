@@ -1070,17 +1070,15 @@ def _use_lightop_sparse_mla_topk() -> bool:
 def _lightop_sparse_mask_topk_ops():
     """Return the paired LightOp sparse-MQA and mask-TopK functions."""
     try:
-        from lightop.attention import fast_topk_transform_sparse_mask_fused
-        from lightop.gemmopt import (
+        from lightop.attention import (
+            fast_topk_transform_sparse_mask_fused,
             page_mqa_logits_sparse_mask,
-            page_mqa_logits_sparse_mask_grouped,
         )
     except (AttributeError, ImportError, OSError):
         return None
 
     operations = (
         page_mqa_logits_sparse_mask,
-        page_mqa_logits_sparse_mask_grouped,
         fast_topk_transform_sparse_mask_fused,
     )
     if not all(callable(operation) for operation in operations):
@@ -1145,7 +1143,7 @@ def _lightop_mask_topk_decode_metadata(
     operations = _lightop_sparse_mask_topk_ops()
     if operations is None:
         return None
-    producer, grouped_producer, consumer = operations
+    producer, consumer = operations
 
     rows = batch_size * next_n
     if seq_lens.dim() == 2:
@@ -1168,13 +1166,6 @@ def _lightop_mask_topk_decode_metadata(
 
     q_rows = q.reshape(rows, 1, q.shape[2], q.shape[3])
     expanded_block_table = block_table.repeat_interleave(next_n, dim=0)
-    if next_n == 1:
-        producer_fn = producer
-        producer_kwargs = {}
-    else:
-        producer_fn = grouped_producer
-        producer_kwargs = {"group_size": next_n}
-
     # The consumer uses one page-size-1 entry per logical token. It is not the
     # physical cache page table passed to the producer.
     page_table_size_1 = torch.arange(
@@ -1184,14 +1175,13 @@ def _lightop_mask_topk_decode_metadata(
         rows + 1, dtype=torch.int32, device=q.device
     )
     return (
-        producer_fn,
+        producer,
         consumer,
         q_rows,
         context_lens,
         expanded_block_table,
         page_table_size_1,
         cu_seqlens_q,
-        producer_kwargs,
     )
 
 
@@ -1222,7 +1212,6 @@ def _lightop_mask_topk_decode(
         expanded_block_table,
         page_table_size_1,
         cu_seqlens_q,
-        producer_kwargs,
     ) = metadata
     try:
         logits, nonzero_mask = producer(
@@ -1235,7 +1224,6 @@ def _lightop_mask_topk_decode(
             max_model_len,
             clean_logits=True,
             num_warps=4,
-            **producer_kwargs,
         )
         topk_indices = consumer(
             score=logits,
@@ -1248,7 +1236,7 @@ def _lightop_mask_topk_decode(
         logger.info_once(
             "Using LightOp sparse Page-MQA producer and "
             "fast_topk_transform_sparse_mask_fused consumer "
-            f"(group_size={producer_kwargs.get('group_size', 1)})."
+            f"(query_rows_per_request={next_n})."
         )
         return topk_indices
     except (AttributeError, TypeError, ValueError) as exc:

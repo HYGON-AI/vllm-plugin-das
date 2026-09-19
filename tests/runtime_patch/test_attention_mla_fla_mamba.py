@@ -62,8 +62,16 @@ def _module(name: str, **values) -> ModuleType:
 
 def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
     """Import the implementation after another test registered its torch op."""
+    from vllm.model_executor.custom_op import CustomOp
     import vllm.utils.torch_utils as torch_utils
 
+    monkeypatch.setattr(
+        CustomOp,
+        "register",
+        classmethod(
+            lambda cls, name, dynamic_arg_dims=None: lambda op_cls: op_cls
+        ),
+    )
     monkeypatch.setattr(
         torch_utils,
         "direct_register_custom_op",
