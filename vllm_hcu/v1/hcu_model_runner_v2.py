@@ -153,6 +153,36 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         with deepep_auto_request_phase_scope():
             return super().execute_model(*args, **kwargs)
 
+    def profile_run(self) -> None:
+        """PCP-aware profile: dummy tokens per rank = max_num_batched_tokens / pcp_size.
+
+        Upstream ``GPUModelRunner.profile_run`` sends ``self.max_num_tokens``
+        (= scheduler_config.max_num_batched_tokens) into ``_dummy_run`` as the
+        per-rank token count.  In PCP, the scheduler's total batch is split
+        across ``pcp_size`` ranks, so each rank actually processes at most
+        ``max_num_batched_tokens / pcp_size`` tokens.  Profiling with the full
+        value inflates MoE / attention workspaces by up to ``pcp_size``, which
+        under DeepEP-HT reserves ``4 * M * K * 2`` bytes per rank and can push
+        the peak past the GPU capacity for PCP+EP configs.
+        """
+        pcp_size = int(
+            getattr(
+                self.vllm_config.parallel_config,
+                "prefill_context_parallel_size",
+                1,
+            )
+            or 1
+        )
+        if pcp_size <= 1:
+            return super().profile_run()
+
+        original_max = self.max_num_tokens
+        self.max_num_tokens = max(1, original_max // pcp_size)
+        try:
+            return super().profile_run()
+        finally:
+            self.max_num_tokens = original_max
+
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
             return super().prepare_attn(input_batch)
