@@ -52,9 +52,11 @@ For DCP decode, the implementation will:
    use the local cache directly.
 5. Invoke the sink-aware HY V4 BF16 sparse FlashMLA wrapper with the local
    TopK lengths and preserve both its output and LSE.
-6. Set output to zero and LSE to negative infinity for ranks whose local TopK
-   row is empty. This gives the common vLLM DCP reduction the identity value
-   it expects.
+6. Set output to zero for ranks whose local TopK row is empty. Without an
+   attention sink, set LSE to negative infinity to provide the common DCP
+   reduction identity. With an attention sink, preserve the kernel LSE: the
+   normalized virtual sink remains a real denominator contribution even when
+   that rank owns no selected KV slot.
 
 The BF16 wrapper will expose the kernel's output and LSE internally. Existing
 non-DCP callers will continue returning the same public output shape and will
@@ -99,7 +101,8 @@ Unit tests will cover:
   `-log(dcp_world_size)` during DCP attention.
 - DCP localizes sparse indices, forwards valid lengths, preserves attention
   sinks, and returns the real kernel LSE.
-- Empty local TopK rows produce zero output and negative-infinity LSE.
+- Empty local TopK rows produce zero output; their LSE is negative infinity
+  without a sink and the normalized sink LSE when a sink is present.
 - FP8 DCP uses the compact gather/dequantization path rather than the native
   FP8 FlashMLA geometry.
 - Model-load validation defers only the enabled DeepEP runtime callback.

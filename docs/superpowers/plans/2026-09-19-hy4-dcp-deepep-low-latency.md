@@ -17,7 +17,8 @@
 - Preserve the existing DCP-size-one HY V4 path and public return shapes.
 - Keep feature-off terminal callbacks eligible to remain armed.
 - Full runtime validation after warmup must fail closed for enabled callbacks that are armed, skipped, or failed.
-- DCP empty local sparse rows return zero output and negative-infinity LSE.
+- DCP empty local sparse rows return zero output. They return negative-infinity
+  LSE without a sink and preserve normalized sink LSE when a sink is present.
 - Count the virtual attention sink exactly once across DCP ranks by subtracting `log(dcp_world_size)` from each rank's sink logit.
 - Hardware acceptance uses `/models/Hy4-preview-Channel-FP8-w8a8`, TP8, DCP2, EP8, `deepep_low_latency`, DeepGEMM, `fp8_ds_mla`, block size 64, and `VLLM_HCU_HYV4_FP8_KV_DEQUANT=1`.
 - Accuracy acceptance is HumanEval items 0 through 7 with 8/8 correct and Pass@1 100%.
@@ -169,14 +170,17 @@ Change fake sparse kernels to return `(output, torch.empty(0), lse)`. Test `_bf1
 
 - [ ] **Step 3: Write failing FP8 DCP forward tests**
 
-Build a bare DCP2 implementation with two token rows. Stub `triton_filter_and_convert_dcp_index` to return one populated row and one empty row, stub `gather_dequantize_fp8_ds_mla_cache` to record the localized indices, and stub the BF16 kernel to return deterministic output/LSE. Assert:
+Build a bare DCP2 implementation with two token rows. Stub `triton_filter_and_convert_dcp_index` to return one populated row and one empty row, stub `gather_dequantize_fp8_ds_mla_cache` to record the localized indices, and stub the BF16 kernel to return deterministic output/LSE. Assert the empty-row output is zero and its kernel LSE is preserved because the normalized sink remains in the denominator:
 
 ```python
 output, lse = impl.forward_mqa(q, fp8_cache, metadata, object())
 assert dequant_indices.equal(localized_indices)
 assert torch.equal(output[1], torch.zeros_like(output[1]))
-assert torch.isneginf(lse[1]).all()
+assert torch.equal(lse[1], kernel_lse[1])
 ```
+
+Repeat with `impl.sinks = None` and `impl._dcp_sinks = None`; assert the empty
+row LSE is negative infinity in the sink-free case.
 
 Also assert DCP-size-one delegates to `super().forward_mqa` so existing prefill/decode behavior remains unchanged.
 
@@ -217,12 +221,13 @@ def _bf16_flash_mla_kernel(self, *args, **kwargs) -> torch.Tensor:
 
 - [ ] **Step 7: Implement HY V4 DCP forward**
 
-For DCP-size-one, delegate to the parent. Otherwise concatenate tuple queries when necessary, take the active rows from `topk_indices_buffer`, and call `triton_filter_and_convert_dcp_index` with metadata block size, interleave size, rank, world size, and `return_valid_counts=True`. For FP8 cache, gather/dequantize the localized selected rows into compact BF16 storage; for BF16 cache, use the local cache directly. Call `_bf16_flash_mla_kernel_with_lse(..., topk_length=topk_length)`, then apply the reduction identity:
+For DCP-size-one, delegate to the parent. Otherwise concatenate tuple queries when necessary, take the active rows from `topk_indices_buffer`, and call `triton_filter_and_convert_dcp_index` with metadata block size, interleave size, rank, world size, and `return_valid_counts=True`. For FP8 cache, gather/dequantize the localized selected rows into compact BF16 storage; for BF16 cache, use the local cache directly. Call `_bf16_flash_mla_kernel_with_lse(..., topk_length=topk_length)`, clear the empty-row output, and apply the sink-free reduction identity:
 
 ```python
 empty_rows = topk_length == 0
 output.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+if self.sinks is None:
+    lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
 return output, lse
 ```
 
@@ -387,4 +392,3 @@ git push -u origin feat/hy4-lightop-mask-topk-adapt
 ```
 
 Expected: the existing remote MR branch advances to the verified local HEAD.
-
