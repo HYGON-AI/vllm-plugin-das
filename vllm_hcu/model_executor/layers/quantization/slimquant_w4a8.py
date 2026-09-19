@@ -153,17 +153,12 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             if (
                 parallel_config is None
                 or getattr(parallel_config, "all2all_backend", None)
-                != "deepep_auto"
-                or getattr(
-                    parallel_config,
-                    "use_deepep_auto_kernels",
-                    None,
-                )
-                is False
+                not in ("deepep_auto", "deepep_low_latency")
             ):
                 raise ValueError(
                     "SlimQuant W4A8 deep_gemm requires DP+EP with "
-                    "all2all_backend='deepep_auto'"
+                    "all2all_backend='deepep_auto' or "
+                    "'deepep_low_latency'"
                 )
         self.moe = moe
         self.quant_config = quant_config
@@ -276,7 +271,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             slimquant_w4a8_uses_deepep_auto,
         )
 
-        uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(
+        uses_deepep = slimquant_w4a8_uses_deepep_auto(
             getattr(self, "moe", None)
         )
         weight_generation = _slimquant_moe_tensor_generation(
@@ -288,7 +283,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             "_hcu_slimquant_post_load_weight_generation",
             None,
         )
-        if not uses_deepep_auto and installed_weight_generation == weight_generation:
+        if not uses_deepep and installed_weight_generation == weight_generation:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             config = getattr(layer, "_hcu_slimquant_post_load_aiter_config", None)
             if config is not None:
@@ -312,7 +307,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 "weight postprocessing"
             )
 
-        if uses_deepep_auto:
+        if uses_deepep:
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
             )
@@ -321,6 +316,16 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 routing_tables=layer._expert_routing_tables(),
+                fixed_use_low_latency=(
+                    True
+                    if getattr(
+                        getattr(self.moe, "moe_parallel_config", None),
+                        "all2all_backend",
+                        None,
+                    )
+                    == "deepep_low_latency"
+                    else None
+                ),
             )
             fused_experts = getattr(self.moe_kernel, "fused_experts", None)
             experts = getattr(fused_experts, "experts", fused_experts)

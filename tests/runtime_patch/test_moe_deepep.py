@@ -3805,6 +3805,67 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
     }
 
 
+def test_slimquant_w4a8_factory_builds_fixed_low_latency_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    prepare_finalize = SimpleNamespace(
+        max_tokens_per_rank=64,
+        num_dispatchers=lambda: 8,
+    )
+    monkeypatch.setattr(
+        all2all_utils,
+        "maybe_make_prepare_finalize",
+        lambda **_kwargs: prepare_finalize,
+    )
+    constructed: dict[str, object] = {}
+
+    class FixedW4A8Experts:
+        def __init__(self, **kwargs):
+            constructed.update(kwargs)
+
+    monkeypatch.setattr(module, "DeepEPAutoW4A8Experts", FixedW4A8Experts)
+    monkeypatch.setattr(
+        module.mk,
+        "FusedMoEKernel",
+        lambda prepare, experts: (prepare, experts),
+    )
+    quant_config = FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        per_act_token_quant=True,
+        per_out_ch_quant=False,
+        block_shape=None,
+        weight_dtype="int4",
+    )
+    moe_config = SimpleNamespace()
+
+    kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+        moe_quant_config=quant_config,
+        moe_config=moe_config,
+        routing_tables=(object(), object(), object()),
+        fixed_use_low_latency=True,
+    )
+
+    assert kernel[0] is prepare_finalize
+    assert isinstance(kernel[1], FixedW4A8Experts)
+    assert prepare_finalize._vllm_hcu_clean_low_latency_buffer is False
+    assert prepare_finalize._hcu_ll_cleaned_buffer_layout is None
+    assert constructed == {
+        "moe_config": moe_config,
+        "quant_config": quant_config,
+        "max_num_tokens": 64,
+        "num_dispatchers": 8,
+        "fixed_use_low_latency": True,
+    }
+
+
 def test_slimquant_w4a8_auto_factory_rejects_non_dynamic_token_scheme(
     monkeypatch: pytest.MonkeyPatch,
 ):

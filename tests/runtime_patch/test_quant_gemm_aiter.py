@@ -4165,17 +4165,34 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
+@pytest.mark.parametrize(
+    (
+        "all2all_backend",
+        "auto_kernels",
+        "fixed_use_low_latency",
+        "architecture",
+    ),
+    [
+        ("deepep_auto", True, None, "DeepseekV4ForCausalLM"),
+        ("deepep_low_latency", False, True, "DeepseekV4ForCausalLM"),
+        ("deepep_low_latency", False, True, "HYV4ForCausalLM"),
+    ],
+)
+def test_slimquant_w4a8_deepep_uses_w4a8_deepgemm_factory_not_aiter(
     monkeypatch: pytest.MonkeyPatch,
+    all2all_backend: str,
+    auto_kernels: bool,
+    fixed_use_low_latency: bool | None,
+    architecture: str,
 ):
-    """DP+EP W4A8 must own an auto DeepGEMM kernel, not an AITER fallback."""
+    """DP+EP W4A8 must own the selected DeepGEMM kernel, not AITER."""
 
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as deepgemm_module,
     )
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
-    factory_calls: list[tuple[object, object, object]] = []
+    factory_calls: list[tuple[object, object, object, bool | None]] = []
     processed_layers: list[object] = []
 
     class W4A8Experts:
@@ -4194,8 +4211,16 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         moe_quant_config: object,
         moe_config: object,
         routing_tables: object = None,
+        fixed_use_low_latency: bool | None = None,
     ) -> W4A8Kernel:
-        factory_calls.append((moe_quant_config, moe_config, routing_tables))
+        factory_calls.append(
+            (
+                moe_quant_config,
+                moe_config,
+                routing_tables,
+                fixed_use_low_latency,
+            )
+        )
         return W4A8Kernel()
 
     monkeypatch.setattr(
@@ -4208,14 +4233,14 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         compressed_tensors_moe_runtime,
         "prewarm_aiter_w4a8_moe",
         lambda *_args: pytest.fail(
-            "deepep_auto W4A8 must create DeepGEMM experts, not prewarm AITER"
+            "DeepEP W4A8 must create DeepGEMM experts, not prewarm AITER"
         ),
     )
     monkeypatch.setattr(
         compressed_tensors_moe_runtime,
         "apply_aiter_w4a8_moe",
         lambda *_args: pytest.fail(
-            "deepep_auto W4A8 must execute its DeepGEMM kernel, not AITER"
+            "DeepEP W4A8 must execute its DeepGEMM kernel, not AITER"
         ),
     )
 
@@ -4225,13 +4250,11 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
         moe_parallel_config=SimpleNamespace(
             dp_size=2,
             use_ep=True,
-            all2all_backend="deepep_auto",
-            use_deepep_auto_kernels=True,
+            all2all_backend=all2all_backend,
+            use_deepep_auto_kernels=auto_kernels,
         ),
         _hcu_vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"]
-            )
+            model_config=SimpleNamespace(architectures=[architecture])
         ),
     )
     method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(object(), moe)
@@ -4261,7 +4284,9 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
     quant_config = method.moe_quant_config
     assert quant_config is not None
     assert quant_config.weight_quant_dtype == "int4"
-    assert factory_calls == [(quant_config, moe, routing_tables)]
+    assert factory_calls == [
+        (quant_config, moe, routing_tables, fixed_use_low_latency)
+    ]
     assert processed_layers == [layer]
     assert method.moe_kernel is not None
     x = torch.zeros((2, 4), dtype=torch.bfloat16)
@@ -4469,14 +4494,6 @@ def test_slimquant_w4a8_deepep_auto_rejects_missing_ll_lightop(
             2,
             True,
             "deepep_high_throughput",
-            False,
-            "auto",
-            "requires all2all_backend='deepep_auto'",
-        ),
-        (
-            2,
-            True,
-            "deepep_low_latency",
             False,
             "auto",
             "requires all2all_backend='deepep_auto'",

@@ -1118,6 +1118,7 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     moe_config: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     experts_cls: type[DeepEPAutoDeepGemmExperts] | None = None,
+    fixed_use_low_latency: bool | None = None,
 ) -> mk.FusedMoEKernel:
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
@@ -1132,6 +1133,25 @@ def _make_deepep_auto_deepgemm_moe_kernel(
     )
     if prepare_finalize is None:
         raise RuntimeError("DeepEP auto prepare/finalize was not constructed")
+    if fixed_use_low_latency is True:
+        max_num_tokens = getattr(prepare_finalize, "max_tokens_per_rank", None)
+        if max_num_tokens is None:
+            raise RuntimeError("DeepEP fixed LL token capacity is unavailable")
+        if experts_cls is None:
+            experts_cls = DeepEPAutoDeepGemmExperts
+        experts = experts_cls(
+            moe_config=moe_config,
+            quant_config=moe_quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=prepare_finalize.num_dispatchers(),
+            fixed_use_low_latency=True,
+        )
+        # Fixed DeepEP LL owns a persistent dispatch buffer.  Initialize its
+        # layout on the first forward, then retain it across decode steps.
+        prepare_finalize._vllm_hcu_clean_low_latency_buffer = False
+        prepare_finalize._hcu_ll_cleaned_buffer_layout = None
+        logger.info_once("Using fixed DeepEP LL MoE kernel with masked experts.")
+        return mk.FusedMoEKernel(prepare_finalize, experts)
     max_num_tokens = prepare_finalize.ll_prepare_finalize.max_num_tokens_per_rank()
     if max_num_tokens is None:
         raise RuntimeError("DeepEP auto LL token capacity is unavailable")
@@ -1195,8 +1215,9 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    fixed_use_low_latency: bool | None = None,
 ) -> mk.FusedMoEKernel:
-    """Build the unified DeepEP HT/LL kernel for SlimQuant W4A8."""
+    """Build the auto or fixed low-latency DeepEP kernel for W4A8."""
 
     if moe_quant_config.weight_quant_dtype != "int4":
         raise ValueError("SlimQuant auto factory requires INT4 W4A8 quantization")
@@ -1243,4 +1264,5 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_config=moe_config,
         routing_tables=routing_tables,
         experts_cls=DeepEPAutoW4A8Experts,
+        fixed_use_low_latency=fixed_use_low_latency,
     )
