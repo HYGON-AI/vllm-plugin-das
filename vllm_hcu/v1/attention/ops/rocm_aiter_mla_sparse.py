@@ -1396,6 +1396,9 @@ def rocm_aiter_sparse_attn_indexer_native(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -1568,6 +1571,21 @@ def rocm_aiter_sparse_attn_indexer_native(
                     )
                 )
 
+            if dcp_world_size > 1:
+                from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+                    _merge_dcp_topk_global,
+                )
+
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
+
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
         assert decode_metadata is not None
@@ -1599,18 +1617,23 @@ def rocm_aiter_sparse_attn_indexer_native(
             else decode_metadata.seq_lens
         )
 
-        mask_topk = _lightop_mask_topk_decode(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            batch_size,
-            next_n,
-            topk_tokens,
-            max_model_len,
-            decode_metadata.requires_padding,
-        )
+        # DCP must exchange both local token ids and their scores before the
+        # final global Top-K.  The paired LightOp route returns indices only,
+        # so keep DCP on the logits-producing path below.
+        mask_topk = None
+        if dcp_world_size <= 1:
+            mask_topk = _lightop_mask_topk_decode(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                batch_size,
+                next_n,
+                topk_tokens,
+                max_model_len,
+                decode_metadata.requires_padding,
+            )
         if mask_topk is None:
             if v4_fp8_fallback:
                 # Q was packed above; apply the identical layout to head weights.
@@ -1661,6 +1684,20 @@ def rocm_aiter_sparse_attn_indexer_native(
                     topk_tokens,
                     row_ends=row_ends,
                 )
+            )
+
+        if dcp_world_size > 1:
+            from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+                _merge_dcp_topk_global,
+            )
+
+            _merge_dcp_topk_global(
+                logits,
+                topk_indices,
+                topk_tokens,
+                dcp_rank,
+                dcp_world_size,
+                cp_kv_cache_interleave_size,
             )
 
         if decode_metadata.requires_padding:
