@@ -73,8 +73,9 @@ def test_moe_load_converts_nibbles_and_scale_before_current_dispatch(tmp_path, m
     layer.moe_config.in_dtype = torch.float32
     method = config.get_quant_method(layer, "model.layers.1.mlp.experts.routed_experts")
     assert isinstance(method, SlimQuantW4A8Int8AiterMoEMethod)
-    assert method.apply.__func__ is SlimQuantW4A8Int8AiterMoEMethod.apply
-    assert method.process_weights_after_loading.__func__ is SlimQuantW4A8Int8AiterMoEMethod.process_weights_after_loading
+    assert method.apply.__func__ is module("hyv4_w4a8").HYV4W4A8MoEMethod.apply
+    assert (method.process_weights_after_loading.__func__ is
+            module("hyv4_w4a8").HYV4W4A8MoEMethod.process_weights_after_loading)
     assert not method.supports_eplb
     del layer.quant_method
     layer.quant_method = method
@@ -127,6 +128,99 @@ def test_moe_load_converts_nibbles_and_scale_before_current_dispatch(tmp_path, m
     # negative gate and half as large up projection.
     expected = torch.tensor([[.0819116, .0819116], [.7019927, .7019927]])
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_native_aiter_moe_keeps_raw_packed_layout_and_uses_int4_triton(
+    tmp_path, monkeypatch
+):
+    """The native checkpoint is calibrated for AITER's packed INT4 kernel."""
+    import sys
+    from types import ModuleType
+
+    from tests.accuracy.test_hyv4_native_format import native_index
+    from tests.models.static_eplb_test_utils import GenericMoE
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime as runtime,
+    )
+
+    config = module("hyv4_native").HYV4NativeW4A8Config(str(native_index(tmp_path)))
+    layer = GenericMoE(0).moe_layers[0].routed_experts
+    layer.moe_config.moe_backend = "aiter"
+    layer.moe_config.experts_per_token = 2
+    layer.moe_config.swiglu_limit = 10.0
+    del layer.quant_method
+    method = config.get_quant_method(
+        layer, "model.layers.1.mlp.experts.routed_experts"
+    )
+    layer.quant_method = method
+    method.create_weights(
+        layer, 2, 2, 2, torch.bfloat16, weight_loader=layer.weight_loader
+    )
+
+    packed13 = torch.tensor(
+        [[[0x12], [0x34], [0x56], [0x78]]] * 2, dtype=torch.uint8
+    )
+    packed2 = torch.tensor([[[0x21], [0x43]]] * 2, dtype=torch.uint8)
+    scales13 = torch.full((2, 4, 1), 0.5)
+    scales2 = torch.full((2, 2, 1), 0.25)
+    for name, value in (
+        ("w13_weight", packed13),
+        ("w2_weight", packed2),
+        ("w13_weight_scale", scales13),
+        ("w2_weight_scale", scales2),
+    ):
+        param = getattr(layer, name)
+        for expert in range(2):
+            if name.startswith("w13"):
+                for shard, piece in zip(("w1", "w3"), value[expert].chunk(2)):
+                    param.weight_loader(param, piece, name, shard, expert)
+            else:
+                param.weight_loader(param, value[expert], name, "w2", expert)
+
+    monkeypatch.setattr(
+        runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda *args, **kwargs: pytest.fail("native HYV4 must not select MOE_C"),
+    )
+    method.process_weights_after_loading(layer)
+    torch.testing.assert_close(layer.w13_weight_scale, scales13)
+    torch.testing.assert_close(layer.w2_weight_scale, scales2)
+
+    call = {}
+    fused_moe = ModuleType("aiter.ops.triton.fused_moe")
+
+    def fake_fused_experts_impl(*args, **kwargs):
+        call["args"] = args
+        call["kwargs"] = kwargs
+        return torch.full_like(args[0], 7)
+
+    fused_moe.fused_experts_impl = fake_fused_experts_impl
+    monkeypatch.setitem(sys.modules, "aiter.ops.triton.fused_moe", fused_moe)
+    native_expert_map = torch.tensor([0, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
+    layer._expert_map = native_expert_map
+    layer.expert_mask = expert_mask
+    layer.rocm_aiter_fmoe_enabled = True
+    layer.global_num_experts = 2
+    x = torch.ones(1, 2)
+    topk_weights = torch.tensor([[0.75, 0.25]])
+    topk_ids = torch.tensor([[0, 1]])
+    actual = method.apply(layer, x, topk_weights, topk_ids, None, None)
+
+    torch.testing.assert_close(actual, torch.full_like(x, 7))
+    assert call["args"][:5] == (
+        x.contiguous(),
+        layer.w13_weight,
+        layer.w2_weight,
+        topk_weights,
+        topk_ids,
+    )
+    assert call["kwargs"]["use_int4_w4a8"] is True
+    assert call["kwargs"]["per_channel_quant"] is True
+    assert call["kwargs"]["w1_scale"] is layer.w13_weight_scale
+    assert call["kwargs"]["w2_scale"] is layer.w2_weight_scale
+    assert call["kwargs"]["expert_map"] is native_expert_map
 
 
 @pytest.mark.parametrize("native", [False, True])

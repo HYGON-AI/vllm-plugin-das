@@ -470,6 +470,54 @@ def test_w4a8_contiguous_rejects_invalid_channel_scale_before_packing(
     assert pack_calls == 0
 
 
+def test_w4a8_gfx936_hipc_scales_cancel_kernel_nibble_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as module,
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_w4a8_hipc_implicit_scale_factor",
+        lambda: 16.0,
+    )
+    w1 = torch.full((2, 8, 1), 16.0)
+    w2 = torch.full((2, 4, 1), 32.0)
+
+    adjusted_w1, adjusted_w2 = module.w4a8_hipc_weight_scales(w1, w2)
+
+    torch.testing.assert_close(adjusted_w1, torch.ones_like(w1))
+    torch.testing.assert_close(adjusted_w2, torch.full_like(w2, 2.0))
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    (("gfx936:sramecc+:xnack-", 16.0), ("gfx938", 1.0)),
+)
+def test_w4a8_hipc_implicit_scale_factor_is_architecture_specific(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: str,
+    expected: float,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as module,
+    )
+
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(module.torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        module.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName=arch) if device == 3 else None,
+    )
+    module._w4a8_hipc_implicit_scale_factor.cache_clear()
+    try:
+        assert module._w4a8_hipc_implicit_scale_factor() == expected
+    finally:
+        module._w4a8_hipc_implicit_scale_factor.cache_clear()
+
+
 def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -507,6 +555,11 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     gemm_calls: list[tuple[object, object, torch.Tensor]] = []
 
     monkeypatch.setattr(module, "compute_aligned_M", lambda **_kwargs: 2)
+    monkeypatch.setattr(
+        module,
+        "w4a8_hipc_weight_scales",
+        lambda w1, w2: (w1 / 16.0, w2 / 16.0),
+    )
     monkeypatch.setattr(
         module,
         "_resize_cache",
@@ -568,8 +621,10 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     )
 
     assert len(gemm_calls) == 2
-    assert gemm_calls[0][1] == (experts._deepgemm_w13, w13_scale)
-    assert gemm_calls[1][1] == (experts._deepgemm_w2, w2_scale)
+    assert gemm_calls[0][1][0] is experts._deepgemm_w13
+    assert gemm_calls[1][1][0] is experts._deepgemm_w2
+    torch.testing.assert_close(gemm_calls[0][1][1], w13_scale / 16.0)
+    torch.testing.assert_close(gemm_calls[1][1][1], w2_scale / 16.0)
     assert gemm_calls[0][2].dtype == torch.int32
     assert gemm_calls[1][2] is gemm_calls[0][2]
     assert permute_call["expert_map"] is expert_map
@@ -753,6 +808,7 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
         _hcu_logical_k=64,
         moe_problem_size=lambda *_args: (1, 2, 128, 64, 1),
         estimate_expected_m=lambda **_kwargs: 2,
+        _hipc_weight_scales=lambda: (w13_scale / 16.0, w2_scale / 16.0),
     )
 
     output = torch.empty((1, 2, 64), dtype=torch.bfloat16)
@@ -778,8 +834,10 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
     )
 
     assert len(gemm_calls) == 2
-    assert gemm_calls[0][1] == (derived_w13, w13_scale)
-    assert gemm_calls[1][1] == (derived_w2, w2_scale)
+    assert gemm_calls[0][1][0] is derived_w13
+    assert gemm_calls[1][1][0] is derived_w2
+    torch.testing.assert_close(gemm_calls[0][1][1], w13_scale / 16.0)
+    torch.testing.assert_close(gemm_calls[1][1][1], w2_scale / 16.0)
     assert gemm_calls[0][3] is expert_num_tokens
     assert gemm_calls[1][3] is expert_num_tokens
     assert gemm_calls[0][4] == 2

@@ -3332,7 +3332,13 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
         experts.ll_experts = object.__new__(
             runtime.DeepEPDeepGemmW4A8MaskedExperts
         )
+    quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 128, 1), 16.0),
+        w2_scale=torch.full((1, 64, 1), 32.0),
+    )
+    experts.quant_config = quant_config
     for child in {experts.ht_experts, experts.ll_experts}:
+        child.quant_config = quant_config
         child._deepgemm_w13 = None
         child._deepgemm_w2 = None
     return experts
@@ -3442,6 +3448,41 @@ def test_slimquant_w4a8_auto_packs_original_storage_once_for_role(
         assert experts.ht_experts._deepgemm_w2.untyped_storage().data_ptr() == (
             experts.ll_experts._deepgemm_w2.untyped_storage().data_ptr()
         )
+
+
+def test_slimquant_w4a8_auto_postload_caches_corrected_scales_by_generation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    _install_in_place_w4a8_packers(monkeypatch)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def correct_scales(w1_scale: torch.Tensor, w2_scale: torch.Tensor):
+        calls.append((w1_scale, w2_scale))
+        return w1_scale / 16.0, w2_scale / 16.0
+
+    monkeypatch.setattr(runtime, "w4a8_hipc_weight_scales", correct_scales)
+    experts = _slimquant_w4a8_auto_experts(True)
+    layer = _slimquant_w4a8_auto_layer()
+
+    experts.process_weights_after_loading(layer)
+    first = experts.ll_experts._hipc_weight_scales()
+    second = experts.ll_experts._hipc_weight_scales()
+
+    assert len(calls) == 1
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    torch.testing.assert_close(first[0], torch.ones_like(first[0]))
+    torch.testing.assert_close(first[1], torch.full_like(first[1], 2.0))
+
+    experts.quant_config.w1_scale.add_(16.0)
+    refreshed = experts.ll_experts._hipc_weight_scales()
+    assert len(calls) == 2
+    assert refreshed[0] is not first[0]
+    torch.testing.assert_close(refreshed[0], torch.full_like(refreshed[0], 2.0))
 
 
 def test_slimquant_w4a8_auto_is_idempotent_across_state_dict_and_sleep_restore(
@@ -3802,6 +3843,67 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         "max_num_tokens": 64,
         "num_dispatchers": 8,
         "fixed_use_low_latency": None,
+    }
+
+
+def test_slimquant_w4a8_factory_builds_fixed_low_latency_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    prepare_finalize = SimpleNamespace(
+        max_tokens_per_rank=64,
+        num_dispatchers=lambda: 8,
+    )
+    monkeypatch.setattr(
+        all2all_utils,
+        "maybe_make_prepare_finalize",
+        lambda **_kwargs: prepare_finalize,
+    )
+    constructed: dict[str, object] = {}
+
+    class FixedW4A8Experts:
+        def __init__(self, **kwargs):
+            constructed.update(kwargs)
+
+    monkeypatch.setattr(module, "DeepEPAutoW4A8Experts", FixedW4A8Experts)
+    monkeypatch.setattr(
+        module.mk,
+        "FusedMoEKernel",
+        lambda prepare, experts: (prepare, experts),
+    )
+    quant_config = FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=torch.ones((2, 8, 1)),
+        w2_scale=torch.ones((2, 4, 1)),
+        per_act_token_quant=True,
+        per_out_ch_quant=False,
+        block_shape=None,
+        weight_dtype="int4",
+    )
+    moe_config = SimpleNamespace()
+
+    kernel = module.make_deepep_auto_deepgemm_w4a8_moe_kernel(
+        moe_quant_config=quant_config,
+        moe_config=moe_config,
+        routing_tables=(object(), object(), object()),
+        fixed_use_low_latency=True,
+    )
+
+    assert kernel[0] is prepare_finalize
+    assert isinstance(kernel[1], FixedW4A8Experts)
+    assert prepare_finalize._vllm_hcu_clean_low_latency_buffer is False
+    assert prepare_finalize._hcu_ll_cleaned_buffer_layout is None
+    assert constructed == {
+        "moe_config": moe_config,
+        "quant_config": quant_config,
+        "max_num_tokens": 64,
+        "num_dispatchers": 8,
+        "fixed_use_low_latency": True,
     }
 
 
