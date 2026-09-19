@@ -39,12 +39,16 @@ For DCP decode, the implementation will:
 2. Convert the shared logical sparse TopK indices into rank-local physical
    cache slots with `triton_filter_and_convert_dcp_index`, requesting a valid
    count for every query row.
-3. For `fp8_ds_mla`, gather and dequantize only those rank-local selected
+3. Use the post-weight-load attention hook to all-gather each rank's local
+   attention-sink shard once across the DCP group. The gathered sink order
+   matches the rank-ordered query-head all-gather performed by vLLM, avoiding
+   a collective in every decode layer invocation.
+4. For `fp8_ds_mla`, gather and dequantize only those rank-local selected
    slots into the compact BF16 cache already used by HY V4. For BF16 cache,
    use the local cache directly.
-4. Invoke the sink-aware HY V4 BF16 sparse FlashMLA wrapper with the local
+5. Invoke the sink-aware HY V4 BF16 sparse FlashMLA wrapper with the local
    TopK lengths and preserve both its output and LSE.
-5. Set output to zero and LSE to negative infinity for ranks whose local TopK
+6. Set output to zero and LSE to negative infinity for ranks whose local TopK
    row is empty. This gives the common vLLM DCP reduction the identity value
    it expects.
 
@@ -86,6 +90,8 @@ validation.
 Unit tests will cover:
 
 - HY V4 advertises decode LSE support.
+- DCP gathers the loaded local sink shards once in rank order and uses the
+  gathered values for the corresponding gathered query heads.
 - DCP localizes sparse indices, forwards valid lengths, preserves attention
   sinks, and returns the real kernel LSE.
 - Empty local TopK rows produce zero output and negative-infinity LSE.
