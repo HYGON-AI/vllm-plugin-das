@@ -11,7 +11,7 @@ import torch
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 
-from vllm_hcu.models.hy_v4 import hcu_sparse
+from vllm_hcu.models.hy_v4 import fp8_kv_dequant, hcu_sparse
 from vllm_hcu.models.hy_v4.attention import (
     HYV4MLAAttentionLayer,
     Indexer,
@@ -361,6 +361,116 @@ def test_tokens_per_request_includes_current_decode_token(
     )
 
     assert hcu_sparse._tokens_per_request(speculative_config) == expected
+
+
+def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def lightop_gather(
+        cache,
+        indices,
+        output,
+        valid_lengths,
+        compact_indices,
+        tokens_per_request,
+    ):
+        calls.append(
+            (
+                cache,
+                indices,
+                output,
+                valid_lengths,
+                compact_indices,
+                tokens_per_request,
+            )
+        )
+        output.fill_(2)
+        compact_indices.copy_(
+            torch.arange(indices.numel(), dtype=torch.int32).view_as(indices)
+        )
+
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_resolve_lightop_gather",
+        lambda: lightop_gather,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_gather_dequantize_fp8_ds_mla_kernel",
+        pytest.fail,
+    )
+    cache = torch.zeros((2, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor(
+        [[0, 1], [2, 3], [4, 5], [6, -1]], dtype=torch.int64
+    )
+
+    output, compact_indices = (
+        fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+            cache,
+            indices,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            tokens_per_request=4,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].dtype == torch.int32
+    assert calls[0][3].tolist() == [2, 2, 2, 2]
+    assert calls[0][5] == 4
+    assert output.shape == (8, 576)
+    assert output.eq(2).all()
+    torch.testing.assert_close(
+        compact_indices,
+        torch.arange(8, dtype=torch.int32).view(4, 2),
+    )
+
+
+def test_fp8_kv_dequant_falls_back_when_lightop_gather_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launches: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            assert grid == (4,)
+
+            def launch(*args, **kwargs):
+                launches.append((args, kwargs))
+                args[2].fill_(3)
+
+            return launch
+
+    monkeypatch.setattr(fp8_kv_dequant, "_resolve_lightop_gather", lambda: None)
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_gather_dequantize_fp8_ds_mla_kernel",
+        FakeKernel(),
+    )
+    cache = torch.zeros((1, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor([[3, -1], [7, 8]], dtype=torch.int64)
+
+    output, compact_indices = (
+        fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+            cache,
+            indices,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            tokens_per_request=4,
+        )
+    )
+
+    assert len(launches) == 1
+    assert launches[0][0][1].dtype == torch.int32
+    assert output.shape == (4, 576)
+    assert output.eq(3).all()
+    torch.testing.assert_close(
+        compact_indices,
+        torch.tensor([[0, -1], [2, 3]], dtype=torch.int32),
+    )
 
 
 def test_dcp_gathers_sink_once_after_weights_load(monkeypatch) -> None:

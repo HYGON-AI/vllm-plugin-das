@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dequantize HY V4's ``fp8_ds_mla`` KV cache to BF16 for the sparse kernel.
+"""Gather and dequantize HY V4's FP8 KV cache for the sparse kernel.
 
 The fp8 FlashMLA sparse kernel hardcodes DeepSeek's ``fp8_ds_mla`` geometry, so
 opting out of it (via ``VLLM_HCU_HYV4_FP8_KV_DEQUANT``) means the BF16 sparse
-kernel must run instead, which needs a BF16 KV cache. This module dequantizes
-only the ``topk`` slots the sparse kernel actually reads into a compact BF16
-buffer, keeping a fixed output shape so the decode path stays CUDA-graph-safe.
+kernel must run instead, which needs a BF16 KV cache. This module prefers
+LightOp's fused gather/up-convert op and retains the Triton implementation as a
+fallback when the installed LightOp does not expose that op.
 
 The ``fp8_ds_mla`` per-token layout is 656 bytes, written by
 ``concat_and_cache_ds_mla_kernel`` (csrc/hcu_cache_kernel.cu):
@@ -23,6 +23,9 @@ BF16 output row is ``[NoPE(512) || RoPE(64)]`` = 576, matching the layout the fp
 import torch
 import triton
 import triton.language as tl
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # fp8_ds_mla layout constants (see module docstring / concat_and_cache_ds_mla).
 _ROW_BYTES = 656
@@ -32,6 +35,23 @@ _TILE = 128
 _N_TILES = _NOPE_DIM // _TILE  # 4
 _SCALE_BYTE_OFF = _NOPE_DIM  # 512
 _ROPE_BYTE_OFF = _NOPE_DIM + _N_TILES * 4  # 528
+
+_LIGHTOP_GATHER = None
+_LIGHTOP_GATHER_RESOLVED = False
+
+
+def _resolve_lightop_gather():
+    """Resolve the single raw LightOp op not yet in a public category."""
+    global _LIGHTOP_GATHER, _LIGHTOP_GATHER_RESOLVED
+    if not _LIGHTOP_GATHER_RESOLVED:
+        try:
+            from lightop.op import decode_gather_and_up_convert_with_indices
+        except (AttributeError, ImportError, OSError):
+            _LIGHTOP_GATHER = None
+        else:
+            _LIGHTOP_GATHER = decode_gather_and_up_convert_with_indices
+        _LIGHTOP_GATHER_RESOLVED = True
+    return _LIGHTOP_GATHER
 
 
 @triton.jit
@@ -100,9 +120,9 @@ def gather_dequantize_fp8_ds_mla_cache(
             (``block * block_size + pos``), with -1 marking unfilled entries.
         kv_lora_rank: NoPE dim (512 for HY V4).
         qk_rope_head_dim: RoPE dim (64 for HY V4).
-        tokens_per_request: Retained for compatibility with the fused gather
-            implementation. The standalone kernel already treats every query
-            row independently.
+        tokens_per_request: Query rows contributed by each request, including
+            the current decode token. MTP3 therefore passes 4; ordinary decode
+            passes 1. LightOp uses this for request-local KV deduplication.
 
     Returns:
         ``(kv_bf16, new_indices)`` where ``kv_bf16`` is BF16
@@ -111,7 +131,6 @@ def gather_dequantize_fp8_ds_mla_cache(
         ``new_indices`` is ``(num_tokens, topk)`` addressing those rows (-1
         preserved for unfilled entries), ready for ``flash_mla_sparse_fwd``.
     """
-    del tokens_per_request
     assert kv_lora_rank == _NOPE_DIM and qk_rope_head_dim == _ROPE_DIM, (
         f"gather_dequantize_fp8_ds_mla_cache hardcodes the DeepSeek fp8_ds_mla "
         f"geometry (NoPE={_NOPE_DIM}, RoPE={_ROPE_DIM}), got "
@@ -124,15 +143,51 @@ def gather_dequantize_fp8_ds_mla_cache(
     num_tokens, topk = topk_indices.shape
     num_out = num_tokens * topk
     out_dim = kv_lora_rank + qk_rope_head_dim
-    idx_flat = topk_indices.reshape(-1).contiguous()
-    out = torch.empty((num_out, out_dim), dtype=torch.bfloat16, device=kv_cache.device)
+    idx32 = topk_indices.to(torch.int32).contiguous()
+    out = torch.empty(
+        (num_tokens, topk, out_dim),
+        dtype=torch.bfloat16,
+        device=kv_cache.device,
+    )
+    compact_indices = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=kv_cache.device
+    )
+
+    lightop_gather = _resolve_lightop_gather()
+    if lightop_gather is not None:
+        # LightOp caps validity on the topk axis at valid_lengths[q]. The
+        # indices already use -1 for invalid slots, so a full-width cap keeps
+        # that mask authoritative and matches the Triton fallback bit-for-bit.
+        valid_lengths = torch.full(
+            (num_tokens,), topk, dtype=torch.int32, device=kv_cache.device
+        )
+        lightop_gather(
+            cache_u8,
+            idx32,
+            out,
+            valid_lengths,
+            compact_indices,
+            tokens_per_request,
+        )
+        logger.info_once(
+            "Using LightOp decode_gather_and_up_convert_with_indices "
+            f"(tokens_per_request={tokens_per_request})."
+        )
+        return out.reshape(num_out, out_dim), compact_indices
+
+    logger.warning_once(
+        "LightOp decode_gather_and_up_convert_with_indices is unavailable; "
+        "using the Triton FP8 KV gather/dequant fallback."
+    )
+    idx_flat = idx32.reshape(-1)
+    out_flat = out.reshape(num_out, out_dim)
 
     _gather_dequantize_fp8_ds_mla_kernel[(num_out,)](
         cache_u8,
         idx_flat,
-        out,
+        out_flat,
         cache_u8.stride(0),
-        out.stride(0),
+        out_flat.stride(0),
         ROW_BYTES=_ROW_BYTES,
         OUT_DIM=out_dim,
         NOPE_DIM=_NOPE_DIM,
@@ -145,7 +200,9 @@ def gather_dequantize_fp8_ds_mla_cache(
 
     # Compact row ids: token t's k-th slot lives at row t*topk+k, -1 preserved.
     base = torch.arange(
-        num_out, device=kv_cache.device, dtype=topk_indices.dtype
+        num_out, device=kv_cache.device, dtype=torch.int32
     ).view(num_tokens, topk)
-    new_indices = torch.where(topk_indices >= 0, base, base.new_full((), -1))
-    return out, new_indices
+    compact_indices.copy_(
+        torch.where(idx32 >= 0, base, base.new_full((), -1))
+    )
+    return out_flat, compact_indices
