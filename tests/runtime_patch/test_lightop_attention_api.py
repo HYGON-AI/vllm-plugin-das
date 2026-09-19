@@ -435,6 +435,92 @@ def test_sparse_mask_route_pairs_plain_producer_and_consumer(
     assert calls == ["producer", "consumer"]
 
 
+def test_sparse_mask_route_reuses_identity_page_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    page_tables: list[torch.Tensor] = []
+
+    def producer(*args, **kwargs):
+        del args, kwargs
+        return torch.zeros((2, 192)), torch.zeros((2, 12), dtype=torch.int16)
+
+    def consumer(**kwargs):
+        page_tables.append(kwargs["page_table_size_1"])
+        return torch.zeros((2, 2048), dtype=torch.int32)
+
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_sparse_mask_topk_ops",
+        lambda: (producer, consumer),
+    )
+    q = torch.zeros((2, 1, 32, 128), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.zeros((3, 64, 1, 132), dtype=torch.uint8)
+    weights = torch.zeros((2, 32), dtype=torch.float32)
+    seq_lens = torch.tensor([12, 20], dtype=torch.int32)
+    block_table = torch.zeros((2, 3), dtype=torch.int32)
+
+    for _ in range(2):
+        assert runtime._lightop_mask_topk_decode(
+            q,
+            kv_cache,
+            weights,
+            seq_lens,
+            block_table,
+            2,
+            1,
+            2048,
+            192,
+            False,
+        ) is not None
+
+    assert len(page_tables) == 2
+    assert page_tables[0].data_ptr() == page_tables[1].data_ptr()
+    assert page_tables[0].is_contiguous()
+    torch.testing.assert_close(
+        page_tables[0][1], torch.arange(192, dtype=torch.int32)
+    )
+
+
+def test_sparse_mask_route_reserves_identity_table_during_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    arange_calls: list[int] = []
+    original_arange = torch.arange
+
+    def tracked_arange(*args, **kwargs):
+        if args and args[0] == 320:
+            arange_calls.append(args[0])
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", tracked_arange)
+    monkeypatch.setattr(
+        runtime,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+
+    runtime.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((3, 1), dtype=torch.float32),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((3, 32, 128), dtype=torch.float8_e4m3fn),
+        k=torch.zeros((3, 128), dtype=torch.float32),
+        weights=torch.ones((3, 32), dtype=torch.float32),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=320,
+        total_seq_lens=320,
+        topk_indices_buffer=torch.full((3, 2048), -1, dtype=torch.int32),
+        skip_k_cache_insert=True,
+    )
+
+    assert arange_calls == [320]
+
+
 def test_sparse_mask_route_uses_public_plain_producer_for_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

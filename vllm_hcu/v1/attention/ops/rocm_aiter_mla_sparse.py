@@ -34,6 +34,54 @@ logger = init_logger(__name__)
 
 lightop_attention = None
 
+_LIGHTOP_IDENTITY_PAGE_TABLES: dict[
+    tuple[str, int | None, int], torch.Tensor
+] = {}
+
+
+def _lightop_identity_page_table(
+    device: torch.device,
+    rows: int,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Return a stable, contiguous logical-token identity page table."""
+    device = torch.device(device)
+    key = (device.type, device.index, max_model_len)
+    table = _LIGHTOP_IDENTITY_PAGE_TABLES.get(key)
+    if table is None or table.shape[0] < rows:
+        table = torch.arange(
+            max_model_len, dtype=torch.int32, device=device
+        ).repeat(rows, 1)
+        _LIGHTOP_IDENTITY_PAGE_TABLES[key] = table
+    return table[:rows]
+
+
+def _reserve_lightop_identity_page_table_for_profile(
+    hidden_states: torch.Tensor,
+    q_fp8: torch.Tensor,
+    topk_tokens: int,
+    max_model_len: int,
+) -> None:
+    """Charge the persistent mask-TopK table to the memory profile run."""
+    if not (
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
+        and current_platform.is_rocm()
+        and on_gfx938()
+        and topk_tokens == 2048
+        and max_model_len > 0
+        and max_model_len % 64 == 0
+        and q_fp8.dim() == 3
+        and q_fp8.shape[1:] == (32, 128)
+        and q_fp8.dtype == torch.float8_e4m3fn
+    ):
+        return
+    _lightop_identity_page_table(
+        hidden_states.device,
+        hidden_states.shape[0],
+        max_model_len,
+    )
+
 
 def _get_lightop_attention():
     global lightop_attention
@@ -1168,9 +1216,9 @@ def _lightop_mask_topk_decode_metadata(
     expanded_block_table = block_table.repeat_interleave(next_n, dim=0)
     # The consumer uses one page-size-1 entry per logical token. It is not the
     # physical cache page table passed to the producer.
-    page_table_size_1 = torch.arange(
-        max_model_len, dtype=torch.int32, device=q.device
-    ).repeat(rows, 1)
+    page_table_size_1 = _lightop_identity_page_table(
+        q.device, rows, max_model_len
+    )
     cu_seqlens_q = torch.arange(
         rows + 1, dtype=torch.int32, device=q.device
     )
@@ -1409,6 +1457,12 @@ def rocm_aiter_sparse_attn_indexer_native(
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
+        _reserve_lightop_identity_page_table_for_profile(
+            hidden_states,
+            q_fp8,
+            topk_tokens,
+            max_model_len,
+        )
         return rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,
@@ -1469,58 +1523,106 @@ def rocm_aiter_sparse_attn_indexer_native(
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
+        max_local_total_seq_lens = max(
+            getattr(
+                chunk,
+                "max_local_total_seq_lens",
+                chunk.total_seq_lens,
+            )
+            for chunk in prefill_metadata.chunks
+        )
+        k_fp8_full = torch.empty(
+            [max_local_total_seq_lens, head_dim],
+            device=device,
+            dtype=fp8_dtype,
+        )
+        k_scale_full = torch.empty(
+            [max_local_total_seq_lens, 4],
+            device=device,
+            dtype=torch.uint8,
+        )
         for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim],
-                device=device,
-                dtype=fp8_dtype,
+            local_cu_seq_lens = getattr(chunk, "local_cu_seq_lens", None)
+            if local_cu_seq_lens is None:
+                local_cu_seq_lens = chunk.cu_seq_lens
+            local_total_seq_lens = getattr(
+                chunk, "local_total_seq_lens", chunk.total_seq_lens
             )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4],
-                device=device,
-                dtype=torch.uint8,
+            chunk_max_local_seq_lens = getattr(
+                chunk,
+                "max_local_total_seq_lens",
+                chunk.total_seq_lens,
             )
-            if v4_fp8_fallback:
-                # Fixed-size GPU gather; sequence boundaries remain device data.
-                page_size = kv_cache.shape[1]
-                pages = kv_cache.view(kv_cache.shape[0], -1)
-                offsets = torch.arange(chunk.total_seq_lens, device=kv_cache.device)
-                seq = torch.searchsorted(chunk.cu_seq_lens[1:].contiguous(), offsets, right=True)
-                # The CPU allocation length is an upper bound during async
-                # speculation. Mask before indexing the exact device tables:
-                # searchsorted returns num_reqs for the inactive tail.
-                active = offsets < chunk.cu_seq_lens[-1]
-                seq = torch.where(active, seq, 0)
-                local = torch.where(active, offsets - chunk.cu_seq_lens[seq], 0)
-                page_ids = torch.where(
-                    active, chunk.block_table[seq, local // page_size], 0
-                ).long()
-                values = pages[:, :page_size * head_dim].reshape(-1, page_size, head_dim)
-                scales = pages[:, page_size * head_dim:].reshape(-1, page_size, 4)
-                # Gather bytes before viewing FP8 for HIP indexing compatibility.
-                value_bytes = values[page_ids, local % page_size]
-                scale_bytes = scales[page_ids, local % page_size]
-                # Zero inactive output bytes as well: page 0 may contain stale
-                # data, including NaNs. Mask uint8 before interpreting FP8.
-                value_bytes.masked_fill_(~active[:, None], 0)
-                scale_bytes.masked_fill_(~active[:, None], 0)
-                k_fp8.copy_(value_bytes.contiguous().view(fp8_dtype))
-                k_scale.copy_(scale_bytes)
-            elif not current_platform.is_rocm() or on_gfx938():
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-            else:
-                cp_gather_indexer_k_bf16_cache_triton(
-                    kv_cache,
-                    k_fp8,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
+            skip_kv_gather = getattr(chunk, "skip_kv_gather", False)
+            k_fp8 = k_fp8_full[:chunk_max_local_seq_lens]
+            k_scale = k_scale_full[:chunk_max_local_seq_lens]
+            if not skip_kv_gather and local_total_seq_lens > 0:
+                if v4_fp8_fallback:
+                    local_cu_seq_lens = getattr(
+                        chunk, "local_cu_seq_lens", None
+                    )
+                    if local_cu_seq_lens is None:
+                        local_cu_seq_lens = chunk.cu_seq_lens
+                    chunk_max_local_seq_lens = getattr(
+                        chunk,
+                        "max_local_total_seq_lens",
+                        chunk.total_seq_lens,
+                    )
+                    # Fixed-size GPU gather; sequence boundaries remain device
+                    # data.
+                    page_size = kv_cache.shape[1]
+                    pages = kv_cache.view(kv_cache.shape[0], -1)
+                    offsets = torch.arange(
+                        chunk_max_local_seq_lens, device=kv_cache.device
+                    )
+                    seq = torch.searchsorted(
+                        local_cu_seq_lens[1:].contiguous(),
+                        offsets,
+                        right=True,
+                    )
+                    # The CPU allocation length is an upper bound during async
+                    # speculation. Mask before indexing the exact device tables:
+                    # searchsorted returns num_reqs for the inactive tail.
+                    active = offsets < local_cu_seq_lens[-1]
+                    seq = torch.where(active, seq, 0)
+                    local = torch.where(
+                        active, offsets - local_cu_seq_lens[seq], 0
+                    )
+                    page_ids = torch.where(
+                        active, chunk.block_table[seq, local // page_size], 0
+                    ).long()
+                    values = pages[:, : page_size * head_dim].reshape(
+                        -1, page_size, head_dim
+                    )
+                    scales = pages[:, page_size * head_dim :].reshape(
+                        -1, page_size, 4
+                    )
+                    # Gather bytes before viewing FP8 for HIP indexing
+                    # compatibility.
+                    value_bytes = values[page_ids, local % page_size]
+                    scale_bytes = scales[page_ids, local % page_size]
+                    # Zero inactive output bytes as well: page 0 may contain
+                    # stale data, including NaNs. Mask uint8 before interpreting
+                    # FP8.
+                    value_bytes.masked_fill_(~active[:, None], 0)
+                    scale_bytes.masked_fill_(~active[:, None], 0)
+                    k_fp8.copy_(value_bytes.contiguous().view(fp8_dtype))
+                    k_scale.copy_(scale_bytes)
+                elif not current_platform.is_rocm() or on_gfx938():
+                    ops.cp_gather_indexer_k_quant_cache(
+                        kv_cache,
+                        k_fp8,
+                        k_scale,
+                        chunk.block_table,
+                        local_cu_seq_lens,
+                    )
+                else:
+                    cp_gather_indexer_k_bf16_cache_triton(
+                        kv_cache,
+                        k_fp8,
+                        chunk.block_table,
+                        local_cu_seq_lens,
+                    )
                 # cp_gather_indexer_k_quant_cache_triton(
                 #     kv_cache,
                 #     k_fp8,
@@ -1530,34 +1632,45 @@ def rocm_aiter_sparse_attn_indexer_native(
                 #     token_to_seq=chunk.token_to_seq,
                 # )
 
-            logits_fn = fp8_mqa_logits_torch if v4_fp8_fallback else rocm_fp8_mqa_logits
-            logits = logits_fn(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            if _use_lightop_sparse_mla_topk():
-                _lightop_topk_indices_prefill(
-                    logits,
+            q_slice = q_fp8[chunk.token_start : chunk.token_end]
+            if local_total_seq_lens == 0:
+                logits = q_slice.new_empty(
+                    (q_slice.shape[0], 0), dtype=torch.float32
+                )
+                topk_indices.fill_(-1)
+            else:
+                logits_fn = (
+                    fp8_mqa_logits_torch
+                    if v4_fp8_fallback
+                    else rocm_fp8_mqa_logits
+                )
+                logits = logits_fn(
+                    q_slice,
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_indices,
-                    topk_tokens,
                 )
-            else:
-                topk_indices.copy_(
-                    _topk_indices_torch(
+                if _use_lightop_sparse_mla_topk():
+                    _lightop_topk_indices_prefill(
                         logits,
-                        topk_tokens,
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
                     )
-                )
+                else:
+                    topk_indices.copy_(
+                        _topk_indices_torch(
+                            logits,
+                            topk_tokens,
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                        )
+                    )
 
             if dcp_world_size > 1:
                 from vllm_hcu.model_executor.layers.sparse_attn_indexer import (

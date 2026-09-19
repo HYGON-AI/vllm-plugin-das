@@ -2392,6 +2392,250 @@ def test_hcu_dcp_topk_merge_selects_global_candidates(monkeypatch):
     torch.testing.assert_close(indices, torch.tensor([[3, 2]], dtype=torch.int32))
 
 
+def test_hcu_dcp_topk_merge_accepts_empty_local_logits(monkeypatch):
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+    local_packed = []
+
+    class _Group:
+        def all_gather(self, packed, dim):
+            assert dim == 1
+            local_packed.append(packed.clone())
+            remote = torch.tensor([[[5.0, 1.0], [3.0, 3.0]]])
+            return torch.cat((packed, remote), dim=1)
+
+    monkeypatch.setattr(indexer, "current_platform", _Platform)
+    monkeypatch.setattr(indexer, "get_dcp_group", lambda: _Group())
+    indices = torch.full((1, 2), -1, dtype=torch.int32)
+    indexer._merge_dcp_topk_global(
+        logits=torch.empty((1, 0), dtype=torch.float32),
+        topk_indices=indices,
+        topk_tokens=2,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert torch.isneginf(local_packed[0][..., 0]).all()
+    torch.testing.assert_close(
+        local_packed[0][..., 1], torch.full((1, 2), -1.0)
+    )
+    torch.testing.assert_close(indices, torch.tensor([[1, 3]], dtype=torch.int32))
+
+
+def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    chunk = SimpleNamespace(
+        total_seq_lens=12,
+        local_total_seq_lens=6,
+        max_local_total_seq_lens=7,
+        skip_kv_gather=False,
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 6, 12], dtype=torch.int32),
+        local_cu_seq_lens=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0, 3], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([3, 6], dtype=torch.int32),
+        token_start=0,
+        token_end=2,
+    )
+    reused_chunk = SimpleNamespace(
+        **{
+            **vars(chunk),
+            "skip_kv_gather": True,
+            "token_start": 2,
+            "token_end": 4,
+        }
+    )
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+                    num_kv_actual_tokens=4,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=4,
+                    prefill=SimpleNamespace(chunks=[chunk, reused_chunk]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    gather_calls: list[tuple[tuple[int, ...], torch.Tensor]] = []
+
+    def gather(cache, k_fp8, k_scale, block_table, cu_seq_lens):
+        del cache, k_scale, block_table
+        gather_calls.append((tuple(k_fp8.shape), cu_seq_lens))
+
+    from vllm import _custom_ops as ops
+
+    monkeypatch.setattr(ops, "cp_gather_indexer_k_quant_cache", gather)
+
+    gathered_k_ptrs: list[int] = []
+
+    def logits(q, kv, weights, row_starts, row_ends):
+        del q, weights, row_starts, row_ends
+        assert kv[0].shape == (7, 128)
+        gathered_k_ptrs.append(kv[0].data_ptr())
+        return torch.zeros((2, 6), dtype=torch.float32)
+
+    monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", logits)
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "_topk_indices_torch",
+        lambda *args, **kwargs: torch.zeros((2, 1), dtype=torch.int32),
+    )
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+    monkeypatch.setattr(indexer, "_merge_dcp_topk_global", lambda *a, **k: None)
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((4, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((4, 32, 128)),
+        k=torch.zeros((4, 128)),
+        weights=torch.ones((4, 32)),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=128,
+        max_model_len=64,
+        total_seq_lens=12,
+        topk_indices_buffer=torch.full((4, 1), -1, dtype=torch.int32),
+        skip_k_cache_insert=True,
+        dcp_rank=0,
+        dcp_world_size=2,
+    )
+
+    assert len(gather_calls) == 1
+    assert gather_calls[0][0] == (7, 128)
+    torch.testing.assert_close(gather_calls[0][1], chunk.local_cu_seq_lens)
+    assert len(gathered_k_ptrs) == 2
+    assert gathered_k_ptrs[0] == gathered_k_ptrs[1]
+
+
+def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(monkeypatch):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    chunk = SimpleNamespace(
+        total_seq_lens=4,
+        local_total_seq_lens=0,
+        max_local_total_seq_lens=4,
+        skip_kv_gather=False,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 4], dtype=torch.int32),
+        local_cu_seq_lens=torch.tensor([0, 0], dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([0], dtype=torch.int32),
+        token_start=0,
+        token_end=1,
+    )
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[chunk]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    from vllm import _custom_ops as ops
+
+    monkeypatch.setattr(
+        ops,
+        "cp_gather_indexer_k_quant_cache",
+        lambda *args, **kwargs: pytest.fail("empty rank gathered KV"),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "rocm_fp8_mqa_logits",
+        lambda *args, **kwargs: pytest.fail("empty rank computed logits"),
+    )
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    merged: list[tuple[torch.Tensor, torch.Tensor]] = []
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+    monkeypatch.setattr(
+        indexer,
+        "_merge_dcp_topk_global",
+        lambda logits, indices, *args, **kwargs: merged.append(
+            (logits, indices.clone())
+        ),
+    )
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 32, 128)),
+        k=torch.zeros((1, 128)),
+        weights=torch.ones((1, 32)),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=128,
+        max_model_len=64,
+        total_seq_lens=4,
+        topk_indices_buffer=torch.full((1, 1), 7, dtype=torch.int32),
+        skip_k_cache_insert=True,
+        dcp_rank=1,
+        dcp_world_size=2,
+    )
+
+    assert len(merged) == 1
+    assert merged[0][0].shape == (1, 0)
+    assert merged[0][1].item() == -1
+    assert result.item() == -1
+
+
 def test_hcu_sparse_indexer_merges_dcp_decode_candidates(monkeypatch):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 

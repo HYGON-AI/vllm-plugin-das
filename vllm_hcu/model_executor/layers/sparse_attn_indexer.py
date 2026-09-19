@@ -104,12 +104,15 @@ def _merge_dcp_topk_global(
     if current_platform.is_rocm():
         valid = topk_indices >= 0
         safe_local = topk_indices.clamp_min(0).to(torch.long)
-        score_columns = safe_local
-        if row_starts is not None:
-            score_columns = score_columns + row_starts.to(torch.long).view(-1, 1)
-        score_columns.clamp_max_(max(logits.shape[1] - 1, 0))
-        scores = torch.gather(logits, 1, score_columns)
-        scores.masked_fill_(~valid, float("-inf"))
+        if logits.shape[1] == 0:
+            scores = logits.new_full(topk_indices.shape, float("-inf"))
+        else:
+            score_columns = safe_local
+            if row_starts is not None:
+                score_columns = score_columns + row_starts.to(torch.long).view(-1, 1)
+            score_columns.clamp_max_(logits.shape[1] - 1)
+            scores = torch.gather(logits, 1, score_columns)
+            scores.masked_fill_(~valid, float("-inf"))
         global_ids = (
             (safe_local // cp_interleave)
             * (dcp_world_size * cp_interleave)
