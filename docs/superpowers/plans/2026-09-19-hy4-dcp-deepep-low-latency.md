@@ -14,6 +14,8 @@
 
 - Work on `feat/hy4-lightop-mask-topk-adapt` and stack commits on its existing remote MR.
 - Do not add or use the rejected direct Aiter paged-MQA optimization.
+- Use only categorized public LightOp APIs. Keep FP8 KV gather/dequantization
+  on the standalone Triton path until LightOp publishes the required gather.
 - Preserve the existing DCP-size-one HY V4 path and public return shapes.
 - Keep feature-off terminal callbacks eligible to remain armed.
 - Full runtime validation after warmup must fail closed for enabled callbacks that are armed, skipped, or failed.
@@ -171,7 +173,7 @@ git commit -m "fix: validate DeepEP runtime patches after warmup"
 - Test: `tests/models/hy_v4/test_attention.py`
 
 **Interfaces:**
-- Consumes: `get_dcp_group().all_gather(tensor, dim=0)`, `triton_filter_and_convert_dcp_index(..., return_valid_counts=True)`, `gather_dequantize_fp8_ds_mla_cache(...)`, and `flash_mla_sparse_fwd(...) -> (output, auxiliary, lse)`.
+- Consumes: `get_dcp_group().all_gather(tensor, dim=0)`, `triton_filter_and_convert_dcp_index(..., return_valid_counts=True)`, the standalone Triton `gather_dequantize_fp8_ds_mla_cache(...)`, and `flash_mla_sparse_fwd(...) -> (output, auxiliary, lse)`.
 - Produces: `HYV4MLAAttentionLayer.process_weights_after_loading(act_dtype: torch.dtype) -> None` forwards to the backend after MLA projection preparation; `HYV4FlashMLASparseImpl.can_return_lse_for_decode = True`; `_dcp_sinks: torch.Tensor | None`; backend `process_weights_after_loading(act_dtype: torch.dtype) -> None`; `_bf16_flash_mla_kernel_with_lse(...) -> tuple[torch.Tensor, torch.Tensor]`; and `forward_mqa(...) -> tuple[torch.Tensor, torch.Tensor | None]`.
 
 - [x] **Step 1: Write failing sink-gather and DCP capability tests**
@@ -384,6 +386,15 @@ git status --short
 ```
 
 Expected: compilation and whitespace checks succeed; only known local validation artifacts remain untracked.
+
+- [x] **Step 4: Run the portable repository contract suite**
+
+```bash
+python3.10 tools/run_patch_tests.py --suite contract -- \
+  -o cache_dir=/tmp/hcu-ci-pytest-cache-mr126
+```
+
+Expected and observed: 2386 passed, 181 deselected.
 
 ### Task 4: Validate TP8 DCP2 EP8 DeepEP Low-Latency on Hardware
 

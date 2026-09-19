@@ -85,8 +85,10 @@ For DCP decode, the implementation will:
    adjustment makes the later cross-rank LSE reduction count the sink exactly
    once instead of once per rank.
 4. For `fp8_ds_mla`, gather and dequantize only those rank-local selected
-   slots into the compact BF16 cache already used by HY V4. For BF16 cache,
-   use the local cache directly.
+   slots into the compact BF16 cache already used by HY V4. The final path
+   uses the repository's standalone Triton kernel because the installed
+   LightOp package does not publish this gather through a categorized public
+   API. For BF16 cache, use the local cache directly.
 5. Invoke the sink-aware HY V4 BF16 sparse FlashMLA wrapper with the local
    TopK lengths and preserve its output and raw LSE. When a sink is active,
    compute `logaddexp(raw_lse, normalized_sink)` so the LSE describes the same
@@ -171,19 +173,27 @@ current TP8 baseline. The acceptance target is 8/8 correct and Pass@1 100%.
 Focused runtime and model tests, Python compilation, and diff whitespace
 checks must also pass before committing and pushing the branch.
 
+The repository's contract suite also enforces the categorized LightOp API.
+Sparse mask TopK therefore imports its producer and consumer only from
+`lightop.attention`; the obsolete `lightop.op` and `lightop.gemmopt`
+namespaces are not used.
+
 ## Validation Result
 
 The exact TP8/DCP2/EP8 configuration started with
 `DeepEPLLAll2AllManager`, completed a deterministic multi-token decode, and
-shut down cleanly. EvalScope executed `HumanEval/0` through `HumanEval/7` with
-8/8 successful requests, Accuracy 100%, and Pass@1 100%. The observed mean
-latency was 38.118 seconds and average output throughput was 3.5 tokens/s for
-this eight-sample correctness run; these figures are observational and are not
-an A/B performance comparison.
+shut down cleanly. The final Triton-gather implementation passed the complete
+portable contract suite (2386 passed, 181 deselected). EvalScope executed
+`HumanEval/0` through `HumanEval/7` with 8/8 successful requests, Accuracy
+100%, and Pass@1 100%. The final run observed mean latency of 13.571 seconds
+and average output throughput of 9.67 tokens/s for this eight-sample
+correctness run; these figures are observational and are not an A/B
+performance comparison.
 
 ## Delivery
 
 The implementation and tests will be committed on
-`feat/hy4-lightop-mask-topk-adapt` and pushed to its existing remote MR. Only
-the DCP/LSE and DeepEP lifecycle fixes are added; no direct Aiter paged-MQA
-operator or cache-layout conversion is included.
+`feat/hy4-lightop-mask-topk-adapt` and pushed to its existing remote MR. The
+delivery includes the DCP indexer/LSE fixes, DeepEP lifecycle fixes, and the
+public LightOp API migration required by the current target branch. No direct
+Aiter paged-MQA operator or cache-layout conversion is included.
