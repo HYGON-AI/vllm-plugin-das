@@ -5,11 +5,12 @@
 """Attention layer with FlashAttention."""
 
 import copy
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
+
+from vllm_hcu.v1.attention.backends.flash_attn_metadata import FlashAttentionMetadata
 
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
@@ -326,48 +327,6 @@ class HcuFlashAttentionBackend(AttentionBackend):
                 "supported by the complete HCU FlashAttention runtime"
             )
         return None
-
-
-@dataclass
-class FlashAttentionMetadata:
-    # NOTE(sang): Definition of context_len, query_len, and seq_len.
-    # |---------- N-1 iteration --------|
-    # |---------------- N iteration ---------------------|
-    # |- tokenA -|......................|-- newTokens ---|
-    # |---------- context_len ----------|
-    # |-------------------- seq_len ---------------------|
-    #                                   |-- query_len ---|
-
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    max_query_len: int
-    query_start_loc: torch.Tensor
-    max_seq_len: int
-    seq_lens: torch.Tensor
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
-
-    # For cascade attention.
-    use_cascade: bool
-    common_prefix_len: int
-    cu_prefix_query_lens: torch.Tensor | None
-    prefix_kv_lens: torch.Tensor | None
-    suffix_kv_lens: torch.Tensor | None
-
-    # For GQA DCP
-    max_dcp_context_kv_len: int | None = None
-    dcp_context_kv_lens: torch.Tensor | None = None
-
-    # Populated per step for a GQA PCP+DCP prefill.
-    pcp_plan: "PCPPlan | None" = None
-
-    # Optional aot scheduling
-    scheduler_metadata: torch.Tensor | None = None
-    prefix_scheduler_metadata: torch.Tensor | None = None
-    max_num_splits: int = 0
-
-    causal: bool | torch.Tensor = True
-
-    sliding_window: tuple[int, int] | None = None
 
 
 def _get_sliding_window_configs(

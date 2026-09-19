@@ -12,6 +12,19 @@ def register_model():
     register_hy_v4_config()
 
     ModelRegistry.register_model(
+        "KimiK3ForConditionalGeneration",
+        "vllm_hcu.models.kimi_k3:KimiK3ForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
+        "KimiK3MTPModel",
+        "vllm_hcu.models.kimi_k3:KimiK3MTP",
+    )
+    ModelRegistry.register_model(
+        "KimiLinearForCausalLM",
+        "vllm_hcu.models.kimi_k3:KimiLinearForCausalLM",
+    )
+
+    ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
 

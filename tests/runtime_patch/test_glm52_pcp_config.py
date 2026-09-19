@@ -111,7 +111,12 @@ def test_hyv4_pp2_pcp4_exact_target_only_topology_is_allowed(
 
 
 def _native_hyv4_mtp_config(make_config, **overrides):
-    config = make_config(speculative=True, num_speculative_tokens=3, **overrides)
+    values = {
+        "speculative": True,
+        "num_speculative_tokens": 3,
+    }
+    values.update(overrides)
+    config = make_config(**values)
     config.model_config.hf_config = SimpleNamespace(num_nextn_predict_layers=1)
     config.model_config.model = "native-hyv4"
     config.speculative_config.draft_model_config = SimpleNamespace(
@@ -125,11 +130,32 @@ def _native_hyv4_mtp_config(make_config, **overrides):
     return config
 
 
-def test_hyv4_exact_pp2_pcp4_native_mtp3_is_allowed(make_hyv4_pp2_pcp4_config):
-    config = _native_hyv4_mtp_config(make_hyv4_pp2_pcp4_config)
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4, 8])
+def test_hyv4_pp2_pcp4_native_mtp_accepts_any_token_depth(
+    make_hyv4_pp2_pcp4_config, num_speculative_tokens,
+):
+    config = _native_hyv4_mtp_config(
+        make_hyv4_pp2_pcp4_config,
+        num_speculative_tokens=num_speculative_tokens,
+    )
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
     assert config.model_config.architectures == ["HYV4ForCausalLM"]
     assert config.speculative_config.draft_model_config.architectures == ["HYV4MTPModel"]
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4, 8])
+def test_hyv4_pp1_native_mtp_accepts_any_token_depth(
+    make_pcp_config, num_speculative_tokens,
+):
+    config = _native_hyv4_mtp_config(
+        make_pcp_config,
+        architecture="HYV4ForCausalLM",
+        pp=1,
+        tp=1,
+        pcp=8,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
 def test_hyv4_mtp3_revalidation_accepts_current_sparse_cache_canonicalization(
@@ -147,7 +173,7 @@ def test_hyv4_mtp3_revalidation_accepts_current_sparse_cache_canonicalization(
 
 
 @pytest.mark.parametrize("override", [
-    {"pp": 1}, {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 8},
+    {"pp": 3}, {"tp": 2}, {"pcp": 2}, {"pcp": 8},
     {"dp": 2}, {"dcp": 2}, {"enable_expert_parallel": False},
     {"enforce_eager": False}, {"use_v2": False}, {"lora": True},
     {"multimodal": True}, {"kv_offload": True}, {"kv_transfer": True},
@@ -161,9 +187,6 @@ def test_hyv4_mtp3_neighbors_stay_closed(make_hyv4_pp2_pcp4_config, override):
 
 
 @pytest.mark.parametrize("path,value", [
-    ("speculative_config.num_speculative_tokens", 1),
-    ("speculative_config.num_speculative_tokens", 2),
-    ("speculative_config.num_speculative_tokens", 4),
     ("speculative_config.draft_model_config.architectures", ["UnknownDraft"]),
     ("speculative_config.draft_model_config.model", "separate-checkpoint"),
     ("speculative_config.draft_model_config.hf_config.n_predict", 2),
@@ -498,11 +521,11 @@ def test_gqa_pcp_allows_piecewise_graph_execution(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
-@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
-def test_glm52_pcp_allows_validated_builtin_mtp_depths(
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4, 8])
+def test_glm52_pcp_allows_builtin_mtp_token_depths(
     make_pcp_config, num_speculative_tokens: int
 ) -> None:
-    """Rejecting either validated draft depth breaks PCP+MTP service startup."""
+    """GLM-5.2 PCP keeps built-in MTP while allowing any draft depth."""
 
     config = make_pcp_config(
         pcp=2,
@@ -560,10 +583,6 @@ def test_gqa_pcp_rejects_hybrid_kv_cache_groups(make_pcp_config) -> None:
             {"speculative": True, "speculative_method": "eagle"},
             "only supports built-in MTP",
         ),
-        (
-            {"speculative": True, "num_speculative_tokens": 3},
-            "one or two speculative tokens",
-        ),
         ({"enforce_eager": False}, "eager"),
         ({"lora": True}, "LoRA"),
         ({"multimodal": True}, "multimodal"),
@@ -599,6 +618,9 @@ def _make_vllm_module() -> ModuleType:
                 raise AssertionError("legacy GQA DCP head constraint")
 
     class VllmConfig:
+        def __post_init__(self) -> None:
+            return None
+
         def with_hf_config(self, hf_config: object, architectures=None):
             del hf_config, architectures
             return self
@@ -724,8 +746,8 @@ def test_model_arch_config_signature_drift_names_exact_target() -> None:
     with pytest.raises(PatchCompatibilityError) as error:
         patch_vllm_config.apply_to_module(module)
 
-    assert patch_vllm_config.TARGETS[4] in str(error.value)
-    assert patch_vllm_config.TARGETS[2] not in str(error.value)
+    assert "vllm.config.model.ModelConfig.get_model_arch_config" in str(error.value)
+    assert "VllmConfig._get_v2_model_runner_unsupported_features" not in str(error.value)
 
 
 class _LifecycleCompilationConfig:

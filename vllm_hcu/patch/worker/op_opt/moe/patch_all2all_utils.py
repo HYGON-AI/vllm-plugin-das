@@ -61,6 +61,9 @@ def apply_to_module(module: ModuleType) -> bool:
         use_monolithic=False,
         eep_stage=False,
     ):
+        if getattr(moe.moe_parallel_config, "use_deepep_ll_kernels", False):
+            manager = target.get_ep_all2all_manager(eep_stage)
+            manager._vllm_hcu_ll_num_topk = int(moe.experts_per_token)
         if getattr(
             moe.moe_parallel_config, "use_deepep_auto_kernels", False
         ):

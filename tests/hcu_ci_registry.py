@@ -181,6 +181,12 @@ register_hcu_ci(
 )
 
 register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_flashmla_decode_align_triton_mla.py",
+    est_time=180,
+)
+
+register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/patch/test_base_linear_parameter.py",
     est_time=180,

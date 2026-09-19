@@ -92,6 +92,19 @@ def collect_diagnostics(*, arm_platform: bool = True) -> list[Diagnostic]:
             compatibility.detail(),
         )
     )
+    try:
+        from vllm_hcu.models.kimi_k3 import __all__ as kimi_exports
+
+        kimi_ok = {
+            "KimiK3ForConditionalGeneration",
+            "KimiK3MTP",
+            "KimiLinearForCausalLM",
+        }.issubset(set(kimi_exports))
+        kimi_detail = ",".join(sorted(kimi_exports))
+    except Exception as exc:
+        kimi_ok = False
+        kimi_detail = f"{type(exc).__name__}: {exc}"
+    checks.append(Diagnostic("kimi_k3_plugin_surface", kimi_ok, kimi_detail))
     if vllm_root is not None:
         checks.extend(_source_integrity_checks(vllm_root))
 

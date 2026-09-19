@@ -192,6 +192,20 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
     def finalize_weight_and_reduce_impl(self):
         return TopKWeightAndReduceNoOP()
 
+    def _validate_activation(self, activation):
+        if activation != MoEActivation.SILU:
+            raise NotImplementedError(
+                "SlimQuant W4A8 DeepGEMM supports only SiLU activation"
+            )
+
+    def _quantize_activation(self, gateup_output, quant_output, m_indices):
+        return fuse_silu_mul_quant(
+            gateup_output, output=quant_output, expert_ids=m_indices,
+        )
+
+    def _permute_scale_kwargs(self, hidden_size):
+        return {}
+
     def workspace_shapes(
         self,
         M: int,
@@ -239,10 +253,7 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         del global_num_experts, a2_scale, apply_router_weight_on_input
         if hidden_states.size(0) == 0:
             return
-        if activation != MoEActivation.SILU:
-            raise NotImplementedError(
-                "SlimQuant W4A8 DeepGEMM supports only SiLU activation"
-            )
+        self._validate_activation(activation)
         if a1q_scale is None:
             raise RuntimeError(
                 "SlimQuant W4A8 DeepGEMM requires per-token activation scales"
@@ -276,6 +287,7 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
                 expert_map=expert_map,
                 expert_tokens_meta=expert_tokens_meta,
                 aq_out=input_workspace,
+                **self._permute_scale_kwargs(K),
             )
         )
         m_indices = m_indices.to(dtype=torch.int32).contiguous()
@@ -292,10 +304,8 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
             workspace13.view(dtype=torch.int8),
             (m_aligned, activation_out_dim),
         )
-        q_activation, q_activation_scale = fuse_silu_mul_quant(
-            gateup_output,
-            output=quant_output,
-            expert_ids=m_indices,
+        q_activation, q_activation_scale = self._quantize_activation(
+            gateup_output, quant_output, m_indices,
         )
         down_output = _resize_cache(workspace2, (m_aligned, K))
         m_grouped_w4a8_gemm_nt_contiguous_hipc(
