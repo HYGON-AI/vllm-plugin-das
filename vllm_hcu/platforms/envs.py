@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_PD_SPLIT: bool = False
+    VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH: bool = False
+    VLLM_HCU_1D_MROPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
@@ -414,6 +416,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_PD_SPLIT":
         lambda: (os.environ.get("VLLM_HCU_USE_PD_SPLIT", "False").lower() in
                  ("true", "1")),
+
+    # Guarded steady decode scheduling; opt-in on a supported async scheduler.
+    "VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH":
+        lambda: _environment_flag(os.environ.get("VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH", "0")),
+    # Opt-in token-major M-RoPE storage; also gated by USE_CUSTOM_OPS.
+    "VLLM_HCU_1D_MROPE":
+        lambda: _environment_flag(os.environ.get("VLLM_HCU_1D_MROPE", "0")),
 
     # If use custom AITER_W4A16_MOE impl, please set True
     "VLLM_HCU_USE_AITER_W4A16_MOE":
