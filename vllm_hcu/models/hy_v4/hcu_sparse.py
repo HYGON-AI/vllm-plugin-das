@@ -369,6 +369,15 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         output = output[:, :query_heads, :]
         lse = lse[:, :query_heads]
+        if attn_sink is not None:
+            # FlashMLA applies the sink denominator to `output` but documents
+            # that its returned LSE excludes the sink. DCP correction needs
+            # the denominator that produced `output`, so fold the same sink
+            # logit into LSE before the cross-rank log-sum-exp reduction.
+            lse = torch.logaddexp(
+                lse,
+                attn_sink[:query_heads].view(1, query_heads),
+            )
         return output, lse
 
     def forward_mqa(

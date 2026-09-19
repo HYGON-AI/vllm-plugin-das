@@ -458,9 +458,15 @@ def test_bf16_dcp_kernel_preserves_and_slices_lse(monkeypatch) -> None:
     assert output.shape == (2, 8, 3)
     assert lse.shape == (2, 8)
     assert captured["attn_sink"] is not None
+    raw_lse = torch.arange(2 * 64, dtype=torch.float32).view(2, 64)[:, :8]
+    normalized_sink = impl._dcp_sinks - math.log(2)
+    torch.testing.assert_close(
+        lse,
+        torch.logaddexp(raw_lse, normalized_sink.view(1, -1)),
+    )
     torch.testing.assert_close(
         captured["attn_sink"][:8],
-        impl._dcp_sinks - math.log(2),
+        normalized_sink,
     )
 
 
