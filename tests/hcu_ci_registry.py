@@ -57,6 +57,12 @@ register_hcu_ci(
 
 register_hcu_ci(
     job="hy4-contract",
+    target="tests/models/hy_v4/test_dcp_q_replicate.py",
+    est_time=30,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
     target="tests/models/hy_v4/test_custom_w4a8.py",
     est_time=60,
 )
