@@ -20,6 +20,8 @@ BF16 output row is ``[NoPE(512) || RoPE(64)]`` = 576, matching the layout the fp
 *prefill* path produces and what ``flash_mla_sparse_fwd`` consumes (``d_v=512``).
 """
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
@@ -38,6 +40,28 @@ _ROPE_BYTE_OFF = _NOPE_DIM + _N_TILES * 4  # 528
 
 _LIGHTOP_GATHER = None
 _LIGHTOP_GATHER_RESOLVED = False
+
+
+@dataclass
+class LightOpKVReuseState:
+    """Compact-index mapping reused within HY V4 IndexShare groups."""
+
+    compact_indices: torch.Tensor
+    dedup_key: tuple[int, int, int] | None = None
+    supports_mapping_reuse: bool | None = None
+
+    @classmethod
+    def from_topk_buffer(
+        cls,
+        topk_indices_buffer: torch.Tensor,
+    ) -> "LightOpKVReuseState":
+        if topk_indices_buffer.dtype != torch.int32 or topk_indices_buffer.ndim != 2:
+            raise ValueError(
+                "HY V4 TopK indices must be a two-dimensional int32 tensor; "
+                f"got {tuple(topk_indices_buffer.shape)}, "
+                f"{topk_indices_buffer.dtype}."
+            )
+        return cls(compact_indices=torch.empty_like(topk_indices_buffer))
 
 
 def _resolve_lightop_gather():
@@ -105,6 +129,9 @@ def gather_dequantize_fp8_ds_mla_cache(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     tokens_per_request: int = 1,
+    reuse_state: LightOpKVReuseState | None = None,
+    allow_mapping_reuse: bool = False,
+    mapping_reuse_group_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dequantize only the topk-selected ``fp8_ds_mla`` slots to a compact BF16.
 
@@ -123,6 +150,13 @@ def gather_dequantize_fp8_ds_mla_cache(
         tokens_per_request: Query rows contributed by each request, including
             the current decode token. MTP3 therefore passes 4; ordinary decode
             passes 1. LightOp uses this for request-local KV deduplication.
+        reuse_state: Shared compact-index storage for an IndexShare group.
+        allow_mapping_reuse: Reuse ``reuse_state``'s mapping when its runtime
+            shape matches. Full indexer producers pass false; following shared
+            layers pass true.
+        mapping_reuse_group_size: Target-verify width eligible for mapping
+            reuse. Ordinary gathers and DCP pass 1, which also clears any
+            mapping left by a previous target-verify group.
 
     Returns:
         ``(kv_bf16, new_indices)`` where ``kv_bf16`` is BF16
@@ -149,9 +183,26 @@ def gather_dequantize_fp8_ds_mla_cache(
         dtype=torch.bfloat16,
         device=kv_cache.device,
     )
-    compact_indices = torch.empty(
-        (num_tokens, topk), dtype=torch.int32, device=kv_cache.device
-    )
+    if reuse_state is None:
+        compact_indices = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=kv_cache.device
+        )
+    else:
+        shared_indices = reuse_state.compact_indices
+        if (
+            shared_indices.dtype != torch.int32
+            or shared_indices.device != kv_cache.device
+            or shared_indices.ndim != 2
+            or shared_indices.shape[0] < num_tokens
+            or shared_indices.shape[1] != topk
+        ):
+            raise ValueError(
+                "LightOp KV reuse buffer must be int32 on the KV-cache device "
+                f"with shape at least ({num_tokens}, {topk}); got "
+                f"{tuple(shared_indices.shape)}, {shared_indices.dtype}, "
+                f"{shared_indices.device}."
+            )
+        compact_indices = shared_indices[:num_tokens]
 
     lightop_gather = _resolve_lightop_gather()
     if lightop_gather is not None:
@@ -161,7 +212,19 @@ def gather_dequantize_fp8_ds_mla_cache(
         valid_lengths = torch.full(
             (num_tokens,), topk, dtype=torch.int32, device=kv_cache.device
         )
-        lightop_gather(
+        dedup_key = (num_tokens, cache_u8.numel(), tokens_per_request)
+        reuse_eligible = bool(
+            reuse_state is not None
+            and mapping_reuse_group_size > 1
+            and tokens_per_request == mapping_reuse_group_size
+            and reuse_state.supports_mapping_reuse is not False
+        )
+        reuse_compact_indices = bool(
+            reuse_eligible
+            and allow_mapping_reuse
+            and reuse_state.dedup_key == dedup_key
+        )
+        lightop_args = (
             cache_u8,
             idx32,
             out,
@@ -169,12 +232,45 @@ def gather_dequantize_fp8_ds_mla_cache(
             compact_indices,
             tokens_per_request,
         )
+        if not reuse_compact_indices:
+            lightop_gather(*lightop_args)
+        else:
+            try:
+                lightop_gather(
+                    *lightop_args,
+                    reuse_compact_indices=True,
+                )
+            except TypeError:
+                # Older LightOp builds expose only the six positional
+                # arguments. Rebuild the mapping for this layer and remember
+                # the ABI result so later layers keep using the compatible
+                # call shape.
+                assert reuse_state is not None
+                reuse_state.supports_mapping_reuse = False
+                lightop_gather(*lightop_args)
+                reuse_compact_indices = False
+                logger.warning_once(
+                    "Installed LightOp does not support compact-index mapping "
+                    "reuse; using the compatible gather path."
+                )
+        if reuse_state is not None:
+            if reuse_compact_indices:
+                reuse_state.supports_mapping_reuse = True
+            reuse_state.dedup_key = (
+                dedup_key
+                if reuse_eligible
+                and reuse_state.supports_mapping_reuse is not False
+                else None
+            )
         logger.info_once(
             "Using LightOp decode_gather_and_up_convert_with_indices "
-            f"(tokens_per_request={tokens_per_request})."
+            f"(tokens_per_request={tokens_per_request}, "
+            f"reuse_compact_indices={reuse_compact_indices})."
         )
         return out.reshape(num_out, out_dim), compact_indices
 
+    if reuse_state is not None:
+        reuse_state.dedup_key = None
     logger.warning_once(
         "LightOp decode_gather_and_up_convert_with_indices is unavailable; "
         "using the Triton FP8 KV gather/dequant fallback."

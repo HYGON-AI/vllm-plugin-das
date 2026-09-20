@@ -432,6 +432,211 @@ def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
     )
 
 
+def test_fp8_kv_dequant_reuses_lightop_mapping_for_shared_indexer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, bool]] = []
+
+    def lightop_gather(
+        cache,
+        indices,
+        output,
+        valid_lengths,
+        compact_indices,
+        tokens_per_request=1,
+        dedup_table=None,
+        reuse_compact_indices=False,
+    ):
+        del cache, valid_lengths, dedup_table
+        calls.append((compact_indices.data_ptr(), reuse_compact_indices))
+        output.fill_(len(calls))
+        if not reuse_compact_indices:
+            compact_indices.copy_(
+                torch.arange(indices.numel(), dtype=torch.int32).view_as(indices)
+            )
+
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_resolve_lightop_gather",
+        lambda: lightop_gather,
+    )
+    cache = torch.zeros((2, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor(
+        [[0, 1], [2, 3], [4, 5], [6, -1]], dtype=torch.int32
+    )
+    state = fp8_kv_dequant.LightOpKVReuseState(
+        compact_indices=torch.empty((8, 2), dtype=torch.int32)
+    )
+
+    first_output, first_indices = fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+        cache,
+        indices,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        tokens_per_request=4,
+        reuse_state=state,
+        allow_mapping_reuse=False,
+        mapping_reuse_group_size=4,
+    )
+    second_output, second_indices = (
+        fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+            cache,
+            indices,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            tokens_per_request=4,
+            reuse_state=state,
+            allow_mapping_reuse=True,
+            mapping_reuse_group_size=4,
+        )
+    )
+
+    assert calls == [(first_indices.data_ptr(), False), (first_indices.data_ptr(), True)]
+    assert second_indices.data_ptr() == first_indices.data_ptr()
+    assert first_output.eq(1).all()
+    assert second_output.eq(2).all()
+    torch.testing.assert_close(
+        second_indices,
+        torch.arange(8, dtype=torch.int32).view(4, 2),
+    )
+
+
+def test_fp8_kv_dequant_decode_resets_lightop_mapping_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reuse_flags: list[bool] = []
+
+    def lightop_gather(
+        cache,
+        indices,
+        output,
+        valid_lengths,
+        compact_indices,
+        tokens_per_request=1,
+        dedup_table=None,
+        reuse_compact_indices=False,
+    ):
+        del cache, valid_lengths, dedup_table
+        reuse_flags.append(reuse_compact_indices)
+        output.zero_()
+        compact_indices.copy_(
+            torch.arange(indices.numel(), dtype=torch.int32).view_as(indices)
+        )
+
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_resolve_lightop_gather",
+        lambda: lightop_gather,
+    )
+    cache = torch.zeros((1, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor([[0, 1]], dtype=torch.int32)
+    state = fp8_kv_dequant.LightOpKVReuseState(
+        compact_indices=torch.empty((4, 2), dtype=torch.int32)
+    )
+    state.dedup_key = (1, cache.numel(), 1)
+
+    fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+        cache,
+        indices,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        tokens_per_request=1,
+        reuse_state=state,
+        allow_mapping_reuse=True,
+    )
+
+    assert reuse_flags == [False]
+    assert state.dedup_key is None
+
+
+def test_fp8_kv_dequant_falls_back_to_old_lightop_mapping_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def old_lightop_gather(
+        cache,
+        indices,
+        output,
+        valid_lengths,
+        compact_indices,
+        tokens_per_request=1,
+    ):
+        del cache, valid_lengths
+        calls.append(tokens_per_request)
+        output.zero_()
+        compact_indices.copy_(
+            torch.arange(indices.numel(), dtype=torch.int32).view_as(indices)
+        )
+
+    monkeypatch.setattr(
+        fp8_kv_dequant,
+        "_resolve_lightop_gather",
+        lambda: old_lightop_gather,
+    )
+    cache = torch.zeros((1, 64, 656), dtype=torch.uint8)
+    indices = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    state = fp8_kv_dequant.LightOpKVReuseState(
+        compact_indices=torch.empty((2, 2), dtype=torch.int32),
+        dedup_key=(2, cache.numel(), 2),
+    )
+
+    fp8_kv_dequant.gather_dequantize_fp8_ds_mla_cache(
+        cache,
+        indices,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        tokens_per_request=2,
+        reuse_state=state,
+        allow_mapping_reuse=True,
+        mapping_reuse_group_size=2,
+    )
+
+    assert calls == [2]
+    assert state.supports_mapping_reuse is False
+    assert state.dedup_key is None
+
+
+def test_lightop_kv_reuse_state_preallocates_from_topk_buffer() -> None:
+    topk_indices = torch.empty((8, 2048), dtype=torch.int32)
+
+    state = fp8_kv_dequant.LightOpKVReuseState.from_topk_buffer(topk_indices)
+
+    assert state.compact_indices.shape == topk_indices.shape
+    assert state.compact_indices.dtype == torch.int32
+    assert state.compact_indices.device == topk_indices.device
+    assert state.compact_indices.data_ptr() != topk_indices.data_ptr()
+    assert state.dedup_key is None
+
+
+@pytest.mark.parametrize(
+    ("is_prefilling", "num_tokens", "expected_group_size"),
+    [
+        ([False, False], 8, 4),
+        ([True, True], 8, 1),
+        ([False, True], 8, 1),
+        ([False, False], 7, 1),
+    ],
+)
+def test_lightop_mapping_reuse_only_marks_uniform_target_verify(
+    is_prefilling: list[bool],
+    num_tokens: int,
+    expected_group_size: int,
+) -> None:
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        max_query_len=4,
+        num_actual_tokens=num_tokens,
+    )
+
+    group_size = hcu_sparse._lightop_mapping_reuse_group_size(
+        metadata,
+        torch.tensor(is_prefilling, dtype=torch.bool),
+    )
+
+    assert group_size == expected_group_size
+
+
 @pytest.mark.parametrize(
     ("batch_size", "query_len", "expected_tokens_per_request"),
     [(2, 4, 4), (8, 1, 1)],
@@ -471,6 +676,61 @@ def test_fp8_kv_dequant_uses_runtime_query_width(
 
 
 @pytest.mark.parametrize(
+    ("is_indexer_producer", "expected_allow_reuse"),
+    [(True, False), (False, True)],
+)
+def test_fp8_dequant_only_allows_mapping_reuse_for_shared_indexer(
+    monkeypatch: pytest.MonkeyPatch,
+    is_indexer_producer: bool,
+    expected_allow_reuse: bool,
+) -> None:
+    impl = _bare_impl(None)
+    state = object()
+    impl._lightop_kv_reuse_state = state
+    impl._is_indexer_producer = is_indexer_producer
+    observed: list[tuple[object, bool, int]] = []
+
+    def gather(
+        cache,
+        indices,
+        kv_lora_rank,
+        rope_dim,
+        tokens_per_request,
+        *,
+        reuse_state=None,
+        allow_mapping_reuse=False,
+        mapping_reuse_group_size=1,
+    ):
+        del cache, kv_lora_rank, rope_dim, tokens_per_request
+        observed.append(
+            (reuse_state, allow_mapping_reuse, mapping_reuse_group_size)
+        )
+        num_rows = indices.numel()
+        return (
+            torch.zeros((num_rows, 576), dtype=torch.bfloat16),
+            torch.arange(num_rows, dtype=torch.int32).view_as(indices),
+        )
+
+    monkeypatch.setattr(hcu_sparse, "gather_dequantize_fp8_ds_mla_cache", gather)
+    monkeypatch.setattr(
+        impl,
+        "_bf16_flash_mla_kernel",
+        lambda q, cache, indices: torch.zeros(
+            (q.shape[0], q.shape[1], impl.kv_lora_rank), dtype=q.dtype
+        ),
+    )
+
+    impl._dequant_bf16_attn(
+        torch.zeros((2, 4, 4, 576), dtype=torch.bfloat16),
+        torch.zeros((1, 64, 656), dtype=torch.uint8),
+        torch.zeros((2, 4, 2), dtype=torch.int32),
+        mapping_reuse_group_size=4,
+    )
+
+    assert observed == [(state, expected_allow_reuse, 4)]
+
+
+@pytest.mark.parametrize(
     ("num_reqs", "max_query_len", "num_tokens", "expected_width"),
     [(2, 4, 8, 4), (2, 4, 7, 1)],
 )
@@ -491,7 +751,15 @@ def test_fp8_mixed_batch_passes_request_width_to_dequant(
         lambda req_ids, block_table, indices, **kwargs: indices,
     )
 
-    def fake_dequant(self, q, cache, indices, tokens_per_request=None):
+    def fake_dequant(
+        self,
+        q,
+        cache,
+        indices,
+        tokens_per_request=None,
+        mapping_reuse_group_size=1,
+    ):
+        assert mapping_reuse_group_size == 1
         observed.append(tokens_per_request)
         return torch.zeros(
             (q.shape[0], q.shape[1], q.shape[2], self.kv_lora_rank),
@@ -732,6 +1000,9 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     impl.dcp_rank = 1
     impl.kv_cache_dtype = "fp8_ds_mla"
     impl._dcp_sinks = torch.arange(8, dtype=torch.float32)
+    state = object()
+    impl._lightop_kv_reuse_state = state
+    impl._is_indexer_producer = False
     impl.topk_indices_buffer = torch.tensor(
         [[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.int32
     )
@@ -745,13 +1016,26 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
         calls["filter"] = (req_ids, block_table, indices, kwargs)
         return localized_indices, topk_length
 
-    def fake_dequant(cache, indices, kv_lora_rank, rope_dim, tokens_per_request):
+    def fake_dequant(
+        cache,
+        indices,
+        kv_lora_rank,
+        rope_dim,
+        tokens_per_request,
+        *,
+        reuse_state=None,
+        allow_mapping_reuse=False,
+        mapping_reuse_group_size=1,
+    ):
         calls["dequant"] = (
             cache,
             indices,
             kv_lora_rank,
             rope_dim,
             tokens_per_request,
+            reuse_state,
+            allow_mapping_reuse,
+            mapping_reuse_group_size,
         )
         return torch.zeros(8, 576), torch.tensor(
             [[0, 1, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32
@@ -794,6 +1078,7 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     }
     assert calls["dequant"][1] is localized_indices
     assert calls["dequant"][4] == 1
+    assert calls["dequant"][5:] == (state, False, 1)
     assert calls["kernel"][3] is topk_length
     torch.testing.assert_close(output[0], kernel_output[0])
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]))

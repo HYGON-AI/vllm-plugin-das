@@ -32,10 +32,14 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
 import vllm_hcu.platforms.envs as henvs
-from vllm_hcu.models.hy_v4.fp8_kv_dequant import gather_dequantize_fp8_ds_mla_cache
+from vllm_hcu.models.hy_v4.fp8_kv_dequant import (
+    LightOpKVReuseState,
+    gather_dequantize_fp8_ds_mla_cache,
+)
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
+    FlashMLASparseMetadataBuilder,
 )
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
@@ -61,6 +65,46 @@ def _uniform_tokens_per_request(num_tokens: int, num_reqs: int) -> int:
             f"num_tokens={num_tokens}, num_reqs={num_reqs}."
         )
     return num_tokens // num_reqs
+
+
+def _lightop_mapping_reuse_group_size(
+    metadata: FlashMLASparseMetadata,
+    is_prefilling: torch.Tensor | None,
+) -> int:
+    """Return a reuse width only for uniform, pure target-verify batches."""
+    uniform_width = (
+        metadata.num_reqs > 0
+        and metadata.max_query_len > 1
+        and metadata.num_actual_tokens
+        == metadata.num_reqs * metadata.max_query_len
+    )
+    pure_decode = bool(
+        is_prefilling is not None
+        and is_prefilling.device.type == "cpu"
+        and not is_prefilling[: metadata.num_reqs].any().item()
+    )
+    return metadata.max_query_len if uniform_width and pure_decode else 1
+
+
+class HYV4FlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+    """Mark only pure multi-token decode batches as LightOp reuse groups."""
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ) -> FlashMLASparseMetadata:
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+        )
+        metadata.lightop_kv_group_size = _lightop_mapping_reuse_group_size(
+            metadata,
+            common_attn_metadata.is_prefilling,
+        )
+        return metadata
 
 
 class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
@@ -90,11 +134,14 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # MLA Specific Arguments
         topk_indices_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
         **mla_args,
     ) -> None:
         # ``SparseMLACommonImpl`` takes explicit keyword arguments only, so the
         # sink has to be removed before the base classes see``mla_args``.
         sinks: torch.Tensor | None = mla_args.pop("sinks", None)
+        self._lightop_kv_reuse_state = lightop_kv_reuse_state
+        self._is_indexer_producer = indexer is not None
         super().__init__(
             num_heads,
             head_size,
@@ -309,6 +356,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             kv_c_and_k_pe_cache,
             topk_indices.unsqueeze(0),
             tokens_per_request,
+            getattr(attn_metadata, "lightop_kv_group_size", 1),
         )
         return attn_out.squeeze(0)
 
@@ -318,6 +366,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         tokens_per_request: int | None = None,
+        mapping_reuse_group_size: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dequantize the fp8 KV cache to BF16 and run the BF16 sparse kernel.
 
@@ -345,12 +394,23 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         # Gather + dequantize only the selected slots; remap indices to the
         # compact buffer's rows.
+        reuse_state = getattr(self, "_lightop_kv_reuse_state", None)
+        reuse_kwargs = (
+            {
+                "reuse_state": reuse_state,
+                "allow_mapping_reuse": not self._is_indexer_producer,
+                "mapping_reuse_group_size": mapping_reuse_group_size,
+            }
+            if reuse_state is not None
+            else {}
+        )
         kv_bf16, new_idx = gather_dequantize_fp8_ds_mla_cache(
             kv_c_and_k_pe_cache,
             idx_flat,
             self.kv_lora_rank,
             rope_dim,
             tokens_per_request,
+            **reuse_kwargs,
         )
 
         out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
@@ -476,12 +536,23 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             tokens_per_request = _uniform_tokens_per_request(
                 num_actual_toks, attn_metadata.num_reqs
             )
+            reuse_state = getattr(self, "_lightop_kv_reuse_state", None)
+            reuse_kwargs = (
+                {
+                    "reuse_state": reuse_state,
+                    "allow_mapping_reuse": False,
+                    "mapping_reuse_group_size": 1,
+                }
+                if reuse_state is not None
+                else {}
+            )
             cache, kernel_indices = gather_dequantize_fp8_ds_mla_cache(
                 kv_c_and_k_pe_cache,
                 topk_indices,
                 self.kv_lora_rank,
                 rope_dim,
                 tokens_per_request,
+                **reuse_kwargs,
             )
         else:
             cache = kv_c_and_k_pe_cache
@@ -510,6 +581,10 @@ class HYV4FlashMLASparseBackend(HcuFlashMLASparseBackend):
     @staticmethod
     def get_impl_cls() -> type[HYV4FlashMLASparseImpl]:
         return HYV4FlashMLASparseImpl
+
+    @staticmethod
+    def get_builder_cls() -> type[HYV4FlashMLASparseMetadataBuilder]:
+        return HYV4FlashMLASparseMetadataBuilder
 
     @classmethod
     def supports_sink(cls) -> bool:

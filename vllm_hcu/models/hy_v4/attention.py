@@ -56,6 +56,8 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
+from .fp8_kv_dequant import LightOpKVReuseState
+
 logger = init_logger(__name__)
 
 _SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
@@ -837,6 +839,7 @@ class HYV4MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1067,6 +1070,8 @@ class HYV4MLAAttention(nn.Module):
                 _require_sparse_mqa_backend(sink_backend)
 
         extra_impl_args = {} if sinks is None else {"sinks": sinks}
+        if self.is_sparse and lightop_kv_reuse_state is not None:
+            extra_impl_args["lightop_kv_reuse_state"] = lightop_kv_reuse_state
         self.mla_attn = HYV4MLAAttentionLayer(
             num_heads=self.num_local_heads,
             scale=self.scaling,
