@@ -534,10 +534,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # Vendor-specific KDA kernels: AMD/ROCm and NVIDIA keep their own copies
         # under kimi_k3/{amd,nvidia}/ops so each can diverge independently.
-        # On ROCm the decode/recurrent kernels dispatch to bolt_ops; the prefill
+        # On ROCm the decode/recurrent kernels dispatch to boltops; the prefill
         # orchestration (chunk_kda_with_fused_gate) stays vendored in vLLM.
         if current_platform.is_rocm():
-            from bolt_ops.fla.kda import (
+            from boltops.fla.kda import (
                 fused_recurrent_kda,
                 fused_recurrent_kda_packed_decode,
             )
