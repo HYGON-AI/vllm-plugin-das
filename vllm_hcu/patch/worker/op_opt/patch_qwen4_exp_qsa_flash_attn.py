@@ -23,7 +23,6 @@ from ._common import (
     require_exact_signature,
 )
 from vllm_hcu.v1.attention.backends.qsa import (
-    QSA_BACKEND_FLASH,
     get_qsa_flash_attn_mode,
     get_qsa_kernel_backend,
 )
@@ -82,11 +81,6 @@ def apply_to_module(module: ModuleType) -> bool:
         defaults={"out": None},
     )
 
-    # Temporary one-shot diagnostics for the first real QSA invocation in
-    # each worker.  Keeping the flags local avoids printing once per token.
-    mqa_route_logged = False
-    sparse_route_logged = False
-
     @functools.wraps(original_mqa)
     def hcu_mqa_paged(
         q,
@@ -99,7 +93,6 @@ def apply_to_module(module: ModuleType) -> bool:
         num_columns=None,
         score_scale=None,
     ):
-        nonlocal mqa_route_logged
         mode = get_qsa_flash_attn_mode()
         try:
             backend = get_qsa_kernel_backend(
@@ -109,17 +102,6 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         except RuntimeError as exc:
             raise PatchCompatibilityError(str(exc)) from exc
-        if not mqa_route_logged:
-            route = (
-                "flash_attn.mqa_paged_score_func"
-                if backend.name == QSA_BACKEND_FLASH
-                else "vllm QSA Triton kernel"
-            )
-            print(
-                f"[HCU QSA][{mode.upper()}] using {route}",
-                flush=True,
-            )
-            mqa_route_logged = True
         return backend.mqa_paged_score(
             q,
             k_cache,
@@ -142,7 +124,6 @@ def apply_to_module(module: ModuleType) -> bool:
         token_to_req,
         out=None,
     ):
-        nonlocal sparse_route_logged
         mode = get_qsa_flash_attn_mode()
         try:
             backend = get_qsa_kernel_backend(
@@ -152,17 +133,6 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         except RuntimeError as exc:
             raise PatchCompatibilityError(str(exc)) from exc
-        if not sparse_route_logged:
-            route = (
-                "flash_attn.sparse_gqa_paged_attn_func"
-                if backend.name == QSA_BACKEND_FLASH
-                else "vllm QSA Triton kernel"
-            )
-            print(
-                f"[HCU QSA][{mode.upper()}] using {route}",
-                flush=True,
-            )
-            sparse_route_logged = True
         return backend.sparse_gqa_paged_attn(
             q,
             k_cache,
