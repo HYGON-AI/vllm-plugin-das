@@ -14,6 +14,7 @@ _SLIMQUANT_NAMES = (
     "slimquant_marlin",
     "slimquant_compressed_tensors_marlin",
     "slimquant_w4a8",
+    "kimi_k3_w4a8",
 )
 TARGETS = tuple(
     f"{TARGET_MODULE}.register_quantization_config[{name}]"

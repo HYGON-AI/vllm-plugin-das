@@ -651,6 +651,7 @@ def _make_compilation_module() -> ModuleType:
 
     class CompilationConfig:
         def __init__(self) -> None:
+            self.mode = SimpleNamespace(name="VLLM_COMPILE")
             self.pass_config = SimpleNamespace(enable_sp=False)
             self.calls = 0
             self.sp_observed = False
@@ -755,6 +756,17 @@ def test_compilation_adapter_skips_non_piecewise_cudagraphs() -> None:
     assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
 
 
+def test_compilation_adapter_skips_none_mode() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.mode = SimpleNamespace(name="NONE")
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter")
+
+    assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
+
+
 def test_compilation_adapter_requires_finalized_splitting_ops_list() -> None:
     module = _make_compilation_module()
     patch_compilation_config.apply_to_module(module)
@@ -831,6 +843,8 @@ class _FakeModelConfig:
 
 class _FakeCompilationConfig:
     def __init__(self, sizes: list[int] | None = None) -> None:
+        self.mode = None
+        self.pass_config = SimpleNamespace(fuse_act_quant=None)
         self.cudagraph_capture_sizes = sizes
         self.max_cudagraph_capture_size = None
         self.compile_sizes: list[int | str] | None = [
@@ -860,6 +874,10 @@ def _make_vllm_module() -> ModuleType:
             self.compilation_config = _FakeCompilationConfig(sizes)
             self.scheduler_config = SimpleNamespace(max_num_batched_tokens=64)
             self.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+            self.post_init_calls = 0
+
+        def __post_init__(self) -> None:
+            self.post_init_calls += 1
 
         def with_hf_config(
             self,
@@ -903,6 +921,36 @@ def test_vllm_adapter_refreshes_hf_text_config_and_arch_config() -> None:
     updated = config.with_hf_config(_FakeHFConfig("new"))
     assert updated.model_config.hf_text_config.name == "new"
     assert updated.model_config.model_arch_config == "new"
+
+
+def test_kimi_k3_defaults_use_breakable_cudagraph_without_overriding_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _make_vllm_module()
+    patch_vllm_config.apply_to_module(module)
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+
+    config = module.VllmConfig()
+    config.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    config.__post_init__()
+
+    assert config.post_init_calls == 1
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
+    assert config.compilation_config.pass_config.fuse_act_quant is True
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    explicit_env = module.VllmConfig()
+    explicit_env.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    explicit_env.__post_init__()
+    assert explicit_env.compilation_config.pass_config.fuse_act_quant is None
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+    explicit_mode = module.VllmConfig()
+    explicit_mode.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    explicit_mode.compilation_config.mode = "user-selected"
+    explicit_mode.__post_init__()
+    assert "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
+    assert explicit_mode.compilation_config.pass_config.fuse_act_quant is None
 
 
 def test_request_cudagraph_buckets_and_feature_off_equivalence(
@@ -1246,6 +1294,7 @@ def test_slimquant_uses_public_registry_without_loading_concrete_kernels(
         "slimquant_marlin",
         "slimquant_compressed_tensors_marlin",
         "slimquant_w4a8",
+        "kimi_k3_w4a8",
     ]
     assert not patch_slimquant_registry.apply_to_module(module)
 
@@ -1613,6 +1662,69 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.block_size == 64
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mla_backend_priority_matches_v0251(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.platforms.hcu import _get_backend_priorities
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_FLASHMLA", enabled)
+    _get_backend_priorities.cache_clear()
+    try:
+        names = [backend.name for backend in _get_backend_priorities(True, False)]
+        assert names == ["FLASHMLA", "TRITON_MLA"]
+    finally:
+        _get_backend_priorities.cache_clear()
+
+
+def test_hcu_collective_switch_and_source_decode_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import shared_experts
+    from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", raising=False)
+    assert HCUPlatform.use_custom_allreduce() is True
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "0")
+    assert HCUPlatform.use_custom_allreduce() is False
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "1")
+    assert HCUPlatform.use_custom_allreduce() is True
+
+    from vllm.platforms.interface import Platform
+
+    other_config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+    )
+    assert HCUPlatform.get_default_ir_op_priority(other_config) == (
+        Platform.get_default_ir_op_priority(other_config)
+    )
+    priority = HCUPlatform.get_default_ir_op_priority(SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+    ))
+    assert priority.rms_norm == ["vllm_c", "native"]
+    assert priority.fused_add_rms_norm == ["vllm_c", "native"]
+
+    runner = object.__new__(shared_experts.SharedExperts)
+    runner._stream = object()
+    hidden_states = SimpleNamespace(shape=(1,))
+    monkeypatch.setattr(shared_experts.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        shared_experts.current_platform, "is_cuda_alike", lambda: True
+    )
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE", False)
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH", False)
+    monkeypatch.setattr(
+        shared_experts.envs, "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 1
+    )
+
+    assert runner._should_run_shared_in_aux_stream(hidden_states) is False
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE", True)
+    assert runner._should_run_shared_in_aux_stream(hidden_states) is True
 
 
 @pytest.mark.parametrize(

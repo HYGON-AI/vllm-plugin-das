@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
 from types import ModuleType
+from types import SimpleNamespace
 
 from ._common import (
     PatchCompatibilityError,
@@ -176,7 +178,34 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
+        situ_beta = kwargs.get("activation_situ_beta")
+        situ_linear_beta = kwargs.get("activation_situ_linear_beta")
+        if "activation_situ_beta" not in inspect.signature(factory).parameters:
+            kwargs.pop("activation_situ_beta", None)
+            kwargs.pop("activation_situ_linear_beta", None)
+            if situ_beta is not None and "swiglu_beta" not in kwargs:
+                kwargs["swiglu_beta"] = situ_beta
+            if kwargs.get("activation") == "situ":
+                # vLLM 0.25.1 has no public ``situ`` activation enum.  The
+                # Kimi W4A8 quant method consumes the preserved beta values
+                # below and dispatches the actual SiTu kernel itself.
+                kwargs["activation"] = "silu"
         runner = factory(*args, **kwargs)
+        if kwargs.get("activation") == "silu" and situ_beta is not None:
+            # Keep the semantic activation visible to the Kimi quant method;
+            # the legacy factory only accepted ``silu`` during construction.
+            runner.moe_config.activation = SimpleNamespace(
+                value="situ",
+                is_gated=True,
+                custom_op_name="situ_and_mul",
+            )
+            # RoutedExperts snapshots activation in its constructor; the
+            # modular forward reads that snapshot, not moe_config again.
+            runner.routed_experts.activation = runner.moe_config.activation
+        if situ_beta is not None:
+            runner.moe_config.activation_situ_beta = situ_beta
+        if situ_linear_beta is not None:
+            runner.moe_config.activation_situ_linear_beta = situ_linear_beta
         experts = runner.routed_experts
         if type(experts.quant_method) is not official_unquantized_cls:
             return runner
