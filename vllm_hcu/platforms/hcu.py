@@ -29,8 +29,13 @@ logger = init_logger(__name__)
 _ensure_platform_plugin_ready()
 
 
-def get_hcu_flash_attn_mode() -> str:
-    """Resolve the HCU flash-attention sub-mode from serialized config."""
+def get_hcu_flash_attn_mode(vllm_config: "VllmConfig | None" = None) -> str:
+    """Resolve the HCU flash-attention sub-mode from serialized config.
+
+    A forward pass already has the worker's deserialised ``VllmConfig``.  Let
+    callers provide it directly because Model Runner V2 does not necessarily
+    install that object as vLLM's process-global current config.
+    """
 
     try:
         from vllm.config import get_current_vllm_config_or_none
@@ -41,7 +46,9 @@ def get_hcu_flash_attn_mode() -> str:
 
     from vllm_hcu.patch.config import get_hcu_config
 
-    config = get_current_vllm_config_or_none()
+    config = vllm_config
+    if config is None:
+        config = get_current_vllm_config_or_none()
     explicit_mode = (
         None if config is None else get_hcu_config(config).hcu_flash_attn_mode
     )
@@ -164,6 +171,8 @@ def _get_backend_priorities(
 
 def register_attention_backends() -> None:
     # Install HCU defaults without replacing user or third-party overrides.
+    # QSA is model-local and dispatches TRITON_QSA/FLASH_QSA in its own
+    # adapter; it intentionally does not become a global enum backend here.
     backends = (
         (
             AttentionBackendEnum.TRITON_ATTN,
@@ -210,6 +219,24 @@ class HCUPlatform(Platform):
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     ]
+
+    @classmethod
+    def set_additional_forward_context(
+        cls, *args, **kwargs
+    ) -> dict[str, object]:
+        """Expose the resolved attention mode to model-local QSA kernels.
+
+        QSA is not a global vLLM attention backend, so it cannot obtain the
+        mode through the attention selector.  Carrying the normalized mode in
+        the standard ``ForwardContext.additional_kwargs`` keeps the QSA
+        dispatcher tied to the exact config used by this forward pass.
+        """
+
+        additional = super().set_additional_forward_context(*args, **kwargs)
+        additional["hcu_flash_attn_mode"] = get_hcu_flash_attn_mode(
+            kwargs.get("vllm_config")
+        )
+        return additional
 
     supported_quantization: list[str] = [
         "awq",
