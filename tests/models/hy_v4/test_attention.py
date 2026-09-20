@@ -342,25 +342,28 @@ def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
     impl.kv_cache_dtype = "auto"
     impl.head_size = 576
     impl.kv_lora_rank = 512
-    impl.tokens_per_request = 1
     return impl
 
 
 @pytest.mark.parametrize(
-    ("num_speculative_tokens", "expected"),
-    [(None, 1), (0, 1), (3, 4)],
+    ("num_tokens", "num_reqs", "expected"),
+    [(8, 2, 4), (8, 8, 1)],
 )
-def test_tokens_per_request_includes_current_decode_token(
-    num_speculative_tokens: int | None,
+def test_uniform_tokens_per_request(
+    num_tokens: int,
+    num_reqs: int,
     expected: int,
 ) -> None:
-    speculative_config = (
-        None
-        if num_speculative_tokens is None
-        else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
-    )
+    assert hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs) == expected
 
-    assert hcu_sparse._tokens_per_request(speculative_config) == expected
+
+@pytest.mark.parametrize(("num_tokens", "num_reqs"), [(7, 2), (8, 0)])
+def test_uniform_tokens_per_request_rejects_invalid_shape(
+    num_tokens: int,
+    num_reqs: int,
+) -> None:
+    with pytest.raises(ValueError, match="uniform query width|at least one request"):
+        hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs)
 
 
 def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
@@ -427,6 +430,91 @@ def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
         compact_indices,
         torch.arange(8, dtype=torch.int32).view(4, 2),
     )
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "query_len", "expected_tokens_per_request"),
+    [(2, 4, 4), (8, 1, 1)],
+)
+def test_fp8_kv_dequant_uses_runtime_query_width(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    query_len: int,
+    expected_tokens_per_request: int,
+) -> None:
+    impl = _bare_impl(None)
+    observed: list[int] = []
+
+    def gather(cache, indices, kv_lora_rank, rope_dim, tokens_per_request):
+        observed.append(tokens_per_request)
+        num_rows = indices.numel()
+        return (
+            torch.zeros((num_rows, kv_lora_rank + rope_dim), dtype=torch.bfloat16),
+            torch.arange(num_rows, dtype=torch.int32).view_as(indices),
+        )
+
+    monkeypatch.setattr(hcu_sparse, "gather_dequantize_fp8_ds_mla_cache", gather)
+    monkeypatch.setattr(
+        impl,
+        "_bf16_flash_mla_kernel",
+        lambda q, cache, indices: torch.zeros(
+            (q.shape[0], q.shape[1], impl.kv_lora_rank), dtype=q.dtype
+        ),
+    )
+    q = torch.zeros((batch_size, query_len, 4, 576), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 64, 656), dtype=torch.uint8)
+    indices = torch.zeros((batch_size, query_len, 2), dtype=torch.int32)
+
+    impl._dequant_bf16_attn(q, cache, indices)
+
+    assert observed == [expected_tokens_per_request]
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "max_query_len", "num_tokens", "expected_width"),
+    [(2, 4, 8, 4), (2, 4, 7, 1)],
+)
+def test_fp8_mixed_batch_passes_request_width_to_dequant(
+    monkeypatch: pytest.MonkeyPatch,
+    num_reqs: int,
+    max_query_len: int,
+    num_tokens: int,
+    expected_width: int,
+) -> None:
+    impl = _bare_impl(None)
+    observed: list[int | None] = []
+
+    monkeypatch.setattr(hcu_sparse.henvs, "VLLM_HCU_HYV4_FP8_KV_DEQUANT", True)
+    monkeypatch.setattr(
+        hcu_sparse,
+        "triton_convert_req_index_to_global_index",
+        lambda req_ids, block_table, indices, **kwargs: indices,
+    )
+
+    def fake_dequant(self, q, cache, indices, tokens_per_request=None):
+        observed.append(tokens_per_request)
+        return torch.zeros(
+            (q.shape[0], q.shape[1], q.shape[2], self.kv_lora_rank),
+            dtype=q.dtype,
+        ), None
+
+    impl._dequant_bf16_attn = MethodType(fake_dequant, impl)
+    q = torch.zeros((num_tokens, 4, 576), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 64, 656), dtype=torch.uint8)
+    indices = torch.zeros((num_tokens, 2), dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_reqs=num_reqs,
+        max_query_len=max_query_len,
+        num_actual_tokens=num_tokens,
+        req_id_per_token=torch.arange(num_tokens, dtype=torch.int32),
+        block_table=torch.zeros((num_reqs, 1), dtype=torch.int32),
+        block_size=64,
+    )
+
+    output = impl._forward_fp8_kv_mixed_batch(q, cache, indices, metadata)
+
+    assert output.shape == (num_tokens, 4, impl.kv_lora_rank)
+    assert observed == [expected_width]
 
 
 def test_fp8_kv_dequant_falls_back_when_lightop_gather_is_unavailable(
@@ -686,6 +774,7 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     q = torch.zeros(2, 8, 576)
     fp8_cache = torch.zeros(16, 656, dtype=torch.uint8)
     metadata = SimpleNamespace(
+        num_reqs=2,
         req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
         block_table=torch.tensor([[7], [11]], dtype=torch.int32),
         block_size=64,
@@ -704,6 +793,7 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
         "return_valid_counts": True,
     }
     assert calls["dequant"][1] is localized_indices
+    assert calls["dequant"][4] == 1
     assert calls["kernel"][3] is topk_length
     torch.testing.assert_close(output[0], kernel_output[0])
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]))

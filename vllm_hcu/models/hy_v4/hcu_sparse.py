@@ -26,9 +26,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
-from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
 import vllm_hcu.platforms.envs as henvs
@@ -51,12 +51,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _tokens_per_request(speculative_config: object | None) -> int:
-    """Return decode rows per request, including the current token."""
-    num_speculative_tokens = int(
-        getattr(speculative_config, "num_speculative_tokens", 0) or 0
-    )
-    return num_speculative_tokens + 1 if num_speculative_tokens > 0 else 1
+def _uniform_tokens_per_request(num_tokens: int, num_reqs: int) -> int:
+    """Return a uniform query width for request-grouped LightOp gather."""
+    if num_reqs <= 0:
+        raise ValueError("DCP sparse attention requires at least one request")
+    if num_tokens % num_reqs != 0:
+        raise ValueError(
+            "DCP sparse attention requires a uniform query width: "
+            f"num_tokens={num_tokens}, num_reqs={num_reqs}."
+        )
+    return num_tokens // num_reqs
 
 
 class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
@@ -109,14 +113,6 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
         self._dcp_sinks: torch.Tensor | None = None
-        # MTP width: query rows per request in a decode batch. LightOp's gather
-        # groups ``num_tokens`` rows into requests with this stride. MTP3 has
-        # three speculative rows plus the current decode row, so it passes 4;
-        # plain decoding passes 1.
-        speculative_config = getattr(
-            get_current_vllm_config(), "speculative_config", None
-        )
-        self.tokens_per_request = _tokens_per_request(speculative_config)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Prepare MLA weights and gather static sink shards for DCP."""
@@ -270,11 +266,58 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         return out, lse
 
+    def _forward_fp8_kv_mixed_batch(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Run mixed-batch FP8 dequant with the actual request query width."""
+        if not henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT:
+            return super()._forward_fp8_kv_mixed_batch(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+            )
+
+        topk_indices = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+
+        # The upstream mixed-batch path collapses all requests into one query
+        # batch before invoking the FP8 kernel. Recover the per-request width
+        # for uniform decode (including MTP verification). Non-uniform prefill
+        # cannot be represented by LightOp's scalar request width, so grouping
+        # each token independently preserves correctness without deduplication.
+        tokens_per_request = 1
+        if (
+            attn_metadata.num_reqs > 0
+            and attn_metadata.max_query_len > 0
+            and attn_metadata.num_actual_tokens
+            == attn_metadata.num_reqs * attn_metadata.max_query_len
+        ):
+            tokens_per_request = attn_metadata.max_query_len
+
+        attn_out, _ = self._dequant_bf16_attn(
+            q.unsqueeze(0),
+            kv_c_and_k_pe_cache,
+            topk_indices.unsqueeze(0),
+            tokens_per_request,
+        )
+        return attn_out.squeeze(0)
+
     def _dequant_bf16_attn(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
+        tokens_per_request: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dequantize the fp8 KV cache to BF16 and run the BF16 sparse kernel.
 
@@ -293,6 +336,8 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         """
         num_tokens_b, seq_len, num_heads, head_dim = q.shape
         rope_dim = self.head_size - self.kv_lora_rank
+        if tokens_per_request is None:
+            tokens_per_request = seq_len
 
         # Flatten tokens; indices are already global cache slots.
         q_flat = q.reshape(num_tokens_b * seq_len, num_heads, head_dim)
@@ -305,7 +350,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             idx_flat,
             self.kv_lora_rank,
             rope_dim,
-            self.tokens_per_request,
+            tokens_per_request,
         )
 
         out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
@@ -428,12 +473,15 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         if self.kv_cache_dtype == "fp8_ds_mla":
             rope_dim = self.head_size - self.kv_lora_rank
+            tokens_per_request = _uniform_tokens_per_request(
+                num_actual_toks, attn_metadata.num_reqs
+            )
             cache, kernel_indices = gather_dequantize_fp8_ds_mla_cache(
                 kv_c_and_k_pe_cache,
                 topk_indices,
                 self.kv_lora_rank,
                 rope_dim,
-                self.tokens_per_request,
+                tokens_per_request,
             )
         else:
             cache = kv_c_and_k_pe_cache
