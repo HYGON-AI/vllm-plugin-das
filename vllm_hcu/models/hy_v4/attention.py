@@ -24,9 +24,12 @@ from vllm.config.cache import CacheDType
 from vllm.distributed import (
     divide,
     get_dcp_group,
+    get_dp_group,
     get_pcp_group,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    init_model_parallel_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
@@ -436,11 +439,23 @@ class HYV4MLAAttentionLayer(MLAAttention):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
+
 _LINEAR_GATE_PCP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD"
+_LINEAR_GATE_PCP_GROUP_SIZE_ENV = "VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE"
 _LINEAR_GATE_PCP_CHUNK_ENV = "VLLM_HCU_LINEAR_GATE_PCP_CHUNKING"
 _LINEAR_GATE_PCP_BLOCK_TOKENS_ENV = "VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS"
 _LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS = 4096
 _linear_gate_pcp_shard_logged = False
+_linear_gate_pcp_groups: dict[tuple[int, ...], object] = {}
+_LINEAR_GATE_DP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_DP_SHARD"
+_LINEAR_GATE_DP_GROUP_SIZE_ENV = "VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE"
+_LINEAR_GATE_DP_CHUNK_ENV = "VLLM_HCU_LINEAR_GATE_DP_CHUNKING"
+_LINEAR_GATE_DP_BLOCK_TOKENS_ENV = "VLLM_HCU_LINEAR_GATE_DP_BLOCK_TOKENS"
+_LINEAR_GATE_DP_DEFAULT_GROUP_SIZE = 8
+_LINEAR_GATE_DP_DEFAULT_BLOCK_TOKENS = 4096
+_linear_gate_dp_shard_logged = False
+_linear_gate_dp_groups: dict[tuple[int, ...], object] = {}
+_LINEAR_GATE_ALLOWED_GROUP_SIZES = (2, 4, 8)
 
 _DCP_Q_REPLICATE_ENV = "VLLM_DCP_Q_REPLICATE"
 
@@ -607,35 +622,227 @@ def linear_gate_pcp_chunking_enabled() -> bool:
     return _env_flag(_LINEAR_GATE_PCP_CHUNK_ENV, False)
 
 
-def linear_gate_pcp_block_tokens() -> int:
-    """Return the positive local-token block size for linear_gate PCP."""
-    raw_value = os.environ.get(
-        _LINEAR_GATE_PCP_BLOCK_TOKENS_ENV,
-        str(_LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS),
-    ).strip()
+def _env_positive_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, str(default)).strip()
     try:
-        block_tokens = int(raw_value)
+        value = int(raw_value)
     except ValueError as exc:
         raise ValueError(
-            f"{_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV} must be a positive integer; "
-            f"got {raw_value!r}."
+            f"{name} must be a positive integer; got {raw_value!r}."
         ) from exc
-    if block_tokens <= 0:
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer; got {value}.")
+    return value
+
+
+def linear_gate_pcp_block_tokens() -> int:
+    """Return the positive local-token block size for linear_gate PCP."""
+    return _env_positive_int(
+        _LINEAR_GATE_PCP_BLOCK_TOKENS_ENV,
+        _LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS,
+    )
+
+
+def _linear_gate_pcp_group_size(pcp_size: int) -> int:
+    """Return the PCP subgroup size that shares one K-sharded linear_gate.
+
+    Unset ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` keeps the historical behavior
+    of sharding across the full PCP group. When set, the value must be 2, 4, or
+    8 and must divide ``pcp_size``.
+    """
+    raw = os.environ.get(_LINEAR_GATE_PCP_GROUP_SIZE_ENV)
+    if raw is None or raw.strip() == "":
+        return pcp_size
+    try:
+        size = int(raw.strip())
+    except ValueError as exc:
         raise ValueError(
-            f"{_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV} must be a positive integer; "
-            f"got {block_tokens}."
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {raw!r}."
+        ) from exc
+    if size not in _LINEAR_GATE_ALLOWED_GROUP_SIZES:
+        raise ValueError(
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {size}."
         )
-    return block_tokens
+    return size
 
 
-class PCPShardedGateLinear(ColumnParallelLinear):
-    """PCP-shard ``linear_gate`` using K sharding.
+def _linear_gate_pcp_group_ranks(
+    world: int,
+    dp_size: int,
+    pp_size: int,
+    pcp_size: int,
+    tp_size: int,
+    group_size: int,
+) -> list[list[int]]:
+    """Split each PCP group into K-shard subgroups of ``group_size`` ranks."""
+    coordinates = dp_size * pp_size * pcp_size * tp_size
+    if world % coordinates != 0:
+        raise RuntimeError(
+            "unable to derive PCP linear_gate subgroup topology: "
+            f"world={world}, dp={dp_size}, pp={pp_size}, pcp={pcp_size}, "
+            f"tp={tp_size}."
+        )
+    if pcp_size % group_size != 0:
+        raise ValueError(
+            f"PCP size {pcp_size} is not divisible by group size {group_size}."
+        )
+    # Layout matches vLLM: ExternalDP x DP x PP x PCP x TP.
+    ranks = torch.arange(world).reshape(-1, dp_size, pp_size, pcp_size, tp_size)
+    groups = ranks.transpose(3, 4).reshape(-1, pcp_size)
+    return [
+        chunk.tolist() for row in groups for chunk in row.reshape(-1, group_size)
+    ]
+
+
+def _get_linear_gate_pcp_group():
+    """Return the PCP subgroup that K-shards one replica of linear_gate.
+
+    ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` splits the PCP group into independent
+    replicas. For PCP=32 and group size 8, ranks ``[0,8)``, ``[8,16)``,
+    ``[16,24)``, and ``[24,32)`` each shard the same full weight and run
+    all-to-all plus reduce-scatter inside the subgroup. When the env is unset,
+    the full PCP group is used.
+    """
+    pcp = get_pcp_group()
+    size = _linear_gate_pcp_group_size(pcp.world_size)
+    if pcp.world_size <= 1:
+        raise ValueError(
+            "linear_gate PCP sharding requires prefill_context_parallel_size > 1; "
+            f"got pcp_size={pcp.world_size}. Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+        )
+    if pcp.world_size % size != 0:
+        raise ValueError(
+            f"PCP size {pcp.world_size} is not divisible by "
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV}={size}."
+        )
+    if size == pcp.world_size:
+        return pcp
+    world = dist.get_world_size()
+    dp = get_dp_group().world_size
+    pp = get_pp_group().world_size
+    tp = get_tensor_model_parallel_world_size()
+    group_ranks = _linear_gate_pcp_group_ranks(
+        world, dp, pp, pcp.world_size, tp, size
+    )
+    key = tuple(rank for group in group_ranks for rank in group)
+    if key not in _linear_gate_pcp_groups:
+        _linear_gate_pcp_groups[key] = init_model_parallel_group(
+            group_ranks,
+            pcp.local_rank,
+            pcp.torch_distributed_backend,
+            group_name="hy_v4_linear_gate_pcp",
+        )
+    return _linear_gate_pcp_groups[key]
+
+
+def linear_gate_dp_shard_enabled() -> bool:
+    """Return whether gated MLA linear_gate DP sharding is enabled."""
+    return _env_flag(_LINEAR_GATE_DP_SHARD_ENV, False)
+
+
+def linear_gate_dp_chunking_enabled() -> bool:
+    """Return whether large linear_gate DP inputs should be chunked.
+
+    Chunking defaults to disabled. Set
+    ``VLLM_HCU_LINEAR_GATE_DP_CHUNKING=1`` to enable chunked collectives.
+    """
+    return _env_flag(_LINEAR_GATE_DP_CHUNK_ENV, False)
+
+
+def linear_gate_dp_block_tokens() -> int:
+    """Return the positive local-token block size for linear_gate DP."""
+    return _env_positive_int(
+        _LINEAR_GATE_DP_BLOCK_TOKENS_ENV,
+        _LINEAR_GATE_DP_DEFAULT_BLOCK_TOKENS,
+    )
+
+
+def _linear_gate_dp_group_size() -> int:
+    """Return the DP subgroup size that shares one K-sharded linear_gate."""
+    size = _env_positive_int(
+        _LINEAR_GATE_DP_GROUP_SIZE_ENV,
+        _LINEAR_GATE_DP_DEFAULT_GROUP_SIZE,
+    )
+    if size not in _LINEAR_GATE_ALLOWED_GROUP_SIZES:
+        raise ValueError(
+            f"{_LINEAR_GATE_DP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {size}."
+        )
+    return size
+
+
+def _linear_gate_dp_group_ranks(
+    world: int,
+    dp_size: int,
+    pp_size: int,
+    pcp_size: int,
+    tp_size: int,
+    group_size: int,
+) -> list[list[int]]:
+    """Split each DP group into K-shard subgroups of ``group_size`` ranks."""
+    coordinates = dp_size * pp_size * pcp_size * tp_size
+    if world % coordinates != 0:
+        raise RuntimeError(
+            "unable to derive DP linear_gate subgroup topology: "
+            f"world={world}, dp={dp_size}, pp={pp_size}, pcp={pcp_size}, "
+            f"tp={tp_size}."
+        )
+    if dp_size % group_size != 0:
+        raise ValueError(
+            f"DP size {dp_size} is not divisible by group size {group_size}."
+        )
+    ranks = torch.arange(world).reshape(-1, dp_size, pp_size, pcp_size, tp_size)
+    groups = ranks.transpose(1, 4).reshape(-1, dp_size)
+    return [chunk.tolist() for row in groups for chunk in row.reshape(-1, group_size)]
+
+
+def _get_linear_gate_dp_group():
+    """Return the DP subgroup that K-shards one replica of linear_gate.
+
+    ``VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE`` splits the DP group into independent
+    replicas. For DP=32 and group size 8, ranks ``[0,8)``, ``[8,16)``,
+    ``[16,24)``, and ``[24,32)`` each shard the same full weight and run
+    all-to-all plus reduce-scatter inside the subgroup.
+    """
+    dp = get_dp_group()
+    size = _linear_gate_dp_group_size()
+    if dp.world_size <= 1:
+        raise ValueError(
+            "linear_gate DP sharding requires data_parallel_size > 1; got "
+            f"dp_size={dp.world_size}. Unset {_LINEAR_GATE_DP_SHARD_ENV}."
+        )
+    if dp.world_size % size != 0:
+        raise ValueError(
+            f"DP size {dp.world_size} is not divisible by "
+            f"{_LINEAR_GATE_DP_GROUP_SIZE_ENV}={size}."
+        )
+    if size == dp.world_size:
+        return dp
+    world = dist.get_world_size()
+    pp = get_pp_group().world_size
+    pcp = get_pcp_group().world_size
+    tp = get_tensor_model_parallel_world_size()
+    group_ranks = _linear_gate_dp_group_ranks(
+        world, dp.world_size, pp, pcp, tp, size
+    )
+    key = tuple(rank for group in group_ranks for rank in group)
+    if key not in _linear_gate_dp_groups:
+        _linear_gate_dp_groups[key] = init_model_parallel_group(
+            group_ranks,
+            dp.local_rank,
+            dp.torch_distributed_backend,
+            group_name="hy_v4_linear_gate_dp",
+        )
+    return _linear_gate_dp_groups[key]
+
+
+class _KShardedGateLinear(ColumnParallelLinear):
+    """K-shard ``linear_gate`` over an arbitrary process group.
 
     ``k_shard`` slices the weight input dimension. An all-to-all sends each
     destination rank its K slice for every token, producing
-    ``[global_tokens, K/PCP]`` before a partial GEMM and token reduce-scatter.
+    ``[group_tokens, K/group]`` before a partial GEMM and token reduce-scatter.
     reduce-scatter is the fused equivalent of all-reduce followed by
-    redistribution to each token-owning PCP rank.
+    redistribution to each token-owning rank.
     """
 
     def __init__(
@@ -643,33 +850,44 @@ class PCPShardedGateLinear(ColumnParallelLinear):
         input_size: int,
         output_size: int,
         *,
+        group,
+        parallel_name: str,
+        enable_env: str,
+        align_uneven_tokens: bool,
+        chunking_enabled_fn,
+        block_tokens_fn,
+        log_once_flag: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        pcp_group = get_pcp_group()
-        self.pcp_rank = pcp_group.rank_in_group
-        self.pcp_size = pcp_group.world_size
+        self.shard_group = group
+        self.shard_rank = group.rank_in_group
+        self.shard_size = group.world_size
+        self.parallel_name = parallel_name
+        self.align_uneven_tokens = align_uneven_tokens
+        self._chunking_enabled_fn = chunking_enabled_fn
+        self._block_tokens_fn = block_tokens_fn
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size != 1:
             raise ValueError(
-                "linear_gate PCP sharding requires tensor_parallel_size == 1 "
-                f"(TP already shards linear_gate); got tp_size={tp_size}. "
-                f"Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+                f"linear_gate {parallel_name} sharding requires "
+                "tensor_parallel_size == 1 (TP already shards linear_gate); "
+                f"got tp_size={tp_size}. Unset {enable_env}."
             )
-        if self.pcp_size <= 1:
+        if self.shard_size <= 1:
             raise ValueError(
-                "linear_gate PCP sharding requires prefill_context_parallel_size > 1; got "
-                f"pcp_size={self.pcp_size}. Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+                f"linear_gate {parallel_name} sharding requires "
+                f"{parallel_name} group size > 1; got "
+                f"{parallel_name}_size={self.shard_size}. Unset {enable_env}."
             )
-        shard_dim = input_size
-        if shard_dim % self.pcp_size != 0:
+        if input_size % self.shard_size != 0:
             raise ValueError(
-                f"linear_gate k_shard dimension {shard_dim} is not divisible "
-                f"by pcp_size {self.pcp_size}."
+                f"linear_gate k_shard dimension {input_size} is not divisible "
+                f"by {parallel_name} size {self.shard_size}."
             )
         self.gate_full_input_size = input_size
         self.gate_output_size = output_size
-        self.gate_shard_input_size = input_size // self.pcp_size
+        self.gate_shard_input_size = input_size // self.shard_size
         local_input_size = self.gate_shard_input_size
         local_output_size = output_size
         super().__init__(
@@ -683,9 +901,9 @@ class PCPShardedGateLinear(ColumnParallelLinear):
         )
         if self.is_quantization:
             raise ValueError(
-                "linear_gate PCP sharding only supports unquantized gate "
-                f"weights; layer {prefix} resolved quantized method "
-                f"{self.quant_method.__class__.__name__}."
+                f"linear_gate {parallel_name} sharding only supports "
+                f"unquantized gate weights; layer {prefix} resolved quantized "
+                f"method {self.quant_method.__class__.__name__}."
             )
         expected_weight_numel = local_input_size * local_output_size
         if self.weight.numel() != expected_weight_numel:
@@ -694,41 +912,43 @@ class PCPShardedGateLinear(ColumnParallelLinear):
                 f"elements; expected {expected_weight_numel} for local shape "
                 f"[{local_output_size}, {local_input_size}]"
             )
-        global _linear_gate_pcp_shard_logged
-        if not _linear_gate_pcp_shard_logged:
-            _linear_gate_pcp_shard_logged = True
+        logged = globals()[log_once_flag]
+        if not logged:
+            globals()[log_once_flag] = True
             logger.info(
-                "HY V4 linear_gate PCP K sharding enabled: PCP=%d, "
+                "HY V4 linear_gate %s K sharding enabled: %s=%d, "
                 "full weight=[%d, %d], local weight=[%d, %d].",
-                self.pcp_size,
+                parallel_name,
+                parallel_name,
+                self.shard_size,
                 self.gate_output_size,
                 self.gate_full_input_size,
                 self.gate_output_size,
                 self.gate_shard_input_size,
             )
 
-    def _narrow_to_pcp_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
-        """Slice this PCP rank's input columns from the full checkpoint weight."""
+    def _narrow_to_k_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        """Slice this rank's input columns from the full checkpoint weight."""
         if loaded_weight.dim() == 2 and loaded_weight.shape == (
             self.gate_output_size,
             self.gate_full_input_size,
         ):
             return loaded_weight.narrow(
                 1,
-                self.pcp_rank * self.gate_shard_input_size,
+                self.shard_rank * self.gate_shard_input_size,
                 self.gate_shard_input_size,
             )
         raise ValueError(
-            "linear_gate PCP sharding expected the full checkpoint weight of "
-            f"shape [{self.gate_output_size}, {self.gate_full_input_size}], got "
-            f"{tuple(loaded_weight.shape)}."
+            f"linear_gate {self.parallel_name} sharding expected the full "
+            f"checkpoint weight of shape [{self.gate_output_size}, "
+            f"{self.gate_full_input_size}], got {tuple(loaded_weight.shape)}."
         )
 
     def weight_loader(self, param, loaded_weight: torch.Tensor):
-        super().weight_loader(param, self._narrow_to_pcp_shard(loaded_weight))
+        super().weight_loader(param, self._narrow_to_k_shard(loaded_weight))
 
     def weight_loader_v2(self, param, loaded_weight: torch.Tensor):
-        super().weight_loader_v2(param, self._narrow_to_pcp_shard(loaded_weight))
+        super().weight_loader_v2(param, self._narrow_to_k_shard(loaded_weight))
 
     def _linear(self, hidden: torch.Tensor) -> torch.Tensor:
         weight = self.weight
@@ -739,77 +959,140 @@ class PCPShardedGateLinear(ColumnParallelLinear):
         if weight.shape[1] == hidden.shape[-1]:
             return torch.nn.functional.linear(hidden, weight)
         raise RuntimeError(
-            "linear_gate PCP sharding found an unexpected weight layout "
-            f"{tuple(weight.shape)} for input width {hidden.shape[-1]}"
+            f"linear_gate {self.parallel_name} sharding found an unexpected "
+            f"weight layout {tuple(weight.shape)} for input width "
+            f"{hidden.shape[-1]}"
         )
 
-    def _local_k_slice(self, hidden: torch.Tensor) -> torch.Tensor:
-        start = self.pcp_rank * self.gate_shard_input_size
-        return hidden.narrow(-1, start, self.gate_shard_input_size).contiguous()
+    def _align_tokens(
+        self, input_: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        local_tokens = input_.shape[0]
+        if not self.align_uneven_tokens:
+            return input_, local_tokens, local_tokens
+        count = torch.tensor(
+            [local_tokens], device=input_.device, dtype=torch.int32
+        )
+        dist.all_reduce(
+            count,
+            op=dist.ReduceOp.MAX,
+            group=self.shard_group.device_group,
+        )
+        max_tokens = int(count.item())
+        if max_tokens > local_tokens:
+            input_ = torch.nn.functional.pad(
+                input_, (0, 0, 0, max_tokens - local_tokens)
+            )
+        return input_, local_tokens, max_tokens
+
+    def _k_shard_block(self, block: torch.Tensor) -> torch.Tensor:
+        current_tokens = block.shape[0]
+        send = (
+            block.reshape(
+                current_tokens, self.shard_size, self.gate_shard_input_size
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+        received = torch.empty_like(send)
+        dist.all_to_all_single(
+            received.view(-1),
+            send.view(-1),
+            group=self.shard_group.device_group,
+        )
+        partial = self._linear(
+            received.view(
+                self.shard_size * current_tokens,
+                self.gate_shard_input_size,
+            )
+        )
+        return self.shard_group.reduce_scatter(partial.contiguous(), dim=0)
 
     def _forward_k_shard(self, input_: torch.Tensor) -> torch.Tensor:
-        pcp_group = get_pcp_group()
-        local_tokens = input_.shape[0]
-        chunking_enabled = linear_gate_pcp_chunking_enabled()
-        block_tokens = linear_gate_pcp_block_tokens() if chunking_enabled else local_tokens
-        if chunking_enabled and local_tokens > block_tokens:
-            output = None
-            for start in range(0, local_tokens, block_tokens):
-                end = min(start + block_tokens, local_tokens)
-                current_tokens = end - start
-                # For destination rank r, send K slice r of this rank-local token
-                # block. The receive layout is source-rank-major global token order.
-                send = input_[start:end].reshape(
-                    current_tokens, self.pcp_size, self.gate_shard_input_size
-                ).transpose(0, 1).contiguous()
-                received = torch.empty_like(send)
-                dist.all_to_all_single(
-                    received.view(-1),
-                    send.view(-1),
-                    group=pcp_group.device_group,
-                )
-                partial = self._linear(
-                    received.view(
-                        self.pcp_size * current_tokens,
-                        self.gate_shard_input_size,
-                    )
-                )
-                # Equivalent to all-reduce(partial) followed by selecting this
-                # rank's token rows. Blocking bounds the unreduced gate activation.
-                block_output = pcp_group.reduce_scatter(partial.contiguous(), dim=0)
-                if output is None:
-                    output = block_output.new_empty(
-                        (local_tokens, self.gate_output_size)
-                    )
-                output[start:end].copy_(block_output)
-
-            if output is None:
-                return input_.new_empty((0, self.gate_output_size))
-            return output
+        aligned, local_tokens, aligned_tokens = self._align_tokens(input_)
+        if aligned_tokens == 0:
+            return input_.new_empty((0, self.gate_output_size))
+        chunking_enabled = self._chunking_enabled_fn()
+        block_tokens = (
+            self._block_tokens_fn() if chunking_enabled else aligned_tokens
+        )
+        if chunking_enabled and aligned_tokens > block_tokens:
+            output = aligned.new_empty(
+                (aligned_tokens, self.gate_output_size)
+            )
+            for start in range(0, aligned_tokens, block_tokens):
+                end = min(start + block_tokens, aligned_tokens)
+                output[start:end].copy_(self._k_shard_block(aligned[start:end]))
         else:
-            # For destination rank r, send K slice r of every local token. The
-            # receive layout is source-rank-major, which is global token order.
-            send = input_.reshape(
-                local_tokens, self.pcp_size, self.gate_shard_input_size
-            ).transpose(0, 1).contiguous()
-            received = torch.empty_like(send)
-            dist.all_to_all_single(
-                received.view(-1),
-                send.view(-1),
-                group=pcp_group.device_group,
-            )
-            partial = self._linear(
-                received.view(self.pcp_size * local_tokens, self.gate_shard_input_size)
-            )
-            # Equivalent to all-reduce(partial) followed by selecting this rank's
-            # token rows, but avoids materializing the full reduced output.
-            return pcp_group.reduce_scatter(partial.contiguous(), dim=0)
+            output = self._k_shard_block(aligned)
+        if local_tokens != aligned_tokens:
+            return output[:local_tokens]
+        return output
 
     def forward(self, input_):
         output = self._forward_k_shard(input_)
         if not self.return_bias:
             return output
         return output, None
+
+
+class PCPShardedGateLinear(_KShardedGateLinear):
+    """PCP-shard ``linear_gate`` using K sharding inside a PCP subgroup."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        pcp_group = _get_linear_gate_pcp_group()
+        super().__init__(
+            input_size,
+            output_size,
+            group=pcp_group,
+            parallel_name="PCP",
+            enable_env=_LINEAR_GATE_PCP_SHARD_ENV,
+            align_uneven_tokens=False,
+            chunking_enabled_fn=linear_gate_pcp_chunking_enabled,
+            block_tokens_fn=linear_gate_pcp_block_tokens,
+            log_once_flag="_linear_gate_pcp_shard_logged",
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.pcp_rank = self.shard_rank
+        self.pcp_size = self.shard_size
+
+
+class DPShardedGateLinear(_KShardedGateLinear):
+    """DP-shard ``linear_gate`` using K sharding inside a DP subgroup."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        dp_group = _get_linear_gate_dp_group()
+        super().__init__(
+            input_size,
+            output_size,
+            group=dp_group,
+            parallel_name="DP",
+            enable_env=_LINEAR_GATE_DP_SHARD_ENV,
+            align_uneven_tokens=True,
+            chunking_enabled_fn=linear_gate_dp_chunking_enabled,
+            block_tokens_fn=linear_gate_dp_block_tokens,
+            log_once_flag="_linear_gate_dp_shard_logged",
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.dp_rank = self.shard_rank
+        self.dp_size = self.shard_size
+
 
 class HYV4MLAAttention(nn.Module):
     """Multi-head latent attention with optional sparse lightning indexer.
@@ -1029,8 +1312,21 @@ class HYV4MLAAttention(nn.Module):
                 self.gate_projection_size_per_head = self.v_head_dim
             else:
                 raise ValueError(f"Unknown gating type: {config.gating_type}")
+            if linear_gate_pcp_shard_enabled() and linear_gate_dp_shard_enabled():
+                raise ValueError(
+                    "linear_gate PCP sharding and DP sharding cannot be "
+                    f"enabled together. Unset {_LINEAR_GATE_PCP_SHARD_ENV} or "
+                    f"{_LINEAR_GATE_DP_SHARD_ENV}."
+                )
             if linear_gate_pcp_shard_enabled():
                 self.linear_gate = PCPShardedGateLinear(
+                    self.hidden_size,
+                    self.num_heads * self.gate_projection_size_per_head,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.linear_gate",
+                )
+            elif linear_gate_dp_shard_enabled():
+                self.linear_gate = DPShardedGateLinear(
                     self.hidden_size,
                     self.num_heads * self.gate_projection_size_per_head,
                     quant_config=quant_config,
