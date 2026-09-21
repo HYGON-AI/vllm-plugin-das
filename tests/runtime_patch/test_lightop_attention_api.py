@@ -607,6 +607,38 @@ def test_sparse_mask_route_reserves_identity_table_during_profile(
     assert arange_calls == [320]
 
 
+def test_sparse_mla_reserves_identity_table_for_fused_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    calls: list[tuple[torch.device, int, int]] = []
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_LIGHTOP_MASK_TOPK", False)
+    monkeypatch.setattr(
+        runtime.henvs, "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", True
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_identity_page_table",
+        lambda device, rows, max_model_len: calls.append(
+            (torch.device(device), rows, max_model_len)
+        ),
+    )
+    hidden_states = torch.zeros((64, 1), dtype=torch.float32)
+    q_fp8 = torch.zeros((64, 32, 128), dtype=torch.float8_e4m3fn)
+
+    runtime._reserve_lightop_identity_page_table_for_profile(
+        hidden_states,
+        q_fp8,
+        topk_tokens=2048,
+        max_model_len=8192,
+    )
+
+    assert calls == [(torch.device("cpu"), 64, 8192)]
+
+
 def test_sparse_mask_route_uses_public_plain_producer_for_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

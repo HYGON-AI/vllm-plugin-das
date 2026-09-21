@@ -62,10 +62,13 @@ def _reserve_lightop_identity_page_table_for_profile(
     topk_tokens: int,
     max_model_len: int,
 ) -> None:
-    """Charge the persistent mask-TopK table to the memory profile run."""
+    """Charge persistent LightOp TopK mappings to the memory profile run."""
     if not (
         henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
+        and (
+            henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
+            or _use_lightop_sparse_mla_topk()
+        )
         and current_platform.is_rocm()
         and on_gfx938()
         and topk_tokens == 2048
