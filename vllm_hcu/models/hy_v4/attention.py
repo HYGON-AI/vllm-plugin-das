@@ -867,6 +867,15 @@ class _KShardedGateLinear(ColumnParallelLinear):
         self.align_uneven_tokens = align_uneven_tokens
         self._chunking_enabled_fn = chunking_enabled_fn
         self._block_tokens_fn = block_tokens_fn
+        # DP all_to_all_single needs equal numel. Pad only this GEMM to the
+        # scheduler cap (a Python int fixed at init). No cross-rank sync and
+        # no .item() in the forward, so FULL CUDA graph capture/replay keeps
+        # one communication shape. Attention/MoE still see the real token
+        # count; output is sliced back below.
+        self._align_pad_tokens: int | None = None
+        if align_uneven_tokens:
+            sched = get_current_vllm_config().scheduler_config
+            self._align_pad_tokens = int(sched.max_num_batched_tokens)
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size != 1:
             raise ValueError(
@@ -915,9 +924,11 @@ class _KShardedGateLinear(ColumnParallelLinear):
         logged = globals()[log_once_flag]
         if not logged:
             globals()[log_once_flag] = True
+            chunking = self._chunking_enabled_fn()
             logger.info(
                 "HY V4 linear_gate %s K sharding enabled: %s=%d, "
-                "full weight=[%d, %d], local weight=[%d, %d].",
+                "full weight=[%d, %d], local weight=[%d, %d], "
+                "chunking=%s, block_tokens=%s, align_pad_tokens=%s.",
                 parallel_name,
                 parallel_name,
                 self.shard_size,
@@ -925,6 +936,9 @@ class _KShardedGateLinear(ColumnParallelLinear):
                 self.gate_full_input_size,
                 self.gate_output_size,
                 self.gate_shard_input_size,
+                chunking,
+                self._block_tokens_fn() if chunking else "all",
+                self._align_pad_tokens if self._align_pad_tokens is not None else "off",
             )
 
     def _narrow_to_k_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
@@ -970,20 +984,21 @@ class _KShardedGateLinear(ColumnParallelLinear):
         local_tokens = input_.shape[0]
         if not self.align_uneven_tokens:
             return input_, local_tokens, local_tokens
-        count = torch.tensor(
-            [local_tokens], device=input_.device, dtype=torch.int32
-        )
-        dist.all_reduce(
-            count,
-            op=dist.ReduceOp.MAX,
-            group=self.shard_group.device_group,
-        )
-        max_tokens = int(count.item())
-        if max_tokens > local_tokens:
-            input_ = torch.nn.functional.pad(
-                input_, (0, 0, 0, max_tokens - local_tokens)
+        pad_tokens = self._align_pad_tokens
+        assert pad_tokens is not None
+        if local_tokens > pad_tokens:
+            raise RuntimeError(
+                f"linear_gate {self.parallel_name} input has {local_tokens} "
+                f"tokens, above the fixed pad {pad_tokens}."
             )
-        return input_, local_tokens, max_tokens
+        if local_tokens < pad_tokens:
+            # Zero-fill only this GEMM. Pad width is a Python constant, so
+            # all_to_all_single numel matches on every rank without a
+            # host sync.
+            input_ = torch.nn.functional.pad(
+                input_, (0, 0, 0, pad_tokens - local_tokens)
+            )
+        return input_, local_tokens, pad_tokens
 
     def _k_shard_block(self, block: torch.Tensor) -> torch.Tensor:
         current_tokens = block.shape[0]
@@ -1013,9 +1028,10 @@ class _KShardedGateLinear(ColumnParallelLinear):
         if aligned_tokens == 0:
             return input_.new_empty((0, self.gate_output_size))
         chunking_enabled = self._chunking_enabled_fn()
-        block_tokens = (
-            self._block_tokens_fn() if chunking_enabled else aligned_tokens
-        )
+        if chunking_enabled:
+            block_tokens = self._block_tokens_fn()
+        else:
+            block_tokens = aligned_tokens
         if chunking_enabled and aligned_tokens > block_tokens:
             output = aligned.new_empty(
                 (aligned_tokens, self.gate_output_size)
@@ -1496,14 +1512,13 @@ class HYV4MLAAttention(nn.Module):
             hidden_states.shape[0],
             self.num_local_heads * self.v_head_dim,
         )
-        # Single coarse eager break covering the indexer and MLA attention, as
-        # the breakable cudagraph contract requires: everything that reads
-        # per-batch metadata runs in one eager segment, so no tensor has to stay
-        # alive across a capture-segment boundary.
+        # Indexer, MLA, and DP-sharded linear_gate share one eager break under
+        # PIECEWISE. Gate padding is a fixed Python length, so FULL capture
+        # can include this region without a host sync.
         attn_out = torch.empty(
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
-        self._indexer_and_attn(
+        self._indexer_attn_and_gate(
             hidden_states,
             q_c,
             positions,
@@ -1514,21 +1529,11 @@ class HYV4MLAAttention(nn.Module):
             q_dcp_replicated,
         )
 
-        if self.gated_mla and self.linear_gate is not None:
-            gate_score = self.linear_gate(hidden_states)[0]
-            if self.config.gating_type == "headwise":
-                gate_score = gate_score.unsqueeze(-1)
-                attn_out = attn_out.reshape(*attn_out.shape[:-1], -1, self.v_head_dim)
-                attn_out = attn_out * torch.sigmoid(gate_score)
-                attn_out = attn_out.reshape(*attn_out.shape[:-2], -1)
-            else:
-                attn_out = attn_out * torch.sigmoid(gate_score)
-
         out, _ = self.o_proj(attn_out)
         return out
 
     @eager_break_during_capture
-    def _indexer_and_attn(
+    def _indexer_attn_and_gate(
         self,
         hidden_states: torch.Tensor,
         q_c: torch.Tensor | None,
@@ -1539,15 +1544,7 @@ class HYV4MLAAttention(nn.Module):
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
         q_dcp_replicated: torch.Tensor | None = None,
     ) -> None:
-        """Run the lightning indexer and MLA attention in one eager segment.
-
-        Both read per-batch attention metadata, so under the breakable cudagraph
-        they must not be captured. Keeping them in a single break (instead of one
-        break each) also means the attention inputs never have to survive a
-        capture-segment boundary. The nested ``sparse_attn_indexer`` and
-        ``unified_mla_attention_with_output`` breaks short-circuit here, since
-        the capture is no longer active inside an eager segment.
-        """
+        """Indexer + MLA + optional linear_gate in one eager PIECEWISE segment."""
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
         out.copy_(
@@ -1559,6 +1556,15 @@ class HYV4MLAAttention(nn.Module):
                 q_dcp_replicated=q_dcp_replicated,
             )
         )
+        if self.gated_mla and self.linear_gate is not None:
+            gate_score = self.linear_gate(hidden_states)[0]
+            if self.config.gating_type == "headwise":
+                gate_score = gate_score.unsqueeze(-1)
+                gated = out.reshape(*out.shape[:-1], -1, self.v_head_dim)
+                gated = gated * torch.sigmoid(gate_score)
+                out.copy_(gated.reshape(out.shape))
+            else:
+                out.mul_(torch.sigmoid(gate_score))
 
 
 __all__ = [
