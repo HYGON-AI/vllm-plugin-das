@@ -349,6 +349,92 @@ def test_sparse_mla_topk_helpers_use_categorized_attention_kernels(
     assert len(decode_calls) == 1
 
 
+def test_sparse_mla_decode_uses_fast_topk_transform_for_mtp3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    fused_calls: list[dict[str, object]] = []
+    expected = torch.tensor(
+        [[8, 7], [9, 8], [10, 9], [11, 10]], dtype=torch.int32
+    )
+
+    def fast_topk_transform_fused(**kwargs):
+        fused_calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(
+            fast_topk_transform_fused=fast_topk_transform_fused,
+            top_k_per_row_decode=lambda *_args: pytest.fail(
+                "legacy decode TopK called"
+            ),
+        ),
+        raising=False,
+    )
+    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
+    if resolver is not None:
+        resolver.cache_clear()
+    logits = torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    topk = torch.full((4, 2), -1, dtype=torch.int32)
+
+    runtime._lightop_topk_indices_decode(
+        logits,
+        torch.tensor([12], dtype=torch.int32),
+        4,
+        topk,
+        2,
+    )
+
+    assert len(fused_calls) == 1
+    call = fused_calls[0]
+    assert call["score"] is logits
+    assert torch.equal(call["lengths"], torch.tensor([9, 10, 11, 12]))
+    assert torch.equal(
+        call["cu_seqlens_q"], torch.tensor([0, 1, 2, 3, 4])
+    )
+    assert call["topk"] == 2
+    assert call["row_starts"] is None
+    page_table = call["page_table_size_1"]
+    assert isinstance(page_table, torch.Tensor)
+    assert page_table.shape == (4, 16)
+    assert page_table.is_contiguous()
+    assert torch.equal(page_table[3], torch.arange(16, dtype=torch.int32))
+    assert torch.equal(topk, expected)
+
+
+def test_sparse_mla_decode_falls_back_without_fast_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    def top_k_per_row_decode(*args):
+        args[3].fill_(5)
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(top_k_per_row_decode=top_k_per_row_decode),
+        raising=False,
+    )
+    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
+    if resolver is not None:
+        resolver.cache_clear()
+    logits = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    topk = torch.full((2, 2), -1, dtype=torch.int32)
+
+    runtime._lightop_topk_indices_decode(
+        logits,
+        torch.tensor([6, 5], dtype=torch.int32),
+        1,
+        topk,
+        2,
+    )
+
+    assert torch.equal(topk, torch.full((2, 2), 5, dtype=torch.int32))
+
+
 def _enable_sparse_mask_route(monkeypatch: pytest.MonkeyPatch):
     runtime = _runtime()
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)

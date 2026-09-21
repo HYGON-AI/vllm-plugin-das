@@ -92,6 +92,18 @@ def _get_lightop_attention():
     return lightop_attention
 
 
+@functools.lru_cache(maxsize=1)
+def _lightop_fast_topk_transform():
+    """Resolve the optional categorized LightOp fused decode TopK API."""
+    try:
+        operation = getattr(
+            _get_lightop_attention(), "fast_topk_transform_fused"
+        )
+    except (AttributeError, ImportError, OSError):
+        return None
+    return operation if callable(operation) else None
+
+
 _GLOBAL_LOGITS_BUFFERS = {}
 
 # mqa_logits分块全局缓存大小，避免大输入打开pc时OOM
@@ -1358,13 +1370,33 @@ def _lightop_topk_indices_decode(
     topk_indices: torch.Tensor,
     topk_tokens: int,
 ) -> None:
-    row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
+    num_rows = logits.shape[0]
+    row_ends = _decode_row_ends_from_seq_lens(
+        seq_lens, next_n, num_rows
+    ).to(device=logits.device, dtype=torch.int32).contiguous()
+    fast_topk_transform = _lightop_fast_topk_transform()
+    if fast_topk_transform is not None:
+        transformed_indices = fast_topk_transform(
+            score=logits,
+            lengths=row_ends,
+            page_table_size_1=_lightop_identity_page_table(
+                logits.device, num_rows, logits.shape[1]
+            ),
+            cu_seqlens_q=torch.arange(
+                num_rows + 1, dtype=torch.int32, device=logits.device
+            ),
+            topk=topk_tokens,
+            row_starts=None,
+        )
+        topk_indices.copy_(transformed_indices)
+        return
+
     _get_lightop_attention().top_k_per_row_decode(
         logits,
         1,
-        row_ends.to(device=logits.device, dtype=torch.int32),
+        row_ends,
         topk_indices,
-        logits.shape[0],
+        num_rows,
         logits.stride(0),
         logits.stride(1),
         topk_tokens,
