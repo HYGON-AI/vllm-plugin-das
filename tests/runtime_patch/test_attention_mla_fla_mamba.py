@@ -2526,6 +2526,31 @@ def test_hcu_dcp_topk_merge_falls_back_when_lightop_fused_api_is_missing(
     assert indices.shape == (1, 2048)
 
 
+def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets(monkeypatch):
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+    indexer._LIGHTOP_DCP_TOPK_METADATA.clear()
+    try:
+        for rows in range(1, 130):
+            lengths, cu_seqlens_q = indexer._lightop_dcp_topk_metadata(
+                torch.device("cpu"), rows, 4096
+            )
+            assert lengths.shape == (rows,)
+            assert cu_seqlens_q.shape == (rows + 1,)
+            assert torch.equal(lengths, torch.full((rows,), 4096, dtype=torch.int32))
+            assert torch.equal(
+                cu_seqlens_q, torch.arange(rows + 1, dtype=torch.int32)
+            )
+
+        assert len(indexer._LIGHTOP_DCP_TOPK_METADATA) == 9
+        total_capacity = sum(
+            lengths.numel() + cu_seqlens_q.numel()
+            for lengths, cu_seqlens_q in indexer._LIGHTOP_DCP_TOPK_METADATA.values()
+        )
+        assert total_capacity <= 2 * (2 * 256 - 1) + 9
+    finally:
+        indexer._LIGHTOP_DCP_TOPK_METADATA.clear()
+
+
 def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 

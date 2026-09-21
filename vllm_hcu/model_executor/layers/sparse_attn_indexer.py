@@ -85,20 +85,26 @@ def _lightop_dcp_topk_metadata(
     rows: int,
     candidate_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return stable full-row lengths and unit-query offsets for DCP TopK."""
+    """Return stable, capacity-bucketed metadata for DCP TopK."""
     device = torch.device(device)
-    key = (device.type, device.index, rows, candidate_count)
+    capacity = 1 << (max(rows, 1) - 1).bit_length()
+    key = (device.type, device.index, candidate_count, capacity)
     metadata = _LIGHTOP_DCP_TOPK_METADATA.get(key)
     if metadata is None:
         lengths = torch.full(
-            (rows,), candidate_count, dtype=torch.int32, device=device
+            (capacity,), candidate_count, dtype=torch.int32, device=device
         )
         cu_seqlens_q = torch.arange(
-            rows + 1, dtype=torch.int32, device=device
+            capacity + 1, dtype=torch.int32, device=device
         )
         metadata = (lengths, cu_seqlens_q)
-        _LIGHTOP_DCP_TOPK_METADATA[key] = metadata
-    return metadata
+        capturing = (
+            device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        )
+        if not capturing:
+            _LIGHTOP_DCP_TOPK_METADATA[key] = metadata
+    lengths, cu_seqlens_q = metadata
+    return lengths[:rows], cu_seqlens_q[: rows + 1]
 
 
 def _assert_cutedsl_dcp_merge_supported(
