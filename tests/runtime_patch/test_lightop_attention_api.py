@@ -431,18 +431,18 @@ def test_sparse_mla_decode_falls_back_without_fast_topk(
     resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
     if resolver is not None:
         resolver.cache_clear()
-    logits = torch.arange(12, dtype=torch.float32).reshape(2, 6)
-    topk = torch.full((2, 2), -1, dtype=torch.int32)
+    logits = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
+    topk = torch.full((2, 2048), -1, dtype=torch.int32)
 
     runtime._lightop_topk_indices_decode(
         logits,
-        torch.tensor([6, 5], dtype=torch.int32),
+        torch.tensor([4096, 4095], dtype=torch.int32),
         1,
         topk,
-        2,
+        2048,
     )
 
-    assert torch.equal(topk, torch.full((2, 2), 5, dtype=torch.int32))
+    assert torch.equal(topk, torch.full((2, 2048), 5, dtype=torch.int32))
 
 
 def test_sparse_mla_decode_keeps_direct_topk_when_fast_transform_disabled(
