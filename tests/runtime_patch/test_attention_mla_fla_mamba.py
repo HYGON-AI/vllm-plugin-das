@@ -2428,6 +2428,129 @@ def test_hcu_dcp_topk_merge_accepts_empty_local_logits(monkeypatch):
     torch.testing.assert_close(indices, torch.tensor([[1, 3]], dtype=torch.int32))
 
 
+def test_hcu_dcp_topk_merge_uses_lightop_fused_global_selection(monkeypatch):
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+    class _Group:
+        def all_gather(self, packed, dim):
+            assert dim == 1
+            remote = packed.clone()
+            remote[..., 0].add_(0.5)
+            remote[..., 1].add_(1)
+            return torch.cat((packed, remote), dim=1)
+
+    fused_calls = []
+    expected = torch.arange(4095, 2047, -1, dtype=torch.int32).reshape(1, -1)
+
+    def fast_topk_transform_fused(**kwargs):
+        fused_calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(indexer, "current_platform", _Platform)
+    monkeypatch.setattr(indexer, "get_dcp_group", lambda: _Group())
+    monkeypatch.setattr(indexer, "_use_lightop_dcp_topk_transform", lambda: True)
+    monkeypatch.setattr(
+        indexer,
+        "_lightop_fast_topk_transform",
+        lambda: fast_topk_transform_fused,
+    )
+    indices = torch.arange(2048, dtype=torch.int32).reshape(1, -1)
+    logits = torch.arange(2048, dtype=torch.float32).reshape(1, -1)
+
+    indexer._merge_dcp_topk_global(
+        logits=logits,
+        topk_indices=indices,
+        topk_tokens=2048,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert len(fused_calls) == 1
+    call = fused_calls[0]
+    assert call["score"].shape == (1, 4096)
+    assert call["score"].is_contiguous()
+    assert call["page_table_size_1"].dtype == torch.int32
+    assert call["page_table_size_1"].is_contiguous()
+    assert torch.equal(call["lengths"], torch.tensor([4096], dtype=torch.int32))
+    assert torch.equal(call["cu_seqlens_q"], torch.tensor([0, 1], dtype=torch.int32))
+    assert call["topk"] == 2048
+    assert call["row_starts"] is None
+    assert torch.equal(indices, expected)
+
+
+def test_hcu_dcp_topk_merge_falls_back_when_lightop_fused_api_is_missing(
+    monkeypatch,
+):
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+    class _Group:
+        def all_gather(self, packed, dim):
+            assert dim == 1
+            return torch.cat((packed, packed.clone()), dim=1)
+
+    torch_topk = torch.topk
+    torch_topk_calls = []
+
+    def tracked_torch_topk(*args, **kwargs):
+        torch_topk_calls.append((args, kwargs))
+        return torch_topk(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "current_platform", _Platform)
+    monkeypatch.setattr(indexer, "get_dcp_group", lambda: _Group())
+    monkeypatch.setattr(indexer, "_use_lightop_dcp_topk_transform", lambda: True)
+    monkeypatch.setattr(indexer, "_lightop_fast_topk_transform", lambda: None)
+    monkeypatch.setattr(indexer.torch, "topk", tracked_torch_topk)
+    indices = torch.arange(2048, dtype=torch.int32).reshape(1, -1)
+
+    indexer._merge_dcp_topk_global(
+        logits=torch.arange(2048, dtype=torch.float32).reshape(1, -1),
+        topk_indices=indices,
+        topk_tokens=2048,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert len(torch_topk_calls) == 1
+    assert indices.shape == (1, 2048)
+
+
+def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets(monkeypatch):
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+    indexer._LIGHTOP_DCP_TOPK_METADATA.clear()
+    try:
+        for rows in range(1, 130):
+            lengths, cu_seqlens_q = indexer._lightop_dcp_topk_metadata(
+                torch.device("cpu"), rows, 4096
+            )
+            assert lengths.shape == (rows,)
+            assert cu_seqlens_q.shape == (rows + 1,)
+            assert torch.equal(lengths, torch.full((rows,), 4096, dtype=torch.int32))
+            assert torch.equal(
+                cu_seqlens_q, torch.arange(rows + 1, dtype=torch.int32)
+            )
+
+        assert len(indexer._LIGHTOP_DCP_TOPK_METADATA) == 9
+        total_capacity = sum(
+            lengths.numel() + cu_seqlens_q.numel()
+            for lengths, cu_seqlens_q in indexer._LIGHTOP_DCP_TOPK_METADATA.values()
+        )
+        assert total_capacity <= 2 * (2 * 256 - 1) + 9
+    finally:
+        indexer._LIGHTOP_DCP_TOPK_METADATA.clear()
+
+
 def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
