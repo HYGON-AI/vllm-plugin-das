@@ -147,6 +147,14 @@ def _runtime():
     return importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
 
 
+@pytest.fixture
+def fast_topk_runtime():
+    runtime = _runtime()
+    runtime._lightop_fast_topk_transform.cache_clear()
+    yield runtime
+    runtime._lightop_fast_topk_transform.cache_clear()
+
+
 @pytest.mark.parametrize("is_gfx938", [False, True])
 def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     monkeypatch: pytest.MonkeyPatch,
@@ -350,9 +358,10 @@ def test_sparse_mla_topk_helpers_use_categorized_attention_kernels(
 
 
 def test_sparse_mla_decode_uses_fast_topk_transform_for_mtp3(
+    fast_topk_runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime()
+    runtime = fast_topk_runtime
     fused_calls: list[dict[str, object]] = []
     expected = torch.arange(2048, dtype=torch.int32).repeat(4, 1)
 
@@ -377,9 +386,6 @@ def test_sparse_mla_decode_uses_fast_topk_transform_for_mtp3(
         True,
         raising=False,
     )
-    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
-    if resolver is not None:
-        resolver.cache_clear()
     logits = torch.arange(4 * 4096, dtype=torch.float32).reshape(4, 4096)
     topk = torch.full((4, 2048), -1, dtype=torch.int32)
 
@@ -409,9 +415,10 @@ def test_sparse_mla_decode_uses_fast_topk_transform_for_mtp3(
 
 
 def test_sparse_mla_decode_falls_back_without_fast_topk(
+    fast_topk_runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime()
+    runtime = fast_topk_runtime
 
     def top_k_per_row_decode(*args):
         args[3].fill_(5)
@@ -428,9 +435,6 @@ def test_sparse_mla_decode_falls_back_without_fast_topk(
         True,
         raising=False,
     )
-    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
-    if resolver is not None:
-        resolver.cache_clear()
     logits = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
     topk = torch.full((2, 2048), -1, dtype=torch.int32)
 
@@ -446,9 +450,10 @@ def test_sparse_mla_decode_falls_back_without_fast_topk(
 
 
 def test_sparse_mla_decode_keeps_direct_topk_when_fast_transform_disabled(
+    fast_topk_runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime()
+    runtime = fast_topk_runtime
 
     def top_k_per_row_decode(*args):
         args[3].fill_(6)
@@ -470,9 +475,6 @@ def test_sparse_mla_decode_keeps_direct_topk_when_fast_transform_disabled(
         False,
         raising=False,
     )
-    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
-    if resolver is not None:
-        resolver.cache_clear()
     topk = torch.full((1, 2048), -1, dtype=torch.int32)
 
     runtime._lightop_topk_indices_decode(
@@ -487,9 +489,10 @@ def test_sparse_mla_decode_keeps_direct_topk_when_fast_transform_disabled(
 
 
 def test_sparse_mla_decode_keeps_direct_topk_for_unsupported_topk(
+    fast_topk_runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime()
+    runtime = fast_topk_runtime
 
     def top_k_per_row_decode(*args):
         args[3].fill_(4)
@@ -511,9 +514,6 @@ def test_sparse_mla_decode_keeps_direct_topk_for_unsupported_topk(
         True,
         raising=False,
     )
-    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
-    if resolver is not None:
-        resolver.cache_clear()
     topk = torch.full((1, 2), -1, dtype=torch.int32)
 
     runtime._lightop_topk_indices_decode(
@@ -528,9 +528,10 @@ def test_sparse_mla_decode_keeps_direct_topk_for_unsupported_topk(
 
 
 def test_sparse_mla_decode_reuses_unit_query_cu_seqlens(
+    fast_topk_runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime()
+    runtime = fast_topk_runtime
     cu_seqlens: list[torch.Tensor] = []
 
     def fast_topk_transform_fused(**kwargs):
@@ -549,9 +550,6 @@ def test_sparse_mla_decode_reuses_unit_query_cu_seqlens(
         True,
         raising=False,
     )
-    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
-    if resolver is not None:
-        resolver.cache_clear()
     logits = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
     topk = torch.empty((2, 2048), dtype=torch.int32)
 
@@ -742,10 +740,12 @@ def test_sparse_mask_route_reserves_identity_table_during_profile(
 
 
 def test_sparse_mla_reserves_identity_table_for_fused_decode(
+    fast_topk_runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime()
+    runtime = fast_topk_runtime
     calls: list[tuple[torch.device, int, int]] = []
+    cu_seqlens_calls: list[tuple[torch.device, int]] = []
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
     monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
@@ -761,9 +761,22 @@ def test_sparse_mla_reserves_identity_table_for_fused_decode(
     )
     monkeypatch.setattr(
         runtime,
+        "lightop_attention",
+        SimpleNamespace(fast_topk_transform_fused=lambda **_kwargs: None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
         "_lightop_identity_page_table",
         lambda device, rows, max_model_len: calls.append(
             (torch.device(device), rows, max_model_len)
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_unit_query_cu_seqlens",
+        lambda device, rows: cu_seqlens_calls.append(
+            (torch.device(device), rows)
         ),
     )
     hidden_states = torch.zeros((64, 1), dtype=torch.float32)
@@ -777,6 +790,45 @@ def test_sparse_mla_reserves_identity_table_for_fused_decode(
     )
 
     assert calls == [(torch.device("cpu"), 64, 8192)]
+    assert cu_seqlens_calls == [(torch.device("cpu"), 64)]
+
+
+def test_sparse_mla_skips_fused_profile_mapping_when_api_is_missing(
+    fast_topk_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = fast_topk_runtime
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_LIGHTOP_MASK_TOPK", False)
+    monkeypatch.setattr(
+        runtime.henvs, "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", True
+    )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_identity_page_table",
+        lambda *_args: pytest.fail("unused fused mapping was reserved"),
+    )
+
+    runtime._reserve_lightop_identity_page_table_for_profile(
+        torch.zeros((64, 1), dtype=torch.float32),
+        torch.zeros((64, 32, 128), dtype=torch.float8_e4m3fn),
+        topk_tokens=2048,
+        max_model_len=8192,
+    )
 
 
 def test_sparse_mask_route_uses_public_plain_producer_for_mtp(

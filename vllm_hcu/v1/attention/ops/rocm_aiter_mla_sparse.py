@@ -82,11 +82,15 @@ def _reserve_lightop_identity_page_table_for_profile(
     max_model_len: int,
 ) -> None:
     """Charge persistent LightOp TopK mappings to the memory profile run."""
+    use_fast_topk_transform = (
+        _use_lightop_fast_topk_transform()
+        and _lightop_fast_topk_transform() is not None
+    )
     if not (
         henvs.VLLM_HCU_USE_CUSTOM_OPS
         and (
             henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
-            or _use_lightop_fast_topk_transform()
+            or use_fast_topk_transform
         )
         and current_platform.is_rocm()
         and on_gfx938()
@@ -103,7 +107,7 @@ def _reserve_lightop_identity_page_table_for_profile(
         hidden_states.shape[0],
         max_model_len,
     )
-    if _use_lightop_fast_topk_transform():
+    if use_fast_topk_transform:
         _lightop_unit_query_cu_seqlens(
             hidden_states.device, hidden_states.shape[0]
         )
