@@ -354,9 +354,7 @@ def test_sparse_mla_decode_uses_fast_topk_transform_for_mtp3(
 ) -> None:
     runtime = _runtime()
     fused_calls: list[dict[str, object]] = []
-    expected = torch.tensor(
-        [[8, 7], [9, 8], [10, 9], [11, 10]], dtype=torch.int32
-    )
+    expected = torch.arange(2048, dtype=torch.int32).repeat(4, 1)
 
     def fast_topk_transform_fused(**kwargs):
         fused_calls.append(kwargs)
@@ -373,34 +371,40 @@ def test_sparse_mla_decode_uses_fast_topk_transform_for_mtp3(
         ),
         raising=False,
     )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
+    )
     resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
     if resolver is not None:
         resolver.cache_clear()
-    logits = torch.arange(64, dtype=torch.float32).reshape(4, 16)
-    topk = torch.full((4, 2), -1, dtype=torch.int32)
+    logits = torch.arange(4 * 4096, dtype=torch.float32).reshape(4, 4096)
+    topk = torch.full((4, 2048), -1, dtype=torch.int32)
 
     runtime._lightop_topk_indices_decode(
         logits,
-        torch.tensor([12], dtype=torch.int32),
+        torch.tensor([2051], dtype=torch.int32),
         4,
         topk,
-        2,
+        2048,
     )
 
     assert len(fused_calls) == 1
     call = fused_calls[0]
     assert call["score"] is logits
-    assert torch.equal(call["lengths"], torch.tensor([9, 10, 11, 12]))
+    assert torch.equal(call["lengths"], torch.tensor([2048, 2049, 2050, 2051]))
     assert torch.equal(
         call["cu_seqlens_q"], torch.tensor([0, 1, 2, 3, 4])
     )
-    assert call["topk"] == 2
+    assert call["topk"] == 2048
     assert call["row_starts"] is None
     page_table = call["page_table_size_1"]
     assert isinstance(page_table, torch.Tensor)
-    assert page_table.shape == (4, 16)
+    assert page_table.shape == (4, 4096)
     assert page_table.is_contiguous()
-    assert torch.equal(page_table[3], torch.arange(16, dtype=torch.int32))
+    assert torch.equal(page_table[3], torch.arange(4096, dtype=torch.int32))
     assert torch.equal(topk, expected)
 
 
@@ -418,6 +422,12 @@ def test_sparse_mla_decode_falls_back_without_fast_topk(
         SimpleNamespace(top_k_per_row_decode=top_k_per_row_decode),
         raising=False,
     )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
+    )
     resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
     if resolver is not None:
         resolver.cache_clear()
@@ -433,6 +443,130 @@ def test_sparse_mla_decode_falls_back_without_fast_topk(
     )
 
     assert torch.equal(topk, torch.full((2, 2), 5, dtype=torch.int32))
+
+
+def test_sparse_mla_decode_keeps_direct_topk_when_fast_transform_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    def top_k_per_row_decode(*args):
+        args[3].fill_(6)
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(
+            fast_topk_transform_fused=lambda **_kwargs: pytest.fail(
+                "opt-in fused transform called while disabled"
+            ),
+            top_k_per_row_decode=top_k_per_row_decode,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        False,
+        raising=False,
+    )
+    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
+    if resolver is not None:
+        resolver.cache_clear()
+    topk = torch.full((1, 2048), -1, dtype=torch.int32)
+
+    runtime._lightop_topk_indices_decode(
+        torch.arange(4096, dtype=torch.float32).reshape(1, 4096),
+        torch.tensor([4096], dtype=torch.int32),
+        1,
+        topk,
+        2048,
+    )
+
+    assert torch.equal(topk, torch.full_like(topk, 6))
+
+
+def test_sparse_mla_decode_keeps_direct_topk_for_unsupported_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    def top_k_per_row_decode(*args):
+        args[3].fill_(4)
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(
+            fast_topk_transform_fused=lambda **_kwargs: pytest.fail(
+                "fused transform only supports topk=2048"
+            ),
+            top_k_per_row_decode=top_k_per_row_decode,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
+    )
+    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
+    if resolver is not None:
+        resolver.cache_clear()
+    topk = torch.full((1, 2), -1, dtype=torch.int32)
+
+    runtime._lightop_topk_indices_decode(
+        torch.arange(16, dtype=torch.float32).reshape(1, 16),
+        torch.tensor([16], dtype=torch.int32),
+        1,
+        topk,
+        2,
+    )
+
+    assert torch.equal(topk, torch.full_like(topk, 4))
+
+
+def test_sparse_mla_decode_reuses_unit_query_cu_seqlens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    cu_seqlens: list[torch.Tensor] = []
+
+    def fast_topk_transform_fused(**kwargs):
+        cu_seqlens.append(kwargs["cu_seqlens_q"])
+        return torch.zeros((2, 2048), dtype=torch.int32)
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(fast_topk_transform_fused=fast_topk_transform_fused),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
+    )
+    resolver = getattr(runtime, "_lightop_fast_topk_transform", None)
+    if resolver is not None:
+        resolver.cache_clear()
+    logits = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
+    topk = torch.empty((2, 2048), dtype=torch.int32)
+
+    for _ in range(2):
+        runtime._lightop_topk_indices_decode(
+            logits,
+            torch.tensor([4096, 4095], dtype=torch.int32),
+            1,
+            topk,
+            2048,
+        )
+
+    assert len(cu_seqlens) == 2
+    assert cu_seqlens[0].data_ptr() == cu_seqlens[1].data_ptr()
+    assert torch.equal(cu_seqlens[0], torch.tensor([0, 1, 2]))
 
 
 def _enable_sparse_mask_route(monkeypatch: pytest.MonkeyPatch):
@@ -618,6 +752,12 @@ def test_sparse_mla_reserves_identity_table_for_fused_decode(
     monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_LIGHTOP_MASK_TOPK", False)
     monkeypatch.setattr(
         runtime.henvs, "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", True
+    )
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
     )
     monkeypatch.setattr(
         runtime,

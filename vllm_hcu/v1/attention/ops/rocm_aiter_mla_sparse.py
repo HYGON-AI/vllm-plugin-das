@@ -37,6 +37,9 @@ lightop_attention = None
 _LIGHTOP_IDENTITY_PAGE_TABLES: dict[
     tuple[str, int | None, int], torch.Tensor
 ] = {}
+_LIGHTOP_UNIT_QUERY_CU_SEQLENS: dict[
+    tuple[str, int | None, int], torch.Tensor
+] = {}
 
 
 def _lightop_identity_page_table(
@@ -56,6 +59,22 @@ def _lightop_identity_page_table(
     return table[:rows]
 
 
+def _lightop_unit_query_cu_seqlens(
+    device: torch.device,
+    rows: int,
+) -> torch.Tensor:
+    """Return stable cumulative lengths for one decode query per row."""
+    device = torch.device(device)
+    key = (device.type, device.index, rows)
+    cu_seqlens_q = _LIGHTOP_UNIT_QUERY_CU_SEQLENS.get(key)
+    if cu_seqlens_q is None:
+        cu_seqlens_q = torch.arange(
+            rows + 1, dtype=torch.int32, device=device
+        )
+        _LIGHTOP_UNIT_QUERY_CU_SEQLENS[key] = cu_seqlens_q
+    return cu_seqlens_q
+
+
 def _reserve_lightop_identity_page_table_for_profile(
     hidden_states: torch.Tensor,
     q_fp8: torch.Tensor,
@@ -67,7 +86,7 @@ def _reserve_lightop_identity_page_table_for_profile(
         henvs.VLLM_HCU_USE_CUSTOM_OPS
         and (
             henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
-            or _use_lightop_sparse_mla_topk()
+            or _use_lightop_fast_topk_transform()
         )
         and current_platform.is_rocm()
         and on_gfx938()
@@ -84,6 +103,10 @@ def _reserve_lightop_identity_page_table_for_profile(
         hidden_states.shape[0],
         max_model_len,
     )
+    if _use_lightop_fast_topk_transform():
+        _lightop_unit_query_cu_seqlens(
+            hidden_states.device, hidden_states.shape[0]
+        )
 
 
 def _get_lightop_attention():
@@ -1129,6 +1152,13 @@ def _use_lightop_sparse_mla_topk() -> bool:
     )
 
 
+def _use_lightop_fast_topk_transform() -> bool:
+    return (
+        _use_lightop_sparse_mla_topk()
+        and henvs.VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _lightop_sparse_mask_topk_ops():
     """Return the paired LightOp sparse-MQA and mask-TopK functions."""
@@ -1377,7 +1407,11 @@ def _lightop_topk_indices_decode(
     row_ends = _decode_row_ends_from_seq_lens(
         seq_lens, next_n, num_rows
     ).to(device=logits.device, dtype=torch.int32).contiguous()
-    fast_topk_transform = _lightop_fast_topk_transform()
+    fast_topk_transform = (
+        _lightop_fast_topk_transform()
+        if _use_lightop_fast_topk_transform() and topk_tokens == 2048
+        else None
+    )
     if fast_topk_transform is not None:
         transformed_indices = fast_topk_transform(
             score=logits,
@@ -1385,8 +1419,8 @@ def _lightop_topk_indices_decode(
             page_table_size_1=_lightop_identity_page_table(
                 logits.device, num_rows, logits.shape[1]
             ),
-            cu_seqlens_q=torch.arange(
-                num_rows + 1, dtype=torch.int32, device=logits.device
+            cu_seqlens_q=_lightop_unit_query_cu_seqlens(
+                logits.device, num_rows
             ),
             topk=topk_tokens,
             row_starts=None,
