@@ -220,24 +220,6 @@ class HCUPlatform(Platform):
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     ]
 
-    @classmethod
-    def set_additional_forward_context(
-        cls, *args, **kwargs
-    ) -> dict[str, object]:
-        """Expose the resolved attention mode to model-local QSA kernels.
-
-        QSA is not a global vLLM attention backend, so it cannot obtain the
-        mode through the attention selector.  Carrying the normalized mode in
-        the standard ``ForwardContext.additional_kwargs`` keeps the QSA
-        dispatcher tied to the exact config used by this forward pass.
-        """
-
-        additional = super().set_additional_forward_context(*args, **kwargs)
-        additional["hcu_flash_attn_mode"] = get_hcu_flash_attn_mode(
-            kwargs.get("vllm_config")
-        )
-        return additional
-
     supported_quantization: list[str] = [
         "awq",
         "awq_marlin",  # will be overwritten with awq

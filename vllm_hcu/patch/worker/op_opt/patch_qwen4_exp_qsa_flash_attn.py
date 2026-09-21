@@ -4,9 +4,10 @@
 
 The official QSA module owns metadata construction, cache views, top-k
 selection, and index expansion.  This adapter only replaces the two audited
-compute wrappers when the QSA dispatcher selects HCU CUTLASS mode; the
-official Triton implementations remain the fallback for every other
-attention mode.  QSA is deliberately not added to vLLM's global
+compute wrappers when ``VLLM_HCU_USE_CUSTOM_OPS`` and
+``VLLM_HCU_USE_QSA_CUTLASS`` are enabled; the official Triton
+implementations remain the fallback otherwise.  QSA is deliberately not added
+to vLLM's global
 ``AttentionBackendEnum``.
 """
 
@@ -23,7 +24,6 @@ from ._common import (
     require_exact_signature,
 )
 from vllm_hcu.v1.attention.backends.qsa import (
-    get_qsa_flash_attn_mode,
     get_qsa_kernel_backend,
 )
 
@@ -93,10 +93,8 @@ def apply_to_module(module: ModuleType) -> bool:
         num_columns=None,
         score_scale=None,
     ):
-        mode = get_qsa_flash_attn_mode()
         try:
             backend = get_qsa_kernel_backend(
-                mode,
                 triton_mqa_paged=original_mqa,
                 triton_sparse_gqa_paged_attn=original_sparse,
             )
@@ -124,10 +122,8 @@ def apply_to_module(module: ModuleType) -> bool:
         token_to_req,
         out=None,
     ):
-        mode = get_qsa_flash_attn_mode()
         try:
             backend = get_qsa_kernel_backend(
-                mode,
                 triton_mqa_paged=original_mqa,
                 triton_sparse_gqa_paged_attn=original_sparse,
             )

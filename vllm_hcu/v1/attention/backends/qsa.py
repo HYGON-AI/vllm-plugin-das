@@ -7,7 +7,8 @@ global ``AttentionBackendEnum`` member.  This module only chooses the QSA
 kernel pair used by that model:
 
 * ``TRITON_QSA`` keeps the official QSA implementation;
-* ``FLASH_QSA`` uses flash_attn's QSA entry points in HCU CUTLASS mode.
+* ``FLASH_QSA`` uses flash_attn's QSA entry points when both
+  ``VLLM_HCU_USE_CUSTOM_OPS`` and ``VLLM_HCU_USE_QSA_CUTLASS`` are enabled.
 
 The generic ``FLASH_ATTN`` backend remains responsible for ordinary attention.
 """
@@ -19,11 +20,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
 
+import vllm_hcu.platforms.envs as henvs
+
 
 QSA_BACKEND_TRITON: Literal["TRITON_QSA"] = "TRITON_QSA"
 QSA_BACKEND_FLASH: Literal["FLASH_QSA"] = "FLASH_QSA"
 QSAKernelName = Literal["TRITON_QSA", "FLASH_QSA"]
-_QSA_MODES = frozenset(("classic", "cutlass", "varlen"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +48,7 @@ def _load_flash_qsa_kernels() -> tuple[Callable[..., Any], Callable[..., Any]]:
         )
     except Exception as exc:
         raise RuntimeError(
-            "FLASH_ATTN_CUTLASS QSA requires flash_attn's "
+            "QSA FlashAttention requires flash_attn's "
             "mqa_paged_score_func and sparse_gqa_paged_attn_func"
         ) from exc
 
@@ -59,49 +61,27 @@ def _load_flash_qsa_kernels() -> tuple[Callable[..., Any], Callable[..., Any]]:
     return mqa_paged_score_func, sparse_gqa_paged_attn_func
 
 
-def get_qsa_flash_attn_mode() -> str:
-    """Return the mode captured by the current forward context when present.
+def is_qsa_cutlass_enabled() -> bool:
+    """Return whether FA QSA is enabled by both HCU switches."""
 
-    ``set_forward_context`` receives the worker's deserialised ``VllmConfig``
-    while ``get_current_vllm_config_or_none`` is not guaranteed to be set in a
-    Model Runner V2 forward.  HCU stores the resolved mode in
-    ``additional_kwargs`` for this reason.  The platform resolver remains a
-    fallback for unit tests and non-forward calls.
-    """
-
-    try:
-        from vllm.forward_context import get_forward_context
-
-        context = get_forward_context()
-    except (AssertionError, ImportError):
-        context = None
-
-    if context is not None:
-        additional_kwargs = getattr(context, "additional_kwargs", None)
-        if isinstance(additional_kwargs, dict):
-            mode = additional_kwargs.get("hcu_flash_attn_mode")
-            if isinstance(mode, str) and mode in _QSA_MODES:
-                return mode
-
-    from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
-
-    return get_hcu_flash_attn_mode()
+    return bool(
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_QSA_CUTLASS
+    )
 
 
 def get_qsa_kernel_backend(
-    mode: str,
     *,
     triton_mqa_paged: Callable[..., Any],
     triton_sparse_gqa_paged_attn: Callable[..., Any],
 ) -> QSAKernelBackend:
-    """Build the QSA kernel adapter for one normalized HCU flash mode.
+    """Build the QSA adapter from the QSA-specific environment switch.
 
-    Only CUTLASS uses flash_attn's QSA kernels.  Classic and varlen retain the
-    official Triton QSA path because the flash_attn QSA entry points are not
-    generic replacements for those implementations.
+    QSA selection is independent of the generic FLASH_ATTN backend mode. The
+    global custom-op switch remains the master gate.
     """
 
-    if mode != "cutlass":
+    if not is_qsa_cutlass_enabled():
         return QSAKernelBackend(
             name=QSA_BACKEND_TRITON,
             mqa_paged_score=triton_mqa_paged,
@@ -120,6 +100,6 @@ __all__ = [
     "QSA_BACKEND_FLASH",
     "QSA_BACKEND_TRITON",
     "QSAKernelBackend",
-    "get_qsa_flash_attn_mode",
     "get_qsa_kernel_backend",
+    "is_qsa_cutlass_enabled",
 ]
