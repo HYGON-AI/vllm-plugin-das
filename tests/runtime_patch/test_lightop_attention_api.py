@@ -220,6 +220,270 @@ def test_sparse_mla_does_not_retry_legacy_namespace(monkeypatch):
         )
 
 
+def test_aiter_opus_paged_mqa_uses_native_page64_cache_and_page_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    expected = torch.full((4, 128), 3.0, dtype=torch.float32)
+
+    def paged_mqa_logits(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_aiter_opus_paged_mqa_logits_fn",
+        lambda: paged_mqa_logits,
+    )
+
+    q = torch.zeros((1, 4, 32, 128), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((3, 64, 1, 132), dtype=torch.uint8)
+    page_bytes = cache.view(3, -1)
+    page_bytes[0, :64 * 128].fill_(1)
+    page_bytes[0, 64 * 128:].fill_(11)
+    page_bytes[1, :64 * 128].fill_(2)
+    page_bytes[1, 64 * 128:].fill_(22)
+    page_bytes[2, :64 * 128].fill_(3)
+    page_bytes[2, 64 * 128:].fill_(33)
+    weights = torch.ones((4, 32), dtype=torch.float32)
+    context_lens = torch.tensor([100], dtype=torch.int32)
+    # Static KV allocations can expose more pages than max_model_len needs.
+    block_tables = torch.tensor([[1, 0, 2]], dtype=torch.int32)
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.empty(0),
+        128,
+    )
+
+    assert result is expected
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is q
+    assert args[1] is cache
+    assert args[2] is weights
+    assert args[3] is context_lens
+    assert args[4] is block_tables
+    assert args[5] == 128
+    assert kwargs == {
+        "out": None,
+        "clean_logits": True,
+        "kernelId": None,
+    }
+
+
+def test_aiter_opus_paged_mqa_falls_back_for_unsupported_mtp_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_aiter_opus_paged_mqa_logits_fn",
+        lambda: pytest.fail("unsupported R=3 called AITER Opus"),
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    expected = torch.ones((3, 64), dtype=torch.float32)
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(paged_mqa_logits=lambda *_args: expected),
+        raising=False,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        torch.zeros((1, 3, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((1, 64, 1, 132), dtype=torch.uint8),
+        torch.ones((3, 32), dtype=torch.float32),
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        64,
+    )
+
+    assert result is expected
+
+
+def test_aiter_opus_paged_mqa_falls_back_off_gfx938(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    monkeypatch.setattr(
+        runtime,
+        "_aiter_opus_paged_mqa_logits_fn",
+        lambda: pytest.fail("AITER Opus probed on an unsupported device"),
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    expected = torch.ones((4, 64), dtype=torch.float32)
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(paged_mqa_logits=lambda *_args: expected),
+        raising=False,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        torch.zeros((1, 4, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((1, 64, 1, 132), dtype=torch.uint8),
+        torch.ones((4, 32), dtype=torch.float32),
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        64,
+    )
+
+    assert result is expected
+
+
+def test_aiter_opus_paged_mqa_falls_back_for_padded_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_aiter_opus_paged_mqa_logits_fn",
+        lambda: pytest.fail("AITER Opus called for a padded decode batch"),
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    expected = torch.ones((4, 64), dtype=torch.float32)
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(paged_mqa_logits=lambda *_args: expected),
+        raising=False,
+    )
+
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        torch.zeros((1, 4, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((1, 64, 1, 132), dtype=torch.uint8),
+        torch.ones((4, 32), dtype=torch.float32),
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        64,
+        allow_aiter_opus=False,
+    )
+
+    assert result is expected
+
+
+def test_aiter_opus_opt_in_bypasses_lightop_sparse_mask_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_sparse_mask_topk_ops",
+        lambda: pytest.fail("LightOp mask route probed while AITER is selected"),
+    )
+
+    result = runtime._lightop_mask_topk_decode(
+        torch.zeros((1, 4, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((2, 64, 1, 132), dtype=torch.uint8),
+        torch.zeros((4, 32), dtype=torch.float32),
+        torch.tensor([100], dtype=torch.int32),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        1,
+        4,
+        2048,
+        128,
+        False,
+    )
+
+    assert result is None
+
+
+def test_aiter_opus_opt_in_keeps_mask_route_for_unsupported_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _enable_sparse_mask_route(monkeypatch)
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    calls: list[str] = []
+
+    def producer(*_args, **_kwargs):
+        calls.append("producer")
+        return torch.zeros((3, 64)), torch.zeros((3, 4), dtype=torch.int16)
+
+    def consumer(**_kwargs):
+        calls.append("consumer")
+        return torch.zeros((3, 2048), dtype=torch.int32)
+
+    monkeypatch.setattr(
+        runtime,
+        "_lightop_sparse_mask_topk_ops",
+        lambda: (producer, consumer),
+    )
+
+    result = runtime._lightop_mask_topk_decode(
+        torch.zeros((1, 3, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((1, 64, 1, 132), dtype=torch.uint8),
+        torch.zeros((3, 32), dtype=torch.float32),
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        1,
+        3,
+        2048,
+        64,
+        False,
+    )
+
+    assert result is not None
+    assert calls == ["producer", "consumer"]
+
+
 def test_chunked_sparse_mla_uses_new_abi_and_categorized_topk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
