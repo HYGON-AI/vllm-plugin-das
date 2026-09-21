@@ -26,6 +26,26 @@ import vllm_hcu.platforms.envs as henvs
 
 logger = init_logger(__name__)
 
+_HYV4_FULL_DCP_ARCHITECTURES = frozenset({"HYV4ForCausalLM"})
+
+
+def _supports_full_decode_cudagraph_with_dcp(vllm_config: "VllmConfig") -> bool:
+    """Return whether the model's DCP path is validated for full decode graphs."""
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    architectures = getattr(vllm_config.model_config, "architectures", ()) or ()
+    dcp_backend = getattr(vllm_config.parallel_config, "dcp_comm_backend", None)
+    requested_mode = vllm_config.compilation_config.cudagraph_mode
+    return (
+        requested_mode is CUDAGraphMode.FULL
+        and vllm_config.compilation_config.mode is CompilationMode.NONE
+        and dcp_backend == "ag_rs"
+        and any(
+            architecture in _HYV4_FULL_DCP_ARCHITECTURES
+            for architecture in architectures
+        )
+    )
+
 _ensure_platform_plugin_ready()
 
 
@@ -583,8 +603,12 @@ class HCUPlatform(Platform):
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # decode context parallel does not support full cudagraphs
-            if parallel_config.decode_context_parallel_size > 1:
+            # Full DCP graphs are opt-in and limited to the validated HY4 ag_rs
+            # decode path. Keep every other DCP configuration on PIECEWISE.
+            if (
+                parallel_config.decode_context_parallel_size > 1
+                and not _supports_full_decode_cudagraph_with_dcp(vllm_config)
+            ):
                 logger.warning_once(
                     "Decode context parallel (DCP) is enabled, which is "
                     "incompatible with full CUDA graphs. "
@@ -599,6 +623,12 @@ class HCUPlatform(Platform):
                     "Overriding cudagraph_mode to PIECEWISE."
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            elif parallel_config.decode_context_parallel_size > 1:
+                logger.info_once(
+                    "HY4 DCP with ag_rs is retaining the explicitly requested "
+                    "full CUDA graph mode. Attention backend capability checks "
+                    "may narrow it to full decode graphs."
+                )
 
         if cache_config and not cache_config.user_specified_block_size:
             backend = vllm_config.attention_config.backend
