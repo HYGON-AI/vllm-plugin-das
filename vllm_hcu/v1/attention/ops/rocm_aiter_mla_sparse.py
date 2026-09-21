@@ -795,6 +795,94 @@ def paged_mqa_logits_module():
     return None
 
 
+@functools.lru_cache(maxsize=1)
+def _aiter_opus_paged_mqa_logits_fn():
+    """Return AITER's Opus paged-MQA entry point when it is installed."""
+    try:
+        from aiter import paged_mqa_logits
+    except (AttributeError, ImportError, OSError):
+        return None
+    return paged_mqa_logits if callable(paged_mqa_logits) else None
+
+
+def _aiter_opus_paged_mqa_logits_eligible(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> bool:
+    """Return whether the request matches AITER Opus's strict public ABI."""
+    return bool(
+        henvs.VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS
+        and current_platform.is_rocm()
+        and on_gfx938()
+        and q_fp8.dim() == 4
+        and q_fp8.dtype == torch.float8_e4m3fn
+        and q_fp8.is_contiguous()
+        and q_fp8.shape[1] in (1, 2, 4)
+        and q_fp8.shape[2] in (32, 64)
+        and q_fp8.shape[3] == 128
+        and kv_cache_fp8.dim() == 4
+        and kv_cache_fp8.dtype == torch.uint8
+        and kv_cache_fp8.is_contiguous()
+        and tuple(kv_cache_fp8.shape[1:]) == (64, 1, 132)
+        and weights.dim() == 2
+        and tuple(weights.shape) == (
+            q_fp8.shape[0] * q_fp8.shape[1],
+            q_fp8.shape[2],
+        )
+        and context_lens.dim() == 1
+        and context_lens.shape[0] == q_fp8.shape[0]
+        and context_lens.dtype == torch.int32
+        and context_lens.is_contiguous()
+        and block_tables.dim() == 2
+        and block_tables.shape[0] == q_fp8.shape[0]
+        and block_tables.shape[1] * kv_cache_fp8.shape[1] >= max_model_len
+        and block_tables.dtype == torch.int32
+        and block_tables.is_contiguous()
+        and _aiter_opus_paged_mqa_logits_fn() is not None
+    )
+
+
+def _aiter_opus_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor | None:
+    """Call AITER Opus with its native page-size-64 cache ABI."""
+    if not _aiter_opus_paged_mqa_logits_eligible(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    ):
+        return None
+
+    paged_mqa_logits = _aiter_opus_paged_mqa_logits_fn()
+    if paged_mqa_logits is None:
+        return None
+
+    logger.info_once("Using AITER Opus page-size-64 paged_mqa_logits.")
+    return paged_mqa_logits(
+        q_fp8,
+        kv_cache_fp8,
+        weights.float().contiguous(),
+        context_lens,
+        block_tables,
+        max_model_len,
+        out=None,
+        clean_logits=True,
+        kernelId=None,
+    )
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -803,6 +891,8 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    *,
+    allow_aiter_opus: bool = True,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -820,11 +910,26 @@ def rocm_fp8_paged_mqa_logits(
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
+        allow_aiter_opus: Whether this batch may use the AITER Opus route.
+            Padded decode batches keep the existing backend because their
+            flattened weights do not follow the packed query-row layout.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if allow_aiter_opus:
+        opus_logits = _aiter_opus_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+        if opus_logits is not None:
+            return opus_logits
+
     from vllm._aiter_ops import rocm_aiter_ops
 
     aiter_paged_mqa_logits_module = None
@@ -1205,6 +1310,14 @@ def _lightop_mask_topk_decode_metadata(
     if not (
         henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_LIGHTOP_MASK_TOPK
+        and not _aiter_opus_paged_mqa_logits_eligible(
+            q,
+            kv_cache,
+            weights,
+            seq_lens,
+            block_table,
+            max_model_len,
+        )
         and current_platform.is_rocm()
         and on_gfx938()
         and not requires_padding
@@ -1830,6 +1943,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                     decode_metadata.block_table,
                     decode_metadata.schedule_metadata,
                     max_model_len=max_model_len,
+                    allow_aiter_opus=not decode_metadata.requires_padding,
                 )
 
         # A padded decode batch has more kernel rows than actual decode

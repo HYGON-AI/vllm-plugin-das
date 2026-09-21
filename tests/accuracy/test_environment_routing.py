@@ -87,6 +87,19 @@ def test_boolean_environment_values_are_lazily_parsed(
     assert hcu_envs.is_set("VLLM_HCU_USE_CUSTOM_OPS") is True
 
 
+def test_aiter_opus_paged_mqa_logits_defaults_off_and_can_be_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS"
+    getter = hcu_envs.hcu_vllm_environment_variables[name]
+
+    monkeypatch.delenv(name, raising=False)
+    assert getter() is False
+
+    monkeypatch.setenv(name, "1")
+    assert getter() is True
+
+
 MIGRATED_KERNEL_FLAGS = (
     "VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE",
     "VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP",
