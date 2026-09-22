@@ -1029,6 +1029,7 @@ class SparseAttnIndexer(CustomOp):
         if (
             dcp_world_size > 1
             or self.skip_k_cache_insert
+            or henvs.VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS
             or not rocm_aiter_ops.is_enabled()
         ):
             from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
