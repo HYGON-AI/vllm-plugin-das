@@ -285,6 +285,48 @@ def test_aiter_opus_paged_mqa_uses_native_page64_cache_and_page_table(
     }
 
 
+def test_aiter_opus_paged_mqa_uses_final_mtp_context_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    calls: list[tuple[object, ...]] = []
+    expected = torch.full((4, 128), 5.0, dtype=torch.float32)
+
+    def paged_mqa_logits(*args, **_kwargs):
+        calls.append(args)
+        return expected
+
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_aiter_opus_paged_mqa_logits_fn",
+        lambda: paged_mqa_logits,
+    )
+
+    context_lens = torch.tensor([[97, 98, 99, 100]], dtype=torch.int32)
+    result = runtime.rocm_fp8_paged_mqa_logits(
+        torch.zeros((1, 4, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((3, 64, 1, 132), dtype=torch.uint8),
+        torch.ones((4, 32), dtype=torch.float32),
+        context_lens,
+        torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        torch.empty(0),
+        128,
+    )
+
+    assert result is expected
+    supplied_context_lens = calls[0][3]
+    assert torch.equal(supplied_context_lens, torch.tensor([100], dtype=torch.int32))
+    assert supplied_context_lens.is_contiguous()
+
+
 def test_aiter_opus_paged_mqa_falls_back_for_unsupported_mtp_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

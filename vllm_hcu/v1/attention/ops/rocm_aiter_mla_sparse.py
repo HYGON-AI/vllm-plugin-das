@@ -814,6 +814,14 @@ def _aiter_opus_paged_mqa_logits_eligible(
     max_model_len: int,
 ) -> bool:
     """Return whether the request matches AITER Opus's strict public ABI."""
+    batch_size, next_n = q_fp8.shape[:2] if q_fp8.dim() == 4 else (-1, -1)
+    context_lens_shape_supported = (
+        context_lens.dim() == 1
+        and tuple(context_lens.shape) == (batch_size,)
+    ) or (
+        context_lens.dim() == 2
+        and tuple(context_lens.shape) == (batch_size, next_n)
+    )
     return bool(
         henvs.VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS
         and current_platform.is_rocm()
@@ -833,8 +841,7 @@ def _aiter_opus_paged_mqa_logits_eligible(
             q_fp8.shape[0] * q_fp8.shape[1],
             q_fp8.shape[2],
         )
-        and context_lens.dim() == 1
-        and context_lens.shape[0] == q_fp8.shape[0]
+        and context_lens_shape_supported
         and context_lens.dtype == torch.int32
         and context_lens.is_contiguous()
         and block_tables.dim() == 2
@@ -869,12 +876,20 @@ def _aiter_opus_paged_mqa_logits(
     if paged_mqa_logits is None:
         return None
 
+    # vLLM's native MTP metadata stores one causal length per query row as
+    # [B, R]. AITER accepts the request's final length [B] and reconstructs
+    # each row's bound as length[b] - R + r + 1.
+    aiter_context_lens = (
+        context_lens
+        if context_lens.dim() == 1
+        else context_lens[:, -1].contiguous()
+    )
     logger.info_once("Using AITER Opus page-size-64 paged_mqa_logits.")
     return paged_mqa_logits(
         q_fp8,
         kv_cache_fp8,
         weights.float().contiguous(),
-        context_lens,
+        aiter_context_lens,
         block_tables,
         max_model_len,
         out=None,
