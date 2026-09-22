@@ -171,7 +171,7 @@ def _get_backend_priorities(
 
 def register_attention_backends() -> None:
     # Install HCU defaults without replacing user or third-party overrides.
-    # QSA is model-local and dispatches TRITON_QSA/FLASH_QSA in its own
+    # QSA is model-local and dispatches triton/cutlass/boltops in its own
     # adapter; it intentionally does not become a global enum backend here.
     backends = (
         (

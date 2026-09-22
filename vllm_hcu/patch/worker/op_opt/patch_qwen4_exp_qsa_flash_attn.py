@@ -3,11 +3,9 @@
 """Route Qwen4Exp QSA wrappers through the QSA-specific kernel dispatcher.
 
 The official QSA module owns metadata construction, cache views, top-k
-selection, and index expansion.  This adapter only replaces the two audited
-compute wrappers when ``VLLM_HCU_USE_CUSTOM_OPS`` and
-``VLLM_HCU_USE_QSA_CUTLASS`` are enabled; the official Triton
-implementations remain the fallback otherwise.  QSA is deliberately not added
-to vLLM's global
+selection, and index expansion. This adapter only replaces the two audited
+compute wrappers; the dispatcher selects Triton, FlashAttention (``cutlass``),
+or BoltOPs (``boltops``). QSA is deliberately not added to vLLM's global
 ``AttentionBackendEnum``.
 """
 
@@ -28,13 +26,13 @@ from vllm_hcu.v1.attention.backends.qsa import (
 )
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.ops.qsa"
-PATCH_ID = "worker.op_opt.qwen4_exp.qsa.flash_attn"
+PATCH_ID = "worker.op_opt.qwen4_exp.qsa.backend"
 TARGETS = (
     f"{TARGET_MODULE}.qsa_mqa_paged",
     f"{TARGET_MODULE}.qsa_sparse_paged_attention",
 )
-_MARKER = "_vllm_hcu_qwen4_exp_qsa_flash_attn_applied"
-_WRAPPER = "_vllm_hcu_qsa_flash_attn_wrapper"
+_MARKER = "_vllm_hcu_qwen4_exp_qsa_backend_applied"
+_WRAPPER = "_vllm_hcu_qsa_backend_wrapper"
 
 
 def apply_to_module(module: ModuleType) -> bool:

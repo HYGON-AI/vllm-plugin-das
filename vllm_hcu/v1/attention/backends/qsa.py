@@ -6,15 +6,17 @@ QSA is owned by the Qwen4Exp model and is intentionally not registered as a
 global ``AttentionBackendEnum`` member.  This module only chooses the QSA
 kernel pair used by that model:
 
-* ``TRITON_QSA`` keeps the official QSA implementation;
-* ``FLASH_QSA`` uses flash_attn's QSA entry points when both
-  ``VLLM_HCU_USE_CUSTOM_OPS`` and ``VLLM_HCU_USE_QSA_CUTLASS`` are enabled.
+* ``triton`` keeps the official QSA implementation;
+* ``cutlass`` uses flash_attn's QSA entry points;
+* ``boltops`` uses BoltOPs' QSA entry points.
 
 The generic ``FLASH_ATTN`` backend remains responsible for ordinary attention.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -22,10 +24,18 @@ from typing import Any, Literal
 
 import vllm_hcu.platforms.envs as henvs
 
+logger = logging.getLogger(__name__)
 
-QSA_BACKEND_TRITON: Literal["TRITON_QSA"] = "TRITON_QSA"
-QSA_BACKEND_FLASH: Literal["FLASH_QSA"] = "FLASH_QSA"
-QSAKernelName = Literal["TRITON_QSA", "FLASH_QSA"]
+
+QSA_BACKEND_TRITON: Literal["triton"] = "triton"
+QSA_BACKEND_CUTLASS: Literal["cutlass"] = "cutlass"
+QSA_BACKEND_BOLTOPS: Literal["boltops"] = "boltops"
+QSAKernelName = Literal["triton", "cutlass", "boltops"]
+_QSA_BACKENDS = frozenset(
+    (QSA_BACKEND_TRITON, QSA_BACKEND_CUTLASS, QSA_BACKEND_BOLTOPS)
+)
+_LEGACY_QSA_CUTLASS_ENV = "VLLM_HCU_USE_QSA_CUTLASS"
+_legacy_qsa_cutlass_warning_emitted = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,13 +71,78 @@ def _load_flash_qsa_kernels() -> tuple[Callable[..., Any], Callable[..., Any]]:
     return mqa_paged_score_func, sparse_gqa_paged_attn_func
 
 
-def is_qsa_cutlass_enabled() -> bool:
-    """Return whether FA QSA is enabled by both HCU switches."""
+@lru_cache(maxsize=1)
+def _load_boltops_qsa_kernels() -> tuple[
+    Callable[..., Any], Callable[..., Any]
+]:
+    """Load the optional BoltOPs QSA entry points once per worker."""
 
-    return bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_QSA_CUTLASS
+    try:
+        from boltops.qsa import (
+            qsa_mqa_paged,
+            qsa_sparse_paged_attention,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "QSA BoltOPs requires boltops.qsa.qsa_mqa_paged and "
+            "boltops.qsa.qsa_sparse_paged_attention"
+        ) from exc
+
+    if not callable(qsa_mqa_paged) or not callable(qsa_sparse_paged_attention):
+        raise RuntimeError("boltops.qsa QSA entry points are not callable")
+    return qsa_mqa_paged, qsa_sparse_paged_attention
+
+
+def _warn_legacy_qsa_cutlass_env() -> None:
+    global _legacy_qsa_cutlass_warning_emitted
+    if (
+        _LEGACY_QSA_CUTLASS_ENV in os.environ
+        and not _legacy_qsa_cutlass_warning_emitted
+    ):
+        logger.warning(
+            "%s is deprecated and ignored; use VLLM_HCU_QSA_BACKEND="
+            "cutlass instead",
+            _LEGACY_QSA_CUTLASS_ENV,
+        )
+        _legacy_qsa_cutlass_warning_emitted = True
+
+
+def _resolve_qsa_backend() -> QSAKernelName:
+    """Resolve the configured QSA backend, including the master gate."""
+
+    _warn_legacy_qsa_cutlass_env()
+    if not henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        return QSA_BACKEND_TRITON
+
+    backend = henvs.VLLM_HCU_QSA_BACKEND
+    if backend not in _QSA_BACKENDS:
+        supported = ", ".join(sorted(_QSA_BACKENDS))
+        raise ValueError(
+            f"Invalid VLLM_HCU_QSA_BACKEND={backend!r}; "
+            f"expected one of: {supported}"
+        )
+    return backend
+
+
+def _triton_qsa_backend(
+    triton_mqa_paged: Callable[..., Any],
+    triton_sparse_gqa_paged_attn: Callable[..., Any],
+) -> QSAKernelBackend:
+    return QSAKernelBackend(
+        name=QSA_BACKEND_TRITON,
+        mqa_paged_score=triton_mqa_paged,
+        sparse_gqa_paged_attn=triton_sparse_gqa_paged_attn,
     )
+
+
+def _load_selected_qsa_backend(
+    backend: QSAKernelName,
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    if backend == QSA_BACKEND_CUTLASS:
+        return _load_flash_qsa_kernels()
+    if backend == QSA_BACKEND_BOLTOPS:
+        return _load_boltops_qsa_kernels()
+    raise AssertionError(f"unexpected non-Triton QSA backend: {backend}")
 
 
 def get_qsa_kernel_backend(
@@ -78,28 +153,38 @@ def get_qsa_kernel_backend(
     """Build the QSA adapter from the QSA-specific environment switch.
 
     QSA selection is independent of the generic FLASH_ATTN backend mode. The
-    global custom-op switch remains the master gate.
+    global custom-op switch remains the master gate. Optional backend loading
+    failures warn and fall back to the official Triton implementation.
     """
 
-    if not is_qsa_cutlass_enabled():
-        return QSAKernelBackend(
-            name=QSA_BACKEND_TRITON,
-            mqa_paged_score=triton_mqa_paged,
-            sparse_gqa_paged_attn=triton_sparse_gqa_paged_attn,
-        )
+    backend = _resolve_qsa_backend()
+    triton_backend = _triton_qsa_backend(
+        triton_mqa_paged,
+        triton_sparse_gqa_paged_attn,
+    )
+    if backend == QSA_BACKEND_TRITON:
+        return triton_backend
 
-    flash_mqa, flash_sparse = _load_flash_qsa_kernels()
+    try:
+        selected_mqa, selected_sparse = _load_selected_qsa_backend(backend)
+    except Exception as exc:
+        logger.warning(
+            "QSA backend %r failed to load; falling back to Triton: %s",
+            backend,
+            exc,
+        )
+        return triton_backend
     return QSAKernelBackend(
-        name=QSA_BACKEND_FLASH,
-        mqa_paged_score=flash_mqa,
-        sparse_gqa_paged_attn=flash_sparse,
+        name=backend,
+        mqa_paged_score=selected_mqa,
+        sparse_gqa_paged_attn=selected_sparse,
     )
 
 
 __all__ = [
-    "QSA_BACKEND_FLASH",
+    "QSA_BACKEND_BOLTOPS",
+    "QSA_BACKEND_CUTLASS",
     "QSA_BACKEND_TRITON",
     "QSAKernelBackend",
     "get_qsa_kernel_backend",
-    "is_qsa_cutlass_enabled",
 ]

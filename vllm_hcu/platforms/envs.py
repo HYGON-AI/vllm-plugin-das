@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
-    VLLM_HCU_USE_QSA_CUTLASS : bool = True
+    VLLM_HCU_QSA_BACKEND: str = "cutlass"
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
@@ -200,11 +200,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_OPS":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True").lower() in
              ("true", "1")),
-    # Enable the FlashAttention QSA kernels independently of the generic
-    # FLASH_ATTN backend mode. The QSA path still requires custom ops.
-    "VLLM_HCU_USE_QSA_CUTLASS":
-    lambda: (os.environ.get("VLLM_HCU_USE_QSA_CUTLASS", "1").lower() in
-             ("true", "1")),
+    # Select the QSA implementation independently of the generic
+    # FLASH_ATTN backend mode. The QSA dispatcher validates the enum and
+    # applies VLLM_HCU_USE_CUSTOM_OPS as its master gate.
+    "VLLM_HCU_QSA_BACKEND":
+    lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
     # If set, control hcu custom silu and mul op
     "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "True").lower() in
