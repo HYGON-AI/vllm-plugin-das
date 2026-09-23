@@ -20,15 +20,18 @@ name would silently change KV cache behaviour. Only``supports_sink`` and the
 two kernel wrappers differ from the parent.
 """
 
+from itertools import pairwise
 from typing import TYPE_CHECKING
 
 import torch
-
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
 )
+
+import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
 )
@@ -41,6 +44,36 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+
+
+def _mtp_topk_union_stats(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> tuple[list[int], list[int]]:
+    """Return valid-selection and union counts for each request."""
+    if topk_indices.ndim != 2:
+        raise ValueError(
+            "HY V4 top-k indices must have shape [num_tokens, topk], but got "
+            f"{tuple(topk_indices.shape)}."
+        )
+    starts = query_start_loc.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if (
+        not starts
+        or starts[0] != 0
+        or starts[-1] != topk_indices.shape[0]
+        or any(end < start for start, end in pairwise(starts))
+    ):
+        raise ValueError("HY V4 query_start_loc must delimit rows in the top-k tensor.")
+
+    indices = topk_indices.detach().to(device="cpu", dtype=torch.int64)
+    valid_counts: list[int] = []
+    union_sizes: list[int] = []
+    for start, end in pairwise(starts):
+        request_indices = indices[start:end].reshape(-1)
+        valid_indices = request_indices[request_indices >= 0]
+        valid_counts.append(valid_indices.numel())
+        union_sizes.append(torch.unique(valid_indices).numel())
+    return valid_counts, union_sizes
 
 
 class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
@@ -91,6 +124,14 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        profile_steps = henvs.VLLM_HCU_HYV4_MTP_TOPK_UNION_PROFILE_STEPS
+        profile_skip_steps = henvs.VLLM_HCU_HYV4_MTP_TOPK_UNION_PROFILE_SKIP_STEPS
+        if profile_steps < 0 or profile_skip_steps < 0:
+            raise ValueError(
+                "HY V4 MTP top-k union profile step counts must be non-negative."
+            )
+        self._mtp_topk_profile_steps = profile_steps
+        self._mtp_topk_profile_skip_steps = profile_skip_steps
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -257,6 +298,59 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         output = output[:, : self.num_heads, :]
         return output
+
+    def _maybe_profile_mtp_topk_union(
+        self,
+        attn_metadata: FlashMLASparseMetadata,
+        layer_name: str | None = None,
+    ) -> None:
+        if self._mtp_topk_profile_steps == 0 or attn_metadata.max_query_len <= 1:
+            return
+        if self._mtp_topk_profile_skip_steps > 0:
+            self._mtp_topk_profile_skip_steps -= 1
+            return
+        if torch.cuda.is_current_stream_capturing():
+            logger.warning_once(
+                "Skipping HY V4 MTP top-k union profiling during graph capture; "
+                "run the measurement in eager mode"
+            )
+            return
+
+        assert self.topk_indices_buffer is not None
+        num_tokens = attn_metadata.num_actual_tokens
+        query_start_loc = attn_metadata.query_start_loc[: attn_metadata.num_reqs + 1]
+        valid_counts, union_sizes = _mtp_topk_union_stats(
+            self.topk_indices_buffer[:num_tokens],
+            query_start_loc,
+        )
+        request_starts = query_start_loc.detach().to(device="cpu").tolist()
+        query_lengths = [int(end - start) for start, end in pairwise(request_starts)]
+        total_valid = sum(valid_counts)
+        total_union = sum(union_sizes)
+        reuse_factor = total_valid / total_union if total_union else 0.0
+        logger.info(
+            "HY V4 MTP top-k union profile: layer=%s, query_lengths=%s, "
+            "valid_counts=%s, union_sizes=%s, aggregate_reuse_factor=%.4f",
+            layer_name or "unknown",
+            query_lengths,
+            valid_counts,
+            union_sizes,
+            reuse_factor,
+        )
+        self._mtp_topk_profile_steps -= 1
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self._maybe_profile_mtp_topk_union(
+            attn_metadata,
+            getattr(layer, "layer_name", None),
+        )
+        return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
 
 
 class HYV4FlashMLASparseBackend(HcuFlashMLASparseBackend):
