@@ -439,12 +439,59 @@ def maybe_gather_indexer_k(
     return cache_k, cache_slot_mapping
 
 
+def maybe_gather_cache_inputs(
+    tensors: tuple[torch.Tensor, ...],
+    slot_mapping: torch.Tensor,
+    metadata: object | None,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Gather arbitrary PCP cache inputs using the audited ownership rules."""
+
+    return _gather_prefill_cache_inputs(tensors, slot_mapping, metadata)
+
+
+def local_pcp_slot_mapping(
+    slot_mapping: torch.Tensor,
+    local_num_tokens: int,
+    metadata: object | None,
+) -> torch.Tensor:
+    """Return this rank's slot segment for a rank-local cache operation."""
+
+    if metadata is None:
+        return slot_mapping[:local_num_tokens]
+    if getattr(metadata, "pcp_has_global_prefill", None) is False:
+        num_actual_tokens = int(
+            getattr(metadata, "num_actual_tokens", local_num_tokens)
+        )
+        return slot_mapping[: min(local_num_tokens, num_actual_tokens)]
+
+    world_size = _pcp_world_size(metadata)
+    if world_size == 1:
+        return slot_mapping[:local_num_tokens]
+
+    pcp_group = get_pcp_group()
+    assert int(pcp_group.world_size) == world_size, (
+        "PCP metadata/process-group size mismatch: "
+        f"metadata={world_size}, group={pcp_group.world_size}"
+    )
+    rank = int(pcp_group.rank_in_group)
+    assert 0 <= rank < world_size, f"invalid PCP rank {rank}/{world_size}"
+    return _rank_slot_slice(
+        slot_mapping,
+        local_num_tokens,
+        metadata,
+        world_size,
+        rank,
+    )
+
+
 __all__ = (
     "current_pcp_cache_ownership_metadata",
     "effective_pcp_metadata_world_size",
     "effective_pcp_world_size",
     "in_replicated_mtp_batch",
     "logical_pcp_metadata_scope",
+    "local_pcp_slot_mapping",
+    "maybe_gather_cache_inputs",
     "maybe_gather_indexer_k",
     "maybe_gather_mla_latent_cache_inputs",
     "pcp_cache_ownership_scope",

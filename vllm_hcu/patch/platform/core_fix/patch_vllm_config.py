@@ -164,10 +164,11 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    is_dsv41 = _DSV41_ARCHITECTURE in architectures
+    if use_mla and not (is_glm52 or is_dsv41):
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "HCU MLA PCP supports only GLM-5.2 (GlmMoeDsaForCausalLM) or "
+            "DeepSeek-V4.1 (DeepseekV41ForCausalLM)."
         )
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
@@ -200,7 +201,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     )
     if use_mla and dcp_size != 1:
-        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+        raise ValueError("HCU MLA PCP does not support decode context parallelism.")
     if not use_mla and dcp_size != 1:
         raise ValueError(
             "FlashAttention PCP does not support decode context parallelism."
@@ -212,8 +213,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if use_mla and not _require_hcu_pcp_attribute(
+        raise ValueError("HCU MLA PCP requires expert parallelism.")
+    if is_glm52 and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
@@ -224,6 +225,10 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         if not use_mla:
             raise ValueError(
                 "FlashAttention PCP does not support speculative decoding or MTP."
+            )
+        if is_dsv41:
+            raise ValueError(
+                "DeepSeek-V4.1 PCP does not support speculative decoding or MTP."
             )
         method = _require_hcu_pcp_attribute(
             speculative_config, "method", "SpeculativeConfig"
@@ -241,7 +246,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             )
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
-    if _require_hcu_pcp_attribute(
+    if not is_dsv41 and _require_hcu_pcp_attribute(
         model_config, "is_multimodal_model", "ModelConfig"
     ):
         raise ValueError("HCU PCP does not support multimodal models.")
