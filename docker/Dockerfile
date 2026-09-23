@@ -68,6 +68,11 @@ RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh
     bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
     rm -f /tmp/dtk_blas_cut_installer.sh
 
+# ---layer--- shca 驱动
+RUN wget -q "${RESOURCE_SERVER_URL}/pkg/shca/others/20260706/shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb" \
+    && dpkg -i --force-all shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb \
+    && rm -rf shca-tools*.deb
+
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \
