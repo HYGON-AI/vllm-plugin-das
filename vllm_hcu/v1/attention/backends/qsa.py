@@ -135,14 +135,55 @@ def _triton_qsa_backend(
     )
 
 
+def _selected_qsa_loader(backend: QSAKernelName) -> Callable[[], tuple]:
+    if backend == QSA_BACKEND_CUTLASS:
+        return _load_flash_qsa_kernels
+    if backend == QSA_BACKEND_BOLTOPS:
+        return _load_boltops_qsa_kernels
+    raise AssertionError(f"unexpected non-Triton QSA backend: {backend}")
+
+
+# Caches the load outcome, failures included, so that an unavailable optional
+# backend neither re-imports nor warns per decode step. Failures are stored as
+# (type, args) rather than the exception object: re-raising a cached exception
+# would append this frame to its traceback on every forward pass. Keyed by the
+# loader object as well as the backend name so that replacing a loader (e.g.
+# under test) cannot reuse a stale outcome.
+_selected_qsa_cache: dict[
+    tuple[QSAKernelName, Callable[[], tuple]],
+    tuple[tuple[Callable[..., Any], Callable[..., Any]] | None, tuple[type, tuple]],
+] = {}
+
+
 def _load_selected_qsa_backend(
     backend: QSAKernelName,
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
-    if backend == QSA_BACKEND_CUTLASS:
-        return _load_flash_qsa_kernels()
-    if backend == QSA_BACKEND_BOLTOPS:
-        return _load_boltops_qsa_kernels()
-    raise AssertionError(f"unexpected non-Triton QSA backend: {backend}")
+    """Load an optional backend, warning once on failure.
+
+    The wrappers call this on every forward pass, so both the import attempt
+    and its warning are one-shot.
+    """
+    loader = _selected_qsa_loader(backend)
+    key = (backend, loader)
+    cached = _selected_qsa_cache.get(key)
+    if cached is None:
+        try:
+            kernels = loader()
+            error: tuple[type, tuple] = ()
+        except Exception as exc:
+            kernels = None
+            error = (type(exc), exc.args)
+            logger.warning(
+                "QSA backend %r failed to load; falling back to Triton: %s",
+                backend,
+                exc,
+            )
+        cached = (kernels, error)
+        _selected_qsa_cache[key] = cached
+    kernels, error = cached
+    if error:
+        raise error[0](*error[1])
+    return kernels
 
 
 def get_qsa_kernel_backend(
@@ -167,12 +208,7 @@ def get_qsa_kernel_backend(
 
     try:
         selected_mqa, selected_sparse = _load_selected_qsa_backend(backend)
-    except Exception as exc:
-        logger.warning(
-            "QSA backend %r failed to load; falling back to Triton: %s",
-            backend,
-            exc,
-        )
+    except Exception:
         return triton_backend
     return QSAKernelBackend(
         name=backend,

@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import logging
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
+import torch
 
 from vllm_hcu.platforms import envs as hcu_envs
 from vllm_hcu.patch.worker.op_opt import (
@@ -232,7 +233,8 @@ def test_qsa_runtime_patch_delegates_both_compute_entry_points(
     def fake_backend(**kwargs):
         assert kwargs["triton_mqa_paged"] is original_mqa
         assert kwargs["triton_sparse_gqa_paged_attn"] is original_sparse
-        return SimpleNamespace(
+        return qsa.QSAKernelBackend(
+            name=qsa.QSA_BACKEND_TRITON,
             mqa_paged_score=selected_mqa,
             sparse_gqa_paged_attn=selected_sparse,
         )
@@ -245,3 +247,213 @@ def test_qsa_runtime_patch_delegates_both_compute_entry_points(
         "selected-sparse"
     )
     assert qsa_patch.apply_to_module(module) is False
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "expected_dtype"),
+    [
+        (qsa.QSA_BACKEND_TRITON, torch.int64),
+        (qsa.QSA_BACKEND_CUTLASS, torch.int64),
+        (qsa.QSA_BACKEND_BOLTOPS, torch.int32),
+    ],
+)
+def test_query_positions_dtype_depends_on_qsa_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+    expected_dtype: torch.dtype,
+):
+    module = ModuleType(qsa_patch.TARGET_MODULE)
+    seen: dict[str, torch.dtype] = {}
+
+    def original_mqa(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns=None,
+        score_scale=None,
+    ):
+        del (
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            num_columns,
+            score_scale,
+        )
+        return "original-mqa"
+
+    def original_sparse(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out=None,
+    ):
+        del q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        return "original-sparse"
+
+    def selected_mqa(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns=None,
+        score_scale=None,
+    ):
+        del (
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            sequence_lengths,
+            compress_ratio,
+            num_columns,
+            score_scale,
+        )
+        seen["query_positions"] = query_positions.dtype
+        return "selected-mqa"
+
+    module.qsa_mqa_paged = original_mqa
+    module.qsa_sparse_paged_attention = original_sparse
+    monkeypatch.setattr(
+        qsa_patch,
+        "get_qsa_kernel_backend",
+        lambda **kwargs: qsa.QSAKernelBackend(
+            name=backend_name,
+            mqa_paged_score=selected_mqa,
+            sparse_gqa_paged_attn=lambda *args, **kwargs: "selected-sparse",
+        ),
+    )
+
+    assert qsa_patch.apply_to_module(module) is True
+    i32 = torch.zeros(2, dtype=torch.int32)
+    i64 = torch.zeros(2, dtype=torch.int64)
+    assert module.qsa_mqa_paged(None, None, i32, i32, i64, i32, 1) == (
+        "selected-mqa"
+    )
+    # BoltOPs pins its index metadata to int32, so the int64 logical-position
+    # buffer must be narrowed; the other backends consume it unchanged.
+    assert seen["query_positions"] is expected_dtype
+
+
+def test_optional_backend_load_failure_is_cached_after_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", "cutlass")
+    attempts = []
+
+    def fail_loader():
+        attempts.append(1)
+        raise RuntimeError("cutlass unavailable")
+
+    monkeypatch.setattr(qsa, "_load_flash_qsa_kernels", fail_loader)
+    with caplog.at_level(logging.WARNING, logger=qsa.__name__):
+        first = _backend(monkeypatch)
+        second = _backend(monkeypatch)
+
+    assert first.name == qsa.QSA_BACKEND_TRITON
+    assert second.name == qsa.QSA_BACKEND_TRITON
+    assert first.mqa_paged_score is _triton_mqa
+    assert second.sparse_gqa_paged_attn is _triton_sparse
+    # A decode loop calls this per forward; the import and the warning must not
+    # repeat once the backend is known to be unavailable.
+    assert len(attempts) == 1
+    assert caplog.text.count("falling back to Triton") == 1
+
+
+def test_qsa_runtime_patch_narrows_metadata_for_boltops(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = ModuleType(qsa_patch.TARGET_MODULE)
+    seen: dict[str, tuple[torch.dtype, ...]] = {}
+
+    def original_mqa(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns=None,
+        score_scale=None,
+    ):
+        del (
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            num_columns,
+            score_scale,
+        )
+        return "original-mqa"
+
+    def original_sparse(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out=None,
+    ):
+        del q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        return "original-sparse"
+
+    def selected_mqa(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns=None,
+        score_scale=None,
+    ):
+        del q, k_cache, compress_ratio, num_columns, score_scale
+        seen["dtypes"] = (
+            page_table.dtype,
+            token_to_req.dtype,
+            query_positions.dtype,
+            sequence_lengths.dtype,
+        )
+        return "selected-mqa"
+
+    module.qsa_mqa_paged = original_mqa
+    module.qsa_sparse_paged_attention = original_sparse
+
+    monkeypatch.setattr(
+        qsa_patch,
+        "get_qsa_kernel_backend",
+        lambda **kwargs: qsa.QSAKernelBackend(
+            name=qsa.QSA_BACKEND_BOLTOPS,
+            mqa_paged_score=selected_mqa,
+            sparse_gqa_paged_attn=lambda *args, **kwargs: "selected-sparse",
+        ),
+    )
+
+    assert qsa_patch.apply_to_module(module) is True
+    i32 = torch.zeros(2, dtype=torch.int32)
+    i64 = torch.zeros(2, dtype=torch.int64)
+    assert module.qsa_mqa_paged(None, None, i32, i32, i64, i32, 1) == (
+        "selected-mqa"
+    )
+    assert seen["dtypes"] == (torch.int32,) * 4
