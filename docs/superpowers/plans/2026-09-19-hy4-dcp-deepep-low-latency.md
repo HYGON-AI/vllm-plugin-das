@@ -25,9 +25,8 @@
   LSE without a sink and preserve normalized sink LSE when a sink is present.
 - HCU DCP indexer ranks exchange compact score/global-ID candidate pairs and
   run a global TopK before the attention backend localizes indices.
-- DCP decode uses the logits-producing HCU indexer route because the fused
-  LightOp mask-TopK route does not expose candidate scores. DCP size one keeps
-  the LightOp route unchanged.
+- DCP decode uses the logits-producing HCU indexer route before the global
+  candidate merge.
 - Count the virtual attention sink exactly once across DCP ranks by subtracting `log(dcp_world_size)` from each rank's sink logit.
 - Hardware acceptance uses `/models/Hy4-preview-Channel-FP8-w8a8`, TP8, DCP2, EP8, `deepep_low_latency`, DeepGEMM, `fp8_ds_mla`, block size 64, and `VLLM_HCU_HYV4_FP8_KV_DEQUANT=1`.
 - Accuracy acceptance is HumanEval items 0 through 7 with 8/8 correct and Pass@1 100%.
@@ -308,9 +307,8 @@ prefill or decode TopK, gather compact score/global-ID pairs and run device-side
 TopK over all candidates. Account for packed prefill row offsets when reading
 scores. Keep the existing CuTeDSL implementation on CUDA.
 
-Bypass the fused LightOp mask-TopK decode pair for DCP because it returns only
-indices and cannot supply the candidate scores required by the global merge.
-Keep its DCP-size-one behavior and public custom-op schema unchanged.
+Use the logits-producing HCU indexer route so the global merge receives both
+candidate indices and scores.
 
 - [x] **Step 4: Run indexer regressions**
 
@@ -417,7 +415,6 @@ Launch a managed background process whose PID is recorded by the script:
 ```bash
 VLLM_HCU_USE_CUSTOM_FLASH_ATTN=1 \
 VLLM_HCU_HYV4_FP8_KV_DEQUANT=1 \
-VLLM_HCU_USE_LIGHTOP_MASK_TOPK=1 \
 vllm serve /models/Hy4-preview-Channel-FP8-w8a8 \
   --served-model-name hy4-dcp2-ep8-ll \
   --trust-remote-code --dtype bfloat16 -q compressed-tensors \
@@ -514,7 +511,6 @@ configuration failure rather than a DCP correctness failure. Keep
 ```bash
 VLLM_HCU_USE_CUSTOM_FLASH_ATTN=1 \
 VLLM_HCU_HYV4_FP8_KV_DEQUANT=1 \
-VLLM_HCU_USE_LIGHTOP_MASK_TOPK=1 \
 vllm serve /models/Hy4-preview-Channel-FP8-w8a8 \
   --served-model-name hy4-dcp2-dp4-ep8-ll \
   --trust-remote-code --dtype bfloat16 -q compressed-tensors \

@@ -4,9 +4,8 @@
 
 Make HY V4 serve and decode correctly with tensor parallel size 8, decode
 context parallel size 2, expert parallelism, DeepEP low-latency all-to-all,
-DeepGEMM MoE, and the existing FP8 KV cache dequantization path. The change is
-stacked on the current LightOp sparse-mask TopK branch and does not add or use
-the rejected direct Aiter paged-MQA optimization.
+DeepGEMM MoE, and the existing FP8 KV cache dequantization path. The change
+does not add or use the rejected direct Aiter paged-MQA optimization.
 
 ## Current Failures
 
@@ -56,10 +55,9 @@ each row's packed sequence offset. Token IDs are converted with the configured
 cache interleave so the attention backend can apply its existing DCP
 localization.
 
-The fused LightOp mask-TopK decode route returns indices without their scores,
-so DCP decode will use the existing logits-producing HCU route before the
-global merge. DCP size one retains the LightOp route and existing custom-op
-schema. This change does not introduce a direct Aiter paged-MQA operator.
+The experimental fused LightOp mask-TopK decode route was removed after it
+regressed performance. Decode uses the logits-producing HCU route before the
+global merge. This change does not introduce a direct Aiter paged-MQA operator.
 
 ## DCP Attention Design
 
@@ -172,11 +170,6 @@ The final accuracy check will run the same eight HumanEval samples used by the
 current TP8 baseline. The acceptance target is 8/8 correct and Pass@1 100%.
 Focused runtime and model tests, Python compilation, and diff whitespace
 checks must also pass before committing and pushing the branch.
-
-The repository's contract suite also enforces the categorized LightOp API.
-Sparse mask TopK therefore imports its producer and consumer only from
-`lightop.attention`; the obsolete `lightop.op` and `lightop.gemmopt`
-namespaces are not used.
 
 ## Validation Result
 
