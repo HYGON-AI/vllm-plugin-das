@@ -127,6 +127,12 @@ def test_linear_gate_pcp_group_size_default_and_override(monkeypatch) -> None:
     assert _linear_gate_pcp_group_size(8) == 2
 
 
+def test_linear_gate_pcp_group_size_rejects_nondivisible_pcp(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", raising=False)
+    with pytest.raises(ValueError, match="not divisible"):
+        _linear_gate_pcp_group_size(4)
+
+
 @pytest.mark.parametrize("value", ["1", "3", "16", "not-an-integer"])
 def test_linear_gate_pcp_rejects_invalid_group_size(monkeypatch, value) -> None:
     monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", value)

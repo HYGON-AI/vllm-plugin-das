@@ -665,6 +665,11 @@ def _linear_gate_pcp_group_size(pcp_size: int) -> int:
         raise ValueError(
             f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {size}."
         )
+    if pcp_size % size != 0:
+        raise ValueError(
+            f"PCP size {pcp_size} is not divisible by "
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV}={size}."
+        )
     return size
 
 
