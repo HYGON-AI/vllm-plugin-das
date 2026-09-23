@@ -14,6 +14,8 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
+import torch
+
 from ._common import (
     PatchCompatibilityError,
     already_applied,
@@ -98,6 +100,13 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         except RuntimeError as exc:
             raise PatchCompatibilityError(str(exc)) from exc
+        # BoltOPs pins its QSA index metadata to int32. Of the four tensors it
+        # receives, three already arrive as int32 from vLLM (page_table,
+        # token_to_req, seq_lens); only the logical-positions buffer is int64,
+        # so it is the sole narrowing cast. cutlass/triton consume the
+        # original types unchanged.
+        if backend.name == "boltops":
+            query_positions = query_positions.to(dtype=torch.int32)
         return backend.mqa_paged_score(
             q,
             k_cache,
