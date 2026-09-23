@@ -122,6 +122,21 @@ def test_glm52_mrv2_mla_pcp2_eager_is_allowed(make_pcp_config) -> None:
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+def test_dsv41_pcp8_ep8_graph_mode_is_allowed(make_pcp_config) -> None:
+    config = make_pcp_config(
+        architecture="DeepseekV41ForCausalLM",
+        use_mla=True,
+        pcp=8,
+        tp=1,
+        enable_expert_parallel=True,
+        enforce_eager=False,
+        multimodal=True,
+        hybrid=True,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
 def test_gqa_mrv2_flash_pcp_is_allowed(make_pcp_config) -> None:
     """GQA PCP must not remain trapped behind the former MLA-only gate."""
 
@@ -303,6 +318,9 @@ def _make_vllm_module() -> ModuleType:
                 raise AssertionError("legacy GQA DCP head constraint")
 
     class VllmConfig:
+        def _maybe_enable_breakable_cudagraph(self) -> None:
+            return None
+
         def with_hf_config(self, hf_config: object, architectures=None):
             del hf_config, architectures
             return self

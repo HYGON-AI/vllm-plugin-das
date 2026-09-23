@@ -6,12 +6,22 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
 
 from vllm_hcu.model_executor.layers.attention import pcp
+
+
+class _FakePCPGroup:
+    world_size = 2
+    rank_in_group = 1
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        assert dim == 0
+        return torch.cat((tensor, tensor + 100), dim=dim)
 
 
 def test_effective_pcp_world_size_is_fullgraph_compilable_across_scope() -> None:
@@ -127,3 +137,50 @@ def test_eager_replicated_mtp_state_remains_task_local() -> None:
     assert scoped_values == [1, 1]
     assert normal_values == [2, 2]
     assert pcp.effective_pcp_world_size(2) == 2
+
+
+def test_generic_cache_gather_preserves_decode_and_gathers_prefill(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: _FakePCPGroup())
+    metadata = SimpleNamespace(
+        pcp_world_size=2,
+        num_decode_tokens=1,
+        pcp_has_global_prefill=True,
+    )
+    values = torch.tensor([[1], [2], [3]], dtype=torch.int64)
+    positions = torch.tensor([10, 11, 12], dtype=torch.int64)
+    slots = torch.tensor([10, 11, 12, 20, 21, 22], dtype=torch.int64)
+
+    (gathered_values, gathered_positions), gathered_slots = (
+        pcp.maybe_gather_cache_inputs(
+            (values, positions),
+            slots,
+            metadata,
+        )
+    )
+
+    assert gathered_values.flatten().tolist() == [1, 2, 3, 102, 103]
+    assert gathered_positions.tolist() == [10, 11, 12, 111, 112]
+    assert gathered_slots.tolist() == [10, 21, 22, 121, 122]
+    assert pcp.local_pcp_slot_mapping(slots, 3, metadata).tolist() == [20, 21, 22]
+
+
+def test_generic_cache_inputs_trim_decode_only_padding() -> None:
+    metadata = SimpleNamespace(
+        pcp_world_size=1,
+        num_actual_tokens=2,
+        pcp_has_global_prefill=False,
+    )
+    values = torch.arange(4)
+    slots = torch.tensor([7, 8, -1, -1], dtype=torch.int64)
+
+    (trimmed,), trimmed_slots = pcp.maybe_gather_cache_inputs(
+        (values,),
+        slots,
+        metadata,
+    )
+
+    assert trimmed.tolist() == [0, 1]
+    assert trimmed_slots.tolist() == [7, 8]
+    assert pcp.local_pcp_slot_mapping(slots, 4, metadata).tolist() == [7, 8]
