@@ -2800,7 +2800,6 @@ def test_hcu_sparse_indexer_merges_dcp_decode_candidates(monkeypatch):
         ),
     )
     monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
-    monkeypatch.setattr(sparse, "_lightop_mask_topk_decode", lambda *a, **k: None)
     monkeypatch.setattr(
         sparse,
         "rocm_fp8_paged_mqa_logits",

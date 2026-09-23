@@ -43,7 +43,6 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = False
-    VLLM_HCU_USE_LIGHTOP_MASK_TOPK: bool = False
     VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS: bool = False
     VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_HCU_USE_AITER_MHC: bool = True
@@ -313,11 +312,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get(
             "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM", "False"
         ).lower() in ("true", "1")),
-
-    # If set, use LightOp mask-aware sparse Page-MQA + TopK for HCU DSA decode.
-    "VLLM_HCU_USE_LIGHTOP_MASK_TOPK":
-        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_MASK_TOPK", "False").lower() in
-                    ("true", "1")),
 
     # Opt in to AITER Opus paged-MQA for HCU DSA decode.
     "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS":
