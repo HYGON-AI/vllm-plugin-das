@@ -295,6 +295,15 @@ register_hcu_ci(
     est_time=10800,
 )
 register_hcu_ci(
+    job="qwen38-flash-next-int8-pp2-tp4-humaneval",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_qwen38_flash_next_int8_pp2_tp4_humaneval.py::"
+        "test_qwen38_flash_next_int8_pp2_tp4_humaneval_evalscope_server"
+    ),
+    est_time=10800,
+)
+register_hcu_ci(
     job="deepseek-gsm8k",
     target=(
         "tests/integration/server/test_evalscope_deepseek_r1_gsm8k.py::"

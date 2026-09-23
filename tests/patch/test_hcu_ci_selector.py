@@ -384,6 +384,7 @@ def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
         "qwen3-vl-mmmu",
         "qwen3-8b-gsm8k",
         "qwen38-flash-next-humaneval",
+        "qwen38-flash-next-int8-pp2-tp4-humaneval",
         "deepseek-gsm8k",
         "glm52-pcp",
         "glm53-flash-channel-fp8-humaneval",

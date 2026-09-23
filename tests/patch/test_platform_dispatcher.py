@@ -60,6 +60,7 @@ def _run_fresh(
 def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
         ("platform.core_fix.envs", "vllm.envs"),
+        ("platform.core_fix.engram_config.hcu", "vllm.config.engram"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
         (
             "platform.core.layer_name_value_member",
@@ -75,6 +76,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "vllm.config.compilation",
         ),
         ("platform.core_fix.hcu_config.vllm", "vllm.config.vllm"),
+        (
+            "platform.core_fix.qwen4_exp.first_stage_ple_pp",
+            "vllm.model_executor.models.config",
+        ),
         (
             "platform.core_fix.hcu_config.slimquant_registry",
             "vllm.model_executor.layers.quantization",
@@ -273,9 +278,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 44,
+        "count": 46,
         "replacements": 11,
-        "callbacks": 33,
+        "callbacks": 35,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
