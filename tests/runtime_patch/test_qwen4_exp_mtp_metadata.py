@@ -194,6 +194,9 @@ def test_scheduler_uses_hybrid_block_size_only_inside_upstream_mamba_split():
         ):
             del self, draft_token_ids, scheduler_output
 
+        def _update_after_schedule(self, scheduler_output):
+            del self, scheduler_output
+
         def __init__(
             self,
             vllm_config,

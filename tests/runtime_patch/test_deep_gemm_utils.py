@@ -34,6 +34,21 @@ def _install_categorized_lightop(
     monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
 
 
+def _install_deepgemm_i8(
+    monkeypatch,
+    *,
+    contiguous_kernel=None,
+    masked_kernel=None,
+) -> None:
+    deepgemm = ModuleType("deepgemm")
+    deepgemm.__path__ = []
+    if contiguous_kernel is not None:
+        deepgemm.m_grouped_i8_gemm_nt_contiguous = contiguous_kernel
+    if masked_kernel is not None:
+        deepgemm.m_grouped_i8_gemm_nt_masked = masked_kernel
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+
+
 def _load_permute_function():
     source_path = (
         Path(__file__).parents[2]
@@ -200,8 +215,11 @@ def test_w8a8_apply_skips_alignment_scope_only_on_rocm(monkeypatch):
             torch.ones((tensor.shape[0], 1)),
         ),
         gemm_name="m_grouped_w8a8_gemm_nt_contig_asm",
-        gemm_kernel=lambda *_args: None,
+        gemm_kernel=lambda *_args: pytest.fail(
+            "LightOp INT8 GEMM routing regressed"
+        ),
     )
+    _install_deepgemm_i8(monkeypatch, contiguous_kernel=lambda *_args: None)
 
     hcu = _load_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
@@ -229,26 +247,34 @@ def test_w8a8_apply_skips_alignment_scope_only_on_rocm(monkeypatch):
     assert events == [("scope", 256), "enter", "exit"]
 
 
-def test_w8a8_apply_uses_categorized_lightop_contiguous_api(
+def test_w8a8_apply_pairs_deepgemm_contiguous_gemm_with_lightop_activation(
     monkeypatch,
 ):
-    calls: list[tuple[object, ...]] = []
+    events: list[str] = []
+
+    def quantize(tensor, **kwargs):
+        events.append("activation")
+        return kwargs["output"], torch.ones((tensor.shape[0], 1))
+
+    def gemm(*_args):
+        events.append("gemm")
+
     _install_categorized_lightop(
         monkeypatch,
         activation_name="fuse_silu_mul_quant",
-        activation_kernel=lambda tensor, **kwargs: (
-            kwargs["output"],
-            torch.ones((tensor.shape[0], 1)),
-        ),
+        activation_kernel=quantize,
         gemm_name="m_grouped_w8a8_gemm_nt_contig_asm",
-        gemm_kernel=lambda *args: calls.append(args),
+        gemm_kernel=lambda *_args: pytest.fail(
+            "LightOp INT8 contiguous GEMM routing regressed"
+        ),
     )
+    _install_deepgemm_i8(monkeypatch, contiguous_kernel=gemm)
     hcu = _load_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
 
     _run_w8a8_apply(hcu, packed_weights=True)
 
-    assert len(calls) == 2
+    assert events == ["gemm", "activation", "gemm"]
 
 
 def _load_batched_deep_gemm_apply():
@@ -291,20 +317,28 @@ def _load_batched_deep_gemm_apply():
     return namespace
 
 
-def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
+def test_w8a8_batched_apply_pairs_deepgemm_masked_gemm_with_lightop_activation(
     monkeypatch,
 ):
-    calls: list[tuple[object, ...]] = []
+    events: list[str] = []
+
+    def quantize(tensor, _counts):
+        events.append("activation")
+        return tensor, torch.ones((*tensor.shape[:-1], 1))
+
+    def gemm(*_args):
+        events.append("gemm")
+
     _install_categorized_lightop(
         monkeypatch,
         activation_name="fuse_silu_mul_quant_ep",
-        activation_kernel=lambda tensor, _counts: (
-            tensor,
-            torch.ones((*tensor.shape[:-1], 1)),
-        ),
+        activation_kernel=quantize,
         gemm_name="m_grouped_w8a8_gemm_nt_masked",
-        gemm_kernel=lambda *args: calls.append(args),
+        gemm_kernel=lambda *_args: pytest.fail(
+            "LightOp INT8 masked GEMM routing regressed"
+        ),
     )
+    _install_deepgemm_i8(monkeypatch, masked_kernel=gemm)
     hcu = _load_batched_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
     experts = SimpleNamespace(
@@ -339,7 +373,7 @@ def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
         apply_router_weight_on_input=False,
     )
 
-    assert len(calls) == 2
+    assert events == ["gemm", "activation", "gemm"]
 
 
 def _make_w4a8_expert_layer() -> torch.nn.Module:
