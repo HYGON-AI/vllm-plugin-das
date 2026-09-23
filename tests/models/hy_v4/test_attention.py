@@ -346,24 +346,41 @@ def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "num_reqs", "expected"),
-    [(8, 2, 4), (8, 8, 1)],
+    ("num_tokens", "num_reqs", "max_query_len", "expected"),
+    [
+        (8, 2, 4, 4),
+        (8, 8, 1, 1),
+        # Chunked prefill can split a fixed token budget unevenly across
+        # requests. LightOp cannot express those widths with its scalar
+        # tokens_per_request argument, so process every row independently.
+        (256, 3, 86, 1),
+        # Divisibility alone does not prove that request widths are uniform.
+        (8, 2, 5, 1),
+    ],
 )
-def test_uniform_tokens_per_request(
+def test_lightop_tokens_per_request(
     num_tokens: int,
     num_reqs: int,
+    max_query_len: int,
     expected: int,
 ) -> None:
-    assert hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs) == expected
+    assert (
+        hcu_sparse._lightop_tokens_per_request(
+            num_tokens,
+            num_reqs,
+            max_query_len,
+        )
+        == expected
+    )
 
 
-@pytest.mark.parametrize(("num_tokens", "num_reqs"), [(7, 2), (8, 0)])
-def test_uniform_tokens_per_request_rejects_invalid_shape(
+@pytest.mark.parametrize(("num_tokens", "num_reqs"), [(8, 0)])
+def test_lightop_tokens_per_request_rejects_invalid_shape(
     num_tokens: int,
     num_reqs: int,
 ) -> None:
-    with pytest.raises(ValueError, match="uniform query width|at least one request"):
-        hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs)
+    with pytest.raises(ValueError, match="at least one request"):
+        hcu_sparse._lightop_tokens_per_request(num_tokens, num_reqs, 4)
 
 
 def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
@@ -1059,6 +1076,7 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     fp8_cache = torch.zeros(16, 656, dtype=torch.uint8)
     metadata = SimpleNamespace(
         num_reqs=2,
+        max_query_len=1,
         req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
         block_table=torch.tensor([[7], [11]], dtype=torch.int32),
         block_size=64,

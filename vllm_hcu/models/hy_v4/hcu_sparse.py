@@ -55,16 +55,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _uniform_tokens_per_request(num_tokens: int, num_reqs: int) -> int:
-    """Return a uniform query width for request-grouped LightOp gather."""
+def _lightop_tokens_per_request(
+    num_tokens: int,
+    num_reqs: int,
+    max_query_len: int,
+) -> int:
+    """Return the LightOp grouping width, or one for a ragged batch."""
     if num_reqs <= 0:
         raise ValueError("DCP sparse attention requires at least one request")
-    if num_tokens % num_reqs != 0:
-        raise ValueError(
-            "DCP sparse attention requires a uniform query width: "
-            f"num_tokens={num_tokens}, num_reqs={num_reqs}."
-        )
-    return num_tokens // num_reqs
+    if max_query_len > 0 and num_tokens == num_reqs * max_query_len:
+        return max_query_len
+    # LightOp only accepts one scalar request width. Chunked prefill can be
+    # ragged, so treat every query row as an independent group. This disables
+    # request-local deduplication while preserving the gather/dequant result.
+    return 1
 
 
 def _lightop_mapping_reuse_group_size(
@@ -533,8 +537,10 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         if self.kv_cache_dtype == "fp8_ds_mla":
             rope_dim = self.head_size - self.kv_lora_rank
-            tokens_per_request = _uniform_tokens_per_request(
-                num_actual_toks, attn_metadata.num_reqs
+            tokens_per_request = _lightop_tokens_per_request(
+                num_actual_toks,
+                attn_metadata.num_reqs,
+                attn_metadata.max_query_len,
             )
             reuse_state = getattr(self, "_lightop_kv_reuse_state", None)
             reuse_kwargs = (
