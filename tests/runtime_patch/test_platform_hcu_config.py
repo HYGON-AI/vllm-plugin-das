@@ -1625,8 +1625,20 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
     assert get_hcu_config(config) == feature_config
 
 
-def test_varlen_flash_attention_uses_64_token_cache_blocks(
+@pytest.mark.parametrize(
+    ("flash_attn_mode", "alignment_size", "expected_block_size"),
+    [
+        ("varlen", "128", 64),
+        ("classic", None, 128),
+        ("classic", "96", 96),
+    ],
+    ids=["varlen", "classic", "environment_override"],
+)
+def test_flash_attention_block_size_survives_backend_update(
     monkeypatch: pytest.MonkeyPatch,
+    flash_attn_mode: str,
+    alignment_size: str | None,
+    expected_block_size: int,
 ) -> None:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm_hcu.platforms import envs as hcu_envs
@@ -1638,30 +1650,36 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
             return False
 
     monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_PD_SPLIT", False)
-    monkeypatch.setattr(
-        hcu_envs,
-        "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE",
-        128,
-    )
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    if alignment_size is None:
+        monkeypatch.delenv("VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE", raising=False)
+    else:
+        monkeypatch.setenv(
+            "VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE", alignment_size
+        )
+
     config = _validation_config(
-        HcuFeatureConfig(hcu_flash_attn_mode="varlen")
+        HcuFeatureConfig(hcu_flash_attn_mode=flash_attn_mode)
     )
     config.compilation_config.cudagraph_mode = _NoFullGraphs()
     config.parallel_config.prefill_context_parallel_size = 1
     config.parallel_config.distributed_executor_backend = "uni"
     config.parallel_config.worker_cls = "auto"
+    config.model_config.is_hybrid = False
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
         block_size=None,
+        kv_cache_dtype_skip_layers=(),
     )
     config.attention_config = SimpleNamespace(
         backend=AttentionBackendEnum.FLASH_ATTN
     )
 
     HCUPlatform.check_and_update_config(config)
+    assert config.cache_config.block_size == expected_block_size
 
-    assert config.cache_config.block_size == 64
+    HCUPlatform.update_block_size_for_backend(config)
+    assert config.cache_config.block_size == expected_block_size
 
 
 @pytest.mark.parametrize("enabled", [False, True])
