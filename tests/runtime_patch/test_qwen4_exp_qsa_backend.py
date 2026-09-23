@@ -355,23 +355,33 @@ def test_optional_backend_load_failure_is_cached_after_first_attempt(
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", "cutlass")
     attempts = []
+    constructed = []
+
+    class TrackedError(RuntimeError):
+        def __init__(self, *args):
+            constructed.append(1)
+            super().__init__(*args)
 
     def fail_loader():
         attempts.append(1)
-        raise RuntimeError("cutlass unavailable")
+        raise TrackedError("cutlass unavailable")
 
     monkeypatch.setattr(qsa, "_load_flash_qsa_kernels", fail_loader)
     with caplog.at_level(logging.WARNING, logger=qsa.__name__):
         first = _backend(monkeypatch)
         second = _backend(monkeypatch)
+        third = _backend(monkeypatch)
 
     assert first.name == qsa.QSA_BACKEND_TRITON
     assert second.name == qsa.QSA_BACKEND_TRITON
+    assert third.name == qsa.QSA_BACKEND_TRITON
     assert first.mqa_paged_score is _triton_mqa
-    assert second.sparse_gqa_paged_attn is _triton_sparse
-    # A decode loop calls this per forward; the import and the warning must not
-    # repeat once the backend is known to be unavailable.
+    assert third.sparse_gqa_paged_attn is _triton_sparse
+    # A decode loop calls this per forward. Once the backend is known to be
+    # unavailable the import, the warning, and the exception must not repeat,
+    # and the fallback must not travel through exception control flow at all.
     assert len(attempts) == 1
+    assert len(constructed) == 1
     assert caplog.text.count("falling back to Triton") == 1
 
 
