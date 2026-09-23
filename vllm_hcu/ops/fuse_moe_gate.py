@@ -6,6 +6,7 @@ import vllm_hcu.platforms.envs as henvs
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 
 from vllm_hcu.model_executor.layers.fused_moe.lightop_routing import (
+    lightop_moe_gate_index_kwargs,
     lightop_moe_gate_kwargs,
 )
 
@@ -61,6 +62,15 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
                     indices_type,
                     input_ids=input_ids,
                 )
+            gate_kwargs.update(
+                lightop_moe_gate_index_kwargs(
+                    lightop_moe,
+                    request_int64_indices=(
+                        indices_type == torch.int64
+                        and self.num_expert_group == 1
+                    ),
+                )
+            )
             from lightop.moe import moe_fused_gate as lightop_moe_fused_gate
 
             topk_weights, topk_ids = lightop_moe_fused_gate(

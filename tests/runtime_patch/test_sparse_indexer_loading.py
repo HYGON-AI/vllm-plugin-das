@@ -71,6 +71,31 @@ def _load_v32_sparse_indexer_contract(**dependencies):
     return namespace["forward_hip"]
 
 
+def _load_sparse_indexer_contract(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_forward_hip", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
 def _load_v32_sparse_indexer_class():
     source = (
         REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
@@ -90,6 +115,52 @@ def _load_v32_sparse_indexer_class():
     namespace = {"torch": torch, "SparseAttnIndexer": object}
     exec(compile(module, "v32_sparse_indexer_class", "exec"), namespace)
     return namespace["V32SparseAttnIndexer"]
+
+
+def test_aiter_opus_flag_routes_sparse_indexer_through_native_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def native_wrapper(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "native-topk"
+
+    module_name = "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
+    fake_module = ModuleType(module_name)
+    fake_module.rocm_aiter_sparse_attn_indexer_native = native_wrapper
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "rocm_aiter_sparse_attn_indexer",
+        lambda *_args, **_kwargs: pytest.fail("legacy AITER indexer was selected"),
+        raising=False,
+    )
+
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        henvs=SimpleNamespace(VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=True),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        dcp_world_size=1,
+        skip_k_cache_insert=False,
+        use_fp4_cache=False,
+        k_cache=SimpleNamespace(prefix="layer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="float32",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=8192,
+        max_total_seq_len=8192,
+        topk_indices_buffer=object(),
+    )
+    q_quant = torch.empty((1, 32, 128), dtype=torch.float8_e4m3fn)
+
+    assert forward_hip(indexer, object(), q_quant, object(), object()) == "native-topk"
+    assert len(calls) == 1
+    assert calls[0][1] == {"skip_k_cache_insert": False}
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
