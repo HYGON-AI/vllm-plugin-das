@@ -444,6 +444,7 @@ _LINEAR_GATE_PCP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD"
 _LINEAR_GATE_PCP_GROUP_SIZE_ENV = "VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE"
 _LINEAR_GATE_PCP_CHUNK_ENV = "VLLM_HCU_LINEAR_GATE_PCP_CHUNKING"
 _LINEAR_GATE_PCP_BLOCK_TOKENS_ENV = "VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS"
+_LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE = 8
 _LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS = 4096
 _linear_gate_pcp_shard_logged = False
 _linear_gate_pcp_groups: dict[tuple[int, ...], object] = {}
@@ -451,7 +452,7 @@ _LINEAR_GATE_DP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_DP_SHARD"
 _LINEAR_GATE_DP_GROUP_SIZE_ENV = "VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE"
 _LINEAR_GATE_DP_CHUNK_ENV = "VLLM_HCU_LINEAR_GATE_DP_CHUNKING"
 _LINEAR_GATE_DP_BLOCK_TOKENS_ENV = "VLLM_HCU_LINEAR_GATE_DP_BLOCK_TOKENS"
-_LINEAR_GATE_DP_DEFAULT_GROUP_SIZE = 8
+_LINEAR_GATE_DP_DEFAULT_GROUP_SIZE = 2
 _LINEAR_GATE_DP_DEFAULT_BLOCK_TOKENS = 4096
 _linear_gate_dp_shard_logged = False
 _linear_gate_dp_groups: dict[tuple[int, ...], object] = {}
@@ -646,19 +647,20 @@ def linear_gate_pcp_block_tokens() -> int:
 def _linear_gate_pcp_group_size(pcp_size: int) -> int:
     """Return the PCP subgroup size that shares one K-sharded linear_gate.
 
-    Unset ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` keeps the historical behavior
-    of sharding across the full PCP group. When set, the value must be 2, 4, or
-    8 and must divide ``pcp_size``.
+    Unset ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` defaults to
+    ``_LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE`` (8). When set, the value must be
+    2, 4, or 8 and must divide ``pcp_size``.
     """
     raw = os.environ.get(_LINEAR_GATE_PCP_GROUP_SIZE_ENV)
     if raw is None or raw.strip() == "":
-        return pcp_size
-    try:
-        size = int(raw.strip())
-    except ValueError as exc:
-        raise ValueError(
-            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {raw!r}."
-        ) from exc
+        size = _LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE
+    else:
+        try:
+            size = int(raw.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {raw!r}."
+            ) from exc
     if size not in _LINEAR_GATE_ALLOWED_GROUP_SIZES:
         raise ValueError(
             f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {size}."
@@ -698,10 +700,9 @@ def _get_linear_gate_pcp_group():
     """Return the PCP subgroup that K-shards one replica of linear_gate.
 
     ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` splits the PCP group into independent
-    replicas. For PCP=32 and group size 8, ranks ``[0,8)``, ``[8,16)``,
+    replicas (default 8). For PCP=32 and group size 8, ranks ``[0,8)``, ``[8,16)``,
     ``[16,24)``, and ``[24,32)`` each shard the same full weight and run
-    all-to-all plus reduce-scatter inside the subgroup. When the env is unset,
-    the full PCP group is used.
+    all-to-all plus reduce-scatter inside the subgroup.
     """
     pcp = get_pcp_group()
     size = _linear_gate_pcp_group_size(pcp.world_size)

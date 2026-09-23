@@ -118,14 +118,8 @@ def test_linear_gate_pcp_sharding_flag_remains_independent(monkeypatch) -> None:
     assert linear_gate_pcp_shard_enabled() is True
 
 
-def test_linear_gate_pcp_group_size_defaults_to_full_pcp(monkeypatch) -> None:
+def test_linear_gate_pcp_group_size_default_and_override(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", raising=False)
-    assert _linear_gate_pcp_group_size(32) == 32
-    assert _linear_gate_pcp_group_size(4) == 4
-
-
-def test_linear_gate_pcp_group_size_is_configurable(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "8")
     assert _linear_gate_pcp_group_size(32) == 8
     monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "4")
     assert _linear_gate_pcp_group_size(16) == 4
@@ -177,11 +171,11 @@ def test_linear_gate_dp_sharding_flag_defaults_off(monkeypatch) -> None:
 
 def test_linear_gate_dp_group_size_is_configurable(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", raising=False)
-    assert _linear_gate_dp_group_size() == 8
+    assert _linear_gate_dp_group_size() == 2
     monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", "4")
     assert _linear_gate_dp_group_size() == 4
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", "2")
-    assert _linear_gate_dp_group_size() == 2
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", "8")
+    assert _linear_gate_dp_group_size() == 8
 
 
 @pytest.mark.parametrize("value", ["1", "3", "16", "not-an-integer"])
