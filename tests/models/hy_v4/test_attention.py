@@ -22,9 +22,14 @@ from vllm_hcu.models.hy_v4.attention import (
     is_skip_topk_indexer_weight,
     require_local_indexer_producer,
     require_hyv4_sink_backend,
+    linear_gate_dp_block_tokens,
+    linear_gate_dp_chunking_enabled,
+    linear_gate_dp_shard_enabled,
     linear_gate_pcp_block_tokens,
     linear_gate_pcp_chunking_enabled,
     linear_gate_pcp_shard_enabled,
+    _linear_gate_dp_group_size,
+    _linear_gate_pcp_group_size,
 )
 
 
@@ -111,6 +116,114 @@ def test_linear_gate_pcp_rejects_invalid_block_tokens(monkeypatch, value) -> Non
 def test_linear_gate_pcp_sharding_flag_remains_independent(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
     assert linear_gate_pcp_shard_enabled() is True
+
+
+def test_linear_gate_pcp_group_size_default_and_override(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", raising=False)
+    assert _linear_gate_pcp_group_size(32) == 8
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "4")
+    assert _linear_gate_pcp_group_size(16) == 4
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "2")
+    assert _linear_gate_pcp_group_size(8) == 2
+
+
+def test_linear_gate_pcp_group_size_rejects_nondivisible_pcp(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", raising=False)
+    with pytest.raises(ValueError, match="not divisible"):
+        _linear_gate_pcp_group_size(4)
+
+
+@pytest.mark.parametrize("value", ["1", "3", "16", "not-an-integer"])
+def test_linear_gate_pcp_rejects_invalid_group_size(monkeypatch, value) -> None:
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", value)
+    with pytest.raises(ValueError):
+        _linear_gate_pcp_group_size(32)
+
+
+def test_linear_gate_pcp_subgroups_split_pcp32_into_groups_of_8() -> None:
+    from vllm_hcu.models.hy_v4.attention import _linear_gate_pcp_group_ranks
+
+    groups = _linear_gate_pcp_group_ranks(
+        world=32, dp_size=1, pp_size=1, pcp_size=32, tp_size=1, group_size=8
+    )
+    assert groups == [
+        list(range(0, 8)),
+        list(range(8, 16)),
+        list(range(16, 24)),
+        list(range(24, 32)),
+    ]
+
+
+def test_linear_gate_pcp_subgroups_support_pcp16_group4() -> None:
+    from vllm_hcu.models.hy_v4.attention import _linear_gate_pcp_group_ranks
+
+    groups = _linear_gate_pcp_group_ranks(
+        world=16, dp_size=1, pp_size=1, pcp_size=16, tp_size=1, group_size=4
+    )
+    assert groups == [
+        list(range(0, 4)),
+        list(range(4, 8)),
+        list(range(8, 12)),
+        list(range(12, 16)),
+    ]
+
+
+def test_linear_gate_dp_sharding_flag_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_DP_SHARD", raising=False)
+    assert linear_gate_dp_shard_enabled() is False
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_DP_SHARD", "1")
+    assert linear_gate_dp_shard_enabled() is True
+
+
+def test_linear_gate_dp_group_size_is_configurable(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", raising=False)
+    assert _linear_gate_dp_group_size() == 2
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", "4")
+    assert _linear_gate_dp_group_size() == 4
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", "8")
+    assert _linear_gate_dp_group_size() == 8
+
+
+@pytest.mark.parametrize("value", ["1", "3", "16", "not-an-integer"])
+def test_linear_gate_dp_rejects_invalid_group_size(monkeypatch, value) -> None:
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_GROUP_SIZE", value)
+    with pytest.raises(ValueError):
+        _linear_gate_dp_group_size()
+
+
+def test_linear_gate_dp_chunking_and_block_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_CHUNKING", "1")
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_DP_BLOCK_TOKENS", "1024")
+    assert linear_gate_dp_chunking_enabled() is True
+    assert linear_gate_dp_block_tokens() == 1024
+
+
+def test_linear_gate_dp_subgroups_split_dp32_into_groups_of_8() -> None:
+    from vllm_hcu.models.hy_v4.attention import _linear_gate_dp_group_ranks
+
+    groups = _linear_gate_dp_group_ranks(
+        world=32, dp_size=32, pp_size=1, pcp_size=1, tp_size=1, group_size=8
+    )
+    assert groups == [
+        list(range(0, 8)),
+        list(range(8, 16)),
+        list(range(16, 24)),
+        list(range(24, 32)),
+    ]
+
+
+def test_linear_gate_dp_subgroups_support_dp16_group4() -> None:
+    from vllm_hcu.models.hy_v4.attention import _linear_gate_dp_group_ranks
+
+    groups = _linear_gate_dp_group_ranks(
+        world=16, dp_size=16, pp_size=1, pcp_size=1, tp_size=1, group_size=4
+    )
+    assert groups == [
+        list(range(0, 4)),
+        list(range(4, 8)),
+        list(range(8, 12)),
+        list(range(12, 16)),
+    ]
 
 
 def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
