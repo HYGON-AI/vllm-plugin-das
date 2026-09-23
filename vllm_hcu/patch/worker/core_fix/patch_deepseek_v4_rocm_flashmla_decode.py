@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Opt-in FlashMLA sparse decode for the native ROCm DeepSeek-V4 model."""
+"""Opt-in FlashMLA sparse prefill/decode for native ROCm DeepSeek-V4."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def _require_flashmla_ready() -> None:
         raise RuntimeError(f"DeepSeek-V4 FlashMLA decode unavailable: {reason}")
     import flash_mla.cuda as flash_mla_cuda
 
-    if not hasattr(flash_mla_cuda, "sparse_decode_fwd"):
+    if not callable(getattr(flash_mla_cuda, "sparse_decode_fwd", None)):
         raise RuntimeError(
             "DeepSeek-V4 FlashMLA decode unavailable: the installed flash_mla "
             "extension does not export sparse_decode_fwd"
@@ -54,6 +54,32 @@ def _require_flashmla_ready() -> None:
         )
 
 
+@functools.cache
+def _require_flashmla_prefill_ready() -> None:
+    """Validate the compiled sparse-prefill entry point before model execution."""
+    from vllm_hcu.v1.attention.ops.flashmla import is_flashmla_sparse_supported
+
+    supported, reason = is_flashmla_sparse_supported()
+    if not supported:
+        raise RuntimeError(f"DeepSeek-V4 FlashMLA prefill unavailable: {reason}")
+    import flash_mla.cuda as flash_mla_cuda
+
+    if not callable(getattr(flash_mla_cuda, "sparse_prefill_fwd", None)):
+        raise RuntimeError(
+            "DeepSeek-V4 FlashMLA prefill unavailable: the installed flash_mla "
+            "extension does not export sparse_prefill_fwd"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("DeepSeek-V4 FlashMLA prefill requires an available ROCm device")
+    arch = str(torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName)
+    arch = arch.split(":", 1)[0]
+    if arch not in ("gfx936", "gfx938"):
+        raise RuntimeError(
+            "DeepSeek-V4 FlashMLA prefill unavailable: no validated sparse "
+            f"prefill kernel for {arch or 'unknown ROCm architecture'}"
+        )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     rocm = load_exact_module(TARGET_MODULE, module)
     attention_cls = require_class(rocm, "DeepseekV4ROCMAiterMLAAttention", TARGET_MODULE)
@@ -64,6 +90,7 @@ def apply_to_module(module: ModuleType) -> bool:
         rocm, "DeepseekV4ROCMAiterMLASparseMetadataBuilder", TARGET_MODULE
     )
     original_decode = require_callable(attention_cls, "_forward_decode", TARGET_MODULE)
+    original_prefill = require_callable(attention_cls, "_forward_prefill", TARGET_MODULE)
     original_scheduler = require_callable(builder_cls, "build_tile_scheduler", TARGET_MODULE)
     original_swa_build = require_callable(builder_cls, "build", TARGET_MODULE)
     original_mla_build = require_callable(mla_builder_cls, "build", TARGET_MODULE)
@@ -74,6 +101,7 @@ def apply_to_module(module: ModuleType) -> bool:
             getattr(fn, _MARKER, False)
             for fn in (
                 attention_cls._forward_decode,
+                attention_cls._forward_prefill,
                 builder_cls.build,
                 builder_cls.build_tile_scheduler,
                 builder_cls.__init__,
@@ -81,12 +109,20 @@ def apply_to_module(module: ModuleType) -> bool:
                 mla_builder_cls.__init__,
             )
         ):
-            raise PatchCompatibilityError("stale DeepSeek-V4 FlashMLA decode patch")
+            raise PatchCompatibilityError("stale DeepSeek-V4 FlashMLA sparse attention patch")
         return False
     require_exact_signature(
         original_decode,
         f"{TARGET_MODULE}.DeepseekV4ROCMAiterMLAAttention._forward_decode",
         positional=("self", "q", "kv_cache", "swa_metadata", "attn_metadata", "swa_only", "output"),
+    )
+    require_exact_signature(
+        original_prefill,
+        f"{TARGET_MODULE}.DeepseekV4ROCMAiterMLAAttention._forward_prefill",
+        positional=(
+            "self", "q", "positions", "compressed_k_cache", "swa_k_cache",
+            "output", "attn_metadata", "swa_metadata",
+        ),
     )
     require_exact_signature(
         original_scheduler,
@@ -260,8 +296,144 @@ def apply_to_module(module: ModuleType) -> bool:
             raise RuntimeError("FlashMLA returned an unexpected output shape")
         output.copy_(out.squeeze(1).to(output.dtype))
 
+    @functools.wraps(original_prefill)
+    def forward_prefill(
+        self,
+        q,
+        positions,
+        compressed_k_cache,
+        swa_k_cache,
+        output,
+        attn_metadata,
+        swa_metadata,
+    ):
+        from vllm_hcu.platforms import envs as henvs
+
+        if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL:
+            return original_prefill(
+                self, q, positions, compressed_k_cache, swa_k_cache, output,
+                attn_metadata, swa_metadata,
+            )
+
+        _require_flashmla_prefill_ready()
+        from vllm_hcu.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+        swa_only = attn_metadata is None
+        num_prefills = swa_metadata.num_prefills
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        query_start_loc = swa_metadata.query_start_loc
+        if seq_lens is None or gather_lens is None:
+            raise ValueError("FlashMLA prefill requires sequence and gather lengths")
+        if query_start_loc_cpu is None or query_start_loc is None:
+            raise ValueError("FlashMLA prefill requires query start locations")
+        if q.ndim != 3 or q.shape[-1] != 512 or output.shape != q.shape:
+            raise ValueError("FlashMLA prefill requires [tokens, heads, 512] q/output")
+        if q.dtype != torch.bfloat16:
+            raise TypeError(f"FlashMLA sparse prefill requires bfloat16 q, got {q.dtype}")
+
+        prefill_token_base = query_start_loc_cpu[swa_metadata.num_decodes]
+        if swa_only:
+            if self.topk_indices_buffer is None:
+                raise ValueError("SWA-only prefill requires the shared topk buffer")
+            topk_indices = self.topk_indices_buffer[num_decode_tokens:]
+            top_k = 0
+            compressed_pool_size = 0
+        else:
+            if compressed_k_cache is None:
+                raise ValueError("compressed prefill requires its KV cache")
+            if self.compress_ratio == 4:
+                if self.topk_indices_buffer is None:
+                    raise ValueError("C4A prefill requires the topk buffer")
+                topk_indices = self.topk_indices_buffer[num_decode_tokens:]
+                topk_indices = topk_indices[:swa_metadata.num_prefill_tokens]
+            elif self.compress_ratio == 128:
+                topk_indices = attn_metadata.c128a_prefill_topk_indices
+            else:
+                raise ValueError(f"Unsupported compress_ratio={self.compress_ratio}")
+            if topk_indices is None:
+                raise ValueError("FlashMLA prefill requires dense topk indices")
+            top_k = topk_indices.shape[-1]
+            compressed_pool_size = (
+                self.max_model_len + self.compress_ratio - 1
+            ) // self.compress_ratio
+
+        workspace_width = (
+            compressed_pool_size + self.window_size + self.max_num_batched_tokens
+        )
+        workspace = rocm.current_workspace_manager().get_simultaneous(
+            ((self.PREFILL_CHUNK_SIZE, workspace_width, q.shape[-1]), torch.bfloat16),
+        )[0]
+        num_chunks = (
+            num_prefills + self.PREFILL_CHUNK_SIZE - 1
+        ) // self.PREFILL_CHUNK_SIZE
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_size = chunk_end - chunk_start
+            if not swa_only:
+                block_table = attn_metadata.block_table[swa_metadata.num_decodes:]
+                rocm.dequantize_and_gather_k_cache(
+                    workspace[:chunk_size],
+                    compressed_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    gather_lens=None,
+                    block_table=block_table[chunk_start:chunk_end],
+                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    offset=0,
+                    use_fnuz=False,
+                )
+
+            swa_block_table = swa_metadata.block_table[swa_metadata.num_decodes:]
+            rocm.dequantize_and_gather_k_cache(
+                workspace[:chunk_size],
+                swa_k_cache,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                gather_lens=gather_lens[chunk_start:chunk_end],
+                block_table=swa_block_table[chunk_start:chunk_end],
+                block_size=swa_metadata.block_size,
+                offset=compressed_pool_size,
+                use_fnuz=rocm.current_platform.is_fp8_fnuz(),
+            )
+
+            query_start = (
+                query_start_loc_cpu[swa_metadata.num_decodes + chunk_start]
+                - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[swa_metadata.num_decodes + chunk_end]
+                - prefill_token_base
+            )
+            combined_indices, combined_lens = rocm.combine_topk_swa_indices(
+                topk_indices[query_start:query_end],
+                query_start_loc[
+                    swa_metadata.num_decodes + chunk_start:
+                    swa_metadata.num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
+                self.compress_ratio,
+                top_k,
+                workspace_width,
+                compressed_pool_size,
+            )
+            chunk_output, _, _ = flash_mla_sparse_fwd(
+                q=q[query_start:query_end],
+                kv=workspace.view(-1, 1, q.shape[-1]),
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.scale,
+                d_v=512,
+                attn_sink=self.attn_sink,
+                topk_length=combined_lens,
+            )
+            output[query_start:query_end].copy_(chunk_output.to(output.dtype))
+
     for fn in (
         forward_decode,
+        forward_prefill,
         build_swa_metadata,
         build_mla_metadata,
         build_tile_scheduler,
@@ -270,6 +442,7 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         setattr(fn, _MARKER, True)
     setattr(attention_cls, "_forward_decode", forward_decode)
+    setattr(attention_cls, "_forward_prefill", forward_prefill)
     setattr(builder_cls, "build_tile_scheduler", build_tile_scheduler)
     setattr(builder_cls, "build", build_swa_metadata)
     setattr(builder_cls, "__init__", swa_builder_init)
