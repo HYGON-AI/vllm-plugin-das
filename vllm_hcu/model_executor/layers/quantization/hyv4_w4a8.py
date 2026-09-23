@@ -202,11 +202,17 @@ class HYV4W4A8LinearMethod(SlimQuantW4A8Int8LinearMethod):
 class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
     """Normalize serialized pieces before the current loader/layout lifecycle.
 
-    Current SlimQuant multiplies canonical channel scales by 16 for INT4
-    kernels. HYV4 serializes signed-INT4 multipliers, so divide on loading.
-    No post-load conversion can accidentally swap an installed AITER layout.
-    supports_eplb remains the current owner's False capability.
+    Native HYV4 with the explicit AITER backend retains checkpoint scales and
+    packed weights for the calibrated INT4 Triton kernel. Other SlimQuant
+    routes multiply canonical scales by 16, so normalize those scales while
+    loading. supports_eplb remains the current owner's False capability.
     """
+
+    def _uses_native_packed_aiter(self) -> bool:
+        return (
+            self.quant_config.checkpoint_format == "hy4_w4a8_v1"
+            and getattr(self.moe, "moe_backend", "auto") == "aiter"
+        )
 
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype, **extra_weight_attrs):
@@ -241,7 +247,8 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
                     if value.shape != expected:
                         raise ValueError(f"HYV4 expert scale requires shape {expected}, "
                                          f"got {tuple(value.shape)}")
-                    value = value / 16.0
+                    if not self._uses_native_packed_aiter():
+                        value = value / 16.0
                 else:
                     # The target loader splits fused checkpoints into the
                     # same per-expert projection ABI before reaching here.
@@ -286,3 +293,73 @@ class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
 
         for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
             wrap(getattr(layer, name), name)
+
+    def process_weights_after_loading(self, layer):
+        if not self._uses_native_packed_aiter():
+            return super().process_weights_after_loading(layer)
+        # Native HYV4 is calibrated for AITER's contiguous packed-INT4
+        # Triton kernel. MOE_C shuffling changes that physical contract.
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            parameter = getattr(layer, name, None)
+            if not isinstance(parameter, torch.nn.Parameter):
+                raise TypeError(f"HYV4 W4A8 requires Parameter {name}")
+            parameter.requires_grad_(False)
+
+    def apply(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+        **kwargs,
+    ):
+        if not self._uses_native_packed_aiter():
+            return super().apply(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                **kwargs,
+            )
+        del shared_experts, shared_experts_input, kwargs
+        from aiter.ops.triton.fused_moe import fused_experts_impl
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+            resolve_aiter_expert_maps,
+        )
+
+        global_num_experts = getattr(
+            layer, "global_num_experts", layer.w13_weight.size(0)
+        )
+        native_expert_map, _ = resolve_aiter_expert_maps(
+            getattr(layer, "expert_map", None), global_num_experts
+        )
+
+        return fused_experts_impl(
+            x.contiguous(),
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            output_dtype=x.dtype,
+            use_int4_w4a8=True,
+            per_channel_quant=True,
+            global_num_experts=global_num_experts,
+            expert_map=native_expert_map,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            activation="silu",
+            is_gated=True,
+            gemm1_limit=getattr(self.moe, "swiglu_limit", 10.0),
+            apply_router_weight_on_input=getattr(
+                layer, "apply_router_weight_on_input", False
+            ),
+        )

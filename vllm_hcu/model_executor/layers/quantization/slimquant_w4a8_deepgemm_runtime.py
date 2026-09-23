@@ -60,6 +60,58 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(*args, **kwargs):
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _w4a8_hipc_implicit_scale_factor() -> float:
+    """Return the architecture-specific scale applied by the HIPC kernel."""
+
+    if not torch.cuda.is_available():
+        return 1.0
+    try:
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = str(properties.gcnArchName).split(":", 1)[0]
+    except (AttributeError, AssertionError, RuntimeError):
+        return 1.0
+    return 16.0 if arch == "gfx936" else 1.0
+
+
+def w4a8_hipc_weight_scales(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert logical W4A8 scales to the HIPC kernel's scale contract."""
+
+    factor = _w4a8_hipc_implicit_scale_factor()
+    if factor == 1.0:
+        return w1_scale, w2_scale
+    return w1_scale / factor, w2_scale / factor
+
+
+def _cached_w4a8_hipc_weight_scales(
+    quant_config: FusedMoEQuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cache static HIPC scales and refresh them after in-place reloads."""
+
+    w1_scale = quant_config.w1_scale
+    w2_scale = quant_config.w2_scale
+    if w1_scale is None or w2_scale is None:
+        raise RuntimeError("SlimQuant W4A8 DeepGEMM requires weight scales")
+    signature = (
+        id(w1_scale),
+        w1_scale._version,
+        id(w2_scale),
+        w2_scale._version,
+        _w4a8_hipc_implicit_scale_factor(),
+    )
+    cached = getattr(quant_config, "_hcu_w4a8_hipc_scales", None)
+    if cached is None or cached[0] != signature:
+        cached = (
+            signature,
+            w4a8_hipc_weight_scales(w1_scale, w2_scale),
+        )
+        setattr(quant_config, "_hcu_w4a8_hipc_scales", cached)
+    return cached[1]
+
+
 def fuse_silu_mul_quant(*args, **kwargs):
     from lightop.activation import fuse_silu_mul_quant as lightop_fuse_silu_mul_quant
 
@@ -206,6 +258,9 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
     def _permute_scale_kwargs(self, hidden_size):
         return {}
 
+    def _hipc_weight_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return _cached_w4a8_hipc_weight_scales(self.quant_config)
+
     def workspace_shapes(
         self,
         M: int,
@@ -293,9 +348,10 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         m_indices = m_indices.to(dtype=torch.int32).contiguous()
 
         gateup_output = _resize_cache(workspace2, (m_aligned, N))
+        w1_scale, w2_scale = self._hipc_weight_scales()
         m_grouped_w4a8_gemm_nt_contiguous_hipc(
             (input_tensor, input_scale),
-            (self._deepgemm_w13, self.w1_scale),
+            (self._deepgemm_w13, w1_scale),
             gateup_output,
             m_indices,
         )
@@ -310,7 +366,7 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
         down_output = _resize_cache(workspace2, (m_aligned, K))
         m_grouped_w4a8_gemm_nt_contiguous_hipc(
             (q_activation, q_activation_scale),
-            (self._deepgemm_w2, self.w2_scale),
+            (self._deepgemm_w2, w2_scale),
             down_output,
             m_indices,
         )
@@ -349,6 +405,9 @@ class DeepEPDeepGemmW4A8BatchedExperts(BatchedDeepGemmExperts):
         self._deepgemm_w13: torch.Tensor | None = None
         self._deepgemm_w2: torch.Tensor | None = None
         logger.info_once("Using SlimQuant W4A8 masked N32 HIPC DeepGEMM experts.")
+
+    def _hipc_weight_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return _cached_w4a8_hipc_weight_scales(self.quant_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Cache N32 views derived from canonical checkpoint parameters."""

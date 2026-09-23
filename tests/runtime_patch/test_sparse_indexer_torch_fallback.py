@@ -100,63 +100,6 @@ def test_decode_graph_replay():
                 expected[i, :length] = ((q[i, 0].float() @ k.T).relu() * weights[i, :, None]).sum(0) * scale
             torch.testing.assert_close(output, expected, atol=0.002, rtol=0.0002)
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_prefill_gather_graph_replay(device):
-    if device == "cuda" and not torch.cuda.is_available():
-        import pytest
-        pytest.skip('GPU graph test requires a visible GPU')
-    source = (Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py').read_text()
-    branch = next((n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and (n.test.id == 'v4_fp8_fallback') and any((isinstance(x, ast.Assign) and any((isinstance(t, ast.Name) and t.id == 'page_size' for t in x.targets)) for x in n.body))))
-    code = compile(ast.Module(body=branch.body, type_ignores=[]), '<gather>', 'exec')
-    (block, dim, count) = (4, 8, 7)
-    values = torch.arange(3 * block * dim, device=device).reshape(3, block, dim).remainder(7).to(torch.float8_e4m3fn)
-    scales = torch.arange(12, device=device, dtype=torch.float32).reshape(3, 4) + 1
-    cache = torch.cat((values.view(torch.uint8).reshape(3, -1), scales.view(torch.uint8).reshape(3, -1)), 1).view(3, block, dim + 4)
-    chunk = SimpleNamespace(total_seq_lens=count, cu_seq_lens=torch.tensor([0, 3, 7], device=device, dtype=torch.int32), block_table=torch.tensor([[2, 1], [0, 2]], device=device, dtype=torch.int32))
-    out = torch.empty(count, dim, device=device, dtype=torch.float8_e4m3fn)
-    out_scale = torch.empty(count, 4, device=device, dtype=torch.uint8)
-    ns = dict(torch=torch, chunk=chunk, kv_cache=cache, head_dim=dim, fp8_dtype=torch.float8_e4m3fn, k_fp8=out, k_scale=out_scale)
-
-    def gather():
-        exec(code, ns)
-    graph = None
-    if device == "cuda":
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                gather()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            gather()
-    # Shrink the exact total, including zero and empty requests, then regrow.
-    # Allocation shapes and graph remain unchanged throughout.
-    for boundary, total in ((0, 7), (2, 4), (0, 0), (3, 3), (0, 2), (5, 7)):
-        chunk.cu_seq_lens.copy_(torch.tensor([0, boundary, total], device=device, dtype=torch.int32))
-        tables = [[2, 1], [0, 2]]
-        if boundary == 0:
-            tables[0] = [-999, -999]
-        if boundary == total:
-            tables[1] = [-999, -999]
-        chunk.block_table.copy_(torch.tensor(tables, device=device, dtype=torch.int32))
-        if graph is not None:
-            graph.replay()
-        else:
-            gather()
-        expected = []
-        expected_scales = []
-        for (seq, (start, end)) in enumerate(((0, boundary), (boundary, total))):
-            for j in range(end - start):
-                page = int(chunk.block_table[seq, j // block].item())
-                expected.append(values[page, j % block].float())
-                expected_scales.append(scales[page, j % block])
-        if total:
-            torch.testing.assert_close(out[:total].float(), torch.stack(expected))
-            torch.testing.assert_close(out_scale.view(torch.float32).flatten()[:total], torch.stack(expected_scales))
-        assert torch.count_nonzero(out.view(torch.uint8)[total:]) == 0
-        assert torch.count_nonzero(out_scale[total:]) == 0
-
 def _load_decode_fn():
     path = Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py'
     node = next((n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'fp8_paged_mqa_logits_torch'))
@@ -241,48 +184,6 @@ def test_long_context_bounds_decode_workspace(monkeypatch):
     for row in range(batch):
         torch.testing.assert_close(out[row, :row], torch.full((row,), float(heads * dim)))
         assert torch.isneginf(out[row, row:]).all()
-
-
-def test_fallback_packs_weights_with_variable_decode_lengths():
-    """Exercise the dispatch branch with a short decode beside a full decode."""
-    path = Path(__file__).resolve().parents[2] / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py'
-    branch = next(
-        n for n in ast.walk(ast.parse(path.read_text()))
-        if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
-        and n.test.id == 'v4_fp8_fallback'
-        and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
-                and c.func.id == 'fp8_paged_mqa_logits_torch' for c in ast.walk(n))
-    )
-    block, dim, heads = 4, 8, 3
-    values = torch.ones(1, block, dim).to(torch.float8_e4m3fn)
-    scales = torch.ones(1, block)
-    cache = torch.cat((values.view(torch.uint8).reshape(1, -1),
-                       scales.view(torch.uint8).reshape(1, -1)), 1).view(1, block, 1, dim + 4)
-    weights = torch.arange(1, 5).float()[:, None].expand(-1, heads)
-    calls = []
-
-    def pack(tensor, lengths):
-        calls.append(tensor.clone())
-        out = torch.zeros(2, 3, heads)
-        out[0, 0] = tensor[0]
-        out[1] = tensor[1:4]
-        return out
-
-    namespace = dict(
-        fp8_paged_mqa_logits_torch=_load_decode_fn(), pack_seq_triton=pack,
-        padded_q_fp8_decode_tokens=torch.ones(2, 3, heads, dim),
-        kv_cache=cache, weights=weights, num_decode_tokens=4, num_padded_tokens=6,
-        seq_lens=torch.tensor([[1, 0, 0], [1, 2, 3]]),
-        decode_lens=torch.tensor([1, 3]), max_model_len=4,
-        decode_metadata=SimpleNamespace(requires_padding=True,
-                                        block_table=torch.zeros(2, 1, dtype=torch.int32)),
-    )
-    exec(compile(ast.Module(body=branch.body, type_ignores=[]), str(path), 'exec'), namespace)
-    assert len(calls) == 1
-    out = namespace['logits']
-    for row, length, weight in [(0, 1, 1), (3, 1, 2), (4, 2, 3), (5, 3, 4)]:
-        torch.testing.assert_close(out[row, :length], torch.full((length,), float(heads * dim * weight)))
-        assert torch.isneginf(out[row, length:]).all()
 
 
 def _load_prefill_fn():

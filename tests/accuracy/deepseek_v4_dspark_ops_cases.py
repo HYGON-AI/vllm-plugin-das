@@ -144,11 +144,16 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
     auto = object.__new__(experts_module.DeepEPAutoW4A8Experts)
     auto._fixed_use_low_latency = None
     auto._use_low_latency_snapshot = False
+    auto.quant_config = SimpleNamespace(
+        w1_scale=hipc_scale,
+        w2_scale=layer.w2_weight_scale * 16.0,
+    )
     auto.ht_experts = object.__new__(
         runtime.DeepEPDeepGemmW4A8ContiguousExperts
     )
     auto.ll_experts = object.__new__(runtime.DeepEPDeepGemmW4A8MaskedExperts)
     for child in (auto.ht_experts, auto.ll_experts):
+        child.quant_config = auto.quant_config
         child._deepgemm_w13 = None
         child._deepgemm_w2 = None
 
@@ -164,13 +169,16 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
     assert ht_weight.untyped_storage().data_ptr() == (
         layer.w13_weight.untyped_storage().data_ptr()
     )
+    ht_scale = auto.ht_experts._hipc_weight_scales()[0]
+    ll_scale = auto.ll_experts._hipc_weight_scales()[0]
+    assert ht_scale is ll_scale
 
     ht_output = torch.empty(
         (tokens, output_size), device=device, dtype=torch.bfloat16
     )
     m_grouped_w4a8_gemm_nt_contiguous_hipc(
         (activation, activation_scale),
-        (ht_weight, hipc_scale),
+        (ht_weight, ht_scale),
         ht_output,
         torch.zeros(tokens, device=device, dtype=torch.int32),
     )
@@ -188,7 +196,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
             .expand(experts, -1, -1)
             .contiguous(),
         ),
-        (ll_weight, hipc_scale),
+        (ll_weight, ll_scale),
         ll_output,
         torch.tensor([tokens, 0], device=device, dtype=torch.int32),
         tokens,

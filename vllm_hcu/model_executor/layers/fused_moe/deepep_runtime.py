@@ -16,19 +16,22 @@ import inspect
 from vllm.platforms import current_platform
 
 
-@functools.lru_cache(maxsize=1)
-def _require_slimquant_w4a8_hipc_runtime() -> None:
+@functools.lru_cache(maxsize=2)
+def _require_slimquant_w4a8_hipc_runtime(
+    fixed_use_low_latency: bool,
+) -> None:
+    deepgemm_ops = [
+        "pack_w4a8_moe_hipc_weight",
+        "view_w4a8_moe_hipc_weight_n32_layout",
+        "m_grouped_w4a8_gemm_nt_masked_hipc",
+    ]
+    activation_ops = ["fuse_silu_mul_quant_ep"]
+    if not fixed_use_low_latency:
+        deepgemm_ops.append("m_grouped_w4a8_gemm_nt_contiguous_hipc")
+        activation_ops.append("fuse_silu_mul_quant")
     required_ops = {
-        "deepgemm": (
-            "pack_w4a8_moe_hipc_weight",
-            "view_w4a8_moe_hipc_weight_n32_layout",
-            "m_grouped_w4a8_gemm_nt_contiguous_hipc",
-            "m_grouped_w4a8_gemm_nt_masked_hipc",
-        ),
-        "lightop.activation": (
-            "fuse_silu_mul_quant",
-            "fuse_silu_mul_quant_ep",
-        ),
+        "deepgemm": tuple(deepgemm_ops),
+        "lightop.activation": tuple(activation_ops),
     }
     missing: list[str] = []
     for module_name, op_names in required_ops.items():
@@ -44,7 +47,7 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
         )
     if missing:
         raise RuntimeError(
-            "SlimQuant W4A8 deepep_auto requires HIPC DeepGEMM/LightOP "
+            "SlimQuant W4A8 DeepEP requires HIPC DeepGEMM/LightOP "
             f"operators; missing {', '.join(missing)}"
         )
 
@@ -53,9 +56,9 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     """Validate and classify the SlimQuant W4A8 MoE execution route.
 
     Pure TP remains owned by the quantization method's AITER/Triton path.
-    Once DeepEP or DP+EP metadata is present, only the synchronized
-    ``deepep_auto`` contract is supported; fixed DeepEP layouts must not fall
-    through to a TP kernel.
+    DP+EP uses either the synchronized ``deepep_auto`` contract or the fixed
+    low-latency DeepEP layout.  Other DeepEP layouts must not fall through to
+    a TP kernel.
     """
 
     parallel_config = getattr(moe_config, "moe_parallel_config", None)
@@ -72,20 +75,19 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     )
     is_dp_ep = dp_size > 1 and use_ep
 
-    fixed_deepep_backends = {
-        "deepep_high_throughput",
+    supported_deepep_backends = {
+        "deepep_auto",
         "deepep_low_latency",
     }
-    if all2all_backend in fixed_deepep_backends or (
-        is_dp_ep and all2all_backend != "deepep_auto"
-    ):
+    if is_dp_ep and all2all_backend not in supported_deepep_backends:
         raise ValueError(
             "SlimQuant W4A8 DP+EP requires "
-            "all2all_backend='deepep_auto'; fixed or incompatible all-to-all "
+            "all2all_backend='deepep_auto' or 'deepep_low_latency'; "
+            "incompatible all-to-all "
             f"backend {all2all_backend!r} is unsupported"
         )
 
-    if all2all_backend != "deepep_auto":
+    if all2all_backend not in supported_deepep_backends:
         if auto_kernels is True:
             raise ValueError(
                 "SlimQuant W4A8 has incompatible use_deepep_auto_kernels "
@@ -98,15 +100,20 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             "SlimQuant W4A8 deepep_auto requires dp_size > 1 and expert "
             "parallelism enabled"
         )
-    if auto_kernels is False:
+    if all2all_backend == "deepep_auto" and auto_kernels is False:
         raise ValueError(
             "SlimQuant W4A8 deepep_auto has incompatible "
+            "use_deepep_auto_kernels metadata"
+        )
+    if all2all_backend == "deepep_low_latency" and auto_kernels is True:
+        raise ValueError(
+            "SlimQuant W4A8 deepep_low_latency has incompatible "
             "use_deepep_auto_kernels metadata"
         )
     moe_backend = getattr(moe_config, "moe_backend", "auto")
     if moe_backend not in ("auto", "deep_gemm"):
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto requires moe_backend='auto' or "
+            "SlimQuant W4A8 DeepEP requires moe_backend='auto' or "
             f"'deep_gemm', got {moe_backend!r}"
         )
     from vllm.config import get_current_vllm_config_or_none
@@ -116,23 +123,30 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if vllm_config is None:
         vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
     architectures = model_architectures(vllm_config)
-    if "DeepseekV4ForCausalLM" not in architectures:
+    supported_architecture = "DeepseekV4ForCausalLM" in architectures or (
+        all2all_backend == "deepep_low_latency"
+        and "HYV4ForCausalLM" in architectures
+    )
+    if not supported_architecture:
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4; "
+            "SlimQuant W4A8 DeepEP is validated only for DeepSeek-V4 or "
+            "HYV4 fixed low latency; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)
     activation_name = getattr(activation, "value", activation)
     if activation_name != "silu":
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto supports only SiLU activation; "
+            "SlimQuant W4A8 DeepEP supports only SiLU activation; "
             f"got {activation_name!r}"
         )
     if not current_platform.is_rocm():
         raise RuntimeError(
-            "SlimQuant W4A8 deepep_auto requires the HCU ROCm runtime"
+            "SlimQuant W4A8 DeepEP requires the HCU ROCm runtime"
         )
-    _require_slimquant_w4a8_hipc_runtime()
+    _require_slimquant_w4a8_hipc_runtime(
+        fixed_use_low_latency=all2all_backend == "deepep_low_latency"
+    )
     return True
 
 

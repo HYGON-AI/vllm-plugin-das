@@ -483,9 +483,14 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
             from lightop.activation import fuse_silu_mul_quant_ep
 
+            scale_getter = getattr(self, "_hipc_weight_scales", None)
+            if callable(scale_getter):
+                w1_scale, w2_scale = scale_getter()
+            else:
+                w1_scale, w2_scale = self.w1_scale, self.w2_scale
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
-                (self._deepgemm_w13, self.w1_scale),
+                (self._deepgemm_w13, w1_scale),
                 workspace1,
                 expert_num_tokens,
                 expected_m,
@@ -496,7 +501,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             )
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a2q, a2q_scale),
-                (self._deepgemm_w2, self.w2_scale),
+                (self._deepgemm_w2, w2_scale),
                 output,
                 expert_num_tokens,
                 expected_m,

@@ -2161,6 +2161,213 @@ def test_sparse_indexer_padded_decode_scratch_preserves_prefill_row():
     assert uniform.data_ptr() == shared.data_ptr()
 
 
+@pytest.mark.parametrize("skip_cache_insert", [False, True])
+def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
+    monkeypatch, skip_cache_insert,
+):
+    """Packed FP8 pages must keep their shuffled cache layout on gfx936."""
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    events = []
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float8_e4m3fn
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    chunk = SimpleNamespace(
+        total_seq_lens=1,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([1], dtype=torch.int32),
+        token_to_seq=torch.zeros(1, dtype=torch.int32),
+        token_start=0,
+        token_end=1,
+    )
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.zeros(1, dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[chunk]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+
+    def insert(k, cache, slots, block_size, scale_fmt):
+        assert k.shape == (1, 1)
+        assert cache.dtype is torch.uint8
+        assert slots.tolist() == [0]
+        assert block_size == 1
+        assert scale_fmt == "ue8m0"
+        events.append("insert")
+
+    monkeypatch.setattr(sparse, "indexer_k_quant_and_cache_triton", insert)
+    from vllm import _custom_ops as ops
+
+    monkeypatch.setattr(
+        ops,
+        "indexer_k_quant_and_cache",
+        lambda *args: pytest.fail("packed gfx936 cache used the custom writer"),
+    )
+
+    def gather(cache, k_fp8, k_scale, block_table, cu_seq_lens, token_to_seq):
+        assert cache.dtype is torch.uint8
+        assert block_table is chunk.block_table
+        assert cu_seq_lens is chunk.cu_seq_lens
+        assert token_to_seq is chunk.token_to_seq
+        k_fp8.zero_()
+        k_scale.zero_()
+        events.append("gather")
+
+    monkeypatch.setattr(sparse, "cp_gather_indexer_k_quant_cache_triton", gather)
+    def logits(q, kv, weights, starts, ends):
+        del q, kv, weights, starts, ends
+        events.append("logits")
+        return torch.zeros((1, 1), dtype=torch.float32)
+
+    monkeypatch.setattr(sparse, "fp8_mqa_logits_torch", logits)
+    monkeypatch.setattr(
+        sparse,
+        "rocm_fp8_mqa_logits",
+        lambda *args: pytest.fail(
+            "packed gfx936 cache dropped its per-key dequant scale"
+        ),
+    )
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "_topk_indices_torch",
+        lambda *args, **kwargs: torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+    output = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 2, 5), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 1, 1), dtype=torch.float8_e4m3fn),
+        k=None if skip_cache_insert else torch.zeros((1, 1)),
+        weights=torch.ones((1, 1)),
+        quant_block_size=1,
+        scale_fmt="ue8m0",
+        topk_tokens=1,
+        head_dim=1,
+        max_model_len=2,
+        total_seq_lens=1,
+        topk_indices_buffer=torch.full((1, 1), -1, dtype=torch.int32),
+        skip_k_cache_insert=skip_cache_insert,
+    )
+
+    assert output.tolist() == [[0]]
+    expected = ["gather", "logits"]
+    if not skip_cache_insert:
+        expected.insert(0, "insert")
+    assert events == expected
+
+
+def test_sparse_indexer_gfx936_packed_cache_uses_quantized_decode_logits(
+    monkeypatch,
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float8_e4m3fn
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.zeros(1, dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=1,
+                    num_decode_tokens=1,
+                    num_prefills=0,
+                    prefill=None,
+                    decode=SimpleNamespace(
+                        decode_lens=torch.ones(1, dtype=torch.int32),
+                        requires_padding=False,
+                        seq_lens=torch.ones(1, dtype=torch.int32),
+                        block_table=torch.zeros((1, 1), dtype=torch.int32),
+                        schedule_metadata=torch.zeros(1, dtype=torch.int32),
+                    ),
+                )
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "fp8_paged_mqa_logits_torch",
+        lambda *args: pytest.fail("packed gfx936 cache used fallback decode logits"),
+    )
+    calls = []
+
+    def decode_logits(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.zeros((1, 2), dtype=torch.float32)
+
+    monkeypatch.setattr(sparse, "rocm_fp8_paged_mqa_logits", decode_logits)
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "_topk_indices_torch",
+        lambda *args, **kwargs: torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+    output = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 2, 5), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 1, 1), dtype=torch.float8_e4m3fn),
+        k=None,
+        weights=torch.ones((1, 1)),
+        quant_block_size=1,
+        scale_fmt="ue8m0",
+        topk_tokens=1,
+        head_dim=1,
+        max_model_len=2,
+        total_seq_lens=1,
+        topk_indices_buffer=torch.full((1, 1), -1, dtype=torch.int32),
+        skip_k_cache_insert=True,
+    )
+
+    assert output.tolist() == [[0]]
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("use_lightop", [False, True])
 def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     monkeypatch, use_lightop
@@ -2253,8 +2460,12 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
         del q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
         return torch.zeros((1, 1), dtype=torch.float32)
 
-    def fake_decode_logits(*args, **kwargs):
-        del args, kwargs
+    def fake_decode_logits(q, kv, decode_weights, *args, **kwargs):
+        del q, kv, args, kwargs
+        torch.testing.assert_close(
+            decode_weights,
+            torch.tensor([[10.0], [-777.0], [20.0], [30.0]]),
+        )
         return torch.zeros((4, 4), dtype=torch.float32)
 
     monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", fake_prefill_logits)
@@ -2263,8 +2474,12 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     )
 
     def fake_pack(x, lengths):
-        del x
-        return torch.zeros((2, 2, 1), dtype=torch.float32)
+        assert lengths.tolist() == [1, 2]
+        packed = torch.full((2, 2, *x.shape[1:]), -777.0, dtype=x.dtype)
+        packed[0, 0] = x[0]
+        packed[1, 0] = x[1]
+        packed[1, 1] = x[2]
+        return packed
 
     def fake_unpack(packed, lengths):
         assert tuple(packed.shape) == (2, 2, 1)
@@ -2313,7 +2528,7 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
         kv_cache=torch.zeros((1, 2, 1), dtype=torch.float32),
         q_fp8=torch.zeros((4, 1, 1), dtype=torch.float32),
         k=torch.zeros((4, 1), dtype=torch.float32),
-        weights=torch.ones((4, 1), dtype=torch.float32),
+        weights=torch.tensor([[10.0], [20.0], [30.0], [40.0]]),
         quant_block_size=1,
         scale_fmt="e4m3",
         topk_tokens=1,
