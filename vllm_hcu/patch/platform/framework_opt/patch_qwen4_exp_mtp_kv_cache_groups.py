@@ -14,6 +14,7 @@ from ._common import (
     already_applied,
     load_exact_module,
     require_callable,
+    require_class,
 )
 
 
@@ -22,10 +23,12 @@ PATCH_ID = "platform.framework_opt.qwen4_exp_mtp_kv_cache_groups"
 TARGETS = (
     f"{TARGET_MODULE}._annotate_eagle_groups",
     f"{TARGET_MODULE}.get_kv_cache_groups",
+    f"{TARGET_MODULE}.get_kv_cache_config_from_groups",
 )
 _MARKER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_applied"
 _WRAPPER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_wrapper"
 _GROUPS_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_groups_wrapper"
+_CONFIG_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_config_wrapper"
 logger = logging.getLogger(__name__)
 _SUPPORTED_MODEL_TYPES = frozenset(
     {
@@ -74,6 +77,11 @@ def apply_to_module(module: ModuleType) -> bool:
         (
             (kv_cache_utils, "_annotate_eagle_groups", _WRAPPER),
             (kv_cache_utils, "get_kv_cache_groups", _GROUPS_WRAPPER),
+            (
+                kv_cache_utils,
+                "get_kv_cache_config_from_groups",
+                _CONFIG_WRAPPER,
+            ),
         ),
     ):
         return False
@@ -104,6 +112,24 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[1]} has incompatible "
             f"signature {get_groups_signature}"
+        )
+    original_get_config = require_callable(
+        kv_cache_utils, "get_kv_cache_config_from_groups", TARGETS[2]
+    )
+    uniform_specs_type = require_class(
+        kv_cache_utils,
+        "UniformTypeKVCacheSpecs",
+        f"{TARGET_MODULE}.UniformTypeKVCacheSpecs",
+    )
+    get_config_signature = inspect.signature(original_get_config)
+    if tuple(get_config_signature.parameters) != (
+        "vllm_config",
+        "kv_cache_groups",
+        "available_memory",
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[2]} has incompatible "
+            f"signature {get_config_signature}"
         )
 
     @functools.wraps(original)
@@ -140,16 +166,104 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         return groups
 
+    @functools.wraps(original_get_config)
+    def hcu_get_kv_cache_config_from_groups(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+    ):
+        config = original_get_config(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if (
+            not _is_qwen_hybrid_mtp(vllm_config)
+            or getattr(parallel_config, "pipeline_parallel_size", 1) <= 1
+        ):
+            return config
+
+        # Upstream keeps the global UniformTypeKVCacheSpecs on a PP-projected
+        # group even when that stage owns none of the group's layers.  The
+        # config builder then emits tensors for those remote layers, while the
+        # group's local layer_names is empty; allocate_kv_cache cannot map such
+        # a tensor back to any group.  Preserve the empty group (the scheduler
+        # needs a stable global group index) but remove only tensors proven to
+        # belong exclusively to that empty projection.
+        owned_layers = {
+            layer_name
+            for group in kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        remote_layers: set[str] = set()
+        for group in kv_cache_groups:
+            if group.layer_names:
+                continue
+            group_spec = group.kv_cache_spec
+            if not isinstance(group_spec, uniform_specs_type):
+                continue
+            remote_spec = group_spec.kv_cache_specs
+            if not isinstance(remote_spec, dict) or not remote_spec:
+                raise RuntimeError(
+                    "Qwen hybrid MTP PP found an incompatible empty "
+                    "UniformType KV group"
+                )
+            remote_layers.update(remote_spec)
+
+        duplicated_layers = owned_layers.intersection(remote_layers)
+        if duplicated_layers:
+            raise RuntimeError(
+                "Qwen hybrid MTP PP KV layers are both locally owned and "
+                f"remote: {sorted(duplicated_layers)}"
+            )
+
+        local_tensors = []
+        for tensor in config.kv_cache_tensors:
+            tensor_layers = set(tensor.layers)
+            if not tensor_layers:
+                raise RuntimeError(
+                    "Qwen hybrid MTP PP found a KV tensor without layers"
+                )
+            local = tensor_layers.intersection(owned_layers)
+            remote = tensor_layers.intersection(remote_layers)
+            unknown = tensor_layers.difference(owned_layers, remote_layers)
+            if unknown:
+                raise RuntimeError(
+                    "Qwen hybrid MTP PP found unowned KV tensor layers: "
+                    f"{sorted(unknown)}"
+                )
+            if local and remote:
+                raise RuntimeError(
+                    "Qwen hybrid MTP PP KV tensor mixes local and remote "
+                    f"layers: {tensor.layers}"
+                )
+            if local:
+                local_tensors.append(tensor)
+        config.kv_cache_tensors = local_tensors
+        return config
+
     setattr(hcu_annotate_eagle_groups, _WRAPPER, True)
     setattr(hcu_get_kv_cache_groups, _GROUPS_WRAPPER, True)
+    setattr(hcu_get_kv_cache_config_from_groups, _CONFIG_WRAPPER, True)
     setattr(kv_cache_utils, "_vllm_hcu_original_annotate_eagle_groups", original)
     setattr(
         kv_cache_utils,
         "_vllm_hcu_original_get_kv_cache_groups",
         original_get_groups,
     )
+    setattr(
+        kv_cache_utils,
+        "_vllm_hcu_original_get_kv_cache_config_from_groups",
+        original_get_config,
+    )
     setattr(kv_cache_utils, "_annotate_eagle_groups", hcu_annotate_eagle_groups)
     setattr(kv_cache_utils, "get_kv_cache_groups", hcu_get_kv_cache_groups)
+    setattr(
+        kv_cache_utils,
+        "get_kv_cache_config_from_groups",
+        hcu_get_kv_cache_config_from_groups,
+    )
     setattr(kv_cache_utils, _MARKER, True)
     return True
 
