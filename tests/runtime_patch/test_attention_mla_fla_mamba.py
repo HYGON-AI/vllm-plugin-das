@@ -2453,10 +2453,10 @@ def test_hcu_dcp_topk_merge_uses_lightop_fused_global_selection(monkeypatch):
 
     monkeypatch.setattr(indexer, "current_platform", _Platform)
     monkeypatch.setattr(indexer, "get_dcp_group", lambda: _Group())
-    monkeypatch.setattr(indexer, "_use_lightop_dcp_topk_transform", lambda: True)
+    monkeypatch.setattr(indexer, "use_lightop_dcp_topk_transform", lambda: True)
     monkeypatch.setattr(
         indexer,
-        "_lightop_fast_topk_transform",
+        "get_lightop_fast_topk_transform",
         lambda: fast_topk_transform_fused,
     )
     indices = torch.arange(2048, dtype=torch.int32).reshape(1, -1)
@@ -2508,8 +2508,8 @@ def test_hcu_dcp_topk_merge_falls_back_when_lightop_fused_api_is_missing(
 
     monkeypatch.setattr(indexer, "current_platform", _Platform)
     monkeypatch.setattr(indexer, "get_dcp_group", lambda: _Group())
-    monkeypatch.setattr(indexer, "_use_lightop_dcp_topk_transform", lambda: True)
-    monkeypatch.setattr(indexer, "_lightop_fast_topk_transform", lambda: None)
+    monkeypatch.setattr(indexer, "use_lightop_dcp_topk_transform", lambda: True)
+    monkeypatch.setattr(indexer, "get_lightop_fast_topk_transform", lambda: None)
     monkeypatch.setattr(indexer.torch, "topk", tracked_torch_topk)
     indices = torch.arange(2048, dtype=torch.int32).reshape(1, -1)
 
@@ -2526,12 +2526,13 @@ def test_hcu_dcp_topk_merge_falls_back_when_lightop_fused_api_is_missing(
     assert indices.shape == (1, 2048)
 
 
-def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets(monkeypatch):
-    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
-    indexer._LIGHTOP_DCP_TOPK_METADATA.clear()
+def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets():
+    from vllm_hcu.v1.attention.ops import decode_topk
+
+    decode_topk._LIGHTOP_DCP_TOPK_METADATA.clear()
     try:
         for rows in range(1, 130):
-            lengths, cu_seqlens_q = indexer._lightop_dcp_topk_metadata(
+            lengths, cu_seqlens_q = decode_topk.get_lightop_dcp_topk_metadata(
                 torch.device("cpu"), rows, 4096
             )
             assert lengths.shape == (rows,)
@@ -2541,14 +2542,14 @@ def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets(monkeypatch):
                 cu_seqlens_q, torch.arange(rows + 1, dtype=torch.int32)
             )
 
-        assert len(indexer._LIGHTOP_DCP_TOPK_METADATA) == 9
+        assert len(decode_topk._LIGHTOP_DCP_TOPK_METADATA) == 9
         total_capacity = sum(
             lengths.numel() + cu_seqlens_q.numel()
-            for lengths, cu_seqlens_q in indexer._LIGHTOP_DCP_TOPK_METADATA.values()
+            for lengths, cu_seqlens_q in decode_topk._LIGHTOP_DCP_TOPK_METADATA.values()
         )
         assert total_capacity <= 2 * (2 * 256 - 1) + 9
     finally:
-        indexer._LIGHTOP_DCP_TOPK_METADATA.clear()
+        decode_topk._LIGHTOP_DCP_TOPK_METADATA.clear()
 
 
 def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):

@@ -4,8 +4,6 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 """Custom Sparse Attention Indexer layers."""
 
-import functools
-
 import torch
 
 import vllm.envs as envs
@@ -44,7 +42,12 @@ from vllm_hcu.model_executor.layers.attention.pcp import (
     maybe_gather_indexer_k,
 )
 from vllm_hcu.platforms import envs as henvs
-from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
+from vllm_hcu.v1.attention.ops.decode_topk import (
+    get_decode_topk_output_buffer,
+    get_lightop_dcp_topk_metadata,
+    get_lightop_fast_topk_transform,
+    use_lightop_dcp_topk_transform,
+)
 
 logger = init_logger(__name__)
 
@@ -52,60 +55,6 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
-
-_LIGHTOP_DCP_TOPK_METADATA: dict[
-    tuple[str, int | None, int, int], tuple[torch.Tensor, torch.Tensor]
-] = {}
-
-
-@functools.lru_cache(maxsize=1)
-def _lightop_fast_topk_transform():
-    """Resolve the optional categorized LightOp fused TopK API."""
-    try:
-        from lightop.attention import fast_topk_transform_fused
-    except (AttributeError, ImportError, OSError):
-        return None
-    return (
-        fast_topk_transform_fused
-        if callable(fast_topk_transform_fused)
-        else None
-    )
-
-
-def _use_lightop_dcp_topk_transform() -> bool:
-    return (
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK
-        and henvs.VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM
-    )
-
-
-def _lightop_dcp_topk_metadata(
-    device: torch.device,
-    rows: int,
-    candidate_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return stable, capacity-bucketed metadata for DCP TopK."""
-    device = torch.device(device)
-    capacity = 1 << (max(rows, 1) - 1).bit_length()
-    key = (device.type, device.index, candidate_count, capacity)
-    metadata = _LIGHTOP_DCP_TOPK_METADATA.get(key)
-    if metadata is None:
-        lengths = torch.full(
-            (capacity,), candidate_count, dtype=torch.int32, device=device
-        )
-        cu_seqlens_q = torch.arange(
-            capacity + 1, dtype=torch.int32, device=device
-        )
-        metadata = (lengths, cu_seqlens_q)
-        capturing = (
-            device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-        )
-        if not capturing:
-            _LIGHTOP_DCP_TOPK_METADATA[key] = metadata
-    lengths, cu_seqlens_q = metadata
-    return lengths[:rows], cu_seqlens_q[: rows + 1]
-
 
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
@@ -179,13 +128,13 @@ def _merge_dcp_topk_global(
         packed = torch.stack((scores, global_ids.to(torch.float32)), dim=-1)
         gathered = get_dcp_group().all_gather(packed, dim=1)
         fast_topk_transform = (
-            _lightop_fast_topk_transform()
-            if topk_tokens == 2048 and _use_lightop_dcp_topk_transform()
+            get_lightop_fast_topk_transform()
+            if topk_tokens == 2048 and use_lightop_dcp_topk_transform()
             else None
         )
         if fast_topk_transform is not None:
             candidate_count = gathered.shape[1]
-            lengths, cu_seqlens_q = _lightop_dcp_topk_metadata(
+            lengths, cu_seqlens_q = get_lightop_dcp_topk_metadata(
                 gathered.device, gathered.shape[0], candidate_count
             )
             topk_indices.copy_(
