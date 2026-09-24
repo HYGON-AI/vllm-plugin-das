@@ -33,6 +33,10 @@ def _backend(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+def test_qsa_dispatch_logger_emits_info_with_default_vllm_logging():
+    assert qsa.logger.isEnabledFor(logging.INFO)
+
+
 @pytest.fixture(autouse=True)
 def _reset_qsa_environment(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(qsa, "_legacy_qsa_cutlass_warning_emitted", False)
@@ -76,12 +80,15 @@ def test_qsa_backend_defaults_to_cutlass(monkeypatch: pytest.MonkeyPatch):
 
 def test_cutlass_qsa_fp8_reader_uses_flash_attention_symbol(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", "cutlass")
 
-    def cutlass_fp8(*args, **kwargs):
+    def sparse_gqa_paged_attn_fp8_func(*args, **kwargs):
         return args, kwargs
+
+    sparse_gqa_paged_attn_fp8_func.__module__ = "flash_attn"
 
     def triton_fp8(*args, **kwargs):
         return None
@@ -89,11 +96,18 @@ def test_cutlass_qsa_fp8_reader_uses_flash_attention_symbol(
     monkeypatch.setattr(
         qsa,
         "_load_flash_qsa_fp8_kernel",
-        lambda: cutlass_fp8,
+        lambda: sparse_gqa_paged_attn_fp8_func,
         raising=False,
     )
 
-    assert qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8) is cutlass_fp8
+    with caplog.at_level(logging.INFO, logger=qsa.logger.name):
+        reader = qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8)
+
+    assert reader is sparse_gqa_paged_attn_fp8_func
+    assert (
+        "QSA FP8 sparse-GQA reader selected: backend=cutlass "
+        "reader=flash_attn.sparse_gqa_paged_attn_fp8_func"
+    ) in caplog.text
 
 
 @pytest.mark.parametrize("configured", ["triton", "boltops"])

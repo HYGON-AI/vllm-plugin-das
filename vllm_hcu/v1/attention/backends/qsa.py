@@ -15,7 +15,6 @@ The generic ``FLASH_ATTN`` backend remains responsible for ordinary attention.
 
 from __future__ import annotations
 
-import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,8 +22,9 @@ from functools import lru_cache
 from typing import Any, Literal
 
 import vllm_hcu.platforms.envs as henvs
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(f"vllm.{__name__}")
 
 
 QSA_BACKEND_TRITON: Literal["triton"] = "triton"
@@ -206,6 +206,12 @@ def get_qsa_fp8_reader(
     if cached is None:
         try:
             reader: Callable[..., Any] | None = loader()
+            logger.info(
+                "QSA FP8 sparse-GQA reader selected: backend=%s reader=%s.%s",
+                backend,
+                getattr(reader, "__module__", type(reader).__module__),
+                getattr(reader, "__name__", type(reader).__name__),
+            )
         except Exception as exc:
             reader = None
             logger.warning(
