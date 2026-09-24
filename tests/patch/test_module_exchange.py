@@ -111,6 +111,11 @@ def test_qwen4_exp_ple_exchange_is_strictly_opt_in_and_lazy(monkeypatch):
     assert (canonical, replacement) not in module_exchange_names()
 
     monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert register_qwen4_exp_ple_exchange(coordinator) == ()
+    assert (canonical, replacement) not in module_exchange_names()
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     registrations = register_qwen4_exp_ple_exchange(coordinator)
     assert len(registrations) == 1
     assert registrations[0].status == PatchStatus.ARMED.value

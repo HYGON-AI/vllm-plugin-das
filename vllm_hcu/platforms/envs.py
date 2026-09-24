@@ -91,6 +91,18 @@ def _environment_flag(raw: str) -> bool:
     return raw.lower() in ("true", "1")
 
 
+def custom_ops_enabled() -> bool:
+    """Return whether the HCU custom-op master switch is enabled."""
+    return _environment_flag(os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True"))
+
+
+def ple_prefetch_enabled() -> bool:
+    """Resolve PLE stream prefetch under the custom-op master switch."""
+    return custom_ops_enabled() and _environment_flag(
+        os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False")
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def resolve_aiter_moe_shuffle() -> bool:
     """Resolve the unified AITER MoE weight-shuffle switch."""
@@ -198,8 +210,7 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True").lower() in
-             ("true", "1")),
+    custom_ops_enabled,
     # Select the QSA implementation independently of the generic
     # FLASH_ATTN backend mode. The QSA dispatcher validates the enum and
     # applies VLLM_HCU_USE_CUSTOM_OPS as its master gate.
@@ -442,10 +453,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                     ("true", "1")),
 
     # Overlap Qwen4Exp PLE INT8 UVA lookup with preceding model compute. This
-    # is intentionally opt-in and does not enable FP8 prefetch.
+    # is intentionally opt-in, is gated by VLLM_HCU_USE_CUSTOM_OPS, and does
+    # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
-        lambda: (os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in
-                    ("true", "1")),
+        ple_prefetch_enabled,
 }
 
 # end-env-vars-definition

@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import functools
-import os
 from types import ModuleType
+
+from vllm_hcu.platforms.envs import ple_prefetch_enabled
 
 from ._common import (
     PatchCompatibilityError,
@@ -23,10 +24,7 @@ _WRAPPER = "_vllm_hcu_qwen4_exp_ple_cudagraph_wrapper"
 
 
 def _requested() -> bool:
-    return os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in (
-        "true",
-        "1",
-    )
+    return ple_prefetch_enabled()
 
 
 def _will_capture(cudagraph_module: ModuleType, wrapper: object) -> bool:

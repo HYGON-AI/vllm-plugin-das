@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 from types import ModuleType
 from weakref import WeakSet
 
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_hcu.platforms.envs import ple_prefetch_enabled
 
 from ._common import (
     PatchCompatibilityError,
@@ -36,10 +36,7 @@ _PREFETCH_OWNERS: WeakSet[object] = WeakSet()
 
 
 def _requested() -> bool:
-    return os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in (
-        "true",
-        "1",
-    )
+    return ple_prefetch_enabled()
 
 
 def _is_torch_compile_init(function) -> bool:

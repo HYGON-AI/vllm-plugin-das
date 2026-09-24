@@ -96,9 +96,11 @@ def _should_prefetch_ple() -> bool:
 
         return bool(henvs.VLLM_HCU_PLE_PREFETCH_STREAM)
     except (ImportError, AttributeError):
-        return os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "0").lower() in (
-            "true",
-            "1",
+        return (
+            os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "1").lower()
+            in ("true", "1")
+            and os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "0").lower()
+            in ("true", "1")
         )
 
 

@@ -11,9 +11,10 @@ is requested.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from pathlib import Path
+
+from vllm_hcu.platforms.envs import ple_prefetch_enabled
 
 from .import_coordinator import (
     IMPORT_COORDINATOR,
@@ -96,10 +97,7 @@ _HCU_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _ple_prefetch_requested() -> bool:
-    return os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False").lower() in (
-        "true",
-        "1",
-    )
+    return ple_prefetch_enabled()
 
 
 def _enabled_groups() -> tuple[tuple[_Entry, ...], ...]:

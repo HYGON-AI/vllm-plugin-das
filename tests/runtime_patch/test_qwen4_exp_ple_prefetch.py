@@ -56,6 +56,26 @@ def test_prefetch_environment_is_lazy_and_defaults_off(monkeypatch):
     assert hcu_envs.is_set("VLLM_HCU_PLE_PREFETCH_STREAM") is True
 
 
+def test_prefetch_respects_custom_ops_master_gate(monkeypatch, ple_layer):
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+
+    assert hcu_envs.VLLM_HCU_PLE_PREFETCH_STREAM is False
+    assert ple_layer._prefetch_method_enabled(_capable_method()) is False
+    assert model_patch._requested() is False
+    assert graph_patch._requested() is False
+    assert int8_patch._should_prefetch_ple() is False
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+
+    assert hcu_envs.VLLM_HCU_PLE_PREFETCH_STREAM is True
+    assert ple_layer._prefetch_method_enabled(_capable_method()) is True
+    assert model_patch._requested() is True
+    assert graph_patch._requested() is True
+    assert int8_patch._should_prefetch_ple() is True
+
+
 def test_prefetch_gate_is_int8_uva_only(monkeypatch, ple_layer):
     monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
     monkeypatch.setenv("VLLM_HCU_PLE_CPU_OFFLOAD", "1")
