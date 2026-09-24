@@ -819,7 +819,8 @@ def _aiter_opus_paged_mqa_logits_eligible(
         and tuple(context_lens.shape) == (batch_size, next_n)
     )
     return bool(
-        henvs.VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS
+        henvs.VLLM_HCU_USE_CUSTOM_OPS
+        and henvs.VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS
         and current_platform.is_rocm()
         and on_gfx938()
         and q_fp8.dim() == 4

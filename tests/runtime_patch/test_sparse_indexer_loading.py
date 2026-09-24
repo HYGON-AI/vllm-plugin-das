@@ -139,7 +139,10 @@ def test_aiter_opus_flag_routes_sparse_indexer_through_native_wrapper(
 
     forward_hip = _load_sparse_indexer_contract(
         torch=torch,
-        henvs=SimpleNamespace(VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=True),
+        henvs=SimpleNamespace(
+            VLLM_HCU_USE_CUSTOM_OPS=True,
+            VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=True,
+        ),
         rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
         _encode_layer_name=lambda value: value,
     )
@@ -161,6 +164,47 @@ def test_aiter_opus_flag_routes_sparse_indexer_through_native_wrapper(
     assert forward_hip(indexer, object(), q_quant, object(), object()) == "native-topk"
     assert len(calls) == 1
     assert calls[0][1] == {"skip_k_cache_insert": False}
+
+
+def test_aiter_opus_flag_does_not_route_native_when_custom_ops_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "rocm_aiter_sparse_attn_indexer",
+        lambda *_args, **_kwargs: "legacy-aiter",
+        raising=False,
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        henvs=SimpleNamespace(
+            VLLM_HCU_USE_CUSTOM_OPS=False,
+            VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=True,
+        ),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        dcp_world_size=1,
+        skip_k_cache_insert=False,
+        use_fp4_cache=False,
+        k_cache=SimpleNamespace(prefix="layer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="float32",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=8192,
+        max_total_seq_len=8192,
+        topk_indices_buffer=object(),
+    )
+
+    assert forward_hip(
+        indexer,
+        object(),
+        torch.empty((1, 32, 128), dtype=torch.float8_e4m3fn),
+        object(),
+        object(),
+    ) == "legacy-aiter"
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])

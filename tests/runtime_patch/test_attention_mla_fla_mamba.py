@@ -2526,6 +2526,22 @@ def test_hcu_dcp_topk_merge_falls_back_when_lightop_fused_api_is_missing(
     assert indices.shape == (1, 2048)
 
 
+def test_hcu_dcp_lightop_topk_requires_custom_ops(monkeypatch):
+    from vllm_hcu.v1.attention.ops import decode_topk
+
+    monkeypatch.setattr(decode_topk.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(
+        decode_topk.henvs, "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", True
+    )
+    monkeypatch.setattr(
+        decode_topk.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+    )
+
+    assert not decode_topk.use_lightop_dcp_topk_transform()
+
+
 def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets():
     from vllm_hcu.v1.attention.ops import decode_topk
 

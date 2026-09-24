@@ -87,17 +87,24 @@ def test_boolean_environment_values_are_lazily_parsed(
     assert hcu_envs.is_set("VLLM_HCU_USE_CUSTOM_OPS") is True
 
 
-def test_aiter_opus_paged_mqa_logits_defaults_off_and_can_be_enabled(
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+    ],
+)
+def test_sparse_decode_acceleration_flags_default_on_and_can_be_disabled(
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
 ) -> None:
-    name = "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS"
     getter = hcu_envs.hcu_vllm_environment_variables[name]
 
     monkeypatch.delenv(name, raising=False)
-    assert getter() is False
-
-    monkeypatch.setenv(name, "1")
     assert getter() is True
+
+    monkeypatch.setenv(name, "0")
+    assert getter() is False
 
 
 MIGRATED_KERNEL_FLAGS = (

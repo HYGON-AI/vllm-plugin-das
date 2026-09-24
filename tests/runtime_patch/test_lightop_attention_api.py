@@ -299,6 +299,51 @@ def test_aiter_opus_paged_mqa_uses_native_page64_cache_and_page_table(
     }
 
 
+def test_aiter_opus_paged_mqa_requires_custom_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_aiter_opus_paged_mqa_logits_fn",
+        lambda: pytest.fail("AITER Opus probed while custom ops are disabled"),
+    )
+
+    assert not runtime._aiter_opus_paged_mqa_logits_eligible(
+        torch.zeros((1, 4, 32, 128), dtype=torch.float8_e4m3fn),
+        torch.zeros((1, 64, 1, 132), dtype=torch.uint8),
+        torch.ones((4, 32), dtype=torch.float32),
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        64,
+    )
+
+
+def test_fast_topk_transform_requires_custom_ops(
+    fast_topk_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = fast_topk_runtime
+    monkeypatch.setattr(runtime.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(
+        runtime.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+        raising=False,
+    )
+
+    assert not runtime._use_lightop_fast_topk_transform()
+
+
 def test_aiter_opus_paged_mqa_uses_final_mtp_context_length(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
