@@ -9,6 +9,39 @@ import torch
 from vllm_hcu.patch.config import HcuFeatureConfig
 
 
+def _dcp_a2a_lse_reduce_with_overlap(
+    reduce_fn,
+    self,
+    *args,
+    **kwargs,
+):
+    """Run g_proj only across the DCP A2A combine window when configured."""
+    overlap_fn = getattr(self, "_hcu_dcp_a2a_overlap_fn", None)
+    aux_stream = getattr(self, "_hcu_dcp_a2a_overlap_stream", None)
+    if overlap_fn is None or aux_stream is None:
+        return reduce_fn(*args, **kwargs)
+
+    start_event = getattr(self, "_hcu_dcp_a2a_overlap_start_event", None)
+    done_event = getattr(self, "_hcu_dcp_a2a_overlap_done_event", None)
+    if start_event is None or done_event is None:
+        raise RuntimeError("DCP A2A overlap requires persistent CUDA events")
+
+    current_stream = torch.cuda.current_stream()
+    # forward_mqa has already queued the local attention on current_stream.
+    # Gate execution starts only after that work, while the current stream
+    # enters the A2A pack/communication/unpack path.
+    start_event.record(current_stream)
+    with torch.cuda.stream(aux_stream):
+        aux_stream.wait_event(start_event)
+        overlap_fn()
+        done_event.record(aux_stream)
+
+    result = reduce_fn(*args, **kwargs)
+    # Join before _v_up_proj so g_proj does not contend with that GEMM.
+    current_stream.wait_event(done_event)
+    return result
+
+
 def lightly_cp_mla_wrapper_forward(
     self,
     positions: torch.Tensor,
@@ -229,8 +262,17 @@ def mla_forward_impl(
         )
         if self.impl.dcp_world_size > 1:
             if self.dcp_a2a:
-                attn_out = upstream.dcp_a2a_lse_reduce(
-                    attn_out, lse, upstream.get_dcp_group(),
+                reduce_fn = getattr(
+                    upstream,
+                    "_vllm_hcu_original_dcp_a2a_lse_reduce",
+                    upstream.dcp_a2a_lse_reduce,
+                )
+                attn_out = _dcp_a2a_lse_reduce_with_overlap(
+                    reduce_fn,
+                    self,
+                    attn_out,
+                    lse,
+                    upstream.get_dcp_group(),
                     is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                 )
             else:

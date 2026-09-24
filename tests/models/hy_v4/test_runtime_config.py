@@ -15,6 +15,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 from vllm_hcu.models.hy_v4.config import HYV4Config
+from vllm_hcu.models.hy_v4.model import enable_hyv4_gate_a2a_overlap
 from vllm_hcu.patch.platform.core_fix import (
     patch_hy_v4_model_arch_config,
     patch_hy_v4_model_head_dtype,
@@ -31,6 +32,29 @@ def test_hyv4_is_a_default_model_runner_v2_architecture() -> None:
     patch_hy_v4_vllm_config.apply_to_module(vllm_config)
 
     assert "HYV4ForCausalLM" in vllm_config.DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
+
+
+@pytest.mark.parametrize(
+    ("enabled", "dcp_size", "backend", "expected"),
+    [
+        ("0", 2, "a2a", False),
+        ("1", 1, "ag_rs", False),
+        ("1", 2, "ag_rs", False),
+        ("1", 2, "a2a", True),
+    ],
+)
+def test_hyv4_gate_overlap_only_enables_for_dcp_a2a(
+    monkeypatch, enabled: str, dcp_size: int, backend: str, expected: bool
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP", enabled)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_size,
+            dcp_comm_backend=backend,
+        )
+    )
+
+    assert enable_hyv4_gate_a2a_overlap(config) is expected
 
 
 def test_hyv4_target_are_classified_as_mla() -> None:
