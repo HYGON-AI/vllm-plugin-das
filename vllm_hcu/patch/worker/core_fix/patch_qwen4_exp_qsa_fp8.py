@@ -57,6 +57,16 @@ _BACKEND_COMBINATION_WRAPPER = "_vllm_hcu_qsa_fp8_backend_combination"
 _READER_ATTR = "_vllm_hcu_qsa_fp8_reader"
 _CACHE_WRITER_ATTR = "_vllm_hcu_qsa_fp8_cache_writer"
 _FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_e5m2")
+_EXPECTED_CACHE_WRITER_ARGUMENTS = (
+    ("key", "Tensor", False),
+    ("value", "Tensor", False),
+    ("key_cache", "Tensor", True),
+    ("value_cache", "Tensor", True),
+    ("slot_mapping", "Tensor", False),
+    ("kv_cache_dtype", "str", False),
+    ("k_scale", "Tensor", False),
+    ("v_scale", "Tensor", False),
+)
 _MISSING = object()
 
 
@@ -120,6 +130,29 @@ def _load_hcu_cache_writer():
             "QSA FP8 cache writer requires "
             "torch.ops.hcu_ops.reshape_and_cache_flash; rebuild or reinstall "
             "vllm_hcu so the native extension matches this source checkout"
+        )
+    try:
+        schema = native_writer.default._schema
+        arguments = tuple(
+            (
+                argument.name,
+                str(argument.type),
+                bool(argument.alias_info and argument.alias_info.is_write),
+            )
+            for argument in schema.arguments
+        )
+        returns = tuple(schema.returns)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(
+            "QSA FP8 cache writer has no inspectable native operator schema; "
+            "rebuild or reinstall vllm_hcu so the native extension matches "
+            "this source checkout"
+        ) from exc
+    if arguments != _EXPECTED_CACHE_WRITER_ARGUMENTS or returns:
+        raise RuntimeError(
+            "QSA FP8 cache writer has incompatible schema "
+            f"{schema}; rebuild or reinstall vllm_hcu so the native "
+            "extension matches this source checkout"
         )
     return reshape_and_cache_flash
 

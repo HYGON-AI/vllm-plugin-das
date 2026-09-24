@@ -150,6 +150,13 @@ def _config(cache_dtype: str) -> SimpleNamespace:
     )
 
 
+def _define_native_cache_writer(namespace: str, schema: str):
+    library = torch.library.Library(namespace, "DEF")
+    library.define(schema)
+    writer = getattr(torch.ops, namespace).reshape_and_cache_flash
+    return library, writer
+
+
 def test_qsa_fp8_cache_writer_fails_early_when_native_op_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -163,6 +170,48 @@ def test_qsa_fp8_cache_writer_fails_early_when_native_op_is_missing(
         RuntimeError,
         match=r"torch\.ops\.hcu_ops\.reshape_and_cache_flash.*rebuild or reinstall",
     ):
+        qsa_fp8_patch._load_hcu_cache_writer()
+
+
+def test_qsa_fp8_cache_writer_fails_early_on_wrong_native_arity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    qsa_fp8_patch = _load_patch()
+    _library, writer = _define_native_cache_writer(
+        "qsa_fp8_bad_writer_arity",
+        "reshape_and_cache_flash(Tensor key, Tensor value, Tensor! key_cache, "
+        "Tensor! value_cache, Tensor slot_mapping, str kv_cache_dtype, "
+        "Tensor k_scale) -> ()",
+    )
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(reshape_and_cache_flash=writer),
+        ),
+    )
+    monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
+
+    with pytest.raises(RuntimeError, match="incompatible schema"):
+        qsa_fp8_patch._load_hcu_cache_writer()
+
+
+def test_qsa_fp8_cache_writer_fails_early_on_non_mutating_cache_schema(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    qsa_fp8_patch = _load_patch()
+    _library, writer = _define_native_cache_writer(
+        "qsa_fp8_bad_writer_mutability",
+        "reshape_and_cache_flash(Tensor key, Tensor value, Tensor key_cache, "
+        "Tensor value_cache, Tensor slot_mapping, str kv_cache_dtype, "
+        "Tensor k_scale, Tensor v_scale) -> ()",
+    )
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(reshape_and_cache_flash=writer),
+        ),
+    )
+    monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
+
+    with pytest.raises(RuntimeError, match="incompatible schema"):
         qsa_fp8_patch._load_hcu_cache_writer()
 
 
