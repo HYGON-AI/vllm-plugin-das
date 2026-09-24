@@ -18,6 +18,7 @@ from vllm_hcu.patch.import_coordinator import (
 
 from . import (
     patch_compilation_config,
+    patch_config_utils,
     patch_engram_config,
     patch_engine_args,
     patch_envs,
@@ -36,6 +37,7 @@ from . import (
 # reviewable when vLLM is upgraded.
 _ORDERED_ADAPTERS = (
     patch_envs,
+    patch_config_utils,
     patch_engram_config,
     patch_import_utils,
     patch_layer_name,

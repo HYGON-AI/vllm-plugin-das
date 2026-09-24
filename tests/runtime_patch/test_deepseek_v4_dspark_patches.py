@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass, field, fields
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -15,8 +16,10 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_load_weights,
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
+    patch_deepseek_v41_dspark_load_weights,
     patch_mhc_backend,
 )
+from vllm_hcu.patch.platform.core_fix import patch_config_utils
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
 
@@ -301,6 +304,70 @@ def test_load_weights_exposes_channel_scale_alias_only_to_official_loader() -> N
     assert dict(model.named_parameters()) == {
         "layers.0.attn.fused_wqa_wkv.weight_scale": parameter
     }
+
+
+def test_dsv41_dspark_load_weights_exposes_both_channel_scale_aliases() -> None:
+    direct_parameter = torch.nn.Parameter(torch.ones(1))
+    inverse_parameter = torch.nn.Parameter(torch.ones(1))
+
+    class DSparkDeepseekV4ForCausalLM(torch.nn.Module):
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            yield "model.layers.0.attn.weight_scale", direct_parameter
+            yield "model.layers.1.attn.weight_scale_inv", inverse_parameter
+
+        def load_weights(self, weights):
+            del weights
+            params = dict(self.named_parameters())
+            assert params["model.layers.0.attn.weight_scale_inv"] is direct_parameter
+            assert params["model.layers.1.attn.weight_scale"] is inverse_parameter
+            return set(params)
+
+    module = _module(
+        patch_deepseek_v41_dspark_load_weights.TARGET_MODULE,
+        DSparkDeepseekV4ForCausalLM=DSparkDeepseekV4ForCausalLM,
+    )
+    patch_deepseek_v41_dspark_load_weights.apply_to_module(module)
+    model = DSparkDeepseekV4ForCausalLM()
+
+    assert model.load_weights([("unused", torch.tensor(1.0))]) == {
+        "model.layers.0.attn.weight_scale",
+        "model.layers.0.attn.weight_scale_inv",
+        "model.layers.1.attn.weight_scale",
+        "model.layers.1.attn.weight_scale_inv",
+    }
+    assert dict(model.named_parameters()) == {
+        "model.layers.0.attn.weight_scale": direct_parameter,
+        "model.layers.1.attn.weight_scale_inv": inverse_parameter,
+    }
+
+
+def test_config_replace_ignores_hcu_runtime_attributes() -> None:
+    @dataclass
+    class ParallelConfig:
+        tensor_parallel_size: int
+        cached_world_size: int = field(init=False, default=1)
+
+    def replace(dataclass_instance, /, **kwargs):
+        del dataclass_instance, kwargs
+        raise AssertionError("HCU wrapper should replace the upstream implementation")
+
+    def is_init_field(cls, name):
+        return next(item for item in fields(cls) if item.name == name).init
+
+    module = _module(
+        patch_config_utils.TARGET_MODULE,
+        replace=replace,
+        is_init_field=is_init_field,
+    )
+    patch_config_utils.apply_to_module(module)
+    config = ParallelConfig(tensor_parallel_size=4)
+    config._vllm_hcu_deepep_auto = True
+
+    copied = module.replace(config, tensor_parallel_size=8)
+
+    assert copied == ParallelConfig(tensor_parallel_size=8)
+    assert not hasattr(copied, "_vllm_hcu_deepep_auto")
 
 
 def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
