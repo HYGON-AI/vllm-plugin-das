@@ -21,6 +21,18 @@ TARGET_MODULE = "vllm.models.deepseek_v4.amd.rocm"
 PATCH_ID = "worker.core_fix.deepseek_v4_rocm.flashmla_sparse"
 _DECODE_MARKER = "_vllm_hcu_flashmla_sparse_decode_applied"
 _PREFILL_MARKER = "_vllm_hcu_flashmla_sparse_prefill_applied"
+_FLASHMLA_PREFILL_HEAD_COUNTS = (64, 128)
+
+
+def _flashmla_decode_supports_heads(num_heads: int) -> bool:
+    return num_heads <= 16 or num_heads in (64, 128)
+
+
+def _builder_uses_flashmla_decode(builder) -> bool:
+    config = builder.vllm_config
+    num_heads = config.model_config.hf_config.num_attention_heads
+    tp_size = config.parallel_config.tensor_parallel_size
+    return _flashmla_decode_supports_heads(num_heads // tp_size)
 
 
 @functools.cache
@@ -140,7 +152,10 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         original_swa_init(self, *args, **kwargs)
         from vllm_hcu.platforms import envs as henvs
 
-        if henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE:
+        if (
+            henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            and _builder_uses_flashmla_decode(self)
+        ):
             # FlashMLA consumes the dense SWA indices; release the AITER-only
             # ragged buffers (max_tokens * window_size int32) right away.
             self.decode_swa_ragged_indices_buffer = None
@@ -151,7 +166,10 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         original_mla_init(self, *args, **kwargs)
         from vllm_hcu.platforms import envs as henvs
 
-        if henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE:
+        if (
+            henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            and _builder_uses_flashmla_decode(self)
+        ):
             self.c128a_decode_topk_ragged_indices_buffer = None
             self.c128a_decode_topk_ragged_indptr_buffer = None
 
@@ -159,7 +177,10 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     def build_swa_metadata(self, common_prefix_len, common_attn_metadata, fast_build=False):
         from vllm_hcu.platforms import envs as henvs
 
-        if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE:
+        if (
+            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            or not _builder_uses_flashmla_decode(self)
+        ):
             return original_swa_build(self, common_prefix_len, common_attn_metadata, fast_build)
         # The base builder already supplies dense SWA indices and the tile
         # scheduler. The native subclass adds only AITER's ragged copy.
@@ -172,7 +193,10 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     def build_mla_metadata(self, common_prefix_len, common_attn_metadata, fast_build=False):
         from vllm_hcu.platforms import envs as henvs
 
-        if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE:
+        if (
+            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            or not _builder_uses_flashmla_decode(self)
+        ):
             return original_mla_build(self, common_prefix_len, common_attn_metadata, fast_build)
         # The base builder already computes C128A dense global top-k and
         # lengths. The native subclass adds only AITER's ragged conversion.
@@ -186,7 +210,11 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         result = original_scheduler(self, num_decode_tokens)
         from vllm_hcu.platforms import envs as henvs
 
-        if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE or num_decode_tokens == 0:
+        if (
+            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            or not _builder_uses_flashmla_decode(self)
+            or num_decode_tokens == 0
+        ):
             return result
         _require_flashmla_ready()
         from vllm_hcu.v1.attention.ops.flashmla import get_mla_metadata
@@ -203,6 +231,10 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             return original_decode(
                 self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
             )
+        if q.ndim == 3 and not _flashmla_decode_supports_heads(q.shape[1]):
+            return original_decode(
+                self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
+            )
 
         _require_flashmla_ready()
         from vllm.models.deepseek_v4.common.ops import (
@@ -213,12 +245,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         num_tokens = swa_metadata.num_decode_tokens
         if q.ndim != 3 or q.shape[0] != num_tokens or q.shape[-1] != 512 or output.shape != q.shape:
             raise ValueError("FlashMLA decode requires one 512-wide output per query")
-        if not (q.shape[1] <= 16 or q.shape[1] in (64, 128)):
-            raise ValueError(
-                "The installed FlashMLA FP8 sparse decode kernels cover local "
-                f"query head counts <=16, 64, and 128; got {q.shape[1]}. "
-                "TP2 (32 local heads) is the unsupported configuration."
-            )
         if (
             self.swa_cache_layer.kv_cache.dtype != torch.uint8
             or self.swa_cache_layer.kv_cache.shape[-1] != 584
@@ -345,6 +371,14 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
         from vllm_hcu.platforms import envs as henvs
 
         if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL:
+            return original(
+                q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
+                rope_head_dim, attn_sink, output, ragged_indices, ragged_indptr,
+            )
+        # The compiled sparse-prefill kernels only instantiate h_q=64/128.
+        # Native ROCm keeps the actual per-rank head count instead of padding,
+        # so TP configurations such as TP2/TP4 must retain the AITER path.
+        if q.ndim == 3 and q.shape[1] not in _FLASHMLA_PREFILL_HEAD_COUNTS:
             return original(
                 q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
                 rope_head_dim, attn_sink, output, ragged_indices, ragged_indptr,

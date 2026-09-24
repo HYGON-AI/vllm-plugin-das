@@ -14,10 +14,18 @@ from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_rocm_flashmla_spars
 from vllm_hcu.platforms import envs as henvs
 
 
-def _build_module(ratio, batch, calls):
+def _build_module(ratio, batch, calls, local_heads=4):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_attention_heads=local_heads)
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+
     class BaseBuilder:
         def __init__(self):
             calls.append("base_swa_init")
+            self.vllm_config = vllm_config
 
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             calls.append("dense_swa")
@@ -42,6 +50,7 @@ def _build_module(ratio, batch, calls):
     class BaseMLABuilder:
         def __init__(self):
             calls.append("base_mla_init")
+            self.vllm_config = vllm_config
 
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             calls.append("dense_mla")
@@ -236,8 +245,9 @@ def test_decode_contract(monkeypatch, ratio, batch):
     # Prefill replaces only the module-level attention kernel called by the
     # native gather/combiner loop.
     prefill_tokens = 2
-    prefill_q = torch.zeros(prefill_tokens, 4, 512, dtype=torch.bfloat16)
+    prefill_q = torch.zeros(prefill_tokens, 64, 512, dtype=torch.bfloat16)
     prefill_out = torch.zeros_like(prefill_q)
+    prefill_sink = torch.zeros(64, dtype=torch.float32)
     module.rocm_sparse_attn_prefill(
         prefill_q,
         torch.zeros(16, 1, 512, dtype=torch.bfloat16),
@@ -247,7 +257,7 @@ def test_decode_contract(monkeypatch, ratio, batch):
         512,
         448,
         64,
-        Attention.attn_sink,
+        prefill_sink,
         prefill_out,
     )
     assert torch.all(prefill_out == 1)
@@ -255,12 +265,6 @@ def test_decode_contract(monkeypatch, ratio, batch):
     assert prefill_call["indices"].shape == (prefill_tokens, 1, 8)
     assert prefill_call["d_v"] == 512
     assert "prefill_guard" in calls
-
-    # Unsupported local head count (TP2 shape) fails loudly instead of
-    # reaching a missing kernel instantiation.
-    q32 = torch.zeros(batch, 32, 512, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="head counts"):
-        Attention()._forward_decode(q32, None, metadata, None, True, q32.clone())
 
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", False)
@@ -280,10 +284,110 @@ def test_decode_contract(monkeypatch, ratio, batch):
         512,
         448,
         64,
-        Attention.attn_sink,
+        prefill_sink,
         prefill_out,
     )
     assert calls[-1] == "aiter_prefill_kernel"
+
+
+@pytest.mark.parametrize(
+    ("heads", "uses_flashmla"),
+    [(16, True), (32, False), (64, True), (128, True)],
+)
+def test_decode_falls_back_for_unsupported_local_head_counts(
+    monkeypatch, heads, uses_flashmla
+):
+    calls = []
+    mapper = ModuleType("vllm.models.deepseek_v4.common.ops")
+    mapper.compute_global_topk_indices_and_lens = lambda *args: (None, None)
+    monkeypatch.setitem(sys.modules, mapper.__name__, mapper)
+    flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")
+    flash.is_flashmla_sparse_supported = lambda: (True, None)
+    flash.get_mla_metadata = lambda: (object(), None)
+
+    def kernel(**kwargs):
+        calls.append("flashmla_decode")
+        return torch.ones_like(kwargs["q"]), None
+
+    flash.flash_mla_with_kvcache = kernel
+    monkeypatch.setitem(sys.modules, flash.__name__, flash)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", False)
+    monkeypatch.setattr(patch, "_require_flashmla_ready", lambda: calls.append("guard"))
+
+    module, Attention, Builder, MLABuilder = _build_module(
+        1, 1, calls, local_heads=heads
+    )
+    assert patch.apply_to_module(module)
+    swa_builder = Builder()
+    mla_builder = MLABuilder()
+    if uses_flashmla:
+        assert swa_builder.decode_swa_ragged_indices_buffer is None
+        assert mla_builder.c128a_decode_topk_ragged_indices_buffer is None
+    else:
+        assert swa_builder.decode_swa_ragged_indices_buffer is not None
+        assert mla_builder.c128a_decode_topk_ragged_indices_buffer is not None
+
+    swa_builder.build(0, None)
+    mla_builder.build(0, None)
+    tiles = swa_builder.build_tile_scheduler(1)
+    metadata = _swa_metadata(1, tiles)
+    q = torch.zeros(1, heads, 512, dtype=torch.bfloat16)
+    Attention()._forward_decode(q, None, metadata, None, True, q.clone())
+
+    assert ("flashmla_decode" in calls) is uses_flashmla
+    assert ("guard" in calls) is uses_flashmla
+    assert ("aiter" in calls) is not uses_flashmla
+    assert ("dense_swa" in calls) is uses_flashmla
+    assert ("ragged_swa" in calls) is not uses_flashmla
+
+
+@pytest.mark.parametrize(
+    ("heads", "uses_flashmla"),
+    [(16, False), (32, False), (64, True), (128, True)],
+)
+def test_prefill_falls_back_for_unsupported_local_head_counts(
+    monkeypatch, heads, uses_flashmla
+):
+    calls = []
+    flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")
+    flash.is_flashmla_sparse_supported = lambda: (True, None)
+
+    def prefill_kernel(**kwargs):
+        calls.append("flashmla_prefill")
+        return torch.ones_like(kwargs["q"]), None, None
+
+    flash.flash_mla_sparse_fwd = prefill_kernel
+    monkeypatch.setitem(sys.modules, flash.__name__, flash)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", True)
+    monkeypatch.setattr(
+        patch, "_require_flashmla_prefill_ready", lambda: calls.append("prefill_guard")
+    )
+
+    module, _, _, _ = _build_module(1, 1, calls)
+    assert patch.apply_to_module(module)
+    tokens = 2
+    q = torch.zeros(tokens, heads, 512, dtype=torch.bfloat16)
+    output = torch.zeros_like(q)
+    module.rocm_sparse_attn_prefill(
+        q,
+        torch.zeros(16, 1, 512, dtype=torch.bfloat16),
+        torch.zeros(tokens, 8, dtype=torch.int32),
+        torch.full((tokens,), 8, dtype=torch.int32),
+        0.125,
+        512,
+        448,
+        64,
+        torch.zeros(heads, dtype=torch.float32),
+        output,
+    )
+
+    assert ("flashmla_prefill" in calls) is uses_flashmla
+    assert ("prefill_guard" in calls) is uses_flashmla
+    assert ("aiter_prefill_kernel" in calls) is not uses_flashmla
+    if uses_flashmla:
+        assert torch.all(output == 1)
 
 
 def test_guard_rejects_unavailable_flashmla(monkeypatch):
