@@ -53,7 +53,13 @@ def _patched_kv_config_module(get_config, uniform_type):
         del vllm_config, kv_cache_spec
         return []
 
+    def _warn_if_unannotated_eagle_mamba(vllm_config, kv_cache_groups):
+        del vllm_config, kv_cache_groups
+
     module._annotate_eagle_groups = _annotate_eagle_groups
+    module._warn_if_unannotated_eagle_mamba = (
+        _warn_if_unannotated_eagle_mamba
+    )
     module.get_kv_cache_groups = get_kv_cache_groups
     module.get_kv_cache_config_from_groups = get_config
     module.UniformTypeKVCacheSpecs = uniform_type
@@ -133,7 +139,13 @@ def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
     def get_kv_cache_groups(vllm_config, kv_cache_spec):
         return []
 
+    def _warn_if_unannotated_eagle_mamba(vllm_config, kv_cache_groups):
+        del vllm_config, kv_cache_groups
+
     module._annotate_eagle_groups = _annotate_eagle_groups
+    module._warn_if_unannotated_eagle_mamba = (
+        _warn_if_unannotated_eagle_mamba
+    )
     module.get_kv_cache_groups = get_kv_cache_groups
     module.get_kv_cache_config_from_groups = _get_kv_cache_config_from_groups
     module.UniformTypeKVCacheSpecs = _DummyUniformTypeKVCacheSpecs
@@ -181,6 +193,7 @@ def test_qwen_mtp_groups_are_annotated_without_target_mamba_groups(model_type):
 
 def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
     module = ModuleType(kv_groups_patch.TARGET_MODULE)
+    warning_observations = []
 
     def _annotate_eagle_groups(
         vllm_config,
@@ -197,16 +210,29 @@ def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
             is_eagle_group=False,
         ),
         SimpleNamespace(
-            layer_names=["mtp.layers.48.self_attn"],
-            kv_cache_spec=SimpleNamespace(),
+            layer_names=[],
+            kv_cache_spec=SimpleNamespace(
+                kv_cache_specs={"mtp.layers.48.self_attn": SimpleNamespace()}
+            ),
             is_eagle_group=False,
         ),
     ]
 
+    def _warn_if_unannotated_eagle_mamba(vllm_config, kv_cache_groups):
+        del vllm_config
+        warning_observations.append(
+            [group.is_eagle_group for group in kv_cache_groups]
+        )
+
     def get_kv_cache_groups(vllm_config, kv_cache_spec):
+        del kv_cache_spec
+        module._warn_if_unannotated_eagle_mamba(vllm_config, groups)
         return groups
 
     module._annotate_eagle_groups = _annotate_eagle_groups
+    module._warn_if_unannotated_eagle_mamba = (
+        _warn_if_unannotated_eagle_mamba
+    )
     module.get_kv_cache_groups = get_kv_cache_groups
     module.get_kv_cache_config_from_groups = _get_kv_cache_config_from_groups
     module.UniformTypeKVCacheSpecs = _DummyUniformTypeKVCacheSpecs
@@ -221,6 +247,7 @@ def test_qwen4_exp_mtp_groups_are_annotated_after_upstream_early_return():
     returned_groups = module.get_kv_cache_groups(qwen_config, {"layers": "spec"})
 
     assert returned_groups is groups
+    assert warning_observations == [[False, True]]
     assert [group.is_eagle_group for group in groups] == [False, True]
 
 
@@ -254,7 +281,13 @@ def test_qwen_mtp_pp_drops_tensors_from_empty_projected_uniform_groups():
         del vllm_config, kv_cache_spec
         return []
 
+    def _warn_if_unannotated_eagle_mamba(vllm_config, kv_cache_groups):
+        del vllm_config, kv_cache_groups
+
     module._annotate_eagle_groups = _annotate_eagle_groups
+    module._warn_if_unannotated_eagle_mamba = (
+        _warn_if_unannotated_eagle_mamba
+    )
     module.get_kv_cache_groups = get_kv_cache_groups
     module.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
 
@@ -318,6 +351,87 @@ def test_qwen_mtp_pp_drops_tensors_from_empty_projected_uniform_groups():
     assert result.kv_cache_groups is groups
     assert result.kv_cache_groups[0] is groups[0]
     assert result.kv_cache_groups[1] is groups[1]
+
+
+def test_qwen_mtp_pp_restores_draft_marker_on_empty_projected_group():
+    """The scheduler must still identify MTP when PP0 owns no draft layer."""
+
+    from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        UniformTypeKVCacheSpecs,
+    )
+
+    mtp_layer = "mtp.layers.48.self_attn"
+    remote_target_layer = "model.layers.24.self_attn"
+    local_target_layer = "model.layers.0.self_attn"
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=[],
+            kv_cache_spec=UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={mtp_layer: spec},
+            ),
+        ),
+        KVCacheGroupSpec(
+            layer_names=[],
+            kv_cache_spec=UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={remote_target_layer: spec},
+            ),
+        ),
+        KVCacheGroupSpec(layer_names=[local_target_layer], kv_cache_spec=spec),
+    ]
+
+    def get_config(vllm_config, kv_cache_groups, available_memory):
+        del vllm_config, available_memory
+        return KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=4096,
+                    layers=[layer_name],
+                    layer_stride=4096,
+                    block_stride=512,
+                )
+                for layer_name in (
+                    mtp_layer,
+                    remote_target_layer,
+                    local_target_layer,
+                )
+            ],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    module = _patched_kv_config_module(get_config, UniformTypeKVCacheSpecs)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="qwen4_exp")
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+
+    result = module.get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    scheduler_config = generate_scheduler_kv_cache_config([result])
+
+    assert [group.is_eagle_group for group in scheduler_config.kv_cache_groups] == [
+        True,
+        False,
+        False,
+    ]
+    assert [tensor.layers for tensor in result.kv_cache_tensors] == [
+        [local_target_layer]
+    ]
 
 
 def test_qwen_mtp_pp_rejects_unclassified_unowned_tensors():

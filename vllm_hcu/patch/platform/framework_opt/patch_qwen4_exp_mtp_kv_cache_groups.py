@@ -24,11 +24,13 @@ TARGETS = (
     f"{TARGET_MODULE}._annotate_eagle_groups",
     f"{TARGET_MODULE}.get_kv_cache_groups",
     f"{TARGET_MODULE}.get_kv_cache_config_from_groups",
+    f"{TARGET_MODULE}._warn_if_unannotated_eagle_mamba",
 )
 _MARKER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_applied"
 _WRAPPER = "_vllm_hcu_qwen4_exp_mtp_kv_groups_wrapper"
 _GROUPS_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_groups_wrapper"
 _CONFIG_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_get_kv_config_wrapper"
+_WARN_WRAPPER = "_vllm_hcu_qwen4_exp_mtp_warn_wrapper"
 logger = logging.getLogger(__name__)
 _SUPPORTED_MODEL_TYPES = frozenset(
     {
@@ -57,6 +59,22 @@ def _is_mtp_layer(name: object) -> bool:
     return isinstance(name, str) and "mtp" in name.lower().split(".")
 
 
+def _group_contains_mtp_layer(group: object) -> bool:
+    layer_names = getattr(group, "layer_names", ())
+    if any(_is_mtp_layer(name) for name in layer_names):
+        return True
+    if layer_names:
+        return False
+
+    # PP projection empties layer_names on stages that do not own this group,
+    # while UniformTypeKVCacheSpecs retains the global layer-to-spec mapping.
+    group_spec = getattr(group, "kv_cache_spec", None)
+    global_specs = getattr(group_spec, "kv_cache_specs", None)
+    return isinstance(global_specs, dict) and any(
+        _is_mtp_layer(name) for name in global_specs
+    )
+
+
 def _annotate_qwen_mtp_groups(vllm_config, kv_cache_groups) -> None:
     if not _is_qwen_hybrid_mtp(vllm_config):
         return
@@ -65,7 +83,7 @@ def _annotate_qwen_mtp_groups(vllm_config, kv_cache_groups) -> None:
     # ``mtp`` prefix.  Mark every group containing such a layer and leave
     # target Mamba groups untouched so align-mode checkpoints remain reusable.
     for group in kv_cache_groups:
-        if any(_is_mtp_layer(name) for name in group.layer_names):
+        if _group_contains_mtp_layer(group):
             group.is_eagle_group = True
 
 
@@ -81,6 +99,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 kv_cache_utils,
                 "get_kv_cache_config_from_groups",
                 _CONFIG_WRAPPER,
+            ),
+            (
+                kv_cache_utils,
+                "_warn_if_unannotated_eagle_mamba",
+                _WARN_WRAPPER,
             ),
         ),
     ):
@@ -131,6 +154,28 @@ def apply_to_module(module: ModuleType) -> bool:
             f"required HCU patch target {TARGETS[2]} has incompatible "
             f"signature {get_config_signature}"
         )
+    original_warn = require_callable(
+        kv_cache_utils,
+        "_warn_if_unannotated_eagle_mamba",
+        TARGETS[3],
+    )
+    warn_signature = inspect.signature(original_warn)
+    if tuple(warn_signature.parameters) != (
+        "vllm_config",
+        "kv_cache_groups",
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[3]} has incompatible "
+            f"signature {warn_signature}"
+        )
+
+    @functools.wraps(original_warn)
+    def hcu_warn_if_unannotated_eagle_mamba(
+        vllm_config,
+        kv_cache_groups,
+    ) -> None:
+        _annotate_qwen_mtp_groups(vllm_config, kv_cache_groups)
+        return original_warn(vllm_config, kv_cache_groups)
 
     @functools.wraps(original)
     def hcu_annotate_eagle_groups(
@@ -209,6 +254,12 @@ def apply_to_module(module: ModuleType) -> bool:
                     "Qwen hybrid MTP PP found an incompatible empty "
                     "UniformType KV group"
                 )
+            # PP projection clears the Eagle marker when this worker owns no
+            # layer in the group.  The scheduler builds its configuration from
+            # the first worker, so restore the marker from the retained global
+            # spec names even though this stage allocates no draft KV tensor.
+            if any(_is_mtp_layer(layer_name) for layer_name in remote_spec):
+                group.is_eagle_group = True
             remote_layers.update(remote_spec)
 
         duplicated_layers = owned_layers.intersection(remote_layers)
@@ -246,6 +297,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(hcu_annotate_eagle_groups, _WRAPPER, True)
     setattr(hcu_get_kv_cache_groups, _GROUPS_WRAPPER, True)
     setattr(hcu_get_kv_cache_config_from_groups, _CONFIG_WRAPPER, True)
+    setattr(hcu_warn_if_unannotated_eagle_mamba, _WARN_WRAPPER, True)
     setattr(kv_cache_utils, "_vllm_hcu_original_annotate_eagle_groups", original)
     setattr(
         kv_cache_utils,
@@ -257,12 +309,22 @@ def apply_to_module(module: ModuleType) -> bool:
         "_vllm_hcu_original_get_kv_cache_config_from_groups",
         original_get_config,
     )
+    setattr(
+        kv_cache_utils,
+        "_vllm_hcu_original_warn_if_unannotated_eagle_mamba",
+        original_warn,
+    )
     setattr(kv_cache_utils, "_annotate_eagle_groups", hcu_annotate_eagle_groups)
     setattr(kv_cache_utils, "get_kv_cache_groups", hcu_get_kv_cache_groups)
     setattr(
         kv_cache_utils,
         "get_kv_cache_config_from_groups",
         hcu_get_kv_cache_config_from_groups,
+    )
+    setattr(
+        kv_cache_utils,
+        "_warn_if_unannotated_eagle_mamba",
+        hcu_warn_if_unannotated_eagle_mamba,
     )
     setattr(kv_cache_utils, _MARKER, True)
     return True
