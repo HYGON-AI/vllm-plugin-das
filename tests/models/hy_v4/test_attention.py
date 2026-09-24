@@ -346,24 +346,54 @@ def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "num_reqs", "expected"),
-    [(8, 2, 4), (8, 8, 1)],
+    ("num_tokens", "num_reqs", "max_query_len", "expected"),
+    [
+        (8, 2, 4, 4),
+        (8, 8, 1, 1),
+        # Chunked prefill can split a fixed token budget unevenly across
+        # requests. LightOp cannot express those widths with its scalar
+        # tokens_per_request argument, so process every row independently.
+        (256, 3, 86, 1),
+        # Divisibility alone does not prove that request widths are uniform.
+        (8, 2, 5, 1),
+    ],
 )
-def test_uniform_tokens_per_request(
+def test_lightop_tokens_per_request(
     num_tokens: int,
     num_reqs: int,
+    max_query_len: int,
     expected: int,
 ) -> None:
-    assert hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs) == expected
+    assert (
+        hcu_sparse._lightop_tokens_per_request(
+            num_tokens,
+            num_reqs,
+            max_query_len,
+        )
+        == expected
+    )
 
 
-@pytest.mark.parametrize(("num_tokens", "num_reqs"), [(7, 2), (8, 0)])
-def test_uniform_tokens_per_request_rejects_invalid_shape(
+@pytest.mark.parametrize(
+    ("num_tokens", "num_reqs", "max_query_len", "error"),
+    [
+        (8, 0, 4, "at least one request"),
+        (1, 1, 0, "positive max_query_len"),
+        (1, 1, -1, "positive max_query_len"),
+    ],
+)
+def test_lightop_tokens_per_request_rejects_invalid_shape(
     num_tokens: int,
     num_reqs: int,
+    max_query_len: int,
+    error: str,
 ) -> None:
-    with pytest.raises(ValueError, match="uniform query width|at least one request"):
-        hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs)
+    with pytest.raises(ValueError, match=error):
+        hcu_sparse._lightop_tokens_per_request(
+            num_tokens,
+            num_reqs,
+            max_query_len,
+        )
 
 
 def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
@@ -635,6 +665,20 @@ def test_lightop_mapping_reuse_only_marks_uniform_target_verify(
     )
 
     assert group_size == expected_group_size
+
+
+def test_lightop_mapping_reuse_rejects_tokens_without_query_width() -> None:
+    metadata = SimpleNamespace(
+        num_reqs=1,
+        max_query_len=0,
+        num_actual_tokens=1,
+    )
+
+    with pytest.raises(ValueError, match="positive max_query_len"):
+        hcu_sparse._lightop_mapping_reuse_group_size(
+            metadata,
+            torch.tensor([False], dtype=torch.bool),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1059,6 +1103,7 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     fp8_cache = torch.zeros(16, 656, dtype=torch.uint8)
     metadata = SimpleNamespace(
         num_reqs=2,
+        max_query_len=1,
         req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
         block_table=torch.tensor([[7], [11]], dtype=torch.int32),
         block_size=64,
@@ -1089,6 +1134,77 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     impl._dcp_sinks = None
     _, sink_free_lse = impl.forward_mqa(q, fp8_cache, metadata, object())
     assert torch.isneginf(sink_free_lse[1]).all()
+
+
+def test_fp8_dcp_ragged_batch_gathers_each_query_row_independently(
+    monkeypatch,
+) -> None:
+    impl = _bare_impl(None)
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 0
+    impl.kv_cache_dtype = "fp8_ds_mla"
+    impl.topk_indices_buffer = torch.arange(20, dtype=torch.int32).view(5, 4)
+
+    localized_indices = torch.arange(100, 120, dtype=torch.int32).view(5, 4)
+    topk_length = torch.full((5,), 4, dtype=torch.int32)
+    compact_indices = torch.arange(20, dtype=torch.int32).view(5, 4)
+    gathered_cache = torch.zeros(20, 576)
+    observed_widths: list[int] = []
+
+    def fake_filter(*args, **kwargs):
+        del args, kwargs
+        return localized_indices, topk_length
+
+    def fake_dequant(
+        cache,
+        indices,
+        kv_lora_rank,
+        rope_dim,
+        tokens_per_request,
+        **kwargs,
+    ):
+        del cache, kv_lora_rank, rope_dim, kwargs
+        assert indices is localized_indices
+        observed_widths.append(tokens_per_request)
+        return gathered_cache, compact_indices
+
+    rowwise_reference = torch.stack(
+        [torch.full((4, 3), float(row)) for row in range(5)]
+    )
+
+    def fake_kernel(self, q, cache, indices, topk_length=None):
+        del self, q
+        assert cache is gathered_cache
+        assert indices is compact_indices
+        assert topk_length is not None
+        return rowwise_reference.clone(), torch.zeros(5, 4)
+
+    monkeypatch.setattr(hcu_sparse, "triton_filter_and_convert_dcp_index", fake_filter)
+    monkeypatch.setattr(
+        hcu_sparse,
+        "gather_dequantize_fp8_ds_mla_cache",
+        fake_dequant,
+    )
+    impl._bf16_flash_mla_kernel_with_lse = MethodType(fake_kernel, impl)
+
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=3,
+        req_id_per_token=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32),
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        block_size=64,
+        cp_kv_cache_interleave_size=1,
+    )
+    output, _ = impl.forward_mqa(
+        torch.zeros(5, 4, 576),
+        torch.zeros(16, 656, dtype=torch.uint8),
+        metadata,
+        object(),
+    )
+
+    assert observed_widths == [1]
+    torch.testing.assert_close(output, rowwise_reference)
 
 
 def test_dcp_size_one_delegates_to_upstream_forward(monkeypatch) -> None:
