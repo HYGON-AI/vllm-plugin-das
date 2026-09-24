@@ -150,6 +150,22 @@ def _config(cache_dtype: str) -> SimpleNamespace:
     )
 
 
+def test_qsa_fp8_cache_writer_fails_early_when_native_op_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    qsa_fp8_patch = _load_patch()
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(hcu_ops=SimpleNamespace()),
+    )
+    monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"torch\.ops\.hcu_ops\.reshape_and_cache_flash.*rebuild or reinstall",
+    ):
+        qsa_fp8_patch._load_hcu_cache_writer()
+
+
 def test_qsa_owner_accepts_fp8_cache_and_restores_shared_config(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -328,6 +344,11 @@ def test_qsa_fp8_forward_uses_native_view_and_device_scales(
         qsa_fp8_patch,
         "get_qsa_fp8_reader",
         lambda **kwargs: reader,
+    )
+    monkeypatch.setattr(
+        qsa_fp8_patch,
+        "_load_hcu_cache_writer",
+        lambda: lambda *args: None,
     )
     qsa_fp8_patch.apply_to_module(module)
     impl = module.Qwen4ExpQSAFlashAttentionImpl(

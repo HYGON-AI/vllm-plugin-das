@@ -110,6 +110,17 @@ def _upstream_triton_fp8_reader():
 def _load_hcu_cache_writer():
     from vllm_hcu.v1.attention.backends.fa_utils import reshape_and_cache_flash
 
+    native_writer = getattr(
+        getattr(torch.ops, "hcu_ops", None),
+        "reshape_and_cache_flash",
+        None,
+    )
+    if not callable(native_writer):
+        raise RuntimeError(
+            "QSA FP8 cache writer requires "
+            "torch.ops.hcu_ops.reshape_and_cache_flash; rebuild or reinstall "
+            "vllm_hcu so the native extension matches this source checkout"
+        )
     return reshape_and_cache_flash
 
 
