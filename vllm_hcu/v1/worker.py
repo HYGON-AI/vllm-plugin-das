@@ -7,7 +7,11 @@ import gc
 import torch
 import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
-from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.gpu_worker import (
+    Worker,
+    _num_workspace_lanes,
+    init_worker_distributed_environment,
+)
 from vllm.utils.torch_utils import set_random_seed
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.config import VllmConfig, CacheConfig
@@ -171,7 +175,11 @@ class HcuGPUWorker(Worker):
 
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        init_workspace_manager(
+            self.device,
+            num_ubatches,
+            _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
+        )
 
         # Construct the model runner
         self.model_runner: GPUModelRunner = _create_model_runner(  # type: ignore
