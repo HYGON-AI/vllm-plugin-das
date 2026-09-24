@@ -106,18 +106,31 @@ def test_cutlass_qsa_fp8_reader_uses_flash_attention_symbol(
     ) in caplog.text
 
 
-@pytest.mark.parametrize("configured", ["triton", "boltops"])
-def test_non_cutlass_qsa_fp8_reader_keeps_framework_fallback(
+@pytest.mark.parametrize(
+    ("custom_ops", "configured"),
+    [("0", "invalid"), ("1", "triton"), ("1", "boltops")],
+)
+def test_qsa_fp8_reader_is_independent_of_generic_backend_controls(
     monkeypatch: pytest.MonkeyPatch,
+    custom_ops: str,
     configured: str,
 ):
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
     monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", configured)
+
+    def flash_fp8(*args, **kwargs):
+        return args, kwargs
 
     def triton_fp8(*args, **kwargs):
         return None
 
-    assert qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8) is triton_fp8
+    monkeypatch.setattr(
+        qsa,
+        "_load_flash_qsa_fp8_kernel",
+        lambda: flash_fp8,
+    )
+
+    assert qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8) is flash_fp8
 
 
 def test_missing_cutlass_qsa_fp8_symbol_falls_back_before_capture(

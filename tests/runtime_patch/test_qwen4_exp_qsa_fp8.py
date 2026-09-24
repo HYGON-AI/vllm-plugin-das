@@ -432,16 +432,19 @@ def test_qsa_bf16_cache_update_keeps_upstream_path(monkeypatch: pytest.MonkeyPat
     assert impl.upstream_cache_update_called
 
 
-def test_qsa_fp8_cache_update_respects_custom_ops_master_gate(
+@pytest.mark.parametrize("cache_dtype", ["fp8_e4m3", "fp8_e5m2"])
+def test_qsa_fp8_cache_update_ignores_custom_ops_master_gate(
     monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: str,
 ):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     qsa_fp8_patch = _load_patch()
     module = _owner_module(qsa_fp8_patch)
+    writes = []
     monkeypatch.setattr(
         qsa_fp8_patch,
         "_load_hcu_cache_writer",
-        lambda: pytest.fail("master gate must disable the HCU writer"),
+        lambda: lambda *args: writes.append(args),
         raising=False,
     )
     monkeypatch.setattr(
@@ -451,12 +454,61 @@ def test_qsa_fp8_cache_update_respects_custom_ops_master_gate(
     )
     qsa_fp8_patch.apply_to_module(module)
     impl = module.Qwen4ExpQSAFlashAttentionImpl(
-        1, 4, 0.5, 1, None, None, "fp8_e5m2"
+        1, 4, 0.5, 1, None, None, cache_dtype
+    )
+    layer = SimpleNamespace(
+        _k_scale=torch.tensor([0.75], dtype=torch.float32),
+        _v_scale=torch.tensor([1.25], dtype=torch.float32),
+    )
+    key = torch.ones((2, 1, 4), dtype=torch.bfloat16)
+    value = key + 1
+    kv_cache = torch.zeros((2, 1, 4, 8), dtype=torch.uint8)
+    slot_mapping = torch.tensor([0, 5], dtype=torch.int64)
+
+    impl.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
+    assert not hasattr(impl, "upstream_cache_update_called")
+    assert len(writes) == 1
+    assert writes[0][4:] == (
+        slot_mapping,
+        cache_dtype,
+        layer._k_scale,
+        layer._v_scale,
     )
 
-    impl.do_kv_cache_update(object(), object(), object(), object(), object())
 
-    assert impl.upstream_cache_update_called
+@pytest.mark.parametrize(
+    ("method_name", "replacement"),
+    [
+        (
+            "supports_kv_cache_dtype",
+            classmethod(lambda cls, cache_dtype, unexpected=None: True),
+        ),
+        (
+            "supports_combination",
+            classmethod(lambda cls, head_size, dtype: None),
+        ),
+    ],
+)
+def test_qsa_backend_capability_signature_drift_is_rejected_atomically(
+    method_name: str,
+    replacement: classmethod,
+):
+    qsa_fp8_patch = _load_patch()
+    module = _owner_module(qsa_fp8_patch)
+    backend = module.Qwen4ExpQSAFlashAttentionBackend
+    setattr(backend, method_name, replacement)
+    original_supported = list(backend.supported_kv_cache_dtypes)
+
+    with pytest.raises(
+        qsa_fp8_patch.PatchCompatibilityError,
+        match="incompatible signature",
+    ):
+        qsa_fp8_patch.apply_to_module(module)
+
+    assert backend.supported_kv_cache_dtypes == original_supported
+    assert vars(backend)[method_name] is replacement
+    assert not hasattr(module, qsa_fp8_patch._MARKER)
 
 
 def test_qsa_bf16_forward_keeps_upstream_path(monkeypatch: pytest.MonkeyPatch):

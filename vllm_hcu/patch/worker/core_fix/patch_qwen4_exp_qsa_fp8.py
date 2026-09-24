@@ -15,7 +15,6 @@ from types import ModuleType
 
 import torch
 
-from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.v1.attention.backends.qsa import get_qsa_fp8_reader
 
 from ._common import (
@@ -122,8 +121,30 @@ def _configure_fp8_impl(impl, cache_dtype: str) -> None:
         _READER_ATTR,
         get_qsa_fp8_reader(triton_fp8=_upstream_triton_fp8_reader()),
     )
-    if henvs.VLLM_HCU_USE_CUSTOM_OPS:
-        setattr(impl, _CACHE_WRITER_ATTR, _load_hcu_cache_writer())
+    setattr(impl, _CACHE_WRITER_ATTR, _load_hcu_cache_writer())
+
+
+def _require_classmethod_signature(
+    owner: type,
+    name: str,
+    target: str,
+    positional: tuple[str, ...],
+):
+    for parent in owner.__mro__:
+        descriptor = vars(parent).get(name, _MISSING)
+        if descriptor is _MISSING:
+            continue
+        if not isinstance(descriptor, classmethod):
+            raise PatchCompatibilityError(
+                f"required HCU patch target {target} must be a classmethod"
+            )
+        require_exact_signature(
+            descriptor.__func__,
+            target,
+            positional=("cls", *positional),
+        )
+        return getattr(owner, name), owner.__dict__.get(name, _MISSING)
+    raise PatchCompatibilityError(f"required HCU patch target {target} is missing")
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -230,17 +251,31 @@ def apply_to_module(module: ModuleType) -> bool:
         "canonicalize_singleton_dim_strides",
         f"{TARGET_MODULE}.canonicalize_singleton_dim_strides",
     )
-    original_supports_kv_cache_dtype = require_callable(
-        backend_cls, "supports_kv_cache_dtype", _BACKEND_DTYPE_TARGET
+    original_supports_kv_cache_dtype, original_dtype_descriptor = (
+        _require_classmethod_signature(
+            backend_cls,
+            "supports_kv_cache_dtype",
+            _BACKEND_DTYPE_TARGET,
+            ("kv_cache_dtype",),
+        )
     )
-    original_supports_combination = require_callable(
-        backend_cls, "supports_combination", _BACKEND_COMBINATION_TARGET
-    )
-    original_dtype_descriptor = backend_cls.__dict__.get(
-        "supports_kv_cache_dtype", _MISSING
-    )
-    original_combination_descriptor = backend_cls.__dict__.get(
-        "supports_combination", _MISSING
+    original_supports_combination, original_combination_descriptor = (
+        _require_classmethod_signature(
+            backend_cls,
+            "supports_combination",
+            _BACKEND_COMBINATION_TARGET,
+            (
+                "head_size",
+                "dtype",
+                "kv_cache_dtype",
+                "block_size",
+                "use_mla",
+                "has_sink",
+                "use_sparse",
+                "use_mm_prefix",
+                "device_capability",
+            ),
+        )
     )
 
     @functools.wraps(
@@ -436,10 +471,7 @@ def apply_to_module(module: ModuleType) -> bool:
         kv_cache,
         slot_mapping,
     ):
-        if (
-            self.kv_cache_dtype not in _FP8_CACHE_DTYPES
-            or not henvs.VLLM_HCU_USE_CUSTOM_OPS
-        ):
+        if self.kv_cache_dtype not in _FP8_CACHE_DTYPES:
             return original_cache_update(
                 self,
                 layer,

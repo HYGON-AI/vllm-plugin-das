@@ -188,18 +188,11 @@ def get_qsa_fp8_reader(
 ) -> Callable[..., Any]:
     """Resolve the FP8 main-cache reader before CUDA Graph capture.
 
-    The QSA indexer and its paged MQA score kernel remain BF16. Only CUTLASS
-    currently supplies an HCU-validated FP8 sparse-GQA reader; other backend
-    selections retain an upstream Triton FP8 reader when one is available.
+    The QSA indexer and its paged MQA score kernel remain BF16. FP8 cache
+    selection is independent of the generic QSA backend and custom-op controls:
+    FlashAttention supplies the HCU-validated sparse-GQA reader, with an
+    upstream Triton FP8 reader retained only as an availability fallback.
     """
-
-    backend = _resolve_qsa_backend()
-    if backend != QSA_BACKEND_CUTLASS:
-        if callable(triton_fp8):
-            return triton_fp8
-        raise RuntimeError(
-            f"QSA backend {backend!r} has no FP8 sparse-GQA reader"
-        )
 
     loader = _load_flash_qsa_fp8_kernel
     cached = _selected_qsa_fp8_cache.get(loader)
@@ -208,7 +201,7 @@ def get_qsa_fp8_reader(
             reader: Callable[..., Any] | None = loader()
             logger.info(
                 "QSA FP8 sparse-GQA reader selected: backend=%s reader=%s.%s",
-                backend,
+                QSA_BACKEND_CUTLASS,
                 getattr(reader, "__module__", type(reader).__module__),
                 getattr(reader, "__name__", type(reader).__name__),
             )
