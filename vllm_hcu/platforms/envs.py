@@ -211,9 +211,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
     custom_ops_enabled,
-    # Select the QSA implementation independently of the generic
-    # FLASH_ATTN backend mode. The QSA dispatcher validates the enum and
-    # applies VLLM_HCU_USE_CUSTOM_OPS as its master gate.
+    # Select the BF16 QSA implementation independently of the generic
+    # FLASH_ATTN backend mode. The BF16 dispatcher applies
+    # VLLM_HCU_USE_CUSTOM_OPS as its master gate; FP8 QSA is selected by the
+    # cache dtype and uses its dedicated reader/writer independently.
     "VLLM_HCU_QSA_BACKEND":
     lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
     # If set, control hcu custom silu and mul op
