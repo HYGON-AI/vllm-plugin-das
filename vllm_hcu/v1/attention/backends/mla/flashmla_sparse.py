@@ -183,7 +183,11 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
                 attn_metadata,
                 layer,
             )
-        if self.kv_cache_dtype == "fp8_ds_mla":
+        fp8_dequant = (
+            self.kv_cache_dtype == "fp8_ds_mla"
+            and henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT
+        )
+        if self.kv_cache_dtype == "fp8_ds_mla" and not fp8_dequant:
             raise RuntimeError("HCU sparse MLA DCP does not support FP8 KV cache")
 
         from vllm import _custom_ops as ops
@@ -218,12 +222,35 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
                 return_valid_counts=True,
             )
         )
-        cache = kv_c_and_k_pe_cache.view(
-            -1,
-            1,
-            kv_c_and_k_pe_cache.shape[-1],
-        )
-        indices = topk_indices.view(num_actual_toks, 1, -1)
+        if fp8_dequant:
+            tokens_per_request = _lightop_tokens_per_request(
+                num_actual_toks,
+                attn_metadata.num_reqs,
+                attn_metadata.max_query_len,
+            )
+            reuse_state = getattr(self, "_lightop_kv_reuse_state", None)
+            reuse_kwargs = (
+                {
+                    "reuse_state": reuse_state,
+                    "allow_mapping_reuse": False,
+                    "mapping_reuse_group_size": 1,
+                }
+                if reuse_state is not None
+                else {}
+            )
+            cache, kernel_indices = gather_dequantize_fp8_ds_mla_cache(
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                self.kv_lora_rank,
+                self.head_size - self.kv_lora_rank,
+                tokens_per_request,
+                **reuse_kwargs,
+            )
+        else:
+            cache = kv_c_and_k_pe_cache
+            kernel_indices = topk_indices
+        cache = cache.view(-1, 1, cache.shape[-1])
+        indices = kernel_indices.view(num_actual_toks, 1, -1)
         attn_out, _, lse = flash_mla_sparse_fwd(
             q,
             cache,

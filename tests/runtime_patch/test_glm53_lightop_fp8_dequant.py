@@ -180,6 +180,131 @@ def test_glm_fp8_lightop_route_covers_prefill_and_decode(
     assert lse is None
 
 
+def test_glm_fp8_lightop_dcp_localizes_dequantizes_and_returns_lse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _bare_impl()
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 1
+    state = LightOpKVReuseState.from_topk_buffer(impl.topk_indices_buffer)
+    impl._lightop_kv_reuse_state = state
+
+    monkeypatch.setattr(
+        flashmla_sparse.henvs,
+        "VLLM_HCU_HYV4_FP8_KV_DEQUANT",
+        True,
+    )
+    localized_indices = torch.tensor(
+        [
+            [112, 113, -1, -1],
+            [114, 115, -1, -1],
+            [116, 117, -1, -1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    topk_length = torch.tensor([2, 2, 2, 0], dtype=torch.int32)
+    compact_indices = torch.tensor(
+        [
+            [0, 1, -1, -1],
+            [2, 3, -1, -1],
+            [4, 5, -1, -1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    gathered_cache = torch.zeros(16, 576)
+    calls: dict[str, object] = {}
+
+    def fake_filter(req_ids, block_table, indices, **kwargs):
+        calls["filter"] = (req_ids, block_table, indices, kwargs)
+        return localized_indices, topk_length
+
+    def fake_gather(
+        cache,
+        indices,
+        kv_lora_rank,
+        rope_dim,
+        tokens_per_request,
+        **kwargs,
+    ):
+        calls["gather"] = (
+            cache,
+            indices,
+            kv_lora_rank,
+            rope_dim,
+            tokens_per_request,
+            kwargs,
+        )
+        return gathered_cache, compact_indices
+
+    kernel_output = torch.arange(4 * 64 * 3, dtype=torch.float32).view(4, 64, 3)
+    kernel_lse = torch.arange(4 * 64, dtype=torch.float32).view(4, 64)
+
+    def fake_kernel(q, cache, indices, scale, *, topk_length):
+        calls["kernel"] = (q, cache, indices, scale, topk_length)
+        return kernel_output.clone(), torch.empty(0), kernel_lse.clone()
+
+    from vllm.v1.attention.backends.mla import sparse_utils
+    from vllm_hcu.v1.attention.ops import flashmla as flashmla_ops
+
+    monkeypatch.setattr(
+        sparse_utils,
+        "triton_filter_and_convert_dcp_index",
+        fake_filter,
+    )
+    monkeypatch.setattr(
+        flashmla_sparse,
+        "gather_dequantize_fp8_ds_mla_cache",
+        fake_gather,
+    )
+    monkeypatch.setattr(flashmla_ops, "flash_mla_sparse_fwd", fake_kernel)
+
+    metadata = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=4,
+        max_query_len=4,
+        req_id_per_token=torch.zeros(4, dtype=torch.int32),
+        block_table=torch.tensor([[7]], dtype=torch.int32),
+        block_size=16,
+        cp_kv_cache_interleave_size=1,
+    )
+    cache = torch.zeros(16, 656, dtype=torch.uint8)
+    output, lse = impl.forward_mqa(
+        torch.zeros(4, 64, 576),
+        cache,
+        metadata,
+        object(),
+    )
+
+    filter_call = calls["filter"]
+    assert filter_call[3] == {
+        "dcp_size": 2,
+        "dcp_rank": 1,
+        "cp_kv_cache_interleave_size": 1,
+        "BLOCK_SIZE": 16,
+        "NUM_TOPK_TOKENS": 4,
+        "return_valid_counts": True,
+    }
+    gather_call = calls["gather"]
+    assert gather_call[0] is cache
+    assert gather_call[1] is localized_indices
+    assert gather_call[2:5] == (512, 64, 4)
+    assert gather_call[5] == {
+        "reuse_state": state,
+        "allow_mapping_reuse": False,
+        "mapping_reuse_group_size": 1,
+    }
+    kernel_call = calls["kernel"]
+    assert kernel_call[1].shape == (16, 1, 576)
+    torch.testing.assert_close(kernel_call[2][:, 0], compact_indices)
+    assert kernel_call[4] is topk_length
+    torch.testing.assert_close(output[:-1], kernel_output[:-1])
+    torch.testing.assert_close(output[-1], torch.zeros_like(output[-1]))
+    torch.testing.assert_close(lse[:-1], kernel_lse[:-1])
+    assert torch.isneginf(lse[-1]).all()
+
+
 def test_glm_shared_indexer_reuses_compact_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
