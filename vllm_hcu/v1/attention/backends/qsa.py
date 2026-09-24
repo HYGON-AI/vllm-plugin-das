@@ -156,6 +156,77 @@ _selected_qsa_cache: dict[
 ] = {}
 
 
+@lru_cache(maxsize=1)
+def _load_flash_qsa_fp8_kernel() -> Callable[..., Any]:
+    """Load and validate the optional FlashAttention FP8 QSA reader."""
+
+    try:
+        from flash_attn import sparse_gqa_paged_attn_fp8_func
+        from flash_attn.flash_attn_interface import flash_attn_cuda
+    except Exception as exc:
+        raise RuntimeError(
+            "QSA FP8 FlashAttention requires "
+            "sparse_gqa_paged_attn_fp8_func"
+        ) from exc
+
+    native = getattr(flash_attn_cuda, "sparse_gqa_paged_attention_fp8", None)
+    if not callable(sparse_gqa_paged_attn_fp8_func) or not callable(native):
+        raise RuntimeError(
+            "QSA FP8 FlashAttention Python or extension symbol is missing"
+        )
+    return sparse_gqa_paged_attn_fp8_func
+
+
+_selected_qsa_fp8_cache: dict[
+    Callable[[], Callable[..., Any]], tuple[Callable[..., Any] | None]
+] = {}
+
+
+def get_qsa_fp8_reader(
+    *,
+    triton_fp8: Callable[..., Any] | None,
+) -> Callable[..., Any]:
+    """Resolve the FP8 main-cache reader before CUDA Graph capture.
+
+    The QSA indexer and its paged MQA score kernel remain BF16. Only CUTLASS
+    currently supplies an HCU-validated FP8 sparse-GQA reader; other backend
+    selections retain an upstream Triton FP8 reader when one is available.
+    """
+
+    backend = _resolve_qsa_backend()
+    if backend != QSA_BACKEND_CUTLASS:
+        if callable(triton_fp8):
+            return triton_fp8
+        raise RuntimeError(
+            f"QSA backend {backend!r} has no FP8 sparse-GQA reader"
+        )
+
+    loader = _load_flash_qsa_fp8_kernel
+    cached = _selected_qsa_fp8_cache.get(loader)
+    if cached is None:
+        try:
+            reader: Callable[..., Any] | None = loader()
+        except Exception as exc:
+            reader = None
+            logger.warning(
+                "QSA CUTLASS FP8 reader failed to load; falling back to "
+                "Triton: %s",
+                exc,
+            )
+        cached = (reader,)
+        _selected_qsa_fp8_cache[loader] = cached
+
+    reader = cached[0]
+    if reader is not None:
+        return reader
+    if callable(triton_fp8):
+        return triton_fp8
+    raise RuntimeError(
+        "QSA FP8 requires FlashAttention's paged FP8 symbol or an upstream "
+        "Triton FP8 reader"
+    )
+
+
 def _load_selected_qsa_backend(
     backend: QSAKernelName,
 ) -> tuple[Callable[..., Any], Callable[..., Any]] | None:
@@ -220,5 +291,6 @@ __all__ = [
     "QSA_BACKEND_CUTLASS",
     "QSA_BACKEND_TRITON",
     "QSAKernelBackend",
+    "get_qsa_fp8_reader",
     "get_qsa_kernel_backend",
 ]

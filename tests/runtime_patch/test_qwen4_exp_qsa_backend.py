@@ -74,6 +74,68 @@ def test_qsa_backend_defaults_to_cutlass(monkeypatch: pytest.MonkeyPatch):
     assert backend.sparse_gqa_paged_attn is cutlass_sparse
 
 
+def test_cutlass_qsa_fp8_reader_uses_flash_attention_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", "cutlass")
+
+    def cutlass_fp8(*args, **kwargs):
+        return args, kwargs
+
+    def triton_fp8(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        qsa,
+        "_load_flash_qsa_fp8_kernel",
+        lambda: cutlass_fp8,
+        raising=False,
+    )
+
+    assert qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8) is cutlass_fp8
+
+
+@pytest.mark.parametrize("configured", ["triton", "boltops"])
+def test_non_cutlass_qsa_fp8_reader_keeps_framework_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", configured)
+
+    def triton_fp8(*args, **kwargs):
+        return None
+
+    assert qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8) is triton_fp8
+
+
+def test_missing_cutlass_qsa_fp8_symbol_falls_back_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_QSA_BACKEND", "cutlass")
+
+    def triton_fp8(*args, **kwargs):
+        return None
+
+    def unavailable():
+        raise RuntimeError("FP8 symbol missing")
+
+    monkeypatch.setattr(
+        qsa,
+        "_load_flash_qsa_fp8_kernel",
+        unavailable,
+        raising=False,
+    )
+    with caplog.at_level(logging.WARNING, logger=qsa.__name__):
+        reader = qsa.get_qsa_fp8_reader(triton_fp8=triton_fp8)
+
+    assert reader is triton_fp8
+    assert "FP8 symbol missing" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("configured", "loader", "expected_name"),
     [
