@@ -1,4 +1,4 @@
-"""CPU contract checks for the opt-in ROCm FlashMLA decode adapter."""
+"""CPU contract checks for the opt-in ROCm FlashMLA sparse adapter."""
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -6,7 +6,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_rocm_flashmla_decode as patch
+from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_rocm_flashmla_sparse as patch
 from vllm_hcu.platforms import envs as henvs
 
 
@@ -59,19 +59,8 @@ def _build_module(ratio, batch, calls):
         swa_cache_layer = SimpleNamespace(kv_cache=torch.zeros(2, 64, 584, dtype=torch.uint8))
         attn_sink = torch.zeros(4, dtype=torch.float32)
         scale = 0.125
-        window_size = 4
-        max_model_len = 128
-        max_num_batched_tokens = 8
-        PREFILL_CHUNK_SIZE = 4
-
         def _forward_decode(self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output):
             calls.append("aiter")
-
-        def _forward_prefill(
-            self, q, positions, compressed_k_cache, swa_k_cache, output,
-            attn_metadata, swa_metadata,
-        ):
-            calls.append("aiter_prefill")
 
     module = ModuleType(patch.TARGET_MODULE)
     module.DeepseekV4ROCMAiterMLAAttention = Attention
@@ -81,14 +70,10 @@ def _build_module(ratio, batch, calls):
     module.DeepseekV4FlashMLAMetadataBuilder = BaseMLABuilder
     module.DeepseekV4ROCMAiterSparseSWAMetadata = SimpleNamespace
     module.DeepseekV4ROCMAiterMLASparseMetadata = SimpleNamespace
-    module.current_platform = SimpleNamespace(is_fp8_fnuz=lambda: False)
-    module.current_workspace_manager = lambda: SimpleNamespace(
-        get_simultaneous=lambda *_: (torch.zeros(4, 140, 512, dtype=torch.bfloat16),)
-    )
-    module.dequantize_and_gather_k_cache = lambda *args, **kwargs: calls.append("gather")
-    module.combine_topk_swa_indices = lambda topk, *args: (
-        torch.zeros(topk.shape[0], 8, dtype=torch.int32),
-        torch.ones(topk.shape[0], dtype=torch.int32),
+    module.rocm_sparse_attn_prefill = (
+        lambda q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
+        rope_head_dim, attn_sink, output, ragged_indices=None,
+        ragged_indptr=None: calls.append("aiter_prefill_kernel")
     )
     return module, Attention, Builder, MLABuilder
 
@@ -105,6 +90,64 @@ def _swa_metadata(batch, tiles):
         is_valid_token=torch.ones(batch, dtype=torch.bool),
         token_to_req_indices=torch.arange(batch, dtype=torch.int32),
     )
+
+
+def test_disabled_patch_does_not_touch_rocm_module(monkeypatch):
+    calls = []
+    module, Attention, Builder, MLABuilder = _build_module(1, 1, calls)
+    originals = (
+        Attention._forward_decode,
+        module.rocm_sparse_attn_prefill,
+        Builder.build,
+        Builder.__init__,
+        MLABuilder.build,
+        MLABuilder.__init__,
+    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", False)
+
+    assert not patch.apply_to_module(module)
+    assert originals == (
+        Attention._forward_decode,
+        module.rocm_sparse_attn_prefill,
+        Builder.build,
+        Builder.__init__,
+        MLABuilder.build,
+        MLABuilder.__init__,
+    )
+
+
+@pytest.mark.parametrize("enabled_path", ["decode", "prefill"])
+def test_feature_flags_patch_only_the_selected_path(monkeypatch, enabled_path):
+    calls = []
+    module, Attention, Builder, MLABuilder = _build_module(1, 1, calls)
+    original_decode = Attention._forward_decode
+    original_prefill = module.rocm_sparse_attn_prefill
+    original_builders = (Builder.build, Builder.__init__, MLABuilder.build, MLABuilder.__init__)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE",
+        enabled_path == "decode",
+    )
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL",
+        enabled_path == "prefill",
+    )
+
+    assert patch.apply_to_module(module)
+    if enabled_path == "decode":
+        assert Attention._forward_decode is not original_decode
+        assert module.rocm_sparse_attn_prefill is original_prefill
+        assert original_builders != (
+            Builder.build, Builder.__init__, MLABuilder.build, MLABuilder.__init__
+        )
+    else:
+        assert Attention._forward_decode is original_decode
+        assert module.rocm_sparse_attn_prefill is not original_prefill
+        assert original_builders == (
+            Builder.build, Builder.__init__, MLABuilder.build, MLABuilder.__init__
+        )
 
 
 @pytest.mark.parametrize("ratio", [1, 4, 128])
@@ -186,43 +229,22 @@ def test_decode_contract(monkeypatch, ratio, batch):
     assert (kwargs["extra_k_cache"] is None) == (ratio == 1)
     assert ("map" in calls) == (ratio == 4)
 
-    # Prefill uses the existing gather/combiner metadata but dispatches the
-    # combined BF16 workspace through FlashMLA sparse_prefill_fwd.
+    # Prefill replaces only the module-level attention kernel called by the
+    # native gather/combiner loop.
     prefill_tokens = 2
-    Attention.topk_indices_buffer = torch.zeros(prefill_tokens, 8, dtype=torch.int32)
-    prefill_swa = SimpleNamespace(
-        num_prefills=1,
-        num_prefill_tokens=prefill_tokens,
-        num_decodes=0,
-        num_decode_tokens=0,
-        prefill_seq_lens=torch.tensor([prefill_tokens], dtype=torch.int32),
-        prefill_gather_lens=torch.tensor([prefill_tokens], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, prefill_tokens], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, prefill_tokens], dtype=torch.int32),
-        block_table=torch.zeros(1, 1, dtype=torch.int32),
-        block_size=4,
-    )
-    prefill_attn = None
-    compressed_cache = None
-    if ratio != 1:
-        prefill_attn = SimpleNamespace(
-            block_table=torch.zeros(1, 1, dtype=torch.int32),
-            block_size=4 * ratio,
-            c128a_prefill_topk_indices=torch.zeros(
-                prefill_tokens, 8, dtype=torch.int32
-            ),
-        )
-        compressed_cache = torch.zeros(1, 4, 584, dtype=torch.uint8)
     prefill_q = torch.zeros(prefill_tokens, 4, 512, dtype=torch.bfloat16)
     prefill_out = torch.zeros_like(prefill_q)
-    Attention()._forward_prefill(
+    module.rocm_sparse_attn_prefill(
         prefill_q,
-        torch.arange(prefill_tokens),
-        compressed_cache,
-        torch.zeros(1, 4, 584, dtype=torch.uint8),
+        torch.zeros(16, 1, 512, dtype=torch.bfloat16),
+        torch.zeros(prefill_tokens, 8, dtype=torch.int32),
+        torch.full((prefill_tokens,), 8, dtype=torch.int32),
+        Attention.scale,
+        512,
+        448,
+        64,
+        Attention.attn_sink,
         prefill_out,
-        prefill_attn,
-        prefill_swa,
     )
     assert torch.all(prefill_out == 1)
     prefill_call = next(c["prefill"] for c in calls if isinstance(c, dict) and "prefill" in c)
@@ -245,10 +267,19 @@ def test_decode_contract(monkeypatch, ratio, batch):
     assert "ragged_swa" in calls and "ragged_mla" in calls
     Attention()._forward_decode(q, None, metadata, None, True, output)
     assert calls[-1] == "aiter"
-    Attention()._forward_prefill(
-        prefill_q, None, None, None, prefill_out, None, prefill_swa
+    module.rocm_sparse_attn_prefill(
+        prefill_q,
+        torch.zeros(16, 1, 512, dtype=torch.bfloat16),
+        torch.zeros(prefill_tokens, 8, dtype=torch.int32),
+        torch.full((prefill_tokens,), 8, dtype=torch.int32),
+        Attention.scale,
+        512,
+        448,
+        64,
+        Attention.attn_sink,
+        prefill_out,
     )
-    assert calls[-1] == "aiter_prefill"
+    assert calls[-1] == "aiter_prefill_kernel"
 
 
 def test_guard_rejects_unavailable_flashmla(monkeypatch):
