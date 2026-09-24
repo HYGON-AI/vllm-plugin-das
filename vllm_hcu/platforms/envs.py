@@ -45,8 +45,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
-    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = False
-    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = False
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
@@ -322,14 +322,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK", "False").lower() in
                     ("true", "1")),
 
-    # Opt in to FlashMLA sparse decode in the native ROCm DeepSeek-V4 model.
+    # Use FlashMLA sparse decode in the native ROCm DeepSeek-V4 model.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE":
-        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "True").lower() in
                     ("true", "1")),
 
-    # Opt in to FlashMLA sparse prefill in the native ROCm DeepSeek-V4 model.
+    # Use FlashMLA sparse prefill in the native ROCm DeepSeek-V4 model.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
-        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower() in
                     ("true", "1")),
 
     # Whether to use the local inverse-RoPE + BF16 einsum path for DeepSeek V4 ROCm WO_A.
