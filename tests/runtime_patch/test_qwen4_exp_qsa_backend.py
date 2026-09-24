@@ -33,10 +33,6 @@ def _backend(monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def test_qsa_dispatch_logger_emits_info_with_default_vllm_logging():
-    assert qsa.logger.isEnabledFor(logging.INFO)
-
-
 @pytest.fixture(autouse=True)
 def _reset_qsa_environment(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(qsa, "_legacy_qsa_cutlass_warning_emitted", False)

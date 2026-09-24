@@ -15,6 +15,9 @@ from types import ModuleType
 
 import torch
 
+from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.v1.attention.backends.qsa import get_qsa_fp8_reader
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -22,20 +25,40 @@ from ._common import (
     require_class,
     require_exact_signature,
 )
-from vllm_hcu.v1.attention.backends.qsa import get_qsa_fp8_reader
 
 TARGET_MODULE = "vllm.models.qwen4_exp.amd.qsa"
 PATCH_ID = "worker.core_fix.qwen4_exp.qsa.fp8_kv_cache"
 _ATTENTION_TARGET = f"{TARGET_MODULE}.Qwen4ExpQSAAttention.__init__"
 _IMPL_INIT_TARGET = f"{TARGET_MODULE}.Qwen4ExpQSAFlashAttentionImpl.__init__"
 _FORWARD_TARGET = f"{TARGET_MODULE}.Qwen4ExpQSAFlashAttentionImpl.forward_qsa"
-TARGETS = (_ATTENTION_TARGET, _IMPL_INIT_TARGET, _FORWARD_TARGET)
+_CACHE_UPDATE_TARGET = (
+    f"{TARGET_MODULE}.Qwen4ExpQSAFlashAttentionImpl.do_kv_cache_update"
+)
+_BACKEND_DTYPE_TARGET = (
+    f"{TARGET_MODULE}.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype"
+)
+_BACKEND_COMBINATION_TARGET = (
+    f"{TARGET_MODULE}.Qwen4ExpQSAFlashAttentionBackend.supports_combination"
+)
+TARGETS = (
+    _ATTENTION_TARGET,
+    _IMPL_INIT_TARGET,
+    _FORWARD_TARGET,
+    _CACHE_UPDATE_TARGET,
+    _BACKEND_DTYPE_TARGET,
+    _BACKEND_COMBINATION_TARGET,
+)
 _MARKER = "_vllm_hcu_qwen4_exp_qsa_fp8_applied"
 _ATTENTION_WRAPPER = "_vllm_hcu_qsa_fp8_attention_init"
 _IMPL_INIT_WRAPPER = "_vllm_hcu_qsa_fp8_impl_init"
 _FORWARD_WRAPPER = "_vllm_hcu_qsa_fp8_forward"
+_CACHE_UPDATE_WRAPPER = "_vllm_hcu_qsa_fp8_cache_update"
+_BACKEND_DTYPE_WRAPPER = "_vllm_hcu_qsa_fp8_backend_dtype"
+_BACKEND_COMBINATION_WRAPPER = "_vllm_hcu_qsa_fp8_backend_combination"
 _READER_ATTR = "_vllm_hcu_qsa_fp8_reader"
+_CACHE_WRITER_ATTR = "_vllm_hcu_qsa_fp8_cache_writer"
 _FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_e5m2")
+_MISSING = object()
 
 
 def _already_applied(owner: object, wrapped: tuple[tuple, ...]) -> bool:
@@ -43,7 +66,8 @@ def _already_applied(owner: object, wrapped: tuple[tuple, ...]) -> bool:
         return False
     for target_owner, name, target, wrapper_marker in wrapped:
         function = require_callable(target_owner, name, target)
-        if not getattr(function, wrapper_marker, False):
+        marker_owner = getattr(function, "__func__", function)
+        if not getattr(marker_owner, wrapper_marker, False):
             raise PatchCompatibilityError(
                 f"required HCU patch marker for {target} is stale; restart the process"
             )
@@ -84,6 +108,12 @@ def _upstream_triton_fp8_reader():
     return reader if callable(reader) else None
 
 
+def _load_hcu_cache_writer():
+    from vllm_hcu.v1.attention.backends.fa_utils import reshape_and_cache_flash
+
+    return reshape_and_cache_flash
+
+
 def _configure_fp8_impl(impl, cache_dtype: str) -> None:
     impl.kv_cache_dtype = cache_dtype
     impl.supports_quant_query_input = False
@@ -92,6 +122,8 @@ def _configure_fp8_impl(impl, cache_dtype: str) -> None:
         _READER_ATTR,
         get_qsa_fp8_reader(triton_fp8=_upstream_triton_fp8_reader()),
     )
+    if henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        setattr(impl, _CACHE_WRITER_ATTR, _load_hcu_cache_writer())
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -111,6 +143,24 @@ def apply_to_module(module: ModuleType) -> bool:
         (attention_cls, "__init__", _ATTENTION_TARGET, _ATTENTION_WRAPPER),
         (impl_cls, "__init__", _IMPL_INIT_TARGET, _IMPL_INIT_WRAPPER),
         (impl_cls, "forward_qsa", _FORWARD_TARGET, _FORWARD_WRAPPER),
+        (
+            impl_cls,
+            "do_kv_cache_update",
+            _CACHE_UPDATE_TARGET,
+            _CACHE_UPDATE_WRAPPER,
+        ),
+        (
+            backend_cls,
+            "supports_kv_cache_dtype",
+            _BACKEND_DTYPE_TARGET,
+            _BACKEND_DTYPE_WRAPPER,
+        ),
+        (
+            backend_cls,
+            "supports_combination",
+            _BACKEND_COMBINATION_TARGET,
+            _BACKEND_COMBINATION_WRAPPER,
+        ),
     )
     if _already_applied(owner, wrapped):
         return False
@@ -157,11 +207,88 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
         defaults={"output_scale": None, "output_block_scale": None},
     )
+    original_cache_update = require_callable(
+        impl_cls, "do_kv_cache_update", _CACHE_UPDATE_TARGET
+    )
+    require_exact_signature(
+        original_cache_update,
+        _CACHE_UPDATE_TARGET,
+        positional=(
+            "self",
+            "layer",
+            "key",
+            "value",
+            "kv_cache",
+            "slot_mapping",
+        ),
+    )
+    original_cache_update_descriptor = impl_cls.__dict__.get(
+        "do_kv_cache_update", _MISSING
+    )
     canonicalize = require_callable(
         owner,
         "canonicalize_singleton_dim_strides",
         f"{TARGET_MODULE}.canonicalize_singleton_dim_strides",
     )
+    original_supports_kv_cache_dtype = require_callable(
+        backend_cls, "supports_kv_cache_dtype", _BACKEND_DTYPE_TARGET
+    )
+    original_supports_combination = require_callable(
+        backend_cls, "supports_combination", _BACKEND_COMBINATION_TARGET
+    )
+    original_dtype_descriptor = backend_cls.__dict__.get(
+        "supports_kv_cache_dtype", _MISSING
+    )
+    original_combination_descriptor = backend_cls.__dict__.get(
+        "supports_combination", _MISSING
+    )
+
+    @functools.wraps(
+        getattr(
+            original_supports_kv_cache_dtype,
+            "__func__",
+            original_supports_kv_cache_dtype,
+        )
+    )
+    def hcu_supports_kv_cache_dtype(cls, kv_cache_dtype):
+        if kv_cache_dtype in _FP8_CACHE_DTYPES:
+            return kv_cache_dtype in cls.supported_kv_cache_dtypes
+        return original_supports_kv_cache_dtype(kv_cache_dtype)
+
+    @functools.wraps(
+        getattr(
+            original_supports_combination,
+            "__func__",
+            original_supports_combination,
+        )
+    )
+    def hcu_supports_combination(
+        cls,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        use_mm_prefix,
+        device_capability,
+    ):
+        del cls
+        upstream_cache_dtype = (
+            "auto" if kv_cache_dtype in _FP8_CACHE_DTYPES else kv_cache_dtype
+        )
+        return original_supports_combination(
+            head_size=head_size,
+            dtype=dtype,
+            kv_cache_dtype=upstream_cache_dtype,
+            block_size=block_size,
+            use_mla=use_mla,
+            has_sink=has_sink,
+            use_sparse=use_sparse,
+            use_mm_prefix=use_mm_prefix,
+            device_capability=device_capability,
+        )
 
     @functools.wraps(original_impl_init)
     def hcu_impl_init(self, *args, **kwargs):
@@ -300,23 +427,101 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return output
 
+    @functools.wraps(original_cache_update)
+    def hcu_do_kv_cache_update(
+        self,
+        layer,
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+    ):
+        if (
+            self.kv_cache_dtype not in _FP8_CACHE_DTYPES
+            or not henvs.VLLM_HCU_USE_CUSTOM_OPS
+        ):
+            return original_cache_update(
+                self,
+                layer,
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+            )
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.head_size, dim=-1
+        )
+        writer = getattr(self, _CACHE_WRITER_ATTR, None)
+        if not callable(writer):
+            raise RuntimeError(
+                "QSA FP8 cache writer was not initialized before capture"
+            )
+        writer(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
+
     setattr(hcu_attention_init, _ATTENTION_WRAPPER, True)
     setattr(hcu_impl_init, _IMPL_INIT_WRAPPER, True)
     setattr(hcu_forward_qsa, _FORWARD_WRAPPER, True)
+    setattr(hcu_do_kv_cache_update, _CACHE_UPDATE_WRAPPER, True)
+    setattr(hcu_supports_kv_cache_dtype, _BACKEND_DTYPE_WRAPPER, True)
+    setattr(hcu_supports_combination, _BACKEND_COMBINATION_WRAPPER, True)
     original_supported = list(backend_cls.supported_kv_cache_dtypes)
     supported = list(dict.fromkeys((*original_supported, *_FP8_CACHE_DTYPES)))
 
     try:
         backend_cls.supported_kv_cache_dtypes = supported
+        setattr(
+            backend_cls,
+            "supports_kv_cache_dtype",
+            classmethod(hcu_supports_kv_cache_dtype),
+        )
+        setattr(
+            backend_cls,
+            "supports_combination",
+            classmethod(hcu_supports_combination),
+        )
         setattr(attention_cls, "__init__", hcu_attention_init)
         setattr(impl_cls, "__init__", hcu_impl_init)
         setattr(impl_cls, "forward_qsa", hcu_forward_qsa)
+        setattr(impl_cls, "do_kv_cache_update", hcu_do_kv_cache_update)
         setattr(owner, _MARKER, True)
     except BaseException:
         backend_cls.supported_kv_cache_dtypes = original_supported
+        if original_dtype_descriptor is _MISSING:
+            delattr(backend_cls, "supports_kv_cache_dtype")
+        else:
+            setattr(
+                backend_cls,
+                "supports_kv_cache_dtype",
+                original_dtype_descriptor,
+            )
+        if original_combination_descriptor is _MISSING:
+            delattr(backend_cls, "supports_combination")
+        else:
+            setattr(
+                backend_cls,
+                "supports_combination",
+                original_combination_descriptor,
+            )
         setattr(attention_cls, "__init__", original_attention_init)
         setattr(impl_cls, "__init__", original_impl_init)
         setattr(impl_cls, "forward_qsa", original_forward)
+        if original_cache_update_descriptor is _MISSING:
+            delattr(impl_cls, "do_kv_cache_update")
+        else:
+            setattr(
+                impl_cls,
+                "do_kv_cache_update",
+                original_cache_update_descriptor,
+            )
         if hasattr(owner, _MARKER):
             delattr(owner, _MARKER)
         raise
