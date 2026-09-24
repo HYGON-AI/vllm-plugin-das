@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Opt-in FlashMLA sparse prefill/decode for native ROCm DeepSeek-V4."""
+"""FlashMLA sparse prefill/decode for native ROCm DeepSeek-V4."""
 
 from __future__ import annotations
 

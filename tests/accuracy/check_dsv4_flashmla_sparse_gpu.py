@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """GPU parity checks for DeepSeek-V4 ROCm FlashMLA sparse attention."""
+
+from __future__ import annotations
 
 import torch
 from flash_mla import (

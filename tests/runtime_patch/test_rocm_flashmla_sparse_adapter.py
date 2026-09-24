@@ -1,4 +1,8 @@
-"""CPU contract checks for the opt-in ROCm FlashMLA sparse adapter."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+"""CPU contract checks for the ROCm FlashMLA sparse adapter."""
+
+from __future__ import annotations
 
 import sys
 from types import ModuleType, SimpleNamespace
