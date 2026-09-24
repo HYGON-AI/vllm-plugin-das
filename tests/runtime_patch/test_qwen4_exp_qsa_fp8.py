@@ -215,6 +215,48 @@ def test_qsa_fp8_cache_writer_fails_early_on_non_mutating_cache_schema(
         qsa_fp8_patch._load_hcu_cache_writer()
 
 
+def test_qsa_fp8_cache_writer_fails_early_on_keyword_only_schema(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    qsa_fp8_patch = _load_patch()
+    _library, writer = _define_native_cache_writer(
+        "qsa_fp8_bad_writer_kwonly",
+        "reshape_and_cache_flash(Tensor key, Tensor value, Tensor! key_cache, "
+        "Tensor! value_cache, Tensor slot_mapping, str kv_cache_dtype, *, "
+        "Tensor k_scale, Tensor v_scale) -> ()",
+    )
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(reshape_and_cache_flash=writer),
+        ),
+    )
+    monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
+
+    with pytest.raises(RuntimeError, match="incompatible schema"):
+        qsa_fp8_patch._load_hcu_cache_writer()
+
+
+def test_qsa_fp8_cache_writer_accepts_exact_native_schema(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    qsa_fp8_patch = _load_patch()
+    _library, writer = _define_native_cache_writer(
+        "qsa_fp8_good_writer_schema",
+        "reshape_and_cache_flash(Tensor key, Tensor value, Tensor! key_cache, "
+        "Tensor! value_cache, Tensor slot_mapping, str kv_cache_dtype, "
+        "Tensor k_scale, Tensor v_scale) -> ()",
+    )
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(reshape_and_cache_flash=writer),
+        ),
+    )
+    monkeypatch.setattr(qsa_fp8_patch, "torch", fake_torch)
+    fa_utils = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
+
+    assert qsa_fp8_patch._load_hcu_cache_writer() is fa_utils.reshape_and_cache_flash
+
+
 def test_qsa_owner_accepts_fp8_cache_and_restores_shared_config(
     monkeypatch: pytest.MonkeyPatch,
 ):

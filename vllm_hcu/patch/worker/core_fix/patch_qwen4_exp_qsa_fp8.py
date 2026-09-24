@@ -57,15 +57,17 @@ _BACKEND_COMBINATION_WRAPPER = "_vllm_hcu_qsa_fp8_backend_combination"
 _READER_ATTR = "_vllm_hcu_qsa_fp8_reader"
 _CACHE_WRITER_ATTR = "_vllm_hcu_qsa_fp8_cache_writer"
 _FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_e5m2")
+_TENSOR_SCHEMA_TYPE = torch._C.TensorType.get()
+_STRING_SCHEMA_TYPE = torch._C.StringType.get()
 _EXPECTED_CACHE_WRITER_ARGUMENTS = (
-    ("key", "Tensor", False),
-    ("value", "Tensor", False),
-    ("key_cache", "Tensor", True),
-    ("value_cache", "Tensor", True),
-    ("slot_mapping", "Tensor", False),
-    ("kv_cache_dtype", "str", False),
-    ("k_scale", "Tensor", False),
-    ("v_scale", "Tensor", False),
+    ("key", _TENSOR_SCHEMA_TYPE, False, False),
+    ("value", _TENSOR_SCHEMA_TYPE, False, False),
+    ("key_cache", _TENSOR_SCHEMA_TYPE, True, False),
+    ("value_cache", _TENSOR_SCHEMA_TYPE, True, False),
+    ("slot_mapping", _TENSOR_SCHEMA_TYPE, False, False),
+    ("kv_cache_dtype", _STRING_SCHEMA_TYPE, False, False),
+    ("k_scale", _TENSOR_SCHEMA_TYPE, False, False),
+    ("v_scale", _TENSOR_SCHEMA_TYPE, False, False),
 )
 _MISSING = object()
 
@@ -136,8 +138,9 @@ def _load_hcu_cache_writer():
         arguments = tuple(
             (
                 argument.name,
-                str(argument.type),
+                argument.type,
                 bool(argument.alias_info and argument.alias_info.is_write),
+                argument.kwarg_only,
             )
             for argument in schema.arguments
         )
