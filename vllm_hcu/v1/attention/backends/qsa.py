@@ -15,6 +15,7 @@ The generic ``FLASH_ATTN`` backend remains responsible for ordinary attention.
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -158,7 +159,7 @@ _selected_qsa_cache: dict[
 
 @lru_cache(maxsize=1)
 def _load_flash_qsa_fp8_kernel() -> Callable[..., Any]:
-    """Load and validate the optional FlashAttention FP8 QSA reader."""
+    """Load and validate the FlashAttention FP8 QSA reader."""
 
     try:
         from flash_attn import sparse_gqa_paged_attn_fp8_func
@@ -174,11 +175,30 @@ def _load_flash_qsa_fp8_kernel() -> Callable[..., Any]:
         raise RuntimeError(
             "QSA FP8 FlashAttention Python or extension symbol is missing"
         )
+    try:
+        signature = inspect.signature(sparse_gqa_paged_attn_fp8_func)
+        signature.bind(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            out=None,
+            k_scale=None,
+            v_scale=None,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "QSA FP8 FlashAttention reader has incompatible signature; "
+            "install a matching flash_attn wheel"
+        ) from exc
     return sparse_gqa_paged_attn_fp8_func
 
 
 _selected_qsa_fp8_cache: dict[
-    Callable[[], Callable[..., Any]], tuple[Callable[..., Any] | None]
+    Callable[[], Callable[..., Any]],
+    tuple[Callable[..., Any] | None, str | None],
 ] = {}
 
 
@@ -190,8 +210,8 @@ def get_qsa_fp8_reader(
 
     The QSA indexer and its paged MQA score kernel remain BF16. FP8 cache
     selection is independent of the generic QSA backend and custom-op controls:
-    FlashAttention supplies the HCU-validated sparse-GQA reader, with an
-    upstream Triton FP8 reader retained only as an availability fallback.
+    FlashAttention supplies the HCU-validated sparse-GQA reader. An upstream
+    Triton FP8 reader is used only if the target vLLM actually provides one.
     """
 
     loader = _load_flash_qsa_fp8_kernel
@@ -199,6 +219,7 @@ def get_qsa_fp8_reader(
     if cached is None:
         try:
             reader: Callable[..., Any] | None = loader()
+            failure_reason = None
             logger.info(
                 "QSA FP8 sparse-GQA reader selected: backend=%s reader=%s.%s",
                 QSA_BACKEND_CUTLASS,
@@ -207,22 +228,27 @@ def get_qsa_fp8_reader(
             )
         except Exception as exc:
             reader = None
-            logger.warning(
-                "QSA CUTLASS FP8 reader failed to load; falling back to "
-                "Triton: %s",
-                exc,
-            )
-        cached = (reader,)
+            failure_reason = str(exc)
+            if callable(triton_fp8):
+                logger.warning(
+                    "QSA CUTLASS FP8 reader failed to load; falling back to "
+                    "Triton: %s",
+                    exc,
+                )
+            else:
+                logger.warning("QSA FP8 FlashAttention reader unavailable: %s", exc)
+        cached = (reader, failure_reason)
         _selected_qsa_fp8_cache[loader] = cached
 
-    reader = cached[0]
+    reader, failure_reason = cached
     if reader is not None:
         return reader
     if callable(triton_fp8):
         return triton_fp8
     raise RuntimeError(
-        "QSA FP8 requires FlashAttention's paged FP8 symbol or an upstream "
-        "Triton FP8 reader"
+        "QSA FP8 requires a compatible FlashAttention FP8 reader; this vLLM "
+        "build has no Triton FP8 reader. Install a matching flash_attn wheel. "
+        f"Reader failure: {failure_reason}"
     )
 
 

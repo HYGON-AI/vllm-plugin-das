@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import logging
-from types import ModuleType
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -157,6 +158,60 @@ def test_missing_cutlass_qsa_fp8_symbol_falls_back_before_capture(
 
     assert reader is triton_fp8
     assert "FP8 symbol missing" in caplog.text
+
+
+def test_missing_fp8_symbol_without_upstream_reader_reports_required_wheel(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    def unavailable():
+        raise RuntimeError("FP8 symbol missing")
+
+    monkeypatch.setattr(qsa, "_load_flash_qsa_fp8_kernel", unavailable)
+
+    with caplog.at_level(logging.WARNING, logger=qsa.logger.name):
+        with pytest.raises(
+            RuntimeError,
+            match="QSA FP8 requires a compatible FlashAttention FP8 reader",
+        ):
+            qsa.get_qsa_fp8_reader(triton_fp8=None)
+
+    assert "falling back to Triton" not in caplog.text
+
+
+def test_qsa_fp8_reader_rejects_old_python_signature_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def old_reader(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out=None,
+    ):
+        return out
+
+    original_loader = qsa._load_flash_qsa_fp8_kernel
+    original_loader.cache_clear()
+    qsa._selected_qsa_fp8_cache.clear()
+    fake_package = ModuleType("flash_attn")
+    fake_package.sparse_gqa_paged_attn_fp8_func = old_reader
+    fake_interface = ModuleType("flash_attn.flash_attn_interface")
+    fake_interface.flash_attn_cuda = SimpleNamespace(
+        sparse_gqa_paged_attention_fp8=lambda *args: None,
+    )
+    monkeypatch.setitem(sys.modules, "flash_attn", fake_package)
+    monkeypatch.setitem(
+        sys.modules, "flash_attn.flash_attn_interface", fake_interface
+    )
+    try:
+        with pytest.raises(RuntimeError, match="incompatible signature"):
+            qsa.get_qsa_fp8_reader(triton_fp8=None)
+    finally:
+        original_loader.cache_clear()
+        qsa._selected_qsa_fp8_cache.clear()
 
 
 @pytest.mark.parametrize(
