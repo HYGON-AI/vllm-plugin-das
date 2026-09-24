@@ -51,7 +51,20 @@ _REQUEST_CAPTURE_SIZES = (
 )
 
 _DSV41_ARCHITECTURE = "DeepseekV41ForCausalLM"
+_DSV4_ARCHITECTURES = frozenset(
+    {"DeepseekV4ForCausalLM", _DSV41_ARCHITECTURE}
+)
+_DSV4_PCP_EXPERIMENTAL_ENV = "VLLM_HCU_DSV4_PCP_EXPERIMENTAL"
 _LOGGER = logging.getLogger(__name__)
+
+
+def _dsv4_pcp_experimental() -> bool:
+    """Whether the unvalidated DeepSeek-V4/V4.1 PCP path may be armed."""
+
+    return os.environ.get(_DSV4_PCP_EXPERIMENTAL_ENV, "").lower() in (
+        "true",
+        "1",
+    )
 
 
 def _disable_dsv41_aiter_cudagraph(vllm_config: object) -> bool:
@@ -139,6 +152,39 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         ) from exc
 
 
+def _text_only_multimodal(model_config: object) -> bool:
+    """Whether a multimodal checkpoint is deployed text-only for this run.
+
+    Mirrors ``MultiModalRegistry.supports_multimodal_inputs``, which is what the
+    model runner uses to compute its own ``supports_mm_inputs`` flag.  A model
+    runs text-only when every modality limit is zero (``--language-model-only``)
+    and pre-computed embeddings are disabled.  PCP may then run, because no
+    vision token can enter the batch and reach the rank partitioner.
+    """
+
+    get_mm_config = getattr(model_config, "get_multimodal_config", None)
+    if not callable(get_mm_config):
+        return False
+    try:
+        mm_config = get_mm_config()
+    except (AttributeError, ValueError):
+        return False
+    if mm_config is None:
+        return False
+    if bool(getattr(mm_config, "enable_mm_embeds", False)):
+        # Pre-computed embeddings keep the multimodal infrastructure alive even
+        # with every modality limit at zero, so this is not a text-only run.
+        return False
+    try:
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+    except ImportError:
+        return bool(getattr(mm_config, "language_model_only", False))
+    try:
+        return not MULTIMODAL_REGISTRY.supports_multimodal_inputs(model_config)
+    except (AttributeError, ValueError):
+        return bool(getattr(mm_config, "language_model_only", False))
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -164,13 +210,26 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    # DeepSeek-V4/V4.1 PCP is still under bring-up: the attention, compressed-KV,
+    # indexer and SWA wiring is not validated yet.  Keep the scope gate closed
+    # unless the same explicit switch that arms the capability is set, so a
+    # default deployment cannot reach an unvalidated PCP path.
+    is_dsv4 = bool(
+        set(architectures) & _DSV4_ARCHITECTURES
+    ) and _dsv4_pcp_experimental()
+    mla_model_name = None
+    if is_glm52:
+        mla_model_name = "GLM-5.2"
+    elif is_dsv4:
+        mla_model_name = "DeepSeek-V4/V4.1"
+    if use_mla and mla_model_name is None:
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "HCU MLA PCP supports GLM-5.2 and DeepSeek-V4/V4.1; DeepSeek-V4/V4.1 "
+            "requires VLLM_HCU_DSV4_PCP_EXPERIMENTAL=1 while its PCP wiring is "
+            f"under validation. Got architectures={architectures!r}."
         )
-    if is_glm52 and not use_mla:
-        raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if mla_model_name is not None and not use_mla:
+        raise ValueError(f"{mla_model_name} PCP requires MLA or sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -200,7 +259,9 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
     )
     if use_mla and dcp_size != 1:
-        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+        raise ValueError(
+            f"{mla_model_name} PCP does not support decode context parallelism."
+        )
     if not use_mla and dcp_size != 1:
         raise ValueError(
             "FlashAttention PCP does not support decode context parallelism."
@@ -212,11 +273,13 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires expert parallelism.")
+        raise ValueError(f"{mla_model_name} PCP requires expert parallelism.")
     if use_mla and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        raise ValueError(
+            f"{mla_model_name} PCP requires eager execution without graphs."
+        )
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
@@ -229,7 +292,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             speculative_config, "method", "SpeculativeConfig"
         )
         if method != "mtp":
-            raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
+            raise ValueError(f"{mla_model_name} PCP only supports built-in MTP.")
         num_speculative_tokens = _require_hcu_pcp_attribute(
             speculative_config,
             "num_speculative_tokens",
@@ -237,14 +300,24 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
         if num_speculative_tokens not in (1, 2, 3):
             raise ValueError(
-                "GLM-5.2 PCP+MTP requires one to three speculative tokens."
+                f"{mla_model_name} PCP+MTP requires one to three speculative tokens."
             )
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
         model_config, "is_multimodal_model", "ModelConfig"
-    ):
-        raise ValueError("HCU PCP does not support multimodal models.")
+    ) and not _text_only_multimodal(model_config):
+        # A checkpoint may carry a vision tower while this deployment is
+        # text-only.  vLLM expresses that with --language-model-only, which
+        # zeroes every modality limit; MultiModalRegistry then reports no
+        # multimodal inputs and the PCP manager accepts the run.  Keep the
+        # rejection for any deployment that can still accept image/video input,
+        # because PCP cannot partition vision tokens across ranks.
+        raise ValueError(
+            "HCU PCP does not support multimodal models; pass "
+            "--language-model-only for a text-only deployment of a "
+            "multimodal checkpoint."
+        )
     if _require_hcu_pcp_attribute(
         cache_config, "kv_offloading_size", "CacheConfig"
     ) is not None:

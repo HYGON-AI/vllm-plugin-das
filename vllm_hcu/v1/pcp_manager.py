@@ -300,6 +300,25 @@ class HcuPCPManager:
         return self._input_buffers
 
     @staticmethod
+    def _resolve_num_reqs_after_padding(
+        input_batch: InputBatch,
+        padded_num_reqs: int | None,
+        num_local_reqs: int,
+    ) -> int:
+        """Apply the upstream MRV2 request-padding contract."""
+
+        if padded_num_reqs is None:
+            return num_local_reqs
+        if input_batch.has_prefill:
+            raise RuntimeError("PCP FULL graphs require a decode-only batch.")
+        if padded_num_reqs < num_local_reqs:
+            raise RuntimeError(
+                "PCP graph request capacity must cover the rank-local batch: "
+                f"{padded_num_reqs} < {num_local_reqs}."
+            )
+        return padded_num_reqs
+
+    @staticmethod
     def _reorder_segments(
         segments: list[_BatchSegment],
         num_computed_tokens: np.ndarray,
@@ -504,6 +523,7 @@ class HcuPCPManager:
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
+        padded_num_reqs: int | None = None,
     ) -> InputBatch:
         """Return a rank-local InputBatch without mutating the global batch."""
 
@@ -538,6 +558,13 @@ class HcuPCPManager:
         num_padded_tokens = self._padded_num_tokens
         if num_local_reqs > self._max_local_reqs:
             raise RuntimeError("PCP local request count exceeds its buffer")
+        num_reqs_after_padding = self._resolve_num_reqs_after_padding(
+            input_batch,
+            padded_num_reqs,
+            num_local_reqs,
+        )
+        if num_reqs_after_padding > self._max_local_reqs:
+            raise RuntimeError("PCP padded local request count exceeds its buffer")
         if num_padded_tokens > self._max_local_tokens:
             raise RuntimeError("PCP local token count exceeds its buffer")
 
@@ -789,7 +816,7 @@ class HcuPCPManager:
             input_batch,
             req_ids=[input_batch.req_ids[index] for index in global_req_indices],
             num_reqs=num_local_reqs,
-            num_reqs_after_padding=num_local_reqs,
+            num_reqs_after_padding=num_reqs_after_padding,
             idx_mapping=local_idx_mapping,
             idx_mapping_np=local_idx_mapping_np,
             expanded_idx_mapping=expanded_idx_mapping,
@@ -906,11 +933,70 @@ class HcuPCPManager:
         )
         setattr(
             input_batch,
+            "_vllm_hcu_pcp_world_size",
+            self.pcp_size,
+        )
+        setattr(
+            input_batch,
             "_vllm_hcu_pcp_replicated_slot_indices",
             self._replicated_slot_indices[
                 : input_batch.num_tokens_after_padding
             ],
         )
+        if self._global_has_prefill:
+            global_batch = self._global_batch
+            global_num_tokens = int(global_batch.num_tokens)
+            global_num_reqs = int(global_batch.num_reqs)
+            global_query_start_loc = global_batch.query_start_loc[
+                : global_num_reqs + 1
+            ]
+            global_query_lens = (
+                global_query_start_loc[1:] - global_query_start_loc[:-1]
+            )
+            global_token_to_req_indices = torch.repeat_interleave(
+                torch.arange(
+                    global_num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                global_query_lens,
+                output_size=global_num_tokens,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_local_num_tokens",
+                self._padded_num_tokens,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_num_tokens",
+                global_num_tokens,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_restore_idx",
+                self._hidden_restore_idx,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_padded_gather_idx",
+                self._padded_gather_idx,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_positions",
+                global_batch.positions[:global_num_tokens],
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_query_start_loc",
+                global_query_start_loc,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_token_to_req_indices",
+                global_token_to_req_indices,
+            )
         return local_tables, slot_mappings
 
     def prepare_global_attn(
@@ -1102,6 +1188,8 @@ def maybe_build_pcp_manager(
 
 def make_hcu_pcp_manager_cls(
     vllm_config: object,
+    *,
+    runtime_owner: object | None = None,
 ) -> type[HcuPCPManager]:
     """Bind the plugin manager to the official MRV2 manager constructor."""
 
@@ -1140,6 +1228,16 @@ def make_hcu_pcp_manager_cls(
                     "official PCP manager constructor arguments do not match "
                     f"the bound HCU config: actual={actual}, expected={expected}"
                 )
+            # Recent MRV2 no longer forwards plugin-private runtime objects to
+            # the manager constructor.  The HCU runner owns both objects, so
+            # recover them from the bound runtime owner when the official hook
+            # omits them.  Direct construction without an owner remains
+            # fail-closed.
+            if runtime_owner is not None:
+                if req_states is None:
+                    req_states = getattr(runtime_owner, "req_states", None)
+                if block_tables is None:
+                    block_tables = getattr(runtime_owner, "block_tables", None)
             if req_states is None or block_tables is None:
                 raise PatchCompatibilityError(
                     "official PCP manager constructor omitted HCU runtime state"

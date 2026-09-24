@@ -54,7 +54,7 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    pcp_module.make_hcu_pcp_manager_cls = lambda config: NullPCPManager
+    pcp_module.make_hcu_pcp_manager_cls = lambda config, **kwargs: NullPCPManager
 
     class FakeBlockTables:
         def get_dummy_block_tables(self, num_reqs):
@@ -238,8 +238,9 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
 
     manager = Manager()
 
-    def bind_manager(vllm_config):
+    def bind_manager(vllm_config, *, runtime_owner=None):
         assert vllm_config.parallel_config.prefill_context_parallel_size == 2
+        assert runtime_owner is not None
 
         class BoundManager:
             @staticmethod
@@ -463,7 +464,9 @@ def test_pcp_runner_routes_dummy_slots_through_manager(
 
     manager = Manager()
 
-    def bind_manager(vllm_config):
+    def bind_manager(vllm_config, *, runtime_owner=None):
+        assert runtime_owner is not None
+
         class BoundManager:
             @staticmethod
             def validate_config(config, supports_mm_inputs):

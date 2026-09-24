@@ -81,3 +81,52 @@ def test_bound_manager_fails_closed_before_allocating_on_argument_drift() -> Non
             dcp_rank=0,
             cp_interleave=1,
         )
+
+
+def test_bound_manager_recovers_runtime_state_from_mrv2_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MRV2 may omit plugin-private state from the manager constructor."""
+
+    config = _config()
+    monkeypatch.setattr(
+        pcp_manager,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=2),
+    )
+    runtime_owner = SimpleNamespace(
+        req_states=object(),
+        block_tables=object(),
+    )
+    manager_cls = pcp_manager.make_hcu_pcp_manager_cls(
+        config,
+        runtime_owner=runtime_owner,
+    )
+
+    original_init = pcp_manager.HcuPCPManager.__init__
+    captured: dict[str, object] = {}
+
+    def capture_init(self, vllm_config, device, req_states, block_tables):
+        del vllm_config, device
+        self.pcp_rank = 0
+        self.dcp_rank = 0
+        captured.update(
+            req_states=req_states,
+            block_tables=block_tables,
+        )
+
+    monkeypatch.setattr(pcp_manager.HcuPCPManager, "__init__", capture_init)
+    manager_cls(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device="cpu",
+        max_num_reqs=16,
+        max_num_tokens=128,
+        dcp_world_size=1,
+        dcp_rank=0,
+        cp_interleave=1,
+    )
+    monkeypatch.setattr(pcp_manager.HcuPCPManager, "__init__", original_init)
+
+    assert captured["req_states"] is runtime_owner.req_states
+    assert captured["block_tables"] is runtime_owner.block_tables

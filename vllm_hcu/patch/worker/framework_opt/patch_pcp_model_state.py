@@ -52,39 +52,66 @@ def _attach_pcp_cache_ownership(
     has_global_prefill: bool,
     replicated_token_mask: object | None = None,
     replicated_slot_indices: object | None = None,
+    pcp_layout: object | None = None,
 ) -> None:
-    """Keep PCP cache ownership separate from backend kernel classification."""
+    """Attach cache ownership and global row metadata to cache writers."""
     visited: set[int] = set()
     for metadata in attn_metadata.values():
         metadata_id = id(metadata)
         if metadata_id in visited:
             continue
         visited.add(metadata_id)
-        if hasattr(metadata, "pcp_world_size"):
-            # PCP manager replicates every decode row and materializes the
-            # complete prefill KV cache on each rank. A decode-only step must
-            # therefore execute as one logical PCP rank. This is especially
-            # important for speculative verification, where unequal draft
-            # counts can make a replicated decode row use a prefill kernel.
-            if not has_global_prefill:
-                setattr(metadata, "pcp_world_size", 1)
+        if not hasattr(metadata, "slot_mapping") and not hasattr(
+            metadata, "pcp_world_size"
+        ):
+            continue
+        # PCP manager replicates every decode row and materializes the
+        # complete prefill KV cache on each rank. A decode-only step must
+        # therefore execute as one logical PCP rank. This is especially
+        # important for speculative verification, where unequal draft
+        # counts can make a replicated decode row use a prefill kernel.
+        world_size = int(
+            getattr(
+                pcp_layout,
+                "_vllm_hcu_pcp_world_size",
+                getattr(metadata, "pcp_world_size", 1),
+            )
+        )
+        setattr(
+            metadata,
+            "pcp_world_size",
+            world_size if has_global_prefill else 1,
+        )
+        setattr(
+            metadata,
+            "pcp_has_global_prefill",
+            bool(has_global_prefill),
+        )
+        if pcp_layout is not None:
+            for name in (
+                "local_num_tokens",
+                "global_num_tokens",
+                "restore_idx",
+                "padded_gather_idx",
+                "global_positions",
+                "global_query_start_loc",
+                "global_token_to_req_indices",
+            ):
+                value = getattr(pcp_layout, f"_vllm_hcu_pcp_{name}", None)
+                if value is not None:
+                    setattr(metadata, f"pcp_{name}", value)
+        if replicated_token_mask is not None:
             setattr(
                 metadata,
-                "pcp_has_global_prefill",
-                bool(has_global_prefill),
+                "pcp_replicated_token_mask",
+                replicated_token_mask,
             )
-            if replicated_token_mask is not None:
-                setattr(
-                    metadata,
-                    "pcp_replicated_token_mask",
-                    replicated_token_mask,
-                )
-            if replicated_slot_indices is not None:
-                setattr(
-                    metadata,
-                    "pcp_replicated_slot_indices",
-                    replicated_slot_indices,
-                )
+        if replicated_slot_indices is not None:
+            setattr(
+                metadata,
+                "pcp_replicated_slot_indices",
+                replicated_slot_indices,
+            )
 
 
 def _require_source_fingerprint(function, target: str, expected: str) -> None:
@@ -219,6 +246,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     "_vllm_hcu_pcp_replicated_slot_indices",
                     None,
                 ),
+                input_batch,
             )
         return attn_metadata
 

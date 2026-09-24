@@ -21,7 +21,9 @@ from ._common import (
 
 TARGET_MODULE = "vllm.models.deepseek_v41.attention"
 PATCH_ID = "worker.core_fix.deepseek_v41.compressor_weight_layout"
-TARGETS = (f"{TARGET_MODULE}.DeepseekV4Attention._run_parallel_input_projections",)
+TARGETS = (
+    f"{TARGET_MODULE}.DeepseekV4Attention._run_parallel_input_projections",
+)
 _CLASS_MARKER = "_vllm_hcu_dsv41_compressor_layout_applied"
 _WRAPPER_MARKER = "_vllm_hcu_dsv41_compressor_layout_wrapper"
 

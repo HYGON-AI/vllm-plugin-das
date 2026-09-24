@@ -432,6 +432,116 @@ def test_model_arch_config_signature_drift_names_exact_target() -> None:
     assert patch_vllm_config.TARGETS[2] not in str(error.value)
 
 
+def test_dsv41_pcp_stays_fail_closed_without_the_experimental_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    make_pcp_config,
+) -> None:
+    """Rejecting the unvalidated V4.1 PCP scope by default must not regress."""
+
+    monkeypatch.delenv(
+        patch_vllm_config._DSV4_PCP_EXPERIMENTAL_ENV, raising=False
+    )
+
+    with pytest.raises(ValueError, match="VLLM_HCU_DSV4_PCP_EXPERIMENTAL"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="DeepseekV41ForCausalLM",
+                use_mla=True,
+                pcp=2,
+                tp=4,
+                enable_expert_parallel=True,
+                enforce_eager=True,
+            )
+        )
+
+
+def test_dsv4_pcp_stays_fail_closed_without_the_experimental_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    make_pcp_config,
+) -> None:
+    """The V4.0 scope must stay closed exactly like V4.1 until wiring lands."""
+
+    monkeypatch.delenv(
+        patch_vllm_config._DSV4_PCP_EXPERIMENTAL_ENV, raising=False
+    )
+
+    with pytest.raises(ValueError, match="VLLM_HCU_DSV4_PCP_EXPERIMENTAL"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="DeepseekV4ForCausalLM",
+                use_mla=True,
+                pcp=2,
+                tp=4,
+                enable_expert_parallel=True,
+                enforce_eager=True,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"],
+)
+def test_dsv4_pcp_scope_opens_only_under_the_experimental_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    make_pcp_config,
+    architecture: str,
+) -> None:
+    """The bring-up switch is the only way to admit the V4/V4.1 MLA scope."""
+
+    monkeypatch.setenv(
+        patch_vllm_config._DSV4_PCP_EXPERIMENTAL_ENV, "1"
+    )
+
+    assert (
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture=architecture,
+                use_mla=True,
+                pcp=2,
+                tp=4,
+                enable_expert_parallel=True,
+                enforce_eager=True,
+            )
+        )
+        is True
+    )
+
+
+def test_dsv41_pcp_keeps_the_glm52_hard_constraints(
+    monkeypatch: pytest.MonkeyPatch,
+    make_pcp_config,
+) -> None:
+    """Opening the V4.1 scope must not relax DP/PP/DCP/MTP restrictions."""
+
+    monkeypatch.setenv(patch_vllm_config._DSV4_PCP_EXPERIMENTAL_ENV, "1")
+
+    with pytest.raises(ValueError, match="data parallel"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="DeepseekV41ForCausalLM",
+                use_mla=True,
+                pcp=2,
+                tp=4,
+                dp=2,
+                enable_expert_parallel=True,
+                enforce_eager=True,
+            )
+        )
+
+    with pytest.raises(ValueError, match="eager"):
+        patch_vllm_config._validate_hcu_pcp_scope(
+            make_pcp_config(
+                architecture="DeepseekV41ForCausalLM",
+                use_mla=True,
+                pcp=2,
+                tp=4,
+                enable_expert_parallel=True,
+                enforce_eager=False,
+            )
+        )
+
+
 class _LifecycleCompilationConfig:
     def __init__(self) -> None:
         self.cudagraph_mode = SimpleNamespace(has_full_cudagraphs=lambda: False)
