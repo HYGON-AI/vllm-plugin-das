@@ -646,6 +646,22 @@ def test_worker_selects_plugin_owned_model_runner(
     assert events == [(config, device)]
 
 
+def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
+    with pytest.raises(RuntimeError, match="only Model Runner V2"):
+        cpu_safe_hcu_worker_module._create_model_runner(
+            object(), object(), use_v2_model_runner=False
+        )
+
+
+def test_explicit_model_runner_v2_config(monkeypatch):
+    from vllm import envs
+    from vllm.config import VllmConfig
+
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    config = object.__new__(VllmConfig)
+    assert config.use_v2_model_runner is True
+
+
 def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     monkeypatch,
 ):
