@@ -7,6 +7,7 @@ sparse backend forwards the per-head learnable sink through both prefill and
 decode without changing backend behavior for other models.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import os
 from typing import cast
@@ -421,13 +422,16 @@ class HYV4MLAAttentionLayer(MLAAttention):
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
         q_dcp_replicated: torch.Tensor | None = None,
+        dcp_a2a_overlap_fn: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Forward local Q while exposing group-replicated Q to decode."""
         self._hcu_q_dcp_replicated = q_dcp_replicated
+        self._hcu_dcp_a2a_overlap_fn = dcp_a2a_overlap_fn
         try:
             return super().forward(q, kv_c_normed, k_pe, output_shape)
         finally:
             self._hcu_q_dcp_replicated = None
+            self._hcu_dcp_a2a_overlap_fn = None
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         spec = super().get_kv_cache_spec(vllm_config)
@@ -840,6 +844,7 @@ class HYV4MLAAttention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
         lightop_kv_reuse_state: LightOpKVReuseState | None = None,
+        gate_a2a_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1095,6 +1100,18 @@ class HYV4MLAAttention(nn.Module):
             getattr(q_proj_layer, "qrep_active", False)
         )
         self.mla_attn._hcu_dcp_q_replicate = self.dcp_q_replicate
+        self.gate_a2a_stream = gate_a2a_stream
+        self.gate_a2a_start_event = (
+            torch.cuda.Event() if gate_a2a_stream is not None else None
+        )
+        self.gate_a2a_done_event = (
+            torch.cuda.Event() if gate_a2a_stream is not None else None
+        )
+        self.mla_attn._hcu_dcp_a2a_overlap_stream = gate_a2a_stream
+        self.mla_attn._hcu_dcp_a2a_overlap_start_event = (
+            self.gate_a2a_start_event
+        )
+        self.mla_attn._hcu_dcp_a2a_overlap_done_event = self.gate_a2a_done_event
 
     def _resolve_sink_backend(
         self, kv_cache_dtype: str
@@ -1218,7 +1235,11 @@ class HYV4MLAAttention(nn.Module):
             q_dcp_replicated,
         )
 
-        if self.gated_mla and self.linear_gate is not None:
+        if (
+            self.gated_mla
+            and self.linear_gate is not None
+            and self.gate_a2a_stream is None
+        ):
             gate_score = self.linear_gate(hidden_states)[0]
             if self.config.gating_type == "headwise":
                 gate_score = gate_score.unsqueeze(-1)
@@ -1254,6 +1275,24 @@ class HYV4MLAAttention(nn.Module):
         """
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        if self.gate_a2a_stream is None:
+            out.copy_(
+                self.mla_attn(
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    output_shape=out.shape,
+                    q_dcp_replicated=q_dcp_replicated,
+                )
+            )
+            return
+
+        assert self.linear_gate is not None
+        gate_scores: list[torch.Tensor] = []
+
+        def compute_gate() -> None:
+            gate_scores.append(self.linear_gate(hidden_states)[0])
+
         out.copy_(
             self.mla_attn(
                 q,
@@ -1261,8 +1300,28 @@ class HYV4MLAAttention(nn.Module):
                 k_pe,
                 output_shape=out.shape,
                 q_dcp_replicated=q_dcp_replicated,
+                dcp_a2a_overlap_fn=compute_gate,
             )
         )
+        # Dummy/profile forwards may have no live DCP metadata and therefore
+        # never enter the A2A call site. Preserve correctness in that case.
+        if not gate_scores:
+            compute_gate()
+        gate_score = gate_scores[0]
+        gate_score.record_stream(torch.cuda.current_stream())
+        self._apply_gate_in_place(out, gate_score)
+
+    def _apply_gate_in_place(
+        self, attn_out: torch.Tensor, gate_score: torch.Tensor
+    ) -> None:
+        if self.config.gating_type == "headwise":
+            gate_score = gate_score.unsqueeze(-1)
+            attn_view = attn_out.reshape(
+                *attn_out.shape[:-1], -1, self.v_head_dim
+            )
+            attn_view.mul_(torch.sigmoid(gate_score))
+        else:
+            attn_out.mul_(torch.sigmoid(gate_score))
 
 
 __all__ = [

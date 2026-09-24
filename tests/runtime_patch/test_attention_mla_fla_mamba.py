@@ -2896,6 +2896,7 @@ def test_mla_attention_wrapper_preserves_short_extend_policy():
         MLACommonMetadata=MLACommonMetadata,
         MLACommonMetadataBuilder=MLACommonMetadataBuilder,
         split_decodes_and_prefills=split_batch,
+        dcp_a2a_lse_reduce=lambda *args, **kwargs: (args, kwargs),
         get_forward_context=lambda: None,
         _encode_layer_name=lambda name: name,
         torch=torch,
