@@ -246,6 +246,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_mla_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_flash_attn")),
+    # Enables an FP8 main KV cache for the QSA owner. It wraps the same
+    # backend/impl classes the adapter above leaves untouched, so it must run
+    # after that adapter has finalized its kernel dispatch.
+    _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_recompute_w_u")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
