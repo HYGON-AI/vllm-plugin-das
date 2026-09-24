@@ -1250,3 +1250,92 @@ def test_pcp_default_model_state_rejects_signature_drift() -> None:
     target.DefaultModelState = DefaultModelState
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         adapter.apply_to_module(target)
+
+
+def _install_recording_profile_run(
+    runner_module: ModuleType, seen: list[int]
+) -> None:
+    """Give the upstream ``GPUModelRunner`` mock a ``profile_run`` that
+    records ``self.max_num_tokens`` at the moment of the call.
+
+    Attaching the method to the class (rather than an instance) lets the
+    HCU override's ``super().profile_run()`` reach it through the MRO.
+    """
+
+    def profile_run(self):
+        seen.append(int(self.max_num_tokens))
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+
+
+def test_profile_run_scales_dummy_tokens_by_pcp_size(
+    pcp_runner_module,
+) -> None:
+    """PCP profile must shrink ``max_num_tokens`` before the dummy forward.
+
+    Upstream ``profile_run`` sends ``self.max_num_tokens`` (=
+    ``max_num_batched_tokens``) into ``_dummy_run``.  In PCP, the scheduler's
+    total batch is split across ``pcp_size`` ranks so each rank only ever
+    sees ``max_num_batched_tokens / pcp_size`` tokens per forward.
+    Profiling with the un-partitioned value inflates the DeepEP-HT MoE
+    workspace by ``pcp_size`` (its per-rank ``M`` scales linearly with the
+    dummy token count) and can push the profile peak past GPU capacity.
+    """
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+
+    runner = runner_module.HcuGPUModelRunnerV2(_config(16), "hcu:0")
+    runner.max_num_tokens = 16384
+
+    runner.profile_run()
+
+    assert seen == [16384 // 16]
+    # The temporary override must not leak past the profile call.
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_leaves_max_num_tokens_untouched_when_pcp_is_one(
+    pcp_runner_module,
+) -> None:
+    """PCP=1 profile must behave exactly like upstream — no partitioning."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+
+    runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
+    runner.max_num_tokens = 16384
+
+    runner.profile_run()
+
+    assert seen == [16384]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_restores_max_num_tokens_on_exception(
+    pcp_runner_module,
+) -> None:
+    """A failing dummy forward must not leave a partitioned value behind.
+
+    If a downstream helper raises (e.g. workspace allocation still OOMs,
+    or a driver error propagates), the runner remains in memory and later
+    code paths — ``initialize_kv_cache``, warmup, cudagraph capture —
+    read ``self.max_num_tokens`` back.  Leaving the partitioned value
+    behind would silently under-size those buffers.
+    """
+
+    runner_module, _ = pcp_runner_module
+
+    def failing_profile_run(self):
+        raise RuntimeError("simulated OOM")
+
+    runner_module.GPUModelRunner.profile_run = failing_profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(8), "hcu:0")
+    runner.max_num_tokens = 4096
+
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        runner.profile_run()
+
+    assert runner.max_num_tokens == 4096
