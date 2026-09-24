@@ -67,6 +67,14 @@ target core's config, parser, scheduler, KV allocation, and speculative APIs
 where their semantics are already correct. Do not register competing parser or
 config patches merely because the old plugin did.
 
+Model Runner V2 is mandatory for this migration, including TP8, MTP3, and
+FP8-KV validation. Set `VLLM_USE_V2_MODEL_RUNNER=1` explicitly in every server
+command; do not rely on the target plugin's GLM-only auto-normalization to
+select it for Hy4. Assert `VllmConfig.use_v2_model_runner` and the actual
+`HcuGPUModelRunnerV2` worker class in tests and live logs. The existing HCU
+worker deliberately rejects V1. Do not revive V1-specific patches or use V1
+as a fallback if Hy4 has an MRV2 incompatibility.
+
 Keep each adaptation behind one exact current-owner interface. Check target
 signatures and downstream imported aliases before changing callback order or
 monkey patches. Missing provider symbols or unsupported shapes take a
@@ -99,8 +107,9 @@ its own paired wheel and compatibility review, not an implicit plugin patch.
    MTP/PCP metadata where applicable, default/fallback operator selection,
    and callback ownership. Run every test file changed by the full MR diff,
    the relevant runtime-patch suite, and installed-artifact bootstrap checks.
-3. Run a fresh foreground TP8 server on the supplied checkpoint with AITER
-   MoE, prefix caching, and the target default Graph policy. Confirm actual
+3. Run a fresh foreground TP8 server on the supplied checkpoint with explicit
+   MRV2, AITER MoE, prefix caching, and the target default Graph policy.
+   Confirm actual `HcuGPUModelRunnerV2` construction and
    Channel-FP8 kernel and AITER config selection or explicit per-shape Triton
    fallback, target PIECEWISE/FULL capture, sparse-attention route, healthy
    HTTP responses, and coherent repeated long-prefix output with nonzero
