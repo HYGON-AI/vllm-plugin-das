@@ -1280,6 +1280,14 @@ def test_profile_run_scales_dummy_tokens_by_pcp_size(
     Profiling with the un-partitioned value inflates the DeepEP-HT MoE
     workspace by ``pcp_size`` (its per-rank ``M`` scales linearly with the
     dummy token count) and can push the profile peak past GPU capacity.
+
+    A 12.5% (``* 9 // 8``) slack is added on top of the exact partition to
+    absorb routing-distribution drift.  DeepEP-HT's per-rank ``M`` fluctuates
+    within ``[M_profile, M_worst_case]`` at serving time; sizing the profile
+    workspace at exactly ``M_profile`` causes the workspace manager to
+    ``empty_cache`` + realloc on nearly every request for the first few
+    hundred requests (observed in production).  The slack keeps that thrash
+    off the hot path while staying well below the un-partitioned upper bound.
     """
 
     runner_module, _ = pcp_runner_module
@@ -1291,7 +1299,11 @@ def test_profile_run_scales_dummy_tokens_by_pcp_size(
 
     runner.profile_run()
 
-    assert seen == [16384 // 16]
+    # Exact partition would be 1024; the 12.5% slack lifts it to 1152.  Assert
+    # the exact expression so any regression to plain ``// pcp_size`` (which
+    # reintroduces the workspace thrash) is caught immediately, and so a
+    # future slack-constant tweak lands in a single, obvious place.
+    assert seen == [(16384 // 16) * 9 // 8]
     # The temporary override must not leak past the profile call.
     assert runner.max_num_tokens == 16384
 

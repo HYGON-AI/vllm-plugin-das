@@ -177,7 +177,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             return super().profile_run()
 
         original_max = self.max_num_tokens
-        self.max_num_tokens = max(1, original_max // pcp_size)
+        self.max_num_tokens = max(1, (original_max // pcp_size) * 9 // 8)
         try:
             return super().profile_run()
         finally:
