@@ -25,10 +25,22 @@ router instead of silently changing expert IDs or weights.
 
 from __future__ import annotations
 
+import inspect
+from functools import lru_cache
 from typing import Any
 
 
 _LEGACY_SCORING_FUNC = "sigmoid"
+
+
+@lru_cache(maxsize=8)
+def _supports_direct_int64_indices(moe_fused_gate: Any) -> bool:
+    """Return whether the installed LightOp exposes its int64 output switch."""
+    try:
+        parameters = inspect.signature(moe_fused_gate).parameters
+    except (TypeError, ValueError):
+        return False
+    return "output_indices_int64" in parameters
 
 
 def lightop_moe_gate_kwargs(
@@ -78,4 +90,18 @@ def lightop_moe_gate_kwargs(
     }
 
 
-__all__ = ["lightop_moe_gate_kwargs"]
+def lightop_moe_gate_index_kwargs(
+    lightop_moe: Any,
+    *,
+    request_int64_indices: bool,
+) -> dict[str, bool]:
+    """Request direct int64 ids when the installed LightOp supports them."""
+    if not request_int64_indices:
+        return {}
+    moe_fused_gate = getattr(lightop_moe, "moe_fused_gate", None)
+    if moe_fused_gate is None or not _supports_direct_int64_indices(moe_fused_gate):
+        return {}
+    return {"output_indices_int64": True}
+
+
+__all__ = ["lightop_moe_gate_index_kwargs", "lightop_moe_gate_kwargs"]

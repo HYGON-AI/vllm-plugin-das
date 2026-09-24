@@ -4135,10 +4135,25 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     lightop_calls: list[tuple[object, ...]] = []
     lightop_gate_kwargs: list[dict[str, object]] = []
 
-    def moe_fused_gate(router_logits, *args, **kwargs):
+    def moe_fused_gate(
+        router_logits,
+        *args,
+        output_indices_int64=False,
+        **kwargs,
+    ):
         lightop_calls.append((router_logits, *args))
-        lightop_gate_kwargs.append(kwargs)
-        routed.append((router_logits, torch.tensor([[3]], dtype=torch.int64)))
+        lightop_gate_kwargs.append(
+            {
+                **kwargs,
+                **(
+                    {"output_indices_int64": True}
+                    if output_indices_int64
+                    else {}
+                ),
+            }
+        )
+        ids_dtype = torch.int64 if output_indices_int64 else torch.int32
+        routed.append((router_logits, torch.tensor([[3]], dtype=ids_dtype)))
         return torch.ones((1, 1)), routed[-1][1]
 
     lightop_moe = _install_lightop_moe(
@@ -4161,6 +4176,30 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     router._compute_routing(None, logits, torch.int32)
     assert lightop_calls[-1][-2:] == (2.827, True)
     assert lightop_gate_kwargs[-1] == {}
+
+    # HY4 uses the group=1 LightOp specialization and DeepEP LL requests
+    # int64 expert ids. A recent LightOp can produce that dtype directly,
+    # avoiding a separate int32-to-int64 elementwise conversion.
+    router.num_expert_group = 1
+    router.topk_group = 1
+    router.top_k = 8
+    hyv4_logits = torch.ones((16, 256))
+    _, ids = router._compute_routing(None, hyv4_logits, torch.int64)
+    assert ids.dtype == torch.int64
+    assert lightop_gate_kwargs[-1] == {"output_indices_int64": True}
+
+    # Older LightOp builds do not expose the dtype switch. Keep their ABI and
+    # retain the existing post-kernel conversion instead of passing a new kwarg.
+    def legacy_moe_fused_gate(router_logits, *args):
+        del args
+        return torch.ones((1, 1)), torch.tensor([[3]], dtype=torch.int32)
+
+    lightop_moe.moe_fused_gate = legacy_moe_fused_gate
+    _, legacy_ids = router._compute_routing(None, hyv4_logits, torch.int64)
+    assert legacy_ids.dtype == torch.int64
+    lightop_moe.moe_fused_gate = moe_fused_gate
+    router.num_expert_group = 2
+    router.top_k = 1
 
     # The installed LightOp has no routing-capability hook, so an unsupported
     # mode must use the official router and must not invoke the fixed

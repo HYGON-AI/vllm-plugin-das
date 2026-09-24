@@ -127,6 +127,7 @@ def cpu_flashmla(monkeypatch):
     _install_stub(
         monkeypatch,
         "vllm.utils.torch_utils",
+        direct_register_custom_op=lambda **kwargs: None,
         is_quantized_kv_cache=lambda cache_dtype: str(cache_dtype).startswith(
             "fp8"
         ),
@@ -438,6 +439,33 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     warmup = SimpleNamespace(is_prefilling=None)
     assert module.split_decodes_and_prefills(warmup, 3, True, True) is True
     assert module.split_calls[-1] == (warmup, 3, True, True)
+
+
+def test_mla_qrep_uses_hcu_runtime_without_lightly_cp(monkeypatch):
+    adapter = _adapter()
+    target_calls = []
+    hcu_calls = []
+    module = _fake_mla_module(adapter, target_calls)
+
+    runtime = ModuleType("vllm_hcu.model_executor.layers.mla_runtime")
+
+    def mla_forward_impl(upstream, self, *args, q_dcp_replicated=None):
+        hcu_calls.append((upstream, self, args, q_dcp_replicated))
+        return "hcu-dcp-qrep"
+
+    runtime.mla_forward_impl = mla_forward_impl
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    assert adapter.apply_to_module(module) is True
+
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
+    replicated_q = torch.tensor([1.0])
+    instance._hcu_q_dcp_replicated = replicated_q
+    args = _forward_args()
+
+    assert instance.forward_impl(*args) == "hcu-dcp-qrep"
+    assert target_calls == []
+    assert hcu_calls == [(module, instance, args, replicated_q)]
 
 
 def test_mla_fp8_spec_selects_the_656_byte_sparse_cache_layout():

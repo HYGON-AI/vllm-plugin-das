@@ -450,6 +450,40 @@ def test_terminal_validation_rejects_enabled_armed_but_allows_feature_off():
         worker_dispatcher.validate_worker_patches(
             require_applied=True, coordinator=coordinator
         )
+
+        deep_ep_patch_id = (
+            "worker.framework_opt.communicator.deep_ep_runtime"
+        )
+        coordinator.register_callback(
+            deep_ep_patch_id,
+            "hcu_worker_dispatcher_deep_ep_terminal_target",
+            lambda module: None,
+            targets="hcu_worker_dispatcher_deep_ep_terminal_target.Manager",
+            feature_enabled=True,
+        )
+        worker_dispatcher.validate_worker_patches(
+            require_applied=True,
+            phase="model_load",
+            coordinator=coordinator,
+        )
+        with pytest.raises(RuntimeError, match="deep_ep_runtime"):
+            worker_dispatcher.validate_worker_patches(
+                require_applied=True,
+                phase="runtime",
+                coordinator=coordinator,
+            )
+        with pytest.raises(ValueError, match="phase"):
+            worker_dispatcher.validate_worker_patches(
+                phase="invalid",  # type: ignore[arg-type]
+                coordinator=coordinator,
+            )
+
+        coordinator.set_feature_enabled(deep_ep_patch_id, False)
+        worker_dispatcher.validate_worker_patches(
+            require_applied=True,
+            phase="runtime",
+            coordinator=coordinator,
+        )
     finally:
         coordinator.reset_for_tests()
 

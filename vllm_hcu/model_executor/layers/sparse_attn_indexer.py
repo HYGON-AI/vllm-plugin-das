@@ -41,7 +41,13 @@ from vllm_hcu.model_executor.layers.attention.pcp import (
     effective_pcp_world_size,
     maybe_gather_indexer_k,
 )
-from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
+from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.v1.attention.ops.decode_topk import (
+    get_decode_topk_output_buffer,
+    get_lightop_dcp_topk_metadata,
+    get_lightop_fast_topk_transform,
+    use_lightop_dcp_topk_transform,
+)
 
 logger = init_logger(__name__)
 
@@ -49,7 +55,6 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
-
 
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
@@ -99,6 +104,58 @@ def _merge_dcp_topk_global(
     rank.
     """
     if dcp_world_size <= 1:
+        return
+
+    if current_platform.is_rocm():
+        valid = topk_indices >= 0
+        safe_local = topk_indices.clamp_min(0).to(torch.long)
+        if logits.shape[1] == 0:
+            scores = logits.new_full(topk_indices.shape, float("-inf"))
+        else:
+            score_columns = safe_local
+            if row_starts is not None:
+                score_columns = score_columns + row_starts.to(torch.long).view(-1, 1)
+            score_columns.clamp_max_(logits.shape[1] - 1)
+            scores = torch.gather(logits, 1, score_columns)
+            scores.masked_fill_(~valid, float("-inf"))
+        global_ids = (
+            (safe_local // cp_interleave)
+            * (dcp_world_size * cp_interleave)
+            + dcp_rank * cp_interleave
+            + safe_local % cp_interleave
+        ).to(torch.int32)
+        global_ids.masked_fill_(~valid, -1)
+        packed = torch.stack((scores, global_ids.to(torch.float32)), dim=-1)
+        gathered = get_dcp_group().all_gather(packed, dim=1)
+        fast_topk_transform = (
+            get_lightop_fast_topk_transform()
+            if topk_tokens == 2048 and use_lightop_dcp_topk_transform()
+            else None
+        )
+        if fast_topk_transform is not None:
+            candidate_count = gathered.shape[1]
+            lengths, cu_seqlens_q = get_lightop_dcp_topk_metadata(
+                gathered.device, gathered.shape[0], candidate_count
+            )
+            topk_indices.copy_(
+                fast_topk_transform(
+                    score=gathered[..., 0].contiguous(),
+                    lengths=lengths,
+                    page_table_size_1=gathered[..., 1]
+                    .to(torch.int32)
+                    .contiguous(),
+                    cu_seqlens_q=cu_seqlens_q,
+                    topk=topk_tokens,
+                    row_starts=None,
+                )
+            )
+        else:
+            _, selected = torch.topk(
+                gathered[..., 0], topk_tokens, dim=1, largest=True, sorted=True
+            )
+            topk_indices.copy_(
+                torch.gather(gathered[..., 1], 1, selected).to(torch.int32)
+            )
         return
 
     # CuteDSL-only path (no PyTorch fallback): Triton-pack each rank's
@@ -723,6 +780,9 @@ if current_platform.is_rocm():
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
     ) -> torch.Tensor:
+        parallel_config = get_current_vllm_config().parallel_config
+        dcp_world_size = parallel_config.decode_context_parallel_size
+        dcp_rank = get_dcp_group().rank_in_group if dcp_world_size > 1 else 0
         return rocm_aiter_sparse_attn_indexer_native(
             hidden_states,
             k_cache_prefix,
@@ -738,6 +798,11 @@ if current_platform.is_rocm():
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert=skip_k_cache_insert,
+            dcp_rank=dcp_rank,
+            dcp_world_size=dcp_world_size,
+            cp_kv_cache_interleave_size=(
+                parallel_config.cp_kv_cache_interleave_size
+            ),
         )
 
     def hcu_sparse_attn_indexer_fake(
@@ -909,12 +974,21 @@ class SparseAttnIndexer(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if self.skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
+        dcp_world_size = getattr(self, "dcp_world_size", 1)
+        if (
+            dcp_world_size > 1
+            or self.skip_k_cache_insert
+            or (
+                henvs.VLLM_HCU_USE_CUSTOM_OPS
+                and henvs.VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS
+            )
+            or not rocm_aiter_ops.is_enabled()
+        ):
             from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
                 rocm_aiter_sparse_attn_indexer_native,
             )
 
-            return rocm_aiter_sparse_attn_indexer_native(
+            native_args = (
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
                 self.k_cache.kv_cache,
@@ -928,7 +1002,20 @@ class SparseAttnIndexer(CustomOp):
                 self.max_model_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
+            )
+            if dcp_world_size <= 1:
+                return rocm_aiter_sparse_attn_indexer_native(
+                    *native_args,
+                    skip_k_cache_insert=self.skip_k_cache_insert,
+                )
+            return rocm_aiter_sparse_attn_indexer_native(
+                *native_args,
                 skip_k_cache_insert=self.skip_k_cache_insert,
+                dcp_rank=getattr(self, "dcp_rank", 0),
+                dcp_world_size=dcp_world_size,
+                cp_kv_cache_interleave_size=getattr(
+                    self, "cp_kv_cache_interleave_size", 1
+                ),
             )
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(

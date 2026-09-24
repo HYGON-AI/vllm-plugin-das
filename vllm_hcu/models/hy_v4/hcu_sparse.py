@@ -20,14 +20,26 @@ name would silently change KV cache behaviour. Only``supports_sink`` and the
 two kernel wrappers differ from the parent.
 """
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.logger import init_logger
+from vllm.distributed.parallel_state import get_dcp_group
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
+    triton_filter_and_convert_dcp_index,
+)
+import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.models.hy_v4.fp8_kv_dequant import (
+    LightOpKVReuseState,
+    gather_dequantize_fp8_ds_mla_cache,
+)
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
+    FlashMLASparseMetadataBuilder,
 )
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
@@ -43,6 +55,58 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _uniform_tokens_per_request(num_tokens: int, num_reqs: int) -> int:
+    """Return a uniform query width for request-grouped LightOp gather."""
+    if num_reqs <= 0:
+        raise ValueError("DCP sparse attention requires at least one request")
+    if num_tokens % num_reqs != 0:
+        raise ValueError(
+            "DCP sparse attention requires a uniform query width: "
+            f"num_tokens={num_tokens}, num_reqs={num_reqs}."
+        )
+    return num_tokens // num_reqs
+
+
+def _lightop_mapping_reuse_group_size(
+    metadata: FlashMLASparseMetadata,
+    is_prefilling: torch.Tensor | None,
+) -> int:
+    """Return a reuse width only for uniform, pure target-verify batches."""
+    uniform_width = (
+        metadata.num_reqs > 0
+        and metadata.max_query_len > 1
+        and metadata.num_actual_tokens
+        == metadata.num_reqs * metadata.max_query_len
+    )
+    pure_decode = bool(
+        is_prefilling is not None
+        and is_prefilling.device.type == "cpu"
+        and not is_prefilling[: metadata.num_reqs].any().item()
+    )
+    return metadata.max_query_len if uniform_width and pure_decode else 1
+
+
+class HYV4FlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+    """Mark only pure multi-token decode batches as LightOp reuse groups."""
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ) -> FlashMLASparseMetadata:
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+        )
+        metadata.lightop_kv_group_size = _lightop_mapping_reuse_group_size(
+            metadata,
+            common_attn_metadata.is_prefilling,
+        )
+        return metadata
+
+
 class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
     """FlashMLA sparse impl that applies HY V4's per-head learnable sink.
 
@@ -53,6 +117,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
     """
 
     supports_pcp: bool = True
+    can_return_lse_for_decode: bool = True
 
     def __init__(
         self,
@@ -69,11 +134,14 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # MLA Specific Arguments
         topk_indices_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
         **mla_args,
     ) -> None:
         # ``SparseMLACommonImpl`` takes explicit keyword arguments only, so the
         # sink has to be removed before the base classes see``mla_args``.
         sinks: torch.Tensor | None = mla_args.pop("sinks", None)
+        self._lightop_kv_reuse_state = lightop_kv_reuse_state
+        self._is_indexer_producer = indexer is not None
         super().__init__(
             num_heads,
             head_size,
@@ -91,6 +159,23 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        self._dcp_sinks: torch.Tensor | None = None
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Prepare MLA weights and gather static sink shards for DCP."""
+        super().process_weights_after_loading(act_dtype)
+        self._dcp_sinks = None
+        if self.sinks is None or self.dcp_world_size <= 1:
+            return
+
+        gathered_sinks = get_dcp_group().all_gather(self.sinks, dim=0)
+        expected_heads = self.num_heads * self.dcp_world_size
+        if gathered_sinks.ndim != 1 or gathered_sinks.shape[0] != expected_heads:
+            raise ValueError(
+                "HYV4 FlashMLA DCP attention sinks must gather to shape "
+                f"({expected_heads},), but got {tuple(gathered_sinks.shape)}."
+            )
+        self._dcp_sinks = gathered_sinks
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -144,6 +229,12 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             return None
 
         query_heads = q.shape[head_dim]
+        dcp_sinks = getattr(self, "_dcp_sinks", None)
+        if dcp_sinks is not None and dcp_sinks.shape[0] == query_heads:
+            # Each DCP rank includes the virtual sink in its local softmax.
+            # Divide its exponential contribution across ranks so the later
+            # LSE reduction counts that shared sink exactly once.
+            sinks = dcp_sinks - math.log(self.dcp_world_size)
         if sinks.shape[0] != query_heads:
             raise ValueError(
                 "HYV4 FlashMLA sparse attention sink head count must match the "
@@ -179,7 +270,15 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # The fp8 FlashMLA kernel hardcodes DeepSeek's fp8_ds_mla geometry
+        # (pe_dim == 64). When VLLM_HCU_HYV4_FP8_KV_DEQUANT is set, dequantize
+        # the fp8 KV cache to BF16 and run the BF16 sparse kernel instead. In
+        # HY V4's mixed-batch mode this interception point handles both prefill
+        # and decode tokens, so the env var covers both paths.
+        if henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT:
+            return self._dequant_bf16_attn(q, kv_c_and_k_pe_cache, topk_indices)
+
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
         padded_num_heads = self.fp8_decode_padded_heads
@@ -214,6 +313,110 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         return out, lse
 
+    def _forward_fp8_kv_mixed_batch(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Run mixed-batch FP8 dequant with the actual request query width."""
+        if not henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT:
+            return super()._forward_fp8_kv_mixed_batch(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+            )
+
+        topk_indices = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+
+        # The upstream mixed-batch path collapses all requests into one query
+        # batch before invoking the FP8 kernel. Recover the per-request width
+        # for uniform decode (including MTP verification). Non-uniform prefill
+        # cannot be represented by LightOp's scalar request width, so grouping
+        # each token independently preserves correctness without deduplication.
+        tokens_per_request = 1
+        if (
+            attn_metadata.num_reqs > 0
+            and attn_metadata.max_query_len > 0
+            and attn_metadata.num_actual_tokens
+            == attn_metadata.num_reqs * attn_metadata.max_query_len
+        ):
+            tokens_per_request = attn_metadata.max_query_len
+
+        attn_out, _ = self._dequant_bf16_attn(
+            q.unsqueeze(0),
+            kv_c_and_k_pe_cache,
+            topk_indices.unsqueeze(0),
+            tokens_per_request,
+            getattr(attn_metadata, "lightop_kv_group_size", 1),
+        )
+        return attn_out.squeeze(0)
+
+    def _dequant_bf16_attn(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        tokens_per_request: int | None = None,
+        mapping_reuse_group_size: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dequantize the fp8 KV cache to BF16 and run the BF16 sparse kernel.
+
+        Replaces the fp8 FlashMLA kernel (which hardcodes the fp8_ds_mla
+        geometry) with the geometry-agnostic BF16 sparse kernel. In HY V4's
+        mixed-batch mode this runs for prefill and decode tokens alike, so both
+        paths go through ``flash_mla_sparse_fwd`` on the upconverted cache.
+
+        Only the ``num_tokens * topk`` slots the sparse kernel actually reads are
+        dequantized, into a compact ``(num_tokens * topk, head_size)`` BF16
+        buffer, and ``topk_indices`` (already converted to global cache slots,
+        with -1 marking invalid entries) is remapped to that buffer's rows.
+        Both ``topk`` and ``num_tokens`` are fixed per step, so the buffer shape
+        is fixed and the decode path stays CUDA-graph-capturable.
+        ``flash_mla_sparse_fwd`` handles the -1 indices natively.
+        """
+        num_tokens_b, seq_len, num_heads, head_dim = q.shape
+        rope_dim = self.head_size - self.kv_lora_rank
+        if tokens_per_request is None:
+            tokens_per_request = seq_len
+
+        # Flatten tokens; indices are already global cache slots.
+        q_flat = q.reshape(num_tokens_b * seq_len, num_heads, head_dim)
+        idx_flat = topk_indices.reshape(num_tokens_b * seq_len, -1)
+
+        # Gather + dequantize only the selected slots; remap indices to the
+        # compact buffer's rows.
+        reuse_state = getattr(self, "_lightop_kv_reuse_state", None)
+        reuse_kwargs = (
+            {
+                "reuse_state": reuse_state,
+                "allow_mapping_reuse": not self._is_indexer_producer,
+                "mapping_reuse_group_size": mapping_reuse_group_size,
+            }
+            if reuse_state is not None
+            else {}
+        )
+        kv_bf16, new_idx = gather_dequantize_fp8_ds_mla_cache(
+            kv_c_and_k_pe_cache,
+            idx_flat,
+            self.kv_lora_rank,
+            rope_dim,
+            tokens_per_request,
+            **reuse_kwargs,
+        )
+
+        out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
+        out = out.reshape(num_tokens_b, seq_len, num_heads, out.shape[-1])
+        return out, None
+
     def _bf16_flash_mla_kernel(
         self,
         q: torch.Tensor,
@@ -221,42 +424,151 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         topk_indices: torch.Tensor,
         topk_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        output, _ = self._bf16_flash_mla_kernel_with_lse(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_length=topk_length,
+        )
+        return output
+
+    def _bf16_flash_mla_kernel_with_lse(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_length: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = q.shape[0]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
 
-        needs_padding = self.num_heads % self.prefill_padding != 0
-        kernel_heads = self.prefill_padding if needs_padding else q.shape[1]
+        query_heads = q.shape[1]
+        needs_padding = query_heads % self.prefill_padding != 0
+        kernel_heads = (
+            math.ceil(query_heads / self.prefill_padding) * self.prefill_padding
+            if needs_padding
+            else query_heads
+        )
         attn_sink = self._sinks_for_query(q, head_dim=1, kernel_heads=kernel_heads)
 
         # NOTE(Chen): kernel requires num_local_head to be a multiple of
         # 64 on hopper and 128 on blackwell
         if needs_padding:
-            assert self.prefill_padding % self.num_heads == 0
             logger.warning_once(
-                f"Padding num_heads from {self.num_heads} to "
-                f"{self.prefill_padding} for BF16 sparse prefill kernel"
+                f"Padding num_heads from {query_heads} to "
+                f"{kernel_heads} for BF16 sparse prefill kernel"
             )
             # Zero (not new_empty) the padded lanes: topk_indices is shared by
             # all heads, so the kernel reduces across the head group and NaNs
             # from uninitialized memory would leak into the real heads.
-            q_padded = q.new_zeros((q.shape[0], self.prefill_padding, q.shape[2]))
-            q_padded[:, : self.num_heads, :] = q
+            q_padded = q.new_zeros((q.shape[0], kernel_heads, q.shape[2]))
+            q_padded[:, :query_heads, :] = q
             q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = flash_mla_sparse_fwd(
+        output, _, lse = flash_mla_sparse_fwd(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
             self.softmax_scale,
             attn_sink=attn_sink,
             topk_length=topk_length,
-        )[0]
+        )
+        if lse is None:
+            raise RuntimeError("HYV4 sparse MLA DCP kernel did not return LSE")
 
-        output = output[:, : self.num_heads, :]
-        return output
+        output = output[:, :query_heads, :]
+        lse = lse[:, :query_heads]
+        if attn_sink is not None:
+            # FlashMLA applies the sink denominator to `output` but documents
+            # that its returned LSE excludes the sink. DCP correction needs
+            # the denominator that produced `output`, so fold the same sink
+            # logit into LSE before the cross-rank log-sum-exp reduction.
+            lse = torch.logaddexp(
+                lse,
+                attn_sink[:query_heads].view(1, query_heads),
+            )
+        return output, lse
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        layer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.dcp_world_size <= 1:
+            return super().forward_mqa(
+                q,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                layer,
+            )
+
+        if isinstance(q, tuple):
+            from vllm import _custom_ops as ops
+
+            ql_nope, q_pe = q
+            q = self.q_concat_buffer[: ql_nope.shape[0]]
+            ops.concat_mla_q(ql_nope, q_pe, q)
+
+        num_actual_toks = q.shape[0]
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        topk_indices, topk_length = triton_filter_and_convert_dcp_index(
+            attn_metadata.req_id_per_token[:num_actual_toks],
+            attn_metadata.block_table,
+            topk_indices,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=(
+                attn_metadata.cp_kv_cache_interleave_size
+            ),
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+        )
+
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            rope_dim = self.head_size - self.kv_lora_rank
+            tokens_per_request = _uniform_tokens_per_request(
+                num_actual_toks, attn_metadata.num_reqs
+            )
+            reuse_state = getattr(self, "_lightop_kv_reuse_state", None)
+            reuse_kwargs = (
+                {
+                    "reuse_state": reuse_state,
+                    "allow_mapping_reuse": False,
+                    "mapping_reuse_group_size": 1,
+                }
+                if reuse_state is not None
+                else {}
+            )
+            cache, kernel_indices = gather_dequantize_fp8_ds_mla_cache(
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                self.kv_lora_rank,
+                rope_dim,
+                tokens_per_request,
+                **reuse_kwargs,
+            )
+        else:
+            cache = kv_c_and_k_pe_cache
+            kernel_indices = topk_indices
+
+        attn_out, lse = self._bf16_flash_mla_kernel_with_lse(
+            q,
+            cache,
+            kernel_indices,
+            topk_length=topk_length,
+        )
+        empty_rows = topk_length == 0
+        attn_out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        if self.sinks is None:
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        return attn_out, lse
 
 
 class HYV4FlashMLASparseBackend(HcuFlashMLASparseBackend):
@@ -269,6 +581,10 @@ class HYV4FlashMLASparseBackend(HcuFlashMLASparseBackend):
     @staticmethod
     def get_impl_cls() -> type[HYV4FlashMLASparseImpl]:
         return HYV4FlashMLASparseImpl
+
+    @staticmethod
+    def get_builder_cls() -> type[HYV4FlashMLASparseMetadataBuilder]:
+        return HYV4FlashMLASparseMetadataBuilder
 
     @classmethod
     def supports_sink(cls) -> bool:

@@ -267,7 +267,8 @@ def apply_to_module(module: ModuleType) -> bool:
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
-        if not config.enable_lightly_cp:
+        q_dcp_replicated = getattr(self, "_hcu_q_dcp_replicated", None)
+        if not config.enable_lightly_cp and q_dcp_replicated is None:
             return original_forward(
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                 output_scale, output_block_scale, quant_group_size,
@@ -275,10 +276,17 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
+        if q_dcp_replicated is None:
+            return mla_forward_impl(
+                mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata,
+                output, output_scale, output_block_scale, quant_group_size,
+                quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            )
         return mla_forward_impl(
             mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
             output_scale, output_block_scale, quant_group_size,
             quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            q_dcp_replicated=q_dcp_replicated,
         )
 
     @functools.wraps(process)
