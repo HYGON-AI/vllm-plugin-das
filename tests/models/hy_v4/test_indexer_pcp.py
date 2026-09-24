@@ -115,10 +115,10 @@ def _constructed_indexer(monkeypatch, world_size, metadata, cache, inputs, group
         return topk_buffer
 
     def isolated_leaf(*args):
-        calls.append(("isolated", args[-1]))
+        calls.append(("isolated", args[-4]))
         assert args[3] is inputs[1]  # Q remains PCP-local.
         assert args[4] is inputs[2]
-        return args[-2]
+        return args[-5]
 
     monkeypatch.setattr(native, "rocm_aiter_sparse_attn_indexer_native", native_leaf)
     monkeypatch.setattr(torch.ops.vllm, "hcu_sparse_attn_indexer", isolated_leaf)
