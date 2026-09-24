@@ -55,6 +55,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _has_uniform_query_width(
+    num_tokens: int,
+    num_reqs: int,
+    max_query_len: int,
+) -> bool:
+    """Return whether every request contributes ``max_query_len`` rows."""
+    if num_tokens > 0 and max_query_len <= 0:
+        raise ValueError(
+            "DCP sparse attention requires a positive max_query_len when "
+            f"tokens are present; got num_tokens={num_tokens}, "
+            f"max_query_len={max_query_len}."
+        )
+    return (
+        num_reqs > 0
+        and max_query_len > 0
+        and num_tokens == num_reqs * max_query_len
+    )
+
+
 def _lightop_tokens_per_request(
     num_tokens: int,
     num_reqs: int,
@@ -63,7 +82,7 @@ def _lightop_tokens_per_request(
     """Return the LightOp grouping width, or one for a ragged batch."""
     if num_reqs <= 0:
         raise ValueError("DCP sparse attention requires at least one request")
-    if max_query_len > 0 and num_tokens == num_reqs * max_query_len:
+    if _has_uniform_query_width(num_tokens, num_reqs, max_query_len):
         return max_query_len
     # LightOp only accepts one scalar request width. Chunked prefill can be
     # ragged, so treat every query row as an independent group. This disables
@@ -77,10 +96,12 @@ def _lightop_mapping_reuse_group_size(
 ) -> int:
     """Return a reuse width only for uniform, pure target-verify batches."""
     uniform_width = (
-        metadata.num_reqs > 0
+        _has_uniform_query_width(
+            metadata.num_actual_tokens,
+            metadata.num_reqs,
+            metadata.max_query_len,
+        )
         and metadata.max_query_len > 1
-        and metadata.num_actual_tokens
-        == metadata.num_reqs * metadata.max_query_len
     )
     pure_decode = bool(
         is_prefilling is not None
@@ -346,14 +367,11 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # for uniform decode (including MTP verification). Non-uniform prefill
         # cannot be represented by LightOp's scalar request width, so grouping
         # each token independently preserves correctness without deduplication.
-        tokens_per_request = 1
-        if (
-            attn_metadata.num_reqs > 0
-            and attn_metadata.max_query_len > 0
-            and attn_metadata.num_actual_tokens
-            == attn_metadata.num_reqs * attn_metadata.max_query_len
-        ):
-            tokens_per_request = attn_metadata.max_query_len
+        tokens_per_request = _lightop_tokens_per_request(
+            attn_metadata.num_actual_tokens,
+            attn_metadata.num_reqs,
+            attn_metadata.max_query_len,
+        )
 
         attn_out, _ = self._dequant_bf16_attn(
             q.unsqueeze(0),
