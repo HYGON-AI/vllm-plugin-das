@@ -177,6 +177,70 @@ remain **unverified**. The independently built plugin wheel is checksummed,
 but this is not full paired-wheel release acceptance; keep the MR in Draft
 until the target vLLM artifact is pinned and that gate is rerun.
 
+## DP2 × TP4 + EP8 + MTP3 default-Graph gate, 2026-09-25
+
+This is an additional, **failed accuracy gate**, not part of the passing TP8
+smoke result. The same isolated plugin-wheel install and Hy4 checkpoint were
+used on devices 0–7. The intended non-eager service command was:
+
+~~~bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  VLLM_USE_V2_MODEL_RUNNER=1 HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  PYTHONNOUSERSITE=1 \
+  PYTHONPATH=/models/hy4-v0281-validation-20260925/plugin-wheel-final \
+  python3 -m vllm.entrypoints.cli.main serve \
+  /models/Hy4-preview-Channel-FP8-w8a8-v2 \
+  --host 127.0.0.1 --port 8012 --trust-remote-code \
+  --tensor-parallel-size 4 --data-parallel-size 2 \
+  --enable-expert-parallel --all2all-backend deepep_low_latency \
+  --moe-backend deep_gemm --enable-prefix-caching \
+  --max-model-len 4096 --block-size 64 --max-num-seqs 16 \
+  --max-num-batched-tokens 256 \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}' --seed 0 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+~~~
+
+The test also isolated the proxy environment, cache directory, and log file;
+those do not change the model flags. Its log is
+`/models/hy4-dp-ep-mtp3-20260925.KLOg/dp2_tp4_ep_ll_deepgemm_mtp3_batch256_server.log`.
+Eight workers constructed `HcuGPUModelRunnerV2`, selected
+`DeepEPLLAll2AllManager` and DeepGEMM LL experts, captured main and draft
+PIECEWISE/FULL Graphs under `FULL_AND_PIECEWISE`, and reached a healthy API.
+Two concurrent HumanEval requests were routed to separate DP engines;
+both returned HTTP 200 but ended at 2048 tokens with repeated, unusable text.
+The partial `/0–1` prediction file is
+`dp2_tp4_ep_ll_deepgemm_mtp3_humaneval8.json` in that evidence directory.
+Speculative draft acceptance was observed, but does **not** establish
+accuracy. The eight-item checker was not run because this gate failed on its
+first two items.
+
+Controls on the same wheel/model/request template narrowed, but did not
+identify, the defect:
+
+| Configuration delta | HumanEval/0–1 observation | Evidence file prefix in the same directory |
+| --- | --- | --- |
+| DP2×TP4/EP8/DeepEP-LL/DeepGEMM, no MTP, default Graph | Both repeated/length at 512 | `dp2_tp4_ep_ll_deepgemm_target_humaneval2_diag` |
+| Same, `--enforce-eager` | Both repeated/length at 512 | `dp2_tp4_ep_ll_deepgemm_target_eager_humaneval2_diag` |
+| DP2×TP4/EP8/AgRs/DeepGEMM, no MTP, default Graph | Both repeated/length at 512 | `dp2_tp4_ep_allgather_deepgemm_target_humaneval2_diag` |
+| DP1×TP8/EP8/AgRs/DeepGEMM, no MTP, default Graph, two concurrent requests | `/0` normal `stop` at 189 tokens; `/1` repeated/length at 512 | `dp1_tp8_ep_allgather_deepgemm_target_humaneval2_diag` |
+| Same TP8/EP8 service, `/1` alone | Normal `stop` at 116 tokens, plausible code | `dp1_tp8_ep_allgather_deepgemm_target_single_h1` |
+| DP2×TP4/EP8/DeepEP-LL/DeepGEMM, no MTP, default Graph, `/1` alone | Repeated/length at 384 | `dp2_tp4_ep_ll_deepgemm_target_single_h1` |
+
+The TP8-alone control points to a concurrency-sensitive EP path; the DP2
+single-request failure additionally implicates DP/TP layout or its EP
+interaction. MTP, Graph capture, and DeepEP-LL are not individually necessary
+for the corruption. These tests do not isolate the exact kernel or prove all
+other DP/EP combinations fail. With `--moe-backend aiter`, the DP2/EP model
+fails earlier because AITER rejects the checkpoint's `batched_experts`
+activation format; `triton` rejects its Channel-FP8 quantization. At
+`--max-num-batched-tokens 4096`, DeepEP-LL RocSHMEM buffer allocation OOMs;
+256 allows startup. The corresponding server logs are in the same evidence
+directory. The DP+EP+MTP3 default-Graph accuracy requirement is therefore
+**not met**; do not merge this Draft MR as claiming that topology or full
+v0.25.1 optimization parity.
+
+## Final source regression suite
+
 Final source regressions at the tested code boundary passed in isolated test
 processes. Commands below were run from the feature worktree with
 `PYTHONNOUSERSITE=1 PYTHONPATH=.` and `--tb=short`, using separate pytest
