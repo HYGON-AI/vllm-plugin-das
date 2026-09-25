@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -626,8 +627,9 @@ def test_worker_selects_plugin_owned_model_runner(
 ):
     events: list[tuple[object, object]] = []
     runner_logs: list[str] = []
+    assert cpu_safe_hcu_worker_module.runner_logger.getEffectiveLevel() <= logging.INFO
     monkeypatch.setattr(
-        cpu_safe_hcu_worker_module.logger,
+        cpu_safe_hcu_worker_module.runner_logger,
         "info",
         lambda message, *args: runner_logs.append(message % args),
     )
