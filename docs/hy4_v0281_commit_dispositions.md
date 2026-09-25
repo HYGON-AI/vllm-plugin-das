@@ -37,6 +37,32 @@ equivalence rulings belong in `hy4_v0281_validation.md`.
 | `021625d` | SlimQuant, MoE routing, native FP8 KV, scale guards | Target has `valid_token_counts`, native KV writer, SlimQuant and MoE owners. Run `test_hcu_cache_kernel_source.py`, `test_moe_deepep.py`, quant/runtime tests in common Task 4; port only an evidenced missing call site. |
 | `50c8f55` | CI Qwen max length | CI-only; exclude. |
 
+## Common-runtime review result
+
+The selected generic part of `9218102` is adapted in
+`rocm_aiter_mla_sparse.py`: decode gathers bounded page chunks without host
+`.item()` reads, and prefill tiles both query and key axes. Its 18 numerical,
+workspace and HIP Graph tests plus 19 adjacent loading tests passed on this
+target (`37 passed`). The DeepSeek-V4-specific branch of that commit is not
+ported.
+
+For `021625d`, the target already has separate SlimQuant, valid-token MoE,
+native FP8 KV writer and scale-guard owners. For `8565e54`, it already has
+LightOp MLA concat, gated RMSNorm, sqrtsoftplus routing and W16A16 MoE
+owners. For `325dee8`, it already has Qwen GDN and FLA adapters. A focused
+target suite covering those owners, DeepEP and PCP configuration passed
+`212/212` after a current-target fake-config fixture was repaired. That is
+contract evidence, **not** a claim of identical performance or numerical
+parity to every v0.25.1 kernel. No untested duplicate kernel is selected for
+this MR.
+
+`b701be3` is V1 communicator/bubble code and is intentionally excluded from
+the MRV2 path; the target's `ParallelConfig` and HCU MRV2 runner own the
+equivalent integration points. `4f1f266`'s steady-decode scheduler is also
+V1-specific (TP1, no prefix caching, no MTP), so it is excluded from the TP8
+Hy4 run; its independent M-RoPE component remains unverified rather than
+declared equivalent. Neither change is an implicit scheduler default.
+
 No source commit is cherry-picked wholesale. The binary HCU extension is not
-part of this source diff; the live validation record must distinguish an
+part of this source diff; the live validation record distinguishes an
 installed-binary overlay from a newly built artifact.

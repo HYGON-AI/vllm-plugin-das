@@ -303,6 +303,9 @@ def _make_vllm_module() -> ModuleType:
                 raise AssertionError("legacy GQA DCP head constraint")
 
     class VllmConfig:
+        def _maybe_enable_breakable_cudagraph(self) -> bool:
+            return False
+
         def with_hf_config(self, hf_config: object, architectures=None):
             del hf_config, architectures
             return self
