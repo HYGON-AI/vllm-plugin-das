@@ -31,6 +31,8 @@ _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 _HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
+        "HYV4ForCausalLM",
+        "HYV4MTPModel",
         "Glm5NextForCausalLM",
         "Glm5NextForConditionalGeneration",
         "Glm5NextMTPModel",
