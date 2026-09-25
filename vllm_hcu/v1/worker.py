@@ -35,7 +35,9 @@ def _create_model_runner(
         )
     from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
 
-    return HcuGPUModelRunnerV2(vllm_config, device)
+    runner = HcuGPUModelRunnerV2(vllm_config, device)
+    logger.info("HCU model runner constructed: %s", type(runner).__name__)
+    return runner
 
 
 class HcuGPUWorker(Worker):

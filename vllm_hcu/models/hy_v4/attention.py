@@ -409,7 +409,7 @@ class HYV4MLAAttentionLayer(MLAAttention):
     """Add Hy4-specific post-load and DCP-Q handling to target MLA."""
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """Prepare MLA projections, then run the selected backend's hook."""
+        """Let target MLA prepare its backend, then apply optional DCP-Q."""
         super().process_weights_after_loading(act_dtype)
         if getattr(self, "_hcu_dcp_q_replicate", False):
             if (
@@ -418,12 +418,11 @@ class HYV4MLAAttentionLayer(MLAAttention):
             ):
                 raise RuntimeError(
                     "VLLM_DCP_Q_REPLICATE does not support Aiter MLA BMM "
-                    "weight formats on vLLM 0.25.1"
+                    "weight formats"
                 )
             self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                 self.W_UK_T.contiguous(), dim=0
             )
-        self.impl.process_weights_after_loading(act_dtype)
 
     def forward(
         self,
@@ -489,9 +488,9 @@ def dcp_q_replication_enabled() -> bool:
 class DCPGroupColumnParallelLinear(ColumnParallelLinear):
     """Shard a Q projection across DCP groups and replicate within a group.
 
-    vLLM 0.25.1 does not yet let ``ColumnParallelLinear`` override its TP
-    rank and world size. This is the equivalent of upstream's newer
-    ``DCPGroupColumnParallelLinear`` adapted to the 0.25.1 constructor.
+    This legacy adapter is inactive for Hy4's validated TP-only route. The
+    target ``ColumnParallelLinear`` now supports ``tp_rank``/``tp_size``;
+    the DCP route must be revalidated before this adapter is selected.
     """
 
     def __init__(

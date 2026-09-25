@@ -8,6 +8,25 @@ import torch
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 
+def test_hyv4_mla_backend_post_load_hook_runs_once(monkeypatch):
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm_hcu.models.hy_v4.attention import HYV4MLAAttentionLayer
+
+    layer = object.__new__(HYV4MLAAttentionLayer)
+    torch.nn.Module.__init__(layer)
+    calls = []
+    layer.impl = SimpleNamespace(
+        process_weights_after_loading=lambda dtype: calls.append(dtype)
+    )
+    monkeypatch.setattr(
+        MLAAttention,
+        "process_weights_after_loading",
+        lambda self, dtype: self.impl.process_weights_after_loading(dtype),
+    )
+    layer.process_weights_after_loading(torch.bfloat16)
+    assert calls == [torch.bfloat16]
+
+
 def test_sparse_e4m3_uses_ds_mla_layout_without_changing_dense_cache():
     from vllm_hcu.models.hy_v4.attention import _normalize_hy_v4_kv_cache_dtype
 

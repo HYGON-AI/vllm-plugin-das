@@ -767,14 +767,14 @@ def test_checkpoint_extra_fused_expert_fails(checkpoint_model):
     ("set_eplb_state", (torch.empty(0), torch.empty(0), torch.empty(0))),
     ("update_physical_experts_metadata", (2, 2)),
 ])
-def test_eplb_state_interface_remains_inert_until_task_7(checkpoint_model, method, args):
+def test_eplb_state_interface_requires_static_plan(checkpoint_model, method, args):
     model = checkpoint_model.model
     model.moe_layers = []
     model.expert_weights = []
     model.layers = []
     model.num_local_physical_experts = 2
     model.num_logical_experts = 2
-    with pytest.raises(NotImplementedError, match="Task 7"):
+    with pytest.raises(NotImplementedError, match="static placement plan"):
         getattr(model, method)(*args)
 
 

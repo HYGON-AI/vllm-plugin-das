@@ -625,6 +625,12 @@ def test_worker_selects_plugin_owned_model_runner(
     expected_class,
 ):
     events: list[tuple[object, object]] = []
+    runner_logs: list[str] = []
+    monkeypatch.setattr(
+        cpu_safe_hcu_worker_module.logger,
+        "info",
+        lambda message, *args: runner_logs.append(message % args),
+    )
     runner_module = ModuleType(expected_module)
 
     class Runner:
@@ -644,6 +650,7 @@ def test_worker_selects_plugin_owned_model_runner(
 
     assert isinstance(result, Runner)
     assert events == [(config, device)]
+    assert runner_logs == ["HCU model runner constructed: Runner"]
 
 
 def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):

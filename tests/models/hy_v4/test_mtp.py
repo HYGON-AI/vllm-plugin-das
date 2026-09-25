@@ -491,7 +491,7 @@ def test_mtp_predictor_constructs_one_layer_and_reuses_it_for_all_steps(monkeypa
     torch.testing.assert_close(embeds, torch.tensor([[6., 7.], [8., 9.]]))
     for method, args in [(draft.set_eplb_state, (None, None, None)),
                          (draft.update_physical_experts_metadata, (2, 2))]:
-        with pytest.raises(NotImplementedError, match="Task 7"):
+        with pytest.raises(NotImplementedError, match="static placement plan"):
             method(*args)
 
 

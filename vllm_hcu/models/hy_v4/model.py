@@ -237,7 +237,7 @@ def _try_load_hyv4_fp8_projection(
 
 
 def _require_hyv4_static_plan(model):
-    raise NotImplementedError("HYV4 EPLB requires a validated Task 7 static plan")
+    raise NotImplementedError("HYV4 EPLB requires a validated static placement plan")
 
 
 class _HYV4CheckpointAccounting:
