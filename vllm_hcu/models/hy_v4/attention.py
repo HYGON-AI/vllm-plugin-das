@@ -1071,6 +1071,7 @@ class HYV4MLAAttention(nn.Module):
             if enable_sink:
                 sinks = self.learnable_sink_param
                 _require_sparse_mqa_backend(sink_backend)
+                self._force_sparse_mqa()
 
         extra_impl_args = {} if sinks is None else {"sinks": sinks}
         self.mla_attn = HYV4MLAAttentionLayer(
@@ -1096,6 +1097,17 @@ class HYV4MLAAttention(nn.Module):
             getattr(q_proj_layer, "qrep_active", False)
         )
         self.mla_attn._hcu_dcp_q_replicate = self.dcp_q_replicate
+
+    def _force_sparse_mqa(self) -> None:
+        """Keep sink-enabled short prefills off the sink-less dense MLA path."""
+        attention_config = get_current_vllm_config().attention_config
+        if attention_config.sparse_mla_force_mqa:
+            return
+        attention_config.sparse_mla_force_mqa = True
+        logger.info_once(
+            "HY V4 learnable sink enabled: forcing sparse MQA for prefill "
+            "because dense MLA prefill does not apply attention sinks."
+        )
 
     def _resolve_sink_backend(
         self, kv_cache_dtype: str

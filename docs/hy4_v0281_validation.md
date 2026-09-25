@@ -226,23 +226,61 @@ identify, the defect:
 | Same TP8/EP8 service, `/1` alone | Normal `stop` at 116 tokens, plausible code | `dp1_tp8_ep_allgather_deepgemm_target_single_h1` |
 | DP2×TP4/EP8/DeepEP-LL/DeepGEMM, no MTP, default Graph, `/1` alone | Repeated/length at 384 | `dp2_tp4_ep_ll_deepgemm_target_single_h1` |
 
-The TP8-alone control points to a concurrency-sensitive EP path; the DP2
-single-request failure additionally implicates DP/TP layout or its EP
-interaction. MTP, Graph capture, and DeepEP-LL are not individually necessary
-for the corruption. These tests do not isolate the exact kernel or prove all
-other DP/EP combinations fail. With `--moe-backend aiter`, the DP2/EP model
+The original EP/DP/TP inference from these controls was superseded by the
+sink-routing diagnosis below: TP8 without EP also reproduced the mixed-batch
+failure. MTP, Graph capture, and DeepEP-LL are not individually necessary for
+the corruption. With `--moe-backend aiter`, the DP2/EP model
 fails earlier because AITER rejects the checkpoint's `batched_experts`
 activation format; `triton` rejects its Channel-FP8 quantization. At
 `--max-num-batched-tokens 4096`, DeepEP-LL RocSHMEM buffer allocation OOMs;
 256 allows startup. The corresponding server logs are in the same evidence
-directory. The DP+EP+MTP3 default-Graph accuracy requirement is therefore
-**not met**; do not merge this Draft MR as claiming that topology or full
-v0.25.1 optimization parity.
+directory. At this pre-fix revision, the DP2×TP4/EP8/MTP3 default-Graph
+accuracy requirement was **not met**.
+
+## Hy4 learnable-sink mixed-batch fix and accuracy recheck, 2026-09-25
+
+The v0.25.1 DP8/TP1/EP8 MTP3 result was a batch-1 EvalScope 32/32 result,
+not a concurrent-request gate. On the target branch before this fix, the same
+DP8/TP1/EP8 MTP3 Graph topology scored 8/8 when HumanEval/0–7 were sent
+sequentially, but four of eight concurrent requests repeated
+`</think:opensource>` until the token limit. TP8 without EP, MTP, Graphs,
+FP8 MLA KV, or prefix caching still reproduced the two-request failure.
+Layer-0 tracing showed identical pre-attention activations and identical
+indexer selections (all 165 tokens for HumanEval/1); the attention output
+first diverged when a new short prefill shared a batch with an existing
+decode. The target vLLM's short-prefill dense MLA split omits Hy4's learnable
+sink. Its own Hy4 NVIDIA implementation forces sparse MQA when the sink is
+enabled; this HCU adapter now does the same before constructing MLA attention.
+
+The diagnosis first changed only the public
+`--attention-config '{"sparse_mla_force_mqa":true}'` option on the original
+wheel: TP8 two-request output normalized, and DP8/EP8/MTP3/FP8-KV Graph
+concurrent HumanEval passed 8/8. The final source fix was then copied into an
+otherwise unchanged isolated plugin tree. The plugin tree's patched
+`attention.py` SHA-256 matched the feature worktree source exactly. Neither
+final service below supplied an explicit attention-config override:
+
+| Final gate | Result | Evidence under `/models/hy4-dp8-ep8-diagnosis-20260925.VWpz/` |
+| --- | --- | --- |
+| DP8/TP1/EP8, DeepEP-LL/DeepGEMM, MTP3, FP8 E4M3 KV, default Graph; eight concurrent HumanEval requests | **8/8**, all `stop` | `dp8_ep8_mtp3_graph_auto_sink_fix_server.log`, `dp8_ep8_mtp3_graph_auto_sink_fix_humaneval8_concurrent.json`, `_score.json` |
+| DP2×TP4/EP8, DeepEP-LL/DeepGEMM, MTP3, BF16 KV, default Graph; eight concurrent HumanEval requests | **8/8**, all `stop` | `dp2_tp4_ep8_mtp3_graph_auto_sink_fix_server.log`, `dp2_tp4_ep8_mtp3_graph_auto_sink_fix_humaneval8_concurrent.json`, `_score.json` |
+
+The DP8 launch retained `--tensor-parallel-size 1 --data-parallel-size 8
+--enable-expert-parallel --all2all-backend deepep_low_latency --moe-backend
+deep_gemm --kv-cache-dtype fp8_e4m3 --kv-cache-memory-bytes 536870912
+--gpu-memory-utilization 0.95 --max-num-batched-tokens 256
+--speculative-config.method mtp --speculative-config.num_speculative_tokens 3`.
+The DP2×TP4 launch retained the pre-fix command above (port 8013 instead of
+8012). Both used Model Runner V2, eight devices, max model length 4096,
+block size 64 and default non-eager Graph. These eight-sample gates resolve the
+documented short-prefill accuracy failure, but do not replace the full
+v0.25.1 32-sample gate or the still-unverified paired vLLM-wheel release gate.
 
 ## Final source regression suite
 
-Final source regressions at the tested code boundary passed in isolated test
-processes. Commands below were run from the feature worktree with
+The pre-fix source regressions passed in isolated test processes. Commands
+below were run from the feature worktree before the learnable-sink routing
+fix with
 `PYTHONNOUSERSITE=1 PYTHONPATH=.` and `--tb=short`, using separate pytest
 processes and `set -o pipefail` so the retained `tee` logs reflect the test
 exit status:
@@ -262,3 +300,17 @@ counted as a passing gate. The sparse-indexer group passed in a fresh
 process, and final groups above were rerun after the corrections. The skill
 at `/models/upgrading-vllm-hcu/SKILL.md` passed structure validation after
 updating the release-line audit and this gate.
+
+After the learnable-sink fix, `python3 -m pytest -q tests/models/hy_v4
+tests/runtime_patch/test_hcu_model_runner_v2_api.py
+tests/integration/server/test_evalscope_hy4_humaneval.py` passed **160/160**
+tests, including short-prefill routing and sink-enabled/sinkless constructor
+regressions.
+The first full-repository pytest attempt stopped during collection because
+the worktree-relative `vllm_0251` source checkout was absent; the actual
+v0.25.1 source tree is `/models/zb/vllm_025/vllm`.
+With `VLLM_V0251_SOURCE_ROOT` set to that tree, a broad pytest run reached
+650 passed and 64 skipped, with five failures outside the changed Hy4 files
+(W4A8/DeepGEMM accuracy, two clean-process v0.25.1 bootstrap checks,
+LightOp API boundary and patch-coverage audit). It was interrupted after
+137 seconds rather than counted as a full-suite pass.

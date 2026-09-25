@@ -149,6 +149,103 @@ def test_sparse_mqa_backend_accepts_flashmla_and_rejects_dense():
         _require_sparse_mqa_backend(DenseBackend)
 
 
+def test_hyv4_sink_keeps_short_prefill_on_sparse_mqa(monkeypatch):
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm_hcu.models.hy_v4 import attention as hy_attention
+
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(sparse_mla_force_mqa=False)
+    )
+    monkeypatch.setattr(
+        hy_attention, "get_current_vllm_config", lambda: vllm_config
+    )
+    mla = object.__new__(MLAAttention)
+    torch.nn.Module.__init__(mla)
+    mla._vllm_config = vllm_config
+    mla.prefill_backend = None
+    short_prefill = SimpleNamespace(prefill=SimpleNamespace(use_dense_mha=True))
+    assert mla._use_sparse_mha(short_prefill)
+
+    attention = object.__new__(hy_attention.HYV4MLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention._force_sparse_mqa()
+
+    assert not mla._use_sparse_mha(short_prefill)
+
+
+@pytest.mark.parametrize("learnable_sink", [False, True])
+def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
+    monkeypatch, learnable_sink
+):
+    from vllm_hcu.models.hy_v4 import attention as hy_attention
+
+    class StubModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(sparse_mla_force_mqa=False),
+        parallel_config=SimpleNamespace(),
+    )
+    config = SimpleNamespace(
+        layer_types=["sparse_attention"],
+        index_topk=64,
+        indexer_types=["full"],
+        num_hidden_layers=1,
+        rms_norm_eps=1e-6,
+        rope_parameters={},
+        learnable_sink=learnable_sink,
+        gated_mla=False,
+    )
+    monkeypatch.setattr(
+        hy_attention, "get_current_vllm_config", lambda: vllm_config
+    )
+    monkeypatch.setattr(
+        hy_attention, "_require_supported_hy_v4_parallelism", lambda _: None
+    )
+    monkeypatch.setattr(
+        hy_attention, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        hy_attention, "dcp_q_replication_enabled", lambda: False
+    )
+    monkeypatch.setattr(
+        hy_attention, "get_attn_backend", lambda **kwargs: StubModule
+    )
+    monkeypatch.setattr(
+        hy_attention.HYV4MLAAttention,
+        "_resolve_sink_backend", lambda self, _: StubModule
+    )
+    monkeypatch.setattr(
+        hy_attention, "_require_sparse_mqa_backend", lambda _: None
+    )
+    monkeypatch.setattr(
+        hy_attention, "get_rope", lambda *args, **kwargs: StubModule()
+    )
+    for name in (
+        "MergedColumnParallelLinear", "ColumnParallelLinear", "RowParallelLinear",
+        "RMSNorm", "Indexer", "HYV4MLAAttentionLayer",
+    ):
+        monkeypatch.setattr(hy_attention, name, StubModule)
+
+    attention = hy_attention.HYV4MLAAttention(
+        vllm_config=vllm_config,
+        config=config,
+        hidden_size=16,
+        num_heads=1,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+        v_head_dim=8,
+        q_lora_rank=8,
+        kv_lora_rank=8,
+        prefix="model.layers.0.self_attn",
+    )
+
+    assert vllm_config.attention_config.sparse_mla_force_mqa is learnable_sink
+    assert ("sinks" in attention.mla_attn.kwargs) is learnable_sink
+
+
 def _bare_sparse_impl(sinks: torch.Tensor):
     from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
 
