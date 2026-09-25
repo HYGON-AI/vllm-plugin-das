@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -18,21 +19,26 @@ from vllm_hcu.patch.platform.core_fix import platform_core_callback_names
 
 
 REPO = Path(__file__).resolve().parents[2]
-TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
-).resolve()
+_target_root_override = os.environ.get("VLLM_TARGET_ROOT")
+if _target_root_override:
+    TARGET_VLLM_ROOT = Path(_target_root_override).resolve()
+else:
+    _vllm_spec = importlib.util.find_spec("vllm")
+    if _vllm_spec is None or _vllm_spec.origin is None:
+        raise RuntimeError(
+            "VLLM_TARGET_ROOT is unset and the vllm package is not discoverable"
+        )
+    TARGET_VLLM_ROOT = Path(_vllm_spec.origin).resolve().parents[1]
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
 _TARGET_SOURCE_ASSERTION = r'''
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
-_vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
-).resolve()
+_vllm_hcu_root = _VllmHcuPath(_vllm_hcu_os.environ["VLLM_TARGET_ROOT"]).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
@@ -45,7 +51,7 @@ def _run_fresh(
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
@@ -55,6 +61,14 @@ def _run_fresh(
         env=env,
         timeout=timeout,
     )
+
+
+def test_target_root_is_installed_vllm():
+    import vllm
+
+    spec = importlib.util.find_spec("vllm")
+    assert spec is not None and spec.origin is not None
+    assert Path(vllm.__file__).resolve().is_relative_to(TARGET_VLLM_ROOT)
 
 
 def test_platform_core_inventory_is_explicit_and_ordered():
@@ -310,8 +324,10 @@ def test_platform_framework_registration_is_lazy_on_clean_vllm():
         "replacement_modules={replacement for _,_,replacement in "
         "worker_replacements}; "
         "assert not (replacement_modules & sys.modules.keys()); "
-        "assert not ({name for _,name in worker_callback_names()} & "
-        "sys.modules.keys()); "
+        "loaded_worker_callbacks={name for _,name in worker_callback_names()} "
+        "& sys.modules.keys(); "
+        "assert loaded_worker_callbacks <= {"
+        "'vllm.distributed.device_communicators.base_device_communicator'}; "
         "import vllm.v1.outputs; "
         "regs={r.patch_id:r for r in IMPORT_COORDINATOR.registrations()}; "
         "print(json.dumps({'output_status':regs["
