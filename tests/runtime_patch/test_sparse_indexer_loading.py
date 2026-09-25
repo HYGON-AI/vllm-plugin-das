@@ -715,7 +715,13 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
 
 
 def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
-    importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
+    if not hasattr(torch.ops.vllm, "hcu_sparse_attn_indexer"):
+        # With pytest's plugin disabled, an earlier Hy4 import can register
+        # the upstream op under the same name. Torch schemas cannot be
+        # replaced in-process; this HCU-only check runs in isolation instead.
+        if hasattr(torch.ops.vllm, "sparse_attn_indexer"):
+            pytest.skip("upstream sparse indexer already registered")
+        importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
 
     schema = torch.ops.vllm.hcu_sparse_attn_indexer.default._schema
     assert len(schema.returns) == 0
