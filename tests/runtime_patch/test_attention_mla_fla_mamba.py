@@ -438,6 +438,90 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     assert metadata.fp8_extra_metadata.num_prefills == 3
 
 
+def test_flashmla_sparse_admits_hy4_dcp_at_mixed_batch_head_boundary(
+    monkeypatch,
+):
+    adapter = _adapter("patch_flashmla_sparse")
+    rejected = (
+        "DCP for FlashMLA sparse is only supported on the mixed-batch fp8 "
+        "path (num_heads < 32)"
+    )
+
+    class FlashMLASparseMetadataBuilder:
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            del kv_cache_spec, layer_names, device
+            self.vllm_config = vllm_config
+            self.num_heads = 32
+            self.fp8_decode_padded_heads = 64
+            self.fp8_use_mixed_batch = False
+            raise NotImplementedError(rejected)
+
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            del self, common_prefix_len, common_attn_metadata, fast_build
+            return SimpleNamespace(fp8_use_mixed_batch=False)
+
+    class FlashMLASparseImpl:
+        @staticmethod
+        def _compute_fp8_decode_padded_heads(num_heads):
+            return 64 if num_heads <= 64 else 128
+
+        def _fp8_flash_mla_kernel(
+            self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
+        ):
+            return q
+
+        def _bf16_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_length=None,
+            actual_num_heads=None,
+        ):
+            return q
+
+    import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
+
+    monkeypatch.setattr(hcu_flashmla, "FlashMLASchedMeta", object)
+    monkeypatch.setattr(hcu_flashmla, "flash_mla_sparse_fwd", lambda *a, **k: None)
+    monkeypatch.setattr(
+        hcu_flashmla, "flash_mla_with_kvcache", lambda **kwargs: (kwargs, None)
+    )
+    monkeypatch.setattr(hcu_flashmla, "get_mla_metadata", lambda *a, **k: None)
+    module = _module(
+        adapter.TARGET_MODULE,
+        FlashMLASparseMetadataBuilder=FlashMLASparseMetadataBuilder,
+        FlashMLASparseImpl=FlashMLASparseImpl,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        torch=torch,
+    )
+    _install_flashmla_sparse_separate_builder(
+        module, FlashMLASparseMetadataBuilder
+    )
+    assert adapter.apply_to_module(module) is True
+
+    parallel = SimpleNamespace(
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=4,
+        enable_expert_parallel=True,
+        cp_kv_cache_interleave_size=1,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"]),
+        parallel_config=parallel,
+        cache_config=SimpleNamespace(cache_dtype="fp8_e4m3"),
+    )
+    builder = FlashMLASparseMetadataBuilder(None, [], config, torch.device("cpu"))
+    assert builder.fp8_use_mixed_batch is True
+
+    parallel.data_parallel_size = 1
+    with pytest.raises(NotImplementedError, match="mixed-batch fp8"):
+        FlashMLASparseMetadataBuilder(None, [], config, torch.device("cpu"))
+
+
 def test_flashmla_sparse_rejects_old_separate_metadata_signature(monkeypatch):
     adapter = _adapter("patch_flashmla_sparse")
 
