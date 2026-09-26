@@ -143,6 +143,12 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
         def sample_tokens(self, grammar_output):
             events.append("super.sample_tokens")
             assert grammar_output == "grammar"
+            # Upstream 0.28.1 restores PCP only on the final PP stage.
+            # The non-final stage receives the sampled tokens first.
+            if getattr(self, "is_last_pp_rank", True) is False:
+                assert self.execute_model_state.hidden_states is None
+                assert self.execute_model_state.input_batch is self.expected_batch
+                return "received"
             manager = getattr(self, "pcp_manager", None)
             if manager is not None:
                 hidden_states, input_batch = manager.restore_for_sampling(
@@ -152,10 +158,6 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                     hidden_states=hidden_states,
                     input_batch=input_batch,
                 )
-            if getattr(self, "is_last_pp_rank", True) is False:
-                assert self.execute_model_state.hidden_states is None
-                assert self.execute_model_state.input_batch is self.expected_batch
-                return "received"
             assert self.execute_model_state.hidden_states is self.expected_hidden
             assert self.execute_model_state.input_batch is self.expected_batch
             if hasattr(self, "expected_attn_metadata"):
@@ -484,6 +486,42 @@ def test_pp_final_stage_restores_hidden_once() -> None:
         global_batch,
     )
     assert calls == [local_hidden]
+
+
+def test_pp_nonfinal_target_restores_global_batch_before_receive(
+    pcp_runner_module,
+) -> None:
+    """The 0.28.1 upstream non-final PP path does not restore PCP itself."""
+
+    runner_module, events = pcp_runner_module
+    global_batch = object()
+    local_batch = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            events.append("restore_for_sampling")
+            assert hidden_states is None
+            return None, global_batch
+
+    runner = runner_module.HcuGPUModelRunnerV2(
+        _config(4, speculative=False), "hcu:0"
+    )
+    runner.is_last_pp_rank = False
+    runner.pcp_manager = Manager()
+    runner.speculator = None
+    runner.expected_batch = global_batch
+    runner.execute_model_state = _MTPExecuteModelState(
+        input_batch=local_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    events.clear()
+
+    assert runner.sample_tokens("grammar") == "received"
+    assert events == ["restore_for_sampling", "super.sample_tokens"]
 
 
 def test_pp_nonfinal_mtp_rebuilds_global_metadata_once(

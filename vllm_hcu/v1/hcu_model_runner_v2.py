@@ -137,7 +137,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             and execute_model_state is not None
             and getattr(self, "speculator", None) is not None
         )
-        if use_replicated_mtp_batch:
+        restore_nonfinal_pp_batch = (
+            self.pcp_manager is not None
+            and execute_model_state is not None
+            and not getattr(self, "is_last_pp_rank", True)
+        )
+        if use_replicated_mtp_batch or restore_nonfinal_pp_batch:
             (
                 restored_hidden_states,
                 restored_input_batch,
@@ -193,7 +198,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 finally:
                     self.pcp_manager = pcp_manager
             else:
-                # Current upstream owns the ordinary PCP restore lifecycle.
+                # Upstream restores PCP only on the final PP stage. Non-final
+                # ranks need the global batch restored before PP receive.
                 output = super().sample_tokens(grammar_output)
         return output
 
