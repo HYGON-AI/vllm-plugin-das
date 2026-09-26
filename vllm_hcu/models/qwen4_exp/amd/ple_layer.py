@@ -350,7 +350,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 + rows_buffer.numel() * rows_buffer.element_size()
             )
             logger.info_once(
-                "Qwen4Exp PLE INT8 UVA prefetch active: %.3f MiB workspace "
+                "Qwen4Exp PLE UVA prefetch active: %.3f MiB workspace "
                 "for %s (ids=%s, rows=%s)",
                 workspace_bytes / (1024**2),
                 layer_name,

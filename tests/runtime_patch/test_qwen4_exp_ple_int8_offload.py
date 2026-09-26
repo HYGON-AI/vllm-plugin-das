@@ -89,19 +89,90 @@ def _storage_class(quant_config):
     class BaseEmbedding:
         def __init__(self, *args, **kwargs):
             del args
-            self.quant_method = kwargs["quant_method"]
+            self.quant_method = kwargs.get("quant_method")
 
     module = SimpleNamespace(PLEVocabParallelEmbedding=BaseEmbedding)
     return patch._make_storage_class(module, quant_config)
 
 
+def test_slimquant_unquantized_ple_honors_cpu_offload(monkeypatch):
+    # The BF16 PLE table must not consume ~24 GiB per rank on TP4.
+    from vllm.model_executor import parameter
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    monkeypatch.setattr(patch, "_is_pin_memory_available", lambda: False)
+    config = SimpleNamespace(get_name=lambda: "slimquant_w4a8")
+    storage = _storage_class(config)(prefix="model.layers.2.ple.ngram_embedding")
+    method = storage.quant_method
+    assert method is not None, "SlimQuant PLE did not select CPU offload"
+    layer = torch.nn.Module()
+    method.create_weights(layer, 3, [4], 3, 4, torch.bfloat16,
+                          weight_loader=lambda *args: None)
+    assert layer.weight.device.type == "cpu"
+    assert layer.weight.dtype == torch.bfloat16
+    assert tuple(layer.weight.shape) == (4, 3)
+    assert not hasattr(layer, "weight_scale")
+    assert method.requires_device_loading is False
+
+
+def test_slimquant_ple_offload_requires_uva(monkeypatch):
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: False)
+    config = SimpleNamespace(get_name=lambda: "slimquant_w4a8")
+    with pytest.raises(RuntimeError, match="UVA"):
+        _storage_class(config)(prefix="model.layers.2.ple.ngram_embedding")
+
+
+def test_slimquant_ple_offload_disabled_preserves_default(monkeypatch):
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: False)
+    config = SimpleNamespace(get_name=lambda: "slimquant_w4a8")
+    storage = _storage_class(config)(prefix="model.layers.2.ple.ngram_embedding")
+    assert storage.quant_method is None
+
+
+def test_unquantized_ple_uva_lookup_prefetch_and_reload(monkeypatch):
+    method = patch.HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod()
+    layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
+    layer.tp_size = 1
+    layer.weight = torch.nn.Parameter(
+        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+    monkeypatch.setattr(torch.ops._C, "get_cuda_view_from_cpu_tensor",
+                        lambda x: x, raising=False)
+    ids = torch.tensor([[2, 0]])
+    expected = torch.tensor([[[5, 6], [1, 2]]], dtype=torch.bfloat16)
+    torch.testing.assert_close(method.embedding(layer, ids), expected)
+    output = torch.empty_like(expected)
+    method.prepare_prefetch(layer)
+    assert method.is_prefetch_prepared(layer)
+    method.prefetch_lookup_into(layer, ids, output)
+    torch.testing.assert_close(method.finalize_prefetched(layer, output), expected)
+    monkeypatch.setattr(patch, "tensor_model_parallel_all_reduce", lambda x: x * 2)
+    layer.tp_size = 2
+    torch.testing.assert_close(method.finalize_prefetched(layer, output), expected * 2)
+    layer.weight = torch.nn.Parameter(layer.weight.detach().clone() + 10,
+                                      requires_grad=False)
+    method.process_weights_after_loading(layer)
+    assert not method.is_prefetch_prepared(layer)
+    torch.testing.assert_close(method.embedding(layer, ids), expected + 10)
+
+
+@pytest.mark.parametrize("unquantized", [False, True])
 def test_uva_post_load_keeps_parameter_storage_on_cpu(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, unquantized,
 ):
     from vllm.model_executor.model_loader import utils as loader_utils
 
     layer = torch.nn.Module()
-    layer.quant_method = patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+    layer.quant_method = (
+        patch.HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod() if unquantized
+        else patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+    )
     layer.register_parameter(
         "weight",
         torch.nn.Parameter(torch.empty((4, 3), dtype=torch.int8), requires_grad=False),
