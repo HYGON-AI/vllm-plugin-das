@@ -385,6 +385,35 @@ def test_flash_attention_prefers_vendor_kernel_page_size(
     assert backend.get_preferred_block_size(16) == expected_block_size
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_kernel_block_size"),
+    [("varlen", 64), ("cutlass", 64), ("classic", 128)],
+)
+def test_hybrid_flash_attention_splits_manager_pages_to_vendor_kernel_size(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_kernel_block_size: int,
+) -> None:
+    from vllm.v1.worker.utils import select_common_block_size
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
+    monkeypatch.setattr(
+        flash_attn,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(is_hybrid=True),
+            cache_config=SimpleNamespace(
+                mamba_ssm_cache_dtype="float32",
+                mamba_cache_dtype="float32",
+            ),
+        ),
+    )
+
+    assert select_common_block_size(2176, [backend]) == expected_kernel_block_size
+
+
 def test_cutlass_block_first_hnd_stride_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):

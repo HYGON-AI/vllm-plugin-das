@@ -160,6 +160,11 @@ class HcuFlashAttentionBackend(AttentionBackend):
                 or cache_config.mamba_cache_dtype == "float32"
             )
         ):
+            mode = _get_flash_attn_mode()
+            if mode in ("varlen", "cutlass"):
+                return [64]
+            if mode == "classic":
+                return [128]
             # NOTE(tdoublep): while in principle, FA supports
             # MultipleOf(16), these are the block sizes that do not
             # suffer from the NaN propagation problem described here:
