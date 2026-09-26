@@ -1240,3 +1240,69 @@ def test_pcp_default_model_state_rejects_signature_drift() -> None:
     target.DefaultModelState = DefaultModelState
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         adapter.apply_to_module(target)
+
+
+def _install_recording_profile_run(
+    runner_module: ModuleType, seen: list[int]
+) -> None:
+    """Record the token budget observed by the real HCU runner override."""
+
+    def profile_run(self):
+        seen.append(int(self.max_num_tokens))
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+
+
+def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
+    pcp_runner_module,
+) -> None:
+    """PCP profiling must reserve 12.5% above the per-rank token share."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(16), "hcu:0")
+    runner.max_num_tokens = 16384
+
+    runner.profile_run()
+
+    assert seen == [1152]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_keeps_non_pcp_token_budget(
+    pcp_runner_module,
+) -> None:
+    """PCP=1 must retain the upstream profile token budget."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
+    runner.max_num_tokens = 16384
+
+    runner.profile_run()
+
+    assert seen == [16384]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_restores_token_budget_after_failure(
+    pcp_runner_module,
+) -> None:
+    """A failed PCP profile must not leak the temporary per-rank budget."""
+
+    runner_module, _ = pcp_runner_module
+
+    def failing_profile_run(self):
+        assert self.max_num_tokens == 576
+        raise RuntimeError("simulated profile failure")
+
+    runner_module.GPUModelRunner.profile_run = failing_profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(8), "hcu:0")
+    runner.max_num_tokens = 4096
+
+    with pytest.raises(RuntimeError, match="simulated profile failure"):
+        runner.profile_run()
+
+    assert runner.max_num_tokens == 4096

@@ -105,6 +105,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         with deepep_auto_request_phase_scope():
             return super().execute_model(*args, **kwargs)
 
+    def profile_run(self) -> None:
+        """Profile PCP with the per-rank token budget plus routing slack."""
+
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        if pcp_size <= 1:
+            return super().profile_run()
+
+        original_max = self.max_num_tokens
+        self.max_num_tokens = max(1, (original_max // pcp_size) * 9 // 8)
+        try:
+            return super().profile_run()
+        finally:
+            self.max_num_tokens = original_max
+
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
             return super().prepare_attn(input_batch)
