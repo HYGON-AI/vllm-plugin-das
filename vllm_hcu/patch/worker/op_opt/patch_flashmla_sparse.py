@@ -36,8 +36,11 @@ _DCP_MIXED_BATCH_REJECTION = (
 def _is_hyv4_dcp_dp4_config(vllm_config: object | None) -> bool:
     if vllm_config is None:
         return False
-    model_config = vllm_config.model_config
-    parallel_config = vllm_config.parallel_config
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if model_config is None or parallel_config is None or cache_config is None:
+        return False
     topology = (
         int(parallel_config.tensor_parallel_size),
         int(parallel_config.decode_context_parallel_size),
@@ -49,8 +52,7 @@ def _is_hyv4_dcp_dp4_config(vllm_config: object | None) -> bool:
         model_config.architectures == ["HYV4ForCausalLM"]
         and topology == _HYV4_DCP_DP4_TOPOLOGY
         and parallel_config.enable_expert_parallel
-        and vllm_config.cache_config.cache_dtype
-        in {"fp8_e4m3", "fp8_ds_mla"}
+        and cache_config.cache_dtype in {"fp8_e4m3", "fp8_ds_mla"}
     )
 
 
@@ -67,6 +69,17 @@ def apply_to_module(module: ModuleType) -> bool:
     if already_applied(flash, _MARKER, wrapped):
         return False
     builder_init = require_callable(builder_cls, "__init__", TARGETS[4])
+    require_exact_signature(
+        builder_init,
+        TARGETS[4],
+        positional=(
+            "self",
+            "kv_cache_spec",
+            "layer_names",
+            "vllm_config",
+            "device",
+        ),
+    )
     build = require_callable(builder_cls, "build", TARGETS[0])
     require_exact_signature(
         build, TARGETS[0],
@@ -130,6 +143,21 @@ def apply_to_module(module: ModuleType) -> bool:
                 or not str(error).startswith(_DCP_MIXED_BATCH_REJECTION)
             ):
                 raise
+
+            required_state = (
+                "num_heads",
+                "fp8_decode_padded_heads",
+                "fp8_use_mixed_batch",
+            )
+            missing_state = [
+                name for name in required_state if not hasattr(self, name)
+            ]
+            if missing_state:
+                raise PatchCompatibilityError(
+                    "FlashMLA sparse DCP head-boundary rejection moved before "
+                    "required builder initialization: "
+                    f"missing {missing_state}"
+                ) from error
 
             parallel_config = vllm_config.parallel_config
             gathered_num_heads = (
@@ -197,7 +225,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             cp_kv_cache_interleave_size = int(cp_kv_cache_interleave_size)
         pcp_world_size = effective_pcp_world_size(pcp_world_size)
-        if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
+        if (
+            not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH
+            and not _is_hyv4_dcp_dp4_config(vllm_config)
+        ):
             if getattr(result, "fp8_use_mixed_batch", False):
                 result.fp8_extra_metadata = build_fp8_separate_prefill_decode(
                     self,

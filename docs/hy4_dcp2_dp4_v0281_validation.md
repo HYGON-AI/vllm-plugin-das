@@ -114,7 +114,7 @@ done during this run.
 - After shutdown, no owned process remained and all eight cards reported 0%
   memory and compute utilization.
 
-Final focused Hy4, sparse-MLA adapter, and launcher coverage passed 275 tests.
+Final focused Hy4, sparse-MLA adapter, and launcher coverage passed 276 tests.
 The full-repository first-failure run passed 209 tests before reproducing the
 known W4A8 shared-storage numerical baseline failure in
 `test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert`; its mismatch
