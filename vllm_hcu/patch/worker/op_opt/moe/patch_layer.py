@@ -217,12 +217,19 @@ def apply_to_module(module: ModuleType) -> bool:
         for param_name, checkpoint_name, shard_index, shard_id in (
             self.get_expert_mapping(include_fused=True)
         ):
-            if checkpoint_name not in qual_name:
+            checkpoint_scale_name = f"{checkpoint_name}.weight_scale"
+            if checkpoint_scale_name in qual_name:
+                mapped_name = qual_name.replace(
+                    checkpoint_scale_name,
+                    f"{param_name}_scale",
+                )
+            elif checkpoint_name in qual_name:
+                mapped_name = qual_name.replace(checkpoint_name, param_name)
+            else:
                 if matched:
                     break
                 continue
             matched = True
-            mapped_name = qual_name.replace(checkpoint_name, param_name)
             local_name = mapped_name.removeprefix(f"{self.layer_name}.")
             param = getattr(self, local_name)
             if getattr(param, "quant_method", None) != "channel":
