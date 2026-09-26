@@ -26,13 +26,6 @@ def attention_forward(
 ) -> torch.Tensor:
     """Run attention while preserving HCU's custom split KV-cache semantics."""
 
-    if self.calculate_kv_scales:
-        torch.ops.vllm.maybe_calc_kv_scales(
-            query,
-            key,
-            value,
-            upstream._encode_layer_name(self.layer_name),
-        )
     if output_dtype is None:
         output_dtype = query.dtype
     if self.query_quant is not None:

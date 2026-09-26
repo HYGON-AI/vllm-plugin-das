@@ -474,7 +474,7 @@ def test_flashmla_sparse_rejects_old_separate_metadata_signature(monkeypatch):
         adapter.apply_to_module(module)
 
 
-def test_attention_direct_forward_preserves_cpu_values_and_query_device():
+def test_attention_direct_forward_without_legacy_scale_state_preserves_values():
     from vllm_hcu.model_executor.layers import attention_forward_runtime as runtime
     from vllm_hcu.model_executor.layers.mla_runtime import torch as runtime_torch
 
@@ -494,7 +494,6 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
         unified_attention_with_output=attention,
     )
     self = SimpleNamespace(
-        calculate_kv_scales=False,
         query_quant=None,
         num_heads=1,
         num_kv_heads=1,
@@ -527,7 +526,7 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     assert cache_layer_name == "layer"
 
 
-def test_attention_direct_forward_keeps_layer_name_resolution_outside_fullgraph():
+def test_attention_direct_forward_without_legacy_scale_state_compiles_fullgraph():
     from vllm.utils.torch_utils import LayerName
     from vllm_hcu.model_executor.layers import attention_forward_runtime as runtime
 
@@ -545,7 +544,6 @@ def test_attention_direct_forward_keeps_layer_name_resolution_outside_fullgraph(
     class Probe(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.calculate_kv_scales = False
             self.query_quant = None
             self.num_heads = 1
             self.num_kv_heads = 1
