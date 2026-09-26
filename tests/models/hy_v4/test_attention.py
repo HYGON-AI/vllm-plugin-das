@@ -339,3 +339,117 @@ def test_fp8_sparse_kernel_forwards_sink_and_slices_target_lse(monkeypatch):
     assert lse.shape == (1, 4, 2)
     assert torch.equal(captured["attn_sink"][:4], impl.sinks)
     assert torch.isneginf(captured["attn_sink"][4:]).all()
+
+
+def test_hyv4_dcp_gathers_loaded_sinks_once(monkeypatch):
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+
+    impl = _bare_sparse_impl(torch.arange(8, dtype=torch.float32))
+    impl.dcp_world_size = 2
+    other = torch.arange(8, 16, dtype=torch.float32)
+    calls = []
+
+    class Group:
+        def all_gather(self, value, dim):
+            calls.append((value.clone(), dim))
+            return torch.cat((value, other), dim=0)
+
+    monkeypatch.setattr(hcu_sparse, "get_dcp_group", lambda: Group(), raising=False)
+    impl.sinks.add_(10)
+    impl.process_weights_after_loading(torch.bfloat16)
+
+    assert len(calls) == 1 and calls[0][1] == 0
+    torch.testing.assert_close(
+        calls[0][0], torch.arange(8, dtype=torch.float32) + 10
+    )
+    torch.testing.assert_close(
+        impl._dcp_gathered_sinks,
+        torch.cat((torch.arange(8, dtype=torch.float32) + 10, other)),
+    )
+
+    no_dcp = _bare_sparse_impl(torch.arange(8, dtype=torch.float32))
+    no_dcp.process_weights_after_loading(torch.bfloat16)
+    assert no_dcp._dcp_gathered_sinks is None
+    assert len(calls) == 1
+
+
+def test_hyv4_dcp_kernel_passes_gathered_sink_on_rank0_only(monkeypatch):
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+
+    impl = _bare_sparse_impl(torch.arange(8, dtype=torch.float32))
+    impl.dcp_world_size = 2
+    impl._dcp_gathered_sinks = torch.arange(16, dtype=torch.float32)
+    received = []
+
+    def fake_flashmla(**kwargs):
+        received.append(kwargs["attn_sink"])
+        return torch.zeros(1, 2, 64, 512), torch.zeros(1, 64, 2)
+
+    monkeypatch.setattr(hcu_sparse, "flash_mla_with_kvcache", fake_flashmla)
+    metadata = SimpleNamespace(
+        dummy_block_table=torch.zeros(1, 1, dtype=torch.int32),
+        cache_lens=torch.tensor([2], dtype=torch.int32),
+        scheduler_metadata=None,
+    )
+    args = (
+        torch.zeros(1, 2, 16, 576),
+        torch.zeros(1, 656, dtype=torch.uint8),
+        torch.zeros(1, 2, 4, dtype=torch.int32),
+        metadata,
+    )
+
+    impl.dcp_rank = 0
+    impl._fp8_flash_mla_kernel(*args)
+    torch.testing.assert_close(received[0][:16], impl._dcp_gathered_sinks)
+    assert torch.isneginf(received[0][16:]).all()
+
+    impl.dcp_rank = 1
+    impl._fp8_flash_mla_kernel(*args)
+    assert received[1] is None
+
+
+def test_hyv4_dcp_rank0_lse_counts_sink_after_empty_mask(monkeypatch):
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+    from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
+
+    raw_lse = torch.tensor([[0.0] * 16, [float("-inf")] * 16])
+    raw_out = torch.ones(2, 16, 512)
+    raw_out[1].zero_()
+    monkeypatch.setattr(
+        FlashMLASparseImpl,
+        "_forward_fp8_kv_mixed_batch",
+        lambda self, *args: (raw_out.clone(), raw_lse.clone()),
+    )
+    impl = object.__new__(HYV4FlashMLASparseImpl)
+    impl.sinks = torch.ones(8, dtype=torch.float32)
+    impl._dcp_gathered_sinks = torch.ones(16, dtype=torch.float32)
+    impl.dcp_world_size = 2
+
+    impl.dcp_rank = 0
+    out, lse = impl._forward_fp8_kv_mixed_batch(None, None, None, None)
+    torch.testing.assert_close(
+        lse[0], torch.logaddexp(raw_lse[0], impl._dcp_gathered_sinks)
+    )
+    torch.testing.assert_close(lse[1], impl._dcp_gathered_sinks)
+    assert torch.count_nonzero(out[1]) == 0
+
+    impl.dcp_rank = 1
+    other_out, other_lse = impl._forward_fp8_kv_mixed_batch(
+        None, None, None, None
+    )
+    torch.testing.assert_close(other_out, raw_out)
+    torch.testing.assert_close(other_lse, raw_lse)
+
+
+def test_hyv4_uses_target_sparse_mqa_implementation():
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+    from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
+    from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+        HcuFlashMLASparseImpl,
+    )
+
+    assert HYV4FlashMLASparseImpl.forward_mqa is FlashMLASparseImpl.forward_mqa
+    assert (
+        HYV4FlashMLASparseImpl.forward_mqa
+        is not HcuFlashMLASparseImpl.forward_mqa
+    )

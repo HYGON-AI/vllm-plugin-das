@@ -1271,3 +1271,33 @@ def test_flashmla_cat_route_consumes_split_query(
     assert calls[0]["q_pe"] is q_pe
     assert calls[0]["block_table"] is block_table
     assert calls[0]["cache_seqlens"] is seq_lens
+
+
+@pytest.mark.parametrize("local_lse", [0.1, float("-inf")])
+def test_dcp_single_sink_matches_global_softmax(local_lse):
+    local_lse, other_lse, sink = torch.tensor(
+        [local_lse, 0.7, 1.2], dtype=torch.float64
+    )
+    local_value, other_value = torch.tensor([2.0, 4.0], dtype=torch.float64)
+    rank0_lse = torch.logaddexp(local_lse, sink)
+    rank0_output = torch.where(
+        torch.isneginf(local_lse),
+        0.0,
+        torch.exp(local_lse - rank0_lse) * local_value,
+    )
+
+    merged = (
+        torch.exp(rank0_lse) * rank0_output
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(rank0_lse) + torch.exp(other_lse))
+    oracle = (
+        torch.exp(local_lse) * local_value
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(local_lse) + torch.exp(other_lse) + torch.exp(sink))
+    double_sink = (
+        torch.exp(local_lse) * local_value
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(local_lse) + torch.exp(other_lse) + 2 * torch.exp(sink))
+
+    torch.testing.assert_close(merged, oracle)
+    assert not torch.isclose(double_sink, oracle)
