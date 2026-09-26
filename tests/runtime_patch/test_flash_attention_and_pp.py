@@ -1319,3 +1319,45 @@ def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
     assert result == "vendor-result"
     assert calls[0]["block_table"] is block_table
     assert calls[0]["seqused_k"] is seq_lens
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected_query_dtype"),
+    [("fp8_e5m2", torch.bfloat16), ("fp8_e4m3", torch.float8_e4m3fn)],
+)
+def test_hcu_flash_attention_e5m2_keeps_compute_dtype_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: str,
+    expected_query_dtype: torch.dtype,
+) -> None:
+    from vllm_hcu.model_executor.layers.attention_forward_runtime import attention_forward
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_fp8", lambda: True)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_quant_query_input", lambda: True)
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=1, head_size=64, scale=0.125, num_kv_heads=1,
+        alibi_slopes=None, sliding_window=None, kv_cache_dtype=cache_dtype,
+    )
+
+    def consume(query, key, value, output, layer_name, **kwargs):
+        # Vendor E5M2 KV accepts compute-dtype queries, not the E4M3
+        # queries produced by the platform-wide upstream quantizer.
+        assert query.dtype == expected_query_dtype
+        output.copy_(query.to(output.dtype))
+
+    layer = SimpleNamespace(
+        impl=impl,
+        query_quant=lambda query, scale: (query.to(torch.float8_e4m3fn), scale),
+        _q_scale=torch.tensor(1.0),
+        num_heads=1, num_kv_heads=1, head_size=64, head_size_v=64,
+        layer_name="layer", kv_cache_dtype=cache_dtype,
+        attn_backend=SimpleNamespace(forward_includes_kv_cache_update=True),
+        kv_sharing_target_layer_name=None, use_direct_call=True,
+    )
+    upstream = SimpleNamespace(unified_attention_with_output=consume)
+    query = torch.full((2, 64), 1.25, dtype=torch.bfloat16)
+    output = attention_forward(upstream, layer, query, query, query)
+    torch.testing.assert_close(output, query)
