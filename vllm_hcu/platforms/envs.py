@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
@@ -290,6 +291,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
                     ("true", "1")),
+
+    # Use fused TopK + page-table transform for sparse MLA DCP candidates.
+    "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM":
+        lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM", "True"
+        ).lower() in ("true", "1")),
 
     # If use AITER MHC impl, please set True
     "VLLM_HCU_USE_AITER_MHC":
