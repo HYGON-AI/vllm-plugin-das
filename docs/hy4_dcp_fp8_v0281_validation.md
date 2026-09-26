@@ -1,5 +1,9 @@
 # Hy4 FP8 DCP2 validation on v0.28.1-dev
 
+This records the original standalone #154 gate on `627ceda`. The later
+integration into #152, paired-wheel provenance and fresh regression results
+are maintained in [the combined validation record](hy4_v0281_combined_validation.md).
+
 ## Frozen artifacts
 
 - Date: 2026-09-26 UTC.
@@ -12,10 +16,11 @@
 - The wheel was installed with `pip --target` into the plan's ignored validation workspace. `vllm_hcu.__file__` resolved below that target when launched from `/models`, not from a source checkout.
 - HumanEval source: `/models/datasets/humaneval/HumanEval.jsonl.gz`; scorer: EvalScope 1.11.0 installed only in an ignored scoring target.
 
-The installed vLLM distribution exposes the `g77acaf` lineage, but its original
-wheel file and delivery checksum are unavailable. Therefore this is an isolated
-plugin-wheel gate against the installed target, not a complete paired-wheel
-release gate.
+At this original gate, the installed vLLM distribution exposed the `g77acaf`
+lineage but its wheel file and delivery checksum were unavailable. This run
+therefore validates an isolated plugin wheel against the installed target.
+The artifact was subsequently retrieved and byte-compared during #152/#156
+validation; see the combined record for its checksum and paired-wheel gates.
 
 ## Exact service commands
 
@@ -148,12 +153,12 @@ the server log SHA-256 is
 `35a85c63df68f53b79acda6e6498aff8e141bee3d18e24b3f1bb587714b6c7ce`.
 The server was shut down and all eight HCUs returned to 0% VRAM usage.
 
-## Current release decision
+## Original standalone release decision
 
 The target-only, MTP3 and concurrent accuracy gates pass. Independent
 complete-diff review found no blocking runtime issue; its one minor finding
 about request-local versus global MTP step IDs was corrected in the test and
-this record, then the changed-test-file suite passed again. Keep the separate
-MR in Draft because the original paired OpenDAS vLLM wheel file/checksum is
-unavailable, even though the installed target lineage and isolated plugin
-wheel were validated.
+this record, then the changed-test-file suite passed again. At that point
+the separate MR stayed Draft because the paired OpenDAS vLLM artifact was
+unavailable. This historical blocker is superseded by the later combined
+record; it is not an instruction to keep the integrated PR in Draft.
