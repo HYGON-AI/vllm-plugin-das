@@ -71,6 +71,51 @@ def _load_v32_sparse_indexer_contract(**dependencies):
     return namespace["forward_hip"]
 
 
+def _load_sparse_indexer_forward_hip(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_forward_hip", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
+def _load_dcp_topk_merge(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = copy.deepcopy(
+        next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_merge_dcp_topk_global"
+        )
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_dcp_merge", "exec"), namespace)
+    return namespace["_merge_dcp_topk_global"]
+
+
 def _load_v32_sparse_indexer_class():
     source = (
         REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
@@ -90,6 +135,181 @@ def _load_v32_sparse_indexer_class():
     namespace = {"torch": torch, "SparseAttnIndexer": object}
     exec(compile(module, "v32_sparse_indexer_class", "exec"), namespace)
     return namespace["V32SparseAttnIndexer"]
+
+
+def test_hcu_dcp_topk_merge_selects_global_candidates():
+    """HIP must exchange scored local candidates before sparse attention."""
+
+    local_logits = torch.tensor([[10.0, 1.0, 8.0, -5.0]])
+    local_indices = torch.tensor([[0, 2]], dtype=torch.int32)
+    other_candidates = torch.tensor([[[9.0, 1.0], [7.0, 3.0]]])
+    gathered_inputs: list[tuple[torch.Tensor, int]] = []
+
+    class Group:
+        def all_gather(self, value, dim):
+            gathered_inputs.append((value.clone(), dim))
+            return torch.cat((value, other_candidates), dim=dim)
+
+    merge = _load_dcp_topk_merge(
+        torch=torch,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        get_dcp_group=lambda: Group(),
+        get_lightop_fast_topk_transform=lambda: None,
+        use_lightop_dcp_topk_transform=lambda: False,
+        get_lightop_dcp_topk_metadata=lambda *args: pytest.fail(
+            "disabled LightOp DCP selector was used"
+        ),
+        _assert_cutedsl_dcp_merge_supported=lambda *args: pytest.fail(
+            "HIP DCP merge entered the CUDA/CuteDSL path"
+        ),
+    )
+
+    merge(
+        local_logits,
+        local_indices,
+        topk_tokens=2,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert len(gathered_inputs) == 1
+    assert gathered_inputs[0][1] == 1
+    torch.testing.assert_close(
+        gathered_inputs[0][0],
+        torch.tensor([[[10.0, 0.0], [8.0, 4.0]]]),
+    )
+    torch.testing.assert_close(
+        local_indices, torch.tensor([[0, 1]], dtype=torch.int32)
+    )
+
+
+def test_hcu_dcp_sparse_indexer_uses_native_path_with_dcp_contract():
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def native(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[12]
+
+    forward_hip = _load_sparse_indexer_forward_hip(
+        torch=SimpleNamespace(Tensor=torch.Tensor),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+        rocm_aiter_sparse_attn_indexer_native=native,
+    )
+    topk_buffer = object()
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        skip_k_cache_insert=False,
+        dcp_rank=1,
+        dcp_world_size=2,
+        cp_kv_cache_interleave_size=1,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=163840,
+        topk_indices_buffer=topk_buffer,
+    )
+
+    assert (
+        forward_hip(indexer, object(), torch.ones(1, 1), None, object())
+        is topk_buffer
+    )
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "skip_k_cache_insert": False,
+        "dcp_rank": 1,
+        "dcp_world_size": 2,
+        "cp_kv_cache_interleave_size": 1,
+    }
+
+
+def test_hcu_dcp_topk_merge_uses_lightop_fused_global_selection():
+    class Group:
+        def all_gather(self, packed, dim):
+            remote = packed.clone()
+            remote[..., 0].add_(0.5)
+            remote[..., 1].add_(1)
+            return torch.cat((packed, remote), dim=dim)
+
+    fused_calls = []
+    expected = torch.arange(4095, 2047, -1, dtype=torch.int32).reshape(1, -1)
+
+    def fused(**kwargs):
+        fused_calls.append(kwargs)
+        return expected
+
+    merge = _load_dcp_topk_merge(
+        torch=torch,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        get_dcp_group=lambda: Group(),
+        get_lightop_fast_topk_transform=lambda: fused,
+        use_lightop_dcp_topk_transform=lambda: True,
+        get_lightop_dcp_topk_metadata=lambda device, rows, candidates: (
+            torch.full((rows,), candidates, dtype=torch.int32, device=device),
+            torch.arange(rows + 1, dtype=torch.int32, device=device),
+        ),
+    )
+    indices = torch.arange(2048, dtype=torch.int32).reshape(1, -1)
+
+    merge(
+        torch.arange(2048, dtype=torch.float32).reshape(1, -1),
+        indices,
+        topk_tokens=2048,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert len(fused_calls) == 1
+    call = fused_calls[0]
+    assert call["score"].shape == (1, 4096)
+    assert call["page_table_size_1"].dtype == torch.int32
+    assert torch.equal(call["lengths"], torch.tensor([4096], dtype=torch.int32))
+    assert torch.equal(call["cu_seqlens_q"], torch.tensor([0, 1], dtype=torch.int32))
+    assert torch.equal(indices, expected)
+
+
+def test_hcu_dcp_lightop_topk_requires_custom_ops(monkeypatch):
+    from vllm_hcu.v1.attention.ops import decode_topk
+
+    monkeypatch.setattr(decode_topk.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(
+        decode_topk.henvs, "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", True
+    )
+    monkeypatch.setattr(
+        decode_topk.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+    )
+
+    assert not decode_topk.use_lightop_dcp_topk_transform()
+
+
+def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets():
+    from vllm_hcu.v1.attention.ops import decode_topk
+
+    decode_topk._LIGHTOP_DCP_TOPK_METADATA.clear()
+    try:
+        for rows in range(1, 130):
+            lengths, cu_seqlens_q = decode_topk.get_lightop_dcp_topk_metadata(
+                torch.device("cpu"), rows, 4096
+            )
+            assert lengths.shape == (rows,)
+            assert cu_seqlens_q.shape == (rows + 1,)
+            assert torch.equal(
+                lengths, torch.full((rows,), 4096, dtype=torch.int32)
+            )
+            assert torch.equal(
+                cu_seqlens_q, torch.arange(rows + 1, dtype=torch.int32)
+            )
+
+        assert len(decode_topk._LIGHTOP_DCP_TOPK_METADATA) == 9
+    finally:
+        decode_topk._LIGHTOP_DCP_TOPK_METADATA.clear()
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
@@ -715,7 +935,13 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
 
 
 def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
-    importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
+    if not hasattr(torch.ops.vllm, "hcu_sparse_attn_indexer"):
+        # With pytest's plugin disabled, an earlier Hy4 import can register
+        # the upstream op under the same name. Torch schemas cannot be
+        # replaced in-process; this HCU-only check runs in isolation instead.
+        if hasattr(torch.ops.vllm, "sparse_attn_indexer"):
+            pytest.skip("upstream sparse indexer already registered")
+        importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
 
     schema = torch.ops.vllm.hcu_sparse_attn_indexer.default._schema
     assert len(schema.returns) == 0

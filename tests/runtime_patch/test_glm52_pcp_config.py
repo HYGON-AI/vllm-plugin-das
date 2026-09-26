@@ -218,6 +218,68 @@ def test_glm52_pcp_allows_validated_builtin_mtp_depths(
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize("tokens", [1, 2, 3])
+def test_hy4_tp4_pcp2_eager_mtp_is_allowed(make_pcp_config, tokens) -> None:
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=4,
+        pcp=2,
+        speculative=True,
+        num_speculative_tokens=tokens,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_hy4_pp2_tp1_pcp4_eager_mtp2_is_allowed(make_pcp_config) -> None:
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=4,
+        pp=2,
+        speculative=True,
+        num_speculative_tokens=2,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tp": 2},
+        {"pcp": 4},
+        {"dcp": 2},
+        {"dp": 2},
+        {"enforce_eager": False},
+        {"speculative_method": "eagle"},
+        {"enable_expert_parallel": False},
+        {"lora": True},
+        {"multimodal": True},
+        {"kv_offload": True},
+        {"kv_transfer": True},
+    ],
+)
+def test_hy4_pcp_rejects_nearby_unvalidated_config(
+    make_pcp_config, change
+) -> None:
+    values = dict(architecture="HYV4ForCausalLM", tp=4, pcp=2, speculative=True)
+    values.update(change)
+    with pytest.raises(ValueError):
+        patch_vllm_config._validate_hcu_pcp_scope(make_pcp_config(**values))
+
+
+def test_hy4_pp2_pcp4_rejects_mtp3(make_pcp_config) -> None:
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=4,
+        pp=2,
+        speculative=True,
+        num_speculative_tokens=3,
+    )
+    with pytest.raises(ValueError, match="MTP"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
 def test_gqa_pcp_rejects_speculative_decoding(make_pcp_config) -> None:
     """FlashAttention PCP has no replicated speculative-decode contract."""
 
@@ -303,6 +365,9 @@ def _make_vllm_module() -> ModuleType:
                 raise AssertionError("legacy GQA DCP head constraint")
 
     class VllmConfig:
+        def _maybe_enable_breakable_cudagraph(self) -> bool:
+            return False
+
         def with_hf_config(self, hf_config: object, architectures=None):
             del hf_config, architectures
             return self

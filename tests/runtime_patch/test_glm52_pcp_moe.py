@@ -374,3 +374,81 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
         output,
         torch.tensor([[110.0, 112.0], [220.0, 222.0]]),
     )
+
+
+@pytest.mark.parametrize(
+    "pcp_size,use_all2all_kernels", [(1, False), (2, False), (2, True)]
+)
+@pytest.mark.parametrize("shape", [(2, 2), (1, 2, 2)])
+def test_hy4_gate_runs_once_before_runner_dispatch(
+    monkeypatch, moe_runner_module, pcp_size, use_all2all_kernels, shape
+):
+    """Catch duplicate outer gating using the real HCU runner gate/dispatch path.
+
+    Only communication and expert kernels are CPU doubles; this is not a
+    hardware accuracy or performance test.
+    """
+    from vllm_hcu.models.hy_v4.moe import HYV4MoEFused
+
+    class Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden):
+            self.calls += 1
+            return torch.nn.functional.linear(hidden.float(), torch.eye(2)), None
+
+    class Collectives:
+        def all_gather(self, value, dim=0):
+            assert value is not None
+            return torch.cat((value, value), dim=dim)
+
+        def reduce_scatter(self, value, dim=0):
+            return value.chunk(2, dim=dim)[0]
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.gate = Gate()
+    runner._fse_fuse_gate = False
+    runner._shared_experts = None
+    runner.moe_config = SimpleNamespace(
+        dp_size=1,
+        pcp_size=pcp_size,
+        is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=use_all2all_kernels),
+    )
+    runner.routed_experts = SimpleNamespace(
+        _ensure_moe_quant_config_init=lambda: None,
+        quant_method=SimpleNamespace(supports_internal_mk=False),
+    )
+    monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: Collectives())
+    monkeypatch.setattr(
+        moe_runner_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(dp_metadata=None),
+    )
+
+    def cpu_experts(*, hidden_states, router_logits, **kwargs):
+        assert router_logits is not None
+        assert router_logits.dtype == torch.float32
+        torch.testing.assert_close(router_logits, hidden_states.float())
+        return None, hidden_states * router_logits.sigmoid()
+
+    monkeypatch.setattr(runner, "_apply_quant_method", cpu_experts)
+
+    class Experts(torch.nn.Module):
+        def forward(self, *, hidden_states, router_logits):
+            return runner._forward_impl(hidden_states, router_logits, None)
+
+    layer = HYV4MoEFused.__new__(HYV4MoEFused)
+    torch.nn.Module.__init__(layer)
+    layer.gate = runner.gate
+    layer.experts = Experts()
+    hidden = torch.tensor([[0.0, 1.0], [2.0, 3.0]]).reshape(shape)
+
+    actual = layer(hidden)
+
+    assert runner.gate.calls == 1
+    assert actual.shape == hidden.shape
+    torch.testing.assert_close(actual, hidden * hidden.sigmoid())

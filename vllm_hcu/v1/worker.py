@@ -18,6 +18,9 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm.v1.worker.utils import request_memory
 
 logger = init_logger(__name__)
+# The plugin namespace inherits the root WARNING level; use vLLM's configured
+# INFO logger for the runner identity needed in live startup diagnostics.
+runner_logger = init_logger("vllm.hcu.runner")
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -35,7 +38,9 @@ def _create_model_runner(
         )
     from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
 
-    return HcuGPUModelRunnerV2(vllm_config, device)
+    runner = HcuGPUModelRunnerV2(vllm_config, device)
+    runner_logger.info("HCU model runner constructed: %s", type(runner).__name__)
+    return runner
 
 
 class HcuGPUWorker(Worker):

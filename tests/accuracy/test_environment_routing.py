@@ -91,6 +91,25 @@ def test_boolean_environment_values_are_lazily_parsed(
     ("value", "expected"),
     ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
 )
+def test_lightop_fast_topk_transform_environment_defaults_on(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    name = "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert getattr(hcu_envs, name) is expected
+    assert hcu_envs.is_set(name) is (value is not None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, True), ("1", True), ("true", True), ("0", False), ("false", False)),
+)
 def test_lightop_sqrtsoftplus_environment_is_lazy_and_defaults_on(
     monkeypatch: pytest.MonkeyPatch,
     value: str | None,

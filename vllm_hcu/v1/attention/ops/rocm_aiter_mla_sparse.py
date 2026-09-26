@@ -612,98 +612,76 @@ def fp8_paged_mqa_logits_torch(
     block_tables: torch.Tensor,
     max_model_len: int,
 ):
-    from vllm.utils.math_utils import cdiv
-
     fp8_dtype = current_platform.fp8_dtype()
-    batch_size, next_n, _, dim = q.size()
-    if next_n == 1:
-        block_size = kv_cache.shape[1]
-        logits = torch.full(
-            [batch_size, max_model_len],
-            float("-inf"),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        if context_lens.dim() > 1:
-            context_lens = context_lens.squeeze(-1)
-        kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
-        for i in range(batch_size):
-            q_i = q[i, 0].to(torch.float32)
-            q_scale = weights[i]
-            seq_len = int(context_lens[i].item())
-            assert seq_len <= max_model_len
-            num_pages = cdiv(seq_len, block_size)
-            padded_seq_len = num_pages * block_size
-            pages = block_tables[i, :num_pages]
-            cache = kv_cache_flat[pages]
-            scale_offset = block_size * dim
-            cache_value = (
-                cache[..., :scale_offset].view(dtype=fp8_dtype).to(torch.float32)
-            )
-            cache_scale = (
-                cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
-            )
-            cache_value = cache_value.view(padded_seq_len, dim)
-            cache_scale = cache_scale.view(padded_seq_len)
-            score = F.linear(cache_value, q_i)
-            score = F.relu(score)
-            score *= q_scale[None, :]
-            score = score.sum(dim=1)
-            score *= cache_scale
-            logits[i, :seq_len] = score[:seq_len]
-        return logits
-
-    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
-    scale = scale.contiguous().view(torch.float)
-    q = q.float()
-    kv_cache = kv_cache.view(fp8_dtype).float() * scale
-    num_block, block_size, _, dim = kv_cache.size()
+    batch_size, next_n, heads, dim = q.size()
+    block_size = kv_cache.shape[1]
+    # Shapes depend only on the capture bucket, never on GPU scalar values.
+    # Read complete logical pages, masking unused table entries before gather.
+    num_pages = (max_model_len + block_size - 1) // block_size
+    if block_tables.shape[1] < num_pages:
+        # Metadata may allocate only enough columns for this bucket.
+        num_pages = block_tables.shape[1]
+    if context_lens.ndim == 1:
+        # One final context length per request: each query has its own causal end.
+        ends = context_lens[:batch_size, None] - next_n + 1 + torch.arange(next_n, device=q.device)[None, :]
+    else:
+        # Compressed indexer metadata supplies exact per-query cache lengths.
+        ends = context_lens[:batch_size, :next_n]
     logits = torch.full(
-        [batch_size * next_n, max_model_len],
-        float("-inf"),
-        device=q.device,
-        dtype=torch.float32,
+        (batch_size, next_n, max_model_len), float("-inf"),
+        dtype=torch.float32, device=q.device,
     )
-    for i in range(batch_size):
-        context_len = context_lens[i]
-        if context_len.ndim == 0:
-            context_len_i = int(context_len.item())
-            q_offsets = torch.arange(
-                context_len_i - next_n, context_len_i, device=q.device
-            )
-            context_limit = torch.full(
-                (next_n,), context_len_i, dtype=torch.int32, device=q.device
-            )
-        else:
-            context_limit = context_len.to(device=q.device, dtype=torch.int32)
-            q_offsets = context_limit - 1
-        weight_slice = (
-            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+    flat_cache = kv_cache.reshape(-1, block_size * (dim + 4))
+    # Bound temporary KV/score storage independently of the context limit.
+    # Loop bounds use tensor shapes only, so replay may change lengths/pages.
+    # The final logits allocation remains part of the existing top-k ABI.
+    for batch_start in range(0, batch_size, 8):
+        batch_end = min(batch_start + 8, batch_size)
+        batch_count = batch_end - batch_start
+        chunk_ends = ends[batch_start:batch_end]
+        lengths = chunk_ends.amax(dim=1)
+        query = q[batch_start:batch_end].float().reshape(
+            batch_count, next_n * heads, dim
         )
-        max_context_len = int(context_limit.max().item())
-        for block_rk in range(cdiv(max_context_len, block_size)):
-            block_idx = block_tables[i][block_rk]
-            qx, kx = q[i], kv_cache[block_idx]
-            k_offsets = torch.arange(
-                block_rk * block_size, (block_rk + 1) * block_size, device=q.device
+        query_weights = weights.reshape(batch_size, next_n, heads, 1)[
+            batch_start:batch_end
+        ]
+        bytes_per_page = batch_count * block_size * (
+            dim * 6 + next_n * heads * 4 + next_n * 4 + 8
+        )
+        pages_per_chunk = max(1, (8 * 1024 * 1024) // bytes_per_page)
+        for page_start in range(0, num_pages, pages_per_chunk):
+            page_end = min(page_start + pages_per_chunk, num_pages)
+            page_count = page_end - page_start
+            page_offsets = torch.arange(page_start, page_end, device=q.device)
+            valid_pages = page_offsets[None, :] * block_size < lengths[:, None]
+            page_ids = torch.where(
+                valid_pages,
+                block_tables[batch_start:batch_end, page_start:page_end],
+                0,
+            ).long()
+            pages = flat_cache.index_select(0, page_ids.reshape(-1))
+            values = pages[:, :block_size * dim].contiguous().view(fp8_dtype)
+            values = values.reshape(batch_count, page_count * block_size, dim).float()
+            scales = pages[:, block_size * dim:].contiguous().view(torch.float32)
+            scales = scales.reshape(batch_count, page_count * block_size)
+            scores = torch.bmm(query, values.transpose(1, 2)).reshape(
+                batch_count, next_n, heads, page_count * block_size
             )
-            mask = (k_offsets[None, :] < context_limit[:, None]) & (
-                k_offsets[None, :] <= q_offsets[:, None]
+            scores.relu_().mul_(query_weights)
+            scores = scores.sum(dim=2).mul_(scales[:, None, :])
+            token_start = page_start * block_size
+            token_end = min(page_end * block_size, max_model_len)
+            offsets = torch.arange(
+                token_start, page_end * block_size, device=q.device
             )
-            s = torch.where(
-                mask[None, :, :],
-                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
-                    logits.dtype
-                ),
-                float("-inf"),
+            scores.masked_fill_(
+                offsets[None, None, :] >= chunk_ends[:, :, None], float("-inf")
             )
-            s = torch.relu(s) * weight_slice[..., None]
-            s = s.sum(dim=0)
-            logits[
-                i * next_n : (i + 1) * next_n,
-                block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
-    return logits
+            logits[batch_start:batch_end, :, token_start:token_end].copy_(
+                scores[:, :, :token_end - token_start]
+            )
+    return logits.reshape(batch_size * next_n, max_model_len)
 
 
 @functools.lru_cache
@@ -875,22 +853,41 @@ def fp8_mqa_logits_torch(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     k_fp8, scale = kv
-    seq_len_kv = k_fp8.shape[0]
-    k = k_fp8.to(torch.bfloat16)
-    q = q.to(torch.bfloat16)
-
-    mask_lo = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
+    num_queries, heads, dim = q.shape
+    num_keys = k_fp8.shape[0]
+    scale = scale.reshape(-1)
+    logits = torch.empty(
+        (num_queries, num_keys), dtype=torch.float32, device=q.device
     )
-    mask_hi = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
-    )
-    mask = mask_lo & mask_hi
-
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
-
+    # The caller budgets the final M*N logits, not an H*M*N score tensor.
+    # Tile Q and K while keeping the full head reduction and BF16 dot-product
+    # semantics. Shape-only loop bounds also allow CUDA/HIP Graph replay.
+    for query_start in range(0, num_queries, 64):
+        query_end = min(query_start + 64, num_queries)
+        query_count = query_end - query_start
+        query = q[query_start:query_end].to(torch.bfloat16)
+        query_weights = weights[query_start:query_end].T.unsqueeze(-1)
+        # Account for BF16 + FP32 scores, converted K, masks and reduced
+        # logits. The final output and backend GEMM workspace are separate.
+        bytes_per_key = heads * query_count * 6 + dim * 2 + query_count * 8
+        keys_per_chunk = max(1, min(1024, (8 * 1024 * 1024) // bytes_per_key))
+        for key_start in range(0, num_keys, keys_per_chunk):
+            key_end = min(key_start + keys_per_chunk, num_keys)
+            keys = k_fp8[key_start:key_end].to(torch.bfloat16)
+            scores = torch.einsum("mhd,nd->hmn", query, keys).float()
+            scores.mul_(scale[None, None, key_start:key_end])
+            scores.relu_().mul_(query_weights)
+            reduced = scores.sum(dim=0)
+            offsets = torch.arange(key_start, key_end, device=q.device)
+            invalid = (
+                offsets[None, :] < cu_seqlen_ks[query_start:query_end, None]
+            ) | (
+                offsets[None, :] >= cu_seqlen_ke[query_start:query_end, None]
+            )
+            reduced.masked_fill_(invalid, float("-inf"))
+            logits[query_start:query_end, key_start:key_end].copy_(reduced)
+            # Do not retain the previous tile during the next GEMM allocation.
+            del scores, reduced, keys, invalid
     return logits
 
 
@@ -1256,6 +1253,9 @@ def rocm_aiter_sparse_attn_indexer_native(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -1333,67 +1333,112 @@ def rocm_aiter_sparse_attn_indexer_native(
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
+        max_local_total_seq_lens = max(
+            getattr(
+                chunk,
+                "max_local_total_seq_lens",
+                chunk.total_seq_lens,
+            )
+            for chunk in prefill_metadata.chunks
+        )
+        k_fp8_full = torch.empty(
+            [max_local_total_seq_lens, head_dim],
+            device=device,
+            dtype=fp8_dtype,
+        )
+        k_scale_full = torch.empty(
+            [max_local_total_seq_lens, 4],
+            device=device,
+            dtype=torch.uint8,
+        )
         for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim],
-                device=device,
-                dtype=fp8_dtype,
+            local_cu_seq_lens = getattr(chunk, "local_cu_seq_lens", None)
+            if local_cu_seq_lens is None:
+                local_cu_seq_lens = chunk.cu_seq_lens
+            local_total_seq_lens = getattr(
+                chunk, "local_total_seq_lens", chunk.total_seq_lens
             )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4],
-                device=device,
-                dtype=torch.uint8,
+            chunk_max_local_seq_lens = getattr(
+                chunk,
+                "max_local_total_seq_lens",
+                chunk.total_seq_lens,
             )
-            if not current_platform.is_rocm() or on_gfx938():
-                ops.cp_gather_indexer_k_quant_cache(
-                    hipc_kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-            else:
-                cp_gather_indexer_k_bf16_cache_triton(
-                    kv_cache,
-                    k_fp8,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-                # cp_gather_indexer_k_quant_cache_triton(
-                #     kv_cache,
-                #     k_fp8,
-                #     k_scale,
-                #     chunk.block_table,
-                #     chunk.cu_seq_lens,
-                #     token_to_seq=chunk.token_to_seq,
-                # )
+            skip_kv_gather = getattr(chunk, "skip_kv_gather", False)
+            k_fp8 = k_fp8_full[:chunk_max_local_seq_lens]
+            k_scale = k_scale_full[:chunk_max_local_seq_lens]
+            if not skip_kv_gather and local_total_seq_lens > 0:
+                if not current_platform.is_rocm() or on_gfx938():
+                    ops.cp_gather_indexer_k_quant_cache(
+                        hipc_kv_cache,
+                        k_fp8,
+                        k_scale,
+                        chunk.block_table,
+                        local_cu_seq_lens,
+                    )
+                else:
+                    cp_gather_indexer_k_bf16_cache_triton(
+                        kv_cache,
+                        k_fp8,
+                        chunk.block_table,
+                        local_cu_seq_lens,
+                    )
+                    # cp_gather_indexer_k_quant_cache_triton(
+                    #     kv_cache,
+                    #     k_fp8,
+                    #     k_scale,
+                    #     chunk.block_table,
+                    #     local_cu_seq_lens,
+                    #     token_to_seq=chunk.token_to_seq,
+                    # )
 
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            if _use_lightop_sparse_mla_topk():
-                _lightop_topk_indices_prefill(
-                    logits,
+            q_slice = q_fp8[chunk.token_start : chunk.token_end]
+            if local_total_seq_lens == 0:
+                logits = q_slice.new_empty(
+                    (q_slice.shape[0], 0), dtype=torch.float32
+                )
+                topk_indices.fill_(-1)
+            else:
+                logits = rocm_fp8_mqa_logits(
+                    q_slice,
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_indices,
-                    topk_tokens,
                 )
-            else:
-                topk_indices.copy_(
-                    _topk_indices_torch(
+                if _use_lightop_sparse_mla_topk():
+                    _lightop_topk_indices_prefill(
                         logits,
-                        topk_tokens,
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
                     )
+                else:
+                    topk_indices.copy_(
+                        _topk_indices_torch(
+                            logits,
+                            topk_tokens,
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                        )
+                    )
+
+            if dcp_world_size > 1:
+                from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+                    _merge_dcp_topk_global,
+                )
+
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
                 )
 
     if has_decode:
@@ -1461,6 +1506,20 @@ def rocm_aiter_sparse_attn_indexer_native(
                     topk_tokens,
                     row_ends=row_ends,
                 )
+            )
+
+        if dcp_world_size > 1:
+            from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+                _merge_dcp_topk_global,
+            )
+
+            _merge_dcp_topk_global(
+                logits,
+                topk_indices,
+                topk_tokens,
+                dcp_rank,
+                dcp_world_size,
+                cp_kv_cache_interleave_size,
             )
 
         if decode_metadata.requires_padding:
