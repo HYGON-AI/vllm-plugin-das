@@ -45,7 +45,11 @@ def validate_hy4_dcp_config(vllm_config: object) -> bool:
 
     cache_dtype = vllm_config.cache_config.cache_dtype
     if cache_dtype not in _SUPPORTED_CACHE_DTYPES:
-        raise ValueError("HY V4 DCP requires --kv-cache-dtype fp8_e4m3.")
+        supported = ", ".join(sorted(_SUPPORTED_CACHE_DTYPES))
+        raise ValueError(
+            "HY V4 DCP requires --kv-cache-dtype to be one of: "
+            f"{supported}."
+        )
     if not vllm_config.use_v2_model_runner or not model_config.use_mla:
         raise ValueError("HY V4 DCP requires MLA Model Runner V2.")
 

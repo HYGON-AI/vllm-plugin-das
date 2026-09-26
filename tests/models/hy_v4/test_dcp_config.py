@@ -141,6 +141,17 @@ def test_hy4_dcp2_accepts_valid_fp8_mrv2_configuration(
     assert validate_hy4_dcp_config(make_dcp_config(**changes)) is True
 
 
+def test_hy4_dcp2_dtype_error_lists_both_supported_formats(make_dcp_config):
+    from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
+
+    with pytest.raises(ValueError) as error:
+        validate_hy4_dcp_config(make_dcp_config(kv_dtype="fp8_ds_mla_typo"))
+
+    assert "--kv-cache-dtype" in str(error.value)
+    assert "fp8_e4m3" in str(error.value)
+    assert "fp8_ds_mla" in str(error.value)
+
+
 def test_hy4_dcp2_rejects_query_replication_environment(
     monkeypatch, make_dcp_config
 ):

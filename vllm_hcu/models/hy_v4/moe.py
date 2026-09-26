@@ -185,10 +185,11 @@ class HYV4MoEFused(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        router_logits, _ = self.gate(hidden_states)
+        # The runner owns the gate and computes logits after shared-expert
+        # stream synchronization, before dispatch. Do not project twice.
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            router_logits=None,
         )
         return final_hidden_states.view(original_shape)
 

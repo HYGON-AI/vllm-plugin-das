@@ -26,13 +26,16 @@ class _FakeExperts(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.last_router_logits: torch.Tensor | None = None
+        self.gate: nn.Module | None = None
 
     def forward(
         self,
         *,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.gate is not None:
+            router_logits, _ = self.gate(hidden_states)
         self.last_router_logits = router_logits
         return hidden_states + 1
 
@@ -89,6 +92,7 @@ def test_hy_v4_moe_preserves_router_and_clamp_contract(monkeypatch) -> None:
 
     def fake_fused_moe(**kwargs):
         fused_kwargs.update(kwargs)
+        fake_experts.gate = kwargs["gate"]
         return fake_experts
 
     monkeypatch.setattr(moe, "FusedMoEFactory", fake_fused_moe)

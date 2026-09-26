@@ -1,5 +1,45 @@
 # Hy4 combined PR #152 integration validation (2026-09-26)
 
+## Review follow-up after integration commit `093097b`
+
+Three review findings are corrected without changing supported topologies or
+cache formats:
+
+- Hy4 delegates gate evaluation exclusively to the HCU MoE runner. The runner
+  still computes FP32 logits after shared-expert stream synchronization and
+  before dispatch; the discarded outer projection is removed.
+- The breakable-graph registration test records the original environment
+  value even when absent, allowing MonkeyPatch teardown to undo the hook's
+  direct write. Both Hy4 architectures are checked with absent, `0`, and `1`
+  initial values.
+- The DCP dtype error enumerates the existing supported set (`fp8_e4m3` and
+  `fp8_ds_mla`) rather than mentioning only one format.
+
+Before the fixes, six CPU gate regressions observed two calls rather than one,
+two initially-absent environment cases leaked `1`, and the dtype diagnostic
+regression failed. After the fixes, the configuration/registration files passed
+41 tests and the MoE/PCP files passed 23 tests (14 existing deprecation warnings).
+The gate regression executes the real HCU `_forward_impl`, dispatch, and combine
+paths; its communication and expert kernels are CPU doubles. Independent
+read-only review found no Critical, Important, or Minor issue in the corrective
+code/test diff and confirmed the custom-op optional-logits contract.
+
+The complete 22 test files changed by #152, including this follow-up, passed
+**576 tests, 1 skipped**, with 14 existing deprecation warnings in 135.35 seconds.
+
+The full-suite entry point was attempted again but stopped during collection
+in `tests/patch/test_base_linear_parameter.py`: the default
+`VLLM_V0251_SOURCE_ROOT` does not contain the legacy vLLM source tree. This is
+not a full-suite pass. The previously recorded W4A8 failure below is not fixed
+or reclassified by this follow-up.
+
+No new hardware accuracy or performance run is claimed for these fixes. The
+wheel hashes and HumanEval results below remain evidence for the earlier
+`17f1f2b` production tree, not for this follow-up. Compatibility remains scoped
+to the supported HCU replacement initialization path; disabled replacements,
+unrelated legacy defects, and a full-model accuracy/performance certification
+are outside this corrective review.
+
 ## DCP #154 integration candidate
 
 The user requested folding DCP #154 into #152 after PCP #156. The integration
