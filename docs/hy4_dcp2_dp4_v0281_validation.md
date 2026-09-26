@@ -16,6 +16,8 @@ The branch starts at `v0.28.1-dev` commit
   envelope.
 - `54404c9`: retain the mixed-batch FP8 sparse-MLA path at the 32-head
   boundary.
+- `6c5ab68`: keep the exact topology on that safe path even when the generic
+  mixed-batch switch is disabled, and reject upstream constructor drift.
 
 The v0.25.1 implementation was checked as a historical design reference. It
 provides generic DCP/DP process groups but no Hy4-specific configuration gate
@@ -47,10 +49,10 @@ continue to use the upstream behavior.
 The hardware run imported both `vllm_hcu` and `hcu_ops` from the isolated
 install of:
 
-`vllm_hcu-0.28.1rc1.dev491+das.54404c9.dtk2604-cp310-cp310-linux_x86_64.whl`
+`vllm_hcu-0.28.1rc1.dev491+das.6c5ab68.dtk2604-cp310-cp310-linux_x86_64.whl`
 
 SHA-256:
-`9c34be221cc02a07f578cb3f1fcf4ecaf03155ff5dcb2a54bfd3890cd8628fd7`
+`463d1c0737500bf7ae23aa9c7630949cc66c20a14d0e58af22e22e333e2554f8`
 
 The paired framework was installed vLLM
 `0.28.1+das.77acaf6.dtk2604`.
@@ -104,6 +106,10 @@ done during this run.
 - DCP, DP, and EP process groups initialized; EP world size was eight.
 - The target captured 19 PIECEWISE CUDA Graph sizes. The MTP speculator then
   captured its model and prefill PIECEWISE graphs on all eight workers.
+- The final review-fix run deliberately set
+  `VLLM_HCU_USE_FP8_MIXED_BATCH=0`. The exact Hy4 topology still retained the
+  required mixed-batch path, completed the same captures, and passed 8/8;
+  unrelated configurations continue to honor the generic switch.
 - The API reached ready state. `/health` returned HTTP 200 before and after
   the requests.
 - Ordered HumanEval/0-7 requests all returned HTTP 200 with
