@@ -94,19 +94,25 @@ def _normalize_hy_v4_kv_cache_dtype(
 
 
 def _require_supported_hy_v4_parallelism(parallel_config) -> None:
-    """Admit only the validated Hy4 DCP topology beyond the TP-only path."""
-    pcp = parallel_config.prefill_context_parallel_size
-    dcp = parallel_config.decode_context_parallel_size
+    """Allow the independent PCP and DCP contracts, never their combination."""
+    pcp = int(parallel_config.prefill_context_parallel_size)
+    dcp = int(parallel_config.decode_context_parallel_size)
     if pcp == 1 and dcp == 1:
         return
     topology = (
-        parallel_config.tensor_parallel_size,
+        int(parallel_config.tensor_parallel_size),
         dcp,
         pcp,
-        parallel_config.pipeline_parallel_size,
-        parallel_config.data_parallel_size,
+        int(parallel_config.pipeline_parallel_size),
+        int(parallel_config.data_parallel_size),
     )
     if topology == (8, 2, 1, 1, 1):
+        # The DCP config gate owns the remaining dtype/backend/EP checks.
+        return
+    if (
+        topology in {(4, 1, 2, 1, 1), (1, 1, 4, 2, 1)}
+        and parallel_config.enable_expert_parallel
+    ):
         return
     raise RuntimeError(
         "HY V4 HCU context parallel topology has not been validated: "

@@ -1078,12 +1078,17 @@ class HcuPCPManager:
         )
 
     def restore_for_sampling(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, InputBatch]:
-        """Restore final hidden states and the exact saved global InputBatch."""
+        self, hidden_states: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, InputBatch]:
+        """Restore the global batch; gather hidden states only on final PP."""
 
         assert self._global_batch is not None
-        return self.restore_hidden_states(hidden_states), self._global_batch
+        restored = (
+            None
+            if hidden_states is None
+            else self.restore_hidden_states(hidden_states)
+        )
+        return restored, self._global_batch
 
 
 def maybe_build_pcp_manager(
