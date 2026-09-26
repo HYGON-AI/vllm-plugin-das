@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.linear import (
@@ -95,14 +96,18 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
-        if isinstance(layer, LinearBase):
-            if self.ignore and should_ignore_layer(
-                prefix,
-                ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
-                use_fnmatch=True,
-            ):
+        if self.ignore and should_ignore_layer(
+            prefix,
+            ignore=self.ignore,
+            fused_mapping=self.packed_modules_mapping,
+            use_fnmatch=True,
+        ):
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
+            return None
+        if isinstance(layer, LinearBase):
             if self.w8a8_include is not None and not should_ignore_layer(
                 prefix,
                 ignore=self.w8a8_include,

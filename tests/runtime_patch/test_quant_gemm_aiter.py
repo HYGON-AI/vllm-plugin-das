@@ -4056,6 +4056,37 @@ def test_slimquant_w4a8_dispatches_current_routed_experts_to_aiter_method():
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_leaves_ignored_mtp_experts_unquantized(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    class FakeUnquantizedFusedMoEMethod:
+        def __init__(self, moe_config):
+            self.moe_config = moe_config
+
+    monkeypatch.setattr(
+        slimquant_w4a8,
+        "UnquantizedFusedMoEMethod",
+        FakeUnquantizedFusedMoEMethod,
+        raising=False,
+    )
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = SimpleNamespace(moe_backend="aiter")
+    config = slimquant_w4a8.SlimQuantW4A8Int8Config.from_config(
+        {
+            "quant_method": "slimquant_w4a8",
+            "ignore": [r"re:^mtp\..*"],
+        }
+    )
+
+    method = config.get_quant_method(layer, "mtp.layers.0.mlp.experts")
+
+    assert isinstance(method, FakeUnquantizedFusedMoEMethod)
+    assert method.moe_config is layer.moe_config
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_dispatch_preserves_linear_method():
     from vllm.model_executor.layers.linear import ReplicatedLinear
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
