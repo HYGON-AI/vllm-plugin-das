@@ -106,7 +106,7 @@ def _require_supported_hy_v4_parallelism(parallel_config) -> None:
         int(parallel_config.pipeline_parallel_size),
         int(parallel_config.data_parallel_size),
     )
-    if topology == (8, 2, 1, 1, 1):
+    if topology in {(8, 2, 1, 1, 1), (2, 2, 1, 1, 4)}:
         # The DCP config gate owns the remaining dtype/backend/EP checks.
         return
     if (

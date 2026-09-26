@@ -54,6 +54,7 @@ def test_unsafe_generic_fp8_cache_is_rejected():
         (4, 2, 1, 1, 1, True, True),
         (1, 4, 1, 2, 1, True, True),
         (8, 1, 2, 1, 1, True, True),
+        (2, 1, 2, 1, 4, True, True),
         (2, 2, 1, 1, 1, True, False),
         (8, 2, 1, 1, 1, True, False),
         (4, 2, 2, 1, 1, True, False),

@@ -10,13 +10,19 @@ from vllm_hcu.patch.config import get_hcu_config
 
 
 _HYV4_ARCHITECTURE = "HYV4ForCausalLM"
-_SUPPORTED_TOPOLOGY = (8, 2, 1, 1, 1)
+_SUPPORTED_TOPOLOGIES = frozenset(
+    {
+        (8, 2, 1, 1, 1),
+        (2, 2, 1, 1, 4),
+    }
+)
+_SUPPORTED_HEAD_ENVELOPES = frozenset({(8, 16), (32, 64)})
 _SUPPORTED_CACHE_DTYPES = frozenset({"fp8_e4m3", "fp8_ds_mla"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 def validate_hy4_dcp_config(vllm_config: object) -> bool:
-    """Validate the first supported Hy4 FP8 DCP2 topology.
+    """Validate a supported Hy4 FP8 DCP2 topology.
 
     Returns ``False`` for configurations outside Hy4 DCP, allowing their
     existing validation paths to remain authoritative. Invalid Hy4 DCP
@@ -37,10 +43,11 @@ def validate_hy4_dcp_config(vllm_config: object) -> bool:
         parallel_config.pipeline_parallel_size,
         parallel_config.data_parallel_size,
     )
-    if topology != _SUPPORTED_TOPOLOGY:
+    if topology not in _SUPPORTED_TOPOLOGIES:
         raise ValueError(
             "HY V4 DCP topology is not validated: "
-            f"TP/DCP/PCP/PP/DP={topology}; expected {_SUPPORTED_TOPOLOGY}."
+            f"TP/DCP/PCP/PP/DP={topology}; expected one of "
+            f"{sorted(_SUPPORTED_TOPOLOGIES)}."
         )
 
     cache_dtype = vllm_config.cache_config.cache_dtype
@@ -58,10 +65,12 @@ def validate_hy4_dcp_config(vllm_config: object) -> bool:
         raise ValueError("HY V4 DCP requires 64 attention heads.")
     local_heads = num_heads // parallel_config.tensor_parallel_size
     gathered_heads = local_heads * parallel_config.decode_context_parallel_size
-    if (local_heads, gathered_heads) != (8, 16):
+    head_envelope = (local_heads, gathered_heads)
+    if head_envelope not in _SUPPORTED_HEAD_ENVELOPES:
         raise ValueError(
-            "HY V4 DCP FP8 head envelope requires 8 local and 16 gathered "
-            "attention heads."
+            "HY V4 DCP FP8 head envelope is not validated: "
+            f"local/gathered={head_envelope}; expected one of "
+            f"{sorted(_SUPPORTED_HEAD_ENVELOPES)}."
         )
 
     if parallel_config.dcp_comm_backend != "ag_rs":
