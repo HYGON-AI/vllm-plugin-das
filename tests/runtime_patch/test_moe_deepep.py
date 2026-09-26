@@ -1871,6 +1871,19 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     torch.testing.assert_close(loaded[3][2], fused_scale[1, 2:])
 
     loaded.clear()
+    assert list(
+        experts.load_weights(
+            [("experts.gate_up_proj.weight_scale", fused_scale)]
+        )
+    ) == ["w13_weight_scale"] * 4
+    assert [(shard, expert) for shard, expert, _ in loaded] == [
+        ("w1", 0),
+        ("w1", 1),
+        ("w3", 0),
+        ("w3", 1),
+    ]
+
+    loaded.clear()
     experts.w2_weight_scale = ChannelScale()
     experts.expert_mapping = [
         ("w2_weight", "experts.down_proj", 0, "w2"),
@@ -1885,6 +1898,17 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     ]
     torch.testing.assert_close(loaded[0][2], down_scale[0])
     torch.testing.assert_close(loaded[1][2], down_scale[1])
+
+    loaded.clear()
+    assert list(
+        experts.load_weights(
+            [("experts.down_proj.weight_scale", down_scale)]
+        )
+    ) == ["w2_weight_scale"] * 2
+    assert [(shard, expert) for shard, expert, _ in loaded] == [
+        ("w2", 0),
+        ("w2", 1),
+    ]
 
     assert list(experts.load_weights([("experts.down_proj", down_scale)])) == [
         "official-load"

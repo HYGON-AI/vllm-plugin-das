@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -11,9 +11,14 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -21,7 +26,14 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.utils import set_weight_attrs
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
+
 
 class SlimQuantW4A8Int8Config(QuantizationConfig):
     """SlimQuant W4A8 configuration.
@@ -29,6 +41,17 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
     Weights are static, symmetric per-channel INT4 values packed two per byte.
     Activations are dynamically quantized per token to INT8.
     """
+
+    def __init__(
+        self,
+        ignore: list[str] | None = None,
+        w8a8_include: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.ignore = list(ignore or [])
+        self.w8a8_include = (
+            None if w8a8_include is None else list(w8a8_include)
+        )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -48,14 +71,50 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SlimQuantW4A8Int8Config":
-        return cls()
+        mixed_precision = config.get("mixed_precision")
+        w8a8_include = None
+        if (
+            isinstance(mixed_precision, dict)
+            and "w8a8_include" in mixed_precision
+        ):
+            w8a8_config = mixed_precision.get("w8a8_include") or {}
+            w8a8_include = list(w8a8_config.get("modules") or [])
+        return cls(
+            ignore=config.get("ignore"),
+            w8a8_include=w8a8_include,
+        )
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
+        self.ignore = hf_to_vllm_mapper.apply_list(self.ignore)
+        if self.w8a8_include is not None:
+            self.w8a8_include = hf_to_vllm_mapper.apply_list(
+                self.w8a8_include
+            )
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        if self.ignore and should_ignore_layer(
+            prefix,
+            ignore=self.ignore,
+            fused_mapping=self.packed_modules_mapping,
+            use_fnmatch=True,
+        ):
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
         if isinstance(layer, LinearBase):
+            if self.w8a8_include is not None and not should_ignore_layer(
+                prefix,
+                ignore=self.w8a8_include,
+                fused_mapping=self.packed_modules_mapping,
+                use_fnmatch=True,
+            ):
+                return UnquantizedLinearMethod()
             layer.scheme = CompressedTensorsW8A8Int8(
                 QuantizationStrategy.CHANNEL, False, True
             )
