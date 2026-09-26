@@ -779,10 +779,10 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
+        dcp_rank: int,
+        dcp_world_size: int,
+        cp_kv_cache_interleave_size: int,
     ) -> torch.Tensor:
-        parallel_config = get_current_vllm_config().parallel_config
-        dcp_world_size = parallel_config.decode_context_parallel_size
-        dcp_rank = get_dcp_group().rank_in_group if dcp_world_size > 1 else 0
         return rocm_aiter_sparse_attn_indexer_native(
             hidden_states,
             k_cache_prefix,
@@ -800,9 +800,7 @@ if current_platform.is_rocm():
             skip_k_cache_insert=skip_k_cache_insert,
             dcp_rank=dcp_rank,
             dcp_world_size=dcp_world_size,
-            cp_kv_cache_interleave_size=(
-                parallel_config.cp_kv_cache_interleave_size
-            ),
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
     def hcu_sparse_attn_indexer_fake(
@@ -820,8 +818,16 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
+        dcp_rank: int,
+        dcp_world_size: int,
+        cp_kv_cache_interleave_size: int,
     ) -> torch.Tensor:
-        del skip_k_cache_insert
+        del (
+            skip_k_cache_insert,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+        )
         return rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,
@@ -1109,4 +1115,7 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             skip_k_cache_insert,
+            getattr(self, "dcp_rank", 0),
+            getattr(self, "dcp_world_size", 1),
+            getattr(self, "cp_kv_cache_interleave_size", 1),
         )

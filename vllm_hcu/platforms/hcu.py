@@ -26,7 +26,9 @@ import vllm_hcu.platforms.envs as henvs
 
 logger = init_logger(__name__)
 
-_HYV4_FULL_DCP_ARCHITECTURES = frozenset({"HYV4ForCausalLM"})
+_SPARSE_MLA_FULL_DCP_ARCHITECTURES = frozenset(
+    {"HYV4ForCausalLM", "GlmMoeDsaForCausalLM"}
+)
 
 
 def _supports_full_decode_cudagraph_with_dcp(vllm_config: "VllmConfig") -> bool:
@@ -41,7 +43,7 @@ def _supports_full_decode_cudagraph_with_dcp(vllm_config: "VllmConfig") -> bool:
         and vllm_config.compilation_config.mode is CompilationMode.NONE
         and dcp_backend == "ag_rs"
         and any(
-            architecture in _HYV4_FULL_DCP_ARCHITECTURES
+            architecture in _SPARSE_MLA_FULL_DCP_ARCHITECTURES
             for architecture in architectures
         )
     )
@@ -603,8 +605,9 @@ class HCUPlatform(Platform):
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # Full DCP graphs are opt-in and limited to the validated HY4 ag_rs
-            # decode path. Keep every other DCP configuration on PIECEWISE.
+            # Full DCP graphs are opt-in and limited to validated sparse-MLA
+            # ag_rs decode paths. Keep every other DCP configuration on
+            # PIECEWISE.
             if (
                 parallel_config.decode_context_parallel_size > 1
                 and not _supports_full_decode_cudagraph_with_dcp(vllm_config)
@@ -625,9 +628,9 @@ class HCUPlatform(Platform):
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             elif parallel_config.decode_context_parallel_size > 1:
                 logger.info_once(
-                    "HY4 DCP with ag_rs is retaining the explicitly requested "
-                    "full CUDA graph mode. Attention backend capability checks "
-                    "may narrow it to full decode graphs."
+                    "Sparse MLA DCP with ag_rs is retaining the explicitly "
+                    "requested full CUDA graph mode. Attention backend "
+                    "capability checks may narrow it to full decode graphs."
                 )
 
         if cache_config and not cache_config.user_specified_block_size:
