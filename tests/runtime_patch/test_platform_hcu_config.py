@@ -1018,6 +1018,7 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
         model_config=SimpleNamespace(
+            architectures=["Qwen3ForCausalLM"],
             enforce_eager=True,
             use_mla=False,
             max_model_len=4096,
