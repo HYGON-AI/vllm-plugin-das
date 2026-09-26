@@ -116,7 +116,7 @@ def test_shared_indexer_cannot_precede_its_full_producer():
         compute_skip_topk_layers(config)
 
 
-def test_sparse_e4m3_cache_spec_has_quantized_page_geometry():
+def test_hy4_dcp_sparse_e4m3_cache_spec_keeps_tp8_page_geometry():
     from vllm_hcu.models.hy_v4.attention import HYV4MLAAttentionLayer
 
     attention = object.__new__(HYV4MLAAttentionLayer)
@@ -129,6 +129,11 @@ def test_sparse_e4m3_cache_spec_has_quantized_page_geometry():
         SimpleNamespace(
             model_config=None,
             cache_config=SimpleNamespace(block_size=64),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=8,
+                decode_context_parallel_size=2,
+                cp_kv_cache_interleave_size=1,
+            ),
         )
     )
 
@@ -189,8 +194,9 @@ def test_hyv4_sink_keeps_short_prefill_on_sparse_mqa(monkeypatch):
 
 
 @pytest.mark.parametrize("learnable_sink", [False, True])
+@pytest.mark.parametrize("dcp", [1, 2])
 def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
-    monkeypatch, learnable_sink
+    monkeypatch, learnable_sink, dcp
 ):
     from vllm_hcu.models.hy_v4 import attention as hy_attention
 
@@ -200,14 +206,33 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
             self.kwargs = kwargs
 
     vllm_config = SimpleNamespace(
+        use_v2_model_runner=True,
         attention_config=SimpleNamespace(sparse_mla_force_mqa=False),
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            decode_context_parallel_size=1,
+            tensor_parallel_size=8,
+            decode_context_parallel_size=dcp,
             prefill_context_parallel_size=1,
             pipeline_parallel_size=1,
             data_parallel_size=1,
+            enable_expert_parallel=True,
+            dcp_q_replicate=False,
+            dcp_comm_backend="ag_rs",
+            cp_kv_cache_interleave_size=1,
         ),
+        model_config=SimpleNamespace(
+            architectures=["HYV4ForCausalLM"],
+            use_mla=True,
+            hf_config=SimpleNamespace(num_attention_heads=64),
+            is_multimodal_model=False,
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype="fp8_e4m3", kv_offloading_size=None
+        ),
+        kernel_config=SimpleNamespace(moe_backend="aiter"),
+        speculative_config=None,
+        lora_config=None,
+        kv_transfer_config=None,
+        additional_config={"hcu": {}},
     )
     config = SimpleNamespace(
         layer_types=["sparse_attention"],
@@ -223,14 +248,9 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
         hy_attention, "get_current_vllm_config", lambda: vllm_config
     )
     monkeypatch.setattr(
-        hy_attention, "_require_supported_hy_v4_parallelism", lambda _: None
+        hy_attention, "get_tensor_model_parallel_world_size", lambda: 8
     )
-    monkeypatch.setattr(
-        hy_attention, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(
-        hy_attention, "dcp_q_replication_enabled", lambda: False
-    )
+    monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "0")
     monkeypatch.setattr(
         hy_attention, "get_attn_backend", lambda **kwargs: StubModule
     )
@@ -254,7 +274,7 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
         vllm_config=vllm_config,
         config=config,
         hidden_size=16,
-        num_heads=1,
+        num_heads=64,
         qk_nope_head_dim=8,
         qk_rope_head_dim=8,
         v_head_dim=8,
@@ -265,6 +285,9 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
 
     assert vllm_config.attention_config.sparse_mla_force_mqa is learnable_sink
     assert ("sinks" in attention.mla_attn.kwargs) is learnable_sink
+    assert hy_attention.dcp_q_replication_enabled() is False
+    assert attention.num_local_heads == 8
+    assert type(attention.q_b_proj) is StubModule
 
 
 def _bare_sparse_impl(sinks: torch.Tensor):

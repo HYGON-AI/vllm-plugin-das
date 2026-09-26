@@ -1632,17 +1632,17 @@ def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
     )
 
     assert adapter.apply_to_module(module)
-    tensor = torch.arange(4).reshape(2, 1, 2)
+    tensor = torch.arange(8).reshape(4, 1, 2)
     kv_cache = torch.ones(1)
-    slot_mapping = torch.arange(2).reshape(1, 2)
+    slot_mapping = torch.tensor([[0, -1, 1, -1]], dtype=torch.int32)
     SparseMLACommonImpl().do_kv_cache_update(
-        tensor, tensor, kv_cache, slot_mapping, "fp8", torch.ones(1),
+        tensor, tensor, kv_cache, slot_mapping, "fp8_ds_mla", torch.ones(1),
     )
 
     assert len(calls) == 1
-    assert calls[0][1].shape == (2, 2)
-    assert calls[0][3].shape == (2,)
-    assert calls[0][4] == "fp8"
+    assert calls[0][1].shape == (4, 2)
+    torch.testing.assert_close(calls[0][3], slot_mapping.flatten())
+    assert calls[0][4] == "fp8_ds_mla"
     assert not adapter.apply_to_module(module)
 
 
