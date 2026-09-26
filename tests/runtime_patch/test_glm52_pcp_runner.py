@@ -152,6 +152,10 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                     hidden_states=hidden_states,
                     input_batch=input_batch,
                 )
+            if getattr(self, "is_last_pp_rank", True) is False:
+                assert self.execute_model_state.hidden_states is None
+                assert self.execute_model_state.input_batch is self.expected_batch
+                return "received"
             assert self.execute_model_state.hidden_states is self.expected_hidden
             assert self.execute_model_state.input_batch is self.expected_batch
             if hasattr(self, "expected_attn_metadata"):
@@ -441,6 +445,103 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
         "restore_for_sampling",
         "pcp.prepare_global_attn",
         "build_global_slot_mappings_by_layer",
+        "model_state.prepare_global_mtp_attn",
+        "super.sample_tokens",
+    ]
+
+
+def test_pp_nonfinal_restores_batch_without_hidden_collective() -> None:
+    from vllm_hcu.v1.pcp_manager import HcuPCPManager
+
+    manager = object.__new__(HcuPCPManager)
+    global_batch = object()
+    manager._global_batch = global_batch
+    manager.restore_hidden_states = lambda _: pytest.fail(
+        "non-final PP stage attempted hidden-state collective"
+    )
+
+    assert manager.restore_for_sampling(None) == (None, global_batch)
+
+
+def test_pp_final_stage_restores_hidden_once() -> None:
+    from vllm_hcu.v1.pcp_manager import HcuPCPManager
+
+    manager = object.__new__(HcuPCPManager)
+    global_batch = object()
+    local_hidden = object()
+    global_hidden = object()
+    calls = []
+    manager._global_batch = global_batch
+
+    def restore(hidden):
+        calls.append(hidden)
+        return global_hidden
+
+    manager.restore_hidden_states = restore
+
+    assert manager.restore_for_sampling(local_hidden) == (
+        global_hidden,
+        global_batch,
+    )
+    assert calls == [local_hidden]
+
+
+def test_pp_nonfinal_mtp_rebuilds_global_metadata_once(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_module, events = pcp_runner_module
+    global_batch = object()
+    local_batch = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            events.append("restore_for_sampling")
+            assert hidden_states is None
+            return None, global_batch
+
+        def prepare_global_attn(self):
+            events.append("pcp.prepare_global_attn")
+            return "global-blocks", "global-slots"
+
+    class ModelState:
+        def prepare_attn(self, input_batch, mode, blocks, slots, groups, config):
+            events.append("model_state.prepare_global_mtp_attn")
+            assert input_batch is global_batch
+            assert blocks == "global-blocks"
+            assert slots == "global-slots"
+            return "global-attn"
+
+    monkeypatch.setattr(
+        runner_module,
+        "build_slot_mappings_by_layer",
+        lambda slots, config: "global-slots-by-layer",
+        raising=False,
+    )
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.is_last_pp_rank = False
+    runner.pcp_manager = Manager()
+    runner.speculator = object()
+    runner.model_state = ModelState()
+    runner.kv_cache_config = "kv-config"
+    runner.attn_groups = "attn-groups"
+    runner.expected_batch = global_batch
+    runner.execute_model_state = _MTPExecuteModelState(
+        input_batch=local_batch,
+        attn_metadata="local-attn",
+        slot_mappings_by_layer="local-slots",
+        hidden_states=None,
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    events.clear()
+
+    assert runner.sample_tokens("grammar") == "received"
+    assert runner.execute_model_state.input_batch is global_batch
+    assert runner.execute_model_state.hidden_states is None
+    assert events == [
+        "restore_for_sampling",
+        "pcp.prepare_global_attn",
         "model_state.prepare_global_mtp_attn",
         "super.sample_tokens",
     ]
