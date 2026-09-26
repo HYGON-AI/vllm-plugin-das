@@ -488,8 +488,9 @@ def test_pp_final_stage_restores_hidden_once() -> None:
     assert calls == [local_hidden]
 
 
-def test_pp_nonfinal_target_restores_global_batch_before_receive(
-    pcp_runner_module,
+@pytest.mark.parametrize("num_speculative_steps", [0, 2])
+def test_pp_nonfinal_restores_global_batch_before_receive(
+    pcp_runner_module, num_speculative_steps,
 ) -> None:
     """The 0.28.1 upstream non-final PP path does not restore PCP itself."""
 
@@ -504,11 +505,12 @@ def test_pp_nonfinal_target_restores_global_batch_before_receive(
             return None, global_batch
 
     runner = runner_module.HcuGPUModelRunnerV2(
-        _config(4, speculative=False), "hcu:0"
+        _config(4, speculative=bool(num_speculative_steps)), "hcu:0"
     )
     runner.is_last_pp_rank = False
     runner.pcp_manager = Manager()
     runner.speculator = None
+    runner.num_speculative_steps = num_speculative_steps
     runner.expected_batch = global_batch
     runner.execute_model_state = _MTPExecuteModelState(
         input_batch=local_batch,
@@ -524,30 +526,49 @@ def test_pp_nonfinal_target_restores_global_batch_before_receive(
     assert events == ["restore_for_sampling", "super.sample_tokens"]
 
 
-def test_pp_nonfinal_mtp_rebuilds_global_metadata_once(
+def test_pp_final_mtp_preserves_unequal_draft_counts_and_global_metadata(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner_module, events = pcp_runner_module
-    global_batch = object()
-    local_batch = object()
+    # Unequal per-request draft counts must survive the local-to-global
+    # restoration before the final PP rank rebuilds global drafter metadata.
+    global_batch = SimpleNamespace(
+        req_ids=["prefill", "decode_a", "decode_b"],
+        num_draft_tokens_per_req=np.asarray([0, 1, 2], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 4, 6, 9], dtype=np.int32),
+    )
+    local_batch = SimpleNamespace(
+        # A partitioned prefill can contribute two virtual local rows;
+        # replicated decode rows retain their original draft counts.
+        req_ids=["prefill", "prefill", "decode_a", "decode_b"],
+        num_draft_tokens_per_req=np.asarray([0, 0, 1, 2], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 1, 2, 4, 7], dtype=np.int32),
+    )
+    global_blocks = np.asarray([[10, 11], [20, 21], [30, 31]])
+    global_slots = np.asarray([640, 641, 642, 643, 1280, 1281, 1920, 1921, 1922])
+    local_hidden = object()
+    global_hidden = object()
 
     class Manager:
         def restore_for_sampling(self, hidden_states):
             events.append("restore_for_sampling")
-            assert hidden_states is None
-            return None, global_batch
+            assert hidden_states is local_hidden
+            return global_hidden, global_batch
 
         def prepare_global_attn(self):
             events.append("pcp.prepare_global_attn")
-            return "global-blocks", "global-slots"
+            assert global_batch.num_draft_tokens_per_req.tolist() == [0, 1, 2]
+            return global_blocks, global_slots
 
     class ModelState:
         def prepare_attn(self, input_batch, mode, blocks, slots, groups, config):
             events.append("model_state.prepare_global_mtp_attn")
             assert input_batch is global_batch
-            assert blocks == "global-blocks"
-            assert slots == "global-slots"
+            assert input_batch.num_draft_tokens_per_req.tolist() == [0, 1, 2]
+            assert input_batch.query_start_loc_np.tolist() == [0, 4, 6, 9]
+            np.testing.assert_array_equal(blocks, global_blocks)
+            np.testing.assert_array_equal(slots, global_slots)
             return "global-attn"
 
     monkeypatch.setattr(
@@ -557,26 +578,29 @@ def test_pp_nonfinal_mtp_rebuilds_global_metadata_once(
         raising=False,
     )
     runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
-    runner.is_last_pp_rank = False
+    runner.is_last_pp_rank = True
     runner.pcp_manager = Manager()
     runner.speculator = object()
     runner.model_state = ModelState()
     runner.kv_cache_config = "kv-config"
     runner.attn_groups = "attn-groups"
     runner.expected_batch = global_batch
+    runner.expected_hidden = global_hidden
+    runner.expected_attn_metadata = "global-attn"
+    runner.expected_slot_mappings_by_layer = "global-slots-by-layer"
     runner.execute_model_state = _MTPExecuteModelState(
         input_batch=local_batch,
         attn_metadata="local-attn",
         slot_mappings_by_layer="local-slots",
-        hidden_states=None,
+        hidden_states=local_hidden,
         aux_hidden_states=None,
         finished_req_ids=set(),
     )
     events.clear()
 
-    assert runner.sample_tokens("grammar") == "received"
+    assert runner.sample_tokens("grammar") == "sampled"
     assert runner.execute_model_state.input_batch is global_batch
-    assert runner.execute_model_state.hidden_states is None
+    assert runner.execute_model_state.hidden_states is global_hidden
     assert events == [
         "restore_for_sampling",
         "pcp.prepare_global_attn",
