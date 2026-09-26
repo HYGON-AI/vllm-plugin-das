@@ -55,6 +55,24 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any):
         layout = _flash_attn_layout()
+        if layout == "bhsd":
+            # vLLM exposes logical [block, token, head, channel] views even
+            # when the backing storage is HND. The vendor bhsd interface
+            # also requires the head/token axes in that order in the shape.
+            positional = list(args)
+            for position, parameter in ((1, "k"), (2, "v")):
+                cache = (
+                    positional[position]
+                    if len(positional) > position
+                    else kwargs.get(parameter)
+                )
+                if isinstance(cache, torch.Tensor) and cache.ndim == 4:
+                    native_view = cache.transpose(1, 2)
+                    if len(positional) > position:
+                        positional[position] = native_view
+                    else:
+                        kwargs[parameter] = native_view
+            args = tuple(positional)
         if layout_position is not None and len(args) > layout_position:
             positional = list(args)
             positional[layout_position] = layout

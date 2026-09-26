@@ -156,6 +156,57 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
         )
 
 
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("positional", [False, True])
+def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
+    monkeypatch, layout, dtype, positional,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout=layout,
+    )
+    physical_shape = (3, 2, 64, 8) if layout == "HND" else (3, 64, 2, 8)
+    physical = torch.linspace(-2, 2, 3072).reshape(physical_shape).to(dtype)
+    key = physical.transpose(1, 2) if layout == "HND" else physical
+    value = key.clone()
+    original_stride = key.stride()
+
+    def vendor(q, k, v, layout="bshd"):
+        return k, v, layout
+
+    wrapped = fa_utils._with_kv_cache_layout(vendor, "probe")
+    if positional:
+        actual_key, actual_value, actual_layout = wrapped(None, key, value, "bshd")
+    else:
+        actual_key, actual_value, actual_layout = wrapped(q=None, k=key, v=value)
+
+    assert actual_layout == ("bhsd" if layout == "HND" else "bshd")
+    assert tuple(actual_key.shape) == physical_shape
+    assert tuple(actual_value.shape) == physical_shape
+    assert actual_key.data_ptr() == key.data_ptr()
+    assert actual_value.data_ptr() == value.data_ptr()
+    assert actual_key.dtype == actual_value.dtype == dtype
+    torch.testing.assert_close(actual_key.float(), physical.float(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_value.float(), physical.float(), rtol=0, atol=0)
+    assert tuple(key.shape) == (3, 64, 2, 8)
+    assert key.stride() == original_stride
+
+
+def test_hcu_fa_boundary_preserves_nonpaged_kv_axes(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    key = torch.zeros(64, 2, 8)
+    value = torch.ones_like(key)
+
+    def vendor(q, k, v, *, layout="bshd"):
+        return k, v
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=None, k=key, v=value,
+    )
+    assert result[0] is key
+    assert result[1] is value
+
+
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
     calls: list[tuple[int, int, int]] = []
 
@@ -1247,7 +1298,7 @@ def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
     )
     query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
     packed_cache = torch.zeros((144, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.split(128, dim=-1)
+    key_cache, value_cache = packed_cache.transpose(1, 2).split(128, dim=-1)
     seq_lens = torch.tensor([8421], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 37], dtype=torch.int32)
     block_table = torch.arange(144, dtype=torch.int32).unsqueeze(0)
@@ -1301,7 +1352,7 @@ def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
     )
     query = torch.zeros((75, 8, 128), dtype=torch.bfloat16)
     packed_cache = torch.zeros((72, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.split(128, dim=-1)
+    key_cache, value_cache = packed_cache.transpose(1, 2).split(128, dim=-1)
     block_table = torch.arange(72, dtype=torch.int32).unsqueeze(0)
     seq_lens = torch.tensor([4171], dtype=torch.int32)
 
