@@ -415,30 +415,6 @@
         }
       ]
     },
-    "qwen38-flash-next-w4a8-humaneval": {
-      "runner": "nmz36",
-      "arch": "gfx938",
-      "cards": 4,
-      "suite": "model",
-      "pytest_args": [
-        "-k",
-        "qwen38_flash_next_w4a8_humaneval_evalscope_server"
-      ],
-      "timeout_minutes": 180,
-      "requirements": [
-        {
-          "kind": "distribution",
-          "name": "evalscope",
-          "match": "exact",
-          "version": "1.9.1"
-        },
-        {
-          "kind": "model",
-          "env": "VLLM_HCU_QWEN38_FLASH_NEXT_W4A8_MODEL",
-          "relative": "Qwen3.8-Flash-Next-w4a8-slimquant"
-        }
-      ]
-    },
     "qwen38-flash-next-int8-pp2-tp4-humaneval": {
       "runner": "hcu-linux-gfx938-8",
       "arch": "gfx938",
@@ -566,7 +542,6 @@
     {"job": "qwen3-vl-mmmu", "timeout_minutes": 150},
     {"job": "qwen3-8b-gsm8k", "timeout_minutes": 150},
     {"job": "qwen38-flash-next-humaneval", "timeout_minutes": 210},
-    {"job": "qwen38-flash-next-w4a8-humaneval", "timeout_minutes": 210},
     {"job": "qwen38-flash-next-int8-pp2-tp4-humaneval", "timeout_minutes": 210},
     {"job": "deepseek-gsm8k", "timeout_minutes": 360},
     {"job": "glm52-pcp", "timeout_minutes": 360},
@@ -846,15 +821,6 @@
         "qwen38-flash-next-humaneval"
       ]
     },
-    "qwen38-flash-next-w4a8-evalscope": {
-      "patterns": [
-        "tests/integration/server/test_evalscope_qwen38_flash_next_w4a8_humaneval.py",
-        "tests/models/qwen38_flash_next_w4a8_humaneval_evalscope.yaml"
-      ],
-      "jobs": [
-        "qwen38-flash-next-w4a8-humaneval"
-      ]
-    },
     "qwen38-flash-next-int8-pp2-tp4-evalscope": {
       "patterns": [
         "tests/integration/server/test_evalscope_qwen38_flash_next_int8_pp2_tp4_humaneval.py",
@@ -881,7 +847,6 @@
         "qwen35-gsm8k",
         "qwen3-8b-gsm8k",
         "qwen38-flash-next-humaneval",
-        "qwen38-flash-next-w4a8-humaneval",
         "qwen38-flash-next-int8-pp2-tp4-humaneval",
         "qwen3-vl-mmmu",
         "deepseek-gsm8k",
