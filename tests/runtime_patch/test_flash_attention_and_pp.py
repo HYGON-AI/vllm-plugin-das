@@ -207,6 +207,51 @@ def test_hcu_fa_boundary_preserves_nonpaged_kv_axes(monkeypatch):
     assert result[1] is value
 
 
+def test_hcu_cache_layout_survives_worker_initialization_context(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+    cache = CacheConfig()
+    cache.kv_cache_layout = "LBHNC"
+    with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+        assert layouts.get_kv_cache_layout() == "HND"
+    # Worker forwards and Graph capture do not require a global config context.
+    with set_current_vllm_config(None):
+        assert layouts.get_kv_cache_layout() == "HND"
+
+
+def test_hcu_cache_layout_uses_new_resolved_worker_config(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    for resolved, expected in (("LBHNC", "HND"), ("LBNHC", "NHD")):
+        cache = CacheConfig()
+        cache.kv_cache_layout = resolved
+        with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+            assert layouts.get_kv_cache_layout() == expected
+        with set_current_vllm_config(None):
+            assert layouts.get_kv_cache_layout() == expected
+
+
+def test_hcu_cache_layout_does_not_latch_an_unresolved_default(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    cache = CacheConfig()
+    with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+        assert layouts.get_kv_cache_layout() == "NHD"
+        cache.kv_cache_layout = "LBHNC"
+        assert layouts.get_kv_cache_layout() == "HND"
+    with set_current_vllm_config(SimpleNamespace(cache_config=CacheConfig())):
+        assert layouts.get_kv_cache_layout() == "NHD"
+    with set_current_vllm_config(None):
+        assert layouts.get_kv_cache_layout() == "HND"
+
+
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
     calls: list[tuple[int, int, int]] = []
 
