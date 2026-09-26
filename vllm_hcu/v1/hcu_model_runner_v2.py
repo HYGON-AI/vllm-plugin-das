@@ -115,7 +115,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             return super().profile_run()
 
         original_max = self.max_num_tokens
-        self.max_num_tokens = max(1, (original_max // pcp_size) * 9 // 8)
+        # Prefill tokens are partitioned, but decode tokens are replicated on
+        # every PCP rank. A prefill request can also occupy two
+        # DualChunkSwap segments, so reserve two tokens of per-request layout
+        # headroom when that exceeds the decode width. This bounds every
+        # rank-local mix while retaining the 12.5% prefill imbalance slack.
+        partitioned_tokens = (
+            (original_max + pcp_size - 1) // pcp_size
+        ) * 9 // 8
+        replicated_request_tokens = min(
+            original_max,
+            int(self.max_num_reqs) * max(int(self.decode_query_len), 2),
+        )
+        self.max_num_tokens = min(
+            original_max,
+            max(1, partitioned_tokens + replicated_request_tokens),
+        )
         try:
             return super().profile_run()
         finally:

@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from vllm_hcu.patch.worker.framework_opt._common import PatchCompatibilityError
+from vllm_hcu.v1.pcp_manager import HcuPCPManager as RealHcuPCPManager
 
 
 def test_unitary_pcp_world_size_is_fullgraph_compilable() -> None:
@@ -1256,18 +1257,77 @@ def _install_recording_profile_run(
 def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
     pcp_runner_module,
 ) -> None:
-    """PCP profiling must reserve 12.5% above the per-rank token share."""
+    """PCP profiling must include partition and replicated-request headroom."""
 
     runner_module, _ = pcp_runner_module
     seen: list[int] = []
     _install_recording_profile_run(runner_module, seen)
     runner = runner_module.HcuGPUModelRunnerV2(_config(16), "hcu:0")
     runner.max_num_tokens = 16384
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
 
     runner.profile_run()
 
-    assert seen == [1152]
+    assert seen == [1200]
     assert runner.max_num_tokens == 16384
+
+
+@pytest.mark.parametrize(
+    (
+        "budget",
+        "max_num_reqs",
+        "decode_query_len",
+        "lengths",
+        "prefills",
+        "expected",
+    ),
+    [
+        (
+            4096,
+            256,
+            3,
+            [3] * 255 + [3331],
+            [False] * 255 + [True],
+            1599,
+        ),
+        (4096, 512, 3, [3] * 512, [False] * 512, 1536),
+        (512, 256, 1, [1] * 256, [False] * 256, 256),
+    ],
+)
+def test_profile_run_covers_replicated_decode_and_sampler_requests(
+    pcp_runner_module,
+    budget: int,
+    max_num_reqs: int,
+    decode_query_len: int,
+    lengths: list[int],
+    prefills: list[bool],
+    expected: int,
+) -> None:
+    """Profile tokens must cover actual PCP dispatch and sampler concurrency."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.max_num_tokens = budget
+    runner.max_num_reqs = max_num_reqs
+    runner.decode_query_len = decode_query_len
+
+    manager = object.__new__(RealHcuPCPManager)
+    manager._use_mla = True
+    manager.pcp_size = 4
+    actual_dispatch_tokens = manager.get_num_tokens_for_dispatch(
+        np.asarray(lengths, dtype=np.int32),
+        np.asarray(prefills, dtype=np.bool_),
+    )
+
+    runner.profile_run()
+
+    assert actual_dispatch_tokens == expected
+    assert seen[0] >= actual_dispatch_tokens
+    assert min(seen[0], max_num_reqs) == min(budget, max_num_reqs)
+    assert runner.max_num_tokens == budget
 
 
 def test_profile_run_keeps_non_pcp_token_budget(
@@ -1295,12 +1355,14 @@ def test_profile_run_restores_token_budget_after_failure(
     runner_module, _ = pcp_runner_module
 
     def failing_profile_run(self):
-        assert self.max_num_tokens == 576
+        assert self.max_num_tokens == 624
         raise RuntimeError("simulated profile failure")
 
     runner_module.GPUModelRunner.profile_run = failing_profile_run
     runner = runner_module.HcuGPUModelRunnerV2(_config(8), "hcu:0")
     runner.max_num_tokens = 4096
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
 
     with pytest.raises(RuntimeError, match="simulated profile failure"):
         runner.profile_run()
