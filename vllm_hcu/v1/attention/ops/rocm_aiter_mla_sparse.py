@@ -1253,6 +1253,9 @@ def rocm_aiter_sparse_attn_indexer_native(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -1330,67 +1333,112 @@ def rocm_aiter_sparse_attn_indexer_native(
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
+        max_local_total_seq_lens = max(
+            getattr(
+                chunk,
+                "max_local_total_seq_lens",
+                chunk.total_seq_lens,
+            )
+            for chunk in prefill_metadata.chunks
+        )
+        k_fp8_full = torch.empty(
+            [max_local_total_seq_lens, head_dim],
+            device=device,
+            dtype=fp8_dtype,
+        )
+        k_scale_full = torch.empty(
+            [max_local_total_seq_lens, 4],
+            device=device,
+            dtype=torch.uint8,
+        )
         for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim],
-                device=device,
-                dtype=fp8_dtype,
+            local_cu_seq_lens = getattr(chunk, "local_cu_seq_lens", None)
+            if local_cu_seq_lens is None:
+                local_cu_seq_lens = chunk.cu_seq_lens
+            local_total_seq_lens = getattr(
+                chunk, "local_total_seq_lens", chunk.total_seq_lens
             )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4],
-                device=device,
-                dtype=torch.uint8,
+            chunk_max_local_seq_lens = getattr(
+                chunk,
+                "max_local_total_seq_lens",
+                chunk.total_seq_lens,
             )
-            if not current_platform.is_rocm() or on_gfx938():
-                ops.cp_gather_indexer_k_quant_cache(
-                    hipc_kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-            else:
-                cp_gather_indexer_k_bf16_cache_triton(
-                    kv_cache,
-                    k_fp8,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-                # cp_gather_indexer_k_quant_cache_triton(
-                #     kv_cache,
-                #     k_fp8,
-                #     k_scale,
-                #     chunk.block_table,
-                #     chunk.cu_seq_lens,
-                #     token_to_seq=chunk.token_to_seq,
-                # )
+            skip_kv_gather = getattr(chunk, "skip_kv_gather", False)
+            k_fp8 = k_fp8_full[:chunk_max_local_seq_lens]
+            k_scale = k_scale_full[:chunk_max_local_seq_lens]
+            if not skip_kv_gather and local_total_seq_lens > 0:
+                if not current_platform.is_rocm() or on_gfx938():
+                    ops.cp_gather_indexer_k_quant_cache(
+                        hipc_kv_cache,
+                        k_fp8,
+                        k_scale,
+                        chunk.block_table,
+                        local_cu_seq_lens,
+                    )
+                else:
+                    cp_gather_indexer_k_bf16_cache_triton(
+                        kv_cache,
+                        k_fp8,
+                        chunk.block_table,
+                        local_cu_seq_lens,
+                    )
+                    # cp_gather_indexer_k_quant_cache_triton(
+                    #     kv_cache,
+                    #     k_fp8,
+                    #     k_scale,
+                    #     chunk.block_table,
+                    #     local_cu_seq_lens,
+                    #     token_to_seq=chunk.token_to_seq,
+                    # )
 
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            if _use_lightop_sparse_mla_topk():
-                _lightop_topk_indices_prefill(
-                    logits,
+            q_slice = q_fp8[chunk.token_start : chunk.token_end]
+            if local_total_seq_lens == 0:
+                logits = q_slice.new_empty(
+                    (q_slice.shape[0], 0), dtype=torch.float32
+                )
+                topk_indices.fill_(-1)
+            else:
+                logits = rocm_fp8_mqa_logits(
+                    q_slice,
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_indices,
-                    topk_tokens,
                 )
-            else:
-                topk_indices.copy_(
-                    _topk_indices_torch(
+                if _use_lightop_sparse_mla_topk():
+                    _lightop_topk_indices_prefill(
                         logits,
-                        topk_tokens,
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
                     )
+                else:
+                    topk_indices.copy_(
+                        _topk_indices_torch(
+                            logits,
+                            topk_tokens,
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                        )
+                    )
+
+            if dcp_world_size > 1:
+                from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+                    _merge_dcp_topk_global,
+                )
+
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
                 )
 
     if has_decode:
@@ -1458,6 +1506,20 @@ def rocm_aiter_sparse_attn_indexer_native(
                     topk_tokens,
                     row_ends=row_ends,
                 )
+            )
+
+        if dcp_world_size > 1:
+            from vllm_hcu.model_executor.layers.sparse_attn_indexer import (
+                _merge_dcp_topk_global,
+            )
+
+            _merge_dcp_topk_global(
+                logits,
+                topk_indices,
+                topk_tokens,
+                dcp_rank,
+                dcp_world_size,
+                cp_kv_cache_interleave_size,
             )
 
         if decode_metadata.requires_padding:

@@ -1,12 +1,85 @@
-# Hy4 combined PR #152 / #156 validation (2026-09-26)
+# Hy4 combined PR #152 integration validation (2026-09-26)
 
-## Integration and review
+## DCP #154 integration candidate
+
+The user requested folding DCP #154 into #152 after PCP #156. The integration
+candidate is `17f1f2baf1b23f2b975098efd97130e729fb9a2e`, merging #152 head
+`085a589` into #154 without rewriting either branch's history. The four
+conflicts preserve current PCP documentation, both test families, the PP2
+layer-41 producer check, and a union of separately supported PCP/DCP
+topologies. Combined PCP+DCP remains rejected.
+
+The complete 21 changed-test-file set passed **551 tests, 1 skipped** before
+commit and again after independent review (142.43 seconds). Independent review
+found no Critical/Important code blocker. The full suite remains non-green:
+its unconfigured legacy source-root check fails during collection; with the
+installed source root supplied, 209 tests pass before the same historical
+`test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert` failure
+(1,572,632 mismatches, max abs 2,211,653.5, max relative 15.082396507263184).
+
+The clean candidate plugin wheel is
+`vllm_hcu-0.28.1rc1.dev491+das.17f1f2b.dtk2604-cp310-cp310-linux_x86_64.whl`,
+SHA-256 `5f88edbe0120d3d82c1027752195daf72c06b09c4bc9697f7876ba11f60bc515`.
+It is paired with the same isolated vLLM wheel described below, SHA-256
+`2d6b392dcff0d5064c754e838d9ac5ea3ffd5d6c7cac86ed2b5b1b2811cb9b3b`.
+Both Python packages and compiled `hcu_ops` resolve under their respective
+isolated installs. No global installation is modified.
+
+New evidence directory `D`:
+`/models/vllm-plugin-das/.worktrees/feat-hy4-dcp-pcp-v0281/.superpowers/sdd/2026-09-26-hy4-154-into-152`.
+It retains the launcher, original completions, scoring reports, server logs,
+metrics, provenance JSON and complete committed-tree test output.
+
+Fresh DCP2/TP8/EP8 FP8 E4M3 target-only and MTP3 each passed HumanEval/0–31
+**32/32**, with all finish reasons `stop`, under default non-eager
+`PIECEWISE` Graph. Both constructed eight MRV2 workers and captured Graphs.
+Three concurrent MTP3 requests additionally passed **3/3**; accepted/drafted
+counts for /0, /3 and /7 were 130/135, 38/42 and 81/81. Their respective
+fourth request-local steps accepted `[3, 1, 3]`; no global-step identity is
+claimed. The log recorded three running requests, final health was HTTP 200,
+and each owned service fully released all eight cards before the next launch.
+Raw text matched the old standalone DCP wheel in 22/32 target and 23/32 MTP3
+tasks; these are functional passes, not byte-identical-generation claims.
+
+The same paired-wheel candidate also passed these fresh eight-request
+concurrent regressions. Every response finished with `stop`, every final
+health check returned HTTP 200, and each log records eight MRV2 workers.
+
+| Mode | Resolved Graph | HumanEval | Accepted tokens by draft position | Evidence prefix under D |
+| --- | --- | ---: | --- | --- |
+| DP8/TP1/EP8, MTP3, E4M3, DeepEP LL/DeepGEMM | FULL_AND_PIECEWISE | 8/8 | 274/264/249 | `dp8_fp8` |
+| DP2/TP4/EP8, MTP3, BF16 KV, DeepEP LL/DeepGEMM | FULL_AND_PIECEWISE | 8/8 | 275/264/250 | `dp2_tp4_bf16` |
+| TP8, MTP3, E4M3, AITER selector | FULL_AND_PIECEWISE | 8/8 | 279/266/252 | `tp8_fp8` |
+| TP4/PCP2/EP8, MTP3, BF16 KV, AITER selector | NONE (eager) | 8/8 | 277/270/256 | `tp4_mtp3` |
+| PP2/TP1/PCP4/EP4, MTP2, E4M3, DeepEP HT/DeepGEMM | NONE (eager) | 8/8 | 357/342 | `pp2_mtp2` |
+
+DCP prefixes are `dcp_graph_target` and `dcp_graph_mtp3`; the latter's metrics
+sum to 1201/1139/1065 accepted tokens by draft position across its sequential
+and concurrent requests. All seven modes retain metrics snapshots. The PP2
+command uses `VLLM_PP_LAYER_PARTITION=41,37`. Source `serve_pair.py` and the
+first JSON line of each server log retain the exact argv, isolated import
+paths and separate cache roots; the launch commands are also posted to #152.
+All launches explicitly enable `VLLM_USE_NN=1`; none overrides the default
+Graph policy, except the two PCP modes' required `--enforce-eager`.
+
+The AITER selector still uses per-shape Triton fallback where tuning is
+absent. These passes do not certify every AITER kernel shape, PCP+Graph,
+PCP+DCP, BF16 DCP, other DCP topologies, full-dataset accuracy, or a per-call
+native writer trace. Prior no-DCP and PCP target-only/32-sample gates below
+remain historical evidence, not reruns on this new DCP integration wheel.
+
+The independent review and planned live gates are complete. This supports
+folding #154 into #152's feature branch, not merging #152 into `v0.28.1-dev`.
+After the final service exited, no owned process remained and all eight
+HCUs returned to 2 MiB used. No unrelated process was signalled.
+
+## Earlier PCP #156 integration and review
 
 At the user's request, #156 was squash-merged into #152's feature branch
 as `68da40d9028b36359534d93588021459d519409d`. The tree is byte-identical to
 reviewed #156 head `0d1c1bc303814c70016b7cb048f0a5d74c83bcf3`.
 PR #152 still targets `v0.28.1-dev`; this operation did not merge #152 there.
-DCP remains separate in #154.
+DCP was still separate in #154 at this earlier PCP-only gate.
 
 Independent read-only review of the combined production diff found no Critical
 or Important blocker. One non-blocking wording issue remains: shared PCP

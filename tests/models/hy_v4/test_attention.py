@@ -45,46 +45,47 @@ def test_unsafe_generic_fp8_cache_is_rejected():
         _require_accuracy_safe_kv_cache_dtype("fp8")
 
 
-def test_hy4_context_parallel_topology_contract():
+@pytest.mark.parametrize(
+    "tp,pcp,dcp,pp,dp,ep,supported",
+    [
+        (8, 1, 1, 1, 1, False, True),
+        (4, 1, 1, 1, 2, True, True),
+        (1, 1, 1, 1, 8, True, True),
+        (4, 2, 1, 1, 1, True, True),
+        (1, 4, 1, 2, 1, True, True),
+        (8, 1, 2, 1, 1, True, True),
+        (2, 2, 1, 1, 1, True, False),
+        (8, 2, 1, 1, 1, True, False),
+        (4, 2, 2, 1, 1, True, False),
+        (8, 2, 2, 1, 1, True, False),
+        (4, 1, 2, 1, 1, True, False),
+        (8, 1, 4, 1, 1, True, False),
+        (8, 1, 2, 2, 1, True, False),
+        (8, 1, 2, 1, 2, True, False),
+        (4, 2, 1, 1, 2, True, False),
+        (1, 4, 1, 2, 2, True, False),
+        (4, 2, 1, 1, 1, False, False),
+        (1, 4, 1, 2, 1, False, False),
+    ],
+)
+def test_hy4_context_parallel_topology_contract(tp, pcp, dcp, pp, dp, ep, supported):
     from vllm_hcu.models.hy_v4.attention import (
         _require_supported_hy_v4_parallelism,
     )
 
-    for tp, pcp, pp in ((4, 2, 1), (1, 4, 2)):
-        _require_supported_hy_v4_parallelism(
-            SimpleNamespace(
-                tensor_parallel_size=tp,
-                prefill_context_parallel_size=pcp,
-                pipeline_parallel_size=pp,
-                decode_context_parallel_size=1,
-                data_parallel_size=1,
-                enable_expert_parallel=True,
-            )
-        )
-
-    for tp, pcp, pp, dcp in ((2, 2, 1, 1), (4, 2, 1, 2), (1, 1, 1, 2)):
-        with pytest.raises(RuntimeError, match="context parallel"):
-            _require_supported_hy_v4_parallelism(
-                SimpleNamespace(
-                    tensor_parallel_size=tp,
-                    prefill_context_parallel_size=pcp,
-                    pipeline_parallel_size=pp,
-                    decode_context_parallel_size=dcp,
-                    data_parallel_size=1,
-                    enable_expert_parallel=True,
-                )
-            )
-
-    _require_supported_hy_v4_parallelism(
-        SimpleNamespace(
-            tensor_parallel_size=8,
-            prefill_context_parallel_size=1,
-            pipeline_parallel_size=1,
-            decode_context_parallel_size=1,
-            data_parallel_size=1,
-            enable_expert_parallel=True,
-        )
+    config = SimpleNamespace(
+        tensor_parallel_size=tp,
+        prefill_context_parallel_size=pcp,
+        decode_context_parallel_size=dcp,
+        pipeline_parallel_size=pp,
+        data_parallel_size=dp,
+        enable_expert_parallel=ep,
     )
+    if supported:
+        _require_supported_hy_v4_parallelism(config)
+    else:
+        with pytest.raises(RuntimeError, match="context parallel"):
+            _require_supported_hy_v4_parallelism(config)
 
 
 def test_shared_indexer_weights_are_skipped_but_full_producer_is_loaded():
@@ -139,7 +140,7 @@ def test_hy4_pp2_stage_41_starts_with_local_sparse_indexer_producer() -> None:
         require_local_indexer_producer(config, start_layer=40, end_layer=78)
 
 
-def test_sparse_e4m3_cache_spec_has_quantized_page_geometry():
+def test_hy4_dcp_sparse_e4m3_cache_spec_keeps_tp8_page_geometry():
     from vllm_hcu.models.hy_v4.attention import HYV4MLAAttentionLayer
 
     attention = object.__new__(HYV4MLAAttentionLayer)
@@ -152,6 +153,11 @@ def test_sparse_e4m3_cache_spec_has_quantized_page_geometry():
         SimpleNamespace(
             model_config=None,
             cache_config=SimpleNamespace(block_size=64),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=8,
+                decode_context_parallel_size=2,
+                cp_kv_cache_interleave_size=1,
+            ),
         )
     )
 
@@ -215,8 +221,9 @@ def test_hyv4_sink_keeps_short_prefill_on_sparse_mqa(monkeypatch):
 
 
 @pytest.mark.parametrize("learnable_sink", [False, True])
+@pytest.mark.parametrize("dcp", [1, 2])
 def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
-    monkeypatch, learnable_sink
+    monkeypatch, learnable_sink, dcp
 ):
     from vllm_hcu.models.hy_v4 import attention as hy_attention
 
@@ -226,8 +233,33 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
             self.kwargs = kwargs
 
     vllm_config = SimpleNamespace(
+        use_v2_model_runner=True,
         attention_config=SimpleNamespace(sparse_mla_force_mqa=False),
-        parallel_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=True,
+            dcp_q_replicate=False,
+            dcp_comm_backend="ag_rs",
+            cp_kv_cache_interleave_size=1,
+        ),
+        model_config=SimpleNamespace(
+            architectures=["HYV4ForCausalLM"],
+            use_mla=True,
+            hf_config=SimpleNamespace(num_attention_heads=64),
+            is_multimodal_model=False,
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype="fp8_e4m3", kv_offloading_size=None
+        ),
+        kernel_config=SimpleNamespace(moe_backend="aiter"),
+        speculative_config=None,
+        lora_config=None,
+        kv_transfer_config=None,
+        additional_config={"hcu": {}},
     )
     config = SimpleNamespace(
         layer_types=["sparse_attention"],
@@ -243,14 +275,9 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
         hy_attention, "get_current_vllm_config", lambda: vllm_config
     )
     monkeypatch.setattr(
-        hy_attention, "_require_supported_hy_v4_parallelism", lambda _: None
+        hy_attention, "get_tensor_model_parallel_world_size", lambda: 8
     )
-    monkeypatch.setattr(
-        hy_attention, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(
-        hy_attention, "dcp_q_replication_enabled", lambda: False
-    )
+    monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "0")
     monkeypatch.setattr(
         hy_attention, "get_attn_backend", lambda **kwargs: StubModule
     )
@@ -274,7 +301,7 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
         vllm_config=vllm_config,
         config=config,
         hidden_size=16,
-        num_heads=1,
+        num_heads=64,
         qk_nope_head_dim=8,
         qk_rope_head_dim=8,
         v_head_dim=8,
@@ -285,6 +312,9 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
 
     assert vllm_config.attention_config.sparse_mla_force_mqa is learnable_sink
     assert ("sinks" in attention.mla_attn.kwargs) is learnable_sink
+    assert hy_attention.dcp_q_replication_enabled() is False
+    assert attention.num_local_heads == 8
+    assert type(attention.q_b_proj) is StubModule
 
 
 def _bare_sparse_impl(sinks: torch.Tensor):
@@ -399,3 +429,114 @@ def test_fp8_sparse_kernel_forwards_sink_and_slices_target_lse(monkeypatch):
     assert lse.shape == (1, 4, 2)
     assert torch.equal(captured["attn_sink"][:4], impl.sinks)
     assert torch.isneginf(captured["attn_sink"][4:]).all()
+    assert "topk_length" not in captured
+
+
+def test_hyv4_dcp_gathers_loaded_sinks_once(monkeypatch):
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+
+    impl = _bare_sparse_impl(torch.arange(8, dtype=torch.float32))
+    impl.dcp_world_size = 2
+    other = torch.arange(8, 16, dtype=torch.float32)
+    calls = []
+
+    class Group:
+        def all_gather(self, value, dim):
+            calls.append((value.clone(), dim))
+            return torch.cat((value, other), dim=0)
+
+    monkeypatch.setattr(hcu_sparse, "get_dcp_group", lambda: Group(), raising=False)
+    impl.sinks.add_(10)
+    impl.process_weights_after_loading(torch.bfloat16)
+
+    assert len(calls) == 1 and calls[0][1] == 0
+    torch.testing.assert_close(
+        calls[0][0], torch.arange(8, dtype=torch.float32) + 10
+    )
+    torch.testing.assert_close(
+        impl._dcp_gathered_sinks,
+        torch.cat((torch.arange(8, dtype=torch.float32) + 10, other)),
+    )
+
+    no_dcp = _bare_sparse_impl(torch.arange(8, dtype=torch.float32))
+    no_dcp.process_weights_after_loading(torch.bfloat16)
+    assert no_dcp._dcp_gathered_sinks is None
+    assert len(calls) == 1
+
+
+def test_hyv4_dcp_kernel_passes_gathered_sink_on_rank0_only(monkeypatch):
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+
+    impl = _bare_sparse_impl(torch.arange(8, dtype=torch.float32))
+    impl.dcp_world_size = 2
+    impl._dcp_gathered_sinks = torch.arange(16, dtype=torch.float32)
+    received = []
+
+    def fake_flashmla(**kwargs):
+        received.append(kwargs["attn_sink"])
+        return torch.zeros(1, 2, 64, 512), torch.zeros(1, 64, 2)
+
+    monkeypatch.setattr(hcu_sparse, "flash_mla_with_kvcache", fake_flashmla)
+    metadata = SimpleNamespace(
+        dummy_block_table=torch.zeros(1, 1, dtype=torch.int32),
+        cache_lens=torch.tensor([2], dtype=torch.int32),
+        scheduler_metadata=None,
+    )
+    args = (
+        torch.zeros(1, 2, 16, 576),
+        torch.zeros(1, 656, dtype=torch.uint8),
+        torch.zeros(1, 2, 4, dtype=torch.int32),
+        metadata,
+    )
+
+    impl.dcp_rank = 0
+    impl._fp8_flash_mla_kernel(*args)
+    torch.testing.assert_close(received[0][:16], impl._dcp_gathered_sinks)
+    assert torch.isneginf(received[0][16:]).all()
+
+    impl.dcp_rank = 1
+    impl._fp8_flash_mla_kernel(*args)
+    assert received[1] is None
+
+
+def test_hyv4_dcp_rank0_lse_counts_sink_after_empty_mask():
+    from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
+
+    raw_lse = torch.tensor([[0.0] * 16, [float("-inf")] * 16])
+    raw_out = torch.ones(2, 16, 512)
+    raw_out[1].zero_()
+    impl = object.__new__(HYV4FlashMLASparseImpl)
+    impl.sinks = torch.ones(8, dtype=torch.float32)
+    impl._dcp_gathered_sinks = torch.ones(16, dtype=torch.float32)
+    impl.dcp_world_size = 2
+
+    impl.dcp_rank = 0
+    out, lse = impl._add_single_dcp_sink_to_lse(
+        raw_out.clone(), raw_lse.clone()
+    )
+    torch.testing.assert_close(
+        lse[0], torch.logaddexp(raw_lse[0], impl._dcp_gathered_sinks)
+    )
+    torch.testing.assert_close(lse[1], impl._dcp_gathered_sinks)
+    assert torch.count_nonzero(out[1]) == 0
+
+    impl.dcp_rank = 1
+    other_out, other_lse = impl._add_single_dcp_sink_to_lse(
+        raw_out.clone(), raw_lse.clone()
+    )
+    torch.testing.assert_close(other_out, raw_out)
+    torch.testing.assert_close(other_lse, raw_lse)
+
+
+def test_hyv4_uses_target_sparse_mqa_implementation():
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+    from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
+    from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+        HcuFlashMLASparseImpl,
+    )
+
+    assert HYV4FlashMLASparseImpl.forward_mqa is FlashMLASparseImpl.forward_mqa
+    assert (
+        HYV4FlashMLASparseImpl.forward_mqa
+        is not HcuFlashMLASparseImpl.forward_mqa
+    )

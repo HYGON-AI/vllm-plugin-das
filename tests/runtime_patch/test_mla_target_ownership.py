@@ -398,6 +398,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     )
     triton_calls: list[object] = []
     scale_calls: list[object] = []
+    impl_post_load_calls: list[torch.dtype] = []
     upstream = SimpleNamespace(
         get_and_maybe_dequant_weights=lambda layer, out_dtype: physical_weight,
         rocm_aiter_ops=SimpleNamespace(
@@ -411,6 +412,11 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
         ),
     )
     mla = SimpleNamespace(
+        impl=SimpleNamespace(
+            process_weights_after_loading=lambda dtype: (
+                impl_post_load_calls.append(dtype)
+            )
+        ),
         kv_b_proj=object(),
         kv_lora_rank=kv_lora_rank,
         num_heads=num_heads,
@@ -446,6 +452,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     )
     assert triton_calls == []
     assert scale_calls == [(mla, False)]
+    assert impl_post_load_calls == [torch.bfloat16]
 
 
 def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
@@ -1271,3 +1278,107 @@ def test_flashmla_cat_route_consumes_split_query(
     assert calls[0]["q_pe"] is q_pe
     assert calls[0]["block_table"] is block_table
     assert calls[0]["cache_seqlens"] is seq_lens
+
+
+@pytest.mark.parametrize("local_lse", [0.1, float("-inf")])
+def test_dcp_single_sink_matches_global_softmax(local_lse):
+    local_lse, other_lse, sink = torch.tensor(
+        [local_lse, 0.7, 1.2], dtype=torch.float64
+    )
+    local_value, other_value = torch.tensor([2.0, 4.0], dtype=torch.float64)
+    rank0_lse = torch.logaddexp(local_lse, sink)
+    rank0_output = torch.where(
+        torch.isneginf(local_lse),
+        0.0,
+        torch.exp(local_lse - rank0_lse) * local_value,
+    )
+
+    merged = (
+        torch.exp(rank0_lse) * rank0_output
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(rank0_lse) + torch.exp(other_lse))
+    oracle = (
+        torch.exp(local_lse) * local_value
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(local_lse) + torch.exp(other_lse) + torch.exp(sink))
+    double_sink = (
+        torch.exp(local_lse) * local_value
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(local_lse) + torch.exp(other_lse) + 2 * torch.exp(sink))
+
+    torch.testing.assert_close(merged, oracle)
+    assert not torch.isclose(double_sink, oracle)
+
+
+def test_hyv4_fp8_dcp_keeps_scattered_local_slots_for_hcu_flashmla(monkeypatch):
+    from vllm.v1.attention.backends.mla import flashmla_sparse as upstream
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+    from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
+
+    seen = {}
+
+    def localize(req_ids, block_table, indices, **kwargs):
+        seen.update(kwargs)
+        torch.testing.assert_close(
+            req_ids, torch.tensor([0, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            block_table, torch.tensor([[7], [11]], dtype=torch.int32)
+        )
+        assert indices.shape == (2, 4)
+        return torch.tensor(
+            [[112, -1, 113, -1], [-1, -1, -1, -1]],
+            dtype=torch.int32,
+        )
+
+    monkeypatch.setattr(
+        hcu_sparse, "triton_filter_and_convert_dcp_index", localize
+    )
+    impl = object.__new__(HYV4FlashMLASparseImpl)
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 1
+    impl.need_to_return_lse_for_decode = True
+    kernel_args = {}
+
+    def fp8_kernel(**kwargs):
+        kernel_args.update(kwargs)
+        return (
+            torch.ones(1, 2, 16, 512),
+            torch.zeros(1, 16, 2),
+        )
+
+    monkeypatch.setattr(impl, "_fp8_flash_mla_kernel", fp8_kernel)
+    fp8 = upstream.FlashMLASparseMetadata.FP8KernelMetadata(
+        scheduler_metadata=None,
+        cache_lens=torch.tensor([2], dtype=torch.int32),
+        dummy_block_table=torch.zeros(1, 1, dtype=torch.int32),
+    )
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[7], [11]], dtype=torch.int32),
+        cp_kv_cache_interleave_size=1,
+        block_size=64,
+        fp8_extra_metadata=fp8,
+    )
+
+    out, lse = impl._forward_fp8_kv_mixed_batch(
+        torch.zeros(2, 16, 576),
+        torch.zeros(4, 656, dtype=torch.uint8),
+        torch.zeros(2, 4, dtype=torch.int32),
+        metadata,
+    )
+
+    assert seen["dcp_size"] == 2 and seen["dcp_rank"] == 1
+    assert seen["compact_valid_to_front"] is False
+    assert seen["cp_kv_cache_interleave_size"] == 1
+    torch.testing.assert_close(
+        kernel_args["topk_indices"],
+        torch.tensor(
+            [[[112, -1, 113, -1], [-1, -1, -1, -1]]],
+            dtype=torch.int32,
+        ),
+    )
+    assert kernel_args["q"].shape == (1, 2, 16, 576)
+    assert "topk_length" not in kernel_args
+    assert torch.count_nonzero(out[1]) == 0
+    assert torch.isneginf(lse[1]).all()

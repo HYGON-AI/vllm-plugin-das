@@ -295,6 +295,9 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     _normalize_hcu_model_runner(vllm_config.model_config)
 
     _validate_hcu_pcp_scope(vllm_config)
+    from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
+
+    validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
     updates: dict[str, str] = {}

@@ -94,26 +94,30 @@ def _normalize_hy_v4_kv_cache_dtype(
 
 
 def _require_supported_hy_v4_parallelism(parallel_config) -> None:
-    """Allow only Hy4 context-parallel layouts covered by the HCU contract."""
+    """Allow the independent PCP and DCP contracts, never their combination."""
     pcp = int(parallel_config.prefill_context_parallel_size)
     dcp = int(parallel_config.decode_context_parallel_size)
-    if pcp == dcp == 1:
+    if pcp == 1 and dcp == 1:
         return
     topology = (
         int(parallel_config.tensor_parallel_size),
+        dcp,
         pcp,
         int(parallel_config.pipeline_parallel_size),
+        int(parallel_config.data_parallel_size),
     )
+    if topology == (8, 2, 1, 1, 1):
+        # The DCP config gate owns the remaining dtype/backend/EP checks.
+        return
     if (
-        dcp != 1
-        or topology not in {(4, 2, 1), (1, 4, 2)}
-        or int(parallel_config.data_parallel_size) != 1
-        or not parallel_config.enable_expert_parallel
+        topology in {(4, 1, 2, 1, 1), (1, 1, 4, 2, 1)}
+        and parallel_config.enable_expert_parallel
     ):
-        raise RuntimeError(
-            "HY V4 HCU context parallel topology is not validated: "
-            f"TP/PCP/PP={topology}, DCP={dcp}."
-        )
+        return
+    raise RuntimeError(
+        "HY V4 HCU context parallel topology has not been validated: "
+        f"TP/DCP/PCP/PP/DP={topology}."
+    )
 
 
 def require_hyv4_sink_backend(
@@ -856,6 +860,10 @@ class HYV4MLAAttention(nn.Module):
         layer_idx: int = 0,
     ) -> None:
         super().__init__()
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
+
+            validate_hy4_dcp_config(vllm_config)
         _require_supported_hy_v4_parallelism(vllm_config.parallel_config)
         self.config = config
         self.hidden_size = hidden_size

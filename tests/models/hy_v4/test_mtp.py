@@ -363,27 +363,72 @@ def test_mtp_topk_compaction_keeps_shared_storage_stable():
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_mtp_target_and_draft_share_all_topk_storage_through_pinned_loader(pp_size, monkeypatch):
+def test_mtp_target_and_draft_share_all_topk_storage_through_pinned_loader(
+    pp_size, monkeypatch
+):
     from vllm.v1.worker.gpu.spec_decode.eagle import utils
     draft = _predictor(_mtp())
     target = nn.Module()
     target.model = nn.Module()
-    target.model.topk_indices_buffer = torch.arange(8, dtype=torch.int32).reshape(4, 2)
+    target.model.topk_indices_buffer = torch.arange(
+        8, dtype=torch.int32
+    ).reshape(4, 2)
     target.model.embed_tokens = nn.Embedding(4, 2)
     target.lm_head = nn.Linear(2, 4, bias=False)
     own_embed = draft.model.embed_tokens
     monkeypatch.setattr(utils, "get_model", lambda **kwargs: draft)
     monkeypatch.setattr(utils, "get_pp_group", lambda: SimpleNamespace(world_size=pp_size))
-    loaded = utils.load_eagle_model(target, SimpleNamespace(speculative_config=SimpleNamespace(
-        draft_model_config=object(), kv_cache_dtype=None, attention_backend=None,
-    )))
+    loaded = utils.load_eagle_model(
+        target,
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                draft_model_config=object(),
+                kv_cache_dtype=None,
+                attention_backend=None,
+            )
+        ),
+    )
     attn = loaded.model.layers["2"].mtp_block.self_attn
-    for owner in (loaded.model, attn, attn.indexer, attn.indexer.indexer_op, attn.mla_attn.impl):
-        assert owner.topk_indices_buffer.data_ptr() == target.model.topk_indices_buffer.data_ptr()
+    for owner in (
+        loaded.model,
+        attn,
+        attn.indexer,
+        attn.indexer.indexer_op,
+        attn.mla_attn.impl,
+    ):
+        assert (
+            owner.topk_indices_buffer.data_ptr()
+            == target.model.topk_indices_buffer.data_ptr()
+        )
+    loaded.model.compact_topk_indices(torch.tensor([2, 0, 1]))
+    assert target.model.topk_indices_buffer[:3].tolist() == [
+        [4, 5],
+        [0, 1],
+        [2, 3],
+    ]
     attn.mla_attn.impl.topk_indices_buffer[0, 0] = 41
     assert target.model.topk_indices_buffer[0, 0] == 41
     assert loaded.model.layers["2"].shared_head.head is target.lm_head
-    assert loaded.model.embed_tokens is (target.model.embed_tokens if pp_size == 1 else own_embed)
+    assert loaded.model.embed_tokens is (
+        target.model.embed_tokens if pp_size == 1 else own_embed
+    )
+
+
+def test_dcp_mtp3_unequal_request_lengths_keep_rank_local_metadata(monkeypatch):
+    from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+    monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "0")
+    global_lens = torch.tensor([5, 8, 9], dtype=torch.int32)
+    rank0 = get_dcp_local_seq_lens(global_lens, 2, 0, 1)
+    rank1 = get_dcp_local_seq_lens(global_lens, 2, 1, 1)
+
+    torch.testing.assert_close(
+        rank0, torch.tensor([3, 4, 5], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        rank1, torch.tensor([2, 4, 4], dtype=torch.int32)
+    )
+    torch.testing.assert_close(rank0 + rank1, global_lens)
 
 
 def test_mtp_local_argmax_uses_shared_head_and_delegates_from_wrapper():

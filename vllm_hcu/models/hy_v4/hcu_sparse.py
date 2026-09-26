@@ -25,10 +25,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_filter_and_convert_dcp_index,
 )
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
@@ -90,6 +94,16 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        self._dcp_gathered_sinks: torch.Tensor | None = None
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Gather the final loaded sink weights in DCP query-head order."""
+        super().process_weights_after_loading(act_dtype)
+        self._dcp_gathered_sinks = None
+        if self.dcp_world_size > 1 and self.sinks is not None:
+            self._dcp_gathered_sinks = get_dcp_group().all_gather(
+                self.sinks.detach().contiguous(), dim=0
+            )
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -182,7 +196,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
         padded_num_heads = self.fp8_decode_padded_heads
-        attn_sink = self._sinks_for_query(q, head_dim=2, kernel_heads=padded_num_heads)
+        attn_sink = self._fp8_sink_for_gathered_query(q)
 
         # Pad query if needed (kernel only supports h_q = 64 or 128)
         if actual_num_heads < padded_num_heads:
@@ -213,6 +227,128 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             lse = lse[:, :actual_num_heads, :]
 
         return out, lse
+
+    def _fp8_sink_for_gathered_query(
+        self, q: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Return the one DCP sink term for the gathered FP8 query."""
+        if self.dcp_world_size <= 1:
+            return self._sinks_for_query(
+                q,
+                head_dim=2,
+                kernel_heads=self.fp8_decode_padded_heads,
+            )
+        if self.dcp_rank != 0 or self.sinks is None:
+            return None
+
+        sinks = self._dcp_gathered_sinks
+        query_heads = q.shape[2]
+        if sinks is None or sinks.numel() != query_heads:
+            gathered_heads = None if sinks is None else sinks.numel()
+            raise RuntimeError(
+                "HY V4 DCP sink does not match gathered query heads: "
+                f"sink_heads={gathered_heads}, query_heads={query_heads}."
+            )
+        if sinks.device != q.device:
+            raise RuntimeError(
+                "HY V4 DCP gathered sinks and query must be on the same "
+                f"device, but got sinks={sinks.device}, query={q.device}."
+            )
+        if self.fp8_decode_padded_heads < query_heads:
+            raise RuntimeError(
+                "HY V4 DCP FP8 kernel head count cannot be smaller than "
+                f"the gathered query: kernel_heads="
+                f"{self.fp8_decode_padded_heads}, query_heads={query_heads}."
+            )
+        if self.fp8_decode_padded_heads == query_heads:
+            return sinks
+
+        padded_sinks = sinks.new_full(
+            (self.fp8_decode_padded_heads,), float("-inf")
+        )
+        padded_sinks[:query_heads] = sinks
+        return padded_sinks
+
+    def _forward_fp8_kv_mixed_batch(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Adapt target FP8 DCP indices to the HCU FlashMLA contract."""
+        if self.dcp_world_size <= 1:
+            return super()._forward_fp8_kv_mixed_batch(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+            )
+
+        # gfx93's FP8 sparse-decode kernel does not support ``topk_length``.
+        # Keep ownership-filtered invalid slots as scattered ``-1`` entries;
+        # the kernel masks those positions natively, matching target vLLM's
+        # mixed-batch FP8 DCP path.
+        topk_indices = triton_filter_and_convert_dcp_index(
+            attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+            attn_metadata.block_table,
+            topk_indices,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=(
+                attn_metadata.cp_kv_cache_interleave_size
+            ),
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            compact_valid_to_front=False,
+        )
+
+        fp8_metadata = attn_metadata.fp8_extra_metadata
+        if not isinstance(
+            fp8_metadata, FlashMLASparseMetadata.FP8KernelMetadata
+        ):
+            raise RuntimeError("HY V4 FP8 DCP requires FP8 kernel metadata")
+        kernel_out, kernel_lse = self._fp8_flash_mla_kernel(
+            q=q.unsqueeze(0),
+            kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+            topk_indices=topk_indices.unsqueeze(0),
+            kernel_metadata=fp8_metadata,
+        )
+        output = kernel_out.squeeze(0)
+        if not self.need_to_return_lse_for_decode:
+            return output, None
+        if kernel_lse is None:
+            raise RuntimeError("HY V4 FP8 DCP kernel did not return LSE")
+        raw_lse = kernel_lse.squeeze(0).transpose(0, 1)
+        empty_rows = (topk_indices == -1).all(dim=-1)
+        output.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        raw_lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        output = output.contiguous()
+
+        return self._add_single_dcp_sink_to_lse(output, raw_lse)
+
+    def _add_single_dcp_sink_to_lse(
+        self,
+        output: torch.Tensor,
+        raw_lse: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Expose rank 0's one virtual sink to the target DCP combine."""
+        if self.dcp_world_size <= 1 or self.dcp_rank != 0 or self.sinks is None:
+            return output, raw_lse
+        if raw_lse is None or self._dcp_gathered_sinks is None:
+            raise RuntimeError(
+                "HY V4 DCP requires loaded sink weights and per-head LSE."
+            )
+        if raw_lse.shape[-1] != self._dcp_gathered_sinks.numel():
+            raise RuntimeError(
+                "HY V4 DCP LSE head count does not match gathered sinks: "
+                f"lse_heads={raw_lse.shape[-1]}, "
+                f"sink_heads={self._dcp_gathered_sinks.numel()}."
+            )
+        return output, torch.logaddexp(
+            raw_lse,
+            self._dcp_gathered_sinks.view(1, -1),
+        )
 
     def _bf16_flash_mla_kernel(
         self,
