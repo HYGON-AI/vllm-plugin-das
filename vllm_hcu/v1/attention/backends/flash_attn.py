@@ -826,7 +826,13 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        self.supports_quant_query_input = flash_attn_supports_quant_query_input()
+        # The upstream query quantizer emits the platform E4M3 dtype. The
+        # vendor E5M2 KV reader requires compute-dtype queries instead of
+        # this mixed FP8 pair; keep native E5M2 K/V storage unchanged.
+        self.supports_quant_query_input = (
+            self.kv_cache_dtype != "fp8_e5m2"
+            and flash_attn_supports_quant_query_input()
+        )
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (

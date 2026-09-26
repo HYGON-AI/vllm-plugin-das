@@ -34,6 +34,14 @@ def _install_categorized_lightop(
     monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
 
 
+def _install_deepgemm(monkeypatch, *, gemm_name: str, gemm_kernel) -> None:
+    # CPU contract tests must stop at the vendor GEMM boundary.
+    deepgemm = ModuleType("deepgemm")
+    deepgemm.__path__ = []
+    setattr(deepgemm, gemm_name, gemm_kernel)
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+
+
 def _load_permute_function():
     source_path = (
         Path(__file__).parents[2]
@@ -192,6 +200,11 @@ def _run_w8a8_apply(
 
 
 def test_w8a8_apply_skips_alignment_scope_only_on_rocm(monkeypatch):
+    _install_deepgemm(
+        monkeypatch,
+        gemm_name="m_grouped_i8_gemm_nt_contiguous",
+        gemm_kernel=lambda *_args: None,
+    )
     _install_categorized_lightop(
         monkeypatch,
         activation_name="fuse_silu_mul_quant",
@@ -229,10 +242,15 @@ def test_w8a8_apply_skips_alignment_scope_only_on_rocm(monkeypatch):
     assert events == [("scope", 256), "enter", "exit"]
 
 
-def test_w8a8_apply_uses_categorized_lightop_contiguous_api(
+def test_w8a8_apply_uses_deepgemm_contiguous_api(
     monkeypatch,
 ):
     calls: list[tuple[object, ...]] = []
+    _install_deepgemm(
+        monkeypatch,
+        gemm_name="m_grouped_i8_gemm_nt_contiguous",
+        gemm_kernel=lambda *args: calls.append(args),
+    )
     _install_categorized_lightop(
         monkeypatch,
         activation_name="fuse_silu_mul_quant",
@@ -241,7 +259,7 @@ def test_w8a8_apply_uses_categorized_lightop_contiguous_api(
             torch.ones((tensor.shape[0], 1)),
         ),
         gemm_name="m_grouped_w8a8_gemm_nt_contig_asm",
-        gemm_kernel=lambda *args: calls.append(args),
+        gemm_kernel=lambda *_args: pytest.fail("obsolete LightOP GEMM invoked"),
     )
     hcu = _load_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
@@ -249,6 +267,15 @@ def test_w8a8_apply_uses_categorized_lightop_contiguous_api(
     _run_w8a8_apply(hcu, packed_weights=True)
 
     assert len(calls) == 2
+    assert tuple(calls[0][0][0].shape) == (2, 64)
+    assert tuple(calls[1][0][0].shape) == (2, 8)
+    assert tuple(calls[0][1][0].shape) == (1, 1, 1, 4, 16, 16)
+    assert tuple(calls[1][1][0].shape) == (1, 1, 4, 4, 16, 16)
+    assert tuple(calls[0][2].shape) == (2, 16)
+    assert tuple(calls[1][2].shape) == (2, 64)
+    assert calls[0][3] is calls[1][3]
+    assert calls[0][3].dtype == torch.int32
+    assert calls[0][3].tolist() == [0, 0]
 
 
 def _load_batched_deep_gemm_apply():
@@ -291,10 +318,15 @@ def _load_batched_deep_gemm_apply():
     return namespace
 
 
-def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
+def test_w8a8_batched_apply_uses_deepgemm_masked_api(
     monkeypatch,
 ):
     calls: list[tuple[object, ...]] = []
+    _install_deepgemm(
+        monkeypatch,
+        gemm_name="m_grouped_i8_gemm_nt_masked",
+        gemm_kernel=lambda *args: calls.append(args),
+    )
     _install_categorized_lightop(
         monkeypatch,
         activation_name="fuse_silu_mul_quant_ep",
@@ -303,7 +335,7 @@ def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
             torch.ones((*tensor.shape[:-1], 1)),
         ),
         gemm_name="m_grouped_w8a8_gemm_nt_masked",
-        gemm_kernel=lambda *args: calls.append(args),
+        gemm_kernel=lambda *_args: pytest.fail("obsolete LightOP GEMM invoked"),
     )
     hcu = _load_batched_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
@@ -340,6 +372,16 @@ def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
     )
 
     assert len(calls) == 2
+    assert tuple(calls[0][1][0].shape) == (1, 1, 1, 4, 16, 16)
+    assert tuple(calls[1][1][0].shape) == (1, 1, 4, 4, 16, 16)
+    assert calls[0][1][1] is experts.w1_scale
+    assert calls[1][1][1] is experts.w2_scale
+    assert tuple(calls[0][2].shape) == (1, 2, 16)
+    assert tuple(calls[1][2].shape) == (1, 2, 64)
+    assert calls[0][3] is calls[1][3]
+    assert calls[0][3].dtype == torch.int32
+    assert calls[0][3].tolist() == [1]
+    assert calls[0][4] == calls[1][4] == 2
 
 
 def _make_w4a8_expert_layer() -> torch.nn.Module:

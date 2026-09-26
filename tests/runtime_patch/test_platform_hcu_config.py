@@ -833,6 +833,9 @@ def _make_vllm_module() -> ModuleType:
     module = ModuleType(patch_vllm_config.TARGET_MODULE)
 
     class FakeVllmConfig:
+        def _maybe_enable_breakable_cudagraph(self) -> bool:
+            return False
+
         def __init__(self, sizes: list[int] | None = None) -> None:
             self.additional_config: dict[str, Any] = {}
             self.model_config = _FakeModelConfig(_FakeHFConfig("old"))
@@ -1015,6 +1018,7 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
         model_config=SimpleNamespace(
+            architectures=["Qwen3ForCausalLM"],
             enforce_eager=True,
             use_mla=False,
             max_model_len=4096,
@@ -1458,6 +1462,7 @@ def _vllm_hash(additional_config: dict[str, Any]) -> str:
         load_config=None,
         offload_config=None,
         attention_config=None,
+        engram_config=None,
         lora_config=None,
         speculative_config=None,
         structured_outputs_config=None,

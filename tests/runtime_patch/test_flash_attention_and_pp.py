@@ -156,6 +156,102 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
         )
 
 
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("positional", [False, True])
+def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
+    monkeypatch, layout, dtype, positional,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout=layout,
+    )
+    physical_shape = (3, 2, 64, 8) if layout == "HND" else (3, 64, 2, 8)
+    physical = torch.linspace(-2, 2, 3072).reshape(physical_shape).to(dtype)
+    key = physical.transpose(1, 2) if layout == "HND" else physical
+    value = key.clone()
+    original_stride = key.stride()
+
+    def vendor(q, k, v, layout="bshd"):
+        return k, v, layout
+
+    wrapped = fa_utils._with_kv_cache_layout(vendor, "probe")
+    if positional:
+        actual_key, actual_value, actual_layout = wrapped(None, key, value, "bshd")
+    else:
+        actual_key, actual_value, actual_layout = wrapped(q=None, k=key, v=value)
+
+    assert actual_layout == ("bhsd" if layout == "HND" else "bshd")
+    assert tuple(actual_key.shape) == physical_shape
+    assert tuple(actual_value.shape) == physical_shape
+    assert actual_key.data_ptr() == key.data_ptr()
+    assert actual_value.data_ptr() == value.data_ptr()
+    assert actual_key.dtype == actual_value.dtype == dtype
+    torch.testing.assert_close(actual_key.float(), physical.float(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_value.float(), physical.float(), rtol=0, atol=0)
+    assert tuple(key.shape) == (3, 64, 2, 8)
+    assert key.stride() == original_stride
+
+
+def test_hcu_fa_boundary_preserves_nonpaged_kv_axes(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    key = torch.zeros(64, 2, 8)
+    value = torch.ones_like(key)
+
+    def vendor(q, k, v, *, layout="bshd"):
+        return k, v
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=None, k=key, v=value,
+    )
+    assert result[0] is key
+    assert result[1] is value
+
+
+def test_hcu_cache_layout_survives_worker_initialization_context(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+    cache = CacheConfig()
+    cache.kv_cache_layout = "LBHNC"
+    with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+        assert layouts.get_kv_cache_layout() == "HND"
+    # Worker forwards and Graph capture do not require a global config context.
+    with set_current_vllm_config(None):
+        assert layouts.get_kv_cache_layout() == "HND"
+
+
+def test_hcu_cache_layout_uses_new_resolved_worker_config(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    for resolved, expected in (("LBHNC", "HND"), ("LBNHC", "NHD")):
+        cache = CacheConfig()
+        cache.kv_cache_layout = resolved
+        with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+            assert layouts.get_kv_cache_layout() == expected
+        with set_current_vllm_config(None):
+            assert layouts.get_kv_cache_layout() == expected
+
+
+def test_hcu_cache_layout_does_not_latch_an_unresolved_default(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    cache = CacheConfig()
+    with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+        assert layouts.get_kv_cache_layout() == "NHD"
+        cache.kv_cache_layout = "LBHNC"
+        assert layouts.get_kv_cache_layout() == "HND"
+    with set_current_vllm_config(SimpleNamespace(cache_config=CacheConfig())):
+        assert layouts.get_kv_cache_layout() == "NHD"
+    with set_current_vllm_config(None):
+        assert layouts.get_kv_cache_layout() == "HND"
+
+
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
     calls: list[tuple[int, int, int]] = []
 
@@ -1247,7 +1343,7 @@ def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
     )
     query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
     packed_cache = torch.zeros((144, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.split(128, dim=-1)
+    key_cache, value_cache = packed_cache.transpose(1, 2).split(128, dim=-1)
     seq_lens = torch.tensor([8421], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 37], dtype=torch.int32)
     block_table = torch.arange(144, dtype=torch.int32).unsqueeze(0)
@@ -1281,6 +1377,46 @@ def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
     assert forwarded["cu_seqlens_k"].shape == (2,)
 
 
+
+@pytest.mark.parametrize("with_lse", [False, True])
+@pytest.mark.parametrize("with_output", [False, True])
+def test_flash_attention_long_prefill_writes_caller_output(
+    monkeypatch, with_lse, with_output,
+) -> None:
+    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+
+    query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
+    output = torch.full_like(query, -123) if with_output else None
+    actual = torch.full_like(query, 2.5)
+    lse = torch.ones((8, 37), dtype=torch.float32)
+    probabilities = torch.empty(0)
+    returned = (actual, lse, probabilities) if with_lse else actual
+
+    def vendor_nonpaged(**kwargs):
+        assert kwargs["block_table"] is None
+        assert kwargs["out"] is output
+        assert kwargs.get("return_attn_probs", False) == with_lse
+        # The installed nonpaged vendor interface returns a new tensor and
+        # ignores out. Model forward consumes the caller buffer instead.
+        return returned
+
+    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
+    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", vendor_nonpaged)
+    monkeypatch.setattr(fa_utils, "_gather_paged_kv", lambda *a, **kw: None)
+    cache = torch.zeros((144, 2, 64, 128), dtype=torch.bfloat16).transpose(1, 2)
+    result = fa_utils.flash_attn_varlen_func(
+        q=query, k=cache, v=cache, out=output,
+        cu_seqlens_q=torch.tensor([0, 37], dtype=torch.int32),
+        max_seqlen_q=37, max_seqlen_k=8485,
+        seqused_k=torch.tensor([8485], dtype=torch.int32),
+        block_table=torch.arange(144, dtype=torch.int32).unsqueeze(0),
+        return_softmax_lse=with_lse,
+    )
+    assert result is returned
+    if output is not None:
+        torch.testing.assert_close(output, actual)
+
+
 def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
     monkeypatch,
 ) -> None:
@@ -1301,7 +1437,7 @@ def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
     )
     query = torch.zeros((75, 8, 128), dtype=torch.bfloat16)
     packed_cache = torch.zeros((72, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.split(128, dim=-1)
+    key_cache, value_cache = packed_cache.transpose(1, 2).split(128, dim=-1)
     block_table = torch.arange(72, dtype=torch.int32).unsqueeze(0)
     seq_lens = torch.tensor([4171], dtype=torch.int32)
 
@@ -1319,3 +1455,45 @@ def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
     assert result == "vendor-result"
     assert calls[0]["block_table"] is block_table
     assert calls[0]["seqused_k"] is seq_lens
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected_query_dtype"),
+    [("fp8_e5m2", torch.bfloat16), ("fp8_e4m3", torch.float8_e4m3fn)],
+)
+def test_hcu_flash_attention_e5m2_keeps_compute_dtype_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: str,
+    expected_query_dtype: torch.dtype,
+) -> None:
+    from vllm_hcu.model_executor.layers.attention_forward_runtime import attention_forward
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_fp8", lambda: True)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_quant_query_input", lambda: True)
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=1, head_size=64, scale=0.125, num_kv_heads=1,
+        alibi_slopes=None, sliding_window=None, kv_cache_dtype=cache_dtype,
+    )
+
+    def consume(query, key, value, output, layer_name, **kwargs):
+        # Vendor E5M2 KV accepts compute-dtype queries, not the E4M3
+        # queries produced by the platform-wide upstream quantizer.
+        assert query.dtype == expected_query_dtype
+        output.copy_(query.to(output.dtype))
+
+    layer = SimpleNamespace(
+        impl=impl,
+        query_quant=lambda query, scale: (query.to(torch.float8_e4m3fn), scale),
+        _q_scale=torch.tensor(1.0),
+        num_heads=1, num_kv_heads=1, head_size=64, head_size_v=64,
+        layer_name="layer", kv_cache_dtype=cache_dtype,
+        attn_backend=SimpleNamespace(forward_includes_kv_cache_update=True),
+        kv_sharing_target_layer_name=None, use_direct_call=True,
+    )
+    upstream = SimpleNamespace(unified_attention_with_output=consume)
+    query = torch.full((2, 64), 1.25, dtype=torch.bfloat16)
+    output = attention_forward(upstream, layer, query, query, query)
+    torch.testing.assert_close(output, query)
