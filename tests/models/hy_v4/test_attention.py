@@ -351,20 +351,18 @@ def test_fp8_sparse_kernel_forwards_sink_and_slices_target_lse(monkeypatch):
         cache_lens=torch.tensor([2], dtype=torch.int32),
         scheduler_metadata=None,
     )
-    topk_length = torch.tensor([2], dtype=torch.int32)
     output, lse = impl._fp8_flash_mla_kernel(
         torch.zeros(1, 2, 4, 576),
         torch.zeros(1, 656, dtype=torch.uint8),
         torch.zeros(1, 2, 4, dtype=torch.int32),
         metadata,
-        topk_length,
     )
 
     assert output.shape == (1, 2, 4, 512)
     assert lse.shape == (1, 4, 2)
     assert torch.equal(captured["attn_sink"][:4], impl.sinks)
     assert torch.isneginf(captured["attn_sink"][4:]).all()
-    assert captured["topk_length"] is topk_length
+    assert "topk_length" not in captured
 
 
 def test_hyv4_dcp_gathers_loaded_sinks_once(monkeypatch):

@@ -1310,7 +1310,7 @@ def test_dcp_single_sink_matches_global_softmax(local_lse):
     assert not torch.isclose(double_sink, oracle)
 
 
-def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
+def test_hyv4_fp8_dcp_keeps_scattered_local_slots_for_hcu_flashmla(monkeypatch):
     from vllm.v1.attention.backends.mla import flashmla_sparse as upstream
     from vllm_hcu.models.hy_v4 import hcu_sparse
     from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
@@ -1326,12 +1326,9 @@ def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
             block_table, torch.tensor([[7], [11]], dtype=torch.int32)
         )
         assert indices.shape == (2, 4)
-        return (
-            torch.tensor(
-                [[112, 113, -1, -1], [-1, -1, -1, -1]],
-                dtype=torch.int32,
-            ),
-            torch.tensor([2, 0], dtype=torch.int32),
+        return torch.tensor(
+            [[112, -1, 113, -1], [-1, -1, -1, -1]],
+            dtype=torch.int32,
         )
 
     monkeypatch.setattr(
@@ -1346,8 +1343,8 @@ def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
     def fp8_kernel(**kwargs):
         kernel_args.update(kwargs)
         return (
-            torch.ones(2, 1, 16, 512),
-            torch.zeros(2, 16, 1),
+            torch.ones(1, 2, 16, 512),
+            torch.zeros(1, 16, 2),
         )
 
     monkeypatch.setattr(impl, "_fp8_flash_mla_kernel", fp8_kernel)
@@ -1372,20 +1369,16 @@ def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
     )
 
     assert seen["dcp_size"] == 2 and seen["dcp_rank"] == 1
-    assert seen["return_valid_counts"] is True
-    assert seen["compact_valid_to_front"] is True
+    assert seen["compact_valid_to_front"] is False
     assert seen["cp_kv_cache_interleave_size"] == 1
     torch.testing.assert_close(
         kernel_args["topk_indices"],
         torch.tensor(
-            [[[112, 113, -1, -1]], [[-1, -1, -1, -1]]],
+            [[[112, -1, 113, -1], [-1, -1, -1, -1]]],
             dtype=torch.int32,
         ),
     )
-    assert kernel_args["q"].shape == (2, 1, 16, 576)
-    torch.testing.assert_close(
-        kernel_args["topk_length"],
-        torch.tensor([2, 0], dtype=torch.int32),
-    )
+    assert kernel_args["q"].shape == (1, 2, 16, 576)
+    assert "topk_length" not in kernel_args
     assert torch.count_nonzero(out[1]) == 0
     assert torch.isneginf(lse[1]).all()
