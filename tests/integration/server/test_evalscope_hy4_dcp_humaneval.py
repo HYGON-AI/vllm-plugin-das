@@ -10,7 +10,9 @@ import os
 import re
 import shlex
 import sys
+import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -91,11 +93,24 @@ def server_args(mode: str) -> list[str]:
 def server_env() -> dict[str, str]:
     """Return an isolated eight-HCU environment for the launcher."""
     env = os.environ.copy()
-    env.pop("VLLM_PLUGINS", None)
+    for name in (
+        "VLLM_PLUGINS",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        env.pop(name, None)
     env.update(
         {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_USE_NN": "1",
             "VLLM_DCP_Q_REPLICATE": "0",
+            "VLLM_HCU_USE_CUSTOM_OPS": "1",
+            "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM": "1",
             "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
@@ -168,6 +183,64 @@ def request_humaneval(output_path: Path, count: int) -> None:
                 f"{problem['task_id']} finished with "
                 f"{records[-1]['finish_reason']!r}; refusing accuracy claim"
             )
+
+
+def validate_concurrent_records(records: list[dict]) -> None:
+    """Require different request-local draft patterns, not global step IDs."""
+    if [row.get("task_id") for row in records] != [
+        "HumanEval/0", "HumanEval/3", "HumanEval/7"
+    ]:
+        raise RuntimeError("Concurrent task ids or order do not match")
+    acceptances = []
+    for row in records:
+        if row.get("finish_reason") != "stop":
+            raise RuntimeError(f"{row['task_id']} did not stop normally")
+        spec_stats = (row.get("metrics") or {}).get("speculative_decoding") or {}
+        steps = spec_stats.get("per_step_accepted")
+        if not isinstance(steps, list) or not steps or not all(
+            isinstance(step, int) and 0 <= step <= 3 for step in steps
+        ):
+            raise RuntimeError(f"{row['task_id']} lacks detailed MTP3 metrics")
+        acceptances.append(steps)
+    if not any(len(set(step_counts)) > 1 for step_counts in zip(*acceptances)):
+        raise RuntimeError(
+            "Concurrent requests did not show different request-local "
+            "draft acceptance"
+        )
+
+
+def request_concurrent(output_path: Path) -> None:
+    """Exercise concurrent MTP3 target verification with detailed metrics."""
+    if output_path.exists():
+        raise FileExistsError(f"Refusing to overwrite prior result: {output_path}")
+    problems = humaneval(8)
+    selected = [problems[index] for index in (0, 3, 7)]
+    start = threading.Barrier(len(selected))
+
+    def submit(problem: dict) -> dict:
+        request = urllib.request.Request(
+            "http://127.0.0.1:8000/v1/chat/completions",
+            data=json.dumps(request_payload(problem)).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        start.wait(timeout=30)
+        with opener.open(request, timeout=1800) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        return {
+            "task_id": problem["task_id"],
+            "completion": choice["message"]["content"],
+            "finish_reason": choice["finish_reason"],
+            "usage": body.get("usage"),
+            "metrics": body.get("metrics"),
+        }
+
+    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        records = list(pool.map(submit, selected))
+    output_path.write_text(json.dumps(records, indent=2) + "\n")
+    validate_concurrent_records(records)
 
 
 def normalize_completion(completion: str) -> str:
@@ -253,9 +326,18 @@ def test_dcp_launcher_pins_mrv2_query_sharding_and_eight_cards():
     env = server_env()
 
     assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert env["VLLM_USE_NN"] == "1"
     assert env["VLLM_DCP_Q_REPLICATE"] == "0"
+    assert env["VLLM_HCU_USE_CUSTOM_OPS"] == "1"
+    assert env["VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM"] == "1"
     assert env["HIP_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
     assert "VLLM_PLUGINS" not in env
+    assert "VLLM_USE_BREAKABLE_CUDAGRAPH" not in env
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        assert name not in env
 
 
 def test_dcp_launcher_rejects_unknown_mode():
@@ -311,6 +393,27 @@ def test_prediction_gate_rejects_wrong_order_and_truncation():
         validate_prediction_records(records, problems)
 
 
+def test_concurrent_gate_requires_different_request_local_draft_acceptance():
+    records = [
+        {
+            "task_id": f"HumanEval/{index}",
+            "finish_reason": "stop",
+            "metrics": {
+                "speculative_decoding": {"per_step_accepted": accepted}
+            },
+        }
+        for index, accepted in zip((0, 3, 7), ([3, 3, 2], [3, 1, 3], [3, 3, 3]))
+    ]
+    validate_concurrent_records(records)
+
+    records[1]["metrics"]["speculative_decoding"]["per_step_accepted"] = [3, 3, 2]
+    records[2]["metrics"]["speculative_decoding"]["per_step_accepted"] = [3, 3, 2]
+    with pytest.raises(
+        RuntimeError, match="different request-local draft acceptance"
+    ):
+        validate_concurrent_records(records)
+
+
 def test_request_refuses_existing_result_file(tmp_path):
     output_path = tmp_path / "prior-run.json"
     output_path.write_text("prior result")
@@ -326,13 +429,35 @@ def _print_server_command(mode: str) -> None:
         f"{name}={shlex.quote(env[name])}"
         for name in (
             "VLLM_USE_V2_MODEL_RUNNER",
+            "VLLM_USE_NN",
             "VLLM_DCP_Q_REPLICATE",
+            "VLLM_HCU_USE_CUSTOM_OPS",
+            "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
             "HIP_VISIBLE_DEVICES",
             "NO_PROXY",
+            "no_proxy",
             "PYTHONNOUSERSITE",
         )
     ]
-    command = assigned + ["env", "-u", "VLLM_PLUGINS"]
+    command = assigned + [
+        "env",
+        "-u",
+        "VLLM_PLUGINS",
+        "-u",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH",
+        "-u",
+        "HTTP_PROXY",
+        "-u",
+        "HTTPS_PROXY",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "http_proxy",
+        "-u",
+        "https_proxy",
+        "-u",
+        "all_proxy",
+    ]
     command.extend(shlex.quote(argument) for argument in server_args(mode))
     print(" ".join(command))
 
@@ -347,8 +472,11 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["score"] and len(sys.argv) == 4:
         score_humaneval(Path(sys.argv[2]), Path(sys.argv[3]))
         raise SystemExit(0)
+    if sys.argv[1:2] == ["concurrent"] and len(sys.argv) == 3:
+        request_concurrent(Path(sys.argv[2]))
+        raise SystemExit(0)
     raise SystemExit(
         "Usage: test_evalscope_hy4_dcp_humaneval.py "
         "command MODE | request OUTPUT.json 8|32 | "
-        "score PREDICTIONS.json REPORT.json"
+        "score PREDICTIONS.json REPORT.json | concurrent OUTPUT.json"
     )
