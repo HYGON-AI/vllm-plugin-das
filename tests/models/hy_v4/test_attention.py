@@ -121,6 +121,24 @@ def test_shared_indexer_cannot_precede_its_full_producer():
         compute_skip_topk_layers(config)
 
 
+def test_hy4_pp2_stage_41_starts_with_local_sparse_indexer_producer() -> None:
+    from vllm_hcu.models.hy_v4.attention import require_local_indexer_producer
+
+    indexer_types = ["full"] * 78
+    indexer_types[40] = "shared"
+    indexer_types[42] = "shared"
+    config = SimpleNamespace(
+        index_topk=2048,
+        num_hidden_layers=78,
+        indexer_types=indexer_types,
+        layer_types=["deepseek_sparse_attention"] * 78,
+    )
+
+    require_local_indexer_producer(config, start_layer=41, end_layer=78)
+    with pytest.raises(ValueError, match="preceding local 'full'"):
+        require_local_indexer_producer(config, start_layer=40, end_layer=78)
+
+
 def test_sparse_e4m3_cache_spec_has_quantized_page_geometry():
     from vllm_hcu.models.hy_v4.attention import HYV4MLAAttentionLayer
 
@@ -145,9 +163,12 @@ def test_sparse_e4m3_cache_spec_has_quantized_page_geometry():
 def test_hyv4_sparse_backend_keeps_flashmla_name_and_sink_capability():
     from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseBackend
 
+    impl = HYV4FlashMLASparseBackend.get_impl_cls()
     assert HYV4FlashMLASparseBackend.get_name() == "FLASHMLA_SPARSE"
     assert HYV4FlashMLASparseBackend.is_sparse()
     assert HYV4FlashMLASparseBackend.supports_sink()
+    assert impl.supports_pcp is True
+    assert impl.can_return_lse_for_decode is True
 
 
 def test_sparse_mqa_backend_accepts_flashmla_and_rejects_dense():
@@ -309,6 +330,46 @@ def test_bf16_sparse_kernel_returns_target_output_lse_pair(monkeypatch):
     assert lse.shape == (2, 4)
     assert torch.equal(captured["sink"][:4], impl.sinks)
     assert torch.isneginf(captured["sink"][4:]).all()
+
+
+def test_hy4_pcp_short_prefills_and_decode_keep_sink_and_finite_lse(
+    monkeypatch,
+) -> None:
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+
+    impl = _bare_sparse_impl(torch.arange(4, dtype=torch.float32))
+    impl.kv_cache_dtype = "bfloat16"
+    impl.need_to_return_lse_for_decode = True
+    impl.topk_indices_buffer = torch.zeros(3, 4, dtype=torch.int32)
+    seen_sinks = []
+
+    def fake_sparse_fwd(q, kv, indices, scale, attn_sink=None, topk_length=None):
+        seen_sinks.append(attn_sink)
+        return (
+            torch.ones(q.shape[0], q.shape[1], 512),
+            None,
+            torch.ones(q.shape[0], q.shape[1]),
+        )
+
+    def forward_bf16(q, cache, indices, metadata, actual_num_heads):
+        return impl._bf16_flash_mla_kernel(
+            q, cache, indices, actual_num_heads=actual_num_heads
+        )
+
+    monkeypatch.setattr(hcu_sparse, "flash_mla_sparse_fwd", fake_sparse_fwd)
+    impl._forward_bf16_kv = forward_bf16
+    cache = torch.zeros(8, 576)
+    for num_tokens in (2, 2, 1):
+        output, lse = impl.forward_mqa(
+            torch.zeros(num_tokens, 4, 576), cache, SimpleNamespace(), None
+        )
+        assert output.shape == (num_tokens, 4, 512)
+        assert lse.shape == (num_tokens, 4)
+        assert torch.isfinite(lse).all()
+
+    assert len(seen_sinks) == 3
+    for sink in seen_sinks:
+        torch.testing.assert_close(sink[:4], impl.sinks)
 
 
 def test_fp8_sparse_kernel_forwards_sink_and_slices_target_lse(monkeypatch):

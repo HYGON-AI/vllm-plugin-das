@@ -35,6 +35,71 @@ def _pcp_module():
     )
 
 
+def test_hy4_two_prefills_decode_and_mtp_keep_one_replicated_cache_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both MLA and indexer writers share the mixed-row PCP slot order."""
+    pcp = _pcp_module()
+    local_kv = torch.arange(1, 7, dtype=torch.float32).reshape(-1, 1)
+    local_rope = (local_kv + 100).reshape(-1, 1, 1)
+    local_indexer = local_kv + 200
+    slots = torch.tensor(
+        [10, 11, 20, 900, 901, 902, 30, 31, 40, -1, -1, -1],
+        dtype=torch.int64,
+    )
+    rank0_prefills = torch.tensor([[1.0], [2.0], [3.0]])
+    rank1_prefills = torch.tensor([[11.0], [12.0], [13.0]])
+    group = _FakePCPGroup(
+        [
+            ("kv", rank0_prefills, torch.cat((rank0_prefills, rank1_prefills))),
+            (
+                "rope_k",
+                rank0_prefills + 100,
+                torch.cat((rank0_prefills, rank1_prefills)) + 100,
+            ),
+            (
+                "indexer_k",
+                rank0_prefills + 200,
+                torch.cat((rank0_prefills, rank1_prefills)) + 200,
+            ),
+        ]
+    )
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
+    metadata = SimpleNamespace(
+        pcp_world_size=2,
+        num_decode_tokens=1,
+        num_prefills=2,
+        pcp_has_global_prefill=True,
+        pcp_replicated_token_mask=torch.tensor(
+            [False, False, False, True, True, True]
+        ),
+        pcp_replicated_slot_indices=torch.tensor([0, 0, 0, 3, 4, 5]),
+    )
+
+    actual_kv, actual_rope, actual_slots = (
+        pcp.maybe_gather_mla_latent_cache_inputs(
+            local_kv, local_rope, slots, metadata
+        )
+    )
+    actual_indexer, indexer_slots = pcp.maybe_gather_indexer_k(
+        local_indexer, slots, metadata
+    )
+
+    expected_kv = torch.tensor(
+        [[4.0], [5.0], [6.0], [1.0], [2.0], [3.0], [11.0], [12.0], [13.0]]
+    )
+    expected_slots = torch.tensor(
+        [900, 901, 902, 10, 11, 20, 30, 31, 40], dtype=torch.int64
+    )
+    torch.testing.assert_close(actual_kv, expected_kv)
+    torch.testing.assert_close(actual_rope, expected_kv.reshape(-1, 1, 1) + 100)
+    torch.testing.assert_close(actual_indexer, expected_kv + 200)
+    torch.testing.assert_close(actual_slots, expected_slots)
+    torch.testing.assert_close(indexer_slots, expected_slots)
+    assert group.calls == ["kv", "rope_k", "indexer_k"]
+    group.assert_exhausted()
+
+
 def test_mla_prefill_gathers_uneven_rank_inputs_in_collective_order(
     monkeypatch: pytest.MonkeyPatch,
 ):
