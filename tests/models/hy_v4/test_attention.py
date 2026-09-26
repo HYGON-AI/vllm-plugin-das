@@ -351,7 +351,7 @@ def test_fp8_sparse_kernel_forwards_sink_and_slices_target_lse(monkeypatch):
         cache_lens=torch.tensor([2], dtype=torch.int32),
         scheduler_metadata=None,
     )
-    topk_length = torch.tensor([2, 1], dtype=torch.int32)
+    topk_length = torch.tensor([2], dtype=torch.int32)
     output, lse = impl._fp8_flash_mla_kernel(
         torch.zeros(1, 2, 4, 576),
         torch.zeros(1, 656, dtype=torch.uint8),

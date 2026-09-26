@@ -1346,8 +1346,8 @@ def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
     def fp8_kernel(**kwargs):
         kernel_args.update(kwargs)
         return (
-            torch.ones(1, 2, 16, 512),
-            torch.zeros(1, 16, 2),
+            torch.ones(2, 1, 16, 512),
+            torch.zeros(2, 16, 1),
         )
 
     monkeypatch.setattr(impl, "_fp8_flash_mla_kernel", fp8_kernel)
@@ -1378,10 +1378,11 @@ def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
     torch.testing.assert_close(
         kernel_args["topk_indices"],
         torch.tensor(
-            [[[112, 113, -1, -1], [-1, -1, -1, -1]]],
+            [[[112, 113, -1, -1]], [[-1, -1, -1, -1]]],
             dtype=torch.int32,
         ),
     )
+    assert kernel_args["q"].shape == (2, 1, 16, 576)
     torch.testing.assert_close(
         kernel_args["topk_length"],
         torch.tensor([2, 0], dtype=torch.int32),

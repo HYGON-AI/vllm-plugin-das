@@ -314,18 +314,22 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         ):
             raise RuntimeError("HY V4 FP8 DCP requires FP8 kernel metadata")
         kernel_out, kernel_lse = self._fp8_flash_mla_kernel(
-            q=q.unsqueeze(0),
+            # HCU's FP8 sparse-decode ABI accepts one ``topk_length`` per
+            # batch item, not per query position. Treat every independent
+            # sparse query token as a one-token batch item so each compacted
+            # row keeps its own valid length.
+            q=q.unsqueeze(1),
             kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
-            topk_indices=topk_indices.unsqueeze(0),
+            topk_indices=topk_indices.unsqueeze(1),
             kernel_metadata=fp8_metadata,
             topk_length=topk_length,
         )
-        output = kernel_out.squeeze(0)
+        output = kernel_out.squeeze(1)
         if not self.need_to_return_lse_for_decode:
             return output, None
         if kernel_lse is None:
             raise RuntimeError("HY V4 FP8 DCP kernel did not return LSE")
-        raw_lse = kernel_lse.squeeze(0).transpose(0, 1)
+        raw_lse = kernel_lse.squeeze(-1)
         empty_rows = topk_length == 0
         output.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
         raw_lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
