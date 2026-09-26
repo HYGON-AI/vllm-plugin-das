@@ -1,8 +1,11 @@
 # Hy4 PCP on v0.28.1-dev: validation record
 
-This is an eager-only, separate follow-up to PR #152. It does not claim
-PCP+CUDA Graph or PCP+DCP. The candidate branch is `feat/hy4-pcp-v0281`,
-based on PR #152 commit `1b51a2bccf36437f0638a74887bffb9167a7e294`.
+This eager-only work was initially submitted as PR #156, based on PR #152
+commit `1b51a2bccf36437f0638a74887bffb9167a7e294`. At the user's request,
+PR #156 was squash-merged into PR #152 as `68da40d9028b36359534d93588021459d519409d`
+on 2026-09-26. The resulting tree is identical to the reviewed #156 head
+`0d1c1bc`. It does not claim PCP+CUDA Graph or PCP+DCP. See the
+[combined validation record](hy4_v0281_combined_validation.md) for the latest gate.
 
 ## Frozen wheel and model provenance
 

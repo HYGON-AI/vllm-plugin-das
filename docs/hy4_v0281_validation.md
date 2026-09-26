@@ -5,7 +5,7 @@
 - Plugin source after proxy-free fetch: origin/v0.25.1 at 6ea7b12f3d77d4564d613aac31c5e6c5e7a8641d.
 - Plugin target after proxy-free fetch: origin/v0.28.1-dev at 93021650a5c768121507d5b8241d0e848756e44e.
 - Feature worktree: feat/hy4-v0281-alignment, based on the target SHA above.
-- OpenDAS vLLM: 0.28.1+dtk2604.torch2110.2609171627.g77acaf, imported from /usr/local/lib/python3.10/dist-packages/vllm. This version reports the 77acaf lineage; the installed wheel artifact and checksum are not available in the inspected /models locations or dist-info direct_url.json, so exact delivery provenance remains unverified.
+- OpenDAS vLLM: 0.28.1+dtk2604.torch2110.2609171627.g77acaf, initially imported from /usr/local/lib/python3.10/dist-packages/vllm. The wheel artifact was unavailable at the original inspection; the later [combined gate](hy4_v0281_combined_validation.md) pins its checksum and verifies all packaged files against that installation. The version reports the 77acaf lineage; no full source SHA is inferred from the abbreviated version string.
 - Installed plugin distribution: vllm-hcu 0.28.1rc1.dev491+dtk2604.torch2110.2609191510.g06f72c. Tests import plugin source from this worktree, not the installed distribution.
 - Python 3.10.12; PyTorch 2.11.0, HIP 6.3.26113; DTK 2604 is encoded in the installed package versions.
 - Proprietary providers: aiter 0.1.6+dtk2604.torch2110.2609200940.g0cb699; flash_attn 2.8.4+dtk2604.torch2110.2609241509.g624d7b; flash_mla 1.2.0+dtk2604.torch2110.2609161027.g5b030d; lightop 0.6.0+dtk2604.torch2110.2609201832.g8cd3e1.
@@ -172,10 +172,14 @@ exited after SIGINT; all eight cards returned to 2 MiB used, and a later
 `rocm-smi --showpids` reported no KFD processes. Retained outputs:
 `/models/hy4-v0281-validation-20260925/final_wheel_teardown_smi.log`
 (device memory) and `final_wheel_teardown_pids.log` (clean PID retry).
-The preinstalled OpenDAS vLLM wheel's exact delivery artifact and checksum
-remain **unverified**. The independently built plugin wheel is checksummed,
-but this is not full paired-wheel release acceptance; keep the MR in Draft
-until the target vLLM artifact is pinned and that gate is rerun.
+At this historical gate, the preinstalled OpenDAS vLLM delivery artifact and
+checksum were unverified, so the MR remained Draft. This provenance gap was
+subsequently resolved: the downloaded wheel has SHA-256
+`2d6b392dcff0d5064c754e838d9ac5ea3ffd5d6c7cac86ed2b5b1b2811cb9b3b`,
+and all 3,008 packaged vLLM files match the installed runtime byte-for-byte.
+The [combined validation record](hy4_v0281_combined_validation.md) records
+the isolated paired-wheel rerun and current readiness; do not carry this
+historical Draft instruction forward as a current blocker.
 
 ## DP2 × TP4 + EP8 + MTP3 default-Graph gate, 2026-09-25
 
@@ -274,7 +278,9 @@ The DP2×TP4 launch retained the pre-fix command above (port 8013 instead of
 8012). Both used Model Runner V2, eight devices, max model length 4096,
 block size 64 and default non-eager Graph. These eight-sample gates resolve the
 documented short-prefill accuracy failure, but do not replace the full
-v0.25.1 32-sample gate or the still-unverified paired vLLM-wheel release gate.
+v0.25.1 32-sample gate. The paired vLLM-wheel provenance gate was still
+unverified at that time and is superseded by the later
+[combined paired-wheel validation](hy4_v0281_combined_validation.md).
 
 ## Final source regression suite
 
