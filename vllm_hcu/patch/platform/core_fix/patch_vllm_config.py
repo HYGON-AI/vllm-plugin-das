@@ -96,6 +96,27 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         ) from exc
 
 
+def _hy4_pcp_topology(parallel_config: object) -> tuple[int, int, int]:
+    """Identify the validated eight-card Hy4 PCP layouts."""
+    return (
+        int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "tensor_parallel_size", "ParallelConfig"
+            )
+        ),
+        int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "prefill_context_parallel_size", "ParallelConfig"
+            )
+        ),
+        int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "pipeline_parallel_size", "ParallelConfig"
+            )
+        ),
+    )
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -121,13 +142,16 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    is_hy4 = architectures == ["HYV4ForCausalLM"]
+    if use_mla and not (is_glm52 or is_hy4):
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "GLM-5.2 and HY V4 MLA PCP only support "
+            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
         )
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if is_hy4 and not use_mla:
+        raise ValueError("HY V4 PCP requires sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -147,9 +171,12 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError(
             "FlashAttention PCP does not support hybrid KV cache groups."
         )
+    hy4_topology = _hy4_pcp_topology(parallel_config) if is_hy4 else None
+    if is_hy4 and hy4_topology not in {(4, 2, 1), (1, 4, 2)}:
+        raise ValueError(f"HY V4 PCP topology is not validated: {hy4_topology}")
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1:
+    ) != 1 and hy4_topology != (1, 4, 2):
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
@@ -196,6 +223,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             raise ValueError(
                 "GLM-5.2 PCP+MTP requires one to three speculative tokens."
             )
+        if is_hy4 and hy4_topology == (1, 4, 2) and num_speculative_tokens != 2:
+            raise ValueError("HY V4 PP2 PCP+MTP requires exactly two draft tokens.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(

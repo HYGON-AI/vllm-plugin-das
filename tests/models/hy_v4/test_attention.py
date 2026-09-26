@@ -45,24 +45,44 @@ def test_unsafe_generic_fp8_cache_is_rejected():
         _require_accuracy_safe_kv_cache_dtype("fp8")
 
 
-def test_unvalidated_context_parallel_paths_fail_closed():
+def test_hy4_context_parallel_topology_contract():
     from vllm_hcu.models.hy_v4.attention import (
         _require_supported_hy_v4_parallelism,
     )
 
-    for pcp, dcp in ((2, 1), (1, 2)):
-        with pytest.raises(RuntimeError, match="TP-only"):
+    for tp, pcp, pp in ((4, 2, 1), (1, 4, 2)):
+        _require_supported_hy_v4_parallelism(
+            SimpleNamespace(
+                tensor_parallel_size=tp,
+                prefill_context_parallel_size=pcp,
+                pipeline_parallel_size=pp,
+                decode_context_parallel_size=1,
+                data_parallel_size=1,
+                enable_expert_parallel=True,
+            )
+        )
+
+    for tp, pcp, pp, dcp in ((2, 2, 1, 1), (4, 2, 1, 2), (1, 1, 1, 2)):
+        with pytest.raises(RuntimeError, match="context parallel"):
             _require_supported_hy_v4_parallelism(
                 SimpleNamespace(
+                    tensor_parallel_size=tp,
                     prefill_context_parallel_size=pcp,
+                    pipeline_parallel_size=pp,
                     decode_context_parallel_size=dcp,
+                    data_parallel_size=1,
+                    enable_expert_parallel=True,
                 )
             )
 
     _require_supported_hy_v4_parallelism(
         SimpleNamespace(
+            tensor_parallel_size=8,
             prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
             decode_context_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=True,
         )
     )
 
