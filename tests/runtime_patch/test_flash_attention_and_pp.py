@@ -1377,6 +1377,46 @@ def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
     assert forwarded["cu_seqlens_k"].shape == (2,)
 
 
+
+@pytest.mark.parametrize("with_lse", [False, True])
+@pytest.mark.parametrize("with_output", [False, True])
+def test_flash_attention_long_prefill_writes_caller_output(
+    monkeypatch, with_lse, with_output,
+) -> None:
+    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+
+    query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
+    output = torch.full_like(query, -123) if with_output else None
+    actual = torch.full_like(query, 2.5)
+    lse = torch.ones((8, 37), dtype=torch.float32)
+    probabilities = torch.empty(0)
+    returned = (actual, lse, probabilities) if with_lse else actual
+
+    def vendor_nonpaged(**kwargs):
+        assert kwargs["block_table"] is None
+        assert kwargs["out"] is output
+        assert kwargs.get("return_attn_probs", False) == with_lse
+        # The installed nonpaged vendor interface returns a new tensor and
+        # ignores out. Model forward consumes the caller buffer instead.
+        return returned
+
+    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
+    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", vendor_nonpaged)
+    monkeypatch.setattr(fa_utils, "_gather_paged_kv", lambda *a, **kw: None)
+    cache = torch.zeros((144, 2, 64, 128), dtype=torch.bfloat16).transpose(1, 2)
+    result = fa_utils.flash_attn_varlen_func(
+        q=query, k=cache, v=cache, out=output,
+        cu_seqlens_q=torch.tensor([0, 37], dtype=torch.int32),
+        max_seqlen_q=37, max_seqlen_k=8485,
+        seqused_k=torch.tensor([8485], dtype=torch.int32),
+        block_table=torch.arange(144, dtype=torch.int32).unsqueeze(0),
+        return_softmax_lse=with_lse,
+    )
+    assert result is returned
+    if output is not None:
+        torch.testing.assert_close(output, actual)
+
+
 def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
     monkeypatch,
 ) -> None:

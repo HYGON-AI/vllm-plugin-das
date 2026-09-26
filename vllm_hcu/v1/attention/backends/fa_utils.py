@@ -269,7 +269,14 @@ def _safe_flash_attn_varlen_func(*args: Any, **kwargs: Any):
     )
     if kwargs.get("return_softmax_lse"):
         kwargs["return_attn_probs"] = True
-    return _flash_attn_varlen_func(*args, **kwargs)
+    result = _flash_attn_varlen_func(*args, **kwargs)
+    output = kwargs.get("out")
+    if isinstance(output, torch.Tensor):
+        # The vendor nonpaged interface returns a new tensor and ignores out,
+        # while model forward consumes the caller's preallocated buffer.
+        actual = result[0] if isinstance(result, tuple) else result
+        output.copy_(actual)
+    return result
 
 
 flash_attn_varlen_func = _with_kv_cache_layout(
