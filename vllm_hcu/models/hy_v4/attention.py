@@ -94,13 +94,25 @@ def _normalize_hy_v4_kv_cache_dtype(
 
 
 def _require_supported_hy_v4_parallelism(parallel_config) -> None:
-    """Keep unvalidated Hy4 context-parallel paths out of this TP release."""
-    pcp = parallel_config.prefill_context_parallel_size
-    dcp = parallel_config.decode_context_parallel_size
-    if pcp != 1 or dcp != 1:
+    """Allow only Hy4 context-parallel layouts covered by the HCU contract."""
+    pcp = int(parallel_config.prefill_context_parallel_size)
+    dcp = int(parallel_config.decode_context_parallel_size)
+    if pcp == dcp == 1:
+        return
+    topology = (
+        int(parallel_config.tensor_parallel_size),
+        pcp,
+        int(parallel_config.pipeline_parallel_size),
+    )
+    if (
+        dcp != 1
+        or topology not in {(4, 2, 1), (1, 4, 2)}
+        or int(parallel_config.data_parallel_size) != 1
+        or not parallel_config.enable_expert_parallel
+    ):
         raise RuntimeError(
-            "HY V4 HCU currently supports TP-only attention; "
-            f"received PCP={pcp}, DCP={dcp}."
+            "HY V4 HCU context parallel topology is not validated: "
+            f"TP/PCP/PP={topology}, DCP={dcp}."
         )
 
 
