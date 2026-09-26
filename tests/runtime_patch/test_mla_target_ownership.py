@@ -1310,8 +1310,9 @@ def test_dcp_single_sink_matches_global_softmax(local_lse):
     assert not torch.isclose(double_sink, oracle)
 
 
-def test_hyv4_fp8_dcp_keeps_scattered_local_slots(monkeypatch):
+def test_hyv4_fp8_dcp_compacts_local_slots_for_hcu_flashmla(monkeypatch):
     from vllm.v1.attention.backends.mla import flashmla_sparse as upstream
+    from vllm_hcu.models.hy_v4 import hcu_sparse
     from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
 
     seen = {}
@@ -1325,26 +1326,31 @@ def test_hyv4_fp8_dcp_keeps_scattered_local_slots(monkeypatch):
             block_table, torch.tensor([[7], [11]], dtype=torch.int32)
         )
         assert indices.shape == (2, 4)
-        return torch.tensor(
-            [[112, -1, 113, -1], [-1, -1, -1, -1]],
-            dtype=torch.int32,
+        return (
+            torch.tensor(
+                [[112, 113, -1, -1], [-1, -1, -1, -1]],
+                dtype=torch.int32,
+            ),
+            torch.tensor([2, 0], dtype=torch.int32),
         )
 
     monkeypatch.setattr(
-        upstream, "triton_filter_and_convert_dcp_index", localize
+        hcu_sparse, "triton_filter_and_convert_dcp_index", localize
     )
     impl = object.__new__(HYV4FlashMLASparseImpl)
     impl.dcp_world_size = 2
     impl.dcp_rank = 1
     impl.need_to_return_lse_for_decode = True
-    monkeypatch.setattr(
-        impl,
-        "_fp8_flash_mla_kernel",
-        lambda **kwargs: (
+    kernel_args = {}
+
+    def fp8_kernel(**kwargs):
+        kernel_args.update(kwargs)
+        return (
             torch.ones(1, 2, 16, 512),
             torch.zeros(1, 16, 2),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(impl, "_fp8_flash_mla_kernel", fp8_kernel)
     fp8 = upstream.FlashMLASparseMetadata.FP8KernelMetadata(
         scheduler_metadata=None,
         cache_lens=torch.tensor([2], dtype=torch.int32),
@@ -1366,7 +1372,19 @@ def test_hyv4_fp8_dcp_keeps_scattered_local_slots(monkeypatch):
     )
 
     assert seen["dcp_size"] == 2 and seen["dcp_rank"] == 1
-    assert seen["compact_valid_to_front"] is False
+    assert seen["return_valid_counts"] is True
+    assert seen["compact_valid_to_front"] is True
     assert seen["cp_kv_cache_interleave_size"] == 1
+    torch.testing.assert_close(
+        kernel_args["topk_indices"],
+        torch.tensor(
+            [[[112, 113, -1, -1], [-1, -1, -1, -1]]],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        kernel_args["topk_length"],
+        torch.tensor([2, 0], dtype=torch.int32),
+    )
     assert torch.count_nonzero(out[1]) == 0
     assert torch.isneginf(lse[1]).all()

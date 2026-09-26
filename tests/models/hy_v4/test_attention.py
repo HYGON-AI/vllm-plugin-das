@@ -351,17 +351,20 @@ def test_fp8_sparse_kernel_forwards_sink_and_slices_target_lse(monkeypatch):
         cache_lens=torch.tensor([2], dtype=torch.int32),
         scheduler_metadata=None,
     )
+    topk_length = torch.tensor([2, 1], dtype=torch.int32)
     output, lse = impl._fp8_flash_mla_kernel(
         torch.zeros(1, 2, 4, 576),
         torch.zeros(1, 656, dtype=torch.uint8),
         torch.zeros(1, 2, 4, dtype=torch.int32),
         metadata,
+        topk_length,
     )
 
     assert output.shape == (1, 2, 4, 512)
     assert lse.shape == (1, 4, 2)
     assert torch.equal(captured["attn_sink"][:4], impl.sinks)
     assert torch.isneginf(captured["attn_sink"][4:]).all()
+    assert captured["topk_length"] is topk_length
 
 
 def test_hyv4_dcp_gathers_loaded_sinks_once(monkeypatch):
@@ -431,25 +434,21 @@ def test_hyv4_dcp_kernel_passes_gathered_sink_on_rank0_only(monkeypatch):
     assert received[1] is None
 
 
-def test_hyv4_dcp_rank0_lse_counts_sink_after_empty_mask(monkeypatch):
-    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+def test_hyv4_dcp_rank0_lse_counts_sink_after_empty_mask():
     from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
 
     raw_lse = torch.tensor([[0.0] * 16, [float("-inf")] * 16])
     raw_out = torch.ones(2, 16, 512)
     raw_out[1].zero_()
-    monkeypatch.setattr(
-        FlashMLASparseImpl,
-        "_forward_fp8_kv_mixed_batch",
-        lambda self, *args: (raw_out.clone(), raw_lse.clone()),
-    )
     impl = object.__new__(HYV4FlashMLASparseImpl)
     impl.sinks = torch.ones(8, dtype=torch.float32)
     impl._dcp_gathered_sinks = torch.ones(16, dtype=torch.float32)
     impl.dcp_world_size = 2
 
     impl.dcp_rank = 0
-    out, lse = impl._forward_fp8_kv_mixed_batch(None, None, None, None)
+    out, lse = impl._add_single_dcp_sink_to_lse(
+        raw_out.clone(), raw_lse.clone()
+    )
     torch.testing.assert_close(
         lse[0], torch.logaddexp(raw_lse[0], impl._dcp_gathered_sinks)
     )
@@ -457,8 +456,8 @@ def test_hyv4_dcp_rank0_lse_counts_sink_after_empty_mask(monkeypatch):
     assert torch.count_nonzero(out[1]) == 0
 
     impl.dcp_rank = 1
-    other_out, other_lse = impl._forward_fp8_kv_mixed_batch(
-        None, None, None, None
+    other_out, other_lse = impl._add_single_dcp_sink_to_lse(
+        raw_out.clone(), raw_lse.clone()
     )
     torch.testing.assert_close(other_out, raw_out)
     torch.testing.assert_close(other_lse, raw_lse)

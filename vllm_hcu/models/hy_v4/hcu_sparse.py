@@ -31,6 +31,9 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_filter_and_convert_dcp_index,
+)
 from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
     HcuFlashMLASparseBackend,
 )
@@ -189,6 +192,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
+        topk_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
@@ -216,6 +220,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             indices=topk_indices,
             softmax_scale=self.softmax_scale,
             attn_sink=attn_sink,
+            topk_length=topk_length,
         )
 
         # The target caller expects LSE with the same unpadded head count.
@@ -273,13 +278,67 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Expose one sink term to the target vLLM DCP LSE combine."""
-        output, raw_lse = super()._forward_fp8_kv_mixed_batch(
-            q,
-            kv_c_and_k_pe_cache,
+        """Adapt target FP8 DCP indices to the HCU FlashMLA contract."""
+        if self.dcp_world_size <= 1:
+            return super()._forward_fp8_kv_mixed_batch(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+            )
+
+        # Target vLLM's current FlashMLA path keeps DCP-invalid slots in their
+        # original positions for kernels that mask scattered ``-1`` entries.
+        # The HCU FlashMLA sparse-decode ABI instead consumes a compact valid
+        # prefix together with ``topk_length``. Reuse the official converter's
+        # fused compaction so reader ownership still matches the scheduler's
+        # DCP interleave and the native cache writer.
+        topk_indices, topk_length = triton_filter_and_convert_dcp_index(
+            attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+            attn_metadata.block_table,
             topk_indices,
-            attn_metadata,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=(
+                attn_metadata.cp_kv_cache_interleave_size
+            ),
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+            compact_valid_to_front=True,
         )
+
+        fp8_metadata = attn_metadata.fp8_extra_metadata
+        if not isinstance(
+            fp8_metadata, FlashMLASparseMetadata.FP8KernelMetadata
+        ):
+            raise RuntimeError("HY V4 FP8 DCP requires FP8 kernel metadata")
+        kernel_out, kernel_lse = self._fp8_flash_mla_kernel(
+            q=q.unsqueeze(0),
+            kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+            topk_indices=topk_indices.unsqueeze(0),
+            kernel_metadata=fp8_metadata,
+            topk_length=topk_length,
+        )
+        output = kernel_out.squeeze(0)
+        if not self.need_to_return_lse_for_decode:
+            return output, None
+        if kernel_lse is None:
+            raise RuntimeError("HY V4 FP8 DCP kernel did not return LSE")
+        raw_lse = kernel_lse.squeeze(0).transpose(0, 1)
+        empty_rows = topk_length == 0
+        output.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        raw_lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        output = output.contiguous()
+
+        return self._add_single_dcp_sink_to_lse(output, raw_lse)
+
+    def _add_single_dcp_sink_to_lse(
+        self,
+        output: torch.Tensor,
+        raw_lse: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Expose rank 0's one virtual sink to the target DCP combine."""
         if self.dcp_world_size <= 1 or self.dcp_rank != 0 or self.sinks is None:
             return output, raw_lse
         if raw_lse is None or self._dcp_gathered_sinks is None:
