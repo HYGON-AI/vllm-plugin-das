@@ -45,24 +45,39 @@ def test_unsafe_generic_fp8_cache_is_rejected():
         _require_accuracy_safe_kv_cache_dtype("fp8")
 
 
-def test_unvalidated_context_parallel_paths_fail_closed():
+def test_hyv4_parallel_guard_accepts_only_first_dcp_topology():
     from vllm_hcu.models.hy_v4.attention import (
         _require_supported_hy_v4_parallelism,
     )
 
-    for pcp, dcp in ((2, 1), (1, 2)):
-        with pytest.raises(RuntimeError, match="TP-only"):
+    for tp, pcp, dcp in ((8, 2, 1), (8, 2, 2), (4, 1, 2), (8, 1, 4)):
+        with pytest.raises(RuntimeError, match="validated"):
             _require_supported_hy_v4_parallelism(
                 SimpleNamespace(
+                    tensor_parallel_size=tp,
                     prefill_context_parallel_size=pcp,
                     decode_context_parallel_size=dcp,
+                    pipeline_parallel_size=1,
+                    data_parallel_size=1,
                 )
             )
 
     _require_supported_hy_v4_parallelism(
         SimpleNamespace(
+            tensor_parallel_size=8,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        )
+    )
+    _require_supported_hy_v4_parallelism(
+        SimpleNamespace(
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=2,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
     )
 
@@ -186,7 +201,13 @@ def test_hyv4_constructor_forces_sparse_mqa_only_with_sink(
 
     vllm_config = SimpleNamespace(
         attention_config=SimpleNamespace(sparse_mla_force_mqa=False),
-        parallel_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
     )
     config = SimpleNamespace(
         layer_types=["sparse_attention"],

@@ -94,14 +94,24 @@ def _normalize_hy_v4_kv_cache_dtype(
 
 
 def _require_supported_hy_v4_parallelism(parallel_config) -> None:
-    """Keep unvalidated Hy4 context-parallel paths out of this TP release."""
+    """Admit only the validated Hy4 DCP topology beyond the TP-only path."""
     pcp = parallel_config.prefill_context_parallel_size
     dcp = parallel_config.decode_context_parallel_size
-    if pcp != 1 or dcp != 1:
-        raise RuntimeError(
-            "HY V4 HCU currently supports TP-only attention; "
-            f"received PCP={pcp}, DCP={dcp}."
-        )
+    if pcp == 1 and dcp == 1:
+        return
+    topology = (
+        parallel_config.tensor_parallel_size,
+        dcp,
+        pcp,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.data_parallel_size,
+    )
+    if topology == (8, 2, 1, 1, 1):
+        return
+    raise RuntimeError(
+        "HY V4 HCU context parallel topology has not been validated: "
+        f"TP/DCP/PCP/PP/DP={topology}."
+    )
 
 
 def require_hyv4_sink_backend(
@@ -844,6 +854,10 @@ class HYV4MLAAttention(nn.Module):
         layer_idx: int = 0,
     ) -> None:
         super().__init__()
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
+
+            validate_hy4_dcp_config(vllm_config)
         _require_supported_hy_v4_parallelism(vllm_config.parallel_config)
         self.config = config
         self.hidden_size = hidden_size
