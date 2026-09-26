@@ -99,6 +99,17 @@ env -u VLLM_PLUGINS \
 For an isolated wheel install, prepend its directory to `PYTHONPATH` as was
 done during this run.
 
+The final review-negative run used the same command with this additional
+leading assignment:
+
+```bash
+VLLM_HCU_USE_FP8_MIXED_BATCH=0
+```
+
+The ordinary production command should omit that diagnostic assignment; the
+default is enabled. The negative run proves that an explicit global disable
+cannot move this exact DCP topology onto the unsafe separate path.
+
 ## Results
 
 - Four DP engines created eight TP/DCP workers, and the log identified all
