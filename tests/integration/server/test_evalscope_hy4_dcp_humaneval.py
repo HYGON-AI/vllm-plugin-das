@@ -27,6 +27,7 @@ MODES = frozenset(
         "dcp_eager_target",
         "dcp_graph_target",
         "dcp_graph_mtp3",
+        "dcp_dp4_graph_mtp3",
     }
 )
 PROMPT_TEMPLATE = (
@@ -81,11 +82,18 @@ def server_args(mode: str) -> list[str]:
         raise ValueError(f"Unknown Hy4 DCP validation mode: {mode}")
     result = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", MODEL]
     result.extend(BASE_ARGS)
+    if mode == "dcp_dp4_graph_mtp3":
+        result[result.index("--tensor-parallel-size") + 1] = "2"
+        result.extend(["--data-parallel-size", "4"])
     if mode.startswith("dcp_"):
         result.extend(DCP_ARGS)
     if mode == "dcp_eager_target":
         result.append("--enforce-eager")
-    if mode in {"control_mtp3", "dcp_graph_mtp3"}:
+    if mode in {
+        "control_mtp3",
+        "dcp_graph_mtp3",
+        "dcp_dp4_graph_mtp3",
+    }:
         result.extend(MTP_ARGS)
     return result
 
@@ -320,6 +328,26 @@ def test_dcp_launcher_mtp3_is_the_only_graph_delta():
         "--speculative-config",
         '{"method":"mtp","num_speculative_tokens":3}',
     ]
+
+
+def test_dcp_dp4_launcher_pins_requested_graph_topology():
+    args = server_args("dcp_dp4_graph_mtp3")
+
+    assert args[args.index("--tensor-parallel-size") + 1] == "2"
+    assert args[args.index("--decode-context-parallel-size") + 1] == "2"
+    assert args[args.index("--data-parallel-size") + 1] == "4"
+    assert "--enable-expert-parallel" in args
+    assert args[args.index("--speculative-config") + 1] == (
+        '{"method":"mtp","num_speculative_tokens":3}'
+    )
+    assert "--enforce-eager" not in args
+    for option in (
+        "--tensor-parallel-size",
+        "--decode-context-parallel-size",
+        "--data-parallel-size",
+        "--speculative-config",
+    ):
+        assert args.count(option) == 1
 
 
 def test_dcp_launcher_pins_mrv2_query_sharding_and_eight_cards():

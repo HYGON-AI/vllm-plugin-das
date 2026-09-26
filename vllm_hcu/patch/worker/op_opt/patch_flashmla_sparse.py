@@ -23,9 +23,37 @@ TARGETS = (
     f"{TARGET_MODULE}.FlashMLASparseImpl._fp8_flash_mla_kernel",
     f"{TARGET_MODULE}.FlashMLASparseImpl._bf16_flash_mla_kernel",
     f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode",
+    f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder.__init__",
 )
 _MARKER = "_vllm_hcu_flashmla_sparse_applied"
 _WRAPPER = "_vllm_hcu_flashmla_sparse_wrapper"
+_HYV4_DCP_DP4_TOPOLOGY = (2, 2, 1, 1, 4)
+_DCP_MIXED_BATCH_REJECTION = (
+    "DCP for FlashMLA sparse is only supported on the mixed-batch fp8 path"
+)
+
+
+def _is_hyv4_dcp_dp4_config(vllm_config: object | None) -> bool:
+    if vllm_config is None:
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if model_config is None or parallel_config is None or cache_config is None:
+        return False
+    topology = (
+        int(parallel_config.tensor_parallel_size),
+        int(parallel_config.decode_context_parallel_size),
+        int(parallel_config.prefill_context_parallel_size),
+        int(parallel_config.pipeline_parallel_size),
+        int(parallel_config.data_parallel_size),
+    )
+    return (
+        model_config.architectures == ["HYV4ForCausalLM"]
+        and topology == _HYV4_DCP_DP4_TOPOLOGY
+        and parallel_config.enable_expert_parallel
+        and cache_config.cache_dtype in {"fp8_e4m3", "fp8_ds_mla"}
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -33,12 +61,25 @@ def apply_to_module(module: ModuleType) -> bool:
     builder_cls = require_class(flash, "FlashMLASparseMetadataBuilder", f"{TARGET_MODULE}.FlashMLASparseMetadataBuilder")
     impl_cls = require_class(flash, "FlashMLASparseImpl", f"{TARGET_MODULE}.FlashMLASparseImpl")
     wrapped = (
+        (builder_cls, "__init__", TARGETS[4], _WRAPPER),
         (builder_cls, "build", TARGETS[0], _WRAPPER),
         (impl_cls, "_fp8_flash_mla_kernel", TARGETS[1], _WRAPPER),
         (impl_cls, "_bf16_flash_mla_kernel", TARGETS[2], _WRAPPER),
     )
     if already_applied(flash, _MARKER, wrapped):
         return False
+    builder_init = require_callable(builder_cls, "__init__", TARGETS[4])
+    require_exact_signature(
+        builder_init,
+        TARGETS[4],
+        positional=(
+            "self",
+            "kv_cache_spec",
+            "layer_names",
+            "vllm_config",
+            "device",
+        ),
+    )
     build = require_callable(builder_cls, "build", TARGETS[0])
     require_exact_signature(
         build, TARGETS[0],
@@ -89,6 +130,56 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         hcu_bindings[name] = value
 
+    @functools.wraps(builder_init)
+    def hcu_builder_init(self, *args, **kwargs):
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is None and len(args) >= 3:
+            vllm_config = args[2]
+        try:
+            return builder_init(self, *args, **kwargs)
+        except NotImplementedError as error:
+            if (
+                not _is_hyv4_dcp_dp4_config(vllm_config)
+                or not str(error).startswith(_DCP_MIXED_BATCH_REJECTION)
+            ):
+                raise
+
+            required_state = (
+                "num_heads",
+                "fp8_decode_padded_heads",
+                "fp8_use_mixed_batch",
+            )
+            missing_state = [
+                name for name in required_state if not hasattr(self, name)
+            ]
+            if missing_state:
+                raise PatchCompatibilityError(
+                    "FlashMLA sparse DCP head-boundary rejection moved before "
+                    "required builder initialization: "
+                    f"missing {missing_state}"
+                ) from error
+
+            parallel_config = vllm_config.parallel_config
+            gathered_num_heads = (
+                self.num_heads
+                * int(parallel_config.decode_context_parallel_size)
+            )
+            gathered_padded_heads = (
+                impl_cls._compute_fp8_decode_padded_heads(
+                    gathered_num_heads
+                )
+            )
+            if self.fp8_decode_padded_heads != gathered_padded_heads:
+                raise NotImplementedError(
+                    "HY V4 DCP2+DP4 requires local and gathered query heads "
+                    "to share one FP8 decode kernel envelope; got "
+                    f"{self.num_heads} local heads padded to "
+                    f"{self.fp8_decode_padded_heads} and "
+                    f"{gathered_num_heads} gathered heads padded to "
+                    f"{gathered_padded_heads}."
+                ) from error
+            self.fp8_use_mixed_batch = True
+
     @functools.wraps(build)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         result = build(self, common_prefix_len, common_attn_metadata, fast_build)
@@ -134,7 +225,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             cp_kv_cache_interleave_size = int(cp_kv_cache_interleave_size)
         pcp_world_size = effective_pcp_world_size(pcp_world_size)
-        if not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH:
+        if (
+            not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH
+            and not _is_hyv4_dcp_dp4_config(vllm_config)
+        ):
             if getattr(result, "fp8_use_mixed_batch", False):
                 result.fp8_extra_metadata = build_fp8_separate_prefill_decode(
                     self,
@@ -200,15 +294,17 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return output[:, :actual_num_heads, :], lse[:, :actual_num_heads]
 
-    for function in (hcu_build, hcu_fp8, hcu_bf16):
+    for function in (hcu_builder_init, hcu_build, hcu_fp8, hcu_bf16):
         setattr(function, _WRAPPER, True)
     # Apply all target mutations only after validation and wrapper construction.
     # The official backend class remains registered and no module alias is used.
     for name, value in hcu_bindings.items():
         setattr(flash, name, value)
+    setattr(builder_cls, "_vllm_hcu_original_init", builder_init)
     setattr(builder_cls, "_vllm_hcu_original_build", build)
     setattr(impl_cls, "_vllm_hcu_original_fp8_kernel", fp8)
     setattr(impl_cls, "_vllm_hcu_original_bf16_kernel", bf16)
+    setattr(builder_cls, "__init__", hcu_builder_init)
     setattr(builder_cls, "build", hcu_build)
     setattr(impl_cls, "_fp8_flash_mla_kernel", hcu_fp8)
     setattr(impl_cls, "_bf16_flash_mla_kernel", hcu_bf16)
