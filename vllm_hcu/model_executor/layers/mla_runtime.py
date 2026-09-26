@@ -263,6 +263,12 @@ def mla_forward_impl(
 def mla_process_weights_nn(upstream, self, act_dtype):
     """Normalize either HCU NN or upstream weight layout before MLA BMM setup."""
 
+    # Preserve the target MLAAttention post-load contract before replacing its
+    # BMM-weight setup. Backends use this hook for state that is independent of
+    # the physical NN layout; HY V4 DCP, for example, gathers its final loaded
+    # per-head sinks here before warmup executes a gathered query.
+    self.impl.process_weights_after_loading(act_dtype)
+
     kv_b_proj_weight = upstream.get_and_maybe_dequant_weights(
         self.kv_b_proj, out_dtype=act_dtype
     )

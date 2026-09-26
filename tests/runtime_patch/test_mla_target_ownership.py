@@ -398,6 +398,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     )
     triton_calls: list[object] = []
     scale_calls: list[object] = []
+    impl_post_load_calls: list[torch.dtype] = []
     upstream = SimpleNamespace(
         get_and_maybe_dequant_weights=lambda layer, out_dtype: physical_weight,
         rocm_aiter_ops=SimpleNamespace(
@@ -411,6 +412,11 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
         ),
     )
     mla = SimpleNamespace(
+        impl=SimpleNamespace(
+            process_weights_after_loading=lambda dtype: (
+                impl_post_load_calls.append(dtype)
+            )
+        ),
         kv_b_proj=object(),
         kv_lora_rank=kv_lora_rank,
         num_heads=num_heads,
@@ -446,6 +452,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     )
     assert triton_calls == []
     assert scale_calls == [(mla, False)]
+    assert impl_post_load_calls == [torch.bfloat16]
 
 
 def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
