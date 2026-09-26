@@ -131,6 +131,9 @@ def test_hy4_dcp2_rejects_unvalidated_configuration(
         {},
         {"kv_dtype": "fp8_ds_mla"},
         {"method": "mtp", "tokens": 3},
+        {"tp": 2, "dp": 4},
+        {"tp": 2, "dp": 4, "kv_dtype": "fp8_ds_mla"},
+        {"tp": 2, "dp": 4, "method": "mtp", "tokens": 3},
     ],
 )
 def test_hy4_dcp2_accepts_valid_fp8_mrv2_configuration(
