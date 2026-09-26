@@ -118,6 +118,11 @@ from vllm.model_executor.models.utils import (
 )
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.models.hy_v4.fp8_kv_dequant import LightOpKVReuseState
+from vllm_hcu.models.index_sharing import compute_skip_topk_layers
+from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+    bind_lightop_kv_reuse_state,
+)
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
@@ -1165,36 +1170,38 @@ class DeepseekV2MLAAttention(nn.Module):
 
         _skip_topk = False
         if self.is_v32:
-            self.indexer_rope_emb = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
-            )
-            self.indexer = Indexer(
-                vllm_config,
-                config,
-                hidden_size,
-                q_lora_rank,
-                quant_config,
-                cache_config,
-                topk_indices_buffer,
-                f"{prefix}.indexer",
-            )
+            layer_id = extract_layer_index(prefix)
+            is_mtp_layer = layer_id >= config.num_hidden_layers
+            if getattr(config, "indexer_types", None) is not None or getattr(
+                config, "use_index_cache", False
+            ):
+                _skip_topk = (
+                    layer_id in compute_skip_topk_layers(config)
+                    and not is_mtp_layer
+                )
 
-            # Enable IndexCache for DeepSeek models to reduce redundant top-k
-            # token selection computations in sparse attention.
-            use_index_cache = getattr(config, "use_index_cache", False)
-            if use_index_cache:
-                # IndexCache config
-                # Refer: https://arxiv.org/abs/2603.12201 for more details.
-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
-                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                layer_id = extract_layer_index(prefix)
-                if _index_topk_pattern is None:
-                    _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
-                elif 0 <= layer_id < len(_index_topk_pattern):
-                    _skip_topk = _index_topk_pattern[layer_id] == "S"
+            if not _skip_topk:
+                self.indexer_rope_emb = get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not getattr(
+                        config, "indexer_rope_interleave", False
+                    ),
+                )
+                self.indexer = Indexer(
+                    vllm_config,
+                    config,
+                    hidden_size,
+                    q_lora_rank,
+                    quant_config,
+                    cache_config,
+                    topk_indices_buffer,
+                    f"{prefix}.indexer",
+                )
+            else:
+                self.indexer_rope_emb = None
+                self.indexer = None
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1251,6 +1258,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
     ) -> None:
         super().__init__()
 
@@ -1302,6 +1310,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
         )
+        if isinstance(self.self_attn, DeepseekV2MLAAttention):
+            bind_lightop_kv_reuse_state(
+                self.self_attn.mla_attn,
+                lightop_kv_reuse_state,
+                is_indexer_producer=self.self_attn.indexer is not None,
+            )
 
         if (
             config.n_routed_experts is not None
@@ -1399,8 +1413,15 @@ class DeepseekV2Model(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            lightop_kv_reuse_state = (
+                LightOpKVReuseState.from_topk_buffer(topk_indices_buffer)
+                if henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT
+                and vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+                else None
+            )
         else:
             topk_indices_buffer = None
+            lightop_kv_reuse_state = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1417,6 +1438,7 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                lightop_kv_reuse_state=lightop_kv_reuse_state,
             ),
             prefix=f"{prefix}.layers",
         )

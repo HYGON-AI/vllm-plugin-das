@@ -1718,14 +1718,19 @@ def _check_hyv4_dcp_cudagraph_policy(
     return config.compilation_config
 
 
-def test_hyv4_ag_rs_dcp_preserves_requested_full_cudagraph(
+@pytest.mark.parametrize(
+    "architecture", ["HYV4ForCausalLM", "GlmMoeDsaForCausalLM"]
+)
+def test_sparse_mla_ag_rs_dcp_preserves_requested_full_cudagraph(
     monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
 ) -> None:
     from vllm.config.compilation import CUDAGraphMode, CompilationMode
     from vllm.v1.attention.backend import AttentionCGSupport
 
     compilation_config = _check_hyv4_dcp_cudagraph_policy(
         monkeypatch,
+        architecture=architecture,
         cudagraph_mode=CUDAGraphMode.FULL,
         compilation_mode=CompilationMode.NONE,
     )
