@@ -69,6 +69,16 @@ resolver: one `name` argument, one exact membership guard whose sole body is
 decorators beyond the required one, lookups, missing calls, duplicated calls,
 and broadened/stale names are rejected; the one exact `lru_cache` decorator is
 required.
+
+LightOp 0.6.0 exposes `gather_and_maybe_dequant_cache` only from the package
+root. The E5M2 MLA compatibility patch therefore has one separately audited
+legacy import exception in
+`vllm_hcu/patch/worker/op_opt/patch_custom_ops.py`. The audit pins the exact
+file, symbol, and `lightop_gather` alias, rejects missing or duplicate uses,
+and checks in an isolated process that the installed root export remains
+callable. This exception can be removed when LightOp publishes the operator in
+a categorized module.
+
 `_lightop_activation` has an equally exact categorized resolver
 shape; every call to it must pass one literal symbol. Literal category
 `getattr` calls are recorded, while unsupported dynamic category lookups are

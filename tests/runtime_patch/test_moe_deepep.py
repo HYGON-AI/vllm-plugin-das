@@ -4336,6 +4336,35 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
         "renormalize": False,
     }
 
+    # A supported routing mode can still have an unsupported LightOp shape.
+    # Fall back only for the backend's explicit capability rejection; other
+    # runtime failures must remain visible.
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
+
+    unsupported_shape_calls = []
+
+    def unsupported_shape(*args, **kwargs):
+        del args, kwargs
+        unsupported_shape_calls.append(True)
+        raise RuntimeError(
+            "moe_fused_gate: unsupported configuration: experts=64, topk=4"
+        )
+
+    lightop_moe.moe_fused_gate = unsupported_shape
+    assert router._compute_routing(None, logits, torch.int32) == "official"
+    assert router._compute_routing(None, logits, torch.int32) == "official"
+    assert len(unsupported_shape_calls) == 1
+
+    def kernel_failure(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("moe_fused_gate: kernel launch failed")
+
+    router.top_k = 2
+    lightop_moe.moe_fused_gate = kernel_failure
+    with pytest.raises(RuntimeError, match="kernel launch failed"):
+        router._compute_routing(None, logits, torch.int32)
+
     # Restore the legacy mode so the next check exercises the categorized
     # export ABI itself rather than the intentional routing fallback.
     router.scoring_func = "sigmoid"
@@ -4371,7 +4400,12 @@ from vllm_hcu.platforms import envs as henvs
 
 calls = []
 gate_kwargs = []
+gate_attempts = []
+gate_failure = None
 def moe_fused_gate(*args, **kwargs):
+    gate_attempts.append(True)
+    if gate_failure is not None:
+        raise gate_failure
     calls.append(args)
     gate_kwargs.append(kwargs)
     return torch.full((1, 1), 0.5), torch.tensor([[2]], dtype=torch.int64)
@@ -4441,6 +4475,23 @@ assert gate_kwargs[-1] == {{
     "scoring_func": "softmax",
     "renormalize": False,
 }}
+router.scoring_func = "sigmoid"
+router.renormalize = True
+gate_failure = RuntimeError(
+    "moe_fused_gate: unsupported configuration: experts=64, topk=4"
+)
+attempts_before_fallback = len(gate_attempts)
+assert router._compute_routing(None, logits, torch.int32) == "official"
+assert router._compute_routing(None, logits, torch.int32) == "official"
+assert len(gate_attempts) == attempts_before_fallback + 1
+router.top_k = 2
+gate_failure = RuntimeError("moe_fused_gate: kernel launch failed")
+try:
+    router._compute_routing(None, logits, torch.int32)
+except RuntimeError as exc:
+    assert "kernel launch failed" in str(exc)
+else:
+    raise AssertionError("non-capability LightOp failures must propagate")
 """
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"

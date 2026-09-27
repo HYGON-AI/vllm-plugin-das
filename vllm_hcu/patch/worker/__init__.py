@@ -238,6 +238,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
 # Attention's public package callback consumes the class installed by the
 # ``attention.attention`` callback, hence the non-alphabetical first entries.
 _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("op_opt", "patch_custom_ops")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_layer")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_exports")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_backend")),

@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from .lightop_routing import lightop_moe_gate_kwargs
+from .lightop_routing import (
+    lightop_moe_gate_kwargs,
+    lightop_moe_gate_should_fallback,
+)
 
 
 def eplb_map_to_physical_and_record(
@@ -64,6 +67,12 @@ def eplb_map_to_physical_and_record(
 
 def make_hcu_grouped_topk_router(base_class):
     class HcuGroupedTopKRouter(base_class):
+        # Negative capability cache: avoid one backend exception per MoE layer
+        # after LightOp rejects a routing configuration.
+        _hcu_unsupported_lightop_gate_configurations: set[
+            tuple[object, ...]
+        ] = set()
+
         def _compute_routing(
             self,
             hidden_states,
@@ -122,22 +131,52 @@ def make_hcu_grouped_topk_router(base_class):
                     indices_type,
                     input_ids=input_ids,
                 )
-            from lightop.moe import moe_fused_gate
-
-            topk_weights, topk_ids = moe_fused_gate(
-                router_logits,
-                self.e_score_correction_bias,
+            gate_configuration = (
+                router_logits.shape[-1],
                 self.num_expert_group,
                 self.topk_group,
                 self.top_k,
                 0,
-                self.routed_scaling_factor,
-                # FusedMoE passes 1.0 to the router when MoERunner owns
-                # output scaling. Otherwise this is the effective router
-                # scale and LightOp must apply it to the routing weights.
-                self.routed_scaling_factor != 1.0,
-                **gate_kwargs,
+                scoring_func,
+                bool(renormalize),
             )
+            unsupported_configurations = type(
+                self
+            )._hcu_unsupported_lightop_gate_configurations
+            if gate_configuration in unsupported_configurations:
+                return super()._compute_routing(
+                    hidden_states,
+                    router_logits,
+                    indices_type,
+                    input_ids=input_ids,
+                )
+            from lightop.moe import moe_fused_gate
+
+            try:
+                topk_weights, topk_ids = moe_fused_gate(
+                    router_logits,
+                    self.e_score_correction_bias,
+                    self.num_expert_group,
+                    self.topk_group,
+                    self.top_k,
+                    0,
+                    self.routed_scaling_factor,
+                    # FusedMoE passes 1.0 to the router when MoERunner owns
+                    # output scaling. Otherwise this is the effective router
+                    # scale and LightOp must apply it to the routing weights.
+                    self.routed_scaling_factor != 1.0,
+                    **gate_kwargs,
+                )
+            except RuntimeError as exc:
+                if not lightop_moe_gate_should_fallback(exc):
+                    raise
+                unsupported_configurations.add(gate_configuration)
+                return super()._compute_routing(
+                    hidden_states,
+                    router_logits,
+                    indices_type,
+                    input_ids=input_ids,
+                )
             if indices_type is not None and topk_ids.dtype != indices_type:
                 topk_ids = topk_ids.to(indices_type)
             return topk_weights, topk_ids

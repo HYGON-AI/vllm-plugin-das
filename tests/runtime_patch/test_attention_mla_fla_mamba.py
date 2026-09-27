@@ -1707,8 +1707,31 @@ def test_uniform_short_extends_use_prefill_classification():
     ) == "official"
 
 
-def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
+def test_common_attention_metadata_and_e5m2_mla_cache_writer(monkeypatch):
     adapter = _adapter("patch_attention_backend")
+    cache_calls = []
+
+    class MLAAttentionImpl:
+        def do_kv_cache_update(
+            self,
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+        ):
+            cache_calls.append(("official", kv_cache_dtype))
+
+    def concat_and_cache_mla(*args):
+        cache_calls.append(args)
+
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(concat_and_cache_mla=concat_and_cache_mla),
+        ),
+    )
+    _install_fake_module(monkeypatch, "vllm_hcu.hcu_ops")
 
     class CommonAttentionMetadata:
         def __init__(self, query_start_loc, query_start_loc_cpu, seq_lens,
@@ -1750,6 +1773,8 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
     module = _module(
         adapter.TARGET_MODULE,
         CommonAttentionMetadata=CommonAttentionMetadata,
+        MLAAttentionImpl=MLAAttentionImpl,
+        torch=fake_torch,
     )
     adapter.apply_to_module(module)
     tensor = torch.arange(4)
@@ -1762,6 +1787,94 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
     assert metadata.replace(max_seq_len=9).num_kv_actual_tokens == 7
     assert metadata.unpadded(2, 1).num_kv_actual_tokens == 2
     assert module.CpCommonAttentionMetadata.__module__.startswith("vllm_hcu")
+
+    tensor = torch.arange(8).reshape(4, 1, 2)
+    kv_cache = torch.ones(1)
+    slot_mapping = torch.tensor([[0, -1, 1, -1]], dtype=torch.int32)
+    impl = MLAAttentionImpl()
+    impl.do_kv_cache_update(
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        "auto",
+        torch.ones(1),
+    )
+    impl.do_kv_cache_update(
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        "fp8_e5m2",
+        torch.ones(1),
+    )
+
+    assert cache_calls[0] == ("official", "auto")
+    assert cache_calls[1][1].shape == (4, 2)
+    torch.testing.assert_close(cache_calls[1][3], slot_mapping.flatten())
+    assert cache_calls[1][4] == "fp8_e5m2"
+    assert not adapter.apply_to_module(module)
+
+
+def test_e5m2_mla_cache_gather_uses_lightop(monkeypatch):
+    adapter = _adapter("patch_custom_ops")
+    calls = []
+
+    def official_gather(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        num_tokens,
+        kv_cache_dtype,
+        scale,
+        seq_starts=None,
+    ):
+        calls.append(("official", kv_cache_dtype, seq_starts))
+
+    def lightop_gather(*args):
+        calls.append(("lightop", *args))
+
+    _install_fake_module(
+        monkeypatch,
+        "lightop",
+        gather_and_maybe_dequant_cache=lightop_gather,
+    )
+    module = _module(
+        adapter.TARGET_MODULE,
+        gather_and_maybe_dequant_cache=official_gather,
+    )
+
+    assert adapter.apply_to_module(module)
+    args = tuple(object() for _ in range(5))
+    scale = object()
+    seq_starts = object()
+    module.gather_and_maybe_dequant_cache(
+        *args,
+        4,
+        "auto",
+        scale,
+        seq_starts,
+    )
+    module.gather_and_maybe_dequant_cache(
+        *args,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+
+    assert calls[0] == ("official", "auto", seq_starts)
+    assert calls[1] == (
+        "lightop",
+        *args,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+    assert not adapter.apply_to_module(module)
 
 
 def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):

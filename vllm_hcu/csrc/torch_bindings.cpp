@@ -54,7 +54,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor k_scale, Tensor v_scale) -> ()");
   ops.impl("reshape_and_cache_flash", torch::kCUDA,
            &reshape_and_cache_flash_hcu);
-  ops.def("concat_and_cache_mla", &concat_and_cache_mla_hcu);
+  ops.def(
+      "concat_and_cache_mla(Tensor kv_c, Tensor k_pe, Tensor! kv_cache, "
+      "Tensor slot_mapping, str kv_cache_dtype, Tensor scale) -> ()");
+  ops.impl("concat_and_cache_mla", torch::kCUDA, &concat_and_cache_mla_hcu);
   ops.def(
       "deepseek_v4_inv_rope(Tensor! rope, Tensor position_ids, "
       "Tensor cos_sin_cache) -> ()");

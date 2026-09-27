@@ -193,28 +193,23 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 num_q_tokens_per_head_k,
                 1,  # MQA for the decode path
             )
+            # HCU dense-FP8 metadata can require more rows than the initial
+            # one-row-per-CU graph buffer. Grow persistent buffers when
+            # needed, but let the copy below return only the valid prefix.
+            if (
+                self.cg_buf_tile_scheduler_metadata is not None
+                and self.cg_buf_tile_scheduler_metadata.shape[0]
+                < tile_scheduler_metadata.shape[0]
+            ):
+                self.cg_buf_tile_scheduler_metadata = torch.empty_like(
+                    tile_scheduler_metadata
+                )
+            if (
+                self.cg_buf_num_splits is not None
+                and self.cg_buf_num_splits.shape[0] < num_splits.shape[0]
+            ):
+                self.cg_buf_num_splits = torch.empty_like(num_splits)
 
-            if self.cg_buf_tile_scheduler_metadata is not None:
-                if (
-                    self.cg_buf_tile_scheduler_metadata.shape[0]
-                    < tile_scheduler_metadata.shape[0]
-                ):
-                    self.cg_buf_tile_scheduler_metadata = torch.empty_like(
-                        tile_scheduler_metadata
-                    )
-                self.cg_buf_tile_scheduler_metadata.zero_()
-                self.cg_buf_tile_scheduler_metadata[
-                    : tile_scheduler_metadata.shape[0]
-                ].copy_(tile_scheduler_metadata)
-                tile_scheduler_metadata = self.cg_buf_tile_scheduler_metadata
-            if self.cg_buf_num_splits is not None:
-                if self.cg_buf_num_splits.shape[0] < num_splits.shape[0]:
-                    self.cg_buf_num_splits = torch.empty_like(num_splits)
-                num_splits_buf = self.cg_buf_num_splits[: num_splits.shape[0]]
-                num_splits_buf.zero_()
-                num_splits_buf.copy_(num_splits)
-                num_splits = num_splits_buf
-                
             # Copy FP8 metadata into persistent CUDA graph buffers
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                 assert self.cg_buf_tile_scheduler_metadata is not None
@@ -228,7 +223,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 assert n <= self.cg_buf_num_splits.size(0)
                 self.cg_buf_num_splits[:n].copy_(num_splits)
                 num_splits = self.cg_buf_num_splits[:n]
-                
+
             scheduler_metadata.tile_scheduler_metadata = tile_scheduler_metadata
             scheduler_metadata.num_splits = num_splits
 

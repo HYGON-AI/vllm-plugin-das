@@ -24,6 +24,7 @@ TARGETS = (
     f"{TARGET_MODULE}.CommonAttentionMetadata.__init__",
     f"{TARGET_MODULE}.CommonAttentionMetadata.unpadded",
     f"{TARGET_MODULE}.CommonAttentionMetadata.replace",
+    f"{TARGET_MODULE}.MLAAttentionImpl.do_kv_cache_update",
 )
 _MARKER = "_vllm_hcu_attention_backend_metadata_applied"
 _WRAPPER = "_vllm_hcu_attention_backend_metadata_wrapper"
@@ -36,10 +37,16 @@ _HCU_FIELDS = (
 def apply_to_module(module: ModuleType) -> bool:
     backend = load_exact_module(TARGET_MODULE, module)
     common = require_class(backend, "CommonAttentionMetadata", f"{TARGET_MODULE}.CommonAttentionMetadata")
+    mla_impl = require_class(
+        backend,
+        "MLAAttentionImpl",
+        f"{TARGET_MODULE}.MLAAttentionImpl",
+    )
     wrapped = (
         (common, "__init__", TARGETS[1], _WRAPPER),
         (common, "unpadded", TARGETS[2], _WRAPPER),
         (common, "replace", TARGETS[3], _WRAPPER),
+        (mla_impl, "do_kv_cache_update", TARGETS[4], _WRAPPER),
     )
     if already_applied(backend, _MARKER, wrapped):
         return False
@@ -57,6 +64,24 @@ def apply_to_module(module: ModuleType) -> bool:
     require_exact_signature(unpadded, TARGETS[2], positional=("self", "num_actual_tokens", "num_actual_reqs"))
     replace = require_callable(common, "replace", TARGETS[3])
     require_exact_signature(replace, TARGETS[3], positional=("self",), var_keyword="kwargs")
+    cache_update = require_callable(
+        mla_impl,
+        "do_kv_cache_update",
+        TARGETS[4],
+    )
+    require_exact_signature(
+        cache_update,
+        TARGETS[4],
+        positional=(
+            "self",
+            "kv_c_normed",
+            "k_pe",
+            "kv_cache",
+            "slot_mapping",
+            "kv_cache_dtype",
+            "k_scale",
+        ),
+    )
 
     from vllm_hcu.v1.attention.metadata import CpCommonAttentionMetadata
 
@@ -85,14 +110,61 @@ def apply_to_module(module: ModuleType) -> bool:
             setattr(result, name, value)
         return result
 
-    for function in (hcu_common_init, hcu_unpadded, hcu_replace):
+    @functools.wraps(cache_update)
+    def hcu_mla_cache_update(
+        self,
+        kv_c_normed,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+    ):
+        if kv_cache_dtype != "fp8_e5m2":
+            return cache_update(
+                self,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+        if kv_cache.numel() == 0:
+            return None
+        try:
+            import vllm_hcu.hcu_ops  # noqa: F401
+
+            op = backend.torch.ops.hcu_ops.concat_and_cache_mla
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "HCU E5M2 MLA concat-and-cache operator is required but unavailable"
+            ) from exc
+        op(
+            kv_c_normed,
+            k_pe.squeeze(1),
+            kv_cache,
+            slot_mapping.flatten(),
+            kv_cache_dtype,
+            k_scale,
+        )
+        return None
+
+    for function in (
+        hcu_common_init,
+        hcu_unpadded,
+        hcu_replace,
+        hcu_mla_cache_update,
+    ):
         setattr(function, _WRAPPER, True)
     setattr(common, "_vllm_hcu_original_init", original_init)
     setattr(common, "_vllm_hcu_original_unpadded", unpadded)
     setattr(common, "_vllm_hcu_original_replace", replace)
+    setattr(mla_impl, "_vllm_hcu_original_do_kv_cache_update", cache_update)
     setattr(common, "__init__", hcu_common_init)
     setattr(common, "unpadded", hcu_unpadded)
     setattr(common, "replace", hcu_replace)
+    setattr(mla_impl, "do_kv_cache_update", hcu_mla_cache_update)
     setattr(backend, "CpCommonAttentionMetadata", CpCommonAttentionMetadata)
     setattr(backend, _MARKER, True)
     return True

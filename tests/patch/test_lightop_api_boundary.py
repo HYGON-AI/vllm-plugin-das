@@ -37,6 +37,13 @@ ALLOWED_TOP_LEVEL = {
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant"),
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant_ep"),
 }
+LEGACY_TOP_LEVEL_IMPORTS = {
+    (
+        "vllm_hcu/patch/worker/op_opt/patch_custom_ops.py",
+        "gather_and_maybe_dequant_cache",
+        "lightop_gather",
+    ),
+}
 
 
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
@@ -62,6 +69,7 @@ class _LightOpVisitor(ast.NodeVisitor):
         self.category_aliases: dict[str, str] = {}
         self.used: set[tuple[str, str]] = set()
         self.allowed_calls: list[tuple[str, str, int]] = []
+        self.allowed_legacy_imports: list[tuple[str, str, str | None, int]] = []
         self.violations: list[str] = []
         self._violation_keys: set[tuple[int, str]] = set()
         self._functions: list[str] = []
@@ -148,6 +156,19 @@ class _LightOpVisitor(ast.NodeVisitor):
             for alias in node.names:
                 if alias.name in PUBLIC_CATEGORIES:
                     self.category_aliases[alias.asname or alias.name] = alias.name
+                elif (
+                    self.relative_path,
+                    alias.name,
+                    alias.asname,
+                ) in LEGACY_TOP_LEVEL_IMPORTS:
+                    self.allowed_legacy_imports.append(
+                        (
+                            self.relative_path,
+                            alias.name,
+                            alias.asname,
+                            node.lineno,
+                        )
+                    )
                 else:
                     self._violate(
                         node,
@@ -463,6 +484,7 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
     violations: list[str] = []
     used: set[tuple[str, str]] = set()
     allowed_calls: list[tuple[str, str, int]] = []
+    allowed_legacy_imports: list[tuple[str, str, str | None, int]] = []
     owner_tree: ast.Module | None = None
     repository = root.parent
 
@@ -474,6 +496,7 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
         violations.extend(visitor.violations)
         used.update(visitor.used)
         allowed_calls.extend(visitor.allowed_calls)
+        allowed_legacy_imports.extend(visitor.allowed_legacy_imports)
         if relative_path == CLAMP_OWNER:
             owner_tree = tree
 
@@ -485,6 +508,20 @@ def _scan(root: Path) -> tuple[list[str], set[tuple[str, str]]]:
             "extra": sorted((actual - expected).elements()),
         }
         violations.append(f"{CLAMP_OWNER}:1: clamp allowlist mismatch: {details}")
+    actual_legacy = Counter(
+        (path, symbol, alias)
+        for path, symbol, alias, _ in allowed_legacy_imports
+    )
+    expected_legacy = Counter(LEGACY_TOP_LEVEL_IMPORTS)
+    if actual_legacy != expected_legacy:
+        details = {
+            "missing": sorted((expected_legacy - actual_legacy).elements()),
+            "extra": sorted((actual_legacy - expected_legacy).elements()),
+        }
+        violations.append(
+            "vllm_hcu:1: legacy top-level LightOp import allowlist mismatch: "
+            f"{details}"
+        )
     if owner_tree is None or not _clamp_resolver_is_exact(owner_tree):
         violations.append(
             f"{CLAMP_OWNER}:1: clamp resolver body is not the exact guarded "
@@ -588,6 +625,13 @@ def _write_mutation_owner(
         f"{activation_wrapper}",
         encoding="utf-8",
     )
+    for relative_path, symbol, alias in LEGACY_TOP_LEVEL_IMPORTS:
+        legacy_owner = tmp_path / relative_path
+        legacy_owner.parent.mkdir(parents=True, exist_ok=True)
+        legacy_owner.write_text(
+            f"from lightop import {symbol} as {alias}\n",
+            encoding="utf-8",
+        )
     return root
 
 
@@ -740,10 +784,13 @@ def test_scanner_records_literal_category_getattr(tmp_path: Path) -> None:
     assert ("lightop.quant", "literal_quant_kernel") in used
 
 
-def test_installed_category_exports_cover_production_symbols() -> None:
+def test_installed_lightop_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
     env = dict(os.environ)
     env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
+    env["LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS"] = json.dumps(
+        sorted({symbol for _, symbol, _ in LEGACY_TOP_LEVEL_IMPORTS})
+    )
     env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     result = subprocess.run(
         [
@@ -761,14 +808,21 @@ def test_installed_category_exports_cover_production_symbols() -> None:
             "total_memory=64 << 30); "
             "torch.cuda.current_device = lambda: 0; "
             "required=json.loads(os.environ['LIGHTOP_REQUIRED_EXPORTS']); "
+            "legacy_required=json.loads("
+            "os.environ['LIGHTOP_REQUIRED_LEGACY_ROOT_EXPORTS']); "
             "modules={name: importlib.import_module(name) "
             "for name, _symbol in required}; "
+            "lightop=importlib.import_module('lightop'); "
             "missing_public=[(name, symbol) for name, symbol in required "
             "if symbol not in modules[name].__all__]; "
             "missing_bound=[(name, symbol) for name, symbol in required "
             "if not hasattr(modules[name], symbol)]; "
+            "missing_legacy=[symbol for symbol in legacy_required "
+            "if not callable(getattr(lightop, symbol, None))]; "
             "assert not missing_public, f'not public: {missing_public}'; "
-            "assert not missing_bound, f'not bound: {missing_bound}'",
+            "assert not missing_bound, f'not bound: {missing_bound}'; "
+            "assert not missing_legacy, "
+            "f'legacy root exports are not callable: {missing_legacy}'",
         ],
         cwd=REPOSITORY,
         env=env,

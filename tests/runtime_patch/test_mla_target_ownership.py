@@ -1295,6 +1295,71 @@ def test_flashmla_cat_route_consumes_split_query(
     assert calls[0]["cache_seqlens"] is seq_lens
 
 
+@pytest.mark.parametrize("initial_rows", [40, 160])
+def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
+    monkeypatch,
+    cpu_flashmla,
+    initial_rows,
+):
+    flashmla = cpu_flashmla
+    valid_tile_metadata = torch.arange(80 * 8, dtype=torch.int32).reshape(80, 8)
+    valid_num_splits = torch.tensor([0, 3], dtype=torch.int32)
+    scheduler_metadata = SimpleNamespace()
+
+    monkeypatch.setattr(
+        flashmla,
+        "get_mla_metadata",
+        lambda *args, **kwargs: (scheduler_metadata, None),
+    )
+    monkeypatch.setattr(
+        flashmla,
+        "get_mla_metadata_dense_fp8",
+        lambda *args, **kwargs: (valid_tile_metadata, valid_num_splits),
+    )
+    monkeypatch.setattr(
+        flashmla,
+        "FlashMLADecodeMetadata",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    builder = object.__new__(flashmla.FlashMLAMetadataBuilder)
+    builder.num_q_heads = 10
+    builder.dcp_world_size = 1
+    builder.is_fp8_kvcache = True
+    # A one-token decode needs 160 rows, while a later multi-token MTP
+    # verification needs only 80. Reusing the larger persistent buffer must
+    # not expose its zero-padded tail to the native kernel.
+    builder.cg_buf_tile_scheduler_metadata = torch.full(
+        (initial_rows, 8),
+        -1,
+        dtype=torch.int32,
+    )
+    builder.cg_buf_num_splits = torch.full((9,), -1, dtype=torch.int32)
+    builder.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
+    )
+
+    result = builder._build_decode(
+        block_table_tensor=torch.zeros(1, 3, dtype=torch.int32),
+        seq_lens_device=torch.tensor([139], dtype=torch.int32),
+        max_seq_len=139,
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_device=torch.tensor([0, 2], dtype=torch.int32),
+        num_decode_tokens=2,
+        dcp_tot_seq_lens_device=None,
+    )
+
+    assert result.scheduler_metadata.tile_scheduler_metadata.shape == (80, 8)
+    torch.testing.assert_close(
+        result.scheduler_metadata.tile_scheduler_metadata,
+        valid_tile_metadata,
+    )
+    torch.testing.assert_close(
+        result.scheduler_metadata.num_splits,
+        valid_num_splits,
+    )
+
+
 @pytest.mark.parametrize("local_lse", [0.1, float("-inf")])
 def test_dcp_single_sink_matches_global_softmax(local_lse):
     local_lse, other_lse, sink = torch.tensor(
