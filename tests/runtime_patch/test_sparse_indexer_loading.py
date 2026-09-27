@@ -530,6 +530,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
             attn_metadata={"indexer": metadata}
         ),
         maybe_gather_indexer_k=gather,
+        _indexer_cache_as_hipc_view=lambda cache: hipc_cache,
         ops=SimpleNamespace(indexer_k_quant_and_cache=cache_insert),
         on_gfx938=lambda: True,
         indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
@@ -538,6 +539,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
         _encode_layer_name=lambda value: value,
     )
     cache = object()
+    hipc_cache = object()
     q_quant = torch.tensor([[7.0, 8.0]])
     weights = torch.tensor([[9.0]])
     hidden_states = torch.tensor([[10.0]])
@@ -566,10 +568,11 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     assert events[0][2] is expanded_slots
     assert events[0][3] is metadata
     assert events[1][1] is gathered_k
-    assert events[1][2] is cache
+    assert events[1][2] is hipc_cache
     assert events[1][3] is gathered_slots
     hcu_args = events[2][1:]
     assert hcu_args[0] is hidden_states
+    assert hcu_args[2] is cache
     assert hcu_args[3] is q_quant
     assert hcu_args[4] is local_k
     assert hcu_args[5] is weights
