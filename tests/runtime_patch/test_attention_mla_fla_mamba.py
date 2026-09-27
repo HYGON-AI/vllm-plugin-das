@@ -137,10 +137,16 @@ def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
         native,
         raising=False,
     )
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "1" if master_enabled else "0",
+    )
+    # The effective policy must come from the process environment even after
+    # vLLM's lazy env module materialized the opposite value.
     monkeypatch.setattr(
         henvs,
         "VLLM_HCU_USE_CUSTOM_OPS",
-        master_enabled,
+        not master_enabled,
         raising=False,
     )
     flashmla._resolve_sparse_mla_fwd.cache_clear()
@@ -170,11 +176,9 @@ def test_flashmla_sparse_boltops_signature_drift_fails_closed(monkeypatch):
         flash_mla_sparse_fwd=incompatible_boltops,
     )
     monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     monkeypatch.setattr(
-        henvs,
-        "VLLM_HCU_USE_CUSTOM_OPS",
-        False,
-        raising=False,
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
     )
     flashmla._resolve_sparse_mla_fwd.cache_clear()
 
@@ -195,11 +199,9 @@ def test_flashmla_sparse_boltops_rejects_fp8_kv_cache(
         HcuFlashMLASparseBackend,
     )
 
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     monkeypatch.setattr(
-        henvs,
-        "VLLM_HCU_USE_CUSTOM_OPS",
-        False,
-        raising=False,
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
     )
 
     reason = HcuFlashMLASparseBackend.supports_combination(
@@ -2022,6 +2024,93 @@ def test_e5m2_mla_cache_gather_uses_lightop(monkeypatch):
         seq_starts,
     )
     assert not adapter.apply_to_module(module)
+
+
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_e5m2_mla_cache_gather_master_off_uses_torch_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    byte_storage: bool,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    adapter = _adapter("patch_custom_ops")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    _install_fake_module(
+        monkeypatch,
+        "lightop",
+        gather_and_maybe_dequant_cache=lambda *args: pytest.fail(
+            "master-off E5M2 gather must not execute LightOp"
+        ),
+    )
+    logical_cache = (
+        torch.arange(4 * 4 * 3, dtype=torch.float32)
+        .reshape(4, 4, 3)
+        .sub(16)
+        .to(torch.float8_e5m2)
+    )
+    src_cache = (
+        logical_cache.view(torch.uint8) if byte_storage else logical_cache
+    )
+    dst = torch.empty((4, 3), dtype=torch.bfloat16)
+    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    token_to_seq = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+    seq_starts = torch.tensor([1, 5], dtype=torch.int32)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    def unsupported_upstream(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        num_tokens,
+        kv_cache_dtype,
+        scale,
+        seq_starts=None,
+    ):
+        del (
+            src_cache,
+            dst,
+            block_table,
+            cu_seq_lens,
+            token_to_seq,
+            num_tokens,
+            kv_cache_dtype,
+            scale,
+            seq_starts,
+        )
+        pytest.fail("the upstream HCU op does not implement E5M2")
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        gather_and_maybe_dequant_cache=unsupported_upstream,
+    )
+    adapter.apply_to_module(module)
+
+    result = module.gather_and_maybe_dequant_cache(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+
+    expected = torch.stack(
+        (
+            logical_cache[0, 1],
+            logical_cache[0, 2],
+            logical_cache[3, 1],
+            logical_cache[3, 2],
+        )
+    ).to(torch.bfloat16).mul_(0.5)
+    assert result is None
+    torch.testing.assert_close(dst, expected)
 
 
 def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):

@@ -107,6 +107,16 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     return custom_ops_enabled() and bool(feature_enabled)
 
 
+def custom_quantization_gemm_enabled() -> bool:
+    """Resolve the quantized-GEMM child switch under the process master."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True")
+        )
+    )
+
+
 def ple_prefetch_enabled() -> bool:
     """Resolve PLE stream prefetch under the custom-op master switch."""
     return custom_ops_enabled() and _environment_flag(

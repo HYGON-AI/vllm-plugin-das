@@ -35,9 +35,7 @@ def _custom_quantization_enabled() -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
 
-        return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
-            henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM
-        )
+        return henvs.custom_quantization_gemm_enabled()
     except (AttributeError, ImportError) as exc:
         raise PatchCompatibilityError(
             "required HCU custom-op or quantization-GEMM flag is unavailable"
@@ -120,7 +118,7 @@ def apply_to_module(module: ModuleType) -> bool:
         original_weight = weight
         original_data = weight.data
         try:
-            # Cancel the v0.25.1 target kernel's own transpose so the final
+            # Cancel the v0.28.1 target kernel's own transpose so the final
             # custom hipBLASLt operand remains [N, K].
             layer.weight.data = original_data.t()
             original_process(self, layer)

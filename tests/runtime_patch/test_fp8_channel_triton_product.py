@@ -599,6 +599,8 @@ def test_channelwise_backend_respects_custom_ops_master_switch(
     master_enabled: bool,
     feature_enabled: bool,
 ):
+    from vllm_hcu.platforms import envs as henvs
+
     monkeypatch.setenv(
         "VLLM_HCU_USE_CUSTOM_OPS",
         "1" if master_enabled else "0",
@@ -607,7 +609,12 @@ def test_channelwise_backend_respects_custom_ops_master_switch(
         "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM",
         "1" if feature_enabled else "0",
     )
-
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        not master_enabled,
+        raising=False,
+    )
     assert scaled_mm._custom_quantization_gemm_enabled() is (
         master_enabled and feature_enabled
     )

@@ -34,9 +34,7 @@ def _custom_quantization_gemm_enabled() -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
 
-        return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
-            henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM
-        )
+        return henvs.custom_quantization_gemm_enabled()
     except (AttributeError, ImportError) as exc:
         raise RuntimeError(
             "required HCU custom-op or quantization-GEMM flag is unavailable"
@@ -152,7 +150,7 @@ def _resolve_scaled_mm_backend() -> tuple[str, Callable[..., torch.Tensor]]:
     ):
         raise RuntimeError(
             "vLLM target triton_scaled_mm signature drifted from the reviewed "
-            "v0.25.1 contract"
+            "v0.28.1 contract"
         )
     return "target-triton", triton_scaled_mm
 

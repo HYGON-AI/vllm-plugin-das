@@ -56,7 +56,7 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     from vllm_hcu.platforms import envs as henvs
 
-    if not henvs.VLLM_HCU_USE_CUSTOM_OPS:
+    if not henvs.optional_custom_op_enabled():
         try:
             _resolve_sparse_mla_fwd()
         except RuntimeError as exc:
@@ -107,7 +107,7 @@ def _resolve_sparse_mla_fwd() -> Callable:
     """Resolve the sparse MLA kernel once under the custom-op master gate."""
     from vllm_hcu.platforms import envs as henvs
 
-    if henvs.VLLM_HCU_USE_CUSTOM_OPS:
+    if henvs.optional_custom_op_enabled():
         return _native_flash_mla_sparse_fwd
 
     try:

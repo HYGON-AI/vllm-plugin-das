@@ -7996,6 +7996,36 @@ def _fake_int8_scheme_module():
     )
 
 
+@pytest.mark.parametrize(
+    ("master_enabled", "feature_enabled"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_int8_backend_respects_custom_ops_master_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    master_enabled: bool,
+    feature_enabled: bool,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS", "1" if master_enabled else "0"
+    )
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM",
+        "1" if feature_enabled else "0",
+    )
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        not master_enabled,
+        raising=False,
+    )
+
+    assert patch_compressed_tensors_w8a8_int8._custom_quantization_enabled() is (
+        master_enabled and feature_enabled
+    )
+
+
 def test_int8_master_off_replaces_upstream_aiter_kernel_with_triton(
     monkeypatch: pytest.MonkeyPatch,
 ):

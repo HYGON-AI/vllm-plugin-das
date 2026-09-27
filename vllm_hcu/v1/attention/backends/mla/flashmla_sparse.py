@@ -111,7 +111,7 @@ class HcuFlashMLASparseBackend(FlashMLASparseBackend):
         from vllm_hcu.platforms import envs as henvs
 
         if (
-            not henvs.VLLM_HCU_USE_CUSTOM_OPS
+            not henvs.optional_custom_op_enabled()
             and kv_cache_dtype not in {None, "auto", "float16", "bfloat16"}
         ):
             return (
