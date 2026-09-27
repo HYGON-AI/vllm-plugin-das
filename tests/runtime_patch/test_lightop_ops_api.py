@@ -458,8 +458,10 @@ def _load_gemma_forward():
     namespace: dict[str, object] = {
         "torch": torch,
         "henvs": SimpleNamespace(
-            VLLM_HCU_USE_CUSTOM_OPS=True,
             VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM=True,
+            optional_custom_op_enabled=lambda feature_enabled=True: bool(
+                feature_enabled
+            ),
         ),
     }
     exec(compile(module, "gemma_forward_contract", "exec"), namespace)

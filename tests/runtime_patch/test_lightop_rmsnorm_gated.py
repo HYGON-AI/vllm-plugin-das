@@ -85,7 +85,7 @@ def test_qwen_module_captured_binding_rejects_signature_drift(
 def test_qwen_gated_rmsnorm_eligibility_is_strict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setattr(
         henvs, "VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED", True
     )
@@ -130,7 +130,7 @@ def test_qwen_gated_rmsnorm_eligibility_is_strict(
         _layer(activation="sigmoid"), x, z
     )
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert not rms_norm_gated._is_qwen_gated_rmsnorm_eligible(_layer(), x, z)
 
 

@@ -175,8 +175,9 @@ def _is_qwen_gated_rmsnorm_eligible(
     z: torch.Tensor | None,
 ) -> bool:
     if not (
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED
+        henvs.optional_custom_op_enabled(
+            henvs.VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED
+        )
     ):
         return False
     if x.ndim != 2 or x.shape[1] not in _VERIFIED_QWEN_WIDTHS:
@@ -214,9 +215,8 @@ def _is_qwen_gated_rmsnorm_eligible(
 class HcuRMSNormGated(RMSNormGated):
     @classmethod
     def enabled(cls) -> bool:
-        return bool(
-            henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED
+        return henvs.optional_custom_op_enabled(
+            henvs.VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED
         ) or super().enabled()
 
     def forward_hip(

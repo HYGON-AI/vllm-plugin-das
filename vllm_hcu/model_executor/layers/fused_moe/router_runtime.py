@@ -91,8 +91,9 @@ def make_hcu_grouped_topk_router(base_class):
             enabled = bool(
                 valid_grouping
                 and self.e_score_correction_bias is not None
-                and henvs.VLLM_HCU_USE_CUSTOM_OPS
-                and henvs.VLLM_HCU_USE_FUSE_MOE_GATE
+                and henvs.optional_custom_op_enabled(
+                    henvs.VLLM_HCU_USE_FUSE_MOE_GATE
+                )
             )
             if not enabled:
                 return super()._compute_routing(

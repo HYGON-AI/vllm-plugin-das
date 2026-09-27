@@ -77,8 +77,9 @@ class HcuRMSNorm(RMSNorm):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         use_custom_rms_norm = (
-            henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_USE_CUSTOM_RMS_NORM
+            henvs.optional_custom_op_enabled(
+                henvs.VLLM_HCU_USE_CUSTOM_RMS_NORM
+            )
             and x.shape[-1] >= _LIGHTOP_RMSNORM_MIN_COLS
         )
         if use_custom_rms_norm:

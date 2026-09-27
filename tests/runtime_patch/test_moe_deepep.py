@@ -1276,10 +1276,10 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
         None, [128, 128], None, None,
     )
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert module.fused_experts_impl(*arguments) == "official"
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
     monkeypatch.setitem(sys.modules, "aiter", ModuleType("aiter"))
     monkeypatch.delitem(sys.modules, "aiter.moe", raising=False)
@@ -4270,7 +4270,7 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
 
     from vllm_hcu.platforms import envs as henvs
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     logits = torch.ones((1, 4))
     assert router._compute_routing(None, logits, torch.int32) == "official"
 
@@ -4288,7 +4288,7 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
         monkeypatch,
         moe_fused_gate=moe_fused_gate,
     )
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
     weights, ids = router._compute_routing(None, logits, torch.int32)
     assert weights.shape == (1, 1)
@@ -4381,6 +4381,59 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     monkeypatch.setitem(sys.modules, "lightop.op", legacy_op)
     with pytest.raises(ImportError):
         router._compute_routing(None, logits, torch.int32)
+
+
+def test_router_master_off_ignores_materialized_true_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    official_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    official_ids = torch.tensor([[1, 3]], dtype=torch.int32)
+
+    class GroupedTopKRouter:
+        def _compute_routing(
+            self,
+            hidden_states,
+            router_logits,
+            indices_type,
+            *,
+            input_ids=None,
+        ):
+            del hidden_states, router_logits, indices_type, input_ids
+            return official_weights, official_ids
+
+    from vllm_hcu.model_executor.layers.fused_moe.router_runtime import (
+        make_hcu_grouped_topk_router,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    _install_lightop_moe(
+        monkeypatch,
+        moe_fused_gate=lambda *args, **kwargs: pytest.fail(
+            "master-off Hy4 gate must use the official router"
+        ),
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
+
+    router_class = make_hcu_grouped_topk_router(GroupedTopKRouter)
+    router = object.__new__(router_class)
+    router.num_expert_group = 2
+    router.topk_group = 1
+    router.top_k = 2
+    router.e_score_correction_bias = torch.ones(4)
+    router.routed_scaling_factor = 1.0
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
+
+    weights, ids = router._compute_routing(
+        torch.zeros((1, 8)),
+        torch.ones((1, 4)),
+        torch.int32,
+    )
+
+    torch.testing.assert_close(weights, official_weights)
+    torch.testing.assert_close(ids, official_ids)
 
 
 @pytest.mark.filterwarnings(

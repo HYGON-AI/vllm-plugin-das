@@ -84,7 +84,7 @@ def test_hcu_topk_topp_forward_is_feature_gated_and_lazy(monkeypatch):
     k = torch.tensor([2])
 
     monkeypatch.delitem(sys.modules, "lightop", raising=False)
-    monkeypatch.setattr(topk_topp_sample.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     monkeypatch.setattr(
         topk_topp_sample.henvs,
         "VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER",
@@ -104,7 +104,7 @@ def test_hcu_topk_topp_forward_is_feature_gated_and_lazy(monkeypatch):
         )
     )
     monkeypatch.setitem(sys.modules, "lightop", lightop)
-    monkeypatch.setattr(topk_topp_sample.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     token_ids, _ = sampler(logits, {}, k, None)
     assert token_ids.tolist() == [3]
     assert len(custom_calls) == 1
