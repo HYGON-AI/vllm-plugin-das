@@ -256,9 +256,11 @@ def test_hy4_pp2_tp1_pcp4_eager_mtp2_is_allowed(make_pcp_config) -> None:
 
 @pytest.mark.parametrize("cache_dtype", ["fp8_e4m3", "fp8_ds_mla"])
 def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
-    make_pcp_config, cache_dtype
+    make_pcp_config, cache_dtype, monkeypatch
 ) -> None:
     """The requested eight-card PCP topology must pass its strict contract."""
+
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
 
     config = make_pcp_config(
         architecture="HYV4ForCausalLM",
@@ -275,9 +277,38 @@ def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
         cache_dtype=cache_dtype,
         all2all_backend="deepep_high_throughput",
         moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
     )
 
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_hy4_tp1_pcp8_requires_linear_gate_pcp_sharding(
+    make_pcp_config, monkeypatch
+) -> None:
+    """PCP8 must fail before loading replicated Hy4 gate weights."""
+
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
+    with pytest.raises(ValueError, match="LINEAR_GATE_PCP_SHARD=1"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
 @pytest.mark.parametrize(
@@ -288,13 +319,20 @@ def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
         ({"cache_dtype": "bfloat16"}, "FP8 E4M3"),
         ({"all2all_backend": "deepep_low_latency"}, "DeepEP HT"),
         ({"moe_backend": "aiter"}, "DeepGEMM"),
+        ({"attention_backend": None}, "FLASHMLA_SPARSE"),
+        (
+            {"attention_backend": AttentionBackendEnum.FLASH_ATTN},
+            "FLASHMLA_SPARSE",
+        ),
         ({"enable_eplb": True}, "EPLB"),
     ],
 )
 def test_hy4_tp1_pcp8_rejects_outside_strict_contract(
-    make_pcp_config, change, message
+    make_pcp_config, change, message, monkeypatch
 ) -> None:
     """PCP8 must not broaden support beyond the hardware gate requested."""
+
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
 
     values = dict(
         architecture="HYV4ForCausalLM",
@@ -311,6 +349,7 @@ def test_hy4_tp1_pcp8_rejects_outside_strict_contract(
         cache_dtype="fp8_e4m3",
         all2all_backend="deepep_high_throughput",
         moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
     )
     values.update(change)
 

@@ -168,6 +168,28 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
         raise ValueError(
             "HY V4 PCP8 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
         )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    attention_config = _require_hcu_pcp_attribute(
+        vllm_config, "attention_config", "VllmConfig"
+    )
+    if (
+        _require_hcu_pcp_attribute(
+            attention_config, "backend", "AttentionConfig"
+        )
+        != AttentionBackendEnum.FLASHMLA_SPARSE
+    ):
+        raise ValueError(
+            "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
+        )
+    if os.environ.get(
+        "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        raise ValueError(
+            "HY V4 PCP8 requires "
+            "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 to avoid replicated "
+            "linear_gate weights exhausting KV-cache memory."
+        )
 
 
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
