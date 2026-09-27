@@ -11,7 +11,7 @@ import inspect
 import sys
 import textwrap
 from dataclasses import dataclass
-from types import FunctionType, ModuleType, SimpleNamespace
+from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 from typing import NamedTuple
 
 import numpy as np
@@ -1271,6 +1271,129 @@ def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
 
     assert seen == [1200]
     assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PCP profiling must not shrink the real MTP propose/prefill shape."""
+
+    runner_module, _ = pcp_runner_module
+    speculator_module = importlib.import_module(
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator"
+    )
+    prefill_tokens: list[int] = []
+
+    class ConcreteSpeculator(speculator_module.AutoRegressiveSpeculator):
+        def load_draft_model(self, target_model):
+            raise NotImplementedError
+
+    speculator = object.__new__(ConcreteSpeculator)
+    speculator.num_speculative_steps = 1
+    speculator.max_model_len = 4096
+    speculator.max_num_reqs = 16
+    speculator.hidden_states = torch.zeros((4096, 1))
+    speculator.last_token_indices = torch.zeros(16, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
+    speculator.input_buffers = object()
+    speculator.prefill_cudagraph_manager = None
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.draft_tokens = torch.zeros((16, 1), dtype=torch.int64)
+    speculator._copy_request_inputs = lambda *args, **kwargs: None
+    speculator._prepare_eplb_forward = lambda *args, **kwargs: None
+    speculator.on_prefill_begin = lambda *args, **kwargs: None
+    speculator.on_prefill_end = lambda *args, **kwargs: None
+
+    def record_prefill(self, num_reqs, num_tokens, *args, **kwargs):
+        prefill_tokens.append(int(num_tokens))
+
+    speculator._prefill = MethodType(record_prefill, speculator)
+
+    monkeypatch.setattr(
+        speculator_module,
+        "prepare_prefill_inputs",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        speculator_module,
+        "get_uniform_decode_token_count",
+        lambda *args, **kwargs: None,
+    )
+
+    def dispatch_prefill(
+        manager,
+        num_reqs,
+        num_tokens,
+        uniform_token_count,
+        **kwargs,
+    ):
+        return (
+            SimpleNamespace(
+                cg_mode=speculator_module.CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(
+        speculator_module,
+        "dispatch_cg_and_sync_dp",
+        dispatch_prefill,
+    )
+
+    def profile_run(self):
+        num_tokens = int(self.max_num_tokens)
+        num_reqs = min(num_tokens, int(self.max_num_reqs))
+        input_batch = SimpleNamespace(
+            num_tokens=num_tokens,
+            num_tokens_after_padding=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=np.full(
+                num_reqs,
+                num_tokens // num_reqs,
+                dtype=np.int32,
+            ),
+            seq_lens_cpu_upper_bound=torch.full(
+                (num_reqs,),
+                num_tokens // num_reqs,
+                dtype=torch.int32,
+            ),
+            idx_mapping=torch.arange(num_reqs, dtype=torch.int64),
+            has_prefill=True,
+        )
+        self.speculator.propose(
+            input_batch=input_batch,
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros((num_tokens, 1)),
+            aux_hidden_states=None,
+            num_sampled=torch.ones(num_reqs, dtype=torch.int32),
+            num_rejected=torch.zeros(num_reqs, dtype=torch.int32),
+            last_sampled=torch.zeros(self.max_num_reqs, dtype=torch.int64),
+            next_prefill_tokens=torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int64,
+            ),
+            temperature=torch.zeros(self.max_num_reqs),
+            seeds=torch.zeros(self.max_num_reqs, dtype=torch.int64),
+            dummy_run=True,
+            skip_attn_for_dummy_run=True,
+            is_profile=True,
+        )
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.max_num_tokens = 4096
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+    runner.speculator = speculator
+
+    runner.profile_run()
+
+    assert prefill_tokens == [4096]
+    assert runner.max_num_tokens == 4096
 
 
 @pytest.mark.parametrize(

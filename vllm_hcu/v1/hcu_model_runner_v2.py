@@ -111,7 +111,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
-        if pcp_size <= 1:
+        # Upstream profiles the target and MTP prefill from the same dummy
+        # batch. Runtime MTP sampling restores the global PCP batch before
+        # propose(), so shrinking this shared budget would under-profile the
+        # replicated draft prefill even though it is safe for the target.
+        if pcp_size <= 1 or getattr(self, "speculator", None) is not None:
             return super().profile_run()
 
         original_max = self.max_num_tokens
