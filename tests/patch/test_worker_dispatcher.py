@@ -227,13 +227,16 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "'vllm_hcu.model_executor.layers.fused_moe.deepep_runtime',"
         "'vllm_hcu.model_executor.layers.fused_moe.aiter_runtime',"
         "'vllm_hcu.model_executor.layers.fused_moe.aiter_ops'}; "
-        "assert not (targets & sys.modules.keys()); "
+        "initial_targets=sorted(targets & sys.modules.keys()); "
+        "assert initial_targets==["
+        "'vllm.distributed.device_communicators.base_device_communicator']; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"
         "'replacements':sum(item.action.value=='replacement' for item in first),"
         "'callbacks':sum(item.action.value=='callback' for item in first),"
         "'statuses':sorted({item.status for item in first}),"
+        "'initial_targets_loaded':initial_targets,"
         "'targets_loaded':sorted(targets & sys.modules.keys()),"
         "'business_loaded':sorted(business & sys.modules.keys()),"
         "'runner_loaded':'vllm_hcu.model_executor.layers.fused_moe.moe_runner' "
@@ -249,8 +252,13 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "second": expected_total,
         "replacements": expected_replacements,
         "callbacks": expected_callbacks,
-        "statuses": ["armed"],
-        "targets_loaded": [],
+        "statuses": ["applied", "armed"],
+        "initial_targets_loaded": [
+            "vllm.distributed.device_communicators.base_device_communicator"
+        ],
+        "targets_loaded": [
+            "vllm.distributed.device_communicators.base_device_communicator"
+        ],
         "business_loaded": [],
         "runner_loaded": False,
         "shared_loaded": False,
@@ -298,7 +306,13 @@ def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
     assert payload["pid"] == payload["actual_pid"]
     assert payload["role"] == "Worker"
     assert payload["count"] == expected_worker_patches
-    assert set(map(tuple, payload["selected"].values())) == {("armed", True)}
+    assert payload["selected"] == {
+        "worker.op_opt.mla.lightly_cp_wrapper": ["armed", True],
+        "worker.framework_opt.communicator.base_custom_sp": ["applied", True],
+        "worker.framework_opt.spec_decode.eagle_topk_buffer": ["armed", True],
+        "worker.op_opt.moe.oracle.fp8_dpsk": ["armed", True],
+        "worker.op_opt.moe.prepare_finalize.deepep_ll": ["armed", True],
+    }
     assert payload["pynccl"] == ["armed", False]
 
 

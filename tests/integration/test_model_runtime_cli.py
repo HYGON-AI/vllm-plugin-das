@@ -686,6 +686,17 @@ def test_case_group_cleanup_does_not_skip_an_exited_leader(monkeypatch):
 def test_dp_rank_joins_the_shared_owned_process_group(monkeypatch):
     calls = []
     installed_handlers = []
+    dp_environment_names = (
+        "VLLM_DP_RANK",
+        "VLLM_DP_RANK_LOCAL",
+        "VLLM_DP_SIZE",
+        "VLLM_DP_MASTER_IP",
+        "VLLM_DP_MASTER_PORT",
+    )
+    original_dp_environment = {
+        name: model_runtime.os.environ.get(name)
+        for name in dp_environment_names
+    }
     process_group_id = SimpleNamespace(value=1234)
     ready = _FakeEvent()
     start_gate = _FakeEvent()
@@ -730,3 +741,7 @@ def test_dp_rank_joins_the_shared_owned_process_group(monkeypatch):
         (signal.SIGINT, signal.default_int_handler),
     ]
     assert ready.is_set()
+    assert {
+        name: model_runtime.os.environ.get(name)
+        for name in dp_environment_names
+    } == original_dp_environment

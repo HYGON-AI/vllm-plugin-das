@@ -1403,28 +1403,42 @@ def _tp_ep_data_parallel_rank(
             os.setpgid(0, process_group_id.value)
     process_group_ready.set()
     start_gate.wait()
-    os.environ["VLLM_DP_RANK"] = str(local_dp_rank)
-    os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
-    os.environ["VLLM_DP_SIZE"] = str(data_parallel_size)
-    os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
-    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
-    if rank_case == "deepseek_v4_dspark":
-        result = _case_deepseek_v4_dspark_rank(
-            model_path,
-            tensor_parallel_size=tensor_parallel_size,
-            data_parallel_size=data_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-    else:
-        result = _case_tp_ep_smoke_rank(
-            model_path,
-            tensor_parallel_size=tensor_parallel_size,
-            data_parallel_size=data_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            all2all_backend=all2all_backend,
-            moe_backend=moe_backend,
-        )
-    result_queue.put((local_dp_rank, result))
+    dp_environment = {
+        "VLLM_DP_RANK": str(local_dp_rank),
+        "VLLM_DP_RANK_LOCAL": str(local_dp_rank),
+        "VLLM_DP_SIZE": str(data_parallel_size),
+        "VLLM_DP_MASTER_IP": dp_master_ip,
+        "VLLM_DP_MASTER_PORT": str(dp_master_port),
+    }
+    missing = object()
+    previous_environment = {
+        name: os.environ.get(name, missing) for name in dp_environment
+    }
+    os.environ.update(dp_environment)
+    try:
+        if rank_case == "deepseek_v4_dspark":
+            result = _case_deepseek_v4_dspark_rank(
+                model_path,
+                tensor_parallel_size=tensor_parallel_size,
+                data_parallel_size=data_parallel_size,
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
+        else:
+            result = _case_tp_ep_smoke_rank(
+                model_path,
+                tensor_parallel_size=tensor_parallel_size,
+                data_parallel_size=data_parallel_size,
+                gpu_memory_utilization=gpu_memory_utilization,
+                all2all_backend=all2all_backend,
+                moe_backend=moe_backend,
+            )
+        result_queue.put((local_dp_rank, result))
+    finally:
+        for name, value in previous_environment.items():
+            if value is missing:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _case_tp_ep_smoke_data_parallel(

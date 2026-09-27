@@ -21,7 +21,6 @@ _PATCH_MARKER = "_vllm_hcu_safe_alignment_installed"
 def is_lightop_marlin_moe_supported(moe: object) -> bool:
     """Check LightOp's two-stage Marlin config before weights are packed."""
     try:
-        from lightop import envs as lightop_envs
         from lightop.moe import get_moe_cuda_marlin_config
 
         in_dtype = getattr(moe, "in_dtype")
@@ -38,6 +37,8 @@ def is_lightop_marlin_moe_supported(moe: object) -> bool:
         if device_index is None:
             device_index = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device_index)
+        arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+        device_name = f"{arch}_{properties.multi_processor_count}cu"
         intermediate = int(getattr(moe, "intermediate_size_per_partition"))
         hidden = int(getattr(moe, "hidden_dim"))
         w13_num_shards = int(getattr(moe, "w13_num_shards"))
@@ -51,7 +52,7 @@ def is_lightop_marlin_moe_supported(moe: object) -> bool:
                 hidden,
                 intermediate,
                 int(getattr(moe, "experts_per_token")),
-                lightop_envs.LMSLIM_GPU_NAME,
+                device_name,
                 properties.multi_processor_count,
                 compute_dtype,
             )

@@ -860,6 +860,16 @@ def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
     )
 
     class FlashMLASparseMetadataBuilder:
+        def __init__(
+            self,
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+        ):
+            del kv_cache_spec, layer_names, device
+            self.vllm_config = vllm_config
+
         def build(
             self,
             common_prefix_len,
@@ -908,12 +918,17 @@ def _build_fp8_separate_prefill_decode(
         sparse_module._build_fp8_separate_prefill_decode
     )
     assert sparse_adapter.apply_to_module(sparse_module) is True
-    sparse_builder = FlashMLASparseMetadataBuilder()
-    sparse_builder.vllm_config = SimpleNamespace(
+    sparse_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=2,
             cp_kv_cache_interleave_size=4,
         )
+    )
+    sparse_builder = FlashMLASparseMetadataBuilder(
+        None,
+        (),
+        sparse_config,
+        torch.device("cpu"),
     )
 
     sparse_metadata = sparse_builder.build(0, common)

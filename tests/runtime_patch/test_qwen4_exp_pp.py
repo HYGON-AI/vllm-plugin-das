@@ -8,6 +8,24 @@ import subprocess
 import sys
 import textwrap
 
+from vllm_hcu.patch.platform.core_fix import patch_qwen4_exp_pp
+from vllm_hcu.patch.worker.core_fix import (
+    patch_qwen4_exp_model_state,
+    patch_qwen4_exp_mtp_pp,
+)
+
+
+def test_qwen4_exp_pp_behavior_is_owned_by_explicit_patch_adapters() -> None:
+    assert patch_qwen4_exp_pp.TARGET_MODULE == (
+        "vllm.model_executor.models.config"
+    )
+    assert patch_qwen4_exp_model_state.TARGET_MODULE == (
+        "vllm.models.qwen4_exp.amd.model_state"
+    )
+    assert patch_qwen4_exp_mtp_pp.TARGET_MODULE == (
+        "vllm.models.qwen4_exp.amd.mtp"
+    )
+
 
 def test_qwen4_exp_pp_allows_ple_layers_owned_by_first_stage() -> None:
     script = textwrap.dedent(
