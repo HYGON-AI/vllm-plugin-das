@@ -110,7 +110,12 @@ def _require_supported_hy_v4_parallelism(parallel_config) -> None:
         # The DCP config gate owns the remaining dtype/backend/EP checks.
         return
     if (
-        topology in {(4, 1, 2, 1, 1), (1, 1, 4, 2, 1)}
+        topology
+        in {
+            (4, 1, 2, 1, 1),
+            (1, 1, 4, 2, 1),
+            (1, 1, 8, 1, 1),
+        }
         and parallel_config.enable_expert_parallel
     ):
         return
