@@ -27,8 +27,32 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
 
 _LEGACY_SCORING_FUNC = "sigmoid"
+_UNSUPPORTED_CONFIGURATION_PREFIX = (
+    "moe_fused_gate: unsupported configuration:"
+)
+
+
+def lightop_moe_gate_should_fallback(exc: RuntimeError) -> bool:
+    """Return whether LightOp explicitly rejected the routing shape."""
+
+    backend_error = str(exc)
+    if not backend_error.startswith(_UNSUPPORTED_CONFIGURATION_PREFIX):
+        return False
+    # Older LightOp builds append an instruction to disable the fused gate.
+    # The plugin now performs that fallback for this configuration itself.
+    backend_error = backend_error.partition(". In vLLM HCU,")[0]
+    logger.warning_once(
+        "LightOp fused MoE gate does not support this routing configuration; "
+        "falling back to the standard vLLM router. Backend error: %s",
+        backend_error,
+    )
+    return True
 
 
 def lightop_moe_gate_kwargs(
@@ -78,4 +102,7 @@ def lightop_moe_gate_kwargs(
     }
 
 
-__all__ = ["lightop_moe_gate_kwargs"]
+__all__ = [
+    "lightop_moe_gate_kwargs",
+    "lightop_moe_gate_should_fallback",
+]
