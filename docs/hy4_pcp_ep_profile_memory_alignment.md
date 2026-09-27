@@ -7,23 +7,27 @@ This change adapts the remaining PCP+EP profile-memory behavior from
 owners on `origin/v0.28.1-dev@0be6e56`. It does not port the v0.25.1 V1
 communicator monkey patch or claim PCP CUDA Graph support.
 
-The post-review implementation tested on hardware is commit `e97b794`. Its
+The second-review implementation tested on hardware is commit `376f2a5`. Its
 isolated wheel is
-`vllm_hcu-0.28.1rc1.dev491+das.e97b794.dtk2604-cp310-cp310-linux_x86_64.whl`,
-SHA-256 `03e46f804fe99ade98492802cec365557a870f86e72be187fb9131648926e3d2`.
+`vllm_hcu-0.28.1rc1.dev491+das.376f2a5.dtk2604-cp310-cp310-linux_x86_64.whl`,
+SHA-256 `d1e440c93b03db8981cad64d37f1f78470a0c5f73446a6a155a56ee93fc95146`.
 
 ## Changes
 
 - Fixed DeepEP high-throughput construction derives `num_nvl_bytes` from
   `VLLM_DEEPEP_BUFFER_SIZE_MB`; the auto manager's existing maximum-size rule
   remains unchanged.
-- `HcuGPUModelRunnerV2.profile_run()` uses a conservative PCP rank-local
-  bound that accounts for partitioned prefill, replicated decode, per-request
-  layout headroom, and MTP decode width. It restores the configured value in
-  `finally`; PCP1 delegates without mutation.
+- Without a loaded speculator, `HcuGPUModelRunnerV2.profile_run()` uses a
+  conservative PCP rank-local bound that accounts for partitioned prefill,
+  replicated decode, and per-request layout headroom. It restores the
+  configured value in `finally`; PCP1 delegates without mutation.
+- With a loaded speculator, it preserves the original global token budget.
+  Upstream profiles the target model and `speculator.propose()` from the same
+  dummy batch, while runtime MTP restores the global PCP batch before the
+  draft prefill. Shrinking that shared batch would under-profile MTP.
 
 For global token budget `B`, PCP width `P`, maximum requests `N`, and decode
-query width `Q`, the temporary profile budget is:
+query width `Q`, the target-only temporary profile budget is:
 
 ```text
 partitioned = floor(ceil(B / P) * 9 / 8)
@@ -34,7 +38,8 @@ profile     = min(B, max(1, partitioned + replicated))
 The partitioned term retains the 12.5% imbalance allowance. The replicated
 term covers decode tokens that remain on every PCP rank and two possible
 `DualChunkSwap` segments per request. The global cap is safe because dispatch
-cannot exceed the admitted global token budget.
+cannot exceed the admitted global token budget. This formula is not applied
+when a speculator is loaded; that path profiles with `B`.
 
 ## Review regression and tests
 
@@ -53,7 +58,15 @@ The third case also asserts that `_dummy_run()` can create all 256 sampling
 requests rather than being truncated to 144. PCP1 behavior and restoration
 after an exception are covered separately.
 
-The complete relevant selection passed **158 tests** with 14 existing
+The second review identified another shared-batch boundary: upstream
+`profile_run()` also invokes MTP `propose()`, and the first MTP `_prefill()`
+sees the complete global PCP batch during real sampling. A test executes the
+installed upstream `AutoRegressiveSpeculator.propose()` body and records the
+actual `_prefill()` input. For PCP4/MTP2 with `B=4096,N=16`, the previous
+candidate profiled 1200 MTP tokens; the corrected path profiles all 4096.
+The same guard covers the `N=256` case that previously profiled only 1920.
+
+The complete relevant selection passed **159 tests** with 14 existing
 warnings:
 
 ```text
@@ -86,7 +99,7 @@ env -u VLLM_PLUGINS -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   PYTHONPATH=<isolated-plugin-wheel> \
   /usr/bin/python -m vllm.entrypoints.cli.main serve \
   /models/Hy4-preview-Channel-FP8-w8a8-v2 \
-  --served-model-name hy4-pcp-ep-mtp2-review-fix \
+  --served-model-name hy4-pcp-ep-mtp2-mtp-profile-fix \
   --host 127.0.0.1 --port 8015 --trust-remote-code \
   --tensor-parallel-size 1 --pipeline-parallel-size 2 \
   --prefill-context-parallel-size 4 --enable-expert-parallel \
@@ -102,18 +115,21 @@ env -u VLLM_PLUGINS -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
 The service constructed eight `HcuGPUModelRunnerV2` workers for
 PP2/TP1/PCP4/EP4/MTP2, selected `DeepEPHTAll2AllManager` and the contiguous
 DeepGEMM HT path, used FP8 E4M3 KV, and resolved CUDA Graph mode to `NONE` as
-expected for this eager PCP topology. The fixed profile used 1920 tokens;
-peak activation was 3.8 GiB on both stages, with 14.13 GiB PP0 and 18.91 GiB
-PP1 available KV cache.
+expected for this eager PCP topology. The MTP-bearing PP1 stage retained the
+global 4096-token profile: peak activation was 3.8 GiB on PP0 and 4.13 GiB on
+PP1, with 14.13 GiB PP0 and 16.98 GiB PP1 available KV cache. The prior
+under-profiled wheel reported only 3.8 GiB PP1 activation and 18.91 GiB PP1
+KV, so the corrected profile materially exercises the missing MTP budget.
 
 Post-review gates:
 
 - HumanEval/0-7: **8/8**.
-- 256-client decode stress: 256/256 HTTP 200, all `stop`, 0 preemptions,
-  109.19 completion tok/s, 4.605 s p95 latency.
-- Mixed high-concurrency gate: 255 active decode requests plus a delayed
-  3000-token prefill request; 256/256 HTTP 200, all `stop`. The long prefill
-  completed in 13.274 s and the service remained healthy.
+- Mixed high-KV gate: 255 unique prompts, each 1445 API prompt tokens with up
+  to 128 output tokens, plus a delayed 4032-token API prefill. All 256
+  requests returned HTTP 200 with `stop`; the long prefill completed in
+  58.128 s. The run admitted 237 concurrent requests, reached 68.2% GPU KV
+  usage with 0% prefix-cache hits, generated 22,608 draft tokens, accepted
+  22,529, and recorded zero preemptions.
 - No Traceback, OOM, timeout, reallocation, or NCCL-timeout marker appeared.
   All eight cards returned to zero reported utilization and memory after
   shutdown.
