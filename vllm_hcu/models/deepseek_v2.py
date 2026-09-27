@@ -873,6 +873,89 @@ def _is_local_indexer_weight(
     return name.rsplit(".indexer.", 1)[0] in indexer_present_prefixes
 
 
+def _compute_skip_topk_layers(
+    config: DeepseekV2Config | DeepseekV3Config,
+) -> set[int]:
+    """Return backbone layers that reuse a preceding indexer producer."""
+    if not hasattr(config, "index_topk"):
+        return set()
+
+    num_hidden_layers = config.num_hidden_layers
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        if len(indexer_types) != num_hidden_layers:
+            raise ValueError(
+                "indexer_types must contain one entry per hidden layer: "
+                f"expected {num_hidden_layers}, got {len(indexer_types)}."
+            )
+        invalid_types = sorted(set(indexer_types) - {"full", "shared"})
+        if invalid_types:
+            raise ValueError(
+                "indexer_types only supports 'full' and 'shared', "
+                f"got {invalid_types}."
+            )
+        seen_full = False
+        for layer_idx, indexer_type in enumerate(indexer_types):
+            if indexer_type == "full":
+                seen_full = True
+            elif not seen_full:
+                raise ValueError(
+                    "A 'shared' indexer requires a preceding 'full' producer; "
+                    f"layer {layer_idx} has none."
+                )
+        return {
+            layer_idx
+            for layer_idx, indexer_type in enumerate(indexer_types)
+            if indexer_type == "shared"
+        }
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if not isinstance(freq, int) or freq <= 0:
+        raise ValueError(
+            f"index_topk_freq must be a positive integer, got {freq!r}."
+        )
+    pattern = getattr(config, "index_topk_pattern", None)
+    offset = getattr(config, "index_skip_topk_offset", 2)
+    skip_layers: set[int] = set()
+    for layer_idx in range(num_hidden_layers):
+        if pattern is None:
+            if max(layer_idx - offset + 1, 0) % freq != 0:
+                skip_layers.add(layer_idx)
+        elif 0 <= layer_idx < len(pattern) and pattern[layer_idx] == "S":
+            skip_layers.add(layer_idx)
+    return skip_layers
+
+
+def _resolve_indexer_sharing(
+    config: DeepseekV2Config | DeepseekV3Config,
+    prefix: str,
+) -> tuple[bool, bool]:
+    """Return ``(skip_topk, is_mtp_layer)`` for one attention layer."""
+    layer_id = extract_layer_index(prefix)
+    is_mtp_layer = layer_id >= config.num_hidden_layers
+    skip_topk = (
+        not is_mtp_layer and layer_id in _compute_skip_topk_layers(config)
+    )
+    return skip_topk, is_mtp_layer
+
+
+def _require_local_indexer_producer(
+    config: DeepseekV2Config | DeepseekV3Config,
+    *,
+    start_layer: int,
+    end_layer: int,
+) -> None:
+    """Reject a PP stage whose first sparse layer has no local producer."""
+    if not hasattr(config, "index_topk") or start_layer == end_layer:
+        return
+    if start_layer in _compute_skip_topk_layers(config):
+        raise RuntimeError(
+            "GLM sparse-indexer PP stage starts on shared indexer layer "
+            f"{start_layer}; choose a partition whose stage begins on a "
+            "'full' producer layer."
+        )
+
+
 def _try_load_quantized_indexer_wk(
     name,
     tensor,
@@ -1165,36 +1248,29 @@ class DeepseekV2MLAAttention(nn.Module):
 
         _skip_topk = False
         if self.is_v32:
-            self.indexer_rope_emb = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
-            )
-            self.indexer = Indexer(
-                vllm_config,
-                config,
-                hidden_size,
-                q_lora_rank,
-                quant_config,
-                cache_config,
-                topk_indices_buffer,
-                f"{prefix}.indexer",
-            )
-
-            # Enable IndexCache for DeepSeek models to reduce redundant top-k
-            # token selection computations in sparse attention.
-            use_index_cache = getattr(config, "use_index_cache", False)
-            if use_index_cache:
-                # IndexCache config
-                # Refer: https://arxiv.org/abs/2603.12201 for more details.
-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
-                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                layer_id = extract_layer_index(prefix)
-                if _index_topk_pattern is None:
-                    _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
-                elif 0 <= layer_id < len(_index_topk_pattern):
-                    _skip_topk = _index_topk_pattern[layer_id] == "S"
+            _skip_topk, _ = _resolve_indexer_sharing(config, prefix)
+            if not _skip_topk:
+                self.indexer_rope_emb = get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not getattr(
+                        config, "indexer_rope_interleave", False
+                    ),
+                )
+                self.indexer = Indexer(
+                    vllm_config,
+                    config,
+                    hidden_size,
+                    q_lora_rank,
+                    quant_config,
+                    cache_config,
+                    topk_indices_buffer,
+                    f"{prefix}.indexer",
+                )
+            else:
+                self.indexer_rope_emb = None
+                self.indexer = None
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1420,6 +1496,12 @@ class DeepseekV2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        if self.is_v32:
+            _require_local_indexer_producer(
+                config,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
