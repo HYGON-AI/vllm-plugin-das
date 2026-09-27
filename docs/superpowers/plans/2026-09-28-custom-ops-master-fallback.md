@@ -4,7 +4,7 @@
 
 **Goal:** Make `VLLM_HCU_USE_CUSTOM_OPS=0` reliably bypass managed LightOp/AITER optimizations while preserving explicit MoE backend selection and the FP8 QSA exception.
 
-**Architecture:** Centralize effective master/child precedence in `vllm_hcu.platforms.envs`, apply it at provider-selection boundaries before imports or layout conversion, and delegate to audited BoltOPs, Triton, upstream vLLM, or vllm_hcu-native paths. Reject unsupported master-off cache/layout combinations before serving instead of silently executing a custom provider.
+**Architecture:** Centralize effective master/child precedence in `vllm_hcu.platforms.envs`, apply it at provider-selection boundaries before imports or layout conversion, and delegate to audited BoltOPs, Triton, upstream vLLM, or vllm_hcu-native paths. For a path without an existing fallback, inspect BoltOPs/Triton and assess a small vllm_hcu reference implementation; if no safe replacement exists, keep that operator unchanged and document it outside the managed set.
 
 **Tech Stack:** Python, pytest, vLLM MRV2 runtime patches, LightOp, AITER, BoltOPs, Triton, HCU/ROCm eight-card hardware.
 
@@ -17,7 +17,8 @@
 - Explicit `--moe-backend aiter`, `triton`, or `deep_gemm` must not be rewritten.
 - FP8 QSA E4M3/E5M2 reader and cache writer remain independent of the master.
 - Provider selection must occur before provider-specific weight/cache layout conversion.
-- Missing safe fallback must produce an early, explicit error rather than execute LightOp/AITER under master-off.
+- Fallback search order is upstream/vllm_hcu native, BoltOPs/Triton, then a maintainable vllm_hcu reference implementation.
+- An operator with no safe replacement remains unchanged and explicitly outside the managed set; do not break model startup merely to enforce the master.
 - Changes, validation evidence, server commands, and skill updates go to existing MR #163.
 
 ## Review Focus
@@ -25,7 +26,7 @@
 - Master off with a child flag explicitly on must bypass the child provider; covered in Tasks 1-4.
 - Explicit AITER MoE plus master off must retain AITER experts but bypass a managed LightOp router; covered in Tasks 1 and 2.
 - FP8 QSA plus master off must retain its dedicated reader/writer; covered in Task 4.
-- Proprietary layout conversion followed by fallback must be impossible; covered in Tasks 3 and 4.
+- Proprietary layout conversion followed by fallback must be impossible; an unchanged exception keeps its original provider and layout end-to-end; covered in Tasks 3 and 4.
 - CUDA graph capture must not hide a first-call provider change or exception-based retry; covered in Task 5.
 
 ---
@@ -162,17 +163,17 @@ Commit message: `fix: bypass optional AITER ops under master-off`
 
 - [ ] **Step 1: Write failing cache-helper and exception tests**
 
-Assert that master-off E5M2/DeepSeek cache helpers delegate to the original implementation or are rejected during compatibility validation without importing LightOp.  Assert separately that QSA E4M3/E5M2 reader/writer still execute with master off.
+For E5M2/DeepSeek cache helpers, first inventory the upstream, vllm_hcu, BoltOPs, and Triton implementations.  Write a master-off test for the selected fallback when one preserves the ABI.  If none exists, add a test documenting that the path remains unchanged and is not falsely reported as managed.  Assert separately that QSA E4M3/E5M2 reader/writer still execute with master off.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
 Run: `pytest -q tests/runtime_patch/test_attention_mla_fla_mamba.py tests/runtime_patch/test_fp8_channel_triton_product.py tests/runtime_patch/test_quant_gemm_aiter.py tests/runtime_patch/test_qwen4_exp_qsa_fp8.py -k 'master_off or custom_ops_master or qsa_fp8'`
 
-Expected: E5M2 cache-helper coverage fails because it currently imports LightOp unconditionally; QSA exception tests pass or identify an accidental broad gate.
+Expected: the chosen cache-helper fallback test fails because the route is not implemented yet, or the explicit unchanged-exception contract is absent; QSA exception tests pass or identify an accidental broad gate.
 
 - [ ] **Step 3: Complete selection-time fallback/rejection**
 
-Use the effective policy for sparse MLA and quant GEMM selectors.  For E5M2/cache-layout paths, delegate before the LightOp import when the original supports the ABI; otherwise add an early compatibility error naming the unsupported cache dtype and master setting.  Do not gate QSA FP8 reader/writer.
+Use the effective policy for sparse MLA and quant GEMM selectors.  For E5M2/cache-layout paths, prefer an upstream/native implementation, then BoltOPs/Triton, then a small vllm_hcu reference path.  If none preserves the ABI, leave the existing operator unchanged, mark it outside the managed set, and do not emit a false fallback message.  Do not gate QSA FP8 reader/writer.
 
 - [ ] **Step 4: Run all attention and quantization regression tests**
 
@@ -198,7 +199,7 @@ Commit message: `fix: complete master-off attention and GEMM fallbacks`
 
 - [ ] **Step 1: Run a source audit for unmanaged provider entry points**
 
-List every production LightOp/AITER import and classify it as managed fallback, explicit MoE/backend-owned, QSA exception, or required HCU primitive.  Treat any unclassified entry as a test/code gap.
+List every production LightOp/AITER import and classify it as managed fallback, explicit MoE/backend-owned, QSA exception, required HCU primitive, or unchanged because no safe fallback exists.  For the last class, record the upstream, BoltOPs, Triton, and local-reference options checked.  Treat any otherwise unclassified entry as a test/code gap.
 
 - [ ] **Step 2: Run the complete repository test suite**
 

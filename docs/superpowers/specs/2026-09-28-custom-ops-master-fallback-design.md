@@ -5,8 +5,10 @@
 Make `VLLM_HCU_USE_CUSTOM_OPS` a reliable safety switch for optional HCU
 operator optimizations.  When it is disabled, managed LightOp and AITER
 sub-operators must not execute: the runtime must select an audited Triton,
-BoltOPs, upstream vLLM, or vllm_hcu-native implementation, or reject the
-configuration before serving if no safe equivalent exists.
+BoltOPs, upstream vLLM, or vllm_hcu-native implementation.  Operators without
+an audited replacement remain explicitly outside the managed set until a
+fallback is available; the master must not make an otherwise working model
+unstartable merely to enforce provider purity.
 
 ## User-visible contract
 
@@ -26,9 +28,12 @@ With `VLLM_HCU_USE_CUSTOM_OPS=0`:
 - routing/gate, normalization, activation, sampling, FLA, MHC, cache helper,
   and similar optional replacements use their upstream vLLM or vllm_hcu
   reference path;
-- a configuration whose cache/layout ABI has no audited non-custom
-  implementation is rejected early with an error naming the operator and
-  required setting;
+- fallback discovery prefers an existing upstream/native implementation,
+  then BoltOPs or Triton, and finally a small maintainable reference
+  implementation owned by vllm_hcu;
+- an operator for which none of those choices is safe remains unchanged and
+  is documented as an explicit unmanaged exception rather than being disabled
+  without a working replacement;
 - selection emits a one-time message identifying the fallback provider when
   that is not already evident from existing backend logs.
 
@@ -54,6 +59,12 @@ Necessary HCU platform primitives that are not optional optimizations are not
 disabled merely because their implementation is registered as a custom
 operator.  Such a path must be documented as a platform primitive or receive
 an audited fallback before it is added to the managed set.
+
+Likewise, an optional operator with no safe fallback is not added to the
+managed set yet.  This is a temporary compatibility exception, not permission
+to silently claim that the operator fell back.  The audit records why the
+existing provider remains necessary and which replacement options were
+checked.
 
 ## Architecture
 
@@ -83,7 +94,7 @@ The audited managed set covers:
 | SiLU-and-mul and fused quant helpers | LightOp | upstream/native composition |
 | sampler/top-k helpers | LightOp | upstream/native implementation |
 | optional FLA and MHC kernels | AITER | BoltOPs/Triton/native implementation |
-| optional MLA concat/top-k/cache helpers | LightOp/AITER | native implementation, or early rejection if the cache ABI has no fallback |
+| optional MLA concat/top-k/cache helpers | LightOp/AITER | native, BoltOPs, Triton, or a vllm_hcu reference implementation; otherwise documented unchanged exception |
 | PLE prefetch stream | HCU optimization | synchronous existing path |
 
 MoE expert kernels, DeepEP/DeepGEMM provider selection, and AITER MoE weight
@@ -98,8 +109,12 @@ precision or runtime failure, and retry a different provider inside a graph.
 
 Missing optional packages select the fallback when the layout is still
 portable.  ABI mismatches, corrupted installations, and failures after a
-provider-specific layout conversion remain visible errors.  Unsupported
-master-off cache formats fail during configuration validation when possible.
+provider-specific layout conversion remain visible errors.  Before declaring
+that no fallback exists, the implementation audit must check upstream vLLM,
+vllm_hcu native code, BoltOPs, and Triton, then assess whether a small portable
+reference implementation can be maintained locally.  If none is safe, the
+operator remains unchanged and outside the managed set with an explicit
+documented reason.
 
 ## Validation
 
