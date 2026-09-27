@@ -129,10 +129,10 @@ def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
 
     try:
         result = flashmla.flash_mla_sparse_fwd(
-            object(),
-            object(),
-            object(),
-            1.0,
+            q=object(),
+            kv=object(),
+            indices=object(),
+            sm_scale=1.0,
         )
     finally:
         flashmla._resolve_sparse_mla_fwd.cache_clear()
