@@ -50,6 +50,24 @@ def _module(name: str, **values) -> ModuleType:
     return module
 
 
+@pytest.mark.parametrize(
+    "adapter_name",
+    ("patch_fla_chunk_o", "patch_fla_chunk_delta_h"),
+)
+def test_fla_selector_master_off_ignores_materialized_true_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_name: str,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    adapter = _adapter(adapter_name)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+
+    assert adapter._enabled() is False
+
+
 def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
     """Import the implementation after another test registered its torch op."""
     from vllm.model_executor.custom_op import CustomOp

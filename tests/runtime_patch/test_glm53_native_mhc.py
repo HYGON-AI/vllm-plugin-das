@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_hcu.patch.worker.core_fix.patch_glm5next_channel_fp8 import (
@@ -15,6 +16,36 @@ class _FakeOp:
 
     def forward_native(self, *args, **kwargs):
         return self.result
+
+
+def test_mhc_post_master_off_ignores_materialized_true_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers import mhc as backend
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MHC", True)
+    monkeypatch.setattr(
+        backend,
+        "_boltops_mhc_post_fwd",
+        lambda *args, **kwargs: pytest.fail(
+            "master-off MHC must use the native fallback"
+        ),
+    )
+    residual = torch.arange(6, dtype=torch.bfloat16).reshape(1, 2, 3)
+    x = torch.ones((1, 3), dtype=torch.bfloat16)
+    post_mix = torch.tensor([[[0.25], [0.5]]], dtype=torch.float32)
+    comb_mix = torch.eye(2, dtype=torch.float32).unsqueeze(0)
+
+    actual = backend.mhc_post(x, residual, post_mix, comb_mix)
+    expected = (
+        residual.to(torch.float32)
+        + post_mix * x.unsqueeze(-2).to(torch.float32)
+    ).to(torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_bind_glm5next_native_mhc_preserves_norm_semantics():

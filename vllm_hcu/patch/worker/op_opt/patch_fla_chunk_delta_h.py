@@ -27,9 +27,8 @@ _WRAPPER = "_vllm_hcu_fla_chunk_delta_h_wrapper"
 def _enabled() -> bool:
     from vllm_hcu.platforms import envs as henvs
 
-    return bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
     )
 
 
