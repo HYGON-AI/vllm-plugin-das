@@ -141,3 +141,29 @@ Update `/models/upgrading-vllm-hcu` with the effective-policy contract, MoE
 backend boundary, QSA exception, fallback matrix, and validation evidence.
 The implementation and documentation remain in the existing MR #163 rather
 than opening another MR.
+
+## Validation record
+
+Candidate `c7250ed333f26bb4c50b8437b3919e5ed6e6926f` was validated against
+installed vLLM `0.28.1+dtk2604.torch2110.2609171627.g77acaf`:
+
+- focused attention/GEMM/QSA suites: 388 passed;
+- v0.28.1 repository suite: 2294 passed, 63 skipped, one explicitly deselected
+  v0.25.1-source test; the two other v0.25.1-only files were ignored;
+- GLM-5.3 DP8/EP8/MTP3 and Hy4 DP8/EP8/MTP3 both reached HTTP health 200,
+  executed BoltOPs sparse MLA on all eight workers, captured target and MTP
+  PIECEWISE/FULL graphs, passed a prompt longer than the 2048 sparse threshold,
+  and scored HumanEval/0-7 at 8/8;
+- a same-source master-off probe reported the Channel-FP8 adapter backend as
+  `target-triton` with its HCU patch marker installed;
+- both owned server process groups stopped cleanly and all eight cards returned
+  to zero reported memory use.
+
+The hardware run used the candidate Python source through `PYTHONPATH` and the
+installed `237e559` native extension. There are no changes from `237e559` to
+the candidate in `vllm_hcu/csrc`, `setup.py`, or `pyproject.toml`; this is
+therefore exact Python-source validation, not an exact candidate-wheel claim.
+The only retained no-fallback exception found by the provider audit is the
+DeepSeek-V4/DSpark `fp8_ds_mla` fused qnorm+RoPE+KVNorm+UE8M0 paged cache
+writer. FP8 QSA reader/writer remains the intentional E4M3/E5M2 exception, and
+explicit MoE expert selection remains outside the generic master.
