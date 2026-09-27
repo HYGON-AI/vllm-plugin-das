@@ -44,19 +44,6 @@ def _adapter(name: str):
     return importlib.import_module(f"vllm_hcu.patch.worker.op_opt.{name}")
 
 
-def _flash_mla_sparse_contract(
-    q,
-    kv,
-    indices,
-    softmax_scale,
-    d_v=512,
-    attn_sink=None,
-    topk_length=None,
-    config=None,
-):
-    del q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, config
-
-
 def _module(name: str, **values) -> ModuleType:
     module = ModuleType(name)
     module.__dict__.update(values)
@@ -97,17 +84,30 @@ def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
     from vllm_hcu.platforms import envs as henvs
     from vllm_hcu.v1.attention.ops import flashmla
 
-    def native(*args, **kwargs):
-        del args, kwargs
+    def native(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+    ):
+        del q, kv, indices, sm_scale, d_v, attn_sink, topk_length
         return "native"
 
-    native.__signature__ = inspect.signature(_flash_mla_sparse_contract)
-
-    def boltops(*args, **kwargs):
-        del args, kwargs
+    def boltops(
+        q,
+        kv,
+        indices,
+        softmax_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+        config=None,
+    ):
+        del q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, config
         return "boltops"
-
-    boltops.__signature__ = inspect.signature(_flash_mla_sparse_contract)
     boltops_mla = _module(
         "boltops.mla",
         flash_mla_sparse_fwd=boltops,
@@ -128,11 +128,16 @@ def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
     flashmla._resolve_sparse_mla_fwd.cache_clear()
 
     try:
-        resolved = flashmla._resolve_sparse_mla_fwd()
+        result = flashmla.flash_mla_sparse_fwd(
+            object(),
+            object(),
+            object(),
+            1.0,
+        )
     finally:
         flashmla._resolve_sparse_mla_fwd.cache_clear()
 
-    assert resolved() == expected_backend
+    assert result == expected_backend
 
 
 def test_flashmla_sparse_boltops_signature_drift_fails_closed(monkeypatch):

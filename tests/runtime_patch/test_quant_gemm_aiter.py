@@ -7946,6 +7946,33 @@ def test_int8_gemm_missing_categorized_export_fails_without_lmslim_retry(
 
 def _fake_int8_scheme_module():
     class CompressedTensorsW8A8Int8:
+        def __init__(self):
+            from compressed_tensors.quantization import QuantizationStrategy
+
+            self.strategy = QuantizationStrategy.CHANNEL
+            self.is_static_input_scheme = False
+            self.input_symmetric = True
+
+        def create_weights(
+            self,
+            layer,
+            output_partition_sizes,
+            input_size_per_partition,
+            params_dtype,
+            weight_loader,
+            **kwargs,
+        ):
+            del (
+                layer,
+                output_partition_sizes,
+                input_size_per_partition,
+                params_dtype,
+                weight_loader,
+                kwargs,
+            )
+            self.kernel = "upstream-kernel"
+            return "upstream-create"
+
         def process_weights_after_loading(self, layer):
             layer.weight = torch.nn.Parameter(
                 layer.weight.t().contiguous(), requires_grad=False
@@ -7960,6 +7987,32 @@ def _fake_int8_scheme_module():
     )
 
 
+def test_int8_master_off_replaces_upstream_aiter_kernel_with_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_int8_scheme_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_custom_quantization_enabled",
+        lambda: False,
+    )
+    patch_compressed_tensors_w8a8_int8.apply_to_module(module)
+    scheme = module.CompressedTensorsW8A8Int8()
+
+    result = scheme.create_weights(
+        object(),
+        [8],
+        16,
+        torch.bfloat16,
+        object(),
+    )
+
+    assert result == "upstream-create"
+    layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
+    scheme.process_weights_after_loading(layer)
+    assert type(scheme.kernel).__name__ == "TritonInt8ScaledMMLinearKernel"
+
+
 def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.MonkeyPatch):
     module = _fake_int8_scheme_module()
     monkeypatch.setattr(
@@ -7969,6 +8022,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     )
     patch_compressed_tensors_w8a8_int8.apply_to_module(module)
     scheme = module.CompressedTensorsW8A8Int8()
+    assert scheme.supports_quanted_inputs() is False
     layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
     assert scheme.apply_weights(layer, "x", None)[0] == "upstream"
     scheme.process_weights_after_loading(layer)
@@ -7988,6 +8042,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     )
     patch_compressed_tensors_w8a8_int8.apply_to_module(feature_module)
     feature_scheme = feature_module.CompressedTensorsW8A8Int8()
+    assert feature_scheme.supports_quanted_inputs() is True
     feature_layer = SimpleNamespace(
         weight=torch.nn.Parameter(torch.ones(2, 3)),
         weight_scale=torch.ones(2, 1),

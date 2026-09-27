@@ -147,6 +147,16 @@ def flash_mla_sparse_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch sparse MLA to native FlashMLA or the BoltOPs fallback."""
     kernel = _resolve_sparse_mla_fwd()
+    if kernel is _native_flash_mla_sparse_fwd:
+        return kernel(
+            q,
+            kv,
+            indices,
+            softmax_scale,
+            d_v,
+            attn_sink,
+            topk_length,
+        )
     return kernel(
         q,
         kv,
