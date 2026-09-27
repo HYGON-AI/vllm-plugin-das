@@ -97,6 +97,16 @@ def custom_ops_enabled() -> bool:
     return _environment_flag(os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True"))
 
 
+def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
+    """Resolve an optional optimized operator under the process master.
+
+    Read the master directly from ``os.environ`` so a materialized lazy module
+    attribute cannot freeze the effective policy for later consumers.
+    """
+
+    return custom_ops_enabled() and bool(feature_enabled)
+
+
 def ple_prefetch_enabled() -> bool:
     """Resolve PLE stream prefetch under the custom-op master switch."""
     return custom_ops_enabled() and _environment_flag(

@@ -3343,6 +3343,15 @@ def test_explicit_aiter_backend_enables_mask_construction_from_current_config(
     assert aiter_runtime.is_aiter_moe_requested()
 
 
+def test_explicit_aiter_moe_ignores_custom_ops_master(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    moe_config = SimpleNamespace(moe_backend="aiter")
+
+    assert aiter_runtime.is_aiter_moe_requested(moe_config)
+
+
 def test_explicit_triton_backend_overrides_enabled_aiter_env(
     monkeypatch: pytest.MonkeyPatch,
 ):
