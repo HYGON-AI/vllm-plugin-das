@@ -788,6 +788,9 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
+        dcp_rank: int,
+        dcp_world_size: int,
+        cp_kv_cache_interleave_size: int,
     ) -> None:
         rocm_aiter_sparse_attn_indexer_native(
             hidden_states,
@@ -804,6 +807,9 @@ if current_platform.is_rocm():
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert=skip_k_cache_insert,
+            dcp_rank=dcp_rank,
+            dcp_world_size=dcp_world_size,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
     def hcu_sparse_attn_indexer_fake(
@@ -821,8 +827,16 @@ if current_platform.is_rocm():
         total_seq_lens: int,
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool,
+        dcp_rank: int,
+        dcp_world_size: int,
+        cp_kv_cache_interleave_size: int,
     ) -> None:
-        del skip_k_cache_insert
+        del (
+            skip_k_cache_insert,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+        )
         rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,
@@ -1029,6 +1043,9 @@ class SparseAttnIndexer(CustomOp):
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
                 self.skip_k_cache_insert,
+                getattr(self, "dcp_rank", 0),
+                getattr(self, "dcp_world_size", 1),
+                getattr(self, "cp_kv_cache_interleave_size", 1),
             )
             return self.topk_indices_buffer
         if rocm_aiter_ops.is_enabled():
@@ -1128,5 +1145,8 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             skip_k_cache_insert,
+            getattr(self, "dcp_rank", 0),
+            getattr(self, "dcp_world_size", 1),
+            getattr(self, "cp_kv_cache_interleave_size", 1),
         )
         return self.topk_indices_buffer
