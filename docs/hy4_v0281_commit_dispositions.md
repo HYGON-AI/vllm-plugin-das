@@ -1,7 +1,7 @@
 # v0.25.1 → v0.28.1-dev source-only commit disposition
 
 Frozen comparison: `origin/v0.25.1@6ea7b12` versus
-`origin/v0.28.1-dev@9302165`, refreshed 2026-09-25. The 28 rows below are
+`origin/v0.28.1-dev@0be6e56`, refreshed 2026-09-27. The 28 rows below are
 the complete non-merge `target..source` set. “Present” means a target owner
 exists; it is not an accuracy or performance claim. Device results and final
 equivalence rulings belong in `hy4_v0281_validation.md`.
@@ -9,11 +9,11 @@ equivalence rulings belong in `hy4_v0281_validation.md`.
 | Commit | Functional owner / target gap | Disposition and selected files / gate |
 | --- | --- | --- |
 | `6ea7b12` | DTK container version label | Release-only; exclude container edit. Verify installed DTK/provenance in validation record. |
-| `3f30e7c` | Hy4 PCP+EP DeepEP wait | Optional PCP/EP excluded; TP8 Hy4 uses `models/hy_v4/{moe,model}.py`, PCP/DCP rejected. |
+| `3f30e7c` | Hy4 PCP+EP DeepEP wait | PCP is now present on the target branch. Adapt the profile-token budget at the MRV2 runner owner: for target-only profiling, account separately for partitioned prefill and replicated decode/request headroom, cap the conservative rank-local bound at the admitted global budget, and restore the configured value in `finally`. When a speculator is loaded, retain the global budget because upstream profiles MTP prefill from the same dummy batch and runtime MTP sees the restored global PCP batch. Retain the target's existing DeepEP ownership. Dispatch-shape and real `propose() -> _prefill()` tests plus the PP2/PCP4/EP4 high-KV live gate cover this behavior. |
 | `df99a09` | Hy4 LightOp mask/top-k experiments | Use final sparse indexer behavior through `models/hy_v4/attention.py`; removed regressive/optional LightOp branches excluded. Sparse tests and TP8 live gate. |
 | `4f1275d` | DTK 26.04 image build | Release-only; no image change. |
 | `534162d` | CI quality gate workflow | CI-only; exclude. |
-| `2b7de5f` | Hy4 PCP+EP and profile memory | TP8-only model adaptation selected; PCP/EP excluded pending Graph/accuracy gate. |
+| `2b7de5f` | Hy4 PCP+EP and profile memory | PCP+EP integration is already carried by merged PR #152. Align the remaining memory behavior at current owners: the conservative MRV2 PCP rank-local profile bound above only for target-only profiling, the global shared batch for MTP profiling, and fixed DeepEP HT `num_nvl_bytes` derived from `VLLM_DEEPEP_BUFFER_SIZE_MB`. Do not port the old V1 communicator monkey patch. Validate with an isolated-wheel PP2/PCP4/EP4/MTP2 gate that includes high request concurrency, high KV occupancy, and mixed prefill/decode. |
 | `4f1f266` | V1 steady-decode scheduler and M-RoPE | Scheduler registry owner differs in MRV2; do not port V1 steady-decode or change default without same-workload evidence. M-RoPE candidate remains unverified for this model; target scheduler review in common Task 4. |
 | `904f4e2` | Kimi-K3 boltops pin | Independent model; follow-up MR. |
 | `7cdd654` | Hy4 PCP-sharded linear gate | TP-only gate runs `models/hy_v4/attention.py`; PCP path excluded. |

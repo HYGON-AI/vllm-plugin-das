@@ -117,6 +117,81 @@ def _hy4_pcp_topology(parallel_config: object) -> tuple[int, int, int]:
     )
 
 
+def _require_hy4_pcp8_contract(vllm_config: object) -> None:
+    """Admit only the hardware-gated Hy4 PCP8 MTP3 configuration."""
+
+    speculative_config = _require_hcu_pcp_attribute(
+        vllm_config, "speculative_config", "VllmConfig"
+    )
+    if (
+        speculative_config is None
+        or _require_hcu_pcp_attribute(
+            speculative_config, "method", "SpeculativeConfig"
+        )
+        != "mtp"
+        or int(
+            _require_hcu_pcp_attribute(
+                speculative_config,
+                "num_speculative_tokens",
+                "SpeculativeConfig",
+            )
+        )
+        != 3
+    ):
+        raise ValueError("HY V4 PCP8 requires checkpoint-native MTP3.")
+
+    parallel_config = _require_hcu_pcp_attribute(
+        vllm_config, "parallel_config", "VllmConfig"
+    )
+    kernel_config = _require_hcu_pcp_attribute(
+        vllm_config, "kernel_config", "VllmConfig"
+    )
+    cache_config = _require_hcu_pcp_attribute(
+        vllm_config, "cache_config", "VllmConfig"
+    )
+    if bool(getattr(parallel_config, "enable_eplb", False)):
+        raise ValueError("HY V4 PCP8 does not support EPLB.")
+    if (
+        _require_hcu_pcp_attribute(
+            parallel_config, "all2all_backend", "ParallelConfig"
+        )
+        != "deepep_high_throughput"
+        or _require_hcu_pcp_attribute(
+            kernel_config, "moe_backend", "KernelConfig"
+        )
+        != "deep_gemm"
+        or _require_hcu_pcp_attribute(
+            cache_config, "cache_dtype", "CacheConfig"
+        )
+        not in ("fp8_e4m3", "fp8_ds_mla")
+    ):
+        raise ValueError(
+            "HY V4 PCP8 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
+        )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    attention_config = _require_hcu_pcp_attribute(
+        vllm_config, "attention_config", "VllmConfig"
+    )
+    if (
+        _require_hcu_pcp_attribute(
+            attention_config, "backend", "AttentionConfig"
+        )
+        != AttentionBackendEnum.FLASHMLA_SPARSE
+    ):
+        raise ValueError(
+            "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
+        )
+    if os.environ.get(
+        "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        raise ValueError(
+            "HY V4 PCP8 requires "
+            "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 to avoid replicated "
+            "linear_gate weights exhausting KV-cache memory."
+        )
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -172,8 +247,10 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             "FlashAttention PCP does not support hybrid KV cache groups."
         )
     hy4_topology = _hy4_pcp_topology(parallel_config) if is_hy4 else None
-    if is_hy4 and hy4_topology not in {(4, 2, 1), (1, 4, 2)}:
+    if is_hy4 and hy4_topology not in {(4, 2, 1), (1, 4, 2), (1, 8, 1)}:
         raise ValueError(f"HY V4 PCP topology is not validated: {hy4_topology}")
+    if is_hy4 and hy4_topology == (1, 8, 1):
+        _require_hy4_pcp8_contract(vllm_config)
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
     ) != 1 and hy4_topology != (1, 4, 2):

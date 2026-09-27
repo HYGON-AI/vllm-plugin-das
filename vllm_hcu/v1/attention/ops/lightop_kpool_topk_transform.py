@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 from functools import cache
 from types import ModuleType
 from typing import Callable
@@ -16,12 +17,15 @@ from vllm_hcu.platforms import envs as henvs
 @cache
 def _get_lightop_kpool_transform() -> Callable | None:
     try:
-        from lightop.fuse_topk_transform import (
-            fast_kpool_topk_transform_fused,
+        attention = importlib.import_module("lightop.attention")
+        fused = getattr(
+            attention,
+            "fast_kpool_topk_transform_fused",
+            None,
         )
-    except (ImportError, AttributeError):
+    except ImportError:
         return None
-    return fast_kpool_topk_transform_fused
+    return fused if callable(fused) else None
 
 
 def lightop_kpool_topk_transform(

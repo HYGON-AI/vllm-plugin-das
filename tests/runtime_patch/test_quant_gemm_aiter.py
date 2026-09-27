@@ -4271,7 +4271,25 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
     quant_config = method.moe_quant_config
     assert quant_config is not None
     assert quant_config.weight_quant_dtype == "int4"
-    assert factory_calls == [(quant_config, moe, routing_tables)]
+    deepgemm_quant_config = factory_calls[0][0]
+    assert deepgemm_quant_config is not quant_config
+    torch.testing.assert_close(
+        quant_config.w1_scale,
+        torch.full_like(layer.w13_weight_scale, 16.0),
+    )
+    torch.testing.assert_close(
+        quant_config.w2_scale,
+        torch.full_like(layer.w2_weight_scale, 16.0),
+    )
+    torch.testing.assert_close(
+        deepgemm_quant_config.w1_scale,
+        layer.w13_weight_scale,
+    )
+    torch.testing.assert_close(
+        deepgemm_quant_config.w2_scale,
+        layer.w2_weight_scale,
+    )
+    assert factory_calls == [(deepgemm_quant_config, moe, routing_tables)]
     assert processed_layers == [layer]
     assert method.moe_kernel is not None
     x = torch.zeros((2, 4), dtype=torch.bfloat16)

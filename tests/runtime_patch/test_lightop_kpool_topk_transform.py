@@ -28,10 +28,10 @@ def test_lightop_kpool_transform_uses_existing_sparse_topk_gate(monkeypatch):
 
     lightop = ModuleType("lightop")
     lightop.__path__ = []  # type: ignore[attr-defined]
-    fused_module = ModuleType("lightop.fuse_topk_transform")
-    fused_module.fast_kpool_topk_transform_fused = fused
+    attention_module = ModuleType("lightop.attention")
+    attention_module.fast_kpool_topk_transform_fused = fused
     monkeypatch.setitem(sys.modules, "lightop", lightop)
-    monkeypatch.setitem(sys.modules, "lightop.fuse_topk_transform", fused_module)
+    monkeypatch.setitem(sys.modules, "lightop.attention", attention_module)
 
     target = _load_target()
     monkeypatch.setattr(target.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
@@ -91,6 +91,21 @@ def test_lightop_kpool_transform_falls_back_for_unsupported_contract(monkeypatch
         )
         is None
     )
+
+
+def test_lightop_kpool_transform_falls_back_when_public_api_is_absent(
+    monkeypatch,
+):
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []  # type: ignore[attr-defined]
+    attention_module = ModuleType("lightop.attention")
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.attention", attention_module)
+
+    target = _load_target()
+    target._get_lightop_kpool_transform.cache_clear()
+
+    assert target._get_lightop_kpool_transform() is None
 
 
 def test_lightop_kpool_transform_installs_through_vllm_hook():

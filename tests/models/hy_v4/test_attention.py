@@ -53,6 +53,7 @@ def test_unsafe_generic_fp8_cache_is_rejected():
         (1, 1, 1, 1, 8, True, True),
         (4, 2, 1, 1, 1, True, True),
         (1, 4, 1, 2, 1, True, True),
+        (1, 8, 1, 1, 1, True, True),
         (8, 1, 2, 1, 1, True, True),
         (2, 1, 2, 1, 4, True, True),
         (2, 2, 1, 1, 1, True, False),
@@ -67,6 +68,7 @@ def test_unsafe_generic_fp8_cache_is_rejected():
         (1, 4, 1, 2, 2, True, False),
         (4, 2, 1, 1, 1, False, False),
         (1, 4, 1, 2, 1, False, False),
+        (1, 8, 1, 1, 1, False, False),
     ],
 )
 def test_hy4_context_parallel_topology_contract(tp, pcp, dcp, pp, dp, ep, supported):

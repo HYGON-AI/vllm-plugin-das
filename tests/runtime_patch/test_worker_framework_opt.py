@@ -280,7 +280,7 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     manager = module.DeepEPHTAll2AllManager("group", "tcp")
     assert manager.num_sms == 30
     kwargs = manager._make_all2all_kwargs()
-    assert kwargs["num_nvl_bytes"] == 1_000_000_000
+    assert kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
     assert kwargs["num_rdma_bytes"] == 500_000_000
     assert kwargs["num_qps_per_rank"] == 30
     manager.set_num_sms(29)
@@ -295,6 +295,27 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     assert intranode.num_sms == 60
     assert intranode_kwargs["num_rdma_bytes"] == 0
     assert intranode_kwargs["num_qps_per_rank"] == 1
+    assert intranode_kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
+
+
+def test_deep_ep_ht_nvl_buffer_tracks_configured_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Each fixed HT manager must use the current DeepEP buffer setting."""
+
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    module = _fake_all2all_module()
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 17)
+    assert patch_all2all.apply_to_module(module) is True
+
+    module.envs.VLLM_DEEPEP_BUFFER_SIZE_MB = 64
+    small = module.DeepEPHTAll2AllManager("group", "tcp")
+    assert small._make_all2all_kwargs()["num_nvl_bytes"] == 64 * 1024 * 1024
+
+    module.envs.VLLM_DEEPEP_BUFFER_SIZE_MB = 2048
+    large = module.DeepEPHTAll2AllManager("group", "tcp")
+    assert large._make_all2all_kwargs()["num_nvl_bytes"] == 2048 * 1024 * 1024
 
 
 def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(

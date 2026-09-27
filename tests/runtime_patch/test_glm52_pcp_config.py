@@ -46,6 +46,7 @@ def _make_pcp_config(**overrides: object) -> object:
     dcp = overrides.pop("dcp", 1)
     dp = overrides.pop("dp", 1)
     enable_expert_parallel = overrides.pop("enable_expert_parallel", True)
+    enable_eplb = overrides.pop("enable_eplb", False)
     enforce_eager = overrides.pop("enforce_eager", True)
     speculative = overrides.pop("speculative", False)
     speculative_method = overrides.pop("speculative_method", "mtp")
@@ -57,6 +58,11 @@ def _make_pcp_config(**overrides: object) -> object:
     kv_transfer = overrides.pop("kv_transfer", False)
     enable_lightly_cp = overrides.pop("enable_lightly_cp", False)
     enable_multi_layers_mtp = overrides.pop("enable_multi_layers_mtp", False)
+    all2all_backend = overrides.pop(
+        "all2all_backend", "deepep_high_throughput"
+    )
+    moe_backend = overrides.pop("moe_backend", "deep_gemm")
+    cache_dtype = overrides.pop("cache_dtype", "fp8_e4m3")
     attention_backend = overrides.pop(
         "attention_backend", AttentionBackendEnum.FLASH_ATTN
     )
@@ -79,7 +85,10 @@ def _make_pcp_config(**overrides: object) -> object:
             decode_context_parallel_size=dcp,
             data_parallel_size=dp,
             enable_expert_parallel=enable_expert_parallel,
+            enable_eplb=enable_eplb,
+            all2all_backend=all2all_backend,
         ),
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
         attention_config=SimpleNamespace(backend=attention_backend),
         speculative_config=(
             SimpleNamespace(
@@ -90,7 +99,10 @@ def _make_pcp_config(**overrides: object) -> object:
             else None
         ),
         lora_config=(SimpleNamespace() if lora else None),
-        cache_config=SimpleNamespace(kv_offloading_size=(1.0 if kv_offload else None)),
+        cache_config=SimpleNamespace(
+            kv_offloading_size=(1.0 if kv_offload else None),
+            cache_dtype=cache_dtype,
+        ),
         kv_transfer_config=(
             SimpleNamespace(kv_connector="MooncakeConnector") if kv_transfer else None
         ),
@@ -240,6 +252,109 @@ def test_hy4_pp2_tp1_pcp4_eager_mtp2_is_allowed(make_pcp_config) -> None:
         num_speculative_tokens=2,
     )
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8_e4m3", "fp8_ds_mla"])
+def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
+    make_pcp_config, cache_dtype, monkeypatch
+) -> None:
+    """The requested eight-card PCP topology must pass its strict contract."""
+
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype=cache_dtype,
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_hy4_tp1_pcp8_requires_linear_gate_pcp_sharding(
+    make_pcp_config, monkeypatch
+) -> None:
+    """PCP8 must fail before loading replicated Hy4 gate weights."""
+
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+
+    with pytest.raises(ValueError, match="LINEAR_GATE_PCP_SHARD=1"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"speculative": False}, "MTP3"),
+        ({"num_speculative_tokens": 2}, "MTP3"),
+        ({"cache_dtype": "bfloat16"}, "FP8 E4M3"),
+        ({"all2all_backend": "deepep_low_latency"}, "DeepEP HT"),
+        ({"moe_backend": "aiter"}, "DeepGEMM"),
+        ({"attention_backend": None}, "FLASHMLA_SPARSE"),
+        (
+            {"attention_backend": AttentionBackendEnum.FLASH_ATTN},
+            "FLASHMLA_SPARSE",
+        ),
+        ({"enable_eplb": True}, "EPLB"),
+    ],
+)
+def test_hy4_tp1_pcp8_rejects_outside_strict_contract(
+    make_pcp_config, change, message, monkeypatch
+) -> None:
+    """PCP8 must not broaden support beyond the hardware gate requested."""
+
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+
+    values = dict(
+        architecture="HYV4ForCausalLM",
+        tp=1,
+        pcp=8,
+        pp=1,
+        dp=1,
+        dcp=1,
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative=True,
+        speculative_method="mtp",
+        num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3",
+        all2all_backend="deepep_high_throughput",
+        moe_backend="deep_gemm",
+        attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+    values.update(change)
+
+    with pytest.raises(ValueError, match=message):
+        patch_vllm_config._validate_hcu_pcp_scope(make_pcp_config(**values))
 
 
 @pytest.mark.parametrize(

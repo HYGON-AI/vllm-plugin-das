@@ -11,7 +11,7 @@ import inspect
 import sys
 import textwrap
 from dataclasses import dataclass
-from types import FunctionType, ModuleType, SimpleNamespace
+from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 from typing import NamedTuple
 
 import numpy as np
@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from vllm_hcu.patch.worker.framework_opt._common import PatchCompatibilityError
+from vllm_hcu.v1.pcp_manager import HcuPCPManager as RealHcuPCPManager
 
 
 def test_unitary_pcp_world_size_is_fullgraph_compilable() -> None:
@@ -1240,3 +1241,253 @@ def test_pcp_default_model_state_rejects_signature_drift() -> None:
     target.DefaultModelState = DefaultModelState
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         adapter.apply_to_module(target)
+
+
+def _install_recording_profile_run(
+    runner_module: ModuleType, seen: list[int]
+) -> None:
+    """Record the token budget observed by the real HCU runner override."""
+
+    def profile_run(self):
+        seen.append(int(self.max_num_tokens))
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+
+
+def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
+    pcp_runner_module,
+) -> None:
+    """PCP profiling must include partition and replicated-request headroom."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(16), "hcu:0")
+    runner.max_num_tokens = 16384
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+
+    runner.profile_run()
+
+    assert seen == [1200]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PCP profiling must not shrink the real MTP propose/prefill shape."""
+
+    runner_module, _ = pcp_runner_module
+    speculator_module = importlib.import_module(
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator"
+    )
+    prefill_tokens: list[int] = []
+
+    class ConcreteSpeculator(speculator_module.AutoRegressiveSpeculator):
+        def load_draft_model(self, target_model):
+            raise NotImplementedError
+
+    speculator = object.__new__(ConcreteSpeculator)
+    speculator.num_speculative_steps = 1
+    speculator.max_model_len = 4096
+    speculator.max_num_reqs = 16
+    speculator.hidden_states = torch.zeros((4096, 1))
+    speculator.last_token_indices = torch.zeros(16, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
+    speculator.input_buffers = object()
+    speculator.prefill_cudagraph_manager = None
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.draft_tokens = torch.zeros((16, 1), dtype=torch.int64)
+    speculator._copy_request_inputs = lambda *args, **kwargs: None
+    speculator._prepare_eplb_forward = lambda *args, **kwargs: None
+    speculator.on_prefill_begin = lambda *args, **kwargs: None
+    speculator.on_prefill_end = lambda *args, **kwargs: None
+
+    def record_prefill(self, num_reqs, num_tokens, *args, **kwargs):
+        prefill_tokens.append(int(num_tokens))
+
+    speculator._prefill = MethodType(record_prefill, speculator)
+
+    monkeypatch.setattr(
+        speculator_module,
+        "prepare_prefill_inputs",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        speculator_module,
+        "get_uniform_decode_token_count",
+        lambda *args, **kwargs: None,
+    )
+
+    def dispatch_prefill(
+        manager,
+        num_reqs,
+        num_tokens,
+        uniform_token_count,
+        **kwargs,
+    ):
+        return (
+            SimpleNamespace(
+                cg_mode=speculator_module.CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(
+        speculator_module,
+        "dispatch_cg_and_sync_dp",
+        dispatch_prefill,
+    )
+
+    def profile_run(self):
+        num_tokens = int(self.max_num_tokens)
+        num_reqs = min(num_tokens, int(self.max_num_reqs))
+        input_batch = SimpleNamespace(
+            num_tokens=num_tokens,
+            num_tokens_after_padding=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=np.full(
+                num_reqs,
+                num_tokens // num_reqs,
+                dtype=np.int32,
+            ),
+            seq_lens_cpu_upper_bound=torch.full(
+                (num_reqs,),
+                num_tokens // num_reqs,
+                dtype=torch.int32,
+            ),
+            idx_mapping=torch.arange(num_reqs, dtype=torch.int64),
+            has_prefill=True,
+        )
+        self.speculator.propose(
+            input_batch=input_batch,
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros((num_tokens, 1)),
+            aux_hidden_states=None,
+            num_sampled=torch.ones(num_reqs, dtype=torch.int32),
+            num_rejected=torch.zeros(num_reqs, dtype=torch.int32),
+            last_sampled=torch.zeros(self.max_num_reqs, dtype=torch.int64),
+            next_prefill_tokens=torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int64,
+            ),
+            temperature=torch.zeros(self.max_num_reqs),
+            seeds=torch.zeros(self.max_num_reqs, dtype=torch.int64),
+            dummy_run=True,
+            skip_attn_for_dummy_run=True,
+            is_profile=True,
+        )
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.max_num_tokens = 4096
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+    runner.speculator = speculator
+
+    runner.profile_run()
+
+    assert prefill_tokens == [4096]
+    assert runner.max_num_tokens == 4096
+
+
+@pytest.mark.parametrize(
+    (
+        "budget",
+        "max_num_reqs",
+        "decode_query_len",
+        "lengths",
+        "prefills",
+        "expected",
+    ),
+    [
+        (
+            4096,
+            256,
+            3,
+            [3] * 255 + [3331],
+            [False] * 255 + [True],
+            1599,
+        ),
+        (4096, 512, 3, [3] * 512, [False] * 512, 1536),
+        (512, 256, 1, [1] * 256, [False] * 256, 256),
+    ],
+)
+def test_profile_run_covers_replicated_decode_and_sampler_requests(
+    pcp_runner_module,
+    budget: int,
+    max_num_reqs: int,
+    decode_query_len: int,
+    lengths: list[int],
+    prefills: list[bool],
+    expected: int,
+) -> None:
+    """Profile tokens must cover actual PCP dispatch and sampler concurrency."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.max_num_tokens = budget
+    runner.max_num_reqs = max_num_reqs
+    runner.decode_query_len = decode_query_len
+
+    manager = object.__new__(RealHcuPCPManager)
+    manager._use_mla = True
+    manager.pcp_size = 4
+    actual_dispatch_tokens = manager.get_num_tokens_for_dispatch(
+        np.asarray(lengths, dtype=np.int32),
+        np.asarray(prefills, dtype=np.bool_),
+    )
+
+    runner.profile_run()
+
+    assert actual_dispatch_tokens == expected
+    assert seen[0] >= actual_dispatch_tokens
+    assert min(seen[0], max_num_reqs) == min(budget, max_num_reqs)
+    assert runner.max_num_tokens == budget
+
+
+def test_profile_run_keeps_non_pcp_token_budget(
+    pcp_runner_module,
+) -> None:
+    """PCP=1 must retain the upstream profile token budget."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
+    runner.max_num_tokens = 16384
+
+    runner.profile_run()
+
+    assert seen == [16384]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_restores_token_budget_after_failure(
+    pcp_runner_module,
+) -> None:
+    """A failed PCP profile must not leak the temporary per-rank budget."""
+
+    runner_module, _ = pcp_runner_module
+
+    def failing_profile_run(self):
+        assert self.max_num_tokens == 624
+        raise RuntimeError("simulated profile failure")
+
+    runner_module.GPUModelRunner.profile_run = failing_profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(8), "hcu:0")
+    runner.max_num_tokens = 4096
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+
+    with pytest.raises(RuntimeError, match="simulated profile failure"):
+        runner.profile_run()
+
+    assert runner.max_num_tokens == 4096

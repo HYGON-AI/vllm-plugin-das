@@ -224,6 +224,25 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         )
         return self.moe_quant_config
 
+    @staticmethod
+    def _get_deepgemm_moe_quant_config(
+        layer: torch.nn.Module,
+    ) -> FusedMoEQuantConfig:
+        # HIPC consumes the packed high-nibble INT8 domain directly, so its
+        # kernel must receive the checkpoint scales without the INT4-unpack
+        # compensation required by AITER and the vLLM fallback.
+        return FusedMoEQuantConfig.make(
+            torch.int8,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            per_act_token_quant=True,
+            per_out_ch_quant=False,
+            block_shape=None,
+            weight_dtype="int4",
+        )
+
     @property
     def is_monolithic(self) -> bool:
         return False
@@ -351,8 +370,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
             )
 
+            deepgemm_quant_config = self._get_deepgemm_moe_quant_config(layer)
             self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
+                moe_quant_config=deepgemm_quant_config,
                 moe_config=self.moe,
                 routing_tables=layer._expert_routing_tables(),
             )

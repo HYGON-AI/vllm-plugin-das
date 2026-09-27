@@ -196,24 +196,26 @@ def test_slimquant_support_requires_configs_for_every_reachable_token_count(
 
     probes: list[int] = []
     lightop = ModuleType("lightop")
-    lightop_envs = ModuleType("lightop.envs")
-    lightop_envs.LMSLIM_GPU_NAME = "mock-hcu"
     lightop_moe = ModuleType("lightop.moe")
+    device_keys: list[str] = []
 
     def get_config(_experts, tokens, *_args):
         probes.append(tokens)
+        device_keys.append(_args[5])
         if tokens == 3:
             return {}, {}, False
         return {"BLOCK_SIZE_M": 16}, {"BLOCK_SIZE_M": 16}, True
 
     lightop_moe.get_moe_cuda_marlin_config = get_config
     monkeypatch.setitem(sys.modules, "lightop", lightop)
-    monkeypatch.setitem(sys.modules, "lightop.envs", lightop_envs)
     monkeypatch.setitem(sys.modules, "lightop.moe", lightop_moe)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=120),
+        lambda _device: SimpleNamespace(
+            gcnArchName="gfx936:sramecc+:xnack-",
+            multi_processor_count=64,
+        ),
     )
 
     supported = compat.is_lightop_marlin_moe_supported(
@@ -231,6 +233,7 @@ def test_slimquant_support_requires_configs_for_every_reachable_token_count(
 
     assert supported is False
     assert probes == [1, 2, 3]
+    assert device_keys == ["gfx936_64cu"] * 3
 
 
 def test_slimquant_int8_config_miss_selects_target_triton(
