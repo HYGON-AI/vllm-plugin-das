@@ -27,7 +27,7 @@ def _get_supported_kv_cache_dtypes(relative_path: str) -> list[str]:
     raise AssertionError(f"supported_kv_cache_dtypes not found in {relative_path}")
 
 
-def test_hcu_mla_backends_declare_fp8_e5m2_support() -> None:
+def test_only_hcu_triton_mla_declares_fp8_e5m2_support() -> None:
     flashmla_dtypes = _get_supported_kv_cache_dtypes(
         "vllm_hcu/v1/attention/backends/mla/flashmla.py"
     )
@@ -35,5 +35,5 @@ def test_hcu_mla_backends_declare_fp8_e5m2_support() -> None:
         "vllm_hcu/v1/attention/backends/mla/triton_mla.py"
     )
 
-    assert "fp8_e5m2" in flashmla_dtypes
+    assert "fp8_e5m2" not in flashmla_dtypes
     assert "fp8_e5m2" in triton_mla_dtypes

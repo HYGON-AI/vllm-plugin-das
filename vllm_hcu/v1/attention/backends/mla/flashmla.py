@@ -60,7 +60,6 @@ class HcuFlashMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     ]
 
     @staticmethod

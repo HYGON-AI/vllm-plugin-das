@@ -81,6 +81,108 @@ def _hcu_device() -> torch.device:
     return torch.device("cuda", 0)
 
 
+def test_concat_and_cache_mla_e5m2_matches_reference_and_graph() -> None:
+    device = _hcu_device()
+    import vllm_hcu.hcu_ops  # noqa: F401
+
+    generator = torch.Generator(device=device).manual_seed(20260927)
+    kv_c = torch.randn(
+        (3, 512), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    k_pe = torch.randn(
+        (3, 64), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    kv_cache = torch.zeros(
+        (2, 64, 576), device=device, dtype=torch.float8_e5m2
+    )
+    slot_mapping = torch.tensor([0, 65, -1], device=device, dtype=torch.int64)
+    scale = torch.ones(1, device=device, dtype=torch.float32)
+
+    for _ in range(2):
+        torch.ops.hcu_ops.concat_and_cache_mla(
+            kv_c,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            "fp8_e5m2",
+            scale,
+        )
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.hcu_ops.concat_and_cache_mla(
+            kv_c,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            "fp8_e5m2",
+            scale,
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected = torch.cat((kv_c, k_pe), dim=1).to(torch.float8_e5m2)
+    torch.testing.assert_close(kv_cache[0, 0].float(), expected[0].float())
+    torch.testing.assert_close(kv_cache[1, 1].float(), expected[1].float())
+    assert kv_cache[0, 1].float().abs().max().item() == 0
+
+
+def test_lightop_e5m2_mla_cache_gather_matches_reference_and_graph() -> None:
+    from lightop import gather_and_maybe_dequant_cache
+
+    device = _hcu_device()
+    head_dim = 576
+    src_cache = (
+        torch.arange(
+            4 * 64 * head_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+        .reshape(4, 64, head_dim)
+        .remainder(17)
+        .sub(8)
+        .to(torch.float8_e5m2)
+    )
+    dst = torch.empty((4, head_dim), device=device, dtype=torch.bfloat16)
+    block_table = torch.tensor(
+        [[0, 1], [2, 3]], device=device, dtype=torch.int32
+    )
+    cu_seq_lens = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
+    token_to_seq = torch.tensor([0, 0, 1, 1], device=device, dtype=torch.int32)
+    seq_starts = torch.tensor([3, 65], device=device, dtype=torch.int32)
+    scale = torch.tensor([0.5], device=device, dtype=torch.float32)
+    args = (
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+
+    for _ in range(2):
+        gather_and_maybe_dequant_cache(*args)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gather_and_maybe_dequant_cache(*args)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected = torch.stack(
+        (
+            src_cache[0, 3],
+            src_cache[0, 4],
+            src_cache[3, 1],
+            src_cache[3, 2],
+        )
+    ).float().mul(0.5).to(torch.bfloat16)
+    torch.testing.assert_close(dst.float(), expected.float())
+
+
 @pytest.mark.parametrize("shape", [(1, 256), (17, 256), (4, 1024)])
 def test_lightop_silu_and_mul_matches_float32_reference(
     shape: tuple[int, int],
