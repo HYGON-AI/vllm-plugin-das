@@ -275,19 +275,27 @@ def test_master_custom_ops_gate_routes_feature_selectors(
     assert selector() is (master_enabled and feature_enabled)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("master_enabled", "feature_enabled"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
 def test_custom_quantization_environment_reaches_int8_path_selector(
     monkeypatch: pytest.MonkeyPatch,
-    enabled: bool,
+    master_enabled: bool,
+    feature_enabled: bool,
 ) -> None:
     monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "1" if master_enabled else "0",
+    )
+    monkeypatch.setenv(
         "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM",
-        "1" if enabled else "0",
+        "1" if feature_enabled else "0",
     )
 
     assert (
         patch_compressed_tensors_w8a8_int8._custom_quantization_enabled()
-        is enabled
+        is (master_enabled and feature_enabled)
     )
 
 

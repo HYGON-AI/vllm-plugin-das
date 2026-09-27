@@ -590,6 +590,29 @@ def test_channelwise_route_calls_target_triton_and_reshapes_output(
     assert fake_product.original_calls == []
 
 
+@pytest.mark.parametrize(
+    ("master_enabled", "feature_enabled"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_channelwise_backend_respects_custom_ops_master_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    master_enabled: bool,
+    feature_enabled: bool,
+):
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "1" if master_enabled else "0",
+    )
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM",
+        "1" if feature_enabled else "0",
+    )
+
+    assert scaled_mm._custom_quantization_gemm_enabled() is (
+        master_enabled and feature_enabled
+    )
+
+
 @pytest.mark.parametrize("value", [None, "1", "true"])
 def test_channelwise_route_uses_lightop_by_default_or_when_enabled(
     fake_product: SimpleNamespace,

@@ -4,8 +4,12 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
 
-import torch
+import functools
+from collections.abc import Callable
+from inspect import signature
 from typing import Tuple
+
+import torch
 
 from vllm.logger import init_logger
 from vllm_hcu.platforms.hcu import on_gfx938
@@ -50,6 +54,14 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
     """
+    from vllm_hcu.platforms import envs as henvs
+
+    if not henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        try:
+            _resolve_sparse_mla_fwd()
+        except RuntimeError as exc:
+            return False, str(exc)
+        return True, None
     is_available, maybe_reason = _is_flashmla_available()
     if not is_available:
         return False, maybe_reason
@@ -64,7 +76,7 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 if _is_flashmla_available()[0]:
     from flash_mla.flash_mla_interface import (  # noqa: F401
         FlashMLASchedMeta,
-        flash_mla_sparse_fwd,
+        flash_mla_sparse_fwd as _native_flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
         get_mla_metadata,
     )
@@ -73,9 +85,78 @@ else:
     class FlashMLASchedMeta:  # type: ignore[no-redef]
         pass
 
-    flash_mla_sparse_fwd = _raise_flashmla_unavailable  # type: ignore[assignment]
+    _native_flash_mla_sparse_fwd = _raise_flashmla_unavailable
     flash_mla_with_kvcache = _raise_flashmla_unavailable  # type: ignore[assignment]
     get_mla_metadata = _raise_flashmla_unavailable  # type: ignore[assignment]
+
+
+_SPARSE_MLA_PARAMETERS = (
+    "q",
+    "kv",
+    "indices",
+    "softmax_scale",
+    "d_v",
+    "attn_sink",
+    "topk_length",
+    "config",
+)
+
+
+@functools.cache
+def _resolve_sparse_mla_fwd() -> Callable:
+    """Resolve the sparse MLA kernel once under the custom-op master gate."""
+    from vllm_hcu.platforms import envs as henvs
+
+    if henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        return _native_flash_mla_sparse_fwd
+
+    try:
+        from boltops.mla import flash_mla_sparse_fwd as boltops_sparse_mla_fwd
+    except (AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            "VLLM_HCU_USE_CUSTOM_OPS=0 requires "
+            "boltops.mla.flash_mla_sparse_fwd"
+        ) from exc
+
+    parameters = signature(boltops_sparse_mla_fwd).parameters
+    if tuple(parameters) != _SPARSE_MLA_PARAMETERS or (
+        parameters["d_v"].default != 512
+        or parameters["attn_sink"].default is not None
+        or parameters["topk_length"].default is not None
+        or parameters["config"].default is not None
+    ):
+        raise RuntimeError(
+            "boltops.mla.flash_mla_sparse_fwd signature drifted from the "
+            "audited BoltOPs 0.1.0 contract"
+        )
+    logger.info_once(
+        "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOPs Triton sparse MLA"
+    )
+    return boltops_sparse_mla_fwd
+
+
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: float,
+    d_v: int = 512,
+    attn_sink: torch.Tensor | None = None,
+    topk_length: torch.Tensor | None = None,
+    config: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch sparse MLA to native FlashMLA or the BoltOPs fallback."""
+    kernel = _resolve_sparse_mla_fwd()
+    return kernel(
+        q,
+        kv,
+        indices,
+        softmax_scale,
+        d_v,
+        attn_sink,
+        topk_length,
+        config,
+    )
 
 
 def get_mla_metadata_dense_fp8(

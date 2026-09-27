@@ -34,11 +34,12 @@ def _custom_quantization_gemm_enabled() -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
 
-        return bool(henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM)
+        return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
+            henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM
+        )
     except (AttributeError, ImportError) as exc:
         raise RuntimeError(
-            "required HCU flag VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM "
-            "is unavailable"
+            "required HCU custom-op or quantization-GEMM flag is unavailable"
         ) from exc
 
 

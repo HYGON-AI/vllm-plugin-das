@@ -44,6 +44,19 @@ def _adapter(name: str):
     return importlib.import_module(f"vllm_hcu.patch.worker.op_opt.{name}")
 
 
+def _flash_mla_sparse_contract(
+    q,
+    kv,
+    indices,
+    softmax_scale,
+    d_v=512,
+    attn_sink=None,
+    topk_length=None,
+    config=None,
+):
+    del q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, config
+
+
 def _module(name: str, **values) -> ModuleType:
     module = ModuleType(name)
     module.__dict__.update(values)
@@ -70,6 +83,117 @@ def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
     return importlib.import_module(
         "vllm_hcu.model_executor.layers.sparse_attn_indexer"
     )
+
+
+@pytest.mark.parametrize(
+    ("master_enabled", "expected_backend"),
+    [(False, "boltops"), (True, "native")],
+)
+def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
+    monkeypatch,
+    master_enabled,
+    expected_backend,
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import flashmla
+
+    def native(*args, **kwargs):
+        del args, kwargs
+        return "native"
+
+    native.__signature__ = inspect.signature(_flash_mla_sparse_contract)
+
+    def boltops(*args, **kwargs):
+        del args, kwargs
+        return "boltops"
+
+    boltops.__signature__ = inspect.signature(_flash_mla_sparse_contract)
+    boltops_mla = _module(
+        "boltops.mla",
+        flash_mla_sparse_fwd=boltops,
+    )
+    monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setattr(
+        flashmla,
+        "_native_flash_mla_sparse_fwd",
+        native,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        master_enabled,
+        raising=False,
+    )
+    flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    try:
+        resolved = flashmla._resolve_sparse_mla_fwd()
+    finally:
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    assert resolved() == expected_backend
+
+
+def test_flashmla_sparse_boltops_signature_drift_fails_closed(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import flashmla
+
+    def incompatible_boltops(q, kv, indices, softmax_scale):
+        del q, kv, indices, softmax_scale
+
+    boltops_mla = _module(
+        "boltops.mla",
+        flash_mla_sparse_fwd=incompatible_boltops,
+    )
+    monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        False,
+        raising=False,
+    )
+    flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    try:
+        with pytest.raises(RuntimeError, match="signature drifted"):
+            flashmla._resolve_sparse_mla_fwd()
+    finally:
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_ds_mla", "fp8_e4m3"])
+def test_flashmla_sparse_boltops_rejects_fp8_kv_cache(
+    monkeypatch,
+    kv_cache_dtype,
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+        HcuFlashMLASparseBackend,
+    )
+
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        False,
+        raising=False,
+    )
+
+    reason = HcuFlashMLASparseBackend.supports_combination(
+        head_size=512,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=64,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=True,
+        use_mm_prefix=False,
+        device_capability=SimpleNamespace(major=9),
+    )
+
+    assert reason is not None
+    assert "BoltOPs" in reason
+    assert "BF16/FP16 KV cache" in reason
 
 
 def _gdn_causal_conv1d_fn(

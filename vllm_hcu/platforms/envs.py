@@ -205,7 +205,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FP8_MIXED_BATCH":
         lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
                  ("true", "1")),  
-    # If set, control hcu custom gemm including w8a8 int8/fp8 etc
+    # Control HCU custom GEMM for W8A8 INT8/FP8. This feature switch is also
+    # gated by VLLM_HCU_USE_CUSTOM_OPS; disabling the master switch routes
+    # quantized linear GEMM through the target vLLM Triton implementations.
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True").lower() in
              ("true", "1")),
