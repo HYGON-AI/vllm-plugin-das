@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gather and dequantize HY V4's FP8 KV cache for the sparse kernel.
+"""Gather and dequantize ``fp8_ds_mla`` KV cache for the sparse kernel.
 
 The fp8 FlashMLA sparse kernel hardcodes DeepSeek's ``fp8_ds_mla`` geometry, so
 opting out of it (via ``VLLM_HCU_HYV4_FP8_KV_DEQUANT``) means the BF16 sparse
@@ -44,7 +44,7 @@ _LIGHTOP_GATHER_RESOLVED = False
 
 @dataclass
 class LightOpKVReuseState:
-    """Compact-index mapping reused within HY V4 IndexShare groups."""
+    """Compact-index mapping reused within sparse IndexShare groups."""
 
     compact_indices: torch.Tensor
     dedup_key: tuple[int, int, int] | None = None
@@ -57,7 +57,7 @@ class LightOpKVReuseState:
     ) -> "LightOpKVReuseState":
         if topk_indices_buffer.dtype != torch.int32 or topk_indices_buffer.ndim != 2:
             raise ValueError(
-                "HY V4 TopK indices must be a two-dimensional int32 tensor; "
+                "Sparse TopK indices must be a two-dimensional int32 tensor; "
                 f"got {tuple(topk_indices_buffer.shape)}, "
                 f"{topk_indices_buffer.dtype}."
             )
@@ -145,8 +145,8 @@ def gather_dequantize_fp8_ds_mla_cache(
         kv_cache: ``(num_blocks, block_size, 656)`` cache, ``fp8_ds_mla`` layout.
         topk_indices: ``(num_tokens, topk)`` global cache slots
             (``block * block_size + pos``), with -1 marking unfilled entries.
-        kv_lora_rank: NoPE dim (512 for HY V4).
-        qk_rope_head_dim: RoPE dim (64 for HY V4).
+        kv_lora_rank: NoPE dim (512 for ``fp8_ds_mla``).
+        qk_rope_head_dim: RoPE dim (64 for ``fp8_ds_mla``).
         tokens_per_request: Query rows contributed by each request, including
             the current decode token. MTP3 therefore passes 4; ordinary decode
             passes 1. LightOp uses this for request-local KV deduplication.

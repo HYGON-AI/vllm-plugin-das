@@ -959,11 +959,19 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
         def get_impl_cls():
             return UpstreamFlashMLASparseImpl
 
+    class UpstreamFlashMLASparseMetadata:
+        pass
+
+    class UpstreamFlashMLASparseMetadataBuilder:
+        pass
+
     _install_stub(
         monkeypatch,
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
         FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+        FlashMLASparseMetadata=UpstreamFlashMLASparseMetadata,
+        FlashMLASparseMetadataBuilder=UpstreamFlashMLASparseMetadataBuilder,
     )
     module_name = "_vllm_hcu_cpu_test_flashmla_sparse_backend"
     source = (
@@ -1001,6 +1009,12 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
         @staticmethod
         def get_impl_cls():
             return UpstreamFlashMLASparseImpl
+
+    class UpstreamFlashMLASparseMetadata:
+        pass
+
+    class UpstreamFlashMLASparseMetadataBuilder:
+        pass
 
     def concat_mla_q(q_nope, q_pe, output):
         output.copy_(torch.cat((q_nope, q_pe), dim=-1))
@@ -1073,6 +1087,8 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
         FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+        FlashMLASparseMetadata=UpstreamFlashMLASparseMetadata,
+        FlashMLASparseMetadataBuilder=UpstreamFlashMLASparseMetadataBuilder,
     )
     _install_stub(monkeypatch, "vllm._custom_ops", concat_mla_q=concat_mla_q)
     _install_stub(
