@@ -1511,6 +1511,13 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
 def test_varlen_flash_attention_uses_64_token_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Source-only test worktrees do not contain the compiled extension. This
+    # contract only exercises backend block-size metadata, not HCU kernels.
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.hcu_ops",
+        ModuleType("vllm_hcu.hcu_ops"),
+    )
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm_hcu.v1.attention.backends.flash_attn import (
         HcuFlashAttentionBackend,
@@ -1732,6 +1739,48 @@ def test_explicit_attention_backend_restores_hcu_registration(
             register_backend(backend, previous_path)
 
     assert selected_path == expected_path
+
+
+@pytest.mark.parametrize("backend_name", ["FLASH_ATTN", "TRITON_ATTN"])
+def test_custom_ops_master_off_preserves_explicit_dense_attention_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=256,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+    )
+    selected_backend = AttentionBackendEnum[backend_name]
+
+    selected_path = HCUPlatform.get_attn_backend_cls(
+        selected_backend,
+        selector_config,
+    )
+
+    assert selected_path == selected_backend.get_path()
 
 
 @pytest.mark.parametrize(

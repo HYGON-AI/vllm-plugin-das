@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import os
 import subprocess
@@ -11,6 +12,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 
 # Unit tests activate adapters explicitly and therefore disable plugin discovery.
 os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
@@ -37,6 +40,36 @@ def _module(name: str, **attributes: object) -> ModuleType:
 def test_clean_vllm_real_factory_and_runtime_contract_smoke():
     # Run before this process imports the heavy Mooncake/model stack so the
     # independent clean-vLLM smoke does not temporarily double memory use.
+    _run_clean_vllm_real_factory_and_runtime_contract_smoke()
+
+
+def test_clean_vllm_smoke_prefers_explicit_source_root(
+    tmp_path, monkeypatch
+):
+    target_root = tmp_path / "target-vllm"
+    target_package = target_root / "vllm"
+    target_package.mkdir(parents=True)
+    (target_package / "__init__.py").touch()
+    monkeypatch.setenv("VLLM_SOURCE_ROOT", str(target_root))
+
+    def fail_if_installed_vllm_is_discovered(_name):
+        raise AssertionError(
+            "installed vLLM discovery must not run when VLLM_SOURCE_ROOT is set"
+        )
+
+    monkeypatch.setattr(
+        importlib.util, "find_spec", fail_if_installed_vllm_is_discovered
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="platform-framework-real-smoke-ok\n",
+            stderr="",
+        ),
+    )
+
     _run_clean_vllm_real_factory_and_runtime_contract_smoke()
 
 
@@ -732,10 +765,18 @@ def test_outputs_keep_model_runner_ipc_stable_and_use_draft_channel():
 
 def _run_clean_vllm_real_factory_and_runtime_contract_smoke():
     repo = Path(__file__).resolve().parents[2]
-    clean_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
-    )
+    clean_vllm = resolve_target_vllm_root()
     script = """
+from pathlib import Path
+from packaging.version import Version
+import os
+import vllm
+from vllm_hcu.version import __vllm_target_version__
+target_root = Path(os.environ['VLLM_SOURCE_ROOT']).resolve()
+assert Path(vllm.__file__).resolve().is_relative_to(target_root)
+assert Version(vllm.__version__).release[:3] == (0, 28, 1)
+assert Version(__vllm_target_version__).release[:3] == (0, 28, 1)
+assert 'VLLM_V0251_SOURCE_ROOT' not in os.environ
 from vllm_hcu.patch.platform.framework_opt import (
     patch_kv_connector_factory, patch_outputs,
 )
@@ -753,6 +794,8 @@ print('platform-framework-real-smoke-ok')
 """
     env = os.environ.copy()
     env["VLLM_PLUGINS"] = "__disabled__"
+    env.pop("VLLM_V0251_SOURCE_ROOT", None)
+    env["VLLM_SOURCE_ROOT"] = str(clean_vllm)
     env["PYTHONPATH"] = os.pathsep.join((str(repo), str(clean_vllm)))
     result = subprocess.run(
         [sys.executable, "-c", script],

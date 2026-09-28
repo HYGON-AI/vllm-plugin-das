@@ -855,10 +855,11 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     monkeypatch: pytest.MonkeyPatch,
     kv_cache_shape: tuple[int, ...],
 ) -> None:
-    """Paged LightOp keeps cleanup disabled while skipping metadata precompute."""
+    """Master-off leaves paged MQA unchanged and skips metadata precompute."""
 
     calls: list[tuple[object, ...]] = []
     output = object()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
 
     def paged_mqa_logits(
         q,

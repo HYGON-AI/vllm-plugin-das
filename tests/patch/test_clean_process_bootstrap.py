@@ -11,56 +11,67 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import sysconfig
 from typing import Any
 
 import pytest
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 _RESULT_PREFIX = "VLLM_HCU_BOOTSTRAP_RESULT="
 
-
-def _resolve_target_vllm_root() -> Path:
-    installed_roots = tuple(
-        Path(path)
-        for key in ("platlib", "purelib")
-        if (path := sysconfig.get_path(key))
-    )
-    candidates = (
-        Path(os.environ["VLLM_V0251_SOURCE_ROOT"])
-        if "VLLM_V0251_SOURCE_ROOT" in os.environ
-        else None,
-        *installed_roots,
-        REPOSITORY.parent / "vllm_0251",
-    )
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        resolved = candidate.resolve()
-        if (resolved / "vllm" / "__init__.py").is_file():
-            return resolved
-    rendered = ", ".join(str(path) for path in candidates if path is not None)
-    raise RuntimeError(
-        "no vLLM 0.25.1 source tree was found; checked: " + rendered
-    )
+TARGET_VLLM_ROOT = resolve_target_vllm_root()
 
 
-TARGET_VLLM_ROOT = _resolve_target_vllm_root()
+_PARENT_COLLECTION_WITH_EXPLICIT_SOURCE = r"""
+import importlib
+import importlib.abc
+import importlib.util
+import sys
+
+original_find_spec = importlib.util.find_spec
+
+def guarded_find_spec(name, *args, **kwargs):
+    if name == "vllm":
+        raise AssertionError("parent process discovered installed vLLM")
+    return original_find_spec(name, *args, **kwargs)
+
+class BlockParentVllm(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "vllm" or fullname.startswith("vllm."):
+            raise AssertionError(f"parent process imported {fullname}")
+        return None
+
+importlib.util.find_spec = guarded_find_spec
+sys.meta_path.insert(0, BlockParentVllm())
+for module_name in (
+    "tests.patch.test_runtime_callbacks",
+    "tests.patch.test_worker_dispatcher",
+    "tests.patch.test_clean_process_bootstrap",
+    "tests.runtime_patch.test_platform_framework_opt",
+):
+    importlib.import_module(module_name)
+    print("COLLECT_OK", module_name)
+"""
 
 
 _TARGET_SOURCE_ASSERTION = r"""
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
+from packaging.version import Version as _VllmHcuVersion
 import vllm as _vllm_hcu_target
+from vllm_hcu.version import __vllm_target_version__ as _vllm_hcu_target_version
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_SOURCE_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: "
     f"{_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
+assert _VllmHcuVersion(_vllm_hcu_target.__version__).release[:3] == (0, 28, 1)
+assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (0, 28, 1)
+assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
 """
 
 _PORTABLE_BOOTSTRAP = rf"""
@@ -290,7 +301,8 @@ def _clean_environment(*, plugins: str) -> dict[str, str]:
         }:
             environment.pop(name)
     environment["VLLM_PLUGINS"] = plugins
-    environment["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    environment.pop("VLLM_V0251_SOURCE_ROOT", None)
+    environment["VLLM_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     python_path = (
         str(TARGET_VLLM_ROOT),
         str(REPOSITORY),
@@ -310,7 +322,7 @@ def _run_clean_python(
 ) -> subprocess.CompletedProcess[str]:
     if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            "VLLM_V0251_SOURCE_ROOT does not contain the target vllm package: "
+            "VLLM_SOURCE_ROOT does not contain the target vllm package: "
             f"{TARGET_VLLM_ROOT}"
         )
     return subprocess.run(
@@ -369,6 +381,22 @@ def _require_local_hcu_extension() -> None:
         "`MAX_JOBS=8 python -m pip install -e . --no-build-isolation` "
         "and rerun this test"
     )
+
+
+def test_explicit_source_root_does_not_require_parent_vllm_import() -> None:
+    environment = _clean_environment(plugins="__disabled__")
+    environment["PYTHONPATH"] = str(REPOSITORY)
+    result = subprocess.run(
+        [sys.executable, "-c", _PARENT_COLLECTION_WITH_EXPLICIT_SOURCE],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("COLLECT_OK") == 4
 
 
 def test_clean_process_arms_complete_patch_inventory_and_is_idempotent() -> None:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import builtins
 import enum
+import importlib
 import inspect
 import logging
 import os
@@ -2380,6 +2381,94 @@ def test_aiter_replacement_rmsnorm_wrappers_delegate_without_retry_logic():
         ]
         assert len(calls) == 1, function_name
         assert not any(isinstance(node, ast.Try) for node in ast.walk(function))
+
+
+def _aiter_replacement_module():
+    return importlib.import_module(
+        "vllm_hcu.model_executor.layers.fused_moe.aiter_ops"
+    )
+
+
+@pytest.mark.parametrize("master_enabled", (False, True))
+@pytest.mark.parametrize("linear_enabled", (False, True))
+def test_aiter_linear_capability_respects_custom_ops_master(
+    monkeypatch: pytest.MonkeyPatch,
+    master_enabled: bool,
+    linear_enabled: bool,
+) -> None:
+    module = _aiter_replacement_module()
+    cls = module.rocm_aiter_ops
+    monkeypatch.setattr(module, "is_aiter_found_and_supported", lambda: True)
+    monkeypatch.setattr(cls, "_AITER_ENABLED", True)
+    monkeypatch.setattr(cls, "_LINEAR_ENABLED", linear_enabled)
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS", "1" if master_enabled else "0"
+    )
+
+    expected = master_enabled and linear_enabled
+    assert cls.is_linear_enabled() is expected
+    assert cls.is_linear_fp8_enabled() is expected
+
+
+@pytest.mark.parametrize("master_enabled", (False, True))
+@pytest.mark.parametrize("custom_ar_enabled", (False, True))
+def test_aiter_custom_all_reduce_capability_respects_custom_ops_master(
+    monkeypatch: pytest.MonkeyPatch,
+    master_enabled: bool,
+    custom_ar_enabled: bool,
+) -> None:
+    module = _aiter_replacement_module()
+    cls = module.rocm_aiter_ops
+    monkeypatch.setattr(module, "is_aiter_found_and_supported", lambda: True)
+    monkeypatch.setattr(cls, "_AITER_ENABLED", True)
+    monkeypatch.setattr(cls, "_CUSTOM_ALL_REDUCE_ENABLED", custom_ar_enabled)
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS", "1" if master_enabled else "0"
+    )
+
+    assert cls.is_custom_all_reduce_enabled() is (
+        master_enabled and custom_ar_enabled
+    )
+
+
+def test_aiter_master_off_hides_existing_all_reduce_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _aiter_replacement_module()
+    cls = module.rocm_aiter_ops
+    from vllm.distributed import parallel_state
+    from vllm.distributed.device_communicators import aiter_custom_all_reduce
+
+    instance = object.__new__(aiter_custom_all_reduce.AiterCustomAllreduce)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(aiter_ar_comm=instance)
+        ),
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+
+    assert cls.get_aiter_allreduce() is None
+
+
+def test_aiter_master_off_preserves_attention_and_moe_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend-owned attention and MoE remain outside the generic master."""
+    module = _aiter_replacement_module()
+    cls = module.rocm_aiter_ops
+    monkeypatch.setattr(module, "is_aiter_found_and_supported", lambda: True)
+    monkeypatch.setattr(cls, "_AITER_ENABLED", True)
+    monkeypatch.setattr(cls, "_MHA_ENABLED", True)
+    monkeypatch.setattr(cls, "_MLA_ENABLED", True)
+    monkeypatch.setattr(cls, "_FMOE_ENABLED", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+
+    assert cls.is_enabled() is True
+    assert cls.is_mha_enabled() is True
+    assert cls.is_mla_enabled() is True
+    assert cls.is_fused_moe_enabled() is True
 
 
 def test_aiter_replacement_maps_each_optional_capability_exactly():

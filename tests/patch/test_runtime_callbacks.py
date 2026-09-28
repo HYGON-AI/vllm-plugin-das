@@ -12,7 +12,9 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from packaging.version import Version
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 import vllm_hcu.patch.runtime_callbacks as runtime_callbacks
 from vllm_hcu.patch._stage3_common import Stage3CompatibilityError
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
@@ -27,6 +29,7 @@ from vllm_hcu.patch.runtime_callbacks import (
     runtime_callback_names,
 )
 from vllm_hcu.patch.runtime_state import PatchRegistry, PatchStatus
+from vllm_hcu.version import __vllm_target_version__
 
 
 EXPECTED_ORDER = (
@@ -315,18 +318,15 @@ def test_weight_installer_is_direct_idempotent_and_keeps_bindings_coherent(
 
 
 @pytest.mark.hcu
-def test_clean_v0251_model_loader_import_order_has_no_weight_debug_cycle():
+def test_clean_current_model_loader_import_order_has_no_weight_debug_cycle():
     repo = Path(__file__).resolve().parents[2]
-    target_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
-    ).resolve()
-    if not (target_vllm / "vllm" / "__init__.py").is_file():
-        raise RuntimeError(
-            f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {target_vllm}"
-        )
+    target_vllm = resolve_target_vllm_root()
+    target_release = Version(__vllm_target_version__).release[:3]
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(target_vllm)
+    env.pop("VLLM_V0251_SOURCE_ROOT", None)
+    env["VLLM_SOURCE_ROOT"] = str(target_vllm)
+    env["VLLM_TARGET_RELEASE"] = ".".join(map(str, target_release))
     env["PYTHONPATH"] = os.pathsep.join((str(target_vllm), str(repo)))
     code = r'''
 import importlib.abc
@@ -336,12 +336,20 @@ import sys
 from pathlib import Path
 
 import vllm
+from packaging.version import Version
+from vllm_hcu.version import __vllm_target_version__
 
-target_root = Path(os.environ["VLLM_V0251_SOURCE_ROOT"]).resolve()
+target_root = Path(os.environ["VLLM_SOURCE_ROOT"]).resolve()
 target_file = Path(vllm.__file__).resolve()
 assert target_file.is_relative_to(target_root), (
     f"vllm resolved outside target root: {target_file} not under {target_root}"
 )
+expected_release = tuple(
+    int(part) for part in os.environ["VLLM_TARGET_RELEASE"].split(".")
+)
+assert Version(vllm.__version__).release[:3] == expected_release
+assert Version(__vllm_target_version__).release[:3] == expected_release
+assert "VLLM_V0251_SOURCE_ROOT" not in os.environ
 
 from vllm_hcu.patch import apply_platform_patches, patch_report
 

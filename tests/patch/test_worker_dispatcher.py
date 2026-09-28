@@ -13,39 +13,56 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from packaging.version import Version
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 import vllm_hcu.patch.worker as worker_dispatcher
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import LatchedPatchError, PatchRegistry, PatchStatus
+from vllm_hcu.version import __vllm_target_version__
 
 
 REPO = Path(__file__).resolve().parents[2]
-TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
-).resolve()
-if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
+TARGET_RELEASE = Version(__vllm_target_version__).release[:3]
+TARGET_VLLM_ROOT = resolve_target_vllm_root()
+if TARGET_RELEASE != (0, 28, 1):
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        "worker dispatcher tests require the v0.28.1 target release, got "
+        f"{__vllm_target_version__}"
     )
 
 _TARGET_SOURCE_ASSERTION = r'''
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
+from packaging.version import Version as _VllmHcuVersion
 import vllm as _vllm_hcu_target
+from vllm_hcu.version import __vllm_target_version__ as _vllm_hcu_target_version
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_SOURCE_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
+_vllm_hcu_expected_release = tuple(
+    int(part) for part in _vllm_hcu_os.environ["VLLM_TARGET_RELEASE"].split(".")
+)
+assert _VllmHcuVersion(_vllm_hcu_target.__version__).release[:3] == (
+    _vllm_hcu_expected_release
+), (_vllm_hcu_target.__version__, _vllm_hcu_expected_release)
+assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (
+    _vllm_hcu_expected_release
+), (_vllm_hcu_target_version, _vllm_hcu_expected_release)
+assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
 '''
 
 
 def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env.pop("VLLM_V0251_SOURCE_ROOT", None)
+    env["VLLM_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_TARGET_RELEASE"] = ".".join(map(str, TARGET_RELEASE))
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
@@ -55,6 +72,20 @@ def _run_fresh(code: str, *, timeout: int = 120) -> subprocess.CompletedProcess[
         env=env,
         timeout=timeout,
     )
+
+
+def test_fresh_process_uses_current_target_release_source():
+    result = _run_fresh(
+        "import json,os,vllm; "
+        "print(json.dumps({'file':vllm.__file__,'version':vllm.__version__,"
+        "'source_root':os.environ['VLLM_SOURCE_ROOT']}))"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert Path(payload["file"]).resolve().is_relative_to(TARGET_VLLM_ROOT)
+    assert Version(payload["version"]).release[:3] == TARGET_RELEASE
+    assert Path(payload["source_root"]).resolve() == TARGET_VLLM_ROOT
 
 
 def test_worker_inventory_is_complete_explicit_and_dependency_ordered():

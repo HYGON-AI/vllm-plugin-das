@@ -30,13 +30,19 @@ from vllm_hcu.version import __vllm_target_version__
 TARGET = "vllm.model_executor.parameter"
 REMOVED_HCU_TARGET = "vllm_hcu.model_executor.parameter"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TARGET_VLLM_ROOT = Path(
+V0251_VLLM_ROOT = Path(
     os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO_ROOT.parent / "vllm_0251")
 ).resolve()
-if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
-    raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
-    )
+
+
+def _require_v0251_vllm_root() -> Path:
+    """Resolve the source used only by explicitly historical v0.25.1 tests."""
+    if not (V0251_VLLM_ROOT / "vllm" / "__init__.py").is_file():
+        raise RuntimeError(
+            "historical v0.25.1 bootstrap requires VLLM_V0251_SOURCE_ROOT "
+            f"to contain vllm: {V0251_VLLM_ROOT}"
+        )
+    return V0251_VLLM_ROOT
 
 
 def _fake_parameter_module() -> ModuleType:
@@ -412,10 +418,11 @@ def test_invalid_loaded_target_is_failed_once_and_never_retried(
 
 
 def _clean_v0251_environment(cache_root: Path) -> dict[str, str]:
+    v0251_root = _require_v0251_vllm_root()
     env = dict(os.environ)
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_V0251_SOURCE_ROOT"] = str(v0251_root)
     env["PYTHONPATH"] = os.pathsep.join(
-        (str(TARGET_VLLM_ROOT), str(REPO_ROOT))
+        (str(v0251_root), str(REPO_ROOT))
     )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["VLLM_CACHE_ROOT"] = str(cache_root)

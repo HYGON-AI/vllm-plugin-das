@@ -147,6 +147,214 @@ def _runtime():
     return importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
 
 
+@pytest.mark.parametrize(
+    ("aiter_enabled", "force_aiter_triton"),
+    ((False, False), (True, False), (False, True)),
+)
+@pytest.mark.parametrize("is_gfx938", (False, True))
+def test_sparse_mla_master_off_prefill_uses_boltops(
+    monkeypatch: pytest.MonkeyPatch,
+    aiter_enabled: bool,
+    force_aiter_triton: bool,
+    is_gfx938: bool,
+) -> None:
+    """The master-off prefill route never reaches AITER or LightOp."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: aiter_enabled)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
+    monkeypatch.setattr(
+        runtime,
+        "mqa_logits_module",
+        lambda: pytest.fail("master-off prefill queried AITER MQA"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("master-off prefill queried LightOp MQA"),
+    )
+
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def boltops_mqa(
+        q,
+        k,
+        scales,
+        normalized_weights,
+        starts,
+        ends,
+        *,
+        D_out=None,
+        backend=None,
+    ):
+        calls.append(
+            (
+                q,
+                k,
+                scales,
+                normalized_weights,
+                starts,
+                ends,
+                D_out,
+                backend,
+            )
+        )
+        return output
+
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_mqa_logits",
+        lambda: boltops_mqa,
+        raising=False,
+    )
+    q = torch.ones((4, 1, 2), dtype=torch.bfloat16)
+    k = torch.ones((3, 2), dtype=torch.bfloat16)
+    scales = torch.ones(3)
+    weights = torch.arange(8, dtype=torch.float16).reshape(2, 4).transpose(0, 1)
+    starts = torch.zeros(4, dtype=torch.int32)
+    ends = torch.full((4,), 3, dtype=torch.int32)
+
+    result = runtime.rocm_fp8_mqa_logits(
+        q,
+        (k, scales),
+        weights,
+        starts,
+        ends,
+        force_aiter_triton=force_aiter_triton,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0] is q
+    assert calls[0][1] is k
+    assert calls[0][2] is None
+    assert calls[0][3].dtype is torch.float32
+    assert calls[0][3].is_contiguous()
+    assert torch.equal(calls[0][3], weights.float().contiguous())
+    assert calls[0][4] is starts
+    assert calls[0][5] is ends
+    assert calls[0][6:] == (None, None)
+
+
+@pytest.mark.parametrize("is_gfx938", (False, True))
+def test_sparse_mla_master_off_prefill_uses_torch_when_boltops_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    is_gfx938: bool,
+) -> None:
+    """A missing optional BoltOPs package retains the portable reference."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_mqa_logits",
+        lambda: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("master-off fallback queried LightOp MQA"),
+    )
+    calls: list[tuple[object, ...]] = []
+    output = object()
+
+    def torch_reference(*args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(runtime, "fp8_mqa_logits_torch", torch_reference)
+    q = torch.ones((1, 1, 2), dtype=torch.bfloat16)
+    kv = (torch.ones((1, 2), dtype=torch.bfloat16), torch.ones(1))
+    weights = torch.ones((1, 1))
+    starts = torch.zeros(1, dtype=torch.int32)
+    ends = torch.ones(1, dtype=torch.int32)
+
+    result = runtime.rocm_fp8_mqa_logits(q, kv, weights, starts, ends)
+
+    assert result is output
+    expected_kv = (kv[0], None)
+    assert calls == [(q, expected_kv, weights, starts, ends)]
+
+
+@pytest.mark.parametrize("boltops_available", (False, True))
+def test_sparse_mla_master_off_preserves_fp8_scale_off_gfx938(
+    monkeypatch: pytest.MonkeyPatch,
+    boltops_available: bool,
+) -> None:
+    """GLM5Next kpool stays FP8 even when the device is not gfx938."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+
+    def boltops_reference(q, k, scale, weights, starts, ends, **_kwargs):
+        return runtime.fp8_mqa_logits_torch(
+            q,
+            (k, scale),
+            weights,
+            starts,
+            ends,
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "_load_boltops_mqa_logits",
+        lambda: boltops_reference if boltops_available else None,
+    )
+    q = torch.ones((1, 32, 128), dtype=torch.float8_e4m3fn)
+    k = torch.stack(
+        (
+            torch.ones(128, dtype=torch.float8_e4m3fn),
+            torch.full((128,), 2.0, dtype=torch.float8_e4m3fn),
+        )
+    )
+    scales = torch.tensor([4.0, 1.0], dtype=torch.float32)
+    weights = torch.zeros((1, 32), dtype=torch.float32)
+    weights[0, 0] = 1.0
+
+    logits = runtime.rocm_fp8_mqa_logits(
+        q,
+        (k, scales),
+        weights,
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        force_aiter_triton=True,
+    )
+
+    assert torch.equal(logits, torch.tensor([[512.0, 256.0]]))
+    assert logits.argmax(dim=-1).item() == 0
+
+
+def test_sparse_mla_boltops_prefill_rejects_public_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present but incompatible BoltOPs install must fail visibly."""
+    runtime = _runtime()
+    assert hasattr(runtime, "_load_boltops_mqa_logits"), (
+        "the sparse-indexer runtime must own a lazy BoltOPs MQA resolver"
+    )
+    resolver = runtime._load_boltops_mqa_logits
+    resolver.cache_clear()
+    incompatible = SimpleNamespace(triton_mqa_logits=lambda q: q)
+    monkeypatch.setattr(
+        runtime.importlib,
+        "import_module",
+        lambda name: incompatible,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="triton_mqa_logits signature"):
+            resolver()
+    finally:
+        resolver.cache_clear()
+
+
 @pytest.mark.parametrize("is_gfx938", [False, True])
 def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     monkeypatch: pytest.MonkeyPatch,
