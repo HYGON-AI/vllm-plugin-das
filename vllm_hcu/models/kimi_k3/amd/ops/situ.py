@@ -18,7 +18,7 @@ class SituAndMul(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_cuda and x.is_contiguous() and x.numel() > 0:
-            from bolt_ops.fused_moe.triton.moe_activation import (
+            from boltops.fused_moe.triton.moe_activation import (
                 triton_situ_and_mul,
             )
 

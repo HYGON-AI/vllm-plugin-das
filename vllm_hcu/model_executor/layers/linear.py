@@ -689,6 +689,29 @@ class ColumnParallelLinear(LinearBase):
         return s
 
 
+class DCPGroupColumnParallelLinear(ColumnParallelLinear):
+    """Compatibility export for vLLM versions that define this MLA layer.
+
+    The HCU linear implementation does not yet implement DCP-group weight
+    sharding. The class is only instantiated when vLLM's Q-replication mode
+    is enabled with DCP > 1; fail explicitly in that unsupported mode while
+    retaining the ordinary TP behavior for models/configurations that import
+    the symbol but do not select it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+        dcp_size = config.parallel_config.decode_context_parallel_size
+        if dcp_size > 1:
+            raise NotImplementedError(
+                "HCU DCPGroupColumnParallelLinear requires DCP-group weight "
+                "sharding, which is not implemented in this plugin."
+            )
+        super().__init__(*args, **kwargs)
+
+
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """Packed linear layers with column parallelism.
 

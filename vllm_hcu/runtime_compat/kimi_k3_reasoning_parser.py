@@ -69,17 +69,6 @@ class KimiK3ReasoningParser(ReasoningParser):
         )
         self._last_streaming_delta_ids: tuple[int, ...] | None = None
         self._last_streaming_content_ids: list[int] | None = None
-        self._content_pending = ""
-        self._content_started = False
-        self._content_prompt_checked = False
-        self._content_closed = False
-        self._content_wrapper_re = re.compile(
-            "(?:" + "|".join((
-                self._response_open_re.pattern,
-                self._response_close_re.pattern,
-                self._message_close_re.pattern,
-            )) + ")"
-        )
 
     @property
     def reasoning_start_str(self) -> str:
@@ -176,65 +165,27 @@ class KimiK3ReasoningParser(ReasoningParser):
                     break
         return text[:-overlap] if overlap else text
 
-    def initialize_content_from_prompt(
-        self, prompt_token_ids: Sequence[int] | None,
-    ) -> None:
-        """Recognize the response opener consumed by K3's native prompt."""
-        if self._content_prompt_checked or prompt_token_ids is None:
-            return
-        self._content_prompt_checked = True
-        if not prompt_token_ids or self._content_started or self._content_closed:
-            return
-        response_ids = self.model_tokenizer.encode(
-            self._RESPONSE_OPEN, add_special_tokens=False
+    def _content_ready_to_emit(self, text: str) -> str:
+        response_open = self._response_open_re.search(text)
+        if response_open is not None:
+            text = text[response_open.end() :]
+        text = self._response_close_re.sub("", text)
+        text = self._message_close_re.sub("", text)
+        return self._without_partial_marker(
+            text, (self._RESPONSE_OPEN, self._RESPONSE_CLOSE, self._MESSAGE_CLOSE)
         )
-        # Only the generation prefix matters, not response tags in earlier
-        # turns. Compare token ids to preserve structural-token identity.
-        if response_ids and list(prompt_token_ids[-len(response_ids):]) == list(
-            response_ids
-        ):
-            self._content_started = True
 
-    def filter_content_delta(self, text: str, *, finished: bool) -> str:
-        """Filter actual delegating-parser output, buffering split XTML tags."""
-        if self._content_closed:
-            return ""
-        pending = self._content_pending + text
-        self._content_pending = ""
-        if not self._content_started:
-            # Until response opens, text may still be residual analysis even
-            # when thinking is disabled. Already emitted deltas cannot be
-            # retracted when the channel marker arrives in a later chunk.
-            response_open = self._response_open_re.search(pending)
-            if response_open is None:
-                if finished:
-                    self._content_closed = True
-                    # Unwrapped output remains supported, matching the
-                    # non-streaming channel selection at end of generation.
-                    return self._strip_content_wrapper(pending)
-                self._content_pending = pending
-                return ""
-            self._content_started = True
-            pending = pending[response_open.end():]
-        output = []
-        while pending:
-            match = self._content_wrapper_re.search(pending, partial=True)
-            if match is None:
-                output.append(pending)
-                break
-            output.append(pending[:match.start()])
-            if match.partial:
-                tail = pending[match.start():]
-                if finished:
-                    output.append(tail)
-                else:
-                    self._content_pending = tail
-                break
-            if self._response_close_re.fullmatch(match.group()):
-                self._content_closed = True
-                break
-            pending = pending[match.end():]
-        return "".join(output)
+    def strip_content_streaming(
+        self, previous_text: str, current_text: str
+    ) -> DeltaMessage | None:
+        current_safe = self._content_ready_to_emit(current_text)
+        previous_safe = self._content_ready_to_emit(previous_text)
+        delta = (
+            current_safe[len(previous_safe) :]
+            if current_safe.startswith(previous_safe)
+            else current_safe
+        )
+        return DeltaMessage(content=delta) if delta else None
 
     def extract_reasoning_streaming(
         self,

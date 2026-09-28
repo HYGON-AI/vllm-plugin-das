@@ -37,7 +37,16 @@ _HCU_FIELDS = (
 def apply_to_module(module: ModuleType) -> bool:
     backend = load_exact_module(TARGET_MODULE, module)
     common = require_class(backend, "CommonAttentionMetadata", f"{TARGET_MODULE}.CommonAttentionMetadata")
-    sparse = require_class(backend, "SparseMLAAttentionImpl", f"{TARGET_MODULE}.SparseMLAAttentionImpl")
+    sparse = getattr(backend, "SparseMLAAttentionImpl", None)
+    if sparse is None:
+        # vLLM 0.26 moved the common MLA cache-update implementation onto the
+        # abstract MLAAttentionImpl base class.
+        sparse = require_class(
+            backend, "MLAAttentionImpl", f"{TARGET_MODULE}.MLAAttentionImpl"
+        )
+        cache_update_target = f"{TARGET_MODULE}.MLAAttentionImpl.do_kv_cache_update"
+    else:
+        cache_update_target = TARGETS[0]
     wrapped = (
         (sparse, "do_kv_cache_update", TARGETS[0], _WRAPPER),
         (common, "__init__", TARGETS[2], _WRAPPER),
@@ -48,9 +57,9 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
     if "CpCommonAttentionMetadata" in vars(backend):
         raise PatchCompatibilityError(f"required HCU-owned type {TARGETS[1]} already exists")
-    cache_update = require_callable(sparse, "do_kv_cache_update", TARGETS[0])
+    cache_update = require_callable(sparse, "do_kv_cache_update", cache_update_target)
     require_exact_signature(
-        cache_update, TARGETS[0],
+        cache_update, cache_update_target,
         positional=("self", "kv_c_normed", "k_pe", "kv_cache", "slot_mapping", "kv_cache_dtype", "k_scale"),
     )
     original_init = require_callable(common, "__init__", TARGETS[2])

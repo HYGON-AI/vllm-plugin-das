@@ -221,6 +221,9 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
+    _CallbackSpec(
+        _adapter("core_fix", "patch_dspark_smoke_layer"),
+    ),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_kimi_k3_model")),
@@ -255,6 +258,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_prefill_metadata")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm")),

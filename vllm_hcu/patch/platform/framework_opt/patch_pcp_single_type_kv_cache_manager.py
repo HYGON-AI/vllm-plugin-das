@@ -35,6 +35,7 @@ _INIT_PARAMETERS = (
     "scheduler_block_size",
     "dcp_world_size",
     "pcp_world_size",
+    "needs_kv_cache_zeroing",
     "max_admission_blocks_per_request",
 )
 _HASH_PARAMETERS = (
@@ -123,6 +124,7 @@ def apply_to_module(module: ModuleType) -> bool:
         {
             "dcp_world_size": 1,
             "pcp_world_size": 1,
+            "needs_kv_cache_zeroing": False,
             "max_admission_blocks_per_request": None,
         },
     )
@@ -143,6 +145,7 @@ def apply_to_module(module: ModuleType) -> bool:
         scheduler_block_size,
         dcp_world_size=1,
         pcp_world_size=1,
+        needs_kv_cache_zeroing=False,
         max_admission_blocks_per_request=None,
     ):
         if pcp_world_size == 1:
@@ -155,6 +158,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 scheduler_block_size,
                 dcp_world_size,
                 pcp_world_size,
+                needs_kv_cache_zeroing,
                 max_admission_blocks_per_request,
             )
 
@@ -167,6 +171,7 @@ def apply_to_module(module: ModuleType) -> bool:
             scheduler_block_size,
             dcp_world_size,
             1,
+            needs_kv_cache_zeroing,
             max_admission_blocks_per_request,
         )
         self.pcp_world_size = pcp_world_size

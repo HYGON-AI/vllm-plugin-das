@@ -22,11 +22,25 @@ TARGETS = (f"{TARGET_MODULE}.KVCacheCoordinator.__init__",)
 _MARKER = "_vllm_hcu_mtp_indexer_coordinator_applied"
 _WRAPPER = "_vllm_hcu_mtp_indexer_coordinator_wrapper"
 
-_PARAMETERS = (
+_PARAMETERS_025 = (
     "self",
     "kv_cache_config",
     "max_model_len",
     "max_num_batched_tokens",
+    "use_eagle",
+    "enable_caching",
+    "enable_kv_cache_events",
+    "dcp_world_size",
+    "pcp_world_size",
+    "scheduler_block_size",
+    "hash_block_size",
+    "metrics_collector",
+)
+_PARAMETERS_026 = (
+    "self",
+    "kv_cache_config",
+    "max_model_len",
+    "max_in_flight_tokens",
     "use_eagle",
     "enable_caching",
     "enable_kv_cache_events",
@@ -71,7 +85,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     original = require_callable(coordinator_cls, "__init__", TARGETS[0])
     signature = inspect.signature(original)
-    if tuple(signature.parameters) != _PARAMETERS:
+    if tuple(signature.parameters) not in (_PARAMETERS_025, _PARAMETERS_026):
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} has incompatible "
             f"signature {signature}"
@@ -87,7 +101,7 @@ def apply_to_module(module: ModuleType) -> bool:
         self,
         kv_cache_config,
         max_model_len,
-        max_num_batched_tokens,
+        capacity_value,
         use_eagle,
         enable_caching,
         enable_kv_cache_events,
@@ -108,7 +122,7 @@ def apply_to_module(module: ModuleType) -> bool:
             self,
             kv_cache_config,
             max_model_len,
-            max_num_batched_tokens,
+            capacity_value,
             effective_use_eagle,
             enable_caching,
             enable_kv_cache_events,

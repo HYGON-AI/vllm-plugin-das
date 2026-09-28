@@ -20,8 +20,20 @@ def apply_to_module(module: ModuleType) -> bool:
     from vllm_hcu.transformers_utils.configs.kimi_k3 import KimiK3Config
 
     existing = registry.get("kimi_k3")
+    if isinstance(existing, str):
+        existing = registry["kimi_k3"]
     if existing is not None and existing is not KimiK3Config:
-        raise PatchCompatibilityError("kimi_k3 config is already owned by another provider")
+        # vLLM 0.26 ships the same config class in-tree. The plugin copy is
+        # byte-for-byte equivalent; leave the upstream registration in place.
+        if (
+            getattr(existing, "__name__", None) != "KimiK3Config"
+            or getattr(existing, "model_type", None) != "kimi_k3"
+        ):
+            raise PatchCompatibilityError(
+                "kimi_k3 config is already owned by an incompatible provider"
+            )
+        setattr(target, _MARKER, True)
+        return False
     registry["kimi_k3"] = KimiK3Config
     setattr(target, _MARKER, True)
     return existing is None

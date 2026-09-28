@@ -47,9 +47,13 @@ def _apply_platform_preserving_role() -> None:
     """
 
     from vllm_hcu.patch import PATCH_REGISTRY, apply_platform_patches
+    from vllm_hcu.runtime_compat.dynamo_metrics import (
+        install_dynamo_metrics_compat,
+    )
     from vllm_hcu.patch.runtime_state import set_process_role
 
     role = PATCH_REGISTRY.process_role()
+    install_dynamo_metrics_compat()
     apply_platform_patches()
     set_process_role(role)
 
@@ -59,13 +63,6 @@ def _prepare_general_plugin() -> None:
     from vllm_hcu.patch.worker import prepare_worker_patches
 
     prepare_worker_patches()
-    # Platform discovery must not import torch. General registration runs at
-    # the runtime boundary, after Worker import callbacks have been armed.
-    from vllm_hcu.runtime_compat.dynamo_metrics import (
-        install_dynamo_metrics_compat,
-    )
-
-    install_dynamo_metrics_compat()
 
 
 def _ensure_platform_plugin_ready() -> None:

@@ -32,22 +32,18 @@ def kimi_ll_graph_boundary(function):
         if not uses_kimi_ll_graph_boundary(layer):
             return function(*args, **kwargs)
 
-        shared_buffer = None
-
         def invoke(call_args, call_kwargs):
-            nonlocal shared_buffer
             result = function(*call_args, **call_kwargs)
             hidden = call_args[0] if call_args else call_kwargs["hidden_states"]
             width = call_args[9] if len(call_args) > 9 else call_kwargs["hidden_dim_unpadded"]
             target = hidden[..., :width] if width > 0 else hidden
             if isinstance(result, tuple):
-                # shared_experts_input is read-only in the custom-op schema.
-                # Keep a separate output alive across eager graph replays.
-                if shared_buffer is None:
-                    shared_buffer = torch.empty_like(result[0])
-                shared_buffer.copy_(result[0])
+                shared = call_args[2] if len(call_args) > 2 else call_kwargs["shared_experts_input"]
+                if shared is None:
+                    raise RuntimeError("Kimi LL graph shared output needs a static input buffer")
+                shared.copy_(result[0])
                 target.copy_(result[1])
-                return shared_buffer, hidden
+                return shared, hidden
             target.copy_(result)
             return hidden
 

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from types import ModuleType
-from copy import deepcopy
 
 import torch
 from torch import nn
@@ -26,7 +25,6 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
 
     base_layer = module.MoonViTEncoderLayer
     base_encoder = module.MoonViT3dEncoder
-    base_tower = module.MoonViT3dPretrainedModel
     base_projector = module.KimiK25MultiModalProjector
     base_projector_forward = module.mm_projector_forward
 
@@ -113,7 +111,15 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
                     f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
                 )
             self.video_attn_type = video_attn_type
-            qkv_hidden_size = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
+            qkv_hidden_size = block_cfg.get("qkv_hidden_size")
+            if qkv_hidden_size is None:
+                # vLLM 0.25.1's K25 wrapper omits this K3-only field while
+                # constructing block_cfg.  K3 keeps a 1536-wide QKV path
+                # over a 1024-wide token embedding (12 heads, 128 per head).
+                if block_cfg.get("hidden_dim") == 1024 and block_cfg.get("num_heads") == 12:
+                    qkv_hidden_size = 1536
+                else:
+                    qkv_hidden_size = block_cfg["hidden_dim"]
             block_cfg = dict(block_cfg)
             block_cfg["qkv_hidden_size"] = qkv_hidden_size
             self.rope_2d = module.Rope2DPosEmbRepeated(
@@ -131,47 +137,6 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
             )
             self.final_layernorm = _make_norm(
                 module, block_cfg.get("norm_type", "layernorm"), hidden_dim
-            )
-
-    class HcuMoonViT3dPretrainedModel(base_tower):
-        def __init__(self, config, quant_config=None, prefix: str = ""):
-            if getattr(config, "model_type", None) != "kimi_k3_vision":
-                super().__init__(config, quant_config=quant_config, prefix=prefix)
-                return
-            nn.Module.__init__(self)
-            config = deepcopy(config)
-            self.config = config
-            self.merge_kernel_size = config.merge_kernel_size
-            self.patch_size = config.patch_size
-            self.merge_type = config.merge_type
-            self.patch_embed = module.MoonVision3dPatchEmbed(
-                out_dim=config.hidden_size,
-                patch_size=config.patch_size,
-                pos_emb_height=config.init_pos_emb_height,
-                pos_emb_width=config.init_pos_emb_width,
-                pos_emb_time=config.init_pos_emb_time,
-                pos_emb_type=config.pos_emb_type,
-            )
-            if not config.patch_embed_proj_bias:
-                self.patch_embed.proj.register_parameter("bias", None)
-            self.patch_embed.pos_emb.interpolation_mode = config.pos_emb_interpolation_mode
-            self.encoder = HcuMoonViT3dEncoder(
-                hidden_dim=config.hidden_size,
-                num_layers=config.num_hidden_layers,
-                block_cfg={
-                    "num_heads": config.num_attention_heads,
-                    "hidden_dim": config.hidden_size,
-                    "mlp_dim": config.intermediate_size,
-                    "qkv_hidden_size": config.qkv_hidden_size,
-                    "norm_type": config.norm_type,
-                    "attn_bias": config.attn_bias,
-                    "linear_bias": config.linear_bias,
-                    "mlp_type": config.mlp_type,
-                    "activation": module.get_act_fn(config.activation_func),
-                },
-                video_attn_type=config.video_attn_type,
-                quant_config=quant_config,
-                prefix=module.maybe_prefix(prefix, "encoder"),
             )
 
     class HcuKimiK25MultiModalProjector(base_projector):
@@ -246,7 +211,6 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
 
     module.MoonViTEncoderLayer = HcuMoonViTEncoderLayer
     module.MoonViT3dEncoder = HcuMoonViT3dEncoder
-    module.MoonViT3dPretrainedModel = HcuMoonViT3dPretrainedModel
     module.KimiK25MultiModalProjector = HcuKimiK25MultiModalProjector
     module.mm_projector_forward = hcu_mm_projector_forward
     module._hcu_kimi_k25_qkv_layout_patch_applied = True

@@ -82,6 +82,22 @@ class HcuGPUWorker(Worker):
 
         validate_worker_patches(require_applied=True)
 
+    def _reserve_mm_ipc_gpu_memory(self, memory_bytes: int) -> int:
+        """Reserve multimodal IPC memory across the supported vLLM APIs."""
+        try:
+            from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
+        except ImportError:
+            # vLLM 0.25.1 exposes this operation on the base Worker.
+            reserve = getattr(super(), "_reserve_mm_ipc_gpu_memory", None)
+            if reserve is None:
+                raise
+            return reserve(memory_bytes)
+        return reserve_mm_ipc_gpu_memory(
+            memory_bytes,
+            self.model_config.multimodal_config,
+            getattr(self.parallel_config, "_api_process_count", 1),
+        )
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Use reference memory accounting for HCU/CuMem allocations."""
@@ -176,6 +192,25 @@ class HcuGPUWorker(Worker):
         )
 
     def compile_or_warm_up_model(self):
+        if (
+            self.use_v2_model_runner
+            and os.environ.get("VLLM_HCU_SKIP_V2_STARTUP_WARMUP") == "1"
+        ):
+            # Keep profiling and graph capture in the base implementation, but
+            # allow HCU smoke runs to defer V2's synthetic scheduler warmup.
+            # Some distributed DSpark warmup shapes can stall at device sync;
+            # real requests still exercise the same model and sampling path.
+            from vllm.v1.worker import gpu_worker
+
+            original_warmup = gpu_worker.warmup_kernels
+            gpu_worker.warmup_kernels = lambda *args, **kwargs: logger.warning(
+                "Skipping V2 startup kernel warmup because "
+                "VLLM_HCU_SKIP_V2_STARTUP_WARMUP=1"
+            )
+            try:
+                return super().compile_or_warm_up_model()
+            finally:
+                gpu_worker.warmup_kernels = original_warmup
         if (
             self.use_v2_model_runner
             and self.parallel_config.pipeline_parallel_size > 1

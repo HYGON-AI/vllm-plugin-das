@@ -5,12 +5,13 @@
 
 import functools
 import gc
+import inspect
 import itertools
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -39,6 +40,7 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.distributed import get_ep_group
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -679,6 +681,14 @@ class GPUModelRunner(
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[placeholder_block_size],
             kernel_block_sizes=[placeholder_block_size],
+            # Newer runtime overlays require this size when creating the
+            # initial placeholder batch; older vLLM versions make it optional.
+            max_num_blocks_per_req=[
+                cdiv(
+                    max(self.max_model_len, self.max_encoder_len),
+                    placeholder_block_size,
+                )
+            ],
             num_spec_tokens=self.num_spec_tokens,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
@@ -1077,15 +1087,18 @@ class GPUModelRunner(
 
     def _init_kv_zero_meta(self) -> None:
         """Initialize the target-owned KV cache block zeroer."""
-        self._kv_block_zeroer = KVBlockZeroer(
-            self.device,
-            pin_memory=self.pin_memory,
-            attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
-            kernel_block_sizes=self._kernel_block_sizes,
-            cache_dtype=self.cache_config.cache_dtype,
-            runner_only_attn_layers=self.runner_only_attn_layers,
-            static_forward_context=(self.compilation_config.static_forward_context),
-        )
+        zeroer_kwargs = {
+            "attn_groups_iter": self._kv_cache_spec_attn_group_iterator(),
+            "kernel_block_sizes": self._kernel_block_sizes,
+            "cache_dtype": self.cache_config.cache_dtype,
+            "runner_only_attn_layers": self.runner_only_attn_layers,
+            "static_forward_context": (
+                self.compilation_config.static_forward_context
+            ),
+        }
+        if "pin_memory" in inspect.signature(KVBlockZeroer.__init__).parameters:
+            zeroer_kwargs["pin_memory"] = self.pin_memory
+        self._kv_block_zeroer = KVBlockZeroer(self.device, **zeroer_kwargs)
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
@@ -3317,6 +3330,19 @@ class GPUModelRunner(
             {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
         )
 
+    def _register_eplb_model(self, load_dummy_weights: bool) -> int:
+        if not self.parallel_config.enable_eplb or load_dummy_weights:
+            return 0
+        model = self.model
+        if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+            model = model.get_language_model()
+        if not is_mixture_of_experts(model):
+            return 0
+        logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
+        assert self.eplb_state is not None
+        self.eplb_state.add_model(model, self.model_config)
+        return 1
+
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
         Step for the EPLB (Expert Parallelism Load Balancing) state.
@@ -3326,6 +3352,8 @@ class GPUModelRunner(
 
         assert self.eplb_state is not None
         model = self.get_model()
+        if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+            model = model.get_language_model()
         assert is_mixture_of_experts(model)
         self.eplb_state.step(
             is_dummy,
@@ -3339,6 +3367,8 @@ class GPUModelRunner(
         old_num_physical_experts: int,
     ) -> None:
         model = self.get_model()
+        if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+            model = model.get_language_model()
         assert is_mixture_of_experts(model)
 
         self.eplb_state = EplbState.from_mapping(
@@ -4273,6 +4303,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(
+                self.model_config, num_tokens_unpadded, ubatch_slices_padded
+            )
         deepep_auto_is_prefilling = None
         if self.hcu_feature_config.deepep_auto:
             deepep_auto_is_prefilling = (
@@ -5082,25 +5116,39 @@ class GPUModelRunner(
                     )
                 else:
                     model_loader = get_model_loader(self.load_config)
-                    from vllm_hcu.runtime_compat.kimi_k3_loading import (
-                        is_kimi_k3_config,
-                        preload_before_weight_loading,
+                    # Build the architecture, warm the BF16 GEMM kernels (shape
+                    # only, before any real weight bytes are read), then stream
+                    # the checkpoint weights -- mirrors BaseModelLoader.load_model
+                    # so GEMM/HIPBLAS problems surface before the slow load.
+                    from vllm.model_executor.model_loader.utils import (
+                        initialize_model,
+                        process_weights_after_loading,
                     )
-
-                    def preload(model):
-                        self.model = model
-                        self._preload_unquantized_gemm_kernels()
-
-                    loading_context = (
-                        preload_before_weight_loading(model_loader, preload)
-                        if is_kimi_k3_config(self.vllm_config)
-                        else nullcontext()
+                    from vllm.model_executor.model_loader.base_loader import (
+                        _has_online_quant,
                     )
-                    with loading_context:
-                        self.model = model_loader.load_model(
-                            vllm_config=self.vllm_config,
-                            model_config=self.model_config,
+                    from vllm.model_executor.model_loader.reload import (
+                        finalize_layerwise_processing,
+                    )
+                    from vllm.utils.torch_utils import set_default_torch_dtype
+
+                    with set_default_torch_dtype(self.model_config.dtype):
+                        with self.device:
+                            self.model = initialize_model(
+                                vllm_config=self.vllm_config,
+                                model_config=self.model_config,
+                            )
+                    self._preload_kimi_ht_communication()
+                    self._preload_unquantized_gemm_kernels()
+                    model_loader.load_weights(self.model, self.model_config)
+                    if _has_online_quant(self.model):
+                        finalize_layerwise_processing(
+                            self.model, self.model_config
                         )
+                    process_weights_after_loading(
+                        self.model, self.model_config, self.device
+                    )
+                    self.model = self.model.eval()
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -5155,21 +5203,8 @@ class GPUModelRunner(
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
 
-                if (
-                    is_mixture_of_experts(self.model)
-                    and self.parallel_config.enable_eplb
-                    and not load_dummy_weights
-                ):
-                    logger.info_once(
-                        "EPLB is enabled for model %s.",
-                        self.model_config.model,
-                    )
-                    assert self.eplb_state is not None
-                    self.eplb_state.add_model(
-                        self.model,
-                        self.model_config,
-                    )
-                    eplb_models += 1
+                if self.parallel_config.enable_eplb:
+                    eplb_models += self._register_eplb_model(load_dummy_weights)
 
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
@@ -5210,8 +5245,8 @@ class GPUModelRunner(
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
 
         if (
-            is_mixture_of_experts(self.model)
-            and self.parallel_config.enable_eplb
+            self.parallel_config.enable_eplb
+            and eplb_models > 0
             and not load_dummy_weights
             and self.eplb_state is not None
             and self.eplb_state.is_async
@@ -5260,6 +5295,22 @@ class GPUModelRunner(
 
         get_offloader().post_init()
 
+    def _preload_kimi_ht_communication(self) -> None:
+        # Diagnostic opt-in: reuse the production manager/cache, only move
+        # native initialization ahead of weight loading and GEMM warmup.
+        from os import environ
+        if (not henvs.VLLM_HCU_USE_CUSTOM_OPS or
+                environ.get("VLLM_HCU_KIMI_EARLY_HT_INIT", "0") != "1"):
+            return
+        if (self.model_config.quantization != "kimi_k3_w4a8" or
+                not self.parallel_config.enable_expert_parallel or
+                self.parallel_config.all2all_backend != "deepep_high_throughput"):
+            return
+        manager = get_ep_group().device_communicator.all2all_manager
+        manager.get_handle({})
+        logger.info("Initialized cached Kimi DeepEP HT buffer before weight load")
+        print("HCU early DeepEP HT buffer initialized before weight load", flush=True)
+
     @torch.inference_mode()
     def _preload_unquantized_gemm_kernels(self) -> None:
         """Warm HCU BF16 GEMM kernels BEFORE real checkpoint weights are streamed.
@@ -5272,10 +5323,6 @@ class GPUModelRunner(
         after the load, and profile_run reuses the warmed kernels (no cold-start
         lm_head logits GEMM).
         """
-        from vllm_hcu.runtime_compat.kimi_k3_loading import is_kimi_k3_config
-
-        if not is_kimi_k3_config(self.vllm_config):
-            return
         print("HCU GEMM preload entered", flush=True)
         model = self.model
         max_tokens = max(1, int(self.max_num_tokens))
@@ -5296,6 +5343,10 @@ class GPUModelRunner(
 
         shapes: dict[tuple[int, int], torch.dtype] = {}
         for module in model.modules():
+            if getattr(module, "_hcu_weight_only_linear", False):
+                # These parameters are consumed directly by a fused operator,
+                # not by this module's linear forward/GEMM implementation.
+                continue
             weight = getattr(module, "weight", None)
             if not isinstance(weight, torch.Tensor):
                 continue
@@ -7214,27 +7265,13 @@ class GPUModelRunner(
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
-                    state_tensors = []
-                    storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
-                        target_shape = (num_blocks, *shape)
-                        stride = torch.empty(target_shape).stride()
-                        target_stride = (num_element_per_page, *stride[1:])
-                        assert storage_offset_bytes % dtype_size == 0
-                        tensor = torch.as_strided(
-                            raw_tensor.view(dtype),
-                            size=target_shape,
-                            stride=target_stride,
-                            storage_offset=storage_offset_bytes // dtype_size,
-                        )
-                        state_tensors.append(tensor)
-                        storage_offset_bytes += stride[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
+                    page_size_bytes = kv_cache_spec.page_size_bytes
+                    # c4fc870's MambaBase.bind_kv_cache unpacks each state
+                    # from a single contiguous byte page. A list of state
+                    # views is the older plugin/runtime contract.
+                    kv_caches[layer_name] = raw_tensor[
+                        : num_blocks * page_size_bytes
+                    ].view(num_blocks, 1, 1, page_size_bytes)
                 else:
                     raise NotImplementedError
 

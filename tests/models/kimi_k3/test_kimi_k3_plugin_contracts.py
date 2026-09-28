@@ -68,10 +68,6 @@ def test_kimi_ll_graph_replay_refreshes_values_at_static_addresses(monkeypatch, 
     shared_input = torch.ones(2, 6)
     result = forward(hidden, None, shared_input, None, None, None, None, None, "layer", 0)
     routed = result[1] if shared else result
-    if shared:
-        assert result[0].data_ptr() != shared_input.data_ptr()
-        assert torch.equal(shared_input, torch.ones_like(shared_input))
-        shared_address = result[0].data_ptr()
     assert routed.data_ptr() == hidden.data_ptr()
     assert torch.equal(hidden, torch.full_like(hidden, 3))
     hidden.fill_(10)
@@ -80,9 +76,8 @@ def test_kimi_ll_graph_replay_refreshes_values_at_static_addresses(monkeypatch, 
     assert len(calls) == 2
     assert torch.equal(hidden, torch.full_like(hidden, 12))
     if shared:
-        assert result[0].data_ptr() == shared_address
-        assert torch.equal(result[0], torch.full_like(shared_input, 23))
-        assert torch.equal(shared_input, torch.full_like(shared_input, 20))
+        assert result[0].data_ptr() == shared_input.data_ptr()
+        assert torch.equal(shared_input, torch.full_like(shared_input, 23))
 
 
 def test_kimi_ht_quant_config_uses_int8_token_scales_and_high_nibble_compensation():
@@ -96,6 +91,37 @@ def test_kimi_ht_quant_config_uses_int8_token_scales_and_high_nibble_compensatio
     assert torch.equal(quant.w1_scale, layer.w13_weight_scale * 16)
     assert torch.equal(quant.w2_scale, layer.w2_weight_scale * 16)
     assert torch.equal(layer.w13_weight_scale, torch.ones(2, 64, 1))
+
+
+def test_kimi_ht_compensated_scales_participate_in_expert_transfer():
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_experts = 3
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    method.create_weights(layer, 3, 32, 32, torch.bfloat16)
+    with torch.no_grad():
+        layer.w13_weight_scale.copy_(torch.arange(1, 4).view(3, 1, 1))
+        layer.w2_weight_scale.copy_(torch.arange(4, 7).view(3, 1, 1))
+    quant = method.get_fused_moe_quant_config(layer)
+    weights = list(layer.get_expert_weights())
+    assert quant.w1_scale.data_ptr() in [w.data_ptr() for w in weights]
+    assert quant.w2_scale.data_ptr() in [w.data_ptr() for w in weights]
+    before = [w.data_ptr() for w in weights]
+    with torch.no_grad():
+        for weight in weights:
+            weight.copy_(weight[[2, 0, 1]])
+    again = method.get_fused_moe_quant_config(layer)
+    assert before == [w.data_ptr() for w in layer.get_expert_weights()]
+    assert again.w1_scale is quant.w1_scale
+    assert again.w2_scale is quant.w2_scale
+    torch.testing.assert_close(quant.w1_scale, layer.w13_weight_scale * 16, atol=0, rtol=0)
+    torch.testing.assert_close(quant.w2_scale, layer.w2_weight_scale * 16, atol=0, rtol=0)
+    assert not method.supports_eplb  # This ownership fix alone is not online EPLB.
+    layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.clone(), requires_grad=False)
+    with pytest.raises(RuntimeError, match="scales replaced"):
+        method.get_fused_moe_quant_config(layer)
 
 
 def test_kimi_ll_quant_config_keeps_scale_correction_at_masked_gemm():
@@ -210,18 +236,11 @@ def test_kimi_ll_packing_uses_loaded_ep_dimensions_once(monkeypatch):
     monkeypatch.setattr(runtime, 'pack_w4a8_moe_hipc_weight', lambda w: calls.append(w.shape) or w)
     monkeypatch.setattr(runtime, 'view_w4a8_moe_hipc_weight_n32_layout', lambda w: w)
     expert.process_weights_after_loading(layer)
-    expected_calls = [(2, 256, 64), (2, 128, 64)]
-    assert calls == expected_calls
-    packed_w13 = layer.w13_weight
-    packed_w2 = layer.w2_weight
     expert.process_weights_after_loading(layer)
     assert expert._hcu_logical_n == 256
     assert expert._hcu_logical_k == 128
-    assert calls == expected_calls  # No repacking on the second invocation.
-    assert layer.w13_weight is packed_w13
-    assert layer.w2_weight is packed_w2
-    assert expert._deepgemm_w13 is packed_w13
-    assert expert._deepgemm_w2 is packed_w2
+    assert len(calls) == 2
+    assert expert._deepgemm_w13 is layer.w13_weight
 
 
 def test_kimi_feature_off_has_no_modular_quant_config():

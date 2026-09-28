@@ -7,7 +7,7 @@
 
 import torch
 
-from vllm.model_executor.layers.fla.ops.kda import (
+from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import (
     FusedRMSNormGated as BaseFusedRMSNormGated,
     rms_norm_gated as base_rms_norm_gated,
 )

@@ -199,7 +199,6 @@ def apply_kimi_k25_qkv_layout(module: ModuleType) -> None:
     module = require_exact_module(module, target)
     require_type(module, "MoonViTEncoderLayer", f"{target}.MoonViTEncoderLayer")
     require_type(module, "MoonViT3dEncoder", f"{target}.MoonViT3dEncoder")
-    require_type(module, "MoonViT3dPretrainedModel", f"{target}.MoonViT3dPretrainedModel")
     require_type(
         module,
         "KimiK25MultiModalProjector",
@@ -296,7 +295,6 @@ _ORDERED_CALLBACKS: tuple[
         (
             "vllm.model_executor.models.kimi_k25_vit.MoonViTEncoderLayer",
             "vllm.model_executor.models.kimi_k25_vit.MoonViT3dEncoder",
-            "vllm.model_executor.models.kimi_k25_vit.MoonViT3dPretrainedModel",
         ),
     ),
 )

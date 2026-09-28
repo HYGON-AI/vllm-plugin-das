@@ -1465,9 +1465,6 @@ def _fake_proposer_module() -> ModuleType:
         def _maybe_share_lm_head(self, target_language_model):
             return "official-share"
 
-        def model_returns_tuple(self):
-            return self.method != "mtp"
-
         def _determine_batch_execution_and_padding(
             self, num_tokens, use_cudagraphs=True
         ):
@@ -1647,10 +1644,8 @@ def test_proposer_propagates_flash_attention_metadata_errors(
         )
 
 
-@pytest.mark.parametrize("kimi_tuple", [False, True])
 def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     monkeypatch: pytest.MonkeyPatch,
-    kimi_tuple,
 ):
     from vllm_hcu.v1.spec_decode import proposer_runtime
 
@@ -1705,17 +1700,11 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     class Model:
         def __call__(self, **kwargs):
             events.append(("model", kwargs))
-            if kimi_tuple:
-                return torch.full((1, 2), 3.0), torch.full((1, 2), 7.0)
             return torch.ones(1, 2)
 
     def build_metadata(metadata, draft_index=None):
         events.append(("metadata", metadata))
         return [metadata], {"layer": metadata}
-
-    def sample(hidden):
-        torch.testing.assert_close(hidden, torch.full((1, 2), 3.0 if kimi_tuple else 1.0))
-        return torch.tensor([42])
 
     proposer = SimpleNamespace(
         method="mtp",
@@ -1744,18 +1733,10 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
         vllm_config=object(),
         _get_slot_mapping=lambda *args: {"slot": args},
         model_returns_tuple=lambda: False,
-        _greedy_sample=sample,
+        _greedy_sample=lambda hidden: torch.tensor([42]),
         num_speculative_tokens=1,
         parallel_drafting=False,
     )
-    if kimi_tuple:
-        patched_module = _fake_proposer_module()
-        patch_llm_base_proposer.apply_to_module(patched_module)
-        proposer.draft_model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["KimiK3MTPModel"]))
-        proposer.model_returns_tuple = (
-            patched_module.SpecDecodeBaseProposer.model_returns_tuple.__get__(proposer)
-        )
     result = proposer_runtime.propose(
         module,
         proposer,
@@ -1810,8 +1791,6 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
         object(),
     )
     assert result.tolist() == [[42, 42]]
-    if kimi_tuple:
-        torch.testing.assert_close(proposer.hidden_states[:1], torch.full((1, 2), 7.0))
     assert ("canonical", canonical) in events
     assert ("metadata", canonical) in events
 

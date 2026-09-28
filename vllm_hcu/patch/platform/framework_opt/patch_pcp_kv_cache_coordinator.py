@@ -22,11 +22,25 @@ PATCH_ID = "platform.framework_opt.pcp_kv_cache_coordinator"
 TARGETS = (f"{TARGET_MODULE}.UnitaryKVCacheCoordinator.__init__",)
 _MARKER = "_vllm_hcu_pcp_kv_cache_coordinator_applied"
 _WRAPPER = "_vllm_hcu_pcp_unitary_coordinator_init_wrapper"
-_PARAMETERS = (
+_PARAMETERS_025 = (
     "self",
     "kv_cache_config",
     "max_model_len",
     "max_num_batched_tokens",
+    "use_eagle",
+    "enable_caching",
+    "enable_kv_cache_events",
+    "dcp_world_size",
+    "pcp_world_size",
+    "scheduler_block_size",
+    "hash_block_size",
+    "metrics_collector",
+)
+_PARAMETERS_026 = (
+    "self",
+    "kv_cache_config",
+    "max_model_len",
+    "max_in_flight_tokens",
     "use_eagle",
     "enable_caching",
     "enable_kv_cache_events",
@@ -55,8 +69,9 @@ def apply_to_module(module: ModuleType) -> bool:
     original = require_callable(unitary, "__init__", TARGETS[0])
     signature = inspect.signature(original)
     parameters = tuple(signature.parameters.values())
+    parameter_names = tuple(signature.parameters)
     if (
-        tuple(signature.parameters) != _PARAMETERS
+        parameter_names not in (_PARAMETERS_025, _PARAMETERS_026)
         or any(
             parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
             for parameter in parameters
@@ -90,7 +105,7 @@ def apply_to_module(module: ModuleType) -> bool:
         self,
         kv_cache_config,
         max_model_len,
-        max_num_batched_tokens,
+        capacity_value,
         use_eagle,
         enable_caching,
         enable_kv_cache_events,
@@ -105,7 +120,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 self,
                 kv_cache_config,
                 max_model_len,
-                max_num_batched_tokens,
+                capacity_value,
                 use_eagle,
                 enable_caching,
                 enable_kv_cache_events,
@@ -119,7 +134,7 @@ def apply_to_module(module: ModuleType) -> bool:
         super(unitary, self).__init__(
             kv_cache_config,
             max_model_len,
-            max_num_batched_tokens,
+            capacity_value,
             use_eagle,
             enable_caching,
             enable_kv_cache_events,

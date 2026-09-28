@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -16,6 +16,8 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm_hcu.models.kimi_k3.amd.ops.situ import SituAndMul
+from vllm_hcu.models.kimi_k3.amd.ops.state_shape import kda_state_shape
+from vllm_hcu.models.kimi_k3.amd.ops.eplb import kimi_eplb_options
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
@@ -36,7 +38,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -62,7 +63,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from bolt_ops.generic import attn_res
+from boltops.generic import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
@@ -284,6 +285,7 @@ class KimiMoE(nn.Module):
         layer_idx: int = 0,
     ):
         super().__init__()
+        enable_eplb, num_redundant_experts = kimi_eplb_options(get_current_vllm_config())
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         num_experts = config.num_experts
@@ -374,6 +376,8 @@ class KimiMoE(nn.Module):
             self.routed_output_transform = None
 
         self.experts = FusedMoE(
+            enable_eplb=enable_eplb,
+            num_redundant_experts=num_redundant_experts,
             shared_experts=self.shared_experts,
             num_experts=num_experts,
             top_k=num_experts_per_token,
@@ -681,6 +685,10 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+            # _apply_attn_res passes the weights straight to boltops.attn_res;
+            # neither ReplicatedLinear.forward is executed for these modules.
+            self.self_attention_res_proj._hcu_weight_only_linear = True
+            self.mlp_res_proj._hcu_weight_only_linear = True
 
     def _run_self_attn(
         self,
@@ -766,6 +774,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
+        _, self.num_redundant_experts = kimi_eplb_options(vllm_config)
+
         config = vllm_config.model_config.hf_text_config
         self.config = config
 
@@ -805,6 +815,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     quant_config=None,
                     prefix=f"{prefix}.output_attn_res_proj",
                 )
+                self.output_attn_res_proj._hcu_weight_only_linear = True
         else:
             self.norm = PPMissingLayer()
             if config.attn_res_block_size is not None:
@@ -988,6 +999,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 ckpt_down_proj_name="w2",
                 ckpt_up_proj_name="w3",
                 num_experts=self.config.num_experts,
+                num_redundant_experts=self.num_redundant_experts,
             )
         else:
             expert_params_mapping = []
@@ -1039,6 +1051,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                expert_weight_seen = False
                 for (
                     expert_param_name,
                     expert_weight_name,
@@ -1068,6 +1081,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                         continue
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
+                    if self.num_redundant_experts:
+                        # Keep the logical checkpoint name intact: multiple
+                        # physical slots can match it, including replicas on
+                        # another rank or on this rank. The loader filters
+                        # non-local physical IDs itself.
+                        param = params_dict[name_mapped]
+                        param.weight_loader(
+                            param, loaded_weight, name_mapped,
+                            expert_id=expert_id, shard_id=expert_shard_id,
+                        )
+                        loaded_params.add(name_mapped)
+                        expert_weight_seen = True
+                        continue
                     name = name_mapped
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -1080,6 +1106,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     )
                     break
                 else:
+                    if expert_weight_seen:
+                        continue
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")
@@ -1113,6 +1141,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
 class KimiLinearForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    _vllm_hcu_kimi_eplb_load_window = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1123,6 +1153,7 @@ class KimiLinearForCausalLM(
         self.model = KimiLinearModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self._init_moe_metadata()
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -1136,6 +1167,46 @@ class KimiLinearForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=logit_scale
         )
+
+    def _init_moe_metadata(self) -> None:
+        # Keep a plain list: registering the same runners in a ModuleList
+        # would introduce aliases into the checkpoint parameter tree.
+        layers = [
+            layer.mlp.experts
+            for layer in self.model.layers[self.model.start_layer : self.model.end_layer]
+            if isinstance(getattr(layer, "mlp", None), KimiMoE)
+        ]
+        logical = self.config.num_experts or 0
+        counts = {
+            (runner.routed_experts.moe_config.num_experts,
+             runner.routed_experts.local_num_experts)
+            for runner in layers
+        }
+        if len(counts) > 1:
+            raise ValueError("Kimi-K3 local MoE layers disagree on expert counts")
+        physical, local = next(iter(counts), (logical, 0))
+        if physical < logical or (layers and not 0 < local <= physical):
+            raise ValueError("Kimi-K3 has invalid physical/local expert counts")
+        self.moe_layers = layers
+        self.num_moe_layers = len(layers)
+        self.num_expert_groups = self.config.num_expert_group or 1
+        self.num_logical_experts = self.num_routed_experts = logical
+        self.num_physical_experts = physical
+        self.num_local_physical_experts = local
+        self.num_shared_experts = self.config.num_shared_experts or 0
+        self.num_redundant_experts = physical - logical
+        # MixtureOfExperts.set_eplb_state collects fresh views after post-load
+        # packing, including both channel scales. Do not snapshot weights here.
+        # This metadata does NOT override the quant method's supports_eplb gate.
+        self.expert_weights = []
+
+    def update_physical_experts_metadata(
+        self, num_physical_experts: int, num_local_physical_experts: int
+    ) -> None:
+        if (num_physical_experts, num_local_physical_experts) != (
+            self.num_physical_experts, self.num_local_physical_experts
+        ):
+            raise ValueError("Kimi-K3 cannot resize packed physical expert storage")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1182,7 +1253,7 @@ class KimiLinearForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.kda_state_shape(
+        return kda_state_shape(
             tp_size,
             hf_config.linear_attn_config["num_heads"],
             hf_config.linear_attn_config["head_dim"],

@@ -400,7 +400,7 @@ def ll_init(
 ):
     if use_fp8_dispatch and use_int8_dispatch:
         raise ValueError("DeepEP LL dispatch cannot enable FP8 and INT8 simultaneously")
-    original(
+    original_args = (
         self,
         buffer,
         max_tokens_per_rank,
@@ -410,6 +410,10 @@ def ll_init(
         physical_to_global,
         local_expert_global_ids,
     )
+    if "use_int8_dispatch" in inspect.signature(original).parameters:
+        original(*original_args, use_int8_dispatch=use_int8_dispatch)
+    else:
+        original(*original_args)
     self.use_int8_dispatch = bool(use_int8_dispatch)
     self._vllm_hcu_clean_low_latency_buffer = False
     self._hcu_low_latency_dispatch_abi = _has_hcu_low_latency_dispatch_abi(buffer)

@@ -162,6 +162,29 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
         defaults={"for_capture": False},
     )
+    # vLLM 0.26 already propagates request phase into CommonAttentionMetadata
+    # in DefaultModelState.prepare_attn. This adapter is a 0.25.1 backport;
+    # retain that native implementation when the field is already supplied.
+    native_source = textwrap.dedent(inspect.getsource(original_prepare_attn))
+    if (
+        "input_batch.is_prefilling_np" in native_source
+        and "is_prefilling=" in native_source
+    ):
+        try:
+            from vllm.config import get_current_vllm_config
+
+            runtime_config = get_current_vllm_config()
+        except (AttributeError, RuntimeError):
+            runtime_config = None
+        if (
+            runtime_config is not None
+            and runtime_config.parallel_config.prefill_context_parallel_size > 1
+        ):
+            raise PatchCompatibilityError(
+                "native vLLM request-phase metadata is present, but the HCU "
+                "PCP-plan bridge is only validated against the 0.25.1 API"
+            )
+        return False
     _require_source_fingerprint(
         original_prepare_attn,
         TARGETS[0],

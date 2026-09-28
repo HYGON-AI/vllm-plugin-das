@@ -25,10 +25,6 @@ MODEL_CONFIG_TARGET = "vllm.config.model"
 TOKENIZER_REGISTRY_TARGET = "vllm.tokenizers.registry"
 RENDERER_REGISTRY_TARGET = "vllm.renderers.registry"
 REASONING_REGISTRY_TARGET = "vllm.reasoning.abs_reasoning_parsers"
-DELEGATING_PARSER_TARGET = "vllm.parser.abstract_parser"
-DELEGATING_PARSER_PATCH_ID = "post_import.kimi_k3.streaming_content"
-MTP_ARCH_TARGET = "vllm.transformers_utils.model_arch_config_convertor"
-MTP_ARCH_PATCH_ID = "post_import.kimi_k3.mtp_arch_config"
 MODEL_CONFIG_PATCH_ID = "post_import.kimi_k3.model_config"
 TOKENIZER_REGISTRY_PATCH_ID = "post_import.kimi_k3.tokenizer_registry"
 RENDERER_REGISTRY_PATCH_ID = "post_import.kimi_k3.renderer_registry"
@@ -144,78 +140,6 @@ def apply_kimi_k3_reasoning_registry(module: ModuleType) -> bool:
     return True
 
 
-def apply_kimi_k3_mtp_arch_config(module: ModuleType) -> bool:
-    target = require_exact_module(module, MTP_ARCH_TARGET)
-    marker = "_hcu_kimi_k3_mtp_arch_config_applied"
-    if getattr(target, marker, False):
-        return False
-    mapping = getattr(target, "MODEL_ARCH_CONFIG_CONVERTORS", None)
-    if not isinstance(mapping, dict) or "kimi_k3_mtp" in mapping:
-        raise Stage3CompatibilityError("Kimi-K3 MTP architecture converter cannot be registered")
-    base = require_type(target, "ModelArchConfigConvertorBase", MTP_ARCH_TARGET)
-
-    class KimiK3MTPModelArchConfigConvertor(base):
-        def get_num_hidden_layers(self):
-            count = getattr(self.hf_text_config, "num_nextn_predict_layers", None)
-            if type(count) is not int or count < 1:
-                raise ValueError("Kimi-K3 MTP requires positive text_config.num_nextn_predict_layers")
-            return count
-
-    mapping["kimi_k3_mtp"] = KimiK3MTPModelArchConfigConvertor
-    setattr(target, marker, True)
-    return True
-
-
-def apply_kimi_k3_streaming_content(module: ModuleType) -> bool:
-    target = require_exact_module(module, DELEGATING_PARSER_TARGET)
-    owner = f"{DELEGATING_PARSER_TARGET}.DelegatingParser"
-    parser_class = require_type(target, "DelegatingParser", owner)
-    marker = "_hcu_kimi_k3_streaming_content_applied"
-    if getattr(parser_class, marker, False):
-        return False
-    original = require_callable(parser_class, "parse_delta", f"{owner}.parse_delta")
-    signature = inspect.signature(original)
-    if tuple(signature.parameters) != (
-        "self", "delta_text", "delta_token_ids", "request",
-        "prompt_token_ids", "finished",
-    ):
-        raise Stage3CompatibilityError(
-            f"DelegatingParser.parse_delta has incompatible signature {signature}"
-        )
-
-    @functools.wraps(original)
-    def parse_delta(
-        self, delta_text, delta_token_ids, request, prompt_token_ids=None,
-        *, finished,
-    ):
-        delta = original(
-            self, delta_text, delta_token_ids, request, prompt_token_ids,
-            finished=finished,
-        )
-        from vllm_hcu.runtime_compat.kimi_k3_reasoning_parser import (
-            KimiK3ReasoningParser,
-        )
-        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
-
-        reasoning_parser = self._reasoning_parser
-        if not isinstance(reasoning_parser, KimiK3ReasoningParser):
-            return delta
-        if reasoning_parser._preserve_tool_channels(request):
-            return delta
-        reasoning_parser.initialize_content_from_prompt(prompt_token_ids)
-        content = reasoning_parser.filter_content_delta(
-            (delta.content or "") if delta else "", finished=finished
-        )
-        if delta is None:
-            return DeltaMessage(content=content) if content else None
-        delta.content = content or None
-        return delta if delta.model_dump(exclude_none=True) else None
-
-    parser_class.parse_delta = parse_delta
-    setattr(parser_class, marker, True)
-    return True
-
-
 def register_kimi_k3_callbacks(
     coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
 ) -> tuple[ImportRegistration, ...]:
@@ -227,18 +151,6 @@ def register_kimi_k3_callbacks(
             MODEL_CONFIG_TARGET,
             apply_kimi_k3_model_config,
             targets=f"{MODEL_CONFIG_TARGET}.ModelConfig.__post_init__",
-        ),
-        coordinator.register_callback(
-            MTP_ARCH_PATCH_ID,
-            MTP_ARCH_TARGET,
-            apply_kimi_k3_mtp_arch_config,
-            targets=f"{MTP_ARCH_TARGET}.MODEL_ARCH_CONFIG_CONVERTORS",
-        ),
-        coordinator.register_callback(
-            DELEGATING_PARSER_PATCH_ID,
-            DELEGATING_PARSER_TARGET,
-            apply_kimi_k3_streaming_content,
-            targets=f"{DELEGATING_PARSER_TARGET}.DelegatingParser.parse_delta",
         ),
         coordinator.register_callback(
             TOKENIZER_REGISTRY_PATCH_ID,
@@ -266,8 +178,6 @@ def register_kimi_k3_callbacks(
 
 __all__ = [
     "apply_kimi_k3_model_config",
-    "apply_kimi_k3_mtp_arch_config",
-    "apply_kimi_k3_streaming_content",
     "apply_kimi_k3_reasoning_registry",
     "apply_kimi_k3_renderer_registry",
     "apply_kimi_k3_tokenizer_registry",

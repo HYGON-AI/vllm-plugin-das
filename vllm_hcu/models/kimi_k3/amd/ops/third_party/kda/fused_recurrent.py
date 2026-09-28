@@ -309,8 +309,8 @@ def fused_recurrent_kda_fwd(
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch recurrent KDA with dense inner dimensions and row strides."""
-    # Delegate the recurrent kernel to bolt_ops (static config, no autotune).
-    from bolt_ops.fla.kda import fused_recurrent_kda_fwd as impl
+    # Delegate the recurrent kernel to boltops (static config, no autotune).
+    from boltops.fla.kda import fused_recurrent_kda_fwd as impl
 
     return impl(
         q,
@@ -355,8 +355,8 @@ def fused_recurrent_kda(
     This vLLM wrapper applies the gate activation and beta sigmoid, selecting
     whether to materialize them before launching the recurrent kernel.
     """
-    # Delegate to bolt_ops, which carries the identical fused-gate logic.
-    from bolt_ops.fla.kda import fused_recurrent_kda as impl
+    # Delegate to boltops, which carries the identical fused-gate logic.
+    from boltops.fla.kda import fused_recurrent_kda as impl
 
     return impl(
         q,
@@ -478,8 +478,8 @@ def fused_recurrent_kda_packed_decode(
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one-token KDA decode directly from packed post-conv QKV."""
-    # Delegate to bolt_ops (static config, no autotune).
-    from bolt_ops.fla.kda import fused_recurrent_kda_packed_decode as impl
+    # Delegate to boltops (static config, no autotune).
+    from boltops.fla.kda import fused_recurrent_kda_packed_decode as impl
 
     return impl(
         mixed_qkv,
