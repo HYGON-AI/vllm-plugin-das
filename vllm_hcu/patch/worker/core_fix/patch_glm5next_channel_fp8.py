@@ -289,9 +289,14 @@ def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
             self, "is_mtp_layer", False
         ):
             from vllm.model_executor.layers import mhc
-            from vllm_hcu.model_executor.layers import mhc as boltops_mhc
+            from vllm_hcu.platforms import envs as henvs
 
-            _bind_glm5next_boltops_mhc(self, mhc, boltops_mhc)
+            if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
+                from vllm_hcu.model_executor.layers import mhc as boltops_mhc
+
+                _bind_glm5next_boltops_mhc(self, mhc, boltops_mhc)
+            else:
+                _bind_glm5next_native_mhc(self, mhc)
 
     setattr(hcu_decoder_init, _MHC_WRAPPER_MARKER, True)
     setattr(decoder_cls, "_vllm_hcu_original_init", original)
