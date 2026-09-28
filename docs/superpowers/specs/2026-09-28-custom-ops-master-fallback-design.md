@@ -87,6 +87,7 @@ The audited managed set covers:
 
 | Area | Optimized provider | Master-off behavior |
 | --- | --- | --- |
+| Dense MLA attention | HCU FlashMLA | vLLM Triton MLA; automatic when no backend is specified, with an explicit HCU `FLASHMLA` request downgraded after a visible warning |
 | Sparse MLA | HCU/LightOp optimized path | BoltOPs sparse MLA |
 | Dense FP8/INT8 GEMM | LightOp/hipBLASLt/AITER selection | target vLLM Triton GEMM |
 | MoE gate/router auxiliary | LightOp | upstream vLLM router |
@@ -122,7 +123,9 @@ Unit tests cover all four master/child combinations, assert the selected
 provider, and use call spies to prove that LightOp/AITER entry points are not
 reached when the master is off.  Separate tests prove that explicit AITER MoE
 selection is not rewritten and that FP8 QSA reader/writer selection remains
-independent.
+independent.  Dense MLA selector tests cover automatic and explicit FLASHMLA
+and Triton choices under both master states, preserve sparse MLA, and preserve
+third-party FLASHMLA registry overrides.
 
 Regression tests cover the Hy4 grouped-top-k gate because that is the known
 precision-risk path.  The master-off result must match the upstream router's
