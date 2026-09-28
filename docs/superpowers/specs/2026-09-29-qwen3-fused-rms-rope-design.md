@@ -42,4 +42,3 @@ idempotence, supported routing, disabled routing, two-dimensional positions,
 dual-chunk attention, and public LightOp API ownership.  HCU validation covers
 single-operator BF16 accuracy/performance and Qwen3-8B service startup,
 `/health`, `/v1/models`, HumanEval prompts 0-7, and an A/B throughput run.
-

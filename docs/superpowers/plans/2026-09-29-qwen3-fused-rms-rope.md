@@ -81,4 +81,3 @@
 - [ ] **Step 4: Run Qwen3-8B baseline/candidate service checks** including `curl --noproxy '*' /health`, `/v1/models`, HumanEval 0-7, and throughput A/B; record exact commands and results.
 - [ ] **Step 5: Run repository verification.** Run: `pytest -q`. Expected: PASS apart from explicitly documented environment skips.
 - [ ] **Step 6: Commit validation documentation.** Commit message: `docs(qwen3): record fused rms rope validation`.
-
