@@ -115,13 +115,16 @@ Run focused suites, `git diff --check`, then repository `pytest -q`; record ever
 
 - [ ] **Step 2: Run HCU kernel and service validation**
 
-On available cards, run the official rejected-draft kernel scenario, repeated deterministic mHC probes, TP4 MTP3 master-off/on service checks, and prefix-cache repeated prompts.
+On available cards, run the official rejected-draft kernel scenario, repeated
+mHC probes, TP4 MTP3 master-off/on service checks, and prefix-cache repeated
+prompts.
 
 - [ ] **Step 3: Run HMMT25 accuracy**
 
-Run the agreed 32-item HMMT25 gate with the corrected code and compare master-off/on outputs, max-token terminations, and scores.
+Run the complete HMMT25 gate with the corrected code and compare master-off/on
+outputs, max-token terminations, and scores.  The packaged February 2025 split
+contains 30 records, so report 30/30 rather than silently claiming 32 inputs.
 
 - [ ] **Step 4: Review and document**
 
 Perform a fresh whole-branch review, fix important findings RED-to-GREEN, update the upgrade skill evidence, and prepare the exact MR comment. Do not push or post until explicitly authorized for the resulting commits.
-

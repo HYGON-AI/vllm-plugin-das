@@ -209,7 +209,7 @@ def _patched_glm5next_tail_cache_spec(num_speculative_tokens: int):
 
 @pytest.mark.parametrize(
     ("num_speculative_tokens", "expected_ring"),
-    [(0, 4), (3, 8)],
+    [(0, 4), (1, 8), (3, 8), (4, 8), (7, 16), (13, 32)],
 )
 def test_glm5next_tail_ring_covers_pool_and_speculative_tokens(
     num_speculative_tokens: int,

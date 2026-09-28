@@ -2,7 +2,7 @@
 
 ## Goal
 
-Restore deterministic GLM-5.3-Flash inference on the v0.28.1-dev target for
+Restore correct GLM-5.3-Flash inference on the v0.28.1-dev target for
 MTP3 under both `VLLM_HCU_USE_CUSTOM_OPS` states.
 
 ## Required behavior
@@ -35,5 +35,4 @@ mHC implementation instead of carrying another TileLang variant.
 - CPU/runtime-patch tests cover pool4/MTP3 ring sizing, kernel launch ring
   metadata, rejected-draft redo, and master-off/on production mHC binding.
 - HCU validation covers TP4 MTP3 with master off and on, prefix-cache reuse,
-  deterministic repeated decoding, and HMMT25 accuracy.
-
+  repeated decoding, and HMMT25 accuracy.
