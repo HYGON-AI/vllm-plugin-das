@@ -11,7 +11,7 @@ from vllm import envs
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.utils.torch_utils import set_random_seed
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
-from vllm.config import CUDAGraphMode, VllmConfig, CacheConfig
+from vllm.config import CUDAGraphMode, VllmConfig, CacheConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
@@ -90,7 +90,8 @@ class HcuGPUWorker(Worker):
             flush=True,
         )
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            self.model_runner.profile_run()
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner.profile_run()
             logger.info(
                 "Initial free memory %s GiB, reserved %s GiB for KV cache",
                 format_gib(self.init_snapshot.free_memory),
@@ -102,7 +103,8 @@ class HcuGPUWorker(Worker):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner.profile_run()
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
             )
@@ -185,10 +187,12 @@ class HcuGPUWorker(Worker):
                 suppress_pp_v2_warmup_sample_broadcast,
             )
 
-            with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
+            with set_current_vllm_config(self.vllm_config), \
+                    suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
                 result = super().compile_or_warm_up_model()
         else:
-            result = super().compile_or_warm_up_model()
+            with set_current_vllm_config(self.vllm_config):
+                result = super().compile_or_warm_up_model()
 
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
         from vllm_hcu.patch.worker import validate_worker_patches

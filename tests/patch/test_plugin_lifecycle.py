@@ -1140,3 +1140,118 @@ def test_plugin_source_has_no_builtins_import_override():
     source = inspect.getsource(plugin)
     assert "patch_utils" not in source
     assert "builtins.__import__" not in source
+
+
+# ---------------------------------------------------------------------------
+# determine_available_memory: vllm_config context contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kv_cache_memory_bytes",
+    [0, 4096],
+    ids=["normal_path", "kv_bytes_fast_path"],
+)
+def test_determine_available_memory_provides_vllm_config_context_to_profile_run(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+    kv_cache_memory_bytes: int,
+):
+    """``profile_run`` must execute inside ``set_current_vllm_config``.
+
+    ``SparseAttnIndexer.__init__`` (and other lazy initialisers) call
+    ``get_current_vllm_config()`` which asserts the context is live.  Before
+    this fix, ``HcuGPUWorker.determine_available_memory`` called
+    ``profile_run`` with no surrounding context, so any lazy init triggered
+    during profiling would crash with AssertionError.
+
+    The fix wraps both call-sites in ``with set_current_vllm_config(...)``.
+    This test verifies the sentinel config object is visible inside
+    ``profile_run`` on both code paths:
+
+    * ``kv_cache_memory_bytes=4096`` → fast path (bypass memory profiling)
+    * ``kv_cache_memory_bytes=0``    → normal path (via memory_profiling ctx)
+    """
+    worker_module = cpu_safe_hcu_worker_module
+
+    # ── tracking state ────────────────────────────────────────────────────
+    sentinel = object()          # stands in for vllm_config
+    active: list[object] = [None]   # config visible at call time
+    config_seen: list[object] = []  # captured inside profile_run
+
+    # ── fake set_current_vllm_config ──────────────────────────────────────
+    from contextlib import contextmanager as _cm
+
+    @_cm
+    def fake_set_current(cfg):
+        active[0] = cfg
+        try:
+            yield
+        finally:
+            active[0] = None
+
+    monkeypatch.setattr(worker_module, "set_current_vllm_config", fake_set_current)
+
+    # ── fake profile_run on the base Worker class ─────────────────────────
+    def recording_profile_run(self):
+        config_seen.append(active[0])
+
+    monkeypatch.setattr(
+        worker_module.Worker, "profile_run", recording_profile_run, raising=False
+    )
+
+    # ── fake memory_profiling ctx (used by the normal path only) ──────────
+    @_cm
+    def fake_memory_profiling(*args, **kwargs):
+        yield SimpleNamespace(
+            torch_peak_increase=0,
+            before_profile=SimpleNamespace(torch_peak=0),
+            non_torch_increase=0,
+            weights_memory=0,
+            after_profile=SimpleNamespace(free_memory=0),
+        )
+
+    monkeypatch.setattr(worker_module, "memory_profiling", fake_memory_profiling)
+
+    # ── minimal worker stub ───────────────────────────────────────────────
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.vllm_config = sentinel
+    worker.rank = 0
+    worker.device = "cpu"
+    worker.model_memory_usage = 0
+    worker.init_snapshot = SimpleNamespace(free_memory=0)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes
+    )
+    worker._reserve_mm_ipc_gpu_memory = lambda n: n
+
+    if kv_cache_memory_bytes == 0:
+        # The normal path reads these after profile_run; stub them out.
+        import torch as _torch
+
+        monkeypatch.setattr(
+            _torch.accelerator,
+            "memory_stats",
+            lambda device: {
+                "allocated_bytes.all.peak": 0,
+                "allocated_bytes.all.current": 0,
+            },
+            raising=False,
+        )
+        monkeypatch.setattr(
+            worker_module, "current_platform",
+            SimpleNamespace(is_cuda=lambda: False),
+            raising=False,
+        )
+
+    worker.determine_available_memory()
+
+    # ── assertions ────────────────────────────────────────────────────────
+    assert len(config_seen) == 1, (
+        "profile_run must be called exactly once from determine_available_memory"
+    )
+    assert config_seen[0] is sentinel, (
+        "profile_run ran outside set_current_vllm_config — "
+        "get_current_vllm_config() calls inside it would raise AssertionError. "
+        f"config seen: {config_seen[0]!r}"
+    )
