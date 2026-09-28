@@ -956,6 +956,16 @@ def _load_boltops_mqa_logits():
     return kernel
 
 
+def _mqa_scale_for_k(
+    k: torch.Tensor,
+    scale: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Keep per-key scales for quantized K, independent of device family."""
+    if k.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    return scale
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -991,7 +1001,7 @@ def rocm_fp8_mqa_logits(
                 "using the vllm_hcu Torch sparse-indexer prefill reference"
             )
             k_fp8, scale = kv
-            kernel_scale = scale if on_gfx938() else None
+            kernel_scale = _mqa_scale_for_k(k_fp8, scale)
             return fp8_mqa_logits_torch(
                 q,
                 (k_fp8, kernel_scale),
@@ -1004,7 +1014,7 @@ def rocm_fp8_mqa_logits(
             "sparse-indexer prefill MQA"
         )
         k_fp8, scale = kv
-        kernel_scale = scale if on_gfx938() else None
+        kernel_scale = _mqa_scale_for_k(k_fp8, scale)
         return boltops_mqa_logits(
             q,
             k_fp8,
