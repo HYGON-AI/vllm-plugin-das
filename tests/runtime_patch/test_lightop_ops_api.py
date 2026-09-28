@@ -440,7 +440,7 @@ def test_dynamic_rms_quant_consumes_returned_tensors(
     assert actual_s is expected_s
 
 
-def _load_gemma_forward():
+def _load_gemma_forward(*, custom_ops_enabled: bool = True):
     method = copy.deepcopy(
         next(
             node
@@ -460,12 +460,32 @@ def _load_gemma_forward():
         "henvs": SimpleNamespace(
             VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM=True,
             optional_custom_op_enabled=lambda feature_enabled=True: bool(
-                feature_enabled
+                custom_ops_enabled and feature_enabled
             ),
         ),
     }
     exec(compile(module, "gemma_forward_contract", "exec"), namespace)
     return namespace["forward_hip"]
+
+
+def test_gemma_rmsnorm_master_off_delegates_to_current_native_fallback() -> None:
+    forward = _load_gemma_forward(custom_ops_enabled=False)
+    x = torch.ones((2, 4))
+    residual = torch.full_like(x, 2)
+    expected = object()
+    calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+
+    def forward_native(
+        actual_x: torch.Tensor,
+        actual_residual: torch.Tensor | None,
+    ) -> object:
+        calls.append((actual_x, actual_residual))
+        return expected
+
+    owner = SimpleNamespace(forward_native=forward_native)
+
+    assert forward(owner, x, residual) is expected
+    assert calls == [(x, residual)]
 
 
 def test_gemma_rmsnorm_uses_new_out_keyword(

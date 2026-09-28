@@ -5,6 +5,7 @@ import torch
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 import vllm_hcu.platforms.envs as henvs
 
+
 @GemmaRMSNorm.register_oot
 class HcuGemmaRMSNorm(GemmaRMSNorm):
     def forward_hip(
@@ -25,14 +26,8 @@ class HcuGemmaRMSNorm(GemmaRMSNorm):
                 gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
                 return x, residual
         else:
-            if torch.compiler.is_compiling():
-                return self.forward_native(x, residual)
-            if not getattr(self, "_is_compiled", False):
-                self._forward_static_no_residual = torch.compile(  # type: ignore
-                    self._forward_static_no_residual
-                )
-                self._forward_static_with_residual = torch.compile(  # type: ignore
-                    self._forward_static_with_residual
-                )
-                self._is_compiled = True
+            # vLLM 0.28.1 implements the portable fallback through IR ops in
+            # ``forward_native``.  The private ``_forward_static_*`` helpers
+            # used by older releases no longer exist, so delegating is both
+            # the current ABI and the master-switch fallback path.
             return self.forward_native(x, residual)
