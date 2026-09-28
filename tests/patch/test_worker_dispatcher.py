@@ -127,6 +127,9 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert positions["worker.op_opt.attention.hcu_layout_and_fused_qkv"] < positions[
         "worker.op_opt.attention.fused_qkv_public_export"
     ]
+    assert worker_dispatcher._patch_features()[
+        "worker.op_opt.qwen3.fused_rms_rope"
+    ] == "always"
     framework_order = (
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
