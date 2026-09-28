@@ -27,15 +27,13 @@ _WRAPPER_MARKER = "_vllm_hcu_lightop_autoawq_wrapper"
 
 def _public_lightop_awq_available() -> bool:
     try:
-        from lightop.gemm_ops import (
-            awq_gemm_marlin_weight_repack,
-            gemm_awq_w4a16_marlin,
+        from vllm_hcu.model_executor.layers.quantization.lightop_autoawq import (
+            _resolve_lightop_awq_ops,
         )
-    except (ImportError, AttributeError):
+        _resolve_lightop_awq_ops()
+    except (ImportError, AttributeError, OSError):
         return False
-    return callable(awq_gemm_marlin_weight_repack) and callable(
-        gemm_awq_w4a16_marlin
-    )
+    return True
 
 
 def _config_is_supported(config: object) -> bool:

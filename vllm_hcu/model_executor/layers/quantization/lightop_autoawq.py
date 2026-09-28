@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from typing import Any
 
@@ -103,6 +104,22 @@ def _resolve_lightop_awq_ops() -> tuple[Callable[..., Any], Callable[..., Any]]:
         gemm_awq_w4a16_marlin,
     )
 
+    expected_signatures = (
+        (awq_gemm_marlin_weight_repack, ("weight_trans", "N", "K")),
+        (gemm_awq_w4a16_marlin, ("a", "b", "scales_zeros")),
+    )
+    for function, expected in expected_signatures:
+        try:
+            actual = tuple(inspect.signature(function).parameters)
+        except (TypeError, ValueError) as error:
+            raise ImportError(
+                "LightOp AutoAWQ public callable has no inspectable signature"
+            ) from error
+        if actual != expected:
+            raise ImportError(
+                "LightOp AutoAWQ public callable has incompatible signature: "
+                f"expected {expected}, got {actual}"
+            )
     return awq_gemm_marlin_weight_repack, gemm_awq_w4a16_marlin
 
 
@@ -151,13 +168,15 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._lightop_active = False
+        self._lightop_gemm = None
         if not self._eligible():
             self.delegate.process_weights_after_loading(layer)
             return
 
         try:
             repack, gemm = _resolve_lightop_awq_ops()
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, OSError):
             self.delegate.process_weights_after_loading(layer)
             return
 
@@ -169,7 +188,7 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         )
         try:
             repacked_weight = repack(weight_trans, self._n, self._k)
-        except (TypeError, ValueError, AssertionError):
+        except (TypeError, ValueError, AssertionError, RuntimeError):
             self.delegate.process_weights_after_loading(layer)
             return
 
@@ -194,6 +213,8 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
             raise RuntimeError("LightOp AutoAWQ GEMM was not initialized")
 
         output_shape = x.shape[:-1] + (self._n,)
+        if x.numel() == 0:
+            return x.new_empty(output_shape)
         output = self._lightop_gemm(
             x.reshape(-1, x.shape[-1]),
             layer.qweight,

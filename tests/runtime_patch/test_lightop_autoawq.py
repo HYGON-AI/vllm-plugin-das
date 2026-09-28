@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -207,6 +208,189 @@ def test_hybrid_awq_delegates_without_mutating_unsupported_weights(
     assert layer.qzeros is qzeros
     assert layer.scales is scales
     assert torch.equal(output, torch.full((2, 3), 17, dtype=torch.bfloat16))
+
+
+def test_lightop_awq_resolver_rejects_incompatible_public_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []
+    gemm_ops = ModuleType("lightop.gemm_ops")
+    gemm_ops.awq_gemm_marlin_weight_repack = lambda weight: weight
+    gemm_ops.gemm_awq_w4a16_marlin = lambda a, b, scales_zeros: a
+    lightop.gemm_ops = gemm_ops
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
+
+    with pytest.raises(ImportError, match="incompatible signature"):
+        autoawq._resolve_lightop_awq_ops()
+
+
+def test_autoawq_patch_treats_public_import_oserror_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    patch = _load_autoawq_patch_module()
+
+    def incompatible_binary():
+        raise OSError("unresolved vendor symbol")
+
+    monkeypatch.setattr(autoawq, "_resolve_lightop_awq_ops", incompatible_binary)
+
+    assert patch._public_lightop_awq_available() is False
+
+
+def test_hybrid_awq_repack_runtime_failure_is_atomic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    delegate = _Delegate()
+    method, layer = _make_method(autoawq, delegate)
+    original = (layer.qweight, layer.qzeros, layer.scales)
+    method._lightop_active = True
+    method._lightop_gemm = lambda *_args: pytest.fail(
+        "stale LightOp state must be cleared"
+    )
+
+    def incompatible_repack(*_args):
+        raise RuntimeError("vendor ABI mismatch")
+
+    monkeypatch.setattr(
+        autoawq, "is_lightop_awq_shape_supported", lambda _k, _n: True
+    )
+    monkeypatch.setattr(
+        autoawq,
+        "_resolve_lightop_awq_ops",
+        lambda: (incompatible_repack, lambda a, b, scales_zeros: a),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert delegate.processed == 1
+    assert layer.qweight is original[0]
+    assert layer.qzeros is original[1]
+    assert layer.scales is original[2]
+    assert not hasattr(layer, "scales_zeros")
+    assert method._lightop_active is False
+    assert method._lightop_gemm is None
+    output = method.apply(layer, torch.ones((1, 128), dtype=torch.float16))
+    assert torch.equal(output, torch.full((1, 3), 17, dtype=torch.float16))
+
+
+def test_hybrid_awq_empty_input_does_not_call_lightop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    delegate = _Delegate()
+    method, layer = _make_method(autoawq, delegate)
+    monkeypatch.setattr(
+        autoawq, "is_lightop_awq_shape_supported", lambda _k, _n: True
+    )
+    monkeypatch.setattr(
+        autoawq,
+        "_resolve_lightop_awq_ops",
+        lambda: (
+            lambda weight, _n, _k: weight,
+            lambda *_args: pytest.fail("M=0 must not call LightOp"),
+        ),
+    )
+    method.process_weights_after_loading(layer)
+
+    output = method.apply(
+        layer,
+        torch.empty((2, 0, 128), dtype=torch.float16),
+        torch.arange(8, dtype=torch.float16),
+    )
+
+    assert output.shape == (2, 0, 8)
+    assert output.dtype == torch.float16
+
+
+def test_hybrid_awq_reprocesses_after_vllm_restores_loader_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    import vllm.model_executor.parameter as parameter
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig,
+        AutoAWQLinearMethod,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        get_layerwise_info,
+        record_metadata_for_reloading,
+    )
+    from vllm.model_executor.model_loader.reload.meta import (
+        materialize_layer,
+        restore_layer_on_meta,
+    )
+    from vllm.model_executor.model_loader.reload.utils import (
+        get_layer_params_buffers,
+    )
+
+    config = AutoAWQConfig(4, 128, True, False)
+    method = autoawq.LightOpAutoAWQLinearMethod(
+        AutoAWQLinearMethod(config), config
+    )
+    layer = torch.nn.Module()
+
+    def weight_loader(param, loaded_weight):
+        param.data.copy_(loaded_weight)
+
+    method.create_weights(
+        layer,
+        128,
+        [8],
+        128,
+        8,
+        torch.float16,
+        weight_loader=weight_loader,
+    )
+    record_metadata_for_reloading(layer)
+    layer.qweight.data.zero_()
+    layer.qzeros.data.zero_()
+    layer.scales.data.fill_(1)
+    repack_calls = 0
+
+    def repack(weight, _n, _k):
+        nonlocal repack_calls
+        repack_calls += 1
+        return weight
+
+    monkeypatch.setattr(
+        autoawq, "is_lightop_awq_shape_supported", lambda _k, _n: True
+    )
+    monkeypatch.setattr(
+        autoawq,
+        "_resolve_lightop_awq_ops",
+        lambda: (repack, lambda a, b, scales_zeros: a),
+    )
+    method.process_weights_after_loading(layer)
+    assert repack_calls == 1
+    assert not hasattr(layer, "qzeros")
+
+    info = get_layerwise_info(layer)
+    info.kernel_tensors = get_layer_params_buffers(layer)
+    restore_layer_on_meta(layer, info)
+    materialize_layer(layer, info)
+    assert hasattr(layer.qweight, "weight_loader")
+    assert hasattr(layer.qzeros, "weight_loader")
+    assert hasattr(layer.scales, "weight_loader")
+    layer.qweight.data.zero_()
+    layer.qzeros.data.zero_()
+    layer.scales.data.fill_(1)
+
+    method.process_weights_after_loading(layer)
+
+    assert repack_calls == 2
+    assert hasattr(layer, "scales_zeros")
+    assert not hasattr(layer, "qzeros")
+    assert not hasattr(layer, "scales")
 
 
 @pytest.mark.parametrize(
