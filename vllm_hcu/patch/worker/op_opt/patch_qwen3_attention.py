@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 from types import ModuleType
 
 import torch
@@ -33,6 +34,12 @@ def fused_rms_rotary_embedding(*args):
     from vllm_hcu.ops.rms_rope import fused_rms_rotary_embedding as fused
 
     return fused(*args)
+
+
+def _register_fused_op_owner() -> None:
+    """Register custom-op schemas before an AOT cache is loaded."""
+
+    importlib.import_module("vllm_hcu.ops.rms_rope")
 
 
 def _supports_fused_path(
@@ -96,6 +103,8 @@ def apply_to_module(module: ModuleType) -> bool:
         positional=("self", "positions", "hidden_states"),
     )
     feature_enabled = henvs.fused_qwen3_rms_rope_enabled()
+    if feature_enabled:
+        _register_fused_op_owner()
 
     @functools.wraps(original)
     def hcu_forward(self, positions, hidden_states):

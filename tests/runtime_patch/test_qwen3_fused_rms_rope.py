@@ -288,6 +288,22 @@ def test_qwen3_patch_is_idempotent_and_preserves_one_original() -> None:
     assert attention_class._vllm_hcu_original_forward is original
 
 
+def test_qwen3_patch_registers_custom_ops_before_installing_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _load_qwen3_patch_module()
+    target, _ = _make_qwen3_target()
+    calls: list[str] = []
+    monkeypatch.delenv("VLLM_HCU_USE_FUSED_RMS_ROPE", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setattr(
+        patch, "_register_fused_op_owner", lambda: calls.append("registered")
+    )
+
+    assert patch.apply_to_module(target) is True
+    assert calls == ["registered"]
+
+
 def test_qwen3_patch_rejects_forward_signature_drift() -> None:
     patch = _load_qwen3_patch_module()
 
