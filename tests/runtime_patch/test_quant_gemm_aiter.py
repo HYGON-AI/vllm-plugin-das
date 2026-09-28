@@ -2410,25 +2410,44 @@ def test_aiter_linear_capability_respects_custom_ops_master(
     assert cls.is_linear_fp8_enabled() is expected
 
 
-@pytest.mark.parametrize("master_enabled", (False, True))
-@pytest.mark.parametrize("custom_ar_enabled", (False, True))
-def test_aiter_custom_all_reduce_capability_respects_custom_ops_master(
+@pytest.mark.parametrize(
+    (
+        "master_enabled",
+        "aiter_enabled",
+        "custom_ar_env",
+        "custom_ar_enabled",
+        "expected",
+    ),
+    (
+        (True, False, "1", True, True),
+        (True, False, None, True, False),
+        (True, True, None, True, True),
+        (True, True, "0", False, False),
+        (False, False, "1", True, False),
+    ),
+)
+def test_aiter_custom_all_reduce_has_an_independent_explicit_switch(
     monkeypatch: pytest.MonkeyPatch,
     master_enabled: bool,
+    aiter_enabled: bool,
+    custom_ar_env: str | None,
     custom_ar_enabled: bool,
+    expected: bool,
 ) -> None:
     module = _aiter_replacement_module()
     cls = module.rocm_aiter_ops
     monkeypatch.setattr(module, "is_aiter_found_and_supported", lambda: True)
-    monkeypatch.setattr(cls, "_AITER_ENABLED", True)
+    monkeypatch.setattr(cls, "_AITER_ENABLED", aiter_enabled)
     monkeypatch.setattr(cls, "_CUSTOM_ALL_REDUCE_ENABLED", custom_ar_enabled)
+    if custom_ar_env is None:
+        monkeypatch.delenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", custom_ar_env)
     monkeypatch.setenv(
         "VLLM_HCU_USE_CUSTOM_OPS", "1" if master_enabled else "0"
     )
 
-    assert cls.is_custom_all_reduce_enabled() is (
-        master_enabled and custom_ar_enabled
-    )
+    assert cls.is_custom_all_reduce_enabled() is expected
 
 
 def test_aiter_master_off_hides_existing_all_reduce_instance(
