@@ -1779,8 +1779,11 @@ class rocm_aiter_ops:
     def is_custom_all_reduce_enabled(cls) -> bool:
         return (
             henvs.custom_ops_enabled()
-            and cls._AITER_ENABLED
             and cls._CUSTOM_ALL_REDUCE_ENABLED
+            and (
+                cls._AITER_ENABLED
+                or envs.is_set("VLLM_ROCM_USE_AITER_CUSTOM_AR")
+            )
         )
 
     @classmethod

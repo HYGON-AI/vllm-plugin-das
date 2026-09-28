@@ -15,6 +15,7 @@ from vllm_hcu.patch.tokenizer_callbacks import register_tokenizer_callbacks
 
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
+    patch_aiter_custom_all_reduce,
     patch_engine_core,
     patch_distributed_utils,
     patch_kv_cache_coordinator,
@@ -45,6 +46,7 @@ _DISPATCH_LOCK = threading.RLock()
 # MTP coordinator wrapper so its base-constructor chain observes DCP-only
 # cache sizing while retaining the existing MTP group semantics.
 _ORDERED_FRAMEWORK_ADAPTERS = (
+    patch_aiter_custom_all_reduce,
     patch_distributed_utils,
     patch_mooncake_connector,
     patch_kv_connector_factory,
