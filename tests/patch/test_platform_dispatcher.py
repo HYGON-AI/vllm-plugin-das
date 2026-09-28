@@ -16,6 +16,7 @@ import pytest
 import vllm_hcu.patch.platform as platform_dispatcher
 from vllm_hcu.patch.platform import platform_framework_callback_names
 from vllm_hcu.patch.platform.core_fix import platform_core_callback_names
+from vllm_hcu.patch.platform.framework_opt import patch_aiter_custom_all_reduce
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -174,6 +175,9 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
 
 
 def test_aiter_custom_ar_explicit_limit_preserves_fused_limit():
+    assert patch_aiter_custom_all_reduce.PATCH_ID == (
+        "platform.framework_opt.aiter_custom_allreduce_buffer"
+    )
     result = _run_fresh(
         "import os; os.environ['AITER_AR_MAX_SIZE_MB'] = '256'; "
         "from vllm_hcu.patch.platform import apply_platform_patches; "
@@ -211,18 +215,42 @@ def test_aiter_custom_ar_explicit_limit_reaches_internal_constructor():
         "import AiterCustomAllreduce; "
         "fake = types.ModuleType("
         "'aiter.dist.device_communicators.custom_all_reduce'); "
-        "fake.CustomAllreduce = lambda group, device, max_size: "
-        "types.SimpleNamespace(max_size=max_size); "
+        "fake.CustomAllreduce = lambda group, device, max_size, "
+        "enable_register_for_capturing: types.SimpleNamespace("
+        "max_size=max_size, enable_register_for_capturing="
+        "enable_register_for_capturing); "
         "sys.modules[fake.__name__] = fake; "
         "instance = AiterCustomAllreduce(object(), 'cuda:0'); "
         "explicit = AiterCustomAllreduce(object(), 'cuda:0', 1048576); "
         "print(type(instance).__name__, instance.aiter_ca.max_size, "
-        "explicit.aiter_ca.max_size)"
+        "explicit.aiter_ca.max_size, "
+        "instance.aiter_ca.enable_register_for_capturing)"
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith(
-        "AiterCustomAllreduce 536870912 1048576"
+        "AiterCustomAllreduce 536870912 1048576 False"
     )
+
+
+def test_aiter_custom_ar_allows_explicit_graph_registration_opt_in():
+    result = _run_fresh(
+        "import os, sys, types; "
+        "os.environ['AITER_AR_ENABLE_REG_CAPTURE'] = '1'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "fake = types.ModuleType("
+        "'aiter.dist.device_communicators.custom_all_reduce'); "
+        "fake.CustomAllreduce = lambda group, device, max_size, "
+        "enable_register_for_capturing: types.SimpleNamespace("
+        "enable_register_for_capturing=enable_register_for_capturing); "
+        "sys.modules[fake.__name__] = fake; "
+        "instance = AiterCustomAllreduce(object(), 'cuda:0'); "
+        "print(instance.aiter_ca.enable_register_for_capturing)"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("True")
 
 
 @pytest.mark.parametrize("value", ("0", "invalid"))

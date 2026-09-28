@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Size vLLM's AITER wrapper for an explicit OpenDAS AITER AR limit."""
+"""Adapt vLLM's AITER wrapper for HCU buffer sizing and graph safety."""
 
 from __future__ import annotations
 
@@ -28,6 +28,13 @@ TARGETS = (
 _MARKER = "_vllm_hcu_aiter_custom_allreduce_buffer_applied"
 _WRAPPER = "_vllm_hcu_aiter_custom_allreduce_buffer_wrapper"
 _MIB = 1024 * 1024
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _configured_buffer_size(default_size: int) -> int:
@@ -89,9 +96,29 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(init)
     def hcu_init(self, group, device, max_size=None):
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            CustomAllreduce as _AiterCustomAllreduce,
+        )
+
         if max_size is None:
             max_size = configured_size
-        return init(self, group, device, max_size)
+        parameters = inspect.signature(_AiterCustomAllreduce).parameters
+        if "enable_register_for_capturing" not in parameters:
+            raise PatchCompatibilityError(
+                "OpenDAS AITER CustomAllreduce must accept "
+                "enable_register_for_capturing"
+            )
+        # The vendor IPC registration path can replay stale graph inputs.
+        # Use AITER's pre-registered copy-in path by default; retain an explicit
+        # opt-in for a future vendor build that fixes direct graph registration.
+        self._impl = _AiterCustomAllreduce(
+            group,
+            device,
+            max_size=max_size,
+            enable_register_for_capturing=_env_flag(
+                "AITER_AR_ENABLE_REG_CAPTURE", default=False
+            ),
+        )
 
     setattr(hcu_init, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", init)
