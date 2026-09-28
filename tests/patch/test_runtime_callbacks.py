@@ -12,9 +12,9 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-import vllm
 from packaging.version import Version
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 import vllm_hcu.patch.runtime_callbacks as runtime_callbacks
 from vllm_hcu.patch._stage3_common import Stage3CompatibilityError
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
@@ -320,16 +320,7 @@ def test_weight_installer_is_direct_idempotent_and_keeps_bindings_coherent(
 @pytest.mark.hcu
 def test_clean_current_model_loader_import_order_has_no_weight_debug_cycle():
     repo = Path(__file__).resolve().parents[2]
-    target_vllm = Path(
-        os.environ.get(
-            "VLLM_SOURCE_ROOT",
-            Path(vllm.__file__).resolve().parents[1],
-        )
-    ).resolve()
-    if not (target_vllm / "vllm" / "__init__.py").is_file():
-        raise RuntimeError(
-            f"VLLM_SOURCE_ROOT does not contain vllm: {target_vllm}"
-        )
+    target_vllm = resolve_target_vllm_root()
     target_release = Version(__vllm_target_version__).release[:3]
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"

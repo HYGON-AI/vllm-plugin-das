@@ -13,9 +13,9 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-import vllm
 from packaging.version import Version
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 import vllm_hcu.patch.worker as worker_dispatcher
 from vllm_hcu.patch.import_coordinator import ExactImportCoordinator
 from vllm_hcu.patch.runtime_state import LatchedPatchError, PatchRegistry, PatchStatus
@@ -24,13 +24,7 @@ from vllm_hcu.version import __vllm_target_version__
 
 REPO = Path(__file__).resolve().parents[2]
 TARGET_RELEASE = Version(__vllm_target_version__).release[:3]
-TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_SOURCE_ROOT", Path(vllm.__file__).resolve().parents[1])
-).resolve()
-if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
-    raise RuntimeError(
-        f"VLLM_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
-    )
+TARGET_VLLM_ROOT = resolve_target_vllm_root()
 if TARGET_RELEASE != (0, 28, 1):
     raise RuntimeError(
         "worker dispatcher tests require the v0.28.1 target release, got "

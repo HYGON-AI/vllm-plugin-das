@@ -11,47 +11,48 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import sysconfig
 from typing import Any
 
 import pytest
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 _RESULT_PREFIX = "VLLM_HCU_BOOTSTRAP_RESULT="
 
-
-def _resolve_target_vllm_root() -> Path:
-    configured_root = os.environ.get("VLLM_SOURCE_ROOT")
-    vllm_spec = importlib.util.find_spec("vllm")
-    discovered_root = (
-        Path(vllm_spec.origin).resolve().parents[1]
-        if vllm_spec is not None and vllm_spec.origin is not None
-        else None
-    )
-    installed_roots = tuple(
-        Path(path)
-        for key in ("platlib", "purelib")
-        if (path := sysconfig.get_path(key))
-    )
-    candidates = (
-        (Path(configured_root),)
-        if configured_root is not None
-        else (discovered_root, *installed_roots)
-    )
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        resolved = candidate.resolve()
-        if (resolved / "vllm" / "__init__.py").is_file():
-            return resolved
-    rendered = ", ".join(str(path) for path in candidates if path is not None)
-    raise RuntimeError(
-        "no current vLLM source/install was found; checked: " + rendered
-    )
+TARGET_VLLM_ROOT = resolve_target_vllm_root()
 
 
-TARGET_VLLM_ROOT = _resolve_target_vllm_root()
+_PARENT_COLLECTION_WITH_EXPLICIT_SOURCE = r"""
+import importlib
+import importlib.abc
+import importlib.util
+import sys
+
+original_find_spec = importlib.util.find_spec
+
+def guarded_find_spec(name, *args, **kwargs):
+    if name == "vllm":
+        raise AssertionError("parent process discovered installed vLLM")
+    return original_find_spec(name, *args, **kwargs)
+
+class BlockParentVllm(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "vllm" or fullname.startswith("vllm."):
+            raise AssertionError(f"parent process imported {fullname}")
+        return None
+
+importlib.util.find_spec = guarded_find_spec
+sys.meta_path.insert(0, BlockParentVllm())
+for module_name in (
+    "tests.patch.test_runtime_callbacks",
+    "tests.patch.test_worker_dispatcher",
+    "tests.patch.test_clean_process_bootstrap",
+    "tests.runtime_patch.test_platform_framework_opt",
+):
+    importlib.import_module(module_name)
+    print("COLLECT_OK", module_name)
+"""
 
 
 _TARGET_SOURCE_ASSERTION = r"""
@@ -380,6 +381,22 @@ def _require_local_hcu_extension() -> None:
         "`MAX_JOBS=8 python -m pip install -e . --no-build-isolation` "
         "and rerun this test"
     )
+
+
+def test_explicit_source_root_does_not_require_parent_vllm_import() -> None:
+    environment = _clean_environment(plugins="__disabled__")
+    environment["PYTHONPATH"] = str(REPOSITORY)
+    result = subprocess.run(
+        [sys.executable, "-c", _PARENT_COLLECTION_WITH_EXPLICIT_SOURCE],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("COLLECT_OK") == 4
 
 
 def test_clean_process_arms_complete_patch_inventory_and_is_idempotent() -> None:

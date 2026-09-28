@@ -13,6 +13,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.fixtures.vllm_source import resolve_target_vllm_root
+
 # Unit tests activate adapters explicitly and therefore disable plugin discovery.
 os.environ.setdefault("VLLM_PLUGINS", "__disabled__")
 
@@ -38,6 +40,36 @@ def _module(name: str, **attributes: object) -> ModuleType:
 def test_clean_vllm_real_factory_and_runtime_contract_smoke():
     # Run before this process imports the heavy Mooncake/model stack so the
     # independent clean-vLLM smoke does not temporarily double memory use.
+    _run_clean_vllm_real_factory_and_runtime_contract_smoke()
+
+
+def test_clean_vllm_smoke_prefers_explicit_source_root(
+    tmp_path, monkeypatch
+):
+    target_root = tmp_path / "target-vllm"
+    target_package = target_root / "vllm"
+    target_package.mkdir(parents=True)
+    (target_package / "__init__.py").touch()
+    monkeypatch.setenv("VLLM_SOURCE_ROOT", str(target_root))
+
+    def fail_if_installed_vllm_is_discovered(_name):
+        raise AssertionError(
+            "installed vLLM discovery must not run when VLLM_SOURCE_ROOT is set"
+        )
+
+    monkeypatch.setattr(
+        importlib.util, "find_spec", fail_if_installed_vllm_is_discovered
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="platform-framework-real-smoke-ok\n",
+            stderr="",
+        ),
+    )
+
     _run_clean_vllm_real_factory_and_runtime_contract_smoke()
 
 
@@ -733,20 +765,7 @@ def test_outputs_keep_model_runner_ipc_stable_and_use_draft_channel():
 
 def _run_clean_vllm_real_factory_and_runtime_contract_smoke():
     repo = Path(__file__).resolve().parents[2]
-    vllm_spec = importlib.util.find_spec("vllm")
-    if vllm_spec is None or vllm_spec.origin is None:
-        raise RuntimeError("current vLLM installation is unavailable")
-    clean_vllm = Path(
-        os.environ.get(
-            "VLLM_SOURCE_ROOT",
-            Path(vllm_spec.origin).resolve().parents[1],
-        )
-    ).resolve()
-    if not (clean_vllm / "vllm" / "__init__.py").is_file():
-        raise RuntimeError(
-            "VLLM_SOURCE_ROOT does not contain the target vllm package: "
-            f"{clean_vllm}"
-        )
+    clean_vllm = resolve_target_vllm_root()
     script = """
 from pathlib import Path
 from packaging.version import Version
