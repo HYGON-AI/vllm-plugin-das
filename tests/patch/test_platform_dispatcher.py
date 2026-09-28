@@ -112,6 +112,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
 def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
     assert platform_framework_callback_names() == (
         (
+            "platform.framework_opt.aiter_custom_allreduce_buffer",
+            "vllm.distributed.device_communicators.aiter_custom_all_reduce",
+        ),
+        (
             "platform.framework_opt.pp_single_rank_partition",
             "vllm.distributed.utils",
         ),
@@ -167,6 +171,67 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         ),
         ("platform.framework_opt.outputs_draft_token_ids", "vllm.v1.outputs"),
     )
+
+
+def test_aiter_custom_ar_explicit_limit_preserves_fused_limit():
+    result = _run_fresh(
+        "import os; os.environ['AITER_AR_MAX_SIZE_MB'] = '256'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "print(AiterCustomAllreduce.MAX_SIZE, "
+        "AiterCustomAllreduce.effective_max_size())"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("134217728 67108864")
+
+
+def test_aiter_custom_ar_unset_limit_preserves_vllm_default():
+    result = _run_fresh(
+        "import os; os.environ.pop('AITER_AR_MAX_SIZE_MB', None); "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "print(AiterCustomAllreduce.MAX_SIZE, "
+        "AiterCustomAllreduce.effective_max_size())"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("134217728 67108864")
+
+
+def test_aiter_custom_ar_explicit_limit_reaches_internal_constructor():
+    result = _run_fresh(
+        "import os, sys, types; "
+        "os.environ['AITER_AR_MAX_SIZE_MB'] = '256'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "fake = types.ModuleType("
+        "'aiter.dist.device_communicators.custom_all_reduce'); "
+        "fake.CustomAllreduce = lambda group, device, max_size: "
+        "types.SimpleNamespace(max_size=max_size); "
+        "sys.modules[fake.__name__] = fake; "
+        "instance = AiterCustomAllreduce(object(), 'cuda:0'); "
+        "print(type(instance).__name__, instance.aiter_ca.max_size)"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("AiterCustomAllreduce 536870912")
+
+
+@pytest.mark.parametrize("value", ("0", "invalid"))
+def test_aiter_custom_ar_rejects_invalid_explicit_limit(value: str):
+    result = _run_fresh(
+        f"import os; os.environ['AITER_AR_MAX_SIZE_MB'] = {value!r}; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce"
+    )
+    assert result.returncode != 0
+    assert "AITER_AR_MAX_SIZE_MB must be a positive integer" in result.stderr
 
 
 def test_slimquant_adapter_import_does_not_preload_target_package():
@@ -292,9 +357,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 46,
+        "count": 47,
         "replacements": 11,
-        "callbacks": 35,
+        "callbacks": 36,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
