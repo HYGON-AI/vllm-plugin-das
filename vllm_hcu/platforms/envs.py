@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
     VLLM_HCU_HYV4_FP8_KV_DEQUANT: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
@@ -339,6 +341,16 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to route DeepSeek V4 ROCm decode through the legacy fallback.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK":
         lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK", "False").lower() in
+                    ("true", "1")),
+
+    # Use FlashMLA sparse decode in the native ROCm DeepSeek-V4 model.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE":
+        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "True").lower() in
+                    ("true", "1")),
+
+    # Use FlashMLA sparse prefill in the native ROCm DeepSeek-V4 model.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
+        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower() in
                     ("true", "1")),
 
     # Whether to dequantize the HY V4 fp8 KV cache to BF16 before the sparse
