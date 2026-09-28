@@ -207,3 +207,85 @@ def test_pcp_rows_restore_handles_an_empty_shard(
     """A request shorter than the rank count leaves ranks with no real rows."""
 
     _case(monkeypatch, query_lens=[1, 6], is_prefilling=[True, True], pcp_size=4)
+
+
+def test_pcp_padding_rows_are_never_zero_width() -> None:
+    """Every rank-local row must carry at least one token.
+
+    The upstream prefill loop walks the batch in ``PREFILL_CHUNK_SIZE`` row
+    groups and slices each group's token range out of ``query_start_loc``. A
+    zero-width row therefore collapses an entire group to an empty slice, which
+    is what crashed ``combine_topk_swa_indices`` on PCP rank 1 in
+    ``run/20260923_192714`` (16 concurrent 145-token prefills). Equalizing row
+    counts is what used to introduce those rows: the rank holding the widest
+    segment needs an extra row but no extra tokens.
+    """
+
+    manager = _manager(pcp_size=2)
+    # 145 splits as chunk_size=37: rank 0 owns 71 tokens over 2 rows, rank 1
+    # owns 74 over 2 rows, so rank 1's third row had no token to carry.
+    input_batch = _input_batch([145] * 16, [True] * 16)
+    segments_by_rank, _ = manager._build_batch_layout(input_batch)
+
+    widths = [
+        [segment.num_tokens for segment in segments]
+        for segments in segments_by_rank
+    ]
+    for rank, rank_widths in enumerate(widths):
+        assert all(width > 0 for width in rank_widths), (
+            f"PCP rank {rank} produced a zero-width row: {rank_widths}"
+        )
+
+    # Equalizing row counts must not disturb the per-rank token totals: the
+    # padding is what keeps MLA/EP collectives uniform across ranks.
+    totals = [sum(rank_widths) for rank_widths in widths]
+    assert len(set(totals)) == 1, f"rank token totals diverged: {totals}"
+
+
+def test_pcp_swa_local_view_bounds_an_expanded_mapping() -> None:
+    """A mixed batch keeps SWA at 1026 local rows, not 8208 expanded rows.
+
+    ``run/20260924_104811`` crashed with ``tensor a (8192)`` versus
+    ``tensor b (8208)`` because SWA sized validity from the expanded mapping.
+    This drives the manager's real layout for that batch: 8191 prefill tokens
+    plus one decode token expand to 1026 rows per rank, which overflows the
+    8192-token buffer by 16.
+    """
+
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    pcp_size = 8
+    manager = _manager(pcp_size)
+    input_batch = _input_batch([8191, 1], [True, False])
+    segments_by_rank, _ = manager._build_batch_layout(input_batch)
+
+    assert manager._padded_num_tokens == 1026
+    assert manager._padded_num_tokens * pcp_size == 8208
+
+    # One equal-width segment per rank, as `_convert_slot_mappings` builds.
+    expanded_slots = torch.arange(8208, dtype=torch.int64)
+
+    with pcp.logical_pcp_metadata_scope(pcp_size):
+        local_slots = pcp.pcp_local_slot_view(
+            expanded_slots, configured_world_size=pcp_size
+        )
+
+    assert local_slots.shape == (1026,)
+    assert local_slots.numel() <= 8192
+    torch.testing.assert_close(local_slots, expanded_slots[:1026])
+
+    # A decode-only step never expands the mapping, so the view is the input.
+    with pcp.logical_pcp_metadata_scope(1):
+        assert (
+            pcp.pcp_local_slot_view(
+                expanded_slots, configured_world_size=pcp_size
+            )
+            is expanded_slots
+        )
+
+    # Every rank-local row count must fit inside the viewed local width.
+    for rank_segments in segments_by_rank:
+        assert (
+            sum(segment.num_tokens for segment in rank_segments)
+            <= local_slots.shape[0]
+        )

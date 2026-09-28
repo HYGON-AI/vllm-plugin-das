@@ -33,13 +33,16 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm_hcu.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+from vllm_hcu.model_executor.layers.attention.pcp import (
+    pcp_local_slot_view,
+)
+from vllm_hcu.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -578,6 +581,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
+        # PCP hands cache writers an expanded, rank-major slot mapping so the
+        # complete cache can be materialized on every rank.  SWA metadata is
+        # built from the rank-local batch, however, and its persistent buffers
+        # are sized by max_num_batched_tokens.  Keep the expanded mapping in
+        # the returned metadata for the PCP cache writer, but derive validity
+        # from the local-width view so the expanded width cannot overrun them.
+        configured_pcp_world_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        local_slot_mapping = pcp_local_slot_view(
+            slot_mapping, configured_pcp_world_size
+        )
+
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
@@ -591,8 +607,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.token_to_req_indices
         )
 
-        is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
+        is_valid_token = self.is_valid_token[: local_slot_mapping.shape[0]]
+        is_valid_token.copy_(local_slot_mapping >= 0)
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (

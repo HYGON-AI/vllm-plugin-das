@@ -438,6 +438,20 @@ class HcuPCPManager:
                 for count, rows in zip(actual_tokens, row_counts)
             ):
                 target_rows += 1
+            # Every rank-local row must carry at least one token. The upstream
+            # prefill loop walks the batch in PREFILL_CHUNK_SIZE row groups and
+            # slices each group's token range out of query_start_loc, so a
+            # zero-width row collapses a whole group to an empty slice. A rank
+            # that already holds the widest segment would otherwise receive
+            # exactly such a row, because equalizing row counts costs it no
+            # missing tokens.
+            target_tokens = max(
+                target_tokens,
+                max(
+                    actual + target_rows - rows
+                    for actual, rows in zip(actual_tokens, row_counts)
+                ),
+            )
             global_start = int(input_batch.query_start_loc_np[req_idx])
             for rank, rank_segments in enumerate(segments_by_rank):
                 missing_tokens = target_tokens - actual_tokens[rank]
@@ -449,7 +463,12 @@ class HcuPCPManager:
                             global_req_idx=req_idx,
                             global_slice=slice(global_start, global_start),
                             local_slice=slice(0, 0),
-                            padding_tokens=missing_tokens if row == 0 else 0,
+                            # Spread the padding so no added row is zero-width.
+                            padding_tokens=(
+                                missing_tokens - (missing_rows - 1)
+                                if row == 0
+                                else 1
+                            ),
                         )
                     )
 

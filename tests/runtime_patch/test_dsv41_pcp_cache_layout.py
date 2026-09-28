@@ -180,3 +180,62 @@ def test_pcp_adapter_helpers_are_not_self_recursive() -> None:
                 if value.func.id == node.name:
                     offenders.append(node.name)
     assert offenders == [], f"self-recursive adapter helpers: {offenders}"
+
+
+def test_swa_builder_bounds_validity_without_losing_expanded_slots() -> None:
+    """SWA validity must come from the local-width view, not the expansion.
+
+    ``run/20260924_104811`` crashed at
+    ``sparse_swa.py: is_valid_token.copy_(slot_mapping >= 0)`` because the
+    builder sized its 8192-token buffer from ``max_num_batched_tokens`` but
+    PCP handed it an 8208-token expanded mapping.  A local-width view fixes
+    the width; the returned metadata must still carry the expanded mapping so
+    the PCP cache writer can globalize every token.  This pins both halves of
+    that contract statically, independent of the HCU runtime.
+    """
+
+    import ast
+    from pathlib import Path
+
+    # Parse the source directly: importing the backend pulls in upstream
+    # jit_warmup symbols absent from every installed vLLM build here.
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/v1/attention/backends/mla/sparse_swa.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    build = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build"
+    )
+
+    # `is_valid_token.copy_(local_slot_mapping >= 0)`: the compared tensor is
+    # the localized view, never the raw expanded mapping.
+    validity_sources: list[str] = []
+    for node in ast.walk(build):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "copy_"
+        ):
+            for argument in node.args:
+                if isinstance(argument, ast.Compare):
+                    compared = argument.left
+                    if isinstance(compared, ast.Name):
+                        validity_sources.append(compared.id)
+    assert validity_sources == ["local_slot_mapping"], (
+        "SWA validity must derive from the localized slot view, "
+        f"got {validity_sources}"
+    )
+
+    # The returned metadata keeps the expanded mapping for cache writers.
+    returned_keywords = {
+        keyword.arg
+        for node in ast.walk(build)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "DeepseekSparseSWAMetadata"
+        for keyword in node.keywords
+    }
+    assert "slot_mapping" in returned_keywords
