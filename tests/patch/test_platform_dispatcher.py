@@ -215,10 +215,14 @@ def test_aiter_custom_ar_explicit_limit_reaches_internal_constructor():
         "types.SimpleNamespace(max_size=max_size); "
         "sys.modules[fake.__name__] = fake; "
         "instance = AiterCustomAllreduce(object(), 'cuda:0'); "
-        "print(type(instance).__name__, instance.aiter_ca.max_size)"
+        "explicit = AiterCustomAllreduce(object(), 'cuda:0', 1048576); "
+        "print(type(instance).__name__, instance.aiter_ca.max_size, "
+        "explicit.aiter_ca.max_size)"
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("AiterCustomAllreduce 536870912")
+    assert result.stdout.strip().endswith(
+        "AiterCustomAllreduce 536870912 1048576"
+    )
 
 
 @pytest.mark.parametrize("value", ("0", "invalid"))
