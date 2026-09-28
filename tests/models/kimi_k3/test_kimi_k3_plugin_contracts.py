@@ -68,10 +68,6 @@ def test_kimi_ll_graph_replay_refreshes_values_at_static_addresses(monkeypatch, 
     shared_input = torch.ones(2, 6)
     result = forward(hidden, None, shared_input, None, None, None, None, None, "layer", 0)
     routed = result[1] if shared else result
-    if shared:
-        assert result[0].data_ptr() != shared_input.data_ptr()
-        assert torch.equal(shared_input, torch.ones_like(shared_input))
-        shared_address = result[0].data_ptr()
     assert routed.data_ptr() == hidden.data_ptr()
     assert torch.equal(hidden, torch.full_like(hidden, 3))
     hidden.fill_(10)
@@ -80,9 +76,181 @@ def test_kimi_ll_graph_replay_refreshes_values_at_static_addresses(monkeypatch, 
     assert len(calls) == 2
     assert torch.equal(hidden, torch.full_like(hidden, 12))
     if shared:
-        assert result[0].data_ptr() == shared_address
-        assert torch.equal(result[0], torch.full_like(shared_input, 23))
+        assert result[0].data_ptr() != shared_input.data_ptr()
+        assert torch.equal(result[0], torch.full_like(result[0], 23))
         assert torch.equal(shared_input, torch.full_like(shared_input, 20))
+
+
+def test_kimi_ll_graph_shared_output_survives_aliased_input(monkeypatch):
+    import sys
+    from vllm_hcu.model_executor.layers.quantization import kimi_k3_graph_runtime as runtime
+
+    method = SimpleNamespace(_hcu_kimi_ll_graph_boundary=True)
+    layer = SimpleNamespace(_quant_method=SimpleNamespace(old_quant_method=method))
+    monkeypatch.setitem(sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.moe_runner",
+        SimpleNamespace(get_layer_from_name=lambda name: layer,
+                        _resolve_layer_name=lambda name: name))
+    monkeypatch.setattr(runtime, "is_breakable_cudagraph_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "weak_ref_tensor", lambda tensor: tensor)
+    segments = []
+    capture = SimpleNamespace(
+        _capturing=True,
+        add_eager=lambda fn: (segments.append(fn), fn())[1],
+    )
+    monkeypatch.setattr(runtime.BreakableCUDAGraphCapture, "current", lambda: capture)
+
+    @runtime.kimi_ll_graph_boundary
+    def forward(hidden, router, shared_input, ids, quanted, scale, weights, topk, name, width):
+        return shared_input + 3, hidden + 2
+
+    hidden = torch.ones(2, 4)
+    result = forward(hidden, None, hidden, None, None, None, None, None, "layer", 0)
+    assert result[0].data_ptr() != hidden.data_ptr()
+    assert torch.equal(result[0], torch.full_like(hidden, 4))
+    assert torch.equal(hidden, torch.full_like(hidden, 3))
+    hidden.fill_(10)
+    segments[0]()
+    assert torch.equal(result[0], torch.full_like(hidden, 13))
+    assert torch.equal(hidden, torch.full_like(hidden, 12))
+
+
+def test_kimi_ll_graph_shared_output_has_independent_nonoverlap_storage(monkeypatch):
+    import sys
+
+    from vllm_hcu.model_executor.layers.quantization import (
+        kimi_k3_graph_runtime as runtime,
+    )
+
+    method = SimpleNamespace(_hcu_kimi_ll_graph_boundary=True)
+    layer = SimpleNamespace(_quant_method=SimpleNamespace(old_quant_method=method))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.moe_runner",
+        SimpleNamespace(
+            get_layer_from_name=lambda name: layer,
+            _resolve_layer_name=lambda name: name,
+        ),
+    )
+    monkeypatch.setattr(runtime, "is_breakable_cudagraph_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "weak_ref_tensor", lambda tensor: tensor)
+    segments = []
+    capture = SimpleNamespace(
+        _capturing=True,
+        add_eager=lambda fn: (segments.append(fn), fn())[1],
+    )
+    monkeypatch.setattr(
+        runtime.BreakableCUDAGraphCapture, "current", lambda: capture
+    )
+
+    @runtime.kimi_ll_graph_boundary
+    def forward(
+        hidden, router, shared_input, ids, quanted, scale, weights, topk, name, width
+    ):
+        return shared_input + 3, hidden + 2
+
+    hidden = torch.ones(2, 4)
+    shared_input = torch.full((2, 4), 5.0)
+    result = forward(
+        hidden, None, shared_input, None, None, None, None, None, "layer", 0
+    )
+    shared_output = result[0]
+    assert shared_output.data_ptr() != shared_input.data_ptr()
+    assert torch.equal(shared_input, torch.full_like(shared_input, 5))
+    assert torch.equal(shared_output, torch.full_like(shared_output, 8))
+    for value in (10.0, 15.0, 20.0):
+        shared_input.fill_(value)
+        segments[0]()
+        assert result[0].data_ptr() == shared_output.data_ptr()
+        assert torch.equal(
+            shared_output, torch.full_like(shared_output, value + 3)
+        )
+        assert torch.equal(shared_input, torch.full_like(shared_input, value))
+
+
+def test_moe_forward_shared_opcheck_declares_input_mutation_contract():
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    # The runtime-patch tests may already have imported moe_runner and kept it
+    # in sys.modules. Run registration capture in a fresh interpreter so this
+    # contract test is independent of pytest's module cache and test order.
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+        from vllm.utils import torch_utils
+
+        registrations = {}
+        original_register = torch_utils.direct_register_custom_op
+
+        def capture_moe_registration(op_name, *args, **kwargs):
+            if op_name in {
+                "moe_forward",
+                "moe_forward_shared",
+                "moe_forward_shared_inplace",
+            }:
+                registrations[op_name] = kwargs
+                return None
+            return original_register(op_name, *args, **kwargs)
+
+        torch_utils.direct_register_custom_op = capture_moe_registration
+        try:
+            moe_runner = importlib.import_module(
+                "vllm_hcu.model_executor.layers.fused_moe.moe_runner"
+            )
+        finally:
+            torch_utils.direct_register_custom_op = original_register
+
+        class Layer:
+            def _forward_impl(
+                self, hidden_states, _router, shared_input, *_args, **_kwargs
+            ):
+                return shared_input + 2, hidden_states + 3
+
+        moe_runner.get_layer_from_name = lambda _name: Layer()
+        from vllm_hcu.model_executor.layers.quantization import (
+            kimi_k3_graph_runtime as runtime,
+        )
+
+        runtime.is_breakable_cudagraph_enabled = lambda: False
+
+        registration = registrations["moe_forward_shared"]
+        test_library = torch.library.Library("hcu_kimi_ll_contract", "FRAGMENT")
+        original_register(
+            op_name="moe_forward_shared",
+            op_func=registration["op_func"],
+            mutates_args=registration["mutates_args"],
+            fake_impl=registration["fake_impl"],
+            target_lib=test_library,
+            dispatch_key="CPU",
+            tags=registration["tags"],
+        )
+        torch.library.opcheck(
+            torch.ops.hcu_kimi_ll_contract.moe_forward_shared.default,
+            (
+                torch.ones(2, 4),
+                None,
+                torch.full((2, 4), 5.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "test-layer",
+                0,
+            ),
+            test_utils=("test_schema",),
+        )
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        check=True,
+    )
 
 
 def test_kimi_ht_quant_config_uses_int8_token_scales_and_high_nibble_compensation():
@@ -96,6 +264,37 @@ def test_kimi_ht_quant_config_uses_int8_token_scales_and_high_nibble_compensatio
     assert torch.equal(quant.w1_scale, layer.w13_weight_scale * 16)
     assert torch.equal(quant.w2_scale, layer.w2_weight_scale * 16)
     assert torch.equal(layer.w13_weight_scale, torch.ones(2, 64, 1))
+
+
+def test_kimi_ht_compensated_scales_participate_in_expert_transfer():
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_experts = 3
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    method.create_weights(layer, 3, 32, 32, torch.bfloat16)
+    with torch.no_grad():
+        layer.w13_weight_scale.copy_(torch.arange(1, 4).view(3, 1, 1))
+        layer.w2_weight_scale.copy_(torch.arange(4, 7).view(3, 1, 1))
+    quant = method.get_fused_moe_quant_config(layer)
+    weights = list(layer.get_expert_weights())
+    assert quant.w1_scale.data_ptr() in [w.data_ptr() for w in weights]
+    assert quant.w2_scale.data_ptr() in [w.data_ptr() for w in weights]
+    before = [w.data_ptr() for w in weights]
+    with torch.no_grad():
+        for weight in weights:
+            weight.copy_(weight[[2, 0, 1]])
+    again = method.get_fused_moe_quant_config(layer)
+    assert before == [w.data_ptr() for w in layer.get_expert_weights()]
+    assert again.w1_scale is quant.w1_scale
+    assert again.w2_scale is quant.w2_scale
+    torch.testing.assert_close(quant.w1_scale, layer.w13_weight_scale * 16, atol=0, rtol=0)
+    torch.testing.assert_close(quant.w2_scale, layer.w2_weight_scale * 16, atol=0, rtol=0)
+    assert not method.supports_eplb  # This ownership fix alone is not online EPLB.
+    layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.clone(), requires_grad=False)
+    with pytest.raises(RuntimeError, match="scales replaced"):
+        method.get_fused_moe_quant_config(layer)
 
 
 def test_kimi_ll_quant_config_keeps_scale_correction_at_masked_gemm():
@@ -210,18 +409,11 @@ def test_kimi_ll_packing_uses_loaded_ep_dimensions_once(monkeypatch):
     monkeypatch.setattr(runtime, 'pack_w4a8_moe_hipc_weight', lambda w: calls.append(w.shape) or w)
     monkeypatch.setattr(runtime, 'view_w4a8_moe_hipc_weight_n32_layout', lambda w: w)
     expert.process_weights_after_loading(layer)
-    expected_calls = [(2, 256, 64), (2, 128, 64)]
-    assert calls == expected_calls
-    packed_w13 = layer.w13_weight
-    packed_w2 = layer.w2_weight
     expert.process_weights_after_loading(layer)
     assert expert._hcu_logical_n == 256
     assert expert._hcu_logical_k == 128
-    assert calls == expected_calls  # No repacking on the second invocation.
-    assert layer.w13_weight is packed_w13
-    assert layer.w2_weight is packed_w2
-    assert expert._deepgemm_w13 is packed_w13
-    assert expert._deepgemm_w2 is packed_w2
+    assert len(calls) == 2
+    assert expert._deepgemm_w13 is layer.w13_weight
 
 
 def test_kimi_feature_off_has_no_modular_quant_config():

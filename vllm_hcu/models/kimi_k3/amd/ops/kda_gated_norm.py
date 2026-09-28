@@ -7,10 +7,17 @@
 
 import torch
 
-from vllm.model_executor.layers.fla.ops.kda import (
-    FusedRMSNormGated as BaseFusedRMSNormGated,
-    rms_norm_gated as base_rms_norm_gated,
-)
+try:
+    from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import (
+        FusedRMSNormGated as BaseFusedRMSNormGated,
+        rms_norm_gated as base_rms_norm_gated,
+    )
+except ImportError:
+    # v0.25.1 vendors the FLA gated norm implementation under KDA ops.
+    from vllm.model_executor.layers.fla.ops.kda import (
+        FusedRMSNormGated as BaseFusedRMSNormGated,
+        rms_norm_gated as base_rms_norm_gated,
+    )
 from vllm.triton_utils import tl, triton
 
 

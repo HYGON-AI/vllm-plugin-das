@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -28,13 +29,35 @@ def apply_to_module(module: ModuleType) -> bool:
     if already_applied(mla, _MARKER, wrapped):
         return False
     original_init = require_callable(cls, "__init__", TARGETS[0])
-    require_exact_signature(
-        original_init, TARGETS[0],
-        positional=("self", "hidden_size", "num_heads", "scale", "qk_nope_head_dim",
-                    "qk_rope_head_dim", "v_head_dim", "q_lora_rank", "kv_lora_rank",
-                    "mla_modules", "cache_config", "quant_config", "prefix", "skip_topk"),
-        defaults={"cache_config": None, "quant_config": None, "prefix": "", "skip_topk": False},
+    expected_init = (
+        "self", "hidden_size", "num_heads", "scale", "qk_nope_head_dim",
+        "qk_rope_head_dim", "v_head_dim", "q_lora_rank", "kv_lora_rank",
+        "mla_modules", "cache_config", "quant_config", "prefix", "skip_topk",
     )
+    init_signature = inspect.signature(original_init)
+    init_names = tuple(init_signature.parameters)
+    if init_names not in (
+        expected_init,
+        expected_init + ("non_causal_multi_token_decode",),
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} has incompatible signature "
+            f"{init_signature}"
+        )
+    init_defaults = {
+        "cache_config": None,
+        "quant_config": None,
+        "prefix": "",
+        "skip_topk": False,
+        "non_causal_multi_token_decode": False,
+    }
+    for name, parameter in init_signature.parameters.items():
+        expected_default = init_defaults.get(name, inspect.Parameter.empty)
+        if parameter.default != expected_default:
+            raise PatchCompatibilityError(
+                f"required HCU patch target {TARGETS[0]} has incompatible signature "
+                f"{init_signature}"
+            )
     original_forward = require_callable(cls, "forward", TARGETS[1])
     require_exact_signature(
         original_forward, TARGETS[1],

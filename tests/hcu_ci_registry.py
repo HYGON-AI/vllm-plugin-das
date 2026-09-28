@@ -21,6 +21,61 @@ def register_hcu_ci(
 # These registrations do not claim checkpoint or accelerator validation.
 register_hcu_ci(
     job="hy4-contract",
+    target="tests/models/kimi_k3/test_kimi_moe_metadata.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/kimi_k3/test_kimi_spec_state_contract.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="hy4-contract",
+    target="tests/models/kimi_k3/test_kimi_eplb_transfer.py",
+    est_time=90,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_kimi_spec_conv_history_hcu.py",
+    est_time=90,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_kimi_spec_forward_hcu.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_kimi_spec_forward_hcu.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_kimi_spec_conv_history_hcu.py",
+    est_time=90,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_kimi_prefill_metadata_hcu.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_kimi_prefill_metadata_hcu.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_kimi_eplb_window_hcu.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_flashmla_decode_align_triton_mla.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="hy4-contract",
     target="tests/accuracy/test_hyv4_native_format.py",
     est_time=60,
 )
@@ -184,12 +239,6 @@ register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
     est_time=330,
-)
-
-register_hcu_ci(
-    job="accuracy-gfx938",
-    target="tests/runtime_patch/test_flashmla_decode_align_triton_mla.py",
-    est_time=180,
 )
 
 register_hcu_ci(

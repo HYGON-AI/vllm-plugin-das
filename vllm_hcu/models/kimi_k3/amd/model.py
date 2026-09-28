@@ -96,32 +96,40 @@ class KimiK3ForConditionalGeneration(
         # vLLM 0.25.x exposes this helper without positional arguments;
         # newer source revisions keep the argument optional and derive the
         # mode from the multimodal runtime config.
-        self.use_data_parallel = is_vit_use_data_parallel()
+        language_model_only = multimodal_config.language_model_only
+        self.language_model_only = language_model_only
+        self.use_data_parallel = (
+            False if language_model_only else is_vit_use_data_parallel()
+        )
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
-        with self._mark_tower_model(vllm_config, "image"):
-            self.vision_tower = MoonViT3dPretrainedModel(
-                config.vision_config,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "vision_tower"),
-            )
-            if self._maybe_ignore_quant_config(quant_config) is not None:
-                self.vision_tower = self.vision_tower.to(device=self.device)
-            else:
-                self.vision_tower = self.vision_tower.to(
+        if language_model_only:
+            self.vision_tower = None
+            self.mm_projector = None
+        else:
+            with self._mark_tower_model(vllm_config, "image"):
+                self.vision_tower = MoonViT3dPretrainedModel(
+                    config.vision_config,
+                    quant_config=self._maybe_ignore_quant_config(quant_config),
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                )
+                if self._maybe_ignore_quant_config(quant_config) is not None:
+                    self.vision_tower = self.vision_tower.to(device=self.device)
+                else:
+                    self.vision_tower = self.vision_tower.to(
+                        device=self.device, dtype=model_config.dtype
+                    )
+
+                self.mm_projector = KimiK25MultiModalProjector(
+                    config=config.vision_config,
+                    use_data_parallel=self.use_data_parallel,
+                    quant_config=self._maybe_ignore_quant_config(quant_config),
+                    prefix=maybe_prefix(prefix, "mm_projector"),
+                )
+                self.mm_projector = self.mm_projector.to(
                     device=self.device, dtype=model_config.dtype
                 )
-
-            self.mm_projector = KimiK25MultiModalProjector(
-                config=config.vision_config,
-                use_data_parallel=self.use_data_parallel,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "mm_projector"),
-            )
-            self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
-            )
 
         self.quant_config = quant_config
         with self._mark_language_model(vllm_config):
@@ -150,6 +158,8 @@ class KimiK3ForConditionalGeneration(
         grid_thws = kwargs.pop("grid_thws", None)
         if pixel_values is None:
             return None
+        if self.vision_tower is None:
+            raise ValueError("Vision inputs are disabled by language_model_only")
 
         if isinstance(pixel_values, list):
             pixel_values = torch.cat(cast(list[torch.Tensor], pixel_values), dim=0)
@@ -183,6 +193,8 @@ class KimiK3ForConditionalGeneration(
     def _process_media_input(
         self, media_input: KimiK25MediaPixelInputs
     ) -> list[torch.Tensor]:
+        if self.vision_tower is None or self.mm_projector is None:
+            raise ValueError("Vision inputs are disabled by language_model_only")
         media_features = vision_tower_forward(
             self.vision_tower,
             media_input["pixel_values"],
@@ -246,7 +258,23 @@ class KimiK3ForConditionalGeneration(
         return KimiLinearForCausalLM.get_mamba_state_copy_func()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(
+                ["vision_tower.", "mm_projector."]
+                if self.language_model_only
+                else None
+            ),
+        )
+        if self.language_model_only:
+            from vllm_hcu.runtime_compat.weight_loading import (
+                skip_safetensors_weight_prefixes,
+            )
+
+            with skip_safetensors_weight_prefixes(
+                ("vision_tower.", "mm_projector.")
+            ):
+                return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         has_projector_post_norm = any(
             name.startswith("mm_projector.post_norm.")
             for name, _ in self.named_parameters()

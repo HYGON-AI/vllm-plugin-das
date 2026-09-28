@@ -193,7 +193,7 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # Delegate the W/U/`kg` reconstruction kernel to boltops.
     from boltops.fla.kda import recompute_w_u_fwd as impl
 

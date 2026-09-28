@@ -12,10 +12,15 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.v1.attention.backend import (
-    CommonAttentionMetadata,
-    CpCommonAttentionMetadata,
-)
+from vllm.v1.attention.backend import CommonAttentionMetadata
+
+try:
+    from vllm.v1.attention.backend import CpCommonAttentionMetadata
+except ImportError:
+    # c4fc870's vLLM runtime does not export this plugin-owned metadata type.
+    # The worker's backend patch registers the same type for consumers that
+    # expect it on vllm.v1.attention.backend.
+    from vllm_hcu.v1.attention.metadata import CpCommonAttentionMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.utils.math_utils import round_up
 

@@ -134,10 +134,7 @@ def apply_to_module(module: ModuleType) -> bool:
         routed_experts_cls, "get_expert_weights", TARGETS[1]
     )
     load_weights = require_callable(routed_experts_cls, "load_weights", TARGETS[2])
-    require_parameter_names(
-        factory,
-        TARGETS[0],
-        (
+    expected_factory_params = (
             "num_experts", "top_k", "hidden_size", "intermediate_size",
             "intermediate_pad", "params_dtype", "renormalize", "use_grouped_topk",
             "num_expert_group", "topk_group", "quant_config", "tp_size", "dp_size",
@@ -150,9 +147,17 @@ def apply_to_module(module: ModuleType) -> bool:
             "gate", "shared_experts", "shared_expert_gate", "routed_input_transform",
             "routed_output_transform", "apply_routed_scale_to_output",
             "zero_expert_type", "hash_indices_table", "runner_cls", "runner_args",
-            "routed_experts_cls", "routed_experts_args",
-        ),
+        "routed_experts_cls", "routed_experts_args",
     )
+    factory_params = set(inspect.signature(factory).parameters)
+    factory_extras = factory_params - set(expected_factory_params)
+    if not set(expected_factory_params).issubset(factory_params) or not (
+        factory_extras <= {"activation_situ_beta", "activation_situ_linear_beta"}
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} has incompatible signature "
+            f"{inspect.signature(factory)}"
+        )
     require_parameter_names(get_weights, TARGETS[1], ("self",))
     require_parameter_names(load_weights, TARGETS[2], ("self", "weights"))
 

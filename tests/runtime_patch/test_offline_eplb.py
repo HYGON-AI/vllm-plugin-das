@@ -9,6 +9,62 @@ from tests.models.static_eplb_test_utils import GenericMoE, config_and_map
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import bind_static_eplb_plan
 
 
+@pytest.mark.parametrize("raises", [False, True])
+def test_kimi_compact_window_exact_and_restored(monkeypatch, raises):
+    from vllm_hcu.models.kimi_k3.amd.ops.eplb import compact_kimi_load_windows
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_KIMI_HT_EPLB", "1")
+    # Partial last chunk, duplicate replicas, unused physical slots, and totals
+    # beyond int32. Per-step logical counts remain representable as upstream.
+    window = torch.full((35, 2, 5), 100_000_000, dtype=torch.int32)
+    mapping = torch.tensor([[0, 1, 2, 1], [2, 0, 1, 2]])
+    logical = torch.zeros((35, 2, 3), dtype=torch.int32)
+    logical.scatter_add_(-1, mapping.unsqueeze(0).expand(35, -1, -1), window[:, :, :4])
+    expected = logical.sum(0)
+    model = SimpleNamespace(_vllm_hcu_kimi_eplb_load_window=True)
+    live = SimpleNamespace(expert_load_window=window, model=model)
+    state = SimpleNamespace(model_states={"m": live}, is_async=False,
+        expert_load_window_size=35, expert_load_window_step=19,
+        parallel_config=SimpleNamespace(enable_eplb=True,
+            all2all_backend="deepep_high_throughput"))
+    saved = window.clone()
+    try:
+        with compact_kimi_load_windows(state, rank_mapping=None):
+            assert state.expert_load_window_size == 1
+            assert live.expert_load_window.shape == (1, 2, 5)
+            out = torch.zeros((1, 2, 3), dtype=torch.int64)
+            out.scatter_add_(-1, mapping.unsqueeze(0), live.expert_load_window[:, :, :4])
+            assert torch.equal(out.sum(0), expected)
+            if raises:
+                raise RuntimeError("transfer failure")
+    except RuntimeError:
+        assert raises
+    assert live.expert_load_window is window
+    assert torch.equal(window, saved)
+    assert state.expert_load_window_size == 35
+    assert state.expert_load_window_step == 19
+
+
+@pytest.mark.parametrize("disabled", ["master", "leaf", "async", "other_model", "backend", "elastic"])
+def test_kimi_compact_window_fallback(monkeypatch, disabled):
+    from vllm_hcu.models.kimi_k3.amd.ops.eplb import compact_kimi_load_windows
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", disabled != "master"
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_KIMI_HT_EPLB", "0" if disabled == "leaf" else "1")
+    window = torch.ones((3, 2, 4), dtype=torch.int32)
+    live = SimpleNamespace(expert_load_window=window, model=SimpleNamespace(
+        _vllm_hcu_kimi_eplb_load_window=disabled != "other_model"))
+    state = SimpleNamespace(model_states={"m": live}, is_async=disabled == "async",
+        expert_load_window_size=3, parallel_config=SimpleNamespace(enable_eplb=True,
+            all2all_backend="other" if disabled == "backend" else "deepep_high_throughput"))
+    with compact_kimi_load_windows(state, rank_mapping={} if disabled == "elastic" else None):
+        assert live.expert_load_window is window
+        assert state.expert_load_window_size == 3
+
+
 def adapter():
     name = "vllm_hcu.patch.worker.framework_opt.patch_offline_eplb"
     assert importlib.util.find_spec(name), "offline state adapter missing"
@@ -311,6 +367,45 @@ def test_record_candidate_never_moves_weights_or_commits_live_map(tmp_path, monk
     payload = json.loads((tmp_path / "record.json").read_text())
     assert payload["model_maps"]["GenericMoE"]["physical_to_logical_map"] == candidate.tolist()
     assert state.model_states["test"].physical_to_logical_map.tolist() == [[0, 1, 2, 0]] * 2
+
+
+@pytest.mark.parametrize("profile", [False, True])
+def test_kimi_compact_window_reaches_original_policy(tmp_path, monkeypatch, profile):
+    _, upstream, state, model, config, _ = setup_state(tmp_path, monkeypatch, "record")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_KIMI_HT_EPLB", "1")
+    model._vllm_hcu_kimi_eplb_load_window = True
+    state.parallel_config.enable_eplb = True
+    state.parallel_config.all2all_backend = "deepep_high_throughput"
+    state.add_model(model, config)
+    live = state.model_states["test"]
+    window = live.expert_load_window
+    window[0].fill_(3)
+    window[1].fill_(7)
+    seen = []
+    def policy(load, *args):
+        seen.append(load.clone())
+        assert state.expert_load_window_size == 1
+        return live.physical_to_logical_map.cpu()
+    state.policy = SimpleNamespace(rebalance_experts=policy)
+    state._allreduce_list = lambda values: values
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: SimpleNamespace(
+        record=lambda: None, synchronize=lambda: None, elapsed_time=lambda other: 0))
+    if profile:
+        # A controlled failure at the original policy also exercises profile
+        # window restoration, before reaching the fixture's forbidden transfer.
+        def fail_policy(load, *args):
+            policy(load, *args)
+            raise RuntimeError("profile policy reached")
+        state.policy.rebalance_experts = fail_policy
+        with pytest.raises(RuntimeError, match="profile policy reached"):
+            state.rearrange(is_profile=True)
+    else:
+        state.rearrange()
+    assert len(seen) == 1
+    assert seen[0].tolist() == [[20, 10, 10]] * 2
+    assert live.expert_load_window is window
+    assert state.expert_load_window_size == 2
 
 
 def test_disable_rearrange_keeps_load_collection(tmp_path, monkeypatch):

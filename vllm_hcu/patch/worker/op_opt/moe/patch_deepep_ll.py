@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from types import ModuleType
 
 from ._common import load_exact_module, require_callable, require_class, require_parameter_names
@@ -38,21 +39,33 @@ def apply_to_module(module: ModuleType) -> bool:
     do_quant = require_callable(cls, "_do_quant", TARGETS[1])
     prepare = require_callable(cls, "prepare_async", TARGETS[2])
     receiver = require_callable(cls, "_receiver", TARGETS[3])
-    require_parameter_names(
-        init,
-        TARGETS[0],
-        (
-            "self",
-            "buffer",
-            "max_tokens_per_rank",
-            "num_dispatchers",
-            "use_fp8_dispatch",
-            "global_to_physical",
-            "physical_to_global",
-            "local_expert_global_ids",
-        ),
+    expected_init = (
+        "self", "buffer", "max_tokens_per_rank", "num_dispatchers",
+        "use_fp8_dispatch", "global_to_physical", "physical_to_global",
+        "local_expert_global_ids",
     )
-    require_parameter_names(do_quant, TARGETS[1], ("self", "x", "a1_dtype", "quant_config"))
+    init_params = tuple(inspect.signature(init).parameters)
+    original_accepts_int8_dispatch = "use_int8_dispatch" in init_params
+    if init_params[: len(expected_init)] != expected_init or set(init_params) - set(
+        expected_init
+    ) not in (set(), {"use_int8_dispatch"}):
+        from ._common import PatchCompatibilityError
+
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} has incompatible signature "
+            f"{inspect.signature(init)}"
+        )
+    expected_do_quant = ("self", "x", "a1_dtype", "quant_config")
+    do_quant_params = tuple(inspect.signature(do_quant).parameters)
+    if do_quant_params[: len(expected_do_quant)] != expected_do_quant or set(
+        do_quant_params
+    ) - set(expected_do_quant) not in (set(), {"expert_num_tokens"}):
+        from ._common import PatchCompatibilityError
+
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[1]} has incompatible signature "
+            f"{inspect.signature(do_quant)}"
+        )
     require_parameter_names(
         prepare,
         TARGETS[2],
@@ -104,6 +117,7 @@ def apply_to_module(module: ModuleType) -> bool:
             physical_to_global,
             local_expert_global_ids,
             use_int8_dispatch,
+            original_accepts_int8_dispatch,
         )
 
     @functools.wraps(do_quant)
