@@ -390,6 +390,56 @@ def cp_gather_indexer_k_quant_cache_triton(
     )
 
 
+def _gather_normal_indexer_k_cache(
+    kv_cache: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    token_to_seq: torch.Tensor,
+) -> None:
+    """Use the existing bounded upstream gather kernel with NORMAL page values."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream
+
+    num_blocks, block_size = kv_cache.shape[:2]
+    head_dim = k_fp8.shape[-1]
+    cache = kv_cache.view(num_blocks, -1)
+    values = cache[:, : block_size * head_dim].view(current_platform.fp8_dtype())
+    scales = cache[:, block_size * head_dim :].view(torch.float32)
+    kernel_args = (
+        values,
+        scales,
+        k_fp8,
+        k_scale.view(torch.float32),
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        block_size,
+        block_table.stride(0),
+        values.stride(0),
+        scales.stride(0),
+        "NORMAL",
+        head_dim,
+        16,
+        16,
+    )
+    if upstream._ON_GFX950:
+        upstream._cp_gather_indexer_quant_cache_gfx950_kernel[(k_fp8.shape[0],)](
+            *kernel_args,
+            cu_seq_lens.shape[0] - 1,
+            block_table.shape[1],
+            num_blocks,
+        )
+    else:
+        upstream._cp_gather_indexer_quant_cache_kernel[(k_fp8.shape[0],)](
+            *kernel_args,
+            k_fp8.shape[0],
+            cu_seq_lens.shape[0] - 1,
+            block_table.shape[1],
+            num_blocks,
+        )
+
+
 @triton.jit
 def _indexer_k_bf16_cache_kernel(
     k_ptr,  # [num_tokens, head_dim] (bf16)
@@ -1342,6 +1392,11 @@ def rocm_aiter_sparse_attn_indexer_native(
     slot_mapping = layer_attn_metadata.slot_mapping[:layer_attn_metadata.num_kv_actual_tokens]
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
+    from vllm_hcu.patch.worker.core_fix.patch_deepseek_v41_indexer_k_layout import (
+        use_normal_indexer_k_layout,
+    )
+
+    normal_indexer_k = skip_k_cache_insert and use_normal_indexer_k_layout()
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
     device = hidden_states.device if k is None else k.device
     # HIPC cache writer/gather require the physical page axis. Keep the
@@ -1394,13 +1449,42 @@ def rocm_aiter_sparse_attn_indexer_native(
                 device=device,
                 dtype=torch.uint8,
             )
-            if not current_platform.is_rocm() or on_gfx938():
+            if normal_indexer_k and on_gfx938():
+                _gather_normal_indexer_k_cache(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    chunk.token_to_seq,
+                )
+            elif normal_indexer_k:
                 ops.cp_gather_indexer_k_quant_cache(
                     hipc_kv_cache,
                     k_fp8,
                     k_scale,
                     chunk.block_table,
                     chunk.cu_seq_lens,
+                )
+            elif not current_platform.is_rocm() or on_gfx938():
+                # The indexer K cache is written with the 16x16 SHUFFLE layout
+                # (``indexer_k_norm_rope_store``), so it must be read back with
+                # the matching layout.  The C++ ``cp_gather_indexer_k_quant_cache``
+                # is row-major and silently permutes the keys, which corrupts the
+                # ratio-1 indexer logits and the top-k selection from the first
+                # compress_ratio==1 layer onward.  Use the upstream Triton gather,
+                # which selects SHUFFLE for block_size > 1.
+                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                    cp_gather_indexer_k_quant_cache_triton as _cp_gather,
+                )
+
+                _cp_gather(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
                 )
             else:
                 cp_gather_indexer_k_bf16_cache_triton(
