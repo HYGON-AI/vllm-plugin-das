@@ -151,10 +151,12 @@ def _runtime():
     ("aiter_enabled", "force_aiter_triton"),
     ((False, False), (True, False), (False, True)),
 )
+@pytest.mark.parametrize("is_gfx938", (False, True))
 def test_sparse_mla_master_off_prefill_uses_boltops(
     monkeypatch: pytest.MonkeyPatch,
     aiter_enabled: bool,
     force_aiter_triton: bool,
+    is_gfx938: bool,
 ) -> None:
     """The master-off prefill route never reaches AITER or LightOp."""
     runtime = _runtime()
@@ -162,6 +164,7 @@ def test_sparse_mla_master_off_prefill_uses_boltops(
     from vllm._aiter_ops import rocm_aiter_ops
 
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: aiter_enabled)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
     monkeypatch.setattr(
         runtime,
         "mqa_logits_module",
@@ -227,7 +230,7 @@ def test_sparse_mla_master_off_prefill_uses_boltops(
     assert len(calls) == 1
     assert calls[0][0] is q
     assert calls[0][1] is k
-    assert calls[0][2] is scales
+    assert calls[0][2] is (scales if is_gfx938 else None)
     assert calls[0][3].dtype is torch.float32
     assert calls[0][3].is_contiguous()
     assert torch.equal(calls[0][3], weights.float().contiguous())
@@ -236,8 +239,10 @@ def test_sparse_mla_master_off_prefill_uses_boltops(
     assert calls[0][6:] == (None, None)
 
 
+@pytest.mark.parametrize("is_gfx938", (False, True))
 def test_sparse_mla_master_off_prefill_uses_torch_when_boltops_is_absent(
     monkeypatch: pytest.MonkeyPatch,
+    is_gfx938: bool,
 ) -> None:
     """A missing optional BoltOPs package retains the portable reference."""
     runtime = _runtime()
@@ -245,6 +250,7 @@ def test_sparse_mla_master_off_prefill_uses_torch_when_boltops_is_absent(
     from vllm._aiter_ops import rocm_aiter_ops
 
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr(
         runtime,
@@ -274,7 +280,8 @@ def test_sparse_mla_master_off_prefill_uses_torch_when_boltops_is_absent(
     result = runtime.rocm_fp8_mqa_logits(q, kv, weights, starts, ends)
 
     assert result is output
-    assert calls == [(q, kv, weights, starts, ends)]
+    expected_kv = (kv[0], kv[1] if is_gfx938 else None)
+    assert calls == [(q, expected_kv, weights, starts, ends)]
 
 
 def test_sparse_mla_boltops_prefill_rejects_public_abi_drift(
