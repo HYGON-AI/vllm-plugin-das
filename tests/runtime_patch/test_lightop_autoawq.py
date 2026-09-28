@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
+from vllm_hcu.platforms import envs as henvs
 
 
 def _load_autoawq_module():
@@ -205,3 +207,132 @@ def test_hybrid_awq_delegates_without_mutating_unsupported_weights(
     assert layer.qzeros is qzeros
     assert layer.scales is scales
     assert torch.equal(output, torch.full((2, 3), 17, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    ("feature", "master", "expected"),
+    ((None, None, False), ("1", None, True), ("1", "0", False)),
+)
+def test_lightop_awq_policy_is_opt_in_and_obeys_master(
+    monkeypatch: pytest.MonkeyPatch,
+    feature: str | None,
+    master: str | None,
+    expected: bool,
+) -> None:
+    for name, value in (
+        ("VLLM_HCU_USE_LIGHTOP_AWQ", feature),
+        ("VLLM_HCU_USE_CUSTOM_OPS", master),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    policy = getattr(henvs, "lightop_awq_enabled", None)
+    assert callable(policy), "LightOp AWQ policy is not implemented"
+    assert policy() is expected
+
+
+def _load_autoawq_patch_module():
+    spec = importlib.util.find_spec(
+        "vllm_hcu.patch.worker.op_opt.patch_auto_awq"
+    )
+    assert spec is not None, "LightOp AutoAWQ selector patch is not implemented"
+    return importlib.import_module(
+        "vllm_hcu.patch.worker.op_opt.patch_auto_awq"
+    )
+
+
+def _make_autoawq_target(*, method=None):
+    target = ModuleType(
+        "vllm.model_executor.layers.quantization.auto_awq"
+    )
+
+    class AutoAWQLinearMethod:
+        pass
+
+    class AutoAWQMarlinLinearMethod:
+        pass
+
+    class AutoAWQConfig:
+        weight_bits = 4
+        group_size = 128
+        zero_point = True
+
+        def __init__(self):
+            self.selected = method or AutoAWQMarlinLinearMethod()
+
+        def get_quant_method(self, layer, prefix):
+            return self.selected
+
+    target.AutoAWQConfig = AutoAWQConfig
+    target.AutoAWQLinearMethod = AutoAWQLinearMethod
+    target.AutoAWQMarlinLinearMethod = AutoAWQMarlinLinearMethod
+    return target, AutoAWQConfig
+
+
+def test_autoawq_patch_wraps_supported_dense_method_when_public_api_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _load_autoawq_patch_module()
+    autoawq = _load_autoawq_module()
+    target, config_class = _make_autoawq_target()
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_AWQ", "1")
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setattr(patch, "_public_lightop_awq_available", lambda: True)
+
+    assert patch.apply_to_module(target) is True
+    config = config_class()
+    selected = config.get_quant_method(object(), "model.layers.0.mlp")
+
+    assert isinstance(selected, autoawq.LightOpAutoAWQLinearMethod)
+    assert selected.delegate is config.selected
+
+
+@pytest.mark.parametrize(
+    "unsupported", ("disabled", "group", "zero_point", "missing_public_api")
+)
+def test_autoawq_patch_returns_original_method_for_unsupported_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported: str,
+) -> None:
+    patch = _load_autoawq_patch_module()
+    target, config_class = _make_autoawq_target()
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_LIGHTOP_AWQ", "0" if unsupported == "disabled" else "1"
+    )
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setattr(
+        patch,
+        "_public_lightop_awq_available",
+        lambda: unsupported != "missing_public_api",
+    )
+    assert patch.apply_to_module(target) is True
+    config = config_class()
+    if unsupported == "group":
+        config.group_size = 64
+    elif unsupported == "zero_point":
+        config.zero_point = False
+
+    selected = config.get_quant_method(object(), "model.layers.0.mlp")
+
+    assert selected is config.selected
+
+
+def test_autoawq_patch_is_idempotent_and_rejects_signature_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _load_autoawq_patch_module()
+    target, config_class = _make_autoawq_target()
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_AWQ", "1")
+    assert patch.apply_to_module(target) is True
+    assert patch.apply_to_module(target) is False
+    assert config_class._vllm_hcu_original_get_quant_method is not None
+
+    target, config_class = _make_autoawq_target()
+
+    def incompatible(self, layer):
+        return None
+
+    config_class.get_quant_method = incompatible
+    with pytest.raises(RuntimeError, match="incompatible signature"):
+        patch.apply_to_module(target)
