@@ -54,7 +54,25 @@ without changing ordinary FlashAttention selection or FP8 paged-MQA decode.
    master policy. Preserve signatures and cold-module replacement validation.
 5. Run the AITER exchange, quantization and communicator suites.
 
-## Task 3: Attention boundary regression
+## Task 3: Current-release worker dispatcher and upgrade-skill guard
+
+**Files:**
+
+- Modify: `tests/patch/test_worker_dispatcher.py`
+- Modify: `/models/upgrading-vllm-hcu/SKILL.md`
+
+1. Replace the hard `VLLM_V0251_SOURCE_ROOT` dependency with the current
+   `VLLM_SOURCE_ROOT`, falling back to the installed vLLM package root.
+2. Require every fresh subprocess to resolve the configured source root and
+   the v0.28.1 release line; remove any inherited v0.25.1 source override.
+3. Run the full worker-dispatcher module and fix current-release contract
+   failures rather than borrowing historical v0.25.1 source.
+4. Add the demonstrated failure as a narrow invariant in the upgrade skill:
+   target-branch gates use the current release source; historical release
+   trees are comparison inputs only and cannot satisfy the target gate.
+5. Validate the skill structure and rerun the worker-dispatcher tests.
+
+## Task 4: Attention boundary regression
 
 **Files:**
 
@@ -66,7 +84,7 @@ without changing ordinary FlashAttention selection or FP8 paged-MQA decode.
    as a characterization/boundary test, not the RED test for Tasks 1 or 2.
 3. Run the complete platform configuration suite.
 
-## Task 4: Review and verification
+## Task 5: Review and verification
 
 1. Re-scan production LightOp/AITER/BoltOPs entry points and classify the
    intentional exceptions.
@@ -74,7 +92,7 @@ without changing ordinary FlashAttention selection or FP8 paged-MQA decode.
 3. Review the full diff against the merge base and fix important findings with
    a RED-to-GREEN regression test.
 
-## Task 5: Hardware validation and MR
+## Task 6: Hardware validation and MR
 
 1. Validate GLM-5.3 Channel-FP8 master-off prefill route, unchanged paged
    decode, DP+EP+MTP3 graph mode, and HumanEval/0-7.
