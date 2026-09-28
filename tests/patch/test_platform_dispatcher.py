@@ -209,6 +209,7 @@ def test_aiter_custom_ar_explicit_limit_reaches_internal_constructor():
     result = _run_fresh(
         "import os, sys, types; "
         "os.environ['AITER_AR_MAX_SIZE_MB'] = '256'; "
+        "os.environ.pop('AITER_AR_ENABLE_REG_CAPTURE', None); "
         "from vllm_hcu.patch.platform import apply_platform_patches; "
         "apply_platform_patches(); "
         "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
