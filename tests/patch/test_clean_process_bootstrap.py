@@ -22,17 +22,22 @@ _RESULT_PREFIX = "VLLM_HCU_BOOTSTRAP_RESULT="
 
 
 def _resolve_target_vllm_root() -> Path:
+    configured_root = os.environ.get("VLLM_SOURCE_ROOT")
+    vllm_spec = importlib.util.find_spec("vllm")
+    discovered_root = (
+        Path(vllm_spec.origin).resolve().parents[1]
+        if vllm_spec is not None and vllm_spec.origin is not None
+        else None
+    )
     installed_roots = tuple(
         Path(path)
         for key in ("platlib", "purelib")
         if (path := sysconfig.get_path(key))
     )
     candidates = (
-        Path(os.environ["VLLM_V0251_SOURCE_ROOT"])
-        if "VLLM_V0251_SOURCE_ROOT" in os.environ
-        else None,
-        *installed_roots,
-        REPOSITORY.parent / "vllm_0251",
+        (Path(configured_root),)
+        if configured_root is not None
+        else (discovered_root, *installed_roots)
     )
     for candidate in candidates:
         if candidate is None:
@@ -42,7 +47,7 @@ def _resolve_target_vllm_root() -> Path:
             return resolved
     rendered = ", ".join(str(path) for path in candidates if path is not None)
     raise RuntimeError(
-        "no vLLM 0.25.1 source tree was found; checked: " + rendered
+        "no current vLLM source/install was found; checked: " + rendered
     )
 
 
@@ -52,15 +57,20 @@ TARGET_VLLM_ROOT = _resolve_target_vllm_root()
 _TARGET_SOURCE_ASSERTION = r"""
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
+from packaging.version import Version as _VllmHcuVersion
 import vllm as _vllm_hcu_target
+from vllm_hcu.version import __vllm_target_version__ as _vllm_hcu_target_version
 _vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
+    _vllm_hcu_os.environ["VLLM_SOURCE_ROOT"]
 ).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: "
     f"{_vllm_hcu_file} not under {_vllm_hcu_root}"
 )
+assert _VllmHcuVersion(_vllm_hcu_target.__version__).release[:3] == (0, 28, 1)
+assert _VllmHcuVersion(_vllm_hcu_target_version).release[:3] == (0, 28, 1)
+assert "VLLM_V0251_SOURCE_ROOT" not in _vllm_hcu_os.environ
 """
 
 _PORTABLE_BOOTSTRAP = rf"""
@@ -290,7 +300,8 @@ def _clean_environment(*, plugins: str) -> dict[str, str]:
         }:
             environment.pop(name)
     environment["VLLM_PLUGINS"] = plugins
-    environment["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    environment.pop("VLLM_V0251_SOURCE_ROOT", None)
+    environment["VLLM_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     python_path = (
         str(TARGET_VLLM_ROOT),
         str(REPOSITORY),
@@ -310,7 +321,7 @@ def _run_clean_python(
 ) -> subprocess.CompletedProcess[str]:
     if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
         raise RuntimeError(
-            "VLLM_V0251_SOURCE_ROOT does not contain the target vllm package: "
+            "VLLM_SOURCE_ROOT does not contain the target vllm package: "
             f"{TARGET_VLLM_ROOT}"
         )
     return subprocess.run(

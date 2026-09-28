@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import os
 import subprocess
@@ -732,10 +733,31 @@ def test_outputs_keep_model_runner_ipc_stable_and_use_draft_channel():
 
 def _run_clean_vllm_real_factory_and_runtime_contract_smoke():
     repo = Path(__file__).resolve().parents[2]
+    vllm_spec = importlib.util.find_spec("vllm")
+    if vllm_spec is None or vllm_spec.origin is None:
+        raise RuntimeError("current vLLM installation is unavailable")
     clean_vllm = Path(
-        os.environ.get("VLLM_V0251_SOURCE_ROOT", repo.parent / "vllm_0251")
-    )
+        os.environ.get(
+            "VLLM_SOURCE_ROOT",
+            Path(vllm_spec.origin).resolve().parents[1],
+        )
+    ).resolve()
+    if not (clean_vllm / "vllm" / "__init__.py").is_file():
+        raise RuntimeError(
+            "VLLM_SOURCE_ROOT does not contain the target vllm package: "
+            f"{clean_vllm}"
+        )
     script = """
+from pathlib import Path
+from packaging.version import Version
+import os
+import vllm
+from vllm_hcu.version import __vllm_target_version__
+target_root = Path(os.environ['VLLM_SOURCE_ROOT']).resolve()
+assert Path(vllm.__file__).resolve().is_relative_to(target_root)
+assert Version(vllm.__version__).release[:3] == (0, 28, 1)
+assert Version(__vllm_target_version__).release[:3] == (0, 28, 1)
+assert 'VLLM_V0251_SOURCE_ROOT' not in os.environ
 from vllm_hcu.patch.platform.framework_opt import (
     patch_kv_connector_factory, patch_outputs,
 )
@@ -753,6 +775,8 @@ print('platform-framework-real-smoke-ok')
 """
     env = os.environ.copy()
     env["VLLM_PLUGINS"] = "__disabled__"
+    env.pop("VLLM_V0251_SOURCE_ROOT", None)
+    env["VLLM_SOURCE_ROOT"] = str(clean_vllm)
     env["PYTHONPATH"] = os.pathsep.join((str(repo), str(clean_vllm)))
     result = subprocess.run(
         [sys.executable, "-c", script],
