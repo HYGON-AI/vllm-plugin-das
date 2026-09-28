@@ -15,6 +15,10 @@ without changing ordinary FlashAttention selection or FP8 paged-MQA decode.
 - Explicit MoE backends and FP8 QSA reader/writer remain independent.
 - Only AITER linear and custom-all-reduce capabilities are master-gated;
   broad AITER/MHA/MLA/MoE capability probes remain unchanged.
+- This master is a hardware-compatibility fallback: prefer an equivalent
+  BoltOPs/Triton implementation, otherwise use the upstream vLLM or vllm_hcu
+  default implementation. Retain an optimized provider only when falling back
+  would violate a required layout/ABI, and document that exception explicitly.
 
 ## Task 1: Sparse-indexer prefill routing
 

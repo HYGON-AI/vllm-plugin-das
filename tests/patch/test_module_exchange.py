@@ -587,14 +587,21 @@ def test_aiter_replacement_preserves_v0251_public_method_surface_and_ar_lifecycl
         "destroy_aiter_allreduce",
         "get_aiter_allreduce_max_size",
     }.isdisjoint(replacement_methods)
-    for method_name in (
-        "refresh_env_variables",
-        "is_custom_all_reduce_enabled",
-        "get_aiter_allreduce",
-    ):
+    for method_name in ("refresh_env_variables",):
         assert ast.dump(
             replacement_methods[method_name], include_attributes=False
         ) == ast.dump(target_methods[method_name], include_attributes=False)
+
+    # These HCU capability bodies intentionally add only the process-wide
+    # custom-op master policy while retaining the upstream signatures and
+    # decorators checked above.
+    for method_name in (
+        "is_linear_enabled",
+        "is_custom_all_reduce_enabled",
+        "get_aiter_allreduce",
+    ):
+        method_source = ast.unparse(replacement_methods[method_name])
+        assert "henvs.custom_ops_enabled()" in method_source, method_name
 
 
 def test_sparse_indexer_replacement_keeps_v0251_q_rope_quant_contract():

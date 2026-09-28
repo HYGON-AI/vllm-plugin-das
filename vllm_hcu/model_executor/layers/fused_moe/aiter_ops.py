@@ -23,6 +23,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer,
     rocm_aiter_sparse_attn_indexer_fake,
 )
+from vllm_hcu.platforms import envs as henvs
 
 try:
     import pandas as pd
@@ -1694,7 +1695,11 @@ class rocm_aiter_ops:
     @classmethod
     @if_aiter_supported
     def is_linear_enabled(cls) -> bool:
-        return cls._AITER_ENABLED and cls._LINEAR_ENABLED
+        return (
+            henvs.custom_ops_enabled()
+            and cls._AITER_ENABLED
+            and cls._LINEAR_ENABLED
+        )
 
     @classmethod
     @if_aiter_supported
@@ -1772,7 +1777,11 @@ class rocm_aiter_ops:
     @classmethod
     @if_aiter_supported
     def is_custom_all_reduce_enabled(cls) -> bool:
-        return cls._AITER_ENABLED and cls._CUSTOM_ALL_REDUCE_ENABLED
+        return (
+            henvs.custom_ops_enabled()
+            and cls._AITER_ENABLED
+            and cls._CUSTOM_ALL_REDUCE_ENABLED
+        )
 
     @classmethod
     @if_aiter_supported
@@ -1835,6 +1844,8 @@ class rocm_aiter_ops:
         """Return the TP device communicator's AITER custom-allreduce if it has
         one, return None otherwise
         """
+        if not henvs.custom_ops_enabled():
+            return None
         from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
             AiterCustomAllreduce,
         )
