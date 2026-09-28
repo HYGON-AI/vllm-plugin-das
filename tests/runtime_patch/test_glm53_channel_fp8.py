@@ -432,6 +432,8 @@ def test_rocm_sparse_builder_disables_missing_aiter_metadata_api(
         "expected",
     ),
     [
+        ("auto", 512, 1, 0, 0, 32, True),
+        ("auto", 512, 0, 2, 2, 1, True),
         ("auto", 512, 0, 2, 4, 2, True),
         ("auto", 512, 0, 2, 12, 6, True),
         ("fp8", 512, 0, 2, 4, 2, False),
