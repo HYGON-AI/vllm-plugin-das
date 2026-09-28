@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import sys
 from importlib.machinery import ModuleSpec
 from types import ModuleType, SimpleNamespace
@@ -17,6 +18,27 @@ from vllm_hcu.patch.worker.op_opt import patch_triton_unified_attention
 from vllm_hcu.platforms import envs as hcu_envs
 
 
+_TEST_FLASH_ATTN_VERSION = "2.8.4+dtk2604.torch2110.2609241509.g624d7b"
+
+
+def _stub_flash_attn_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    flash_attn_extension: ModuleType,
+    version: str = _TEST_FLASH_ATTN_VERSION,
+) -> None:
+    """Keep CPU kernel doubles independent of the installed vendor wheel."""
+
+    flash_attn_extension.__version__ = version
+    distribution_version = importlib.metadata.version
+
+    def version_for_test(distribution_name: str) -> str:
+        if distribution_name == "flash_attn":
+            return version
+        return distribution_version(distribution_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", version_for_test)
+
+
 def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
     hcu_ops = ModuleType("vllm_hcu.hcu_ops")
     hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
@@ -27,6 +49,8 @@ def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
         flash_attn_extension.__name__,
         loader=None,
     )
+    _stub_flash_attn_distribution(monkeypatch, flash_attn_extension)
+
     def layout_entrypoint(
         q=None,
         k=None,
@@ -56,6 +80,8 @@ def _load_hcu_fa_utils_module(
     *,
     kv_cache_layout: str,
     missing_layout_on: str | None = None,
+    flash_attn_varlen_override=None,
+    flash_attn_version: str = _TEST_FLASH_ATTN_VERSION,
 ):
     """Load the real HCU FA boundary against observable kernel doubles."""
 
@@ -76,6 +102,11 @@ def _load_hcu_fa_utils_module(
     flash_attn_extension.__spec__ = ModuleSpec(
         flash_attn_extension.__name__,
         loader=None,
+    )
+    _stub_flash_attn_distribution(
+        monkeypatch,
+        flash_attn_extension,
+        flash_attn_version,
     )
 
     def make_entrypoint(name: str):
@@ -105,7 +136,14 @@ def _load_hcu_fa_utils_module(
         "hg_flash_attn_varlen_func",
         "varlen_fwd_unified",
     ):
-        setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
+        if (
+            symbol == "flash_attn_varlen_func"
+            and flash_attn_varlen_override is not None
+        ):
+            calls[symbol] = []
+            setattr(flash_attn_extension, symbol, flash_attn_varlen_override)
+        else:
+            setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
     monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
     monkeypatch.delitem(
         sys.modules,
@@ -115,6 +153,35 @@ def _load_hcu_fa_utils_module(
 
     module = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
     return module, calls
+
+
+def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The CPU contract loader must not require an installed vendor wheel."""
+
+    real_version = importlib.metadata.version
+
+    def missing_distribution(distribution_name: str):
+        if distribution_name == "flash_attn":
+            raise importlib.metadata.PackageNotFoundError(distribution_name)
+        return real_version(distribution_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.flash_attn",
+        raising=False,
+    )
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        raising=False,
+    )
+
+    module = _load_hcu_flash_attention_module(monkeypatch)
+
+    assert module.__name__ == "vllm_hcu.v1.attention.backends.flash_attn"
 
 
 @pytest.mark.parametrize(
@@ -153,6 +220,27 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
             monkeypatch,
             kv_cache_layout="HND",
             missing_layout_on="hg_flash_attn_varlen_func",
+        )
+
+
+@pytest.mark.parametrize(
+    "incompatible_version",
+    [
+        "2.8.4",
+        "2.8.4+dtk2604.torch2110.2609200000.g111111",
+        "2.8.4+foo",
+        "2.8.4+dtk2605.torch2110.2609010000.g999999",
+    ],
+)
+def test_hcu_fa_boundary_rejects_vendor_build_without_known_gather_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    incompatible_version: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="native long-prefill gather fix"):
+        _load_hcu_fa_utils_module(
+            monkeypatch,
+            kv_cache_layout="HND",
+            flash_attn_version=incompatible_version,
         )
 
 
@@ -1337,45 +1425,48 @@ def test_unified_attention_proxy_forces_single_stage_and_preserves_other_kwargs(
     ]
 
 
-def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("with_output", [False, True])
+@pytest.mark.parametrize("with_lse", [False, True])
+def test_flash_attention_long_chunked_prefill_uses_vendor_paged_gather(
     monkeypatch,
+    layout,
+    cache_dtype,
+    with_output,
+    with_lse,
 ) -> None:
-    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+    vendor_calls = []
 
-    calls: dict[str, object] = {}
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        vendor_calls.append({"q": q, "k": k, "v": v, "layout": layout, **kwargs})
 
-    def fake_official_gather(
-        key_source,
-        value_source,
-        key_output,
-        value_output,
-        block_table,
-        seq_lens,
-        cu_seqlens_k,
-        max_seqlen,
-    ) -> None:
-        calls["source_shapes"] = (key_source.shape, value_source.shape)
-        calls["output_shapes"] = (key_output.shape, value_output.shape)
-        calls["cu_seqlens_k"] = cu_seqlens_k.clone()
-        calls["max_seqlen"] = max_seqlen
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout=layout,
+        flash_attn_varlen_override=vendor,
+    )
 
-    def fake_flash_attn(**kwargs):
-        calls["flash_kwargs"] = kwargs
-        return "flash-result"
-
-    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
-    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", fake_flash_attn)
+    expected_layout = "bhsd" if layout == "HND" else "bshd"
     monkeypatch.setattr(
         fa_utils,
         "_gather_paged_kv",
-        fake_official_gather,
+        lambda *args, **kwargs: pytest.fail("unexpected plugin KV gather"),
+        raising=False,
     )
     query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
-    packed_cache = torch.zeros((144, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.transpose(1, 2).split(128, dim=-1)
+    physical_shape = (
+        (144, 2, 64, 256) if layout == "HND" else (144, 64, 2, 256)
+    )
+    physical_cache = torch.zeros(physical_shape, dtype=cache_dtype)
+    packed_cache = (
+        physical_cache.transpose(1, 2) if layout == "HND" else physical_cache
+    )
+    key_cache, value_cache = packed_cache.split(128, dim=-1)
     seq_lens = torch.tensor([8421], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 37], dtype=torch.int32)
     block_table = torch.arange(144, dtype=torch.int32).unsqueeze(0)
+    output = torch.empty_like(query) if with_output else None
 
     result = fa_utils.flash_attn_varlen_func(
         q=query,
@@ -1386,104 +1477,30 @@ def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
         max_seqlen_k=8421,
         seqused_k=seq_lens,
         block_table=block_table,
-    )
-
-    assert result == "flash-result"
-    assert calls["source_shapes"] == (
-        torch.Size([144, 64, 2, 128]),
-        torch.Size([144, 64, 2, 128]),
-    )
-    assert calls["output_shapes"] == (
-        torch.Size([8421, 2, 128]),
-        torch.Size([8421, 2, 128]),
-    )
-    assert calls["cu_seqlens_k"].tolist() == [0, 8421]
-    assert calls["max_seqlen"] == 8421
-    forwarded = calls["flash_kwargs"]
-    assert isinstance(forwarded, dict)
-    assert forwarded["block_table"] is None
-    assert forwarded["seqused_k"] is None
-    assert forwarded["cu_seqlens_k"].shape == (2,)
-
-
-
-@pytest.mark.parametrize("with_lse", [False, True])
-@pytest.mark.parametrize("with_output", [False, True])
-def test_flash_attention_long_prefill_writes_caller_output(
-    monkeypatch, with_lse, with_output,
-) -> None:
-    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
-
-    query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
-    output = torch.full_like(query, -123) if with_output else None
-    actual = torch.full_like(query, 2.5)
-    lse = torch.ones((8, 37), dtype=torch.float32)
-    probabilities = torch.empty(0)
-    returned = (actual, lse, probabilities) if with_lse else actual
-
-    def vendor_nonpaged(**kwargs):
-        assert kwargs["block_table"] is None
-        assert kwargs["out"] is output
-        assert kwargs.get("return_attn_probs", False) == with_lse
-        # The installed nonpaged vendor interface returns a new tensor and
-        # ignores out. Model forward consumes the caller buffer instead.
-        return returned
-
-    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
-    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", vendor_nonpaged)
-    monkeypatch.setattr(fa_utils, "_gather_paged_kv", lambda *a, **kw: None)
-    cache = torch.zeros((144, 2, 64, 128), dtype=torch.bfloat16).transpose(1, 2)
-    result = fa_utils.flash_attn_varlen_func(
-        q=query, k=cache, v=cache, out=output,
-        cu_seqlens_q=torch.tensor([0, 37], dtype=torch.int32),
-        max_seqlen_q=37, max_seqlen_k=8485,
-        seqused_k=torch.tensor([8485], dtype=torch.int32),
-        block_table=torch.arange(144, dtype=torch.int32).unsqueeze(0),
+        out=output,
         return_softmax_lse=with_lse,
     )
-    assert result is returned
-    if output is not None:
-        torch.testing.assert_close(output, actual)
 
-
-def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
-    monkeypatch,
-) -> None:
-    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
-
-    calls = []
-
-    def fake_flash_attn(**kwargs):
-        calls.append(kwargs)
-        return "vendor-result"
-
-    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
-    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", fake_flash_attn)
-    monkeypatch.setattr(
-        fa_utils,
-        "_gather_paged_kv",
-        lambda *args, **kwargs: pytest.fail("unexpected Triton KV gather"),
-    )
-    query = torch.zeros((75, 8, 128), dtype=torch.bfloat16)
-    packed_cache = torch.zeros((72, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.transpose(1, 2).split(128, dim=-1)
-    block_table = torch.arange(72, dtype=torch.int32).unsqueeze(0)
-    seq_lens = torch.tensor([4171], dtype=torch.int32)
-
-    result = fa_utils.flash_attn_varlen_func(
-        q=query,
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=torch.tensor([0, 75], dtype=torch.int32),
-        max_seqlen_q=75,
-        max_seqlen_k=4171,
-        seqused_k=seq_lens,
-        block_table=block_table,
-    )
-
-    assert result == "vendor-result"
-    assert calls[0]["block_table"] is block_table
-    assert calls[0]["seqused_k"] is seq_lens
+    assert result is None
+    assert len(vendor_calls) == 1
+    forwarded = vendor_calls[0]
+    assert forwarded["q"] is query
+    assert forwarded["block_table"] is block_table
+    assert forwarded["seqused_k"] is seq_lens
+    assert forwarded["out"] is output
+    assert forwarded["return_softmax_lse"] is with_lse
+    assert forwarded["layout"] == expected_layout
+    for name, original in (("k", key_cache), ("v", value_cache)):
+        native = forwarded[name]
+        assert (
+            native.untyped_storage().data_ptr()
+            == original.untyped_storage().data_ptr()
+        )
+        if layout == "HND":
+            assert native.shape == (144, 2, 64, 128)
+            assert native.stride() == original.transpose(1, 2).stride()
+        else:
+            assert native is original
 
 
 @pytest.mark.parametrize(
