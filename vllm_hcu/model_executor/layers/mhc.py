@@ -496,7 +496,7 @@ def mhc_pre(
     num_tokens = residual_flat.shape[0]
     fn_flat = fn
 
-    if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
+    if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
         post_mix, comb_mix, layer_input = _boltops_mhc_pre_big_fuse(
             residual=residual_flat,
             fn=fn_flat,
@@ -593,7 +593,7 @@ def mhc_pre(
         n_splits,
     )
 
-    if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
+    if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
         _boltops_pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -873,7 +873,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
+    if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
         hc_mult = residual.shape[-2]
         hidden_size = residual.shape[-1]
         outer_shape = residual.shape[:-2]
@@ -978,8 +978,9 @@ def mhc_fused_post_pre(
 
     use_tilelang_prenorm = False
     if (
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_TILELANG_MHC_PRENORM
+        henvs.optional_custom_op_enabled(
+            henvs.VLLM_HCU_USE_TILELANG_MHC_PRENORM
+        )
         and num_tokens > fma_token_threshold
     ):
         if num_tokens <= 2048:
@@ -1051,7 +1052,7 @@ def mhc_fused_post_pre(
         #     n_splits=n_splits,
         # )
     else:
-        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
+        if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
             _boltops_mhc_post_fwd(
                 x_flat,
                 residual_flat,
@@ -1088,7 +1089,7 @@ def mhc_fused_post_pre(
                 pre_n_splits,
             )
 
-    if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_AITER_MHC:
+    if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
         _boltops_pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,

@@ -97,6 +97,26 @@ def custom_ops_enabled() -> bool:
     return _environment_flag(os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True"))
 
 
+def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
+    """Resolve an optional optimized operator under the process master.
+
+    Read the master directly from ``os.environ`` so a materialized lazy module
+    attribute cannot freeze the effective policy for later consumers.
+    """
+
+    return custom_ops_enabled() and bool(feature_enabled)
+
+
+def custom_quantization_gemm_enabled() -> bool:
+    """Resolve the quantized-GEMM child switch under the process master."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True")
+        )
+    )
+
+
 def ple_prefetch_enabled() -> bool:
     """Resolve PLE stream prefetch under the custom-op master switch."""
     return custom_ops_enabled() and _environment_flag(
@@ -205,7 +225,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FP8_MIXED_BATCH":
         lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
                  ("true", "1")),  
-    # If set, control hcu custom gemm including w8a8 int8/fp8 etc
+    # Control HCU custom GEMM for W8A8 INT8/FP8. This feature switch is also
+    # gated by VLLM_HCU_USE_CUSTOM_OPS; disabling the master switch routes
+    # quantized linear GEMM through the target vLLM Triton implementations.
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True").lower() in
              ("true", "1")),

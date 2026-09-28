@@ -12,7 +12,9 @@ class HcuGemmaRMSNorm(GemmaRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM:
+        if henvs.optional_custom_op_enabled(
+            henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM
+        ):
             from lightop.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 
             if residual is None:

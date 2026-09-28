@@ -36,7 +36,9 @@ direct_register_custom_op(
 class HcuSiluAndMul(SiluAndMul):
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_SILU_AND_MUL:
+        if henvs.optional_custom_op_enabled(
+            henvs.VLLM_HCU_USE_CUSTOM_SILU_AND_MUL
+        ):
             return torch.ops.vllm.silu_and_mul_opt_lightop(x)
 
         return super().forward_cuda(x)

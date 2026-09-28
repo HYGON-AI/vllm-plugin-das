@@ -35,8 +35,9 @@ class HcuGroupedTopKRouter(GroupedTopKRouter):
         condition = (
             self._valid_grouping(router_logits)
             and self.e_score_correction_bias is not None
-            and henvs.VLLM_HCU_USE_FUSE_MOE_GATE
-            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.optional_custom_op_enabled(
+                henvs.VLLM_HCU_USE_FUSE_MOE_GATE
+            )
         )
         enable_shared_experts_fusion = False
         if condition:

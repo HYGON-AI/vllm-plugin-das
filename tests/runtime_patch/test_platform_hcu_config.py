@@ -1734,6 +1734,168 @@ def test_explicit_attention_backend_restores_hcu_registration(
     assert selected_path == expected_path
 
 
+@pytest.mark.parametrize(
+    ("custom_ops", "selected_backend_name", "expected_backend_name"),
+    [
+        ("1", None, "FLASHMLA"),
+        ("1", "FLASHMLA", "FLASHMLA"),
+        ("1", "TRITON_MLA", "TRITON_MLA"),
+        ("0", None, "TRITON_MLA"),
+        ("0", "FLASHMLA", "TRITON_MLA"),
+        ("0", "TRITON_MLA", "TRITON_MLA"),
+    ],
+)
+def test_dense_mla_selection_obeys_custom_ops_master(
+    monkeypatch: pytest.MonkeyPatch,
+    custom_ops: str,
+    selected_backend_name: str | None,
+    expected_backend_name: str,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=True,
+    )
+    selected_backend = (
+        None
+        if selected_backend_name is None
+        else AttentionBackendEnum[selected_backend_name]
+    )
+
+    selected_path = HCUPlatform.get_attn_backend_cls(
+        selected_backend,
+        selector_config,
+    )
+
+    assert selected_path == AttentionBackendEnum[expected_backend_name].get_path()
+
+
+@pytest.mark.parametrize("selected_backend_name", [None, "FLASHMLA_SPARSE"])
+def test_sparse_mla_keeps_boltops_fallback_under_custom_ops_master_off(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_backend_name: str | None,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=True,
+        use_sparse=True,
+    )
+    selected_backend = (
+        None
+        if selected_backend_name is None
+        else AttentionBackendEnum[selected_backend_name]
+    )
+
+    selected_path = HCUPlatform.get_attn_backend_cls(
+        selected_backend,
+        selector_config,
+    )
+
+    assert selected_path == AttentionBackendEnum.FLASHMLA_SPARSE.get_path()
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_dense_mla_master_off_preserves_third_party_flashmla_override(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    backend = AttentionBackendEnum.FLASHMLA
+    was_overridden = backend.is_overridden()
+    previous_path = backend.get_path()
+    third_party_path = "third_party.attention.CustomFlashMLABackend"
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=True,
+    )
+
+    try:
+        register_backend(backend, third_party_path)
+        selected_path = HCUPlatform.get_attn_backend_cls(
+            backend if explicit else None,
+            selector_config,
+        )
+    finally:
+        backend.clear_override()
+        if was_overridden:
+            register_backend(backend, previous_path)
+
+    assert selected_path == third_party_path
+
+
 @pytest.mark.parametrize("explicit", [True, False])
 def test_attention_selection_preserves_third_party_override(
     monkeypatch: pytest.MonkeyPatch,

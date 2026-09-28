@@ -39,9 +39,8 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_state_dtype(self):
         from vllm_hcu.platforms import envs as henvs
 
-        if not (
+        if not henvs.optional_custom_op_enabled(
             henvs.VLLM_HCU_MAMBA_SSM_CACHE_DTYPE
-            and henvs.VLLM_HCU_USE_CUSTOM_OPS
         ):
             return state_dtype(self)
         from vllm.model_executor.layers.mamba.mamba_utils import (

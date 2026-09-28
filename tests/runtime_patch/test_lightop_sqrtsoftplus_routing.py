@@ -259,6 +259,34 @@ def test_sqrtsoftplus_switches_preserve_official_fallback(
     ) is official_result
 
 
+def test_sqrtsoftplus_master_off_ignores_materialized_true_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_lightop_moe(
+        monkeypatch,
+        moe_fused_gate_sqrtsoftplus=lambda *args, **kwargs: pytest.fail(
+            "master-off route must not execute LightOp"
+        ),
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE",
+        True,
+        raising=False,
+    )
+    official_result = object()
+    module = _target_module(official_result)
+    patch_fused_topk_bias_router.apply_to_module(module)
+
+    assert _call_patched(
+        module,
+        gating_output=_CudaTensorMetadata((1024, 256), torch.float32),
+        correction_bias=_CudaTensorMetadata((256,), torch.float32),
+    ) is official_result
+
+
 def test_hash_routing_never_calls_lightop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

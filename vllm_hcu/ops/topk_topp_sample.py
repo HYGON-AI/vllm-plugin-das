@@ -10,9 +10,8 @@ import vllm_hcu.platforms.envs as henvs
 
 
 def _use_hcu_topk_topp_sampler() -> bool:
-    return bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER
     )
 
 

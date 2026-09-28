@@ -70,8 +70,9 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm_hcu.platforms import envs as henvs
 
         use_lightop = bool(
-            henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
+            henvs.optional_custom_op_enabled(
+                henvs.VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE
+            )
             and can_use_lightop_sqrtsoftplus(
                 gating_output,
                 e_score_correction_bias,

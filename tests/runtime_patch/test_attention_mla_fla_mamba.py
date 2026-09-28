@@ -50,6 +50,24 @@ def _module(name: str, **values) -> ModuleType:
     return module
 
 
+@pytest.mark.parametrize(
+    "adapter_name",
+    ("patch_fla_chunk_o", "patch_fla_chunk_delta_h"),
+)
+def test_fla_selector_master_off_ignores_materialized_true_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_name: str,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    adapter = _adapter(adapter_name)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+
+    assert adapter._enabled() is False
+
+
 def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
     """Import the implementation after another test registered its torch op."""
     from vllm.model_executor.custom_op import CustomOp
@@ -70,6 +88,137 @@ def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
     return importlib.import_module(
         "vllm_hcu.model_executor.layers.sparse_attn_indexer"
     )
+
+
+@pytest.mark.parametrize(
+    ("master_enabled", "expected_backend"),
+    [(False, "boltops"), (True, "native")],
+)
+def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
+    monkeypatch,
+    master_enabled,
+    expected_backend,
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import flashmla
+
+    def native(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+    ):
+        del q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        return "native"
+
+    def boltops(
+        q,
+        kv,
+        indices,
+        softmax_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+        config=None,
+    ):
+        del q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, config
+        return "boltops"
+    boltops_mla = _module(
+        "boltops.mla",
+        flash_mla_sparse_fwd=boltops,
+    )
+    monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setattr(
+        flashmla,
+        "_native_flash_mla_sparse_fwd",
+        native,
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "1" if master_enabled else "0",
+    )
+    # The effective policy must come from the process environment even after
+    # vLLM's lazy env module materialized the opposite value.
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        not master_enabled,
+        raising=False,
+    )
+    flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    try:
+        result = flashmla.flash_mla_sparse_fwd(
+            q=object(),
+            kv=object(),
+            indices=object(),
+            sm_scale=1.0,
+        )
+    finally:
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    assert result == expected_backend
+
+
+def test_flashmla_sparse_boltops_signature_drift_fails_closed(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import flashmla
+
+    def incompatible_boltops(q, kv, indices, softmax_scale):
+        del q, kv, indices, softmax_scale
+
+    boltops_mla = _module(
+        "boltops.mla",
+        flash_mla_sparse_fwd=incompatible_boltops,
+    )
+    monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
+    )
+    flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    try:
+        with pytest.raises(RuntimeError, match="signature drifted"):
+            flashmla._resolve_sparse_mla_fwd()
+    finally:
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_ds_mla", "fp8_e4m3"])
+def test_flashmla_sparse_boltops_rejects_fp8_kv_cache(
+    monkeypatch,
+    kv_cache_dtype,
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+        HcuFlashMLASparseBackend,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
+    )
+
+    reason = HcuFlashMLASparseBackend.supports_combination(
+        head_size=512,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=64,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=True,
+        use_mm_prefix=False,
+        device_capability=SimpleNamespace(major=9),
+    )
+
+    assert reason is not None
+    assert "BoltOPs" in reason
+    assert "BF16/FP16 KV cache" in reason
 
 
 def _gdn_causal_conv1d_fn(
@@ -1875,6 +2024,93 @@ def test_e5m2_mla_cache_gather_uses_lightop(monkeypatch):
         seq_starts,
     )
     assert not adapter.apply_to_module(module)
+
+
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_e5m2_mla_cache_gather_master_off_uses_torch_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    byte_storage: bool,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    adapter = _adapter("patch_custom_ops")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    _install_fake_module(
+        monkeypatch,
+        "lightop",
+        gather_and_maybe_dequant_cache=lambda *args: pytest.fail(
+            "master-off E5M2 gather must not execute LightOp"
+        ),
+    )
+    logical_cache = (
+        torch.arange(4 * 4 * 3, dtype=torch.float32)
+        .reshape(4, 4, 3)
+        .sub(16)
+        .to(torch.float8_e5m2)
+    )
+    src_cache = (
+        logical_cache.view(torch.uint8) if byte_storage else logical_cache
+    )
+    dst = torch.empty((4, 3), dtype=torch.bfloat16)
+    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    token_to_seq = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+    seq_starts = torch.tensor([1, 5], dtype=torch.int32)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    def unsupported_upstream(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        num_tokens,
+        kv_cache_dtype,
+        scale,
+        seq_starts=None,
+    ):
+        del (
+            src_cache,
+            dst,
+            block_table,
+            cu_seq_lens,
+            token_to_seq,
+            num_tokens,
+            kv_cache_dtype,
+            scale,
+            seq_starts,
+        )
+        pytest.fail("the upstream HCU op does not implement E5M2")
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        gather_and_maybe_dequant_cache=unsupported_upstream,
+    )
+    adapter.apply_to_module(module)
+
+    result = module.gather_and_maybe_dequant_cache(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+
+    expected = torch.stack(
+        (
+            logical_cache[0, 1],
+            logical_cache[0, 2],
+            logical_cache[3, 1],
+            logical_cache[3, 2],
+        )
+    ).to(torch.bfloat16).mul_(0.5)
+    assert result is None
+    torch.testing.assert_close(dst, expected)
 
 
 def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):

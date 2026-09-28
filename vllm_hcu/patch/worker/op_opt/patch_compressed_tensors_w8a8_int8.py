@@ -35,11 +35,35 @@ def _custom_quantization_enabled() -> bool:
     try:
         from vllm_hcu.platforms import envs as henvs
 
-        return bool(henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM)
+        return henvs.custom_quantization_gemm_enabled()
     except (AttributeError, ImportError) as exc:
         raise PatchCompatibilityError(
-            "required HCU flag VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM is unavailable"
+            "required HCU custom-op or quantization-GEMM flag is unavailable"
         ) from exc
+
+
+def _make_triton_int8_kernel(scheme):
+    from compressed_tensors.quantization import QuantizationStrategy
+    from vllm.model_executor.kernels.linear.scaled_mm import (
+        Int8ScaledMMLinearLayerConfig,
+        TritonInt8ScaledMMLinearKernel,
+    )
+
+    config = Int8ScaledMMLinearLayerConfig(
+        is_channelwise=scheme.strategy == QuantizationStrategy.CHANNEL,
+        is_static_input_scheme=scheme.is_static_input_scheme,
+        input_symmetric=scheme.input_symmetric,
+    )
+    return TritonInt8ScaledMMLinearKernel(
+        config,
+        layer_param_names=[
+            "weight",
+            "weight_scale",
+            "input_scale",
+            "input_zero_point",
+            "azp_adj",
+        ],
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -82,6 +106,11 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer) -> None:
         if not _custom_quantization_enabled():
+            # The ROCm auto/explicit-AITER selector may have constructed an
+            # AITER kernel already. Replace it before any layout conversion so
+            # master-off deterministically owns both the Triton weight layout
+            # and execution path.
+            self.kernel = _make_triton_int8_kernel(self)
             return original_process(self, layer)
         weight = getattr(layer, "weight", None)
         if getattr(weight, "ndim", None) != 2:
@@ -89,7 +118,7 @@ def apply_to_module(module: ModuleType) -> bool:
         original_weight = weight
         original_data = weight.data
         try:
-            # Cancel the v0.25.1 target kernel's own transpose so the final
+            # Cancel the v0.28.1 target kernel's own transpose so the final
             # custom hipBLASLt operand remains [N, K].
             layer.weight.data = original_data.t()
             original_process(self, layer)
@@ -126,7 +155,7 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
     def supports_quanted_inputs(self) -> bool:
-        return True
+        return _custom_quantization_enabled()
 
     for function in (hcu_process_weights_after_loading, hcu_apply_weights):
         setattr(function, _WRAPPER_MARKER, True)

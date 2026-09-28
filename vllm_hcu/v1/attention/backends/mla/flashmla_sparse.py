@@ -96,6 +96,42 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
     @classmethod
+    def supports_combination(
+        cls,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        use_mm_prefix,
+        device_capability,
+    ) -> str | None:
+        from vllm_hcu.platforms import envs as henvs
+
+        if (
+            not henvs.optional_custom_op_enabled()
+            and kv_cache_dtype not in {None, "auto", "float16", "bfloat16"}
+        ):
+            return (
+                "VLLM_HCU_USE_CUSTOM_OPS=0 routes sparse MLA through "
+                "BoltOPs, which supports only BF16/FP16 KV cache; got "
+                f"{kv_cache_dtype}."
+            )
+        return super().supports_combination(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
+
+    @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         # The HCU FlashMLA library supports GLM5Next's absorbed D512 path.
         # Retain every size supported by the current official backend.

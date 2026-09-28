@@ -26,6 +26,10 @@ import vllm_hcu.platforms.envs as henvs
 
 logger = init_logger(__name__)
 
+_HCU_FLASHMLA_BACKEND_PATH = (
+    "vllm_hcu.v1.attention.backends.mla.flashmla.HcuFlashMLABackend"
+)
+
 _ensure_platform_plugin_ready()
 
 
@@ -150,6 +154,7 @@ def on_gfx938() -> bool:
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
+    prefer_triton_mla: bool = False,
 ) -> list[AttentionBackendEnum]:
     """Get HCU backend priorities; validation filters unavailable kernels."""
     if use_sparse:
@@ -159,6 +164,11 @@ def _get_backend_priorities(
         ]
 
     if use_mla:
+        if prefer_triton_mla:
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.FLASHMLA,
+            ]
         return [
             AttentionBackendEnum.FLASHMLA,
             AttentionBackendEnum.TRITON_MLA,
@@ -203,6 +213,21 @@ def register_attention_backends() -> None:
     for backend, class_path in backends:
         if not backend.is_overridden():
             register_backend(backend, class_path=class_path)
+
+
+def _use_triton_mla_master_fallback(
+    attn_selector_config: "AttentionSelectorConfig",
+) -> bool:
+    """Select Triton for managed dense MLA when custom ops are disabled."""
+
+    return (
+        attn_selector_config.use_mla
+        and not attn_selector_config.use_sparse
+        and not henvs.optional_custom_op_enabled()
+        # A third-party override is not an HCU-managed custom operator.
+        and AttentionBackendEnum.FLASHMLA.get_path()
+        == _HCU_FLASHMLA_BACKEND_PATH
+    )
 
 
 class HCUPlatform(Platform):
@@ -279,9 +304,18 @@ class HCUPlatform(Platform):
         
         register_attention_backends()
         
+        prefer_triton_mla = _use_triton_mla_master_fallback(
+            attn_selector_config
+        )
+        if prefer_triton_mla:
+            logger.warning_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: defaulting managed dense MLA "
+                "to the vLLM Triton MLA backend."
+            )
         backend_priorities = _get_backend_priorities(
             attn_selector_config.use_mla,
             attn_selector_config.use_sparse,
+            prefer_triton_mla,
         )
         for priority, backend in enumerate(backend_priorities):
             try:
@@ -311,6 +345,16 @@ class HCUPlatform(Platform):
 
         attn_selector_config = attn_selector_config._replace(block_size=None)
         register_attention_backends()
+
+        if (
+            selected_backend == AttentionBackendEnum.FLASHMLA
+            and _use_triton_mla_master_fallback(attn_selector_config)
+        ):
+            logger.warning_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: replacing the managed HCU "
+                "FLASHMLA backend with vLLM Triton MLA."
+            )
+            selected_backend = AttentionBackendEnum.TRITON_MLA
 
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
