@@ -95,4 +95,3 @@ def test_lightop_autoawq_matches_v0281_backend_and_dequantized_reference() -> No
         )
         assert current_error <= 0.015625
         assert reference_error <= 0.015625
-

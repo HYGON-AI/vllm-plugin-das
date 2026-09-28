@@ -42,4 +42,3 @@ ownership, and idempotent patching.  HCU tests compare output accuracy and
 latency with the existing v0.28.1 AutoAWQ route for representative tuned
 shapes and token counts.  If no local AutoAWQ model exists, the MR records
 that service-level validation is unavailable rather than claiming it.
-
