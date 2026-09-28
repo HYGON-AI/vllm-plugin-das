@@ -19,7 +19,7 @@ def _hcu_rms_rotary_embedding_impl(
     weight_q: torch.Tensor,
     weight_k: torch.Tensor,
     epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     from lightop.attention import rms_rotary_embedding_fuse
 
     output_q, output_k = rms_rotary_embedding_fuse(
@@ -35,9 +35,10 @@ def _hcu_rms_rotary_embedding_impl(
         None,
         epsilon,
     )
-    if output_k is None:
-        raise RuntimeError("LightOp fused Qwen3 RMS+RoPE returned no key tensor")
-    return output_q, output_k
+    if output_q is not query or output_k is not key:
+        raise RuntimeError(
+            "LightOp fused Qwen3 RMS+RoPE must update query and key in place"
+        )
 
 
 def _hcu_rms_rotary_embedding_fake(
@@ -50,8 +51,8 @@ def _hcu_rms_rotary_embedding_fake(
     weight_q: torch.Tensor,
     weight_k: torch.Tensor,
     epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return query, key
+) -> None:
+    return None
 
 
 direct_register_custom_op(
@@ -73,7 +74,7 @@ def fused_rms_rotary_embedding(
     weight_k: torch.Tensor,
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.hcu_fused_rms_rotary_embedding(
+    torch.ops.vllm.hcu_fused_rms_rotary_embedding(
         positions,
         query,
         key,
@@ -84,6 +85,7 @@ def fused_rms_rotary_embedding(
         weight_k,
         epsilon,
     )
+    return query, key
 
 
 __all__ = ["fused_rms_rotary_embedding"]

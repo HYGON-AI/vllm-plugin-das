@@ -50,15 +50,15 @@ def test_fused_rms_rope_custom_op_declares_query_and_key_mutable() -> None:
     schema = str(torch.ops.vllm.hcu_fused_rms_rotary_embedding.default._schema)
     assert "Tensor(a1!) query" in schema
     assert "Tensor(a2!) key" in schema
-    assert schema.endswith("-> (Tensor, Tensor)")
+    assert schema.endswith("-> ()")
 
 
-def test_fused_rms_rope_fake_preserves_query_and_key_shapes() -> None:
+def test_fused_rms_rope_fake_returns_none_for_inplace_contract() -> None:
     rms_rope = _load_rms_rope_module()
     query = torch.empty((3, 32, 128), device="meta", dtype=torch.bfloat16)
     key = torch.empty((3, 8, 128), device="meta", dtype=torch.bfloat16)
 
-    out_q, out_k = rms_rope._hcu_rms_rotary_embedding_fake(
+    result = rms_rope._hcu_rms_rotary_embedding_fake(
         torch.empty(3, device="meta", dtype=torch.long),
         query,
         key,
@@ -70,8 +70,7 @@ def test_fused_rms_rope_fake_preserves_query_and_key_shapes() -> None:
         1e-6,
     )
 
-    assert out_q is query
-    assert out_k is key
+    assert result is None
 
 
 def test_fused_rms_rope_calls_public_lightop_attention_contract(
@@ -110,7 +109,7 @@ def test_fused_rms_rope_calls_public_lightop_attention_contract(
         1e-6,
     )
 
-    assert result == (query, key)
+    assert result is None
     assert calls == [
         (
             positions,
