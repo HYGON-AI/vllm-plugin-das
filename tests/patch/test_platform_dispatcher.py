@@ -79,7 +79,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.kimi_k3.model_config",
             "vllm.model_executor.models.config",
         ),
-        ("platform.core_fix.kimi_k3_mtp_config", "vllm.config.speculative"),
+        (
+            "platform.core_fix.kimi_k3_mtp_config",
+            "vllm.config.speculative",
+        ),
         (
             "platform.core_fix.hcu_config.slimquant_registry",
             "vllm.model_executor.layers.quantization",

@@ -437,10 +437,6 @@ class HCUPlatform(Platform):
         cls, vllm_config: "VllmConfig"
     ) -> "IrOpPriorityConfig":
         from vllm.config.kernel import IrOpPriorityConfig
-        from vllm_hcu.runtime_compat.kimi_k3_loading import is_kimi_k3_config
-
-        if not is_kimi_k3_config(vllm_config):
-            return super().get_default_ir_op_priority(vllm_config)
 
         # HCU Kimi runs may request torch.compile but fall back at runtime.
         # Prefer the same ROCm C kernels used by the source path rather than

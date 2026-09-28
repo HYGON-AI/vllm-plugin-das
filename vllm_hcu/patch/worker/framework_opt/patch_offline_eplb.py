@@ -170,13 +170,16 @@ def apply_to_module(module):
         load_path, record_path = _paths(self.parallel_config)
         if load_path or (not is_profile and getattr(self.parallel_config, "_vllm_hcu_eplb_disable_rearrange", False)):
             return None
+        from vllm_hcu.models.kimi_k3.amd.ops.eplb import compact_kimi_load_windows
         if not record_path or is_profile:
-            return original_rearrange(self, is_profile=is_profile, rank_mapping=rank_mapping)
+            with compact_kimi_load_windows(self, rank_mapping=rank_mapping):
+                return original_rearrange(self, is_profile=is_profile, rank_mapping=rank_mapping)
         if rank_mapping is not None:
             raise ValueError("Offline EPLB recording does not support elastic EP")
         token = _RECORD_ONLY.set(True)
         try:
-            return original_rearrange(self, is_profile=False, rank_mapping=None)
+            with compact_kimi_load_windows(self, rank_mapping=None):
+                return original_rearrange(self, is_profile=False, rank_mapping=None)
         finally:
             _RECORD_ONLY.reset(token)
 

@@ -39,7 +39,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
@@ -49,6 +48,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm_hcu.models.kimi_k3.amd.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm_hcu.models.kimi_k3.amd.ops.prefill_metadata import prefill_sequence_lengths
+from vllm_hcu.models.kimi_k3.amd.ops.state_shape import kda_state_shape
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
@@ -286,7 +287,9 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
                 param.tp_rank = param_tp_rank
 
 
-@PluggableLayer.register("kimi_gated_delta_net_attention")
+# Keep the HCU implementation separately registered: newer vLLM runtimes
+# already register their native Kimi implementation under the canonical name.
+@PluggableLayer.register("hcu_kimi_gated_delta_net_attention")
 class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_dtype(
         self,
@@ -300,7 +303,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.kda_state_shape(
+        return kda_state_shape(
             self.tp_size,
             self.num_heads,
             self.head_dim,
@@ -583,7 +586,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         q_conv_weight, k_conv_weight, v_conv_weight = conv_weights.split(
             self.local_projection_size, dim=0
         )
-        q_conv_state, k_conv_state, v_conv_state = conv_state.split(
+        # Speculative slots extend the allocation, but normal prefill/decode
+        # own only the first width-1 history entries. The external update
+        # kernel reads the tail of the supplied view; passing the full draft
+        # history would therefore select different tokens than the spec path.
+        non_spec_conv_state = conv_state[..., : conv_weights.size(-1) - 1]
+        q_conv_state, k_conv_state, v_conv_state = non_spec_conv_state.split(
             self.local_projection_size, dim=-2
         )
 
@@ -691,8 +699,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                                 has_initial_state=has_initial_state,
                                 cache_indices=non_spec_state_indices_tensor,
                                 query_start_loc=non_spec_query_start_loc,
-                                seq_lens_cpu=non_spec_query_start_loc.diff()
-                                .tolist(),
+                                seq_lens_cpu=prefill_sequence_lengths(
+                                    m, non_spec_query_start_loc
+                                ),
                             ).transpose(0, 1)
                     return causal_conv1d_fn(
                         x.transpose(0, 1),
@@ -796,7 +805,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # overwrite the input, so no separate out buffer is needed.
                     mixed_qkv_ns = ext_update_fn(
                         mixed_qkv_ns,
-                        conv_state,
+                        non_spec_conv_state,
                         conv_weights,
                         self.conv1d.bias,
                         activation="silu",
@@ -810,7 +819,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     mixed_qkv_ns = _causal_conv1d_update_compat(
                         mixed_qkv_ns,
-                        conv_state,
+                        non_spec_conv_state,
                         conv_weights,
                         self.conv1d.bias,
                         activation="silu",

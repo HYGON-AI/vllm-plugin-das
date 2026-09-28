@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Strict v0.25.1 MLAAttention runtime adapter."""
+"""MLAAttention runtime adapter for audited vLLM release series."""
 
 from __future__ import annotations
 
@@ -47,34 +47,53 @@ def apply_to_module(module: ModuleType) -> bool:
     if already_applied(mla, _MARKER, wrapped):
         return False
     original_init = require_callable(cls, "__init__", TARGETS[0])
-    require_exact_signature(
-        original_init, TARGETS[0],
-        positional=("self", "num_heads", "scale", "qk_nope_head_dim", "qk_rope_head_dim",
-                    "v_head_dim", "q_lora_rank", "kv_lora_rank", "kv_b_proj",
-                    "cache_config", "quant_config", "prefix", "attn_backend",
-                    "use_sparse", "indexer", "topk_indices_buffer"),
-        defaults={"cache_config": None, "quant_config": None, "prefix": "",
-                  "attn_backend": None, "use_sparse": False, "indexer": None,
-                  "topk_indices_buffer": None},
-        var_keyword="extra_impl_args",
+    init_signature = inspect.signature(original_init)
+    init_params = init_signature.parameters
+    required_init = (
+        "self", "num_heads", "scale", "qk_nope_head_dim", "qk_rope_head_dim",
+        "v_head_dim", "q_lora_rank", "kv_lora_rank", "kv_b_proj",
+        "cache_config", "quant_config", "prefix", "attn_backend", "use_sparse",
+        "indexer", "topk_indices_buffer",
     )
+    if not set(required_init).issubset(init_params) or not (
+        "extra_impl_args" in init_params
+        or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in init_params.values())
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} has incompatible signature "
+            f"{init_signature}"
+        )
     original_full_forward = require_callable(cls, "forward", TARGETS[1])
-    require_exact_signature(
-        original_full_forward,
-        TARGETS[1],
-        positional=("self", "q", "kv_c_normed", "k_pe", "output_shape"),
-        defaults={"output_shape": None},
-    )
+    full_forward_params = inspect.signature(original_full_forward).parameters
+    if not {"self", "q", "kv_c_normed", "k_pe", "output_shape"}.issubset(
+        full_forward_params
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[1]} has incompatible signature "
+            f"{inspect.signature(original_full_forward)}"
+        )
+
+    def call_original_full_forward(
+        self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+    ):
+        args = (self, q, kv_c_normed, k_pe, output_shape)
+        if "q_dcp_replicated" in full_forward_params:
+            return original_full_forward(
+                *args, q_dcp_replicated=q_dcp_replicated
+            )
+        return original_full_forward(*args)
     original_forward = require_callable(cls, "forward_impl", TARGETS[2])
-    require_exact_signature(
-        original_forward, TARGETS[2],
-        positional=("self", "q", "k_c_normed", "k_pe", "kv_cache", "attn_metadata",
-                    "output", "output_scale", "output_block_scale", "quant_group_size",
-                    "quant_scale_ue8m0", "quant_col_major", "quant_tma_aligned"),
-        defaults={"output_scale": None, "output_block_scale": None,
-                  "quant_group_size": None, "quant_scale_ue8m0": None,
-                  "quant_col_major": None, "quant_tma_aligned": None},
-    )
+    forward_params = inspect.signature(original_forward).parameters
+    required_forward = {
+        "self", "q", "k_c_normed", "k_pe", "kv_cache", "attn_metadata",
+        "output", "output_scale", "output_block_scale", "quant_group_size",
+        "quant_scale_ue8m0", "quant_col_major", "quant_tma_aligned",
+    }
+    if not required_forward.issubset(forward_params):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[2]} has incompatible signature "
+            f"{inspect.signature(original_forward)}"
+        )
     process = require_callable(cls, "process_weights_after_loading", TARGETS[3])
     require_exact_signature(process, TARGETS[3], positional=("self", "act_dtype"))
     get_kv_cache_spec = require_callable(cls, "get_kv_cache_spec", TARGETS[7])
@@ -169,26 +188,19 @@ def apply_to_module(module: ModuleType) -> bool:
         kv_c_normed,
         k_pe,
         output_shape=None,
+        q_dcp_replicated=None,
     ):
         if not getattr(self, "_hcu_use_pcp", False):
-            return original_full_forward(
-                self,
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape,
+            return call_original_full_forward(
+                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
             )
         from vllm_hcu.model_executor.layers.attention.pcp import (
             in_replicated_mtp_batch,
         )
 
         if in_replicated_mtp_batch():
-            return original_full_forward(
-                self,
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape,
+            return call_original_full_forward(
+                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
             )
 
         if self.calculate_kv_scales:
@@ -263,17 +275,26 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                     output_scale=None, output_block_scale=None, quant_group_size=None,
-                    quant_scale_ue8m0=None, quant_col_major=None, quant_tma_aligned=None):
+                    quant_scale_ue8m0=None, quant_col_major=None, quant_tma_aligned=None,
+                    q_dcp_replicated=None):
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
-        q_dcp_replicated = getattr(self, "_hcu_q_dcp_replicated", None)
-        if not config.enable_lightly_cp and q_dcp_replicated is None:
-            return original_forward(
+        hcu_q_dcp_replicated = getattr(self, "_hcu_q_dcp_replicated", None)
+        if q_dcp_replicated is None:
+            q_dcp_replicated = hcu_q_dcp_replicated
+        if not config.enable_lightly_cp:
+            forward_args = (
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                 output_scale, output_block_scale, quant_group_size,
                 quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
             )
+            if q_dcp_replicated is None:
+                return original_forward(*forward_args)
+            if "q_dcp_replicated" in forward_params:
+                return original_forward(
+                    *forward_args, q_dcp_replicated=q_dcp_replicated
+                )
         from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
         if q_dcp_replicated is None:

@@ -6,10 +6,12 @@
 from vllm import ModelRegistry
 
 from vllm_hcu.models.hy_v4.config import register_hy_v4_config
+from vllm_hcu.models.kimi_k3.dspark_config import register_k3_dspark_config
 
 
 def register_model():
     register_hy_v4_config()
+    register_k3_dspark_config()
 
     ModelRegistry.register_model(
         "KimiK3ForConditionalGeneration",
@@ -66,6 +68,10 @@ def register_model():
     ModelRegistry.register_model(
         "DSparkDraftModel",
         "vllm_hcu.models.deepseek_v4_dspark:DSparkDeepseekV4ForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "K3DSparkModel",
+        "vllm_hcu.models.kimi_k3.dspark:K3DSparkForCausalLM",
     )
 
 

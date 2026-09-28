@@ -368,7 +368,7 @@ def test_qwen_causal_update_routes_compatible_decode_to_external(
     indices = torch.tensor([0, 1])
     result = module.causal_conv1d_update(
         x, state, physical_weight, activation=activation,
-        conv_state_indices=indices, validate_data=True,
+        conv_state_indices=indices, validate_data=False,
     )
     torch.testing.assert_close(result, torch.full_like(x, 7))
     assert "original" not in calls

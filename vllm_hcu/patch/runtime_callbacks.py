@@ -199,7 +199,11 @@ def apply_kimi_k25_qkv_layout(module: ModuleType) -> None:
     module = require_exact_module(module, target)
     require_type(module, "MoonViTEncoderLayer", f"{target}.MoonViTEncoderLayer")
     require_type(module, "MoonViT3dEncoder", f"{target}.MoonViT3dEncoder")
-    require_type(module, "MoonViT3dPretrainedModel", f"{target}.MoonViT3dPretrainedModel")
+    require_type(
+        module,
+        "MoonViT3dPretrainedModel",
+        f"{target}.MoonViT3dPretrainedModel",
+    )
     require_type(
         module,
         "KimiK25MultiModalProjector",

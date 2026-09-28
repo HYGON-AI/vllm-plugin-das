@@ -250,6 +250,7 @@ def test_weight_callback_updates_both_import_bindings(
 
     weight_utils.safetensors_weights_iterator = original_iterator
     default_loader.safetensors_weights_iterator = original_iterator
+    weight_utils.safe_open = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, weight_utils_name, weight_utils)
     passed_modules: list[tuple[ModuleType, ModuleType]] = []
 
@@ -296,6 +297,7 @@ def test_weight_installer_is_direct_idempotent_and_keeps_bindings_coherent(
 
     weight_utils.safetensors_weights_iterator = original_iterator
     default_loader.safetensors_weights_iterator = original_iterator
+    weight_utils.safe_open = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
     imported: list[str] = []
 
