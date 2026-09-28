@@ -44,12 +44,17 @@ def _supports_fused_path(
         return False
     head_dim = getattr(attention, "head_dim", None)
     rotary_emb = getattr(attention, "rotary_emb", None)
+    cos_sin_cache = getattr(rotary_emb, "cos_sin_cache", None)
     if (
         not isinstance(head_dim, int)
+        or getattr(attention, "dual_chunk_attention_config", None) is not None
         or rotary_emb is None
         or getattr(rotary_emb, "head_size", None) != head_dim
         or getattr(rotary_emb, "rotary_dim", None) != head_dim
-        or not isinstance(getattr(rotary_emb, "cos_sin_cache", None), torch.Tensor)
+        or not isinstance(cos_sin_cache, torch.Tensor)
+        or cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[-1] != head_dim
+        or getattr(rotary_emb, "update_cache", False)
         or not callable(getattr(rotary_emb, "_match_cos_sin_cache_dtype", None))
         or not isinstance(getattr(rotary_emb, "is_neox_style", None), bool)
     ):

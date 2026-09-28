@@ -158,6 +158,7 @@ def _make_attention_instance(attention_class):
     instance.q_size = 8
     instance.kv_size = 4
     instance.head_dim = 2
+    instance.dual_chunk_attention_config = None
     qkv = torch.arange(32, dtype=torch.float32).reshape(2, 16)
 
     def qkv_proj(hidden_states):
@@ -230,7 +231,16 @@ def test_qwen3_patch_fuses_supported_text_attention_before_output_projection(
 
 @pytest.mark.parametrize(
     "unsupported",
-    ("disabled", "mrope", "dual_chunk", "partial_rope", "rank3_hidden"),
+    (
+        "disabled",
+        "mrope",
+        "dual_chunk",
+        "missing_cache",
+        "malformed_cache",
+        "stateful_rope",
+        "partial_rope",
+        "rank3_hidden",
+    ),
 )
 def test_qwen3_patch_delegates_unsupported_inputs_before_qkv_projection(
     monkeypatch: pytest.MonkeyPatch,
@@ -248,7 +258,13 @@ def test_qwen3_patch_delegates_unsupported_inputs_before_qkv_projection(
     if unsupported == "mrope":
         positions = positions.repeat(3, 1)
     elif unsupported == "dual_chunk":
+        instance.dual_chunk_attention_config = {"chunk_size": 8}
+    elif unsupported == "missing_cache":
         del instance.rotary_emb.cos_sin_cache
+    elif unsupported == "malformed_cache":
+        instance.rotary_emb.cos_sin_cache = torch.empty((1, 32, 2))
+    elif unsupported == "stateful_rope":
+        instance.rotary_emb.update_cache = True
     elif unsupported == "partial_rope":
         instance.rotary_emb.rotary_dim = 1
     elif unsupported == "rank3_hidden":

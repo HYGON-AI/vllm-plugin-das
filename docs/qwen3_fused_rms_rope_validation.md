@@ -79,6 +79,33 @@ returned HTTP 200 from `/health`, listed the model through `/v1/models`, and
 passed the official tests for HumanEval tasks 0 through 7 (`8/8`, pass@1
 `1.0`). The server log confirms `fp8_e5m2` KV-cache storage.
 
+The exact request, scoring, and token-throughput calculation is committed as
+`tools/qwen3_humaneval8.py`. The validation used OpenAI HumanEval commit
+`6d43fb980f9fee3c892a914eda09951f772ad10d` and these commands for each
+server arm:
+
+```bash
+git clone https://github.com/openai/human-eval.git /tmp/human-eval
+git -C /tmp/human-eval checkout 6d43fb980f9fee3c892a914eda09951f772ad10d
+
+NO_PROXY=127.0.0.1,localhost \
+no_proxy=127.0.0.1,localhost \
+HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+http_proxy= https_proxy= all_proxy= \
+python3 tools/qwen3_humaneval8.py \
+  --human-eval-root /tmp/human-eval \
+  --base-url http://127.0.0.1:8002 \
+  --model /model/Qwen3-8B \
+  --output-dir /tmp/qwen3-fused-rms-rope-candidate
+```
+
+For the baseline, start the server with
+`VLLM_HCU_USE_FUSED_RMS_ROPE=0` and use a fresh
+`--output-dir /tmp/qwen3-fused-rms-rope-baseline`. The tool selects ordered
+tasks 0 through 7, sends one request at a time with temperature 0,
+`max_tokens=2048`, and `enable_thinking=false`, executes the official tests,
+and reports generated tokens divided by summed request wall time.
+
 The sequential eight-request sample measured 63.637 generated tokens/s for
 the opt-out baseline and 62.710 generated tokens/s for the candidate. The
 generated lengths differed (1082 versus 1085 tokens), so this small service

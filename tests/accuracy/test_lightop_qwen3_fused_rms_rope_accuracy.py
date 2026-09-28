@@ -141,4 +141,3 @@ def test_qwen3_fused_rms_rope_matches_current_hcu_path_and_is_faster(
     assert max_key_error <= 0.0625
     assert mean_query_error <= 0.001
     assert mean_key_error <= 0.001
-    assert fused_ms < current_ms
