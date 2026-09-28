@@ -390,13 +390,104 @@ def test_rocm_sparse_builder_disables_missing_aiter_metadata_api(
             self._use_persistent_metadata = True
             self.metadata_info = get_mla_metadata_info_v1("unused")
 
+    def _use_rocm_sparse_triton(
+        *,
+        kv_cache_dtype,
+        head_size,
+        kv_lora_rank,
+        num_prefills,
+        num_decodes,
+        num_decode_tokens,
+        max_query_len,
+    ):
+        del (
+            kv_cache_dtype,
+            head_size,
+            kv_lora_rank,
+            num_prefills,
+            num_decodes,
+            num_decode_tokens,
+            max_query_len,
+        )
+        return False
+
     module.ROCMAiterMLASparseMetadataBuilder = ROCMAiterMLASparseMetadataBuilder
+    module._use_rocm_sparse_triton = _use_rocm_sparse_triton
     patch_rocm_mla_sparse_metadata.apply_to_module(module)
 
     builder = ROCMAiterMLASparseMetadataBuilder()
     assert builder._use_persistent_metadata is False
     assert builder.metadata_info == ((0, torch.int32),) * 6
     assert not hasattr(aiter, "get_mla_metadata_info_v1")
+
+
+@pytest.mark.parametrize(
+    (
+        "kv_cache_dtype",
+        "head_size",
+        "num_prefills",
+        "num_decodes",
+        "num_decode_tokens",
+        "max_query_len",
+        "expected",
+    ),
+    [
+        ("auto", 512, 0, 2, 4, 2, True),
+        ("auto", 512, 0, 2, 12, 6, True),
+        ("fp8", 512, 0, 2, 4, 2, False),
+        ("auto", 576, 0, 2, 4, 2, False),
+        ("auto", 512, 0, 0, 0, 0, False),
+    ],
+)
+def test_rocm_sparse_route_keeps_mtp_verify_on_ragged_triton(
+    kv_cache_dtype: str,
+    head_size: int,
+    num_prefills: int,
+    num_decodes: int,
+    num_decode_tokens: int,
+    max_query_len: int,
+    expected: bool,
+) -> None:
+    module = ModuleType(patch_rocm_mla_sparse_metadata.TARGET_MODULE)
+
+    class ROCMAiterMLASparseMetadataBuilder:
+        def __init__(self):
+            self._use_persistent_metadata = True
+
+    def _use_rocm_sparse_triton(
+        *,
+        kv_cache_dtype,
+        head_size,
+        kv_lora_rank,
+        num_prefills,
+        num_decodes,
+        num_decode_tokens,
+        max_query_len,
+    ):
+        plain_decode = num_decode_tokens == num_decodes
+        return (
+            not kv_cache_dtype.startswith("fp8")
+            and head_size == kv_lora_rank
+            and plain_decode
+            and (num_prefills > 0 or (num_decodes > 0 and max_query_len == 1))
+        )
+
+    module.ROCMAiterMLASparseMetadataBuilder = ROCMAiterMLASparseMetadataBuilder
+    module._use_rocm_sparse_triton = _use_rocm_sparse_triton
+    patch_rocm_mla_sparse_metadata.apply_to_module(module)
+
+    assert (
+        module._use_rocm_sparse_triton(
+            kv_cache_dtype=kv_cache_dtype,
+            head_size=head_size,
+            kv_lora_rank=512,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            max_query_len=max_query_len,
+        )
+        is expected
+    )
 
 
 def test_kpool_indexer_uses_official_triton_path_without_aiter() -> None:
