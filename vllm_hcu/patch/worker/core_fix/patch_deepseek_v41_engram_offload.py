@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Offload DeepSeek V4.1 Engram tables to pinned host memory on HCU.
+"""Offload and PCP-shard DeepSeek V4.1 Engram tables on HCU.
 
-The AMD model uses the common TP-only Engram implementation.  Keep its
-sharding, lookup kernel, staging, and collectives unchanged; replace only the
-large FP8 table storage when ``EngramConfig.cpu_offload`` is enabled.
+The table layout and lookup kernel remain the community head-sharded design.
+For PCP>1, HCU extends the shard count to TP*PCP and gathers PCP token rows
+around the existing lookup and TP head collective.
 """
 
 from __future__ import annotations
 
 import functools
+import mmap
 import weakref
 from types import ModuleType
 
@@ -33,6 +34,7 @@ PATCH_ID = "worker.core_fix.deepseek_v41.engram_offload"
 TARGETS = (f"{TARGET_MODULE}.Engram._create_embedding",)
 _CLASS_MARKER = "_vllm_hcu_dsv41_engram_offload_storage"
 _CREATE_MARKER = "_vllm_hcu_dsv41_engram_offload_create_embedding"
+_ENGRAM_METHOD_MARKER = "_vllm_hcu_dsv41_engram_pcp_methods"
 
 
 def _engram_config():
@@ -61,9 +63,133 @@ def _require_supported_config() -> None:
         )
     if getattr(config, "embedding_across_dp", False):
         raise ValueError(
-            "HCU DeepSeek V4.1 Engram CPU offload keeps TP-only sharding; "
-            "use embedding_across_dp=false"
+            "HCU DeepSeek V4.1 Engram PCP sharding does not support "
+            "embedding_across_dp=true; use embedding_across_dp=false"
         )
+
+
+def _pcp_group():
+    from vllm.distributed.parallel_state import get_pcp_group
+
+    try:
+        return get_pcp_group()
+    except AssertionError:
+        # Model construction tests and PCP=1 startup can precede group setup.
+        return None
+
+
+def _pcp_size() -> int:
+    group = _pcp_group()
+    return 1 if group is None else int(group.world_size)
+
+
+def _pcp_rank() -> int:
+    group = _pcp_group()
+    return 0 if group is None else int(group.rank_in_group)
+
+
+def _pcp_shard_info(
+    tp_size: int, tp_rank: int, pcp_size: int, pcp_rank: int
+) -> tuple[int, int]:
+    """Return the community-compatible TP-major Engram shard coordinates."""
+    return tp_size * pcp_size, tp_rank * pcp_size + pcp_rank
+
+
+def _gather_padded_hash_ids(hash_ids: torch.Tensor):
+    """Return rank-major PCP hashes and the local equal-sized token slot."""
+    group = _pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return hash_ids, int(hash_ids.shape[0])
+
+    # Callers hand in a layer slice of [tokens, layers, heads], which is not
+    # contiguous and cannot feed all_gather_into_tensor directly.
+    hash_ids = hash_ids.contiguous()
+    count = torch.tensor(
+        [hash_ids.shape[0]], dtype=torch.int64, device=hash_ids.device
+    )
+    counts = group.all_gather(count, dim=0)
+    slot = int(counts.max().item())
+    if hash_ids.shape[0] < slot:
+        padding = hash_ids.new_full(
+            (slot - hash_ids.shape[0], *hash_ids.shape[1:]), -1
+        )
+        hash_ids = torch.cat((hash_ids, padding), dim=0)
+    return group.all_gather(hash_ids, dim=0), slot
+
+
+def _install_pcp_engram_methods(engram_class) -> None:
+    """Install PCP token staging around the community Engram implementation."""
+    if getattr(engram_class, _ENGRAM_METHOD_MARKER, False):
+        return
+
+    original_init_staging = require_callable(
+        engram_class, "_init_staging", f"{TARGET_MODULE}.Engram._init_staging"
+    )
+    original_prepare = require_callable(
+        engram_class,
+        "prepare_embeddings",
+        f"{TARGET_MODULE}.Engram.prepare_embeddings",
+    )
+    original_embed = require_callable(
+        engram_class, "embed", f"{TARGET_MODULE}.Engram.embed"
+    )
+
+    @functools.wraps(original_init_staging)
+    def hcu_init_staging(self, max_tokens, head_dim):
+        pcp_size = _pcp_size()
+        if pcp_size == 1 or not getattr(
+            self.embed_tokens, _CLASS_MARKER, False
+        ):
+            return original_init_staging(self, max_tokens, head_dim)
+        return original_init_staging(self, max_tokens * pcp_size, head_dim)
+
+    @functools.wraps(original_prepare)
+    def hcu_prepare_embeddings(self, hash_ids):
+        pcp_size = _pcp_size()
+        if pcp_size == 1 or not getattr(
+            self.embed_tokens, _CLASS_MARKER, False
+        ):
+            return original_prepare(self, hash_ids)
+
+        gathered, slot = _gather_padded_hash_ids(hash_ids)
+        rows = self.staged_rows[: gathered.shape[0]]
+        if rows.shape[0] != gathered.shape[0]:
+            raise RuntimeError(
+                "HCU PCP Engram staging buffer is too small: "
+                f"need {gathered.shape[0]}, have {rows.shape[0]}"
+            )
+        self.embed_tokens.lookup(gathered, rows)
+        self._hcu_pcp_local_tokens = int(hash_ids.shape[0])
+        self._hcu_pcp_slot = slot
+
+    @functools.wraps(original_embed)
+    def hcu_embed(self, hash_ids):
+        pcp_size = _pcp_size()
+        if pcp_size == 1 or not getattr(
+            self.embed_tokens, _CLASS_MARKER, False
+        ):
+            return original_embed(self, hash_ids)
+
+        group = _pcp_group()
+        assert group is not None
+        local_tokens = int(
+            getattr(self, "_hcu_pcp_local_tokens", hash_ids.shape[0])
+        )
+        slot = int(getattr(self, "_hcu_pcp_slot", local_tokens))
+        staged = self._ready_rows(slot * pcp_size)
+        pcp_rows = group.all_gather(staged, dim=1)
+        start = int(group.rank_in_group) * slot
+        rows = pcp_rows[start : start + local_tokens]
+        if self.embed_tokens.tp_size > 1:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            rows = tensor_model_parallel_all_gather(rows, dim=1)
+        return rows[:, : self.embed_tokens.n_hash_cols]
+
+    setattr(engram_class, "_init_staging", hcu_init_staging)
+    setattr(engram_class, "prepare_embeddings", hcu_prepare_embeddings)
+    setattr(engram_class, "embed", hcu_embed)
+    setattr(engram_class, _ENGRAM_METHOD_MARKER, True)
 
 
 def _is_pin_memory_available() -> bool:
@@ -133,12 +259,47 @@ def _register_host_tensor(tensor: torch.Tensor, owner: object) -> torch.Tensor:
     return tensor
 
 
+def _allocate_registered_host_tensor(
+    shape: tuple[int, ...], dtype: torch.dtype, owner: object
+) -> torch.Tensor:
+    """Allocate anonymous pages before registering them with the HCU driver.
+
+    HCU's large ``pin_memory=True`` allocation path is unreliable.  Keeping
+    the mmap object on the embedding owner is required: ``torch.frombuffer``
+    does not make the Python mmap lifetime an explicit part of the module's
+    storage contract, while the registered pages must remain alive until the
+    owner is destroyed.
+    """
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    mapping = mmap.mmap(
+        -1,
+        nbytes,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    raw = torch.frombuffer(mapping, dtype=dtype, count=numel).view(shape)
+    try:
+        registered = _register_host_tensor(raw, owner)
+        mappings = getattr(owner, "_hcu_engram_mappings", None)
+        if mappings is None:
+            mappings = []
+            setattr(owner, "_hcu_engram_mappings", mappings)
+        mappings.append(mapping)
+        return registered
+    except BaseException:
+        mapping.close()
+        raise
+
+
 def _make_offload_embedding_class(base: type) -> type:
     if getattr(base, _CLASS_MARKER, False):
         return base
 
     class HcuDeepseekV41ParallelEngramEmbedding(base):
-        """The common TP-only Engram embedding with pinned-host storage."""
+        """Community head shards with HCU PCP-aware host storage."""
 
         _vllm_hcu_dsv41_engram_offload_storage = True
 
@@ -156,11 +317,28 @@ def _make_offload_embedding_class(base: type) -> type:
             )
             logger.info(
                 "HCU DeepSeek V4.1 Engram CPU offload active: %.2f GiB per "
-                "TP rank (weight=%s, weight_scale_inv=%s, TP-only sharding, "
+                "rank (weight=%s, weight_scale_inv=%s, shard=%s, "
                 "dp_shared_memory=false)",
                 offloaded_bytes / 1024**3,
                 tuple(self.weight.shape),
                 tuple(self.weight_scale_inv.shape),
+                "TPxPCP" if _pcp_size() > 1 else "TP",
+            )
+
+        def _get_shard_info(self):
+            pcp_size = _pcp_size()
+            if pcp_size == 1:
+                return super()._get_shard_info()
+            # Match the community EDP TP-major head order.  PCP ranks with a
+            # fixed TP rank own adjacent head shards; the PCP collective then
+            # restores those heads before the TP collective completes order.
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            return _pcp_shard_info(
+                self.tp_size,
+                get_tensor_model_parallel_rank(),
+                pcp_size,
+                _pcp_rank(),
             )
 
         def _allocate_weights(self):
@@ -175,29 +353,21 @@ def _make_offload_embedding_class(base: type) -> type:
                 / 1024**3
             )
             try:
-                weight = _register_host_tensor(
-                    torch.empty(
-                        self.part_num_embeddings,
-                        self.dim,
-                        dtype=torch.float8_e4m3fn,
-                        device="cpu",
-                    ),
+                weight = _allocate_registered_host_tensor(
+                    (self.part_num_embeddings, self.dim),
+                    torch.float8_e4m3fn,
                     self,
                 )
-                scales = _register_host_tensor(
-                    torch.empty(
-                        self.part_num_embeddings,
-                        self.dim // self.block_size,
-                        dtype=torch.uint8,
-                        device="cpu",
-                    ),
+                scales = _allocate_registered_host_tensor(
+                    (self.part_num_embeddings, self.dim // self.block_size),
+                    torch.uint8,
                     self,
                 )
             except (RuntimeError, TypeError) as exc:
                 raise RuntimeError(
                     "HCU DeepSeek V4.1 Engram CPU offload failed to allocate "
                     f"{requested:.2f} GiB of registered host memory for this "
-                    "TP rank"
+                    "rank"
                 ) from exc
             return weight, scales
 
@@ -257,6 +427,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return False
 
     offload_embedding = _make_offload_embedding_class(embedding_base)
+    _install_pcp_engram_methods(engram_class)
 
     @functools.wraps(original)
     def hcu_create_embedding(self, layout, layer_hash_index):

@@ -34,6 +34,9 @@ def _target_module():
             self.weight = torch.nn.Parameter(weight, requires_grad=False)
             self.weight_scale_inv = torch.nn.Parameter(scales, requires_grad=False)
 
+        def _get_shard_info(self):
+            return 1, 0
+
         def _allocate_weights(self):
             return (
                 torch.empty(self.part_num_embeddings, self.dim),
@@ -45,8 +48,17 @@ def _target_module():
             )
 
     class Engram:
+        def _init_staging(self, max_tokens, head_dim):
+            del max_tokens, head_dim
+
         def _create_embedding(self, layout, layer_hash_index):
             return ("resident", layout, layer_hash_index)
+
+        def prepare_embeddings(self, hash_ids):
+            del hash_ids
+
+        def embed(self, hash_ids):
+            del hash_ids
 
     module.ParallelEngramEmbedding = ParallelEngramEmbedding
     module.Engram = Engram
@@ -117,6 +129,37 @@ def test_patch_rejects_incompatible_create_signature():
     module.Engram._create_embedding = incompatible
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         patch.apply_to_module(module)
+
+
+def test_pcp_hash_gather_pads_to_common_token_slot(monkeypatch):
+    class Group:
+        world_size = 2
+
+        def all_gather(self, tensor, dim=0):
+            if tensor.numel() == 1:
+                return torch.tensor([2, 3], dtype=tensor.dtype)
+            remote = tensor.new_full((1, tensor.shape[1]), 7)
+            return torch.cat((tensor, remote), dim=dim)
+
+    monkeypatch.setattr(patch, "_pcp_group", lambda: Group())
+    hashes = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+
+    gathered, slot = patch._gather_padded_hash_ids(hashes)
+
+    assert slot == 3
+    assert gathered.shape == (4, 2)
+    assert torch.equal(gathered[:3], torch.tensor([[1, 2], [3, 4], [-1, -1]]))
+    assert torch.equal(gathered[3], torch.tensor([7, 7]))
+
+
+def test_pcp_shard_info_is_tp_major():
+    shards = [
+        patch._pcp_shard_info(4, tp_rank, 2, pcp_rank)[1]
+        for tp_rank in range(4)
+        for pcp_rank in range(2)
+    ]
+
+    assert shards == list(range(8))
 
 
 _needs_accelerator = pytest.mark.skipif(
@@ -196,3 +239,22 @@ def test_register_host_tensor_pins_anonymous_allocation(monkeypatch):
     assert not tensor.is_pinned()
     patch._register_host_tensor(tensor, owner)
     assert tensor.is_pinned()
+
+
+def test_allocate_registered_host_tensor_keeps_mmap_alive(monkeypatch):
+    owner = SimpleNamespace()
+    registered: list[torch.Tensor] = []
+
+    def fake_register(tensor, _owner):
+        registered.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(patch, "_register_host_tensor", fake_register)
+    tensor = patch._allocate_registered_host_tensor((8, 16), torch.uint8, owner)
+
+    assert tensor.shape == (8, 16)
+    assert tensor.device.type == "cpu"
+    assert len(owner._hcu_engram_mappings) == 1
+    assert registered == [tensor]
+    tensor.zero_()
+    assert int(tensor.sum()) == 0
