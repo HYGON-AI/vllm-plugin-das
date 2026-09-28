@@ -4,7 +4,12 @@
 
 from __future__ import annotations
 
-from .lightop_routing import lightop_moe_gate_kwargs
+import torch
+
+from .lightop_routing import (
+    lightop_moe_gate_index_kwargs,
+    lightop_moe_gate_kwargs,
+)
 
 
 def eplb_map_to_physical_and_record(
@@ -122,6 +127,16 @@ def make_hcu_grouped_topk_router(base_class):
                     indices_type,
                     input_ids=input_ids,
                 )
+            gate_kwargs.update(
+                lightop_moe_gate_index_kwargs(
+                    lightop_moe,
+                    request_int64_indices=(
+                        indices_type is not None
+                        and indices_type == torch.int64
+                        and self.num_expert_group == 1
+                    ),
+                )
+            )
             from lightop.moe import moe_fused_gate
 
             topk_weights, topk_ids = moe_fused_gate(

@@ -135,11 +135,25 @@ def int8_w8a8_moe_quant_config(
     )
 
 
+_PCP_EP_DEEPEP_BACKENDS = frozenset(
+    {"deepep_high_throughput", "deepep_low_latency", "deepep_auto"}
+)
+
+
 def use_all2all_kernels(parallel_config: object) -> bool:
-    return bool(
-        (parallel_config.dp_size > 1 or parallel_config.is_sequence_parallel)
-        and parallel_config.use_ep
-    )
+    if not parallel_config.use_ep:
+        return False
+    if parallel_config.dp_size > 1 or parallel_config.is_sequence_parallel:
+        return True
+    # HCU PCP+EP: mirror the base_pcp_ep communicator patch. When PCP>1, EP
+    # is enabled, and a DeepEP backend is selected, the CudaCommunicator has
+    # constructed a DeepEPHT/LL manager; the MoE oracle must also route
+    # through the modular kernel path so that manager is actually used
+    # (otherwise MoE falls back to PCP-group all_gather + reduce_scatter,
+    # i.e. plain RCCL, and the DeepEP manager sits idle).
+    pcp_size = int(getattr(parallel_config, "pcp_size", 1) or 1)
+    backend = getattr(parallel_config, "all2all_backend", None)
+    return pcp_size > 1 and backend in _PCP_EP_DEEPEP_BACKENDS
 
 
 def use_deepep_auto_kernels(parallel_config: object) -> bool:

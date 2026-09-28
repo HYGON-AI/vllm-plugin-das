@@ -280,21 +280,34 @@ def apply_to_module(module: ModuleType) -> bool:
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
+        hcu_q_dcp_replicated = getattr(self, "_hcu_q_dcp_replicated", None)
+        if q_dcp_replicated is None:
+            q_dcp_replicated = hcu_q_dcp_replicated
         if not config.enable_lightly_cp:
             forward_args = (
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                 output_scale, output_block_scale, quant_group_size,
                 quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
             )
-            if q_dcp_replicated is not None and "q_dcp_replicated" in forward_params:
-                return original_forward(*forward_args, q_dcp_replicated=q_dcp_replicated)
-            return original_forward(*forward_args)
+            if q_dcp_replicated is None:
+                return original_forward(*forward_args)
+            if "q_dcp_replicated" in forward_params:
+                return original_forward(
+                    *forward_args, q_dcp_replicated=q_dcp_replicated
+                )
         from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
+        if q_dcp_replicated is None:
+            return mla_forward_impl(
+                mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata,
+                output, output_scale, output_block_scale, quant_group_size,
+                quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            )
         return mla_forward_impl(
             mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
             output_scale, output_block_scale, quant_group_size,
             quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            q_dcp_replicated=q_dcp_replicated,
         )
 
     @functools.wraps(process)

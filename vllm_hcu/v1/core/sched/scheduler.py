@@ -12,6 +12,7 @@ delegates directly to the official scheduler.
 from __future__ import annotations
 
 from vllm.v1.core.sched import scheduler as _upstream
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm_hcu.platforms import envs as henvs
 
 # The migrated method intentionally uses the same scheduler data types as the
@@ -812,6 +813,10 @@ class HcuScheduler(_upstream.Scheduler):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def _hcu_steady_decode_fallback_reason(self) -> str | None:
+        """Optional adapter veto, checked before any scheduling/KV mutation."""
+        return None
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not henvs.VLLM_HCU_USE_PD_SPLIT:
             return super().schedule(throttle_prefills=throttle_prefills)
@@ -820,7 +825,54 @@ class HcuScheduler(_upstream.Scheduler):
                 "VLLM_HCU_USE_PD_SPLIT requires VLLM_HCU_USE_CUSTOM_OPS; "
                 "refusing to silently use the default scheduler"
             )
-        return self.schedule_split_pd(throttle_prefills=throttle_prefills)
+        if not henvs.VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH:
+            return self.schedule_split_pd(throttle_prefills=throttle_prefills)
+        from .steady_decode_scheduler import (
+            remember_steady_decode_state,
+            try_steady_decode_schedule,
+        )
+
+        output = try_steady_decode_schedule(self, throttle_prefills)
+        if output is not None:
+            return output
+        output = self.schedule_split_pd(throttle_prefills=throttle_prefills)
+        remember_steady_decode_state(self, output)
+        return output
 
 
-__all__ = ["HcuScheduler"]
+class HcuAsyncScheduler(HcuScheduler, AsyncScheduler):
+    """Split-P/D policy with the native vLLM asynchronous token protocol."""
+
+    _vllm_hcu_steady_decode_supported = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .steady_decode_scheduler import async_scope_error, logger as steady_logger
+
+        error = async_scope_error(self)
+        if error:
+            raise ValueError(f"HcuAsyncScheduler: {error}")
+        if henvs.VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH and not henvs.VLLM_HCU_USE_PD_SPLIT:
+            raise ValueError("HCU steady decode fastpath requires VLLM_HCU_USE_PD_SPLIT=1")
+        steady_logger.info(
+            "HCU async scheduler active: class=%s executor=%s PD_SPLIT=%s "
+            "fastpath=%s max_concurrent_batches=%s",
+            type(self).__name__, self.parallel_config.distributed_executor_backend,
+            henvs.VLLM_HCU_USE_PD_SPLIT, henvs.VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH,
+            self.vllm_config.max_concurrent_batches,
+        )
+
+    def shutdown(self) -> None:
+        counts = getattr(self, "_vllm_hcu_steady_decode_fallbacks", None)
+        if counts is not None:
+            from .steady_decode_scheduler import logger as steady_logger
+
+            hits = getattr(self, "_vllm_hcu_steady_decode_hits", 0)
+            steady_logger.info(
+                "HCU steady decode summary: hits=%d attempts=%d fallbacks=%s",
+                hits, hits + sum(counts.values()), dict(counts),
+            )
+        super().shutdown()
+
+
+__all__ = ["HcuScheduler", "HcuAsyncScheduler"]

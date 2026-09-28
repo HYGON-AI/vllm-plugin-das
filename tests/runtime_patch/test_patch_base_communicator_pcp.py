@@ -67,11 +67,13 @@ def _install_vllm_config(monkeypatch: pytest.MonkeyPatch, config: object) -> Non
 def _pcp_ep_config(
     *,
     pcp_size: int = 8,
+    dcp_size: int = 1,
     ep_enabled: bool = True,
     backend: str | None = "deepep_high_throughput",
 ) -> SimpleNamespace:
     parallel = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
+        decode_context_parallel_size=dcp_size,
         enable_expert_parallel=ep_enabled,
         all2all_backend=backend,
         data_parallel_size=1,
@@ -106,6 +108,26 @@ def test_base_pcp_ep_forces_use_all2all_for_pcp_ep_deepep_ll(
 
     _install_vllm_config(
         monkeypatch, _pcp_ep_config(backend="deepep_low_latency")
+    )
+    communicator = module.DeviceCommunicatorBase(
+        object(), unique_name="ep:0"
+    )
+    assert communicator.use_all2all is True
+
+
+def test_base_pcp_ep_forces_use_all2all_for_dcp_ep_deepep_ll(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_base_communicator_module()
+    assert patch_base_communicator_pcp.apply_to_module(module) is True
+
+    _install_vllm_config(
+        monkeypatch,
+        _pcp_ep_config(
+            pcp_size=1,
+            dcp_size=2,
+            backend="deepep_low_latency",
+        ),
     )
     communicator = module.DeviceCommunicatorBase(
         object(), unique_name="ep:0"
@@ -149,11 +171,16 @@ def test_base_pcp_ep_ignores_non_deepep_backend(
         assert communicator.use_all2all is False, backend
 
 
-def test_base_pcp_ep_ignores_pcp_size_one(monkeypatch: pytest.MonkeyPatch):
+def test_base_pcp_ep_ignores_when_both_cp_sizes_are_one(
+    monkeypatch: pytest.MonkeyPatch,
+):
     module = _fake_base_communicator_module()
     assert patch_base_communicator_pcp.apply_to_module(module) is True
 
-    _install_vllm_config(monkeypatch, _pcp_ep_config(pcp_size=1))
+    _install_vllm_config(
+        monkeypatch,
+        _pcp_ep_config(pcp_size=1, dcp_size=1),
+    )
     communicator = module.DeviceCommunicatorBase(
         object(), unique_name="ep:0"
     )

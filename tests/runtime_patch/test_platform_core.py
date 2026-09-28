@@ -72,6 +72,10 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
     assert getter() is False
     monkeypatch.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
     assert getter() is True
+    qrep_getter = module.environment_variables["VLLM_DCP_Q_REPLICATE"]
+    assert qrep_getter() is False
+    monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "1")
+    assert qrep_getter() is True
 
     monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
     monkeypatch.setenv("VLLM_KNOWN", "1")

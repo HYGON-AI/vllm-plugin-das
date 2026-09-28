@@ -221,9 +221,8 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
-    _CallbackSpec(
-        _adapter("core_fix", "patch_dspark_smoke_layer"),
-    ),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
+    _CallbackSpec(_adapter("core_fix", "patch_dspark_smoke_layer")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_kimi_k3_model")),
@@ -419,6 +418,13 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.framework_opt.spec_decode.eagle_topk_buffer",
         "worker.framework_opt.communicator.deep_ep_runtime",
     }
+)
+
+# DeepEP's all-to-all module is loaded lazily by distributed runtime setup.
+# It may therefore still be armed after model construction, but must be live
+# once compile/warmup has completed.
+_MODEL_LOAD_DEFERRED_TERMINAL_IDS = frozenset(
+    {"worker.framework_opt.communicator.deep_ep_runtime"}
 )
 
 
@@ -837,6 +843,7 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
 def validate_worker_patches(
     require_applied: bool = True,
     *,
+    phase: Literal["model_load", "runtime"] = "runtime",
     coordinator: ExactImportCoordinator | None = None,
 ) -> None:
     """Validate enabled feature chains at a caller-defined terminal point.
@@ -852,15 +859,24 @@ def validate_worker_patches(
 
     if not isinstance(require_applied, bool):
         raise TypeError("require_applied must be bool")
+    if phase not in {"model_load", "runtime"}:
+        raise ValueError(f"unknown worker patch validation phase: {phase!r}")
     coordinator = IMPORT_COORDINATOR if coordinator is None else coordinator
     _raise_latched_or_required_failures(coordinator)
     if not require_applied:
         return
 
+    deferred = (
+        _MODEL_LOAD_DEFERRED_TERMINAL_IDS
+        if phase == "model_load"
+        else frozenset()
+    )
+
     pending: list[str] = []
     for registration in coordinator.registrations():
         if (
             registration.patch_id in _REQUIRED_TERMINAL_IDS
+            and registration.patch_id not in deferred
             and registration.feature_enabled
             and registration.status != PatchStatus.APPLIED.value
         ):

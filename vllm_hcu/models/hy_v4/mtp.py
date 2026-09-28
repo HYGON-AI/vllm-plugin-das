@@ -383,6 +383,12 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
         shared_head = self.layers[str(self.mtp_start_layer_idx)].shared_head
         return self.logits_processor(shared_head.head, shared_head(hidden_states))
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shared_head = self.layers[str(self.mtp_start_layer_idx)].shared_head
+        return self.logits_processor.get_top_tokens(
+            shared_head.head, shared_head(hidden_states)
+        )
+
     set_eplb_state = HYV4Model.set_eplb_state
     update_physical_experts_metadata = HYV4Model.update_physical_experts_metadata
 
@@ -438,6 +444,9 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.get_top_tokens(hidden_states)
 
     def sample(
         self, logits: torch.Tensor, sampling_metadata: SamplingMetadata,

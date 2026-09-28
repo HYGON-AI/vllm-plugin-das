@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Enable DeepEP all2all under PCP + EP even when DP=TP=1.
+"""Enable DeepEP all2all under context parallelism + EP.
 
 Upstream vLLM (base_device_communicator.DeviceCommunicatorBase.__init__)
 computes ``use_all2all = is_ep_communicator and (dp_size > 1 or
-use_sequence_parallel_moe)``. In the HCU PCP + EP scenario with DP=TP=1,
-this evaluates to False, so cuda_communicator never constructs a
-DeepEP all2all manager. This adapter widens the gate to also cover
-PCP > 1 + EP + explicit DeepEP backend.
+use_sequence_parallel_moe)``. In HCU PCP or DCP + EP topologies with DP=1,
+this can evaluate to False, so cuda_communicator never constructs a DeepEP
+all2all manager. This adapter widens the gate to cover context parallelism,
+EP, and an explicit DeepEP backend.
 """
 
 from __future__ import annotations
@@ -102,17 +102,19 @@ def apply_to_module(module: ModuleType) -> bool:
         if pc is None:
             return
         pcp_size = int(getattr(pc, "prefill_context_parallel_size", 1) or 1)
+        dcp_size = int(getattr(pc, "decode_context_parallel_size", 1) or 1)
         ep_enabled = bool(getattr(pc, "enable_expert_parallel", False))
         backend = getattr(pc, "all2all_backend", None)
         if (
-            pcp_size > 1
+            (pcp_size > 1 or dcp_size > 1)
             and ep_enabled
             and backend in _DEEPEP_BACKENDS
         ):
             self.use_all2all = True
             print(
                 "[HCU PATCH base_pcp_ep] force use_all2all=True "
-                f"pcp={pcp_size} backend={backend} unique_name={unique_name!r}",
+                f"pcp={pcp_size} dcp={dcp_size} backend={backend} "
+                f"unique_name={unique_name!r}",
                 flush=True,
             )
 

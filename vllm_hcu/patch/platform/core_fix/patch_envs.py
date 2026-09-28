@@ -21,6 +21,7 @@ PATCH_ID = "platform.core_fix.envs"
 TARGETS = (
     "vllm.envs.validate_environ",
     "vllm.envs.environment_variables.VLLM_ROCM_USE_AITER_MOE",
+    "vllm.envs.environment_variables.VLLM_DCP_Q_REPLICATE",
 )
 _MARKER = "_vllm_hcu_envs_patch_applied"
 
@@ -73,6 +74,9 @@ def apply_to_module(module: ModuleType) -> bool:
 
     environment_variables["VLLM_ROCM_USE_AITER_MOE"] = lambda: os.getenv(
         "VLLM_ROCM_USE_AITER_MOE", "False"
+    ).lower() in ("true", "1")
+    environment_variables["VLLM_DCP_Q_REPLICATE"] = lambda: os.getenv(
+        "VLLM_DCP_Q_REPLICATE", "False"
     ).lower() in ("true", "1")
     # vLLM can cache module-level environment reads.  Clear stale values so a
     # pre-plugin lookup cannot preserve the upstream True default.

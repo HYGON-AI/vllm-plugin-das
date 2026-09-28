@@ -584,6 +584,44 @@ def test_mtp_shared_head_retains_storage_dtype_with_fp32_logits(monkeypatch):
     torch.testing.assert_close(logits, torch.full((2, 64), 4.0))
 
 
+def test_mtp_local_argmax_uses_shared_head_and_delegates_from_wrapper():
+    mtp = _mtp()
+    predictor = object.__new__(mtp.HYV4MultiTokenPredictor)
+    nn.Module.__init__(predictor)
+    predictor.mtp_start_layer_idx = 2
+
+    class SharedHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = nn.Linear(2, 4, bias=False)
+
+        def forward(self, hidden_states):
+            return hidden_states + 7
+
+    layer = nn.Module()
+    layer.shared_head = SharedHead()
+    predictor.layers = nn.ModuleDict({"2": layer})
+    calls = []
+
+    class Processor:
+        def get_top_tokens(self, lm_head, hidden_states):
+            calls.append((lm_head, hidden_states.clone()))
+            return torch.tensor([3, 1], dtype=torch.int64)
+
+    predictor.logits_processor = Processor()
+    draft = object.__new__(mtp.HYV4MTP)
+    nn.Module.__init__(draft)
+    draft.model = predictor
+    hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    actual = draft.get_top_tokens(hidden_states)
+
+    assert torch.equal(actual, torch.tensor([3, 1], dtype=torch.int64))
+    assert len(calls) == 1
+    assert calls[0][0] is layer.shared_head.head
+    torch.testing.assert_close(calls[0][1], hidden_states + 7)
+
+
 def test_mtp_layer_fuses_embeddings_and_previous_hidden_then_final_residual(monkeypatch):
     mtp = _mtp()
     from vllm.model_executor.layers.layernorm import RMSNorm

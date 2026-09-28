@@ -790,6 +790,28 @@ def test_hcu_control_container_uses_runner_identity() -> None:
     assert '--env "USER=$runner_user"' in source
 
 
+def test_hcu_control_container_keeps_writable_state_off_container_tmp() -> None:
+    source = (
+        REPOSITORY / "scripts/ci/hcu/hcu_ci_run_control_container.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'control_parent="${RUNNER_TEMP:-$workspace}"' in source
+    assert '--volume "$control_root:$control_root"' in source
+    assert '--env "HOME=$control_home"' in source
+    assert '--env "TORCHINDUCTOR_CACHE_DIR=$control_torch_cache"' in source
+    assert '--env "XDG_CACHE_HOME=$control_xdg_cache"' in source
+    assert '--env "TMPDIR=$control_tmp"' in source
+    assert "/tmp/hcu-ci-home" not in source
+    assert "/tmp/hcu-ci-torchinductor" not in source
+    assert "/tmp/hcu-ci-cache" not in source
+
+    workflow = (REPOSITORY / ".github/workflows/hcu-pr-ci.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'cache_dir="$XDG_CACHE_HOME/pytest"' in workflow
+    assert "cache_dir=/tmp/hcu-ci-pytest-cache" not in workflow
+
+
 def test_workspace_repairs_detect_wrong_owners_and_directories() -> None:
     for relative in (
         ".github/workflows/hcu-pr-ci.yml",

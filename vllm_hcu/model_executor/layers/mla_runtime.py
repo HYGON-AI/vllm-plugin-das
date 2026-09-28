@@ -94,6 +94,7 @@ def mla_forward_impl(
     quant_scale_ue8m0=None,
     quant_col_major=None,
     quant_tma_aligned=None,
+    q_dcp_replicated=None,
 ):
     """v0.25.1 target MLA forward plus HCU Lightly-CP KV length and CAT support."""
 
@@ -125,6 +126,8 @@ def mla_forward_impl(
     output_padded = output
     output = output[:num_actual_toks, ...]
     q = q[:num_actual_toks, ...]
+    if q_dcp_replicated is not None:
+        q_dcp_replicated = q_dcp_replicated[:num_actual_toks, ...]
     k_c_normed = k_c_normed[:num_kv_actual_toks, ...]
     k_pe = k_pe[:num_kv_actual_toks, ...]
     if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
@@ -147,7 +150,12 @@ def mla_forward_impl(
             output=output[num_mqa_tokens:],
         )
     if num_mqa_tokens > 0:
-        mqa_q = q[:num_mqa_tokens]
+        qrep_decode = q_dcp_replicated is not None
+        mqa_q = (
+            q_dcp_replicated[:num_mqa_tokens]
+            if qrep_decode
+            else q[:num_mqa_tokens]
+        )
         mqa_output_slice = output[:num_mqa_tokens]
         mqa_q_nope, mqa_q_pe = mqa_q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -173,13 +181,20 @@ def mla_forward_impl(
             )
         else:
             N, B, _ = mqa_q_nope.shape
-            L = self.W_UK_T.shape[-1]
+            W_UK_T = (
+                self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
+            )
+            if W_UK_T is None:
+                raise RuntimeError(
+                    "DCP query replication weights were not prepared"
+                )
+            L = W_UK_T.shape[-1]
             if self.q_pad_num_heads is not None:
                 mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                 mqa_ql_nope.resize_((N, B, L))
             else:
                 mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-            torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+            torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
             mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
         from vllm_hcu.platforms.hcu import on_gfx938
 
@@ -201,10 +216,12 @@ def mla_forward_impl(
         else:
             mqa_q = (mqa_ql_nope, mqa_q_pe)
         if self.impl.dcp_world_size > 1:
-            if fp8_attention:
+            if fp8_attention and not qrep_decode:
                 raise RuntimeError("HCU MLA DCP does not support FP8 KV cache")
-            mqa_q = torch.cat(mqa_q, dim=-1)
-            mqa_q = upstream.get_dcp_group().all_gather(mqa_q, dim=1)
+            if isinstance(mqa_q, tuple):
+                mqa_q = torch.cat(mqa_q, dim=-1)
+            if not qrep_decode:
+                mqa_q = upstream.get_dcp_group().all_gather(mqa_q, dim=1)
         if not is_sparse_impl and attn_metadata.decode is None:
             raise RuntimeError("HCU MLA decode metadata is missing")
         attn_out, lse = self.impl.forward_mqa(

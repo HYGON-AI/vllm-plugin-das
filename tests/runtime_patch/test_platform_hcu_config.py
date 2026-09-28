@@ -1664,6 +1664,127 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
+def _check_hyv4_dcp_cudagraph_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    architecture: str = "HYV4ForCausalLM",
+    dcp_backend: str = "ag_rs",
+    pcp_size: int = 1,
+    cudagraph_mode: Any,
+    compilation_mode: Any,
+) -> Any:
+    from vllm.config.compilation import CompilationConfig
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_multiproc_executor,
+        patch_scheduler,
+    )
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda config: HcuFeatureConfig(),
+    )
+    monkeypatch.setattr(
+        patch_scheduler,
+        "select_hcu_scheduler",
+        lambda config: False,
+    )
+    monkeypatch.setattr(
+        patch_multiproc_executor,
+        "select_hcu_multiproc_executor",
+        lambda config: False,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=[architecture],
+            use_mla=True,
+        ),
+        cache_config=None,
+        compilation_config=CompilationConfig(
+            cudagraph_mode=cudagraph_mode,
+            mode=compilation_mode,
+            splitting_ops=[],
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2,
+            prefill_context_parallel_size=pcp_size,
+            dcp_comm_backend=dcp_backend,
+            worker_cls="custom.Worker",
+        ),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+    return config.compilation_config
+
+
+def test_hyv4_ag_rs_dcp_preserves_requested_full_cudagraph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        compilation_mode=CompilationMode.NONE,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.FULL
+    resolved_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH,
+        "DeepseekV32IndexerBackend",
+    )
+    assert resolved_mode is CUDAGraphMode.FULL_DECODE_ONLY
+
+
+@pytest.mark.parametrize(
+    ("architecture", "dcp_backend", "pcp_size", "use_compilation"),
+    [
+        ("Qwen3ForCausalLM", "ag_rs", 1, False),
+        ("HYV4ForCausalLM", "a2a", 1, False),
+        ("HYV4ForCausalLM", "ag_rs", 2, False),
+        ("HYV4ForCausalLM", "ag_rs", 1, True),
+    ],
+)
+def test_unvalidated_dcp_full_cudagraph_combinations_still_use_piecewise(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    dcp_backend: str,
+    pcp_size: int,
+    use_compilation: bool,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    compilation_mode = (
+        CompilationMode.VLLM_COMPILE if use_compilation else CompilationMode.NONE
+    )
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        architecture=architecture,
+        dcp_backend=dcp_backend,
+        pcp_size=pcp_size,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        compilation_mode=compilation_mode,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
+def test_hyv4_ag_rs_dcp_combined_graph_mode_still_uses_piecewise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_mode=CompilationMode.NONE,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_mla_backend_priority_matches_v0251(
     monkeypatch: pytest.MonkeyPatch, enabled: bool,

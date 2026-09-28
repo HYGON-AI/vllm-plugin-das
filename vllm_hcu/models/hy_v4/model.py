@@ -77,12 +77,15 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+import vllm_hcu.platforms.envs as henvs
+
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
     require_local_indexer_producer,
 )
+from .fp8_kv_dequant import LightOpKVReuseState
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused
 
@@ -348,6 +351,7 @@ class HYV4DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -373,6 +377,7 @@ class HYV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             layer_idx=layer_idx,
             topk_indices_buffer=topk_indices_buffer,
+            lightop_kv_reuse_state=lightop_kv_reuse_state,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
@@ -479,8 +484,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 dtype=torch.int32,
                 device=self.device,
             )
+            self.lightop_kv_reuse_state = (
+                LightOpKVReuseState.from_topk_buffer(self.topk_indices_buffer)
+                if henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT
+                else None
+            )
         else:
             self.topk_indices_buffer = None
+            self.lightop_kv_reuse_state = None
         self.config = config
         self.quant_config = quant_config
         self.enable_ihc = getattr(config, "enable_ihc", False)
@@ -505,6 +516,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 quant_config=quant_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                lightop_kv_reuse_state=self.lightop_kv_reuse_state,
             ),
             prefix=f"{prefix}.layers",
         )

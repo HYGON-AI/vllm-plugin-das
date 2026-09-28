@@ -23,6 +23,24 @@ echo "using HCU CI control image: $image" >&2
 workspace="$(realpath "${GITHUB_WORKSPACE:-$workdir}")"
 workdir="$(realpath "$workdir")"
 runner_user="$(id -un)"
+control_parent="${RUNNER_TEMP:-$workspace}"
+if [[ ! -d "$control_parent" || ! -w "$control_parent" ]]; then
+  control_parent="$workspace"
+fi
+control_parent="$(realpath "$control_parent")"
+control_root="$control_parent/hcu-ci-control-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
+control_home="$control_root/home"
+control_torch_cache="$control_root/torchinductor"
+control_xdg_cache="$control_root/cache"
+control_tmp="$control_root/tmp"
+mkdir -p \
+  "$control_home" "$control_torch_cache" "$control_xdg_cache" "$control_tmp"
+
+cleanup_control_root() {
+  chmod -R u+rwX "$control_root" 2>/dev/null || true
+  rm -rf -- "$control_root"
+}
+trap cleanup_control_root EXIT
 
 docker_args=(
   run --rm
@@ -31,16 +49,20 @@ docker_args=(
   --ipc host
   --workdir "$workdir"
   --volume "$workspace:$workspace"
+  --volume "$control_root:$control_root"
   --volume /etc/passwd:/etc/passwd:ro
   --volume /etc/group:/etc/group:ro
   --env CI=1
-  --env HOME=/tmp/hcu-ci-home
+  --env "HOME=$control_home"
   --env "LOGNAME=$runner_user"
   --env PYTHONDONTWRITEBYTECODE=1
   --env PYTHONPATH="$workspace"
-  --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcu-ci-torchinductor
+  --env "TEMP=$control_tmp"
+  --env "TMP=$control_tmp"
+  --env "TMPDIR=$control_tmp"
+  --env "TORCHINDUCTOR_CACHE_DIR=$control_torch_cache"
   --env "USER=$runner_user"
-  --env XDG_CACHE_HOME=/tmp/hcu-ci-cache
+  --env "XDG_CACHE_HOME=$control_xdg_cache"
 )
 
 if [[ -n "${RUNNER_TEMP:-}" && -d "${RUNNER_TEMP:-}" ]]; then
@@ -65,6 +87,6 @@ done
 
 docker "${docker_args[@]}" "$image" bash -lc '
   set -e
-  mkdir -p "$HOME" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
+  mkdir -p "$HOME" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME" "$TMPDIR"
   exec "$@"
 ' -- "$@"
