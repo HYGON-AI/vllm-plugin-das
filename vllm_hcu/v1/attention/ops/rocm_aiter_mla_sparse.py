@@ -6,11 +6,13 @@ import functools
 import importlib
 import math
 from importlib.util import find_spec
+from inspect import Parameter, signature
 
 import torch
 import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
@@ -29,6 +31,7 @@ from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 
 
 lightop_attention = None
+logger = init_logger(__name__)
 
 
 def _get_lightop_attention():
@@ -908,6 +911,49 @@ def mqa_logits_module():
     return None
 
 
+_BOLTOPS_MQA_PARAMETERS = (
+    "Q",
+    "KV",
+    "kv_scales",
+    "weights",
+    "cu_starts",
+    "cu_ends",
+    "D_out",
+    "backend",
+)
+
+
+@functools.lru_cache
+def _load_boltops_mqa_logits():
+    """Resolve the audited BoltOPs sparse-indexer prefill entry point."""
+    try:
+        module = importlib.import_module("boltops.mqa_logits")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"boltops", "boltops.mqa_logits"}:
+            raise
+        return None
+
+    kernel = getattr(module, "triton_mqa_logits", None)
+    if not callable(kernel):
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_mqa_logits is unavailable in the "
+            "installed BoltOPs package"
+        )
+    parameters = signature(kernel).parameters
+    if (
+        tuple(parameters) != _BOLTOPS_MQA_PARAMETERS
+        or parameters["D_out"].kind is not Parameter.KEYWORD_ONLY
+        or parameters["D_out"].default is not None
+        or parameters["backend"].kind is not Parameter.KEYWORD_ONLY
+        or parameters["backend"].default is not None
+    ):
+        raise RuntimeError(
+            "boltops.mqa_logits.triton_mqa_logits signature drifted from "
+            "the audited BoltOPs 0.1.0 contract"
+        )
+    return kernel
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -934,6 +980,30 @@ def rocm_fp8_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+
+    if not henvs.custom_ops_enabled():
+        boltops_mqa_logits = _load_boltops_mqa_logits()
+        if boltops_mqa_logits is None:
+            logger.warning_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: BoltOPs MQA is unavailable; "
+                "using the vllm_hcu Torch sparse-indexer prefill reference"
+            )
+            return fp8_mqa_logits_torch(
+                q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+            )
+        logger.info_once(
+            "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOPs Triton "
+            "sparse-indexer prefill MQA"
+        )
+        k_fp8, scale = kv
+        return boltops_mqa_logits(
+            q,
+            k_fp8,
+            scale,
+            weights.float().contiguous(),
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+        )
 
     # TODO(ganyi): Temporarily workaround, will remove the module check and reference
     # path after aiter merge this kernel into main
