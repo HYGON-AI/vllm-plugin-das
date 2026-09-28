@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSE_SILU_AND_MUL: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
+    VLLM_HCU_USE_FUSED_RMS_ROPE: bool = True
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
@@ -121,6 +122,16 @@ def ple_prefetch_enabled() -> bool:
     """Resolve PLE stream prefetch under the custom-op master switch."""
     return custom_ops_enabled() and _environment_flag(
         os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False")
+    )
+
+
+def fused_qwen3_rms_rope_enabled() -> bool:
+    """Resolve Qwen3 fused Q/K RMSNorm plus RoPE under the master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_USE_FUSED_RMS_ROPE", "True")
+        )
     )
 
 
@@ -192,6 +203,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_NN":
     lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in 
              ("true", "1")),
+    "VLLM_HCU_USE_FUSED_RMS_ROPE":
+    lambda: _environment_flag(
+        os.environ.get("VLLM_HCU_USE_FUSED_RMS_ROPE", "True")
+    ),
     # vLLM will use FlashAttention Backend on hcu, office attention layerout blocksize 128
     "VLLM_HCU_USE_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in

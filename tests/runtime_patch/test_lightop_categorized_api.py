@@ -24,6 +24,7 @@ REQUIRED_EXPORTS = {
         "get_paged_mqa_logits_metadata",
         "mqa_logits",
         "paged_mqa_logits",
+        "rms_rotary_embedding_fuse",
         "split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant",
         "top_k_per_row_decode",
         "top_k_per_row_prefill",
