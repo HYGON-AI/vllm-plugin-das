@@ -13,10 +13,10 @@ environment variable remains a fallback when EngramConfig is omitted. The
 offload path requires the HCU UVA bridge and fails during model initialization
 when that bridge is unavailable.
 
-SlimQuant checkpoints may keep the PLE ngram table INT8 (declared in
-``config.json`` → ``compression_config.mixed_precision.ngram_embedding``);
-such tables select the compressed-tensors INT8 storage so their per-shard
-``weight_scale`` entries load correctly.
+SlimQuant checkpoints may keep the PLE ngram table INT8 (declared in the
+checkpoint's ``mixed_precision.ngram_embedding`` entry, consumed via
+``SlimQuantW4A8Int8Config``); such tables select the compressed-tensors
+INT8 storage so their per-shard ``weight_scale`` entries load correctly.
 """
 
 from __future__ import annotations
@@ -95,33 +95,24 @@ def _should_offload_ple_to_cpu() -> bool:
     return cpu_offload_enabled()
 
 
-def _slimquant_ngram_is_int8() -> bool:
-    """Check the SlimQuant checkpoint's declared PLE ngram quantization.
+def _slimquant_ngram_is_int8(quant_config) -> bool:
+    """Check the effective SlimQuant config's declared PLE ngram quantization.
 
-    SlimQuant checkpoints describe mixed-precision tables in
-    ``config.json`` → ``compression_config.mixed_precision``; the PLE
-    ngram embedding is INT8 when that entry declares 8-bit int8 weights.
+    SlimQuant checkpoints describe mixed-precision tables in the config dict
+    that vLLM's ``get_quant_config`` selects (top-level
+    ``quantization_config``, then ``text_config.quantization_config``, then
+    ``compression_config``) and hands to
+    ``SlimQuantW4A8Int8Config.from_config``, which stores the parsed
+    ``ngram_embedding`` entry on the resolved config object. Reading the
+    entry from that object inherits the config-source priority instead of
+    re-deriving it from ``hf_config``.
     """
-    try:
-        from vllm.config import get_current_vllm_config
-
-        hf_config = getattr(
-            get_current_vllm_config().model_config, "hf_config", None
-        )
-    except (AssertionError, AttributeError, RuntimeError):
-        return False
-    compression = getattr(hf_config, "compression_config", None)
-    if not isinstance(compression, dict):
-        return False
-    mixed = compression.get("mixed_precision")
-    if not isinstance(mixed, dict):
-        return False
-    ngram = mixed.get("ngram_embedding")
-    if not isinstance(ngram, dict):
+    entry = getattr(quant_config, "ngram_embedding_mixed_precision", None)
+    if not isinstance(entry, dict):
         return False
     return (
-        str(ngram.get("format", "")).lower() == "int8"
-        and int(ngram.get("weight_bits", 0)) == 8
+        str(entry.get("format", "")).lower() == "int8"
+        and int(entry.get("weight_bits", 0)) == 8
     )
 
 
@@ -481,7 +472,7 @@ def _make_storage_class(module: ModuleType, quant_config):
                 and effective_quant_config.get_name() == "slimquant_w4a8"
                 and kwargs.get("quant_method") is None
             ):
-                if _slimquant_ngram_is_int8():
+                if _slimquant_ngram_is_int8(effective_quant_config):
                     # The checkpoint keeps the PLE ngram table INT8 with
                     # per-shard weight_scale; reuse the compressed-tensors
                     # INT8 storage so both weight and weight_scale shards

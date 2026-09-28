@@ -46,11 +46,22 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
         self,
         ignore: list[str] | None = None,
         w8a8_include: list[str] | None = None,
+        ngram_embedding_mixed_precision: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.ignore = list(ignore or [])
         self.w8a8_include = (
             None if w8a8_include is None else list(w8a8_include)
+        )
+        # The PLE ngram table entry parsed from the checkpoint's effective
+        # ``mixed_precision`` map (e.g. ``{"format": "int8",
+        # "weight_bits": 8}``), or None when the checkpoint does not declare
+        # one. Consumers must read it from the resolved config object so the
+        # config-source priority of vLLM's ``get_quant_config`` is inherited.
+        self.ngram_embedding_mixed_precision = (
+            None
+            if ngram_embedding_mixed_precision is None
+            else dict(ngram_embedding_mixed_precision)
         )
 
     @classmethod
@@ -73,15 +84,18 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "SlimQuantW4A8Int8Config":
         mixed_precision = config.get("mixed_precision")
         w8a8_include = None
-        if (
-            isinstance(mixed_precision, dict)
-            and "w8a8_include" in mixed_precision
-        ):
-            w8a8_config = mixed_precision.get("w8a8_include") or {}
-            w8a8_include = list(w8a8_config.get("modules") or [])
+        ngram_entry = None
+        if isinstance(mixed_precision, dict):
+            if "w8a8_include" in mixed_precision:
+                w8a8_config = mixed_precision.get("w8a8_include") or {}
+                w8a8_include = list(w8a8_config.get("modules") or [])
+            ngram_entry = mixed_precision.get("ngram_embedding")
+            if not isinstance(ngram_entry, dict):
+                ngram_entry = None
         return cls(
             ignore=config.get("ignore"),
             w8a8_include=w8a8_include,
+            ngram_embedding_mixed_precision=ngram_entry,
         )
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
