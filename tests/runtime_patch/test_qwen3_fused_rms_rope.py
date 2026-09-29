@@ -304,6 +304,29 @@ def test_qwen3_patch_registers_custom_ops_before_installing_wrapper(
     assert calls == ["registered"]
 
 
+def test_qwen3_master_switch_skips_registration_and_delegates_before_qkv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _load_qwen3_patch_module()
+    target, attention_class = _make_qwen3_target()
+    instance, _, _ = _make_attention_instance(attention_class)
+    calls: list[str] = []
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", "1")
+    monkeypatch.setattr(
+        patch, "_register_fused_op_owner", lambda: calls.append("registered")
+    )
+
+    assert patch.apply_to_module(target) is True
+    hidden_states = torch.ones((2, 4))
+    output = instance.forward(torch.tensor([0, 1]), hidden_states)
+
+    assert calls == []
+    assert torch.equal(output, hidden_states - 3)
+    assert instance.original_calls == 1
+    assert instance.qkv_calls == 0
+
+
 def test_qwen3_patch_rejects_forward_signature_drift() -> None:
     patch = _load_qwen3_patch_module()
 
