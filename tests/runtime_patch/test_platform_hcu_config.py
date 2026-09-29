@@ -1670,9 +1670,11 @@ def _check_hyv4_dcp_cudagraph_policy(
     architecture: str = "HYV4ForCausalLM",
     dcp_backend: str = "ag_rs",
     pcp_size: int = 1,
+    breakable_cudagraph: bool = False,
     cudagraph_mode: Any,
     compilation_mode: Any,
 ) -> Any:
+    import vllm.envs as vllm_envs
     from vllm.config.compilation import CompilationConfig
     from vllm_hcu.patch.platform.framework_opt import (
         patch_multiproc_executor,
@@ -1694,6 +1696,11 @@ def _check_hyv4_dcp_cudagraph_policy(
         patch_multiproc_executor,
         "select_hcu_multiproc_executor",
         lambda config: False,
+    )
+    monkeypatch.setattr(
+        vllm_envs,
+        "VLLM_USE_BREAKABLE_CUDAGRAPH",
+        breakable_cudagraph,
     )
     config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -1718,14 +1725,17 @@ def _check_hyv4_dcp_cudagraph_policy(
     return config.compilation_config
 
 
-def test_hyv4_ag_rs_dcp_preserves_requested_full_cudagraph(
+@pytest.mark.parametrize("dcp_backend", ["ag_rs", "a2a"])
+def test_hyv4_dcp_preserves_requested_full_cudagraph_for_supported_backends(
     monkeypatch: pytest.MonkeyPatch,
+    dcp_backend: str,
 ) -> None:
     from vllm.config.compilation import CUDAGraphMode, CompilationMode
     from vllm.v1.attention.backend import AttentionCGSupport
 
     compilation_config = _check_hyv4_dcp_cudagraph_policy(
         monkeypatch,
+        dcp_backend=dcp_backend,
         cudagraph_mode=CUDAGraphMode.FULL,
         compilation_mode=CompilationMode.NONE,
     )
@@ -1742,7 +1752,7 @@ def test_hyv4_ag_rs_dcp_preserves_requested_full_cudagraph(
     ("architecture", "dcp_backend", "pcp_size", "use_compilation"),
     [
         ("Qwen3ForCausalLM", "ag_rs", 1, False),
-        ("HYV4ForCausalLM", "a2a", 1, False),
+        ("HYV4ForCausalLM", "unsupported", 1, False),
         ("HYV4ForCausalLM", "ag_rs", 2, False),
         ("HYV4ForCausalLM", "ag_rs", 1, True),
     ],
@@ -1771,7 +1781,36 @@ def test_unvalidated_dcp_full_cudagraph_combinations_still_use_piecewise(
     assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
 
 
-def test_hyv4_ag_rs_dcp_combined_graph_mode_still_uses_piecewise(
+@pytest.mark.parametrize("dcp_backend", ["ag_rs", "a2a"])
+def test_hyv4_dcp_preserves_default_combined_graph_mode_with_mtp3(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_backend: str,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        dcp_backend=dcp_backend,
+        breakable_cudagraph=True,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_mode=CompilationMode.NONE,
+    )
+
+    assert (
+        compilation_config.cudagraph_mode
+        is CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    resolved_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH,
+        "DeepseekV32IndexerBackend",
+        uniform_decode_query_len=4,
+        use_v2_model_runner=True,
+    )
+    assert resolved_mode is CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+def test_hyv4_dcp_rejects_combined_graph_mode_without_breakable_or_compilation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.config.compilation import CUDAGraphMode, CompilationMode
@@ -1780,6 +1819,20 @@ def test_hyv4_ag_rs_dcp_combined_graph_mode_still_uses_piecewise(
         monkeypatch,
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         compilation_mode=CompilationMode.NONE,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
+def test_hyv4_dcp_rejects_unvalidated_compiled_combined_graph_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
     )
 
     assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
