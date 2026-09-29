@@ -116,3 +116,39 @@ operator table above.
 After the alias-contract correction, the candidate completed compilation,
 FULL/PIECEWISE graph capture, and HumanEval without the PyTorch mutable-input
 alias warning.
+
+## Persistent AOT cache policy regression
+
+The effective policy (`VLLM_HCU_USE_CUSTOM_OPS AND
+VLLM_HCU_USE_FUSED_RMS_ROPE`) is finalized into
+`VllmConfig.additional_config['hcu']` before vLLM computes its compilation
+hash. The post-validation `EngineArgs` adapter preserves that resolved value;
+it does not restore the unresolved parent-process sidecar after
+`VllmConfig.__post_init__`.
+
+Commit `5850bf7` was packaged as
+`vllm_hcu-0.28.1rc1.dev491+das.5850bf7.dtk26041-cp310-cp310-linux_x86_64.whl`.
+The service command above was run twice against the same `VLLM_CACHE_ROOT`,
+with `--max-num-seqs 8 --host 127.0.0.1 --port 8011` added to shorten graph
+capture. The first start used the opt-out and the second used the default-on
+policy:
+
+```bash
+# First start: create the non-fused persistent graph.
+export VLLM_HCU_USE_FUSED_RMS_ROPE=0
+
+# Second start: enable fusion and reuse the same cache root.
+export VLLM_HCU_USE_FUSED_RMS_ROPE=1
+```
+
+| Effective policy | torch.compile cache | Config hash | Generated graph |
+|---|---|---|---|
+| false | `8e88105356` | `129345c2f0` | no fused RMS+RoPE op |
+| true | `aad0a98068` | `125d0d3206` | contains `vllm.hcu_fused_rms_rotary_embedding` |
+
+The second start compiled and saved a new AOT artifact instead of directly
+loading the non-fused graph. Both starts returned HTTP 200 from `/health` and
+`/v1/models`; their deterministic chat smoke requests returned `4`. The
+launch set `VLLM_KV_CACHE_LAYOUT=HND`; the runtime reported its internal
+LBHNC layout and confirmed `fp8_e5m2` KV-cache storage. Evidence is stored under
+`/data/models/qwen3-aot-policy-validation-5850bf7`.
