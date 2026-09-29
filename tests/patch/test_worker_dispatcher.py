@@ -130,6 +130,9 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
     assert worker_dispatcher._patch_features()[
         "worker.op_opt.qwen3.fused_rms_rope"
     ] == "always"
+    assert worker_dispatcher._patch_features()[
+        "worker.op_opt.quantization.lightop_autoawq"
+    ] == "always"
     framework_order = (
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",

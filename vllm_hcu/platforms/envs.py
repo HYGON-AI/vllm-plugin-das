@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
     VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: bool = True
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
+    VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
@@ -115,6 +116,14 @@ def custom_quantization_gemm_enabled() -> bool:
         _environment_flag(
             os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True")
         )
+    )
+
+
+def lightop_awq_enabled() -> bool:
+    """Resolve the opt-in LightOp AutoAWQ backend under the master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_USE_LIGHTOP_AWQ", "False"))
     )
 
 
@@ -310,6 +319,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", "True").lower() in
              ("true", "1")),
+    "VLLM_HCU_USE_LIGHTOP_AWQ":
+    lambda: _environment_flag(
+        os.environ.get("VLLM_HCU_USE_LIGHTOP_AWQ", "False")
+    ),
     # vllm use dp connector
     "VLLM_HCU_USE_DP_CONNECTOR":
     lambda: (os.environ.get("VLLM_HCU_USE_DP_CONNECTOR", "False").lower() in

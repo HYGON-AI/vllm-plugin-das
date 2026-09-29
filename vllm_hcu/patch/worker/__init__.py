@@ -272,6 +272,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_scaled_mm_linear_kernel")),
     _CallbackSpec(_adapter("op_opt", "patch_input_quant_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_w8a8_utils")),
+    _CallbackSpec(_adapter("op_opt", "patch_auto_awq")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_scheme")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),

@@ -30,6 +30,8 @@ REQUIRED_EXPORTS = {
         "top_k_per_row_prefill",
     },
     "lightop.gemm_ops": {
+        "awq_gemm_marlin_weight_repack",
+        "gemm_awq_w4a16_marlin",
         "hipblaslt_w8a8_gemm",
         "hipblaslt_w8a8_channelwise_gemm",
         "m_grouped_w8a8_gemm_nt_contig_asm",
