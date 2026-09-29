@@ -168,8 +168,25 @@ def test_engram_config_rejects_hcu_cross_dp_embedding(
 
     config = engram_config()
     config.embedding_across_dp = True
-    with pytest.raises(ValueError, match="does not support.*embedding_across_dp"):
+    with pytest.raises(ValueError, match="only supported for DeepseekV41"):
         config.verify_model_config(_model_config())
+
+
+@pytest.mark.parametrize("prefetch_enabled", ("0", "1"))
+def test_engram_config_allows_hcu_dsv41_cross_dp_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+    prefetch_enabled: str,
+):
+    module, engram_config = _engram_module()
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", prefetch_enabled)
+    _install_fake_platform(monkeypatch, cuda=False, cuda_alike=True)
+    patch_engram_config.apply(module)
+
+    config = engram_config()
+    config.embedding_across_dp = True
+    config.verify_model_config(
+        _model_config("DeepseekV41ForCausalLM", engram_layer_ids=[1, 14])
+    )
 
 
 @pytest.mark.parametrize(

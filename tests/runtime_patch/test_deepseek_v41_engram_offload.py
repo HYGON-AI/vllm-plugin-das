@@ -60,6 +60,10 @@ def _target_module():
         def embed(self, hash_ids):
             del hash_ids
 
+        def forward(self, hidden_states, hash_ids, token_mask=None):
+            del hash_ids, token_mask
+            return hidden_states.clone()
+
     module.ParallelEngramEmbedding = ParallelEngramEmbedding
     module.Engram = Engram
     return module
@@ -83,7 +87,7 @@ def test_patch_is_idempotent_and_disabled_config_keeps_resident(monkeypatch):
     assert result[0] == "resident"
 
 
-@pytest.mark.parametrize("field", ("dp_shared_memory", "embedding_across_dp"))
+@pytest.mark.parametrize("field", ("dp_shared_memory",))
 def test_offload_rejects_unimplemented_parallel_modes(monkeypatch, field):
     module = _target_module()
     config = dict(
@@ -99,6 +103,55 @@ def test_offload_rejects_unimplemented_parallel_modes(monkeypatch, field):
 
     with pytest.raises(ValueError, match=field):
         module.Engram()._create_embedding(_layout(), 0)
+
+
+def test_dp_offload_allows_embedding_across_dp(monkeypatch):
+    module = _target_module()
+    monkeypatch.setattr(patch, "_require_supported_config", lambda: None)
+    monkeypatch.setattr(patch, "_is_pin_memory_available", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    monkeypatch.setattr(
+        patch,
+        "_engram_dp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        patch,
+        "_pcp_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        patch,
+        "_engram_config",
+        lambda: SimpleNamespace(
+            cpu_offload=True,
+            dp_shared_memory=False,
+            embedding_across_dp=True,
+        ),
+    )
+    monkeypatch.setattr(
+        patch,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                data_parallel_size=2,
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        patch,
+        "_allocate_registered_host_tensor",
+        lambda shape, dtype, owner: torch.empty(shape, dtype=dtype),
+    )
+    patch.apply_to_module(module)
+
+    result = module.Engram()._create_embedding(_layout(), 0)
+
+    assert result is not None
 
 
 def test_offload_requires_uva(monkeypatch):
@@ -160,6 +213,88 @@ def test_pcp_shard_info_is_tp_major():
     ]
 
     assert shards == list(range(8))
+
+
+def test_dp_shard_info_is_tp_major():
+    shards = [
+        patch._engram_dp_shard_info(1, 0, 8, dp_rank)[1]
+        for dp_rank in range(8)
+    ]
+
+    assert shards == list(range(8))
+
+
+def test_dp_hash_gather_pads_to_common_token_slot(monkeypatch):
+    class Group:
+        world_size = 2
+
+        rank_in_group = 0
+
+        def all_gather(self, tensor, dim=0):
+            if tensor.numel() == 1:
+                return torch.tensor([2, 3], dtype=tensor.dtype)
+            remote = tensor.new_full((3, tensor.shape[1]), 7)
+            return torch.cat((tensor, remote), dim=dim)
+
+    class Metadata:
+        num_tokens_across_dp_cpu = torch.tensor([2, 3], dtype=torch.int64)
+
+    class ForwardContext:
+        dp_metadata = Metadata()
+
+    monkeypatch.setattr(patch, "_engram_dp_group", lambda: Group())
+    monkeypatch.setattr(
+        patch, "_engram_config", lambda: SimpleNamespace(embedding_across_dp=True)
+    )
+    monkeypatch.setattr(
+        "vllm.forward_context.get_forward_context", lambda: ForwardContext()
+    )
+    hashes = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+
+    gathered, slot = patch._gather_padded_dp_hash_ids(hashes)
+
+    assert slot == 3
+    assert gathered.shape == (6, 2)
+    assert torch.equal(gathered[:3], torch.tensor([[1, 2], [3, 4], [-1, -1]]))
+    assert torch.equal(gathered[3:], torch.tensor([[7, 7], [7, 7], [7, 7]]))
+
+
+def test_zero_token_engram_forward_skips_hcu_wkv(monkeypatch):
+    module = _target_module()
+    monkeypatch.setattr(
+        patch,
+        "_engram_config",
+        lambda: SimpleNamespace(
+            cpu_offload=True,
+            dp_shared_memory=False,
+            embedding_across_dp=True,
+        ),
+    )
+    monkeypatch.setattr(patch, "_engram_dp_size", lambda: 2)
+    patch.apply_to_module(module)
+    original = module.Engram.forward
+    hidden = torch.empty(0, 4, 32)
+    result = original(module.Engram(), hidden, torch.empty(0, 2, dtype=torch.int32))
+
+    assert result.shape == hidden.shape
+
+
+def test_dp_forward_uses_shard_size_captured_on_embedding(monkeypatch):
+    module = _target_module()
+    monkeypatch.setattr(patch, "_engram_dp_size", lambda: 2)
+    patch.apply_to_module(module)
+    original = module.Engram.forward
+    instance = module.Engram()
+    instance.embed_tokens = SimpleNamespace(**{patch._DP_SIZE_MARKER: 2})
+    instance.embed = lambda hash_ids: torch.empty(
+        0, 2, 32, dtype=torch.bfloat16
+    )
+    monkeypatch.setattr(patch, "_engram_dp_size", lambda: 1)
+
+    hidden = torch.ones(2, 4, 32)
+    result = original(instance, hidden, torch.ones(2, 2, dtype=torch.int32))
+
+    assert torch.equal(result, torch.zeros_like(hidden))
 
 
 _needs_accelerator = pytest.mark.skipif(

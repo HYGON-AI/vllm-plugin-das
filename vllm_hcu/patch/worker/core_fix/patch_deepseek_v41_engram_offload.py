@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Offload and PCP-shard DeepSeek V4.1 Engram tables on HCU.
+"""Offload and parallel-shard DeepSeek V4.1 Engram tables on HCU.
 
 The table layout and lookup kernel remain the community head-sharded design.
 For PCP>1, HCU extends the shard count to TP*PCP and gathers PCP token rows
-around the existing lookup and TP head collective.
+around the existing lookup and TP head collective.  For the first HCU DP
+implementation, ``embedding_across_dp=true`` extends the shard count to
+TP*EDP and gathers DP token rows using the community Engram DP group.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ TARGETS = (f"{TARGET_MODULE}.Engram._create_embedding",)
 _CLASS_MARKER = "_vllm_hcu_dsv41_engram_offload_storage"
 _CREATE_MARKER = "_vllm_hcu_dsv41_engram_offload_create_embedding"
 _ENGRAM_METHOD_MARKER = "_vllm_hcu_dsv41_engram_pcp_methods"
+_DP_SIZE_MARKER = "_vllm_hcu_dsv41_engram_dp_size"
 
 
 def _engram_config():
@@ -61,11 +64,37 @@ def _require_supported_config() -> None:
             "HCU DeepSeek V4.1 Engram CPU offload does not yet support "
             "dp_shared_memory=true; use dp_shared_memory=false"
         )
-    if getattr(config, "embedding_across_dp", False):
+    if getattr(config, "embedding_across_dp", False) and not getattr(
+        config, "cpu_offload", False
+    ):
         raise ValueError(
-            "HCU DeepSeek V4.1 Engram PCP sharding does not support "
-            "embedding_across_dp=true; use embedding_across_dp=false"
+            "HCU DeepSeek V4.1 Engram embedding_across_dp requires "
+            "cpu_offload=true"
         )
+    if getattr(config, "embedding_across_dp", False) and _pcp_size() > 1:
+        raise ValueError(
+            "HCU DeepSeek V4.1 Engram DP sharding does not yet support "
+            "embedding_across_dp=true together with PCP>1"
+        )
+    if getattr(config, "embedding_across_dp", False):
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        parallel = getattr(vllm_config, "parallel_config", None)
+        group = _engram_dp_group()
+        if (
+            parallel is None
+            or int(parallel.tensor_parallel_size) != 1
+            or int(parallel.pipeline_parallel_size) != 1
+            or int(parallel.prefill_context_parallel_size) != 1
+            or int(parallel.data_parallel_size) <= 1
+            or group is None
+            or int(group.world_size) <= 1
+        ):
+            raise ValueError(
+                "HCU DeepSeek V4.1 Engram embedding_across_dp currently "
+                "requires TP=PCP=PP=1, DP>1, and an initialized Engram DP group"
+            )
 
 
 def _pcp_group():
@@ -93,6 +122,98 @@ def _pcp_shard_info(
 ) -> tuple[int, int]:
     """Return the community-compatible TP-major Engram shard coordinates."""
     return tp_size * pcp_size, tp_rank * pcp_size + pcp_rank
+
+
+def _engram_dp_group():
+    from vllm.distributed.parallel_state import get_engram_dp_group
+
+    return get_engram_dp_group()
+
+
+def _engram_dp_size() -> int:
+    config = _engram_config()
+    if config is None or not getattr(config, "embedding_across_dp", False):
+        return 1
+    group = _engram_dp_group()
+    return 1 if group is None else int(group.world_size)
+
+
+def _engram_dp_rank() -> int:
+    group = _engram_dp_group()
+    return 0 if group is None else int(group.rank_in_group)
+
+
+def _engram_instance_dp_size(engram) -> int:
+    """Return the DP shard count captured when this Engram was built."""
+    embedding = getattr(engram, "embed_tokens", None)
+    captured = getattr(embedding, _DP_SIZE_MARKER, None)
+    return int(captured) if captured is not None else _engram_dp_size()
+
+
+def _engram_dp_shard_info(
+    tp_size: int, tp_rank: int, dp_size: int, dp_rank: int
+) -> tuple[int, int]:
+    """Return TP-major shard coordinates for the community EDP layout."""
+    return tp_size * dp_size, tp_rank * dp_size + dp_rank
+
+
+def _dp_token_slot(group) -> int:
+    from vllm.forward_context import get_forward_context
+
+    metadata = get_forward_context().dp_metadata
+    if metadata is None:
+        raise RuntimeError(
+            "HCU Engram DP sharding requires ForwardContext.dp_metadata"
+        )
+    counts = metadata.num_tokens_across_dp_cpu
+    if counts.numel() != int(group.world_size):
+        raise RuntimeError(
+            "HCU Engram DP sharding currently requires the node-local Engram "
+            "DP group to match the model DP group: "
+            f"metadata={counts.numel()}, group={group.world_size}"
+        )
+    return int(counts.max().item())
+
+
+def _gather_padded_dp_hash_ids(hash_ids: torch.Tensor):
+    """Gather DP replica hashes into a common token slot."""
+    group = _engram_dp_group()
+    if group is None or int(group.world_size) == 1:
+        return hash_ids, int(hash_ids.shape[0])
+    hash_ids = hash_ids.contiguous()
+    slot = _dp_token_slot(group)
+    if hash_ids.shape[0] > slot:
+        raise RuntimeError(
+            "HCU Engram DP hash batch exceeds the synchronized token slot: "
+            f"tokens={hash_ids.shape[0]}, slot={slot}"
+        )
+    if hash_ids.shape[0] < slot:
+        padding = hash_ids.new_full(
+            (slot - hash_ids.shape[0], *hash_ids.shape[1:]), -1
+        )
+        hash_ids = torch.cat((hash_ids, padding), dim=0)
+    return group.all_gather(hash_ids, dim=0), slot
+
+
+def _gather_dp_engram_rows(
+    staged: torch.Tensor, local_tokens: int, slot: int, dp_rank: int
+) -> torch.Tensor:
+    """Gather rank-local head rows and keep this DP replica's tokens."""
+    group = _engram_dp_group()
+    assert group is not None
+    from vllm.models.deepseek_v41.common.engram import _engram_select_rows
+
+    gathered = group.all_gather(staged, dim=0)
+    local_heads, dim = staged.shape[1:]
+    rows = staged.new_empty((local_tokens, group.world_size * local_heads, dim))
+    _engram_select_rows(
+        gathered,
+        rows,
+        staged.shape[0],
+        dp_rank * slot,
+        local_heads * dim,
+    )
+    return rows
 
 
 def _gather_padded_hash_ids(hash_ids: torch.Tensor):
@@ -133,25 +254,37 @@ def _install_pcp_engram_methods(engram_class) -> None:
     original_embed = require_callable(
         engram_class, "embed", f"{TARGET_MODULE}.Engram.embed"
     )
+    original_forward = require_callable(
+        engram_class, "forward", f"{TARGET_MODULE}.Engram.forward"
+    )
 
     @functools.wraps(original_init_staging)
     def hcu_init_staging(self, max_tokens, head_dim):
         pcp_size = _pcp_size()
-        if pcp_size == 1 or not getattr(
+        dp_size = _engram_instance_dp_size(self)
+        if max(pcp_size, dp_size) == 1 or not getattr(
             self.embed_tokens, _CLASS_MARKER, False
         ):
             return original_init_staging(self, max_tokens, head_dim)
-        return original_init_staging(self, max_tokens * pcp_size, head_dim)
+        return original_init_staging(
+            self, max_tokens * max(pcp_size, dp_size), head_dim
+        )
 
     @functools.wraps(original_prepare)
     def hcu_prepare_embeddings(self, hash_ids):
         pcp_size = _pcp_size()
-        if pcp_size == 1 or not getattr(
+        dp_size = _engram_instance_dp_size(self)
+        if (pcp_size == 1 and dp_size == 1) or not getattr(
             self.embed_tokens, _CLASS_MARKER, False
         ):
             return original_prepare(self, hash_ids)
 
-        gathered, slot = _gather_padded_hash_ids(hash_ids)
+        if pcp_size > 1 and dp_size > 1:
+            raise RuntimeError("HCU Engram does not yet support PCP+DP sharding")
+        if dp_size > 1:
+            gathered, slot = _gather_padded_dp_hash_ids(hash_ids)
+        else:
+            gathered, slot = _gather_padded_hash_ids(hash_ids)
         rows = self.staged_rows[: gathered.shape[0]]
         if rows.shape[0] != gathered.shape[0]:
             raise RuntimeError(
@@ -159,16 +292,39 @@ def _install_pcp_engram_methods(engram_class) -> None:
                 f"need {gathered.shape[0]}, have {rows.shape[0]}"
             )
         self.embed_tokens.lookup(gathered, rows)
-        self._hcu_pcp_local_tokens = int(hash_ids.shape[0])
-        self._hcu_pcp_slot = slot
+        if dp_size > 1:
+            self._hcu_dp_local_tokens = int(hash_ids.shape[0])
+            self._hcu_dp_slot = slot
+        else:
+            self._hcu_pcp_local_tokens = int(hash_ids.shape[0])
+            self._hcu_pcp_slot = slot
 
     @functools.wraps(original_embed)
     def hcu_embed(self, hash_ids):
         pcp_size = _pcp_size()
-        if pcp_size == 1 or not getattr(
+        dp_size = _engram_instance_dp_size(self)
+        if (pcp_size == 1 and dp_size == 1) or not getattr(
             self.embed_tokens, _CLASS_MARKER, False
         ):
             return original_embed(self, hash_ids)
+
+        if pcp_size > 1 and dp_size > 1:
+            raise RuntimeError("HCU Engram does not yet support PCP+DP sharding")
+
+        if dp_size > 1:
+            local_tokens = int(
+                getattr(self, "_hcu_dp_local_tokens", hash_ids.shape[0])
+            )
+            slot = int(getattr(self, "_hcu_dp_slot", local_tokens))
+            staged = self._ready_rows(slot * dp_size)
+            rows = _gather_dp_engram_rows(
+                staged, local_tokens, slot, _engram_dp_rank()
+            )
+            if self.embed_tokens.tp_size > 1:
+                from vllm.distributed import tensor_model_parallel_all_gather
+
+                rows = tensor_model_parallel_all_gather(rows, dim=1)
+            return rows[:, : self.embed_tokens.n_hash_cols]
 
         group = _pcp_group()
         assert group is not None
@@ -186,9 +342,94 @@ def _install_pcp_engram_methods(engram_class) -> None:
             rows = tensor_model_parallel_all_gather(rows, dim=1)
         return rows[:, : self.embed_tokens.n_hash_cols]
 
+    @functools.wraps(original_forward)
+    def hcu_forward(self, hidden_states, hash_ids, token_mask=None):
+        if _engram_instance_dp_size(self) <= 1:
+            return original_forward(self, hidden_states, hash_ids, token_mask)
+
+        # DP warmup can leave a replica with no local token rows after the
+        # EDP gather.  The upstream method calls WKV before checking the empty
+        # output, while HCU channelwise FP8 scaled-mm rejects M=0.
+        if hidden_states.shape[0] == 0:
+            return torch.empty_like(hidden_states)
+        embedded = self.embed(hash_ids)
+        if (
+            embedded.shape[0] == 0
+            or embedded.shape[1] == 0
+        ):
+            return torch.zeros_like(hidden_states)
+
+        from vllm.models.deepseek_v41.common.engram import (
+            _fused_engram_post_wkv_kernel,
+        )
+        from vllm.triton_utils import triton
+
+        kv = self.wkv(embedded.flatten(-2))
+        num_kv_tokens = hash_ids.shape[0]
+        if token_mask is not None and token_mask.shape != (num_kv_tokens,):
+            raise ValueError("Engram token mask shape does not match hash ids")
+        num_tokens = hidden_states.shape[0]
+        if self.use_sequence_parallel:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            shard_size = (num_kv_tokens + tp_size - 1) // tp_size
+            if hidden_states.shape[0] != shard_size:
+                raise RuntimeError(
+                    "HCU DP Engram sequence-parallel token shape mismatch: "
+                    f"hidden={hidden_states.shape[0]}, shard={shard_size}"
+                )
+            start = min(tp_rank * shard_size, num_kv_tokens)
+            num_kv_tokens = min(shard_size, num_kv_tokens - start)
+            if token_mask is not None:
+                token_mask = token_mask[start : start + num_kv_tokens]
+
+        _, hc_mult, dim = hidden_states.shape
+        if kv.ndim != 2 or kv.shape[1] != (hc_mult + 1) * dim:
+            raise RuntimeError("HCU DP Engram WKV output shape mismatch")
+        output = torch.empty_like(hidden_states)
+        block_size = triton.next_power_of_2(dim)
+        num_warps = 8 if block_size >= 2048 else 4
+        mask = token_mask if token_mask is not None else hidden_states
+        _fused_engram_post_wkv_kernel[(num_tokens * hc_mult,)](
+            hidden_states,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            mask,
+            output,
+            num_kv_tokens,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            hidden_states.stride(2),
+            kv.stride(0),
+            kv.stride(1),
+            self.q_weight.stride(0),
+            self.q_weight.stride(1),
+            self.k_weight.stride(0),
+            self.k_weight.stride(1),
+            token_mask.stride(0) if token_mask is not None else 0,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            self.eps,
+            self.clamp_value,
+            DIM=dim,
+            HC_MULT=hc_mult,
+            BLOCK_SIZE=block_size,
+            HAS_MASK=token_mask is not None,
+            num_warps=num_warps,
+        )
+        return output
+
     setattr(engram_class, "_init_staging", hcu_init_staging)
     setattr(engram_class, "prepare_embeddings", hcu_prepare_embeddings)
     setattr(engram_class, "embed", hcu_embed)
+    setattr(engram_class, "forward", hcu_forward)
     setattr(engram_class, _ENGRAM_METHOD_MARKER, True)
 
 
@@ -307,6 +548,7 @@ def _make_offload_embedding_class(base: type) -> type:
             self._hcu_uva_views = None
             self._hcu_uva_view_src = None
             super().__init__(*args, **kwargs)
+            setattr(self, _DP_SIZE_MARKER, max(1, _engram_dp_size()))
             # Match the official offload implementation for dummy-weight mode.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
@@ -322,11 +564,31 @@ def _make_offload_embedding_class(base: type) -> type:
                 offloaded_bytes / 1024**3,
                 tuple(self.weight.shape),
                 tuple(self.weight_scale_inv.shape),
-                "TPxPCP" if _pcp_size() > 1 else "TP",
+                (
+                    "TPxPCP"
+                    if _pcp_size() > 1
+                    else "TPxEDP"
+                    if _engram_dp_size() > 1
+                    else "TP"
+                ),
             )
 
         def _get_shard_info(self):
             pcp_size = _pcp_size()
+            dp_size = _engram_dp_size()
+            if dp_size > 1:
+                if pcp_size > 1:
+                    raise ValueError(
+                        "HCU Engram does not yet support PCP+DP sharding"
+                    )
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                return _engram_dp_shard_info(
+                    self.tp_size,
+                    get_tensor_model_parallel_rank(),
+                    dp_size,
+                    _engram_dp_rank(),
+                )
             if pcp_size == 1:
                 return super()._get_shard_info()
             # Match the community EDP TP-major head order.  PCP ranks with a
