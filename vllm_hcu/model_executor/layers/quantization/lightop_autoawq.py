@@ -16,6 +16,9 @@ from vllm.model_executor.layers.linear import LinearMethodBase
 
 
 _AWQ_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+_LAYOUT_ATTR = "_vllm_hcu_lightop_autoawq_layout"
+_DELEGATE_LAYOUT = "delegate"
+_LIGHTOP_LAYOUT = "lightop"
 _LIGHTOP_TUNED_KN = frozenset(
     {
         (8192, 10240),
@@ -157,6 +160,8 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         self._params_dtype = params_dtype
         self._k = input_size_per_partition
         self._n = sum(output_partition_sizes)
+        if hasattr(layer, _LAYOUT_ATTR):
+            delattr(layer, _LAYOUT_ATTR)
 
     def _eligible(self) -> bool:
         return (
@@ -168,16 +173,39 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self._lightop_active = False
-        self._lightop_gemm = None
-        if not self._eligible():
+        selected_layout = getattr(layer, _LAYOUT_ATTR, None)
+        if selected_layout == _DELEGATE_LAYOUT:
+            self._lightop_active = False
+            self._lightop_gemm = None
             self.delegate.process_weights_after_loading(layer)
+            return
+        if selected_layout not in (None, _LIGHTOP_LAYOUT):
+            raise RuntimeError(
+                f"Unknown LightOp AutoAWQ parameter layout: {selected_layout!r}"
+            )
+
+        first_processing = selected_layout is None
+        if first_processing:
+            self._lightop_active = False
+            self._lightop_gemm = None
+        if not self._eligible():
+            if not first_processing:
+                raise RuntimeError(
+                    "LightOp AutoAWQ layer became ineligible during reload"
+                )
+            self.delegate.process_weights_after_loading(layer)
+            setattr(layer, _LAYOUT_ATTR, _DELEGATE_LAYOUT)
             return
 
         try:
             repack, gemm = _resolve_lightop_awq_ops()
-        except (ImportError, AttributeError, OSError):
+        except (ImportError, AttributeError, OSError) as error:
+            if not first_processing:
+                raise RuntimeError(
+                    "LightOp AutoAWQ backend became unavailable during reload"
+                ) from error
             self.delegate.process_weights_after_loading(layer)
+            setattr(layer, _LAYOUT_ATTR, _DELEGATE_LAYOUT)
             return
 
         weight_trans, scales_zeros = convert_awq_to_lightop_layout(
@@ -189,7 +217,10 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         try:
             repacked_weight = repack(weight_trans, self._n, self._k)
         except (TypeError, ValueError, AssertionError, RuntimeError):
+            if not first_processing:
+                raise
             self.delegate.process_weights_after_loading(layer)
+            setattr(layer, _LAYOUT_ATTR, _DELEGATE_LAYOUT)
             return
 
         layer.qweight = Parameter(repacked_weight, requires_grad=False)
@@ -200,6 +231,7 @@ class LightOpAutoAWQLinearMethod(LinearMethodBase):
         delattr(layer, "scales")
         self._lightop_gemm = gemm
         self._lightop_active = True
+        setattr(layer, _LAYOUT_ATTR, _LIGHTOP_LAYOUT)
 
     def apply(
         self,

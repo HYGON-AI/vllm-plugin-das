@@ -322,11 +322,11 @@ def test_hybrid_awq_reprocesses_after_vllm_restores_loader_parameters(
         AutoAWQLinearMethod,
     )
     from vllm.model_executor.model_loader.reload.layerwise import (
+        _layerwise_process,
         get_layerwise_info,
         record_metadata_for_reloading,
     )
     from vllm.model_executor.model_loader.reload.meta import (
-        materialize_layer,
         restore_layer_on_meta,
     )
     from vllm.model_executor.model_loader.reload.utils import (
@@ -376,21 +376,156 @@ def test_hybrid_awq_reprocesses_after_vllm_restores_loader_parameters(
 
     info = get_layerwise_info(layer)
     info.kernel_tensors = get_layer_params_buffers(layer)
+    kernel_qweight = info.kernel_tensors[0]["qweight"]
+    kernel_scales_zeros = info.kernel_tensors[0]["scales_zeros"]
     restore_layer_on_meta(layer, info)
-    materialize_layer(layer, info)
-    assert hasattr(layer.qweight, "weight_loader")
-    assert hasattr(layer.qzeros, "weight_loader")
-    assert hasattr(layer.scales, "weight_loader")
-    layer.qweight.data.zero_()
-    layer.qzeros.data.zero_()
-    layer.scales.data.fill_(1)
-
-    method.process_weights_after_loading(layer)
+    layer.quant_method = method
+    _layerwise_process(layer, info)
 
     assert repack_calls == 2
     assert hasattr(layer, "scales_zeros")
     assert not hasattr(layer, "qzeros")
     assert not hasattr(layer, "scales")
+    assert layer.qweight is kernel_qweight
+    assert layer.scales_zeros is kernel_scales_zeros
+
+
+def test_hybrid_awq_reload_keeps_initial_delegate_layout_after_repack_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    import vllm.model_executor.parameter as parameter
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig,
+        AutoAWQLinearMethod,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _layerwise_process,
+        get_layerwise_info,
+        record_metadata_for_reloading,
+    )
+    from vllm.model_executor.model_loader.reload.meta import (
+        restore_layer_on_meta,
+    )
+    from vllm.model_executor.model_loader.reload.utils import (
+        get_layer_params_buffers,
+    )
+
+    config = AutoAWQConfig(4, 128, True, False)
+    method = autoawq.LightOpAutoAWQLinearMethod(
+        AutoAWQLinearMethod(config), config
+    )
+    layer = torch.nn.Module()
+
+    def weight_loader(param, loaded_weight):
+        param.data.copy_(loaded_weight)
+
+    method.create_weights(
+        layer,
+        128,
+        [8],
+        128,
+        8,
+        torch.float16,
+        weight_loader=weight_loader,
+    )
+    record_metadata_for_reloading(layer)
+    layer.qweight.data.zero_()
+    layer.qzeros.data.zero_()
+    layer.scales.data.fill_(1)
+    repack_calls = 0
+
+    def repack(weight, _n, _k):
+        nonlocal repack_calls
+        repack_calls += 1
+        if repack_calls == 1:
+            raise RuntimeError("temporary LightOp resource exhaustion")
+        return weight
+
+    monkeypatch.setattr(
+        autoawq, "is_lightop_awq_shape_supported", lambda _k, _n: True
+    )
+    monkeypatch.setattr(
+        autoawq,
+        "_resolve_lightop_awq_ops",
+        lambda: (repack, lambda a, b, scales_zeros: a),
+    )
+    method.process_weights_after_loading(layer)
+    assert repack_calls == 1
+    assert hasattr(layer, "qzeros")
+    assert hasattr(layer, "scales")
+
+    info = get_layerwise_info(layer)
+    info.kernel_tensors = get_layer_params_buffers(layer)
+    kernel_qweight = info.kernel_tensors[0]["qweight"]
+    kernel_qzeros = info.kernel_tensors[0]["qzeros"]
+    kernel_scales = info.kernel_tensors[0]["scales"]
+    restore_layer_on_meta(layer, info)
+    layer.quant_method = method
+    _layerwise_process(layer, info)
+
+    assert repack_calls == 1
+    assert layer.qweight is kernel_qweight
+    assert layer.qzeros is kernel_qzeros
+    assert layer.scales is kernel_scales
+    assert not hasattr(layer, "scales_zeros")
+
+
+def test_hybrid_awq_reload_does_not_fallback_after_lightop_layout_is_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    autoawq = _load_autoawq_module()
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _layerwise_process,
+        get_layerwise_info,
+        record_metadata_for_reloading,
+    )
+    from vllm.model_executor.model_loader.reload.meta import (
+        restore_layer_on_meta,
+    )
+    from vllm.model_executor.model_loader.reload.utils import (
+        get_layer_params_buffers,
+    )
+
+    delegate = _Delegate()
+    method, layer = _make_method(autoawq, delegate)
+    record_metadata_for_reloading(layer)
+    repack_calls = 0
+
+    def repack(weight, _n, _k):
+        nonlocal repack_calls
+        repack_calls += 1
+        if repack_calls == 2:
+            raise RuntimeError("temporary LightOp resource exhaustion")
+        return weight
+
+    monkeypatch.setattr(
+        autoawq, "is_lightop_awq_shape_supported", lambda _k, _n: True
+    )
+    monkeypatch.setattr(
+        autoawq,
+        "_resolve_lightop_awq_ops",
+        lambda: (repack, lambda a, b, scales_zeros: a),
+    )
+    method.process_weights_after_loading(layer)
+    assert method._lightop_active is True
+
+    info = get_layerwise_info(layer)
+    info.kernel_tensors = get_layer_params_buffers(layer)
+    restore_layer_on_meta(layer, info)
+    layer.quant_method = method
+
+    with pytest.raises(RuntimeError, match="resource exhaustion"):
+        _layerwise_process(layer, info)
+
+    assert repack_calls == 2
+    assert delegate.processed == 0
+    assert method._lightop_active is True
 
 
 @pytest.mark.parametrize(
