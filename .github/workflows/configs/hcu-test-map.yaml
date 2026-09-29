@@ -484,6 +484,17 @@
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
+    "kimi-k3-state-contracts": {
+      "patterns": [
+        "vllm_hcu/models/kimi_k3/amd/linear.py",
+        "vllm_hcu/models/kimi_k3/amd/kimi_gdn_linear_attn.py",
+        "vllm_hcu/models/kimi_k3/amd/ops/state_shape.py",
+        "tests/models/kimi_k3/test_kimi_moe_metadata.py",
+        "tests/models/kimi_k3/test_kimi_spec_state_contract.py",
+        "tests/models/kimi_k3/test_kimi_eplb_transfer.py"
+      ],
+      "jobs": ["hy4-contract", "accuracy-gfx936", "accuracy-gfx938"]
+    },
     "hy4-contract": {
       "patterns": [
         "vllm_hcu/**hy_v4*",
@@ -513,6 +524,10 @@
     },
     "kernel-accuracy-tests": {
       "patterns": [
+        "tests/accuracy/test_kimi_spec_conv_history_hcu.py",
+        "tests/accuracy/test_kimi_spec_forward_hcu.py",
+        "tests/accuracy/test_kimi_prefill_metadata_hcu.py",
+        "tests/accuracy/test_kimi_eplb_window_hcu.py",
         "tests/accuracy/test_hcu_kernel_accuracy.py",
         "tests/accuracy/test_aiter_silu_and_mul.py",
         "tests/accuracy/test_unified_aiter_moe_operator.py"
@@ -539,6 +554,10 @@
     },
     "kernel-runtime": {
       "patterns": [
+        "vllm_hcu/models/kimi_k3/amd/ops/state_shape.py",
+        "vllm_hcu/models/kimi_k3/amd/ops/prefill_metadata.py",
+        "vllm_hcu/models/kimi_k3/amd/ops/eplb.py",
+        "vllm_hcu/patch/worker/op_opt/patch_kimi_prefill_metadata.py",
         "vllm_hcu/csrc/**",
         "vllm_hcu/ops/**",
         "vllm_hcu/model_executor/layers/attention_forward_runtime.py",

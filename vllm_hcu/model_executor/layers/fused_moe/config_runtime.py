@@ -145,12 +145,10 @@ def use_all2all_kernels(parallel_config: object) -> bool:
         return False
     if parallel_config.dp_size > 1 or parallel_config.is_sequence_parallel:
         return True
-    # HCU PCP+EP: mirror the base_pcp_ep communicator patch. When PCP>1, EP
-    # is enabled, and a DeepEP backend is selected, the CudaCommunicator has
-    # constructed a DeepEPHT/LL manager; the MoE oracle must also route
-    # through the modular kernel path so that manager is actually used
-    # (otherwise MoE falls back to PCP-group all_gather + reduce_scatter,
-    # i.e. plain RCCL, and the DeepEP manager sits idle).
+    # In PCP+EP, the HCU communicator patch constructs a DeepEP manager even
+    # though upstream's DP/SP gate remains false. Keep the MoE config in sync
+    # so the runner selects the matching modular all2all path instead of the
+    # PCP gather/scatter fallback.
     pcp_size = int(getattr(parallel_config, "pcp_size", 1) or 1)
     backend = getattr(parallel_config, "all2all_backend", None)
     return pcp_size > 1 and backend in _PCP_EP_DEEPEP_BACKENDS

@@ -64,6 +64,11 @@ def apply_to_module(module: ModuleType) -> bool:
             existing = customized.get(name) if isinstance(customized, dict) else None
             if existing is facade:
                 continue
+            if name == "kimi_k3_w4a8" and isinstance(customized, dict):
+                # vLLM 0.26 ships a CUDA-oriented implementation with this
+                # name. The HCU facade owns backend selection on this platform.
+                customized[name] = facade
+                continue
             raise PatchCompatibilityError(
                 f"quantization method {name!r} is already registered by "
                 f"{existing or 'an unknown provider'}"

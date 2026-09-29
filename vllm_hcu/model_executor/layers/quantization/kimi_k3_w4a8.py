@@ -726,6 +726,11 @@ class KimiK3W4A8Config(QuantizationConfig):
 class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
     """Routed-expert storage and direct gfx938 W4A8 dispatch for Kimi-K3."""
 
+    @property
+    def supports_eplb(self) -> bool:
+        from vllm_hcu.models.kimi_k3.amd.ops.eplb import kimi_ht_eplb_enabled
+        return self.use_deepep_ht and not self.use_deepep_ll and kimi_ht_eplb_enabled()
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # vLLM 0.25.x has no ``situ`` enum; the HCU legacy-MoE adapter carries
@@ -812,6 +817,27 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig | None:
         if self.use_deepep_ht or self.use_deepep_ll:
+            if self.use_deepep_ht:
+                # HT consumes compensated scales. Register these derived
+                # tensors as expert parameters so the base EPLB inventory
+                # moves the actual GEMM inputs along with canonical scales.
+                # Keep their addresses stable across repeated config binding
+                # and in-place expert permutations (including graph readers).
+                marker = getattr(layer, "_kimi_ht_scale_ids", None)
+                if marker is None:
+                    layer._kimi_ht_w13_weight_scale = torch.nn.Parameter(
+                        layer.w13_weight_scale.detach() * 16.0, requires_grad=False)
+                    layer._kimi_ht_w2_weight_scale = torch.nn.Parameter(
+                        layer.w2_weight_scale.detach() * 16.0, requires_grad=False)
+                    layer._kimi_ht_scale_ids = (
+                        id(layer.w13_weight_scale), id(layer.w2_weight_scale),
+                        id(layer._kimi_ht_w13_weight_scale), id(layer._kimi_ht_w2_weight_scale))
+                elif marker != (
+                    id(layer.w13_weight_scale), id(layer.w2_weight_scale),
+                    id(getattr(layer, "_kimi_ht_w13_weight_scale", None)),
+                    id(getattr(layer, "_kimi_ht_w2_weight_scale", None)),
+                ):
+                    raise RuntimeError("Kimi HT scales replaced after binding; reload unsupported")
             return FusedMoEQuantConfig.make(
                 torch.int8, weight_dtype="int4", per_act_token_quant=True,
                 per_out_ch_quant=False,
@@ -819,12 +845,12 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
                 w1_scale=(
                     layer.w13_weight_scale
                     if self.use_deepep_ll
-                    else layer.w13_weight_scale * 16.0
+                    else layer._kimi_ht_w13_weight_scale
                 ),
                 w2_scale=(
                     layer.w2_weight_scale
                     if self.use_deepep_ll
-                    else layer.w2_weight_scale * 16.0
+                    else layer._kimi_ht_w2_weight_scale
                 ),
                 a1_scale=None, a2_scale=None,
             )

@@ -143,7 +143,17 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         return self.hf_processor
 
     def get_hf_config(self) -> KimiK3Config:
-        return self.ctx.get_hf_config(KimiK3Config)
+        # Newer vLLM bundles its own KimiK3Config class. The plugin's 0.25
+        # model and the 0.26 DSpark runtime can therefore describe the same
+        # checkpoint with distinct Python class identities. Preserve the
+        # runtime config object and require the field this processor consumes.
+        hf_config = self.ctx.model_config.hf_config
+        if not hasattr(hf_config, "media_placeholder_token_id"):
+            raise TypeError(
+                "Kimi-K3 HF config must expose media_placeholder_token_id; "
+                f"found {type(hf_config)!r}"
+            )
+        return hf_config
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         # None means unlimited

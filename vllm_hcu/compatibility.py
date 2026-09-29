@@ -66,6 +66,18 @@ def _supported_series() -> tuple[int, int]:
     return series
 
 
+def _supported_series_set() -> frozenset[tuple[int, int]]:
+    """Return release series audited by this plugin checkout.
+
+    The Kimi-K3 DSpark draft architecture is delivered by the vLLM 0.26
+    source branch, while deployed HCU plugin environments still use 0.25.1.
+    Keep both series explicit so either runtime is accepted only after the
+    platform patches have been validated against it.
+    """
+
+    return frozenset({_supported_series(), (0, 26)})
+
+
 def _distribution_location(
     distribution: importlib_metadata.Distribution,
 ) -> str | None:
@@ -115,9 +127,9 @@ def inspect_vllm_compatibility() -> VllmCompatibility:
         )
 
     actual_series = parsed.release[:2]
-    compatible = parsed.epoch == 0 and actual_series == expected_series
+    compatible = parsed.epoch == 0 and actual_series in _supported_series_set()
     if compatible:
-        reason = "installed vLLM release series is supported"
+        reason = f"installed vLLM release series {actual_series!r} is supported"
     else:
         reason = f"installed vLLM release series {actual_series!r} is unsupported"
     return VllmCompatibility(

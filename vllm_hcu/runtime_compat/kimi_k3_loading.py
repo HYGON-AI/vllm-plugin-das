@@ -15,7 +15,11 @@ def is_kimi_k3_config(vllm_config):
 @contextmanager
 def preload_before_weight_loading(loader, preload):
     """Keep load_model overrides, device/dtype contexts and finalization intact."""
-    original = loader.load_weights
+    original = getattr(loader, "load_weights", None)
+    if not callable(original):
+        # Custom loaders with their own weight path remain entirely in control.
+        yield
+        return
     had_override = "load_weights" in vars(loader)
     previous = vars(loader).get("load_weights")
 
@@ -24,7 +28,12 @@ def preload_before_weight_loading(loader, preload):
         preload(model)
         return original(model, model_config)
 
-    loader.load_weights = load_weights
+    try:
+        loader.load_weights = load_weights
+    except (AttributeError, TypeError):
+        # Slotted/immutable custom loaders cannot be safely intercepted.
+        yield
+        return
     try:
         yield
     finally:

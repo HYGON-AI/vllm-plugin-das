@@ -26,10 +26,11 @@ An fp32 manual MLA reference (over the paged cache) validates that the two
 kernels are computing the intended attention rather than merely agreeing on a
 shared bug.
 
-Run from the repository root with vLLM and the HCU plugin installed, using
-one free HCU:
+Run on one free HCU in the plugin container:
 
-    HIP_VISIBLE_DEVICES=0 \\
+    # Set VLLM_SOURCE_ROOT to the local vLLM checkout.
+    PYTHONPATH="${VLLM_SOURCE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \\
+    HIP_VISIBLE_DEVICES=<card> \\
       python -m pytest \\
         tests/runtime_patch/test_flashmla_decode_align_triton_mla.py -q
 """

@@ -5,8 +5,13 @@
 from __future__ import annotations
 
 import importlib
+import inspect
+import json
 import sys
+from contextlib import contextmanager
 from collections.abc import Generator
+from contextvars import ContextVar
+from pathlib import Path
 from types import ModuleType
 
 from vllm.logger import init_logger
@@ -15,6 +20,64 @@ logger = init_logger(__name__)
 
 _WEIGHT_UTILS_MODULE = "vllm.model_executor.model_loader.weight_utils"
 _DEFAULT_LOADER_MODULE = "vllm.model_executor.model_loader.default_loader"
+_WEIGHT_DEBUG_SKIP_DISABLED: ContextVar[bool] = ContextVar(
+    "vllm_hcu_weight_debug_skip_disabled", default=False
+)
+_WEIGHT_PREFIXES_TO_SKIP: ContextVar[tuple[str, ...]] = ContextVar(
+    "vllm_hcu_weight_prefixes_to_skip", default=()
+)
+_SAFE_OPEN_MARKER = "_hcu_safe_open_prefix_filter_applied"
+
+
+class _SafeOpenPrefixView:
+    """Filter safetensors keys before the underlying file reads tensor bytes."""
+
+    def __init__(self, handle, prefixes: tuple[str, ...]):
+        self._handle = handle
+        self._prefixes = prefixes
+
+    def __enter__(self):
+        self._handle = self._handle.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._handle.__exit__(exc_type, exc_value, traceback)
+
+    def keys(self):
+        keys = self._handle.keys()
+        if not self._prefixes:
+            return keys
+        return [
+            key for key in keys
+            if not any(key.startswith(prefix) for prefix in self._prefixes)
+        ]
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
+@contextmanager
+def skip_safetensors_weight_prefixes(
+    prefixes: tuple[str, ...] | list[str],
+):
+    """Skip known-unused model prefixes before safetensors materializes them."""
+    current = _WEIGHT_PREFIXES_TO_SKIP.get()
+    normalized = tuple(dict.fromkeys((*current, *(str(p) for p in prefixes))))
+    token = _WEIGHT_PREFIXES_TO_SKIP.set(normalized)
+    try:
+        yield
+    finally:
+        _WEIGHT_PREFIXES_TO_SKIP.reset(token)
+
+
+@contextmanager
+def disable_weight_debug_skip():
+    """Temporarily load every layer in nested draft-model construction."""
+    token = _WEIGHT_DEBUG_SKIP_DISABLED.set(True)
+    try:
+        yield
+    finally:
+        _WEIGHT_DEBUG_SKIP_DISABLED.reset(token)
 
 
 def _require_exact_module(module: object, expected_name: str) -> ModuleType:
@@ -88,16 +151,34 @@ def install_weight_debug_skip_compat(
         )
 
     original_iterator = weight_iterator
+    iterator_accepts_smoke_limit = "smoke_layer_limit" in inspect.signature(
+        original_iterator
+    ).parameters
     skip_logged = False
 
     DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS = 8
     DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
+
+    if not getattr(weight_utils, _SAFE_OPEN_MARKER, False):
+        original_safe_open = getattr(weight_utils, "safe_open", None)
+        if not callable(original_safe_open):
+            raise RuntimeError("vLLM safetensors safe_open contract is unavailable")
+
+        def safe_open_with_prefix_filter(*args, **kwargs):
+            return _SafeOpenPrefixView(
+                original_safe_open(*args, **kwargs),
+                _WEIGHT_PREFIXES_TO_SKIP.get(),
+            )
+
+        weight_utils.safe_open = safe_open_with_prefix_filter
+        setattr(weight_utils, _SAFE_OPEN_MARKER, True)
 
     def wrapped_safetensors_weights_iterator(
         hf_weights_files: list[str],
         use_tqdm_on_load: bool,
         safetensors_load_strategy: str = "lazy",
         local_expert_ids: set[int] | None = None,
+        smoke_layer_limit: int | None = None,
         *,
         safetensors_prefetch_num_threads: int = (
             DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS
@@ -106,14 +187,80 @@ def install_weight_debug_skip_compat(
     ) -> Generator[tuple[str, object], None, None]:
         import vllm_hcu.platforms.envs as henvs
 
+        if smoke_layer_limit is not None:
+            # The source loader filters tensors after opening every shard. On
+            # very large NFS checkpoints that makes a 12-layer smoke run scan
+            # the complete model. Use the standard HF weight map to avoid
+            # opening shards that contain only omitted decoder layers or
+            # multimodal tensors. Fail closed if the checkpoint index cannot
+            # be matched exactly; this optimization is debug-smoke only.
+            files = list(hf_weights_files)
+            if files:
+                index_path = Path(files[0]).parent / "model.safetensors.index.json"
+                if not index_path.is_file():
+                    raise RuntimeError(
+                        "VLLM_SKIP_WEIGHT smoke loading requires "
+                        f"{index_path} to select relevant checkpoint shards"
+                    )
+                with index_path.open(encoding="utf-8") as index_file:
+                    weight_map = json.load(index_file).get("weight_map")
+                if not isinstance(weight_map, dict):
+                    raise RuntimeError(
+                        f"invalid safetensors weight map in {index_path}"
+                    )
+                available = {Path(path).name for path in files}
+                mapped = {str(shard) for shard in weight_map.values()}
+                if not available.issubset(mapped):
+                    raise RuntimeError(
+                        "safetensors index does not cover every requested "
+                        "checkpoint shard; refusing partial smoke filtering"
+                    )
+                from vllm.model_executor.model_loader.weight_utils import (
+                    should_skip_smoke_layer_weight,
+                )
+
+                prefixes = _WEIGHT_PREFIXES_TO_SKIP.get()
+                needed_shards = {
+                    str(shard)
+                    for name, shard in weight_map.items()
+                    if str(shard) in available
+                    and not should_skip_smoke_layer_weight(
+                        name, smoke_layer_limit
+                    )
+                    and not any(name.startswith(prefix) for prefix in prefixes)
+                }
+                filtered_files = [
+                    path for path in files if Path(path).name in needed_shards
+                ]
+                if not filtered_files:
+                    raise RuntimeError(
+                        "safetensors smoke filtering selected no checkpoint "
+                        "shards; refusing to start an empty model"
+                    )
+                logger.info(
+                    "VLLM_SKIP_WEIGHT selected %d of %d target checkpoint "
+                    "shards using %s",
+                    len(filtered_files),
+                    len(files),
+                    index_path,
+                )
+                hf_weights_files = filtered_files
+
         skip_weight_debug_enabled = henvs.VLLM_HCU_USE_SKIP_WEIGHT_DEBUG
-        for name, param in original_iterator(
+        iterator_kwargs = dict(
             hf_weights_files=hf_weights_files,
             use_tqdm_on_load=use_tqdm_on_load,
             safetensors_load_strategy=safetensors_load_strategy,
             local_expert_ids=local_expert_ids,
-        ):
-            if skip_weight_debug_enabled and "layers." in name:
+        )
+        if iterator_accepts_smoke_limit:
+            iterator_kwargs["smoke_layer_limit"] = smoke_layer_limit
+        for name, param in original_iterator(**iterator_kwargs):
+            if (
+                skip_weight_debug_enabled
+                and not _WEIGHT_DEBUG_SKIP_DISABLED.get()
+                and "layers." in name
+            ):
                 try:
                     layer_id = int(name.split("layers.")[1].split(".")[0])
                     if layer_id >= 5:

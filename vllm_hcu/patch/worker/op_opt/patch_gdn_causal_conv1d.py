@@ -8,7 +8,12 @@ import functools
 import inspect
 from types import ModuleType
 
-from ._common import already_applied, load_exact_module, require_callable
+from ._common import (
+    PatchCompatibilityError,
+    already_applied,
+    load_exact_module,
+    require_callable,
+)
 from ._gdn_common import (
     normalize_nn_conv_weight,
     require_parameter_names,
@@ -28,7 +33,9 @@ _WRAPPER = "_vllm_hcu_gdn_causal_conv1d_wrapper"
 
 def _supports_external_update(arguments: dict[str, object]) -> bool:
     return (
-        arguments["num_accepted_tokens"] is None
+        arguments.get("out") is None
+        and not arguments["validate_data"]
+        and arguments["num_accepted_tokens"] is None
         and arguments["query_start_loc"] is None
         and arguments["max_query_len"] == -1
         and arguments["null_block_id"] == 0
@@ -75,25 +82,30 @@ def apply_to_module(module: ModuleType) -> bool:
         qwen, "causal_conv1d_update", TARGETS[1]
     )
     causal_update_signature = inspect.signature(causal_update)
-    require_parameter_names(
-        causal_update,
-        TARGETS[1],
-        (
-            "x",
-            "conv_state",
-            "weight",
-            "bias",
-            "activation",
-            "conv_state_indices",
-            "num_accepted_tokens",
-            "query_start_loc",
-            "max_query_len",
-            "null_block_id",
-            "block_idx_last_scheduled_token",
-            "initial_state_idx",
-            "validate_data",
-        ),
+    expected_update_parameters = (
+        "x",
+        "conv_state",
+        "weight",
+        "bias",
+        "activation",
+        "conv_state_indices",
+        "num_accepted_tokens",
+        "query_start_loc",
+        "max_query_len",
+        "null_block_id",
+        "block_idx_last_scheduled_token",
+        "initial_state_idx",
+        "validate_data",
     )
+    actual_update_parameters = tuple(causal_update_signature.parameters)
+    if actual_update_parameters not in (
+        expected_update_parameters,
+        (*expected_update_parameters, "out"),
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU target {TARGETS[1]} has incompatible parameters "
+            f"{actual_update_parameters!r}"
+        )
 
     @functools.wraps(causal)
     def hcu_causal_conv(*args, **kwargs):

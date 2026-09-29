@@ -23,9 +23,29 @@ def apply_to_module(module: ModuleType) -> bool:
     for architecture in ("KimiK3ForConditionalGeneration", "KimiK3MTPModel"):
         existing = mapping.get(architecture)
         if existing is not None and existing is not KimiK3ConfigAdapter:
-            raise PatchCompatibilityError(
-                f"{architecture} config adapter is already owned by another provider"
+            # vLLM 0.26 adds the MXFP4 metadata rewrite in its native Kimi-K3
+            # adapter. Preserve that behavior, then apply the HCU SlimQuant
+            # normalization required by this plugin.
+            if not callable(
+                getattr(existing, "verify_and_update_model_config", None)
+            ):
+                raise PatchCompatibilityError(
+                    f"{architecture} config adapter is already owned by an incompatible provider"
+                )
+            native_verify = existing.verify_and_update_model_config
+
+            def verify(model_config, native_verify=native_verify):
+                native_verify(model_config)
+                KimiK3ConfigAdapter.verify_and_update_model_config(model_config)
+
+            composite = type(
+                "HCU" + architecture + "ConfigAdapter",
+                (KimiK3ConfigAdapter,),
+                {"verify_and_update_model_config": staticmethod(verify)},
             )
+            mapping[architecture] = composite
+            changed = True
+            continue
         if existing is None:
             mapping[architecture] = KimiK3ConfigAdapter
             changed = True

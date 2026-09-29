@@ -59,8 +59,8 @@ def _prepare_general_plugin() -> None:
     from vllm_hcu.patch.worker import prepare_worker_patches
 
     prepare_worker_patches()
-    # Platform discovery must not import torch. General registration runs at
-    # the runtime boundary, after Worker import callbacks have been armed.
+    # Dynamo metrics compatibility is runtime setup and may import torch.
+    # Keep it out of the dependency-light platform discovery phase.
     from vllm_hcu.runtime_compat.dynamo_metrics import (
         install_dynamo_metrics_compat,
     )

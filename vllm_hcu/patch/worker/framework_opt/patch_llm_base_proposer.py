@@ -23,9 +23,9 @@ TARGETS = (
     f"{TARGET_MODULE}.SpecDecodeBaseProposer.propose",
     f"{TARGET_MODULE}.SpecDecodeBaseProposer.prepare_inputs_padded",
     f"{TARGET_MODULE}.SpecDecodeBaseProposer._maybe_share_lm_head",
+    f"{TARGET_MODULE}.SpecDecodeBaseProposer.model_returns_tuple",
     f"{TARGET_MODULE}.SpecDecodeBaseProposer._pad_for_sequence_parallelism",
     f"{TARGET_MODULE}.SpecDecodeBaseProposer._determine_batch_execution_and_padding",
-    f"{TARGET_MODULE}.SpecDecodeBaseProposer.model_returns_tuple",
 )
 _MARKER = "_vllm_hcu_base_proposer_applied"
 _WRAPPER = "_vllm_hcu_base_proposer_wrapper"
@@ -43,7 +43,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (proposer_class, "propose", TARGETS[1], _WRAPPER),
         (proposer_class, "prepare_inputs_padded", TARGETS[2], _WRAPPER),
         (proposer_class, "_maybe_share_lm_head", TARGETS[3], _WRAPPER),
-        (proposer_class, "model_returns_tuple", TARGETS[6], _WRAPPER),
+        (proposer_class, "model_returns_tuple", TARGETS[4], _WRAPPER),
         (
             proposer_class,
             "_determine_batch_execution_and_padding",
@@ -53,20 +53,18 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     if already_applied(proposer_module, _MARKER, wrapped):
         padding = require_callable(
-            proposer_class, "_pad_for_sequence_parallelism", TARGETS[4]
+            proposer_class, "_pad_for_sequence_parallelism", TARGETS[5]
         )
         if not getattr(padding, _WRAPPER, False):
             raise PatchCompatibilityError(
-                f"required HCU patch marker for {TARGETS[4]} is stale"
+                f"required HCU patch marker for {TARGETS[5]} is stale"
             )
         return False
     if "_pad_for_sequence_parallelism" in vars(proposer_class):
         raise PatchCompatibilityError(
-            f"audited target vLLM API {TARGETS[4]} unexpectedly already exists"
+            f"audited target vLLM API {TARGETS[5]} unexpectedly already exists"
         )
 
-    original_returns_tuple = require_callable(proposer_class, "model_returns_tuple", TARGETS[6])
-    require_exact_signature(original_returns_tuple, TARGETS[6], positional=("self",))
     original_init = require_callable(proposer_class, "__init__", TARGETS[0])
     require_exact_signature(
         original_init,
@@ -125,12 +123,20 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[3],
         positional=("self", "target_language_model"),
     )
+    original_model_returns_tuple = require_callable(
+        proposer_class, "model_returns_tuple", TARGETS[4]
+    )
+    require_exact_signature(
+        original_model_returns_tuple,
+        TARGETS[4],
+        positional=("self",),
+    )
     original_determine = require_callable(
-        proposer_class, "_determine_batch_execution_and_padding", TARGETS[5]
+        proposer_class, "_determine_batch_execution_and_padding", TARGETS[6]
     )
     require_exact_signature(
         original_determine,
-        TARGETS[5],
+        TARGETS[6],
         positional=("self", "num_tokens", "use_cudagraphs"),
         defaults={"use_cudagraphs": True},
     )
@@ -232,6 +238,14 @@ def apply_to_module(module: ModuleType) -> bool:
             self, target_language_model, original_share
         )
 
+    @functools.wraps(original_model_returns_tuple)
+    def hcu_model_returns_tuple(self):
+        if self.method == "mtp" and "KimiK3MTPModel" in (
+            self.draft_model_config.hf_config.architectures or []
+        ):
+            return True
+        return original_model_returns_tuple(self)
+
     def hcu_pad_for_sequence_parallelism(self, num_scheduled_tokens):
         return proposer_runtime.pad_for_sequence_parallelism(
             self, num_scheduled_tokens
@@ -247,20 +261,11 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_propose,
         hcu_prepare_inputs_padded,
         hcu_share_lm_head,
+        hcu_model_returns_tuple,
         hcu_pad_for_sequence_parallelism,
         hcu_determine,
     ):
         setattr(function, _WRAPPER, True)
-    @functools.wraps(original_returns_tuple)
-    def hcu_model_returns_tuple(self):
-        if self.method == "mtp" and "KimiK3MTPModel" in (
-            self.draft_model_config.hf_config.architectures or []
-        ):
-            return True
-        return original_returns_tuple(self)
-
-    setattr(hcu_model_returns_tuple, _WRAPPER, True)
-    setattr(proposer_class, "model_returns_tuple", hcu_model_returns_tuple)
     setattr(proposer_class, "_vllm_hcu_original_init", original_init)
     setattr(proposer_class, "_vllm_hcu_original_propose", original_propose)
     setattr(
@@ -276,6 +281,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(proposer_class, "propose", hcu_propose)
     setattr(proposer_class, "prepare_inputs_padded", hcu_prepare_inputs_padded)
     setattr(proposer_class, "_maybe_share_lm_head", hcu_share_lm_head)
+    setattr(proposer_class, "model_returns_tuple", hcu_model_returns_tuple)
     setattr(
         proposer_class,
         "_pad_for_sequence_parallelism",

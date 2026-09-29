@@ -154,17 +154,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
-        """PCP-aware profile: dummy tokens per rank = max_num_batched_tokens / pcp_size.
-
-        Upstream ``GPUModelRunner.profile_run`` sends ``self.max_num_tokens``
-        (= scheduler_config.max_num_batched_tokens) into ``_dummy_run`` as the
-        per-rank token count.  In PCP, the scheduler's total batch is split
-        across ``pcp_size`` ranks, so each rank actually processes at most
-        ``max_num_batched_tokens / pcp_size`` tokens.  Profiling with the full
-        value inflates MoE / attention workspaces by up to ``pcp_size``, which
-        under DeepEP-HT reserves ``4 * M * K * 2`` bytes per rank and can push
-        the peak past the GPU capacity for PCP+EP configs.
-        """
+        """Profile the PCP-local token count plus a small routing margin."""
         pcp_size = int(
             getattr(
                 self.vllm_config.parallel_config,

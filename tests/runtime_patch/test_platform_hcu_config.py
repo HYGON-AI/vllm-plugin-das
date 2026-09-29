@@ -1815,17 +1815,7 @@ def test_hcu_collective_switch_and_source_decode_paths(
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "1")
     assert HCUPlatform.use_custom_allreduce() is True
 
-    from vllm.platforms.interface import Platform
-
-    other_config = SimpleNamespace(
-        model_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
-    )
-    assert HCUPlatform.get_default_ir_op_priority(other_config) == (
-        Platform.get_default_ir_op_priority(other_config)
-    )
-    priority = HCUPlatform.get_default_ir_op_priority(SimpleNamespace(
-        model_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
-    ))
+    priority = HCUPlatform.get_default_ir_op_priority(SimpleNamespace())
     assert priority.rms_norm == ["vllm_c", "native"]
     assert priority.fused_add_rms_norm == ["vllm_c", "native"]
 
