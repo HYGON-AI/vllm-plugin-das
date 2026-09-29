@@ -377,16 +377,20 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
-    updates: dict[str, str] = {}
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    updates: dict[str, str | bool] = {
+        # The Qwen3 forward wrapper closes over this effective policy. Persist
+        # the exact same master-and-child result before VllmConfig.compute_hash
+        # so feature-off and feature-on AOT graphs cannot share a cache entry.
+        "fused_qwen3_rms_rope": hcu_envs.fused_qwen3_rms_rope_enabled(),
+    }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache
         # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
-        from vllm_hcu.platforms import envs as hcu_envs
-
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
-    if updates:
-        feature_config = feature_config.with_updates(**updates)
-    # Persist the resolved mode so it enters vLLM's compilation hash.
+    feature_config = feature_config.with_updates(**updates)
+    # Persist every resolved graph policy so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
 
     feature_config = bind_hcu_config(vllm_config)

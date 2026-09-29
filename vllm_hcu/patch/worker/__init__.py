@@ -250,6 +250,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_mla_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_flash_attn")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen3_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_recompute_w_u")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),

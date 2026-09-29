@@ -27,7 +27,7 @@ import vllm_hcu.patch.config as hcu_config_module
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm_hcu.model_executor.layers.quantization import slimquant_facade
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 from vllm_hcu.patch.platform.core_fix import (
     patch_compilation_config,
     patch_engine_args,
@@ -503,6 +503,34 @@ def test_positional_additional_config_is_merged_not_overwritten() -> None:
         enable_lightly_cp=True,
         enable_custom_sp=True,
     )
+
+
+def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
+    module = _make_arg_utils_module()
+    original_create = module.EngineArgs.create_engine_config
+
+    def create_engine_config(
+        self,
+        usage_context: object | None = None,
+        headless: bool = False,
+    ) -> object:
+        config = original_create(self, usage_context, headless)
+        set_hcu_config(
+            config,
+            get_hcu_config(config).with_updates(
+                fused_qwen3_rms_rope=False,
+                hcu_flash_attn_mode="varlen",
+            ),
+        )
+        return config
+
+    module.EngineArgs.create_engine_config = create_engine_config
+    patch_engine_args.apply_to_module(module)
+
+    config = module.EngineArgs().create_engine_config()
+
+    assert get_hcu_config(config).fused_qwen3_rms_rope is False
+    assert get_hcu_config(config).hcu_flash_attn_mode == "varlen"
 
 
 def test_engine_args_rejects_incompatible_target_signature() -> None:
@@ -1506,6 +1534,68 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
 
     assert feature_config.hcu_flash_attn_mode == expected
     assert get_hcu_config(config) == feature_config
+
+
+@pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_fused_qwen3_rms_rope_policy_is_finalized_before_config_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", feature)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert feature_config.fused_qwen3_rms_rope is expected
+    assert get_hcu_config(config) == feature_config
+
+
+def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 0 -> 1 restart must not load the graph persisted for feature-off."""
+
+    def cache_key(master: str, feature: str) -> str:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+        monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", feature)
+        config = _validation_config(HcuFeatureConfig())
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return _vllm_hash(config.additional_config)
+
+    disabled_key = cache_key("1", "0")
+    disabled_graph = tmp_path / disabled_key / "graph.py"
+    disabled_graph.parent.mkdir()
+    disabled_graph.write_text("torch.ops.aten.rms_norm\n", encoding="utf-8")
+
+    enabled_key = cache_key("1", "1")
+    enabled_graph = tmp_path / enabled_key / "graph.py"
+    if not enabled_graph.exists():
+        enabled_graph.parent.mkdir()
+        enabled_graph.write_text(
+            "torch.ops.vllm.hcu_fused_rms_rotary_embedding\n",
+            encoding="utf-8",
+        )
+
+    # Both master-off combinations collapse onto the same effective policy,
+    # while the only graph-changing transition receives a distinct cache key.
+    assert cache_key("0", "0") == cache_key("0", "1")
+    assert cache_key("0", "1") == disabled_key
+    assert enabled_key != disabled_key
+    assert "hcu_fused_rms_rotary_embedding" in enabled_graph.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_varlen_flash_attention_uses_64_token_cache_blocks(

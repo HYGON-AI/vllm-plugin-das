@@ -545,11 +545,24 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
         config = create_engine_config(self, *args, **kwargs)
-        set_hcu_config(config, feature_config)
-        if get_hcu_config(config) != feature_config:
-            raise PatchCompatibilityError(
-                "VllmConfig did not retain the normalized HCU feature sidecar"
-            )
+        resolved_config = get_hcu_config(config)
+        # VllmConfig.__post_init__ calls the platform hook before returning
+        # here. That hook resolves graph-affecting values (for example the
+        # effective Qwen3 fusion policy and FlashAttention sub-mode). Keep its
+        # serialized result authoritative instead of replacing it with the
+        # pre-validation EngineArgs sidecar.
+        requested = feature_config.to_dict()
+        resolved = resolved_config.to_dict()
+        for name, expected in requested.items():
+            if name == "fused_qwen3_rms_rope" or (
+                name == "hcu_flash_attn_mode" and expected is None
+            ):
+                continue
+            if resolved[name] != expected:
+                raise PatchCompatibilityError(
+                    "VllmConfig did not retain normalized HCU field "
+                    f"{name!r}: expected {expected!r}, got {resolved[name]!r}"
+                )
         return config
 
     setattr(engine_args, "_vllm_hcu_original_create_engine_config", create_engine_config)
