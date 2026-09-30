@@ -147,15 +147,14 @@ class HcuGPUWorker(Worker):
             f"current free memory {format_gib(free_gpu_memory)} GiB."
         )
         # FlashMLA KV reserve: only when LINEAR_GATE_PCP_SHARD + MTP (OOM regime).
-        from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
-
+        # Read the env flag directly to avoid importing hy_v4.attention (heavy deps
+        # / circular import risk during worker memory profiling and CPU-safe tests).
+        _shard_enabled = os.environ.get(
+            "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
         flash_mla_reserve = (
-            (2 << 30)
-            if (
-                linear_gate_pcp_shard_enabled()
-                and self.vllm_config.speculative_config is not None
-            )
-            else 0
+            (2 << 30) if _shard_enabled and speculative_config is not None else 0
         )
         self.available_kv_cache_memory_bytes = (
             self.requested_memory

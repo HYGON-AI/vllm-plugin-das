@@ -1175,7 +1175,8 @@ def test_determine_available_memory_provides_vllm_config_context_to_profile_run(
     worker_module = cpu_safe_hcu_worker_module
 
     # ── tracking state ────────────────────────────────────────────────────
-    sentinel = object()          # stands in for vllm_config
+    # speculative_config must exist: normal path may inspect it for FlashMLA reserve.
+    sentinel = SimpleNamespace(speculative_config=None)
     active: list[object] = [None]   # config visible at call time
     config_seen: list[object] = []  # captured inside profile_run
 
@@ -1192,14 +1193,6 @@ def test_determine_available_memory_provides_vllm_config_context_to_profile_run(
 
     monkeypatch.setattr(worker_module, "set_current_vllm_config", fake_set_current)
 
-    # ── fake profile_run on the base Worker class ─────────────────────────
-    def recording_profile_run(self):
-        config_seen.append(active[0])
-
-    monkeypatch.setattr(
-        worker_module.Worker, "profile_run", recording_profile_run, raising=False
-    )
-
     # ── fake memory_profiling ctx (used by the normal path only) ──────────
     @_cm
     def fake_memory_profiling(*args, **kwargs):
@@ -1214,11 +1207,20 @@ def test_determine_available_memory_provides_vllm_config_context_to_profile_run(
     monkeypatch.setattr(worker_module, "memory_profiling", fake_memory_profiling)
 
     # ── minimal worker stub ───────────────────────────────────────────────
+    # determine_available_memory calls ``self.model_runner.profile_run()``, not
+    # ``Worker.profile_run``. Stub the runner so the context contract is observed.
+    def recording_profile_run():
+        config_seen.append(active[0])
+
     worker = object.__new__(worker_module.HcuGPUWorker)
     worker.vllm_config = sentinel
     worker.rank = 0
     worker.device = "cpu"
-    worker.model_memory_usage = 0
+    worker.requested_memory = 0
+    worker.model_runner = SimpleNamespace(
+        profile_run=recording_profile_run,
+        model_memory_usage=0,
+    )
     worker.init_snapshot = SimpleNamespace(free_memory=0)
     worker.cache_config = SimpleNamespace(
         kv_cache_memory_bytes=kv_cache_memory_bytes
