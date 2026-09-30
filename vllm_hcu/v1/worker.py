@@ -146,10 +146,22 @@ class HcuGPUWorker(Worker):
             f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
             f"current free memory {format_gib(free_gpu_memory)} GiB."
         )
+        # FlashMLA KV reserve: only when LINEAR_GATE_PCP_SHARD + MTP (OOM regime).
+        from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
+
+        flash_mla_reserve = (
+            (2 << 30)
+            if (
+                linear_gate_pcp_shard_enabled()
+                and self.vllm_config.speculative_config is not None
+            )
+            else 0
+        )
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - flash_mla_reserve
         )
         memory_summary = (
             "HCU memory profile: "
@@ -162,6 +174,7 @@ class HcuGPUWorker(Worker):
             f"total_consumed={format_gib(total_consumed)} GiB "
             f"transient_peak_headroom={format_gib(transient_peak_headroom)} GiB "
             f"non_kv_cache_memory={format_gib(profile_result.non_kv_cache_memory)} GiB "
+            f"flash_mla_reserve={format_gib(flash_mla_reserve)} GiB "
             f"cudagraph_estimate={format_gib(cudagraph_memory_estimate)} GiB "
             f"requested={format_gib(self.requested_memory)} GiB "
             f"available_kv={format_gib(self.available_kv_cache_memory_bytes)} GiB"
