@@ -809,6 +809,11 @@ def apply_aiter_w4a8_moe(
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_experts_impl,
         )
+        # The explicit vLLM/Triton fallback consumes unpacked signed INT4
+        # values.  Its scale convention needs the high-nibble x16
+        # compensation; AITER MOE_C must receive the raw checkpoint scale.
+        fallback_w1_scale = w1_scale * 16.0
+        fallback_w2_scale = w2_scale * 16.0
         return fused_experts_impl(
             hidden_states,
             fallback_w1,
@@ -824,8 +829,8 @@ def apply_aiter_w4a8_moe(
             per_channel_quant=True,
             global_num_experts=global_num_experts,
             expert_map=native_expert_map,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
+            w1_scale=fallback_w1_scale,
+            w2_scale=fallback_w2_scale,
             a1_scale=getattr(quant_config, "a1_scale", None),
             a2_scale=getattr(quant_config, "a2_scale", None),
             block_shape=None,
