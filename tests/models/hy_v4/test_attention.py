@@ -22,9 +22,12 @@ from vllm_hcu.models.hy_v4.attention import (
     is_skip_topk_indexer_weight,
     require_local_indexer_producer,
     require_hyv4_sink_backend,
-    linear_gate_pcp_block_tokens,
-    linear_gate_pcp_chunking_enabled,
     linear_gate_pcp_shard_enabled,
+    _linear_gate_pcp_group_ranks,
+    _linear_gate_pcp_subgroup_cache_key,
+    _linear_gate_pcp_groups,
+    _get_linear_gate_pcp_group,
+    clear_linear_gate_pcp_groups,
 )
 
 
@@ -91,26 +94,147 @@ def test_hy_v4_preserves_native_kv_cache_dtype(cache_dtype: str) -> None:
     )
 
 
-def test_linear_gate_pcp_chunking_can_be_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_CHUNKING", "0")
-    assert linear_gate_pcp_chunking_enabled() is False
-
-
-def test_linear_gate_pcp_block_tokens_is_configurable(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS", "1024")
-    assert linear_gate_pcp_block_tokens() == 1024
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
-def test_linear_gate_pcp_rejects_invalid_block_tokens(monkeypatch, value) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS", value)
-    with pytest.raises(ValueError, match="positive integer"):
-        linear_gate_pcp_block_tokens()
-
-
 def test_linear_gate_pcp_sharding_flag_remains_independent(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
     assert linear_gate_pcp_shard_enabled() is True
+
+
+def test_linear_gate_pcp_subgroup_cache_key_preserves_group_boundaries() -> None:
+    """group=2 and group=4 cover the same ranks but must not share a cache key."""
+    ranks_g2 = _linear_gate_pcp_group_ranks(
+        world=8, dp_size=1, pp_size=1, pcp_size=8, tp_size=1, group_size=2
+    )
+    ranks_g4 = _linear_gate_pcp_group_ranks(
+        world=8, dp_size=1, pp_size=1, pcp_size=8, tp_size=1, group_size=4
+    )
+    assert ranks_g2 == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert ranks_g4 == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    flat_g2 = tuple(r for g in ranks_g2 for r in g)
+    flat_g4 = tuple(r for g in ranks_g4 for r in g)
+    assert flat_g2 == flat_g4 == (0, 1, 2, 3, 4, 5, 6, 7)
+
+    parent = SimpleNamespace(unique_name="pcp-a")
+    key_g2 = _linear_gate_pcp_subgroup_cache_key(parent, ranks_g2)
+    key_g4 = _linear_gate_pcp_subgroup_cache_key(parent, ranks_g4)
+    assert key_g2 != key_g4
+
+
+def test_linear_gate_pcp_subgroup_cache_drops_stale_parent(monkeypatch) -> None:
+    """Replacing the parent PCP group must not reuse the old subgroup object."""
+    import vllm_hcu.models.hy_v4.attention as attention_mod
+
+    clear_linear_gate_pcp_groups()
+    created: list[SimpleNamespace] = []
+
+    def fake_init(group_ranks, local_rank, backend, group_name=None):
+        group = SimpleNamespace(
+            world_size=len(group_ranks[0]),
+            group_ranks=group_ranks,
+            name=group_name,
+        )
+        created.append(group)
+        return group
+
+    parent_a = SimpleNamespace(
+        world_size=8,
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        unique_name="pcp-a",
+    )
+    parent_b = SimpleNamespace(
+        world_size=8,
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        unique_name="pcp-b",
+    )
+    parallel = SimpleNamespace(
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "2")
+    monkeypatch.setattr(attention_mod, "get_pcp_group", lambda: parent_a)
+    monkeypatch.setattr(
+        attention_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=parallel),
+    )
+    monkeypatch.setattr(attention_mod.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(
+        attention_mod, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.init_model_parallel_group",
+        fake_init,
+    )
+
+    first = _get_linear_gate_pcp_group()
+    assert first.world_size == 2
+    assert len(created) == 1
+    assert len(_linear_gate_pcp_groups) == 1
+
+    # Same parent + same GROUP_SIZE: cache hit.
+    assert _get_linear_gate_pcp_group() is first
+    assert len(created) == 1
+
+    # New parent after destroy/reinit: must rebuild, not reuse first.
+    monkeypatch.setattr(attention_mod, "get_pcp_group", lambda: parent_b)
+    second = _get_linear_gate_pcp_group()
+    assert second is not first
+    assert second.world_size == 2
+    assert len(created) == 2
+    clear_linear_gate_pcp_groups()
+
+
+def test_linear_gate_pcp_subgroup_cache_distinguishes_group_size(monkeypatch) -> None:
+    """Switching GROUP_SIZE 2 -> 4 must create a new subgroup, not reuse size-2."""
+    import vllm_hcu.models.hy_v4.attention as attention_mod
+
+    clear_linear_gate_pcp_groups()
+    created: list[SimpleNamespace] = []
+
+    def fake_init(group_ranks, local_rank, backend, group_name=None):
+        group = SimpleNamespace(
+            world_size=len(group_ranks[0]),
+            group_ranks=group_ranks,
+        )
+        created.append(group)
+        return group
+
+    parent = SimpleNamespace(
+        world_size=8,
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        unique_name="pcp-fixed",
+    )
+    parallel = SimpleNamespace(
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    monkeypatch.setattr(attention_mod, "get_pcp_group", lambda: parent)
+    monkeypatch.setattr(
+        attention_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=parallel),
+    )
+    monkeypatch.setattr(attention_mod.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(
+        attention_mod, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.init_model_parallel_group",
+        fake_init,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "2")
+    g2 = _get_linear_gate_pcp_group()
+    assert g2.world_size == 2
+
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "4")
+    g4 = _get_linear_gate_pcp_group()
+    assert g4 is not g2
+    assert g4.world_size == 4
+    assert len(created) == 2
+    clear_linear_gate_pcp_groups()
 
 
 def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:

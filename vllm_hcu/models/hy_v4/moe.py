@@ -4,6 +4,8 @@
 
 """Dense feed-forward and fused MoE blocks for HY V4 on HCU."""
 
+import os
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -18,8 +20,30 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
+from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
 
 logger = init_logger(__name__)
+
+_HYV4_MOE_CHUNK_SIZE_ENV = "VLLM_HCU_HYV4_MOE_CHUNK_SIZE"
+
+
+def _hyv4_moe_chunk_size() -> int | None:
+    """Return the MoE token chunk size, or None to keep the unchunked path."""
+    raw = os.environ.get(_HYV4_MOE_CHUNK_SIZE_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        size = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"{_HYV4_MOE_CHUNK_SIZE_ENV} must be a positive integer; got {raw!r}."
+        ) from exc
+    if size <= 0:
+        raise ValueError(
+            f"{_HYV4_MOE_CHUNK_SIZE_ENV} must be a positive integer; got {size}."
+        )
+    return size
 
 
 class HYV4FeedForward(nn.Module):
@@ -187,11 +211,31 @@ class HYV4MoEFused(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        # LINEAR_GATE_PCP_SHARD + MTP restore can inflate MoE workspace.
+        # Chunk only when VLLM_HCU_HYV4_MOE_CHUNK_SIZE is set.
+        chunk_size = _hyv4_moe_chunk_size()
+        if (
+            chunk_size is None
+            or not linear_gate_pcp_shard_enabled()
+            or not in_replicated_mtp_batch()
+            or hidden_states.shape[0] <= chunk_size
+        ):
+            router_logits, _ = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+        else:
+            final_hidden_states = torch.empty_like(hidden_states)
+            for start in range(0, hidden_states.shape[0], chunk_size):
+                end = min(start + chunk_size, hidden_states.shape[0])
+                chunk = hidden_states[start:end]
+                router_logits, _ = self.gate(chunk)
+                final_hidden_states[start:end] = self.experts(
+                    hidden_states=chunk,
+                    router_logits=router_logits,
+                )
+
         return final_hidden_states.view(original_shape)
 
 
