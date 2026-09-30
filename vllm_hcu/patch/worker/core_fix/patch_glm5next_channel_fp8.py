@@ -31,6 +31,8 @@ _KPOOL_PATCH_MARKER = "_vllm_hcu_sparse_indexer_kpool_triton_applied"
 _KPOOL_WRAPPER_MARKER = "_vllm_hcu_sparse_indexer_kpool_triton_wrapper"
 _INDEXER_CACHE_PATCH_MARKER = "_vllm_hcu_glm5next_indexer_cache_applied"
 _INDEXER_CACHE_WRAPPER_MARKER = "_vllm_hcu_glm5next_indexer_cache_wrapper"
+_TAIL_CACHE_PATCH_MARKER = "_vllm_hcu_glm5next_tail_cache_ring_applied"
+_TAIL_CACHE_WRAPPER_MARKER = "_vllm_hcu_glm5next_tail_cache_ring_wrapper"
 _QUANT_IGNORE_PATCH_MARKER = "_vllm_hcu_glm5next_quant_ignore_applied"
 _QUANT_IGNORE_WRAPPER_MARKER = "_vllm_hcu_glm5next_quant_ignore_wrapper"
 _MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
@@ -287,9 +289,14 @@ def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
             self, "is_mtp_layer", False
         ):
             from vllm.model_executor.layers import mhc
-            from vllm_hcu.model_executor.layers import mhc as boltops_mhc
+            from vllm_hcu.platforms import envs as henvs
 
-            _bind_glm5next_boltops_mhc(self, mhc, boltops_mhc)
+            if henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_AITER_MHC):
+                from vllm_hcu.model_executor.layers import mhc as boltops_mhc
+
+                _bind_glm5next_boltops_mhc(self, mhc, boltops_mhc)
+            else:
+                _bind_glm5next_native_mhc(self, mhc)
 
     setattr(hcu_decoder_init, _MHC_WRAPPER_MARKER, True)
     setattr(decoder_cls, "_vllm_hcu_original_init", original)
@@ -358,7 +365,64 @@ def _patch_multimodal_quant_ignore(glm_model: ModuleType) -> bool:
     return True
 
 
+def _patch_glm5next_tail_cache(attention: ModuleType) -> bool:
+    cache_cls = vars(attention).get("Glm5NextTailCache")
+    if not isinstance(cache_cls, type):
+        raise PatchCompatibilityError(
+            f"required class {ATTENTION_MODULE}.Glm5NextTailCache is missing"
+        )
+    original = require_callable(
+        cache_cls,
+        "get_kv_cache_spec",
+        f"{ATTENTION_MODULE}.Glm5NextTailCache.get_kv_cache_spec",
+    )
+    if getattr(cache_cls, _TAIL_CACHE_PATCH_MARKER, False):
+        if not getattr(original, _TAIL_CACHE_WRAPPER_MARKER, False):
+            raise PatchCompatibilityError(
+                "GLM5Next tail-cache ring patch marker is stale"
+            )
+        return False
+    require_exact_signature(
+        original,
+        f"{ATTENTION_MODULE}.Glm5NextTailCache.get_kv_cache_spec",
+        positional=("self", "vllm_config"),
+    )
+
+    @functools.wraps(original)
+    def hcu_get_kv_cache_spec(self, vllm_config):
+        from dataclasses import replace
+
+        from vllm.utils.math_utils import cdiv, next_power_of_2
+        from vllm.v1.kv_cache_interface import KpoolTailSpec
+
+        spec = original(self, vllm_config)
+        if not isinstance(spec, KpoolTailSpec):
+            raise PatchCompatibilityError(
+                "GLM5Next tail cache returned a non-kpool spec"
+            )
+        pool = int(self._index_kpool)
+        num_speculative_tokens = int(
+            getattr(vllm_config, "num_speculative_tokens", 0) or 0
+        )
+        span = pool + num_speculative_tokens
+        ring = pool * next_power_of_2(cdiv(span, pool))
+        cache_block_size = int(self.cache_config.block_size)
+        if cache_block_size % ring != 0:
+            raise PatchCompatibilityError(
+                "GLM5Next tail ring must divide the attention block size: "
+                f"block_size={cache_block_size}, ring={ring}"
+            )
+        return replace(spec, block_size=ring, sliding_window=ring)
+
+    setattr(hcu_get_kv_cache_spec, _TAIL_CACHE_WRAPPER_MARKER, True)
+    setattr(cache_cls, "_vllm_hcu_original_get_kv_cache_spec", original)
+    setattr(cache_cls, "get_kv_cache_spec", hcu_get_kv_cache_spec)
+    setattr(cache_cls, _TAIL_CACHE_PATCH_MARKER, True)
+    return True
+
+
 def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
+    changed = _patch_glm5next_tail_cache(attention)
     cache_cls = vars(attention).get("Glm5NextIndexerCache")
     if not isinstance(cache_cls, type):
         raise PatchCompatibilityError(
@@ -374,7 +438,7 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
             raise PatchCompatibilityError(
                 "GLM5Next indexer cache patch marker is stale"
             )
-        return False
+        return changed
     require_exact_signature(
         original,
         f"{ATTENTION_MODULE}.Glm5NextIndexerCache.get_kv_cache_spec",
@@ -415,10 +479,19 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
 
 
 def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
+    from vllm_hcu.v1.attention.ops.glm5next_kpool_ring import (
+        install_glm5next_kpool_ring,
+    )
     from vllm_hcu.v1.attention.ops.lightop_kpool_topk_transform import (
         install_lightop_kpool_topk_transform,
     )
 
+    kpool_ops = vars(kpool).get("kpool_ops")
+    if not isinstance(kpool_ops, ModuleType):
+        raise PatchCompatibilityError(
+            f"required module {KPOOL_MODULE}.kpool_ops is missing"
+        )
+    changed = install_glm5next_kpool_ring(kpool_ops)
     install_lightop_kpool_topk_transform(kpool)
     indexer = vars(kpool).get("SparseAttnIndexerKpool")
     if not isinstance(indexer, type):
@@ -435,7 +508,7 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
             raise PatchCompatibilityError(
                 "sparse indexer kpool Triton fallback patch marker is stale"
             )
-        return False
+        return changed
     require_exact_signature(
         original,
         f"{KPOOL_MODULE}.SparseAttnIndexerKpool.forward_hip",

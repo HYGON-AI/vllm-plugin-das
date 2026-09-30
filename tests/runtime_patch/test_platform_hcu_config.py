@@ -1711,6 +1711,42 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     assert config.cache_config.block_size == 64
 
 
+@pytest.mark.parametrize(
+    ("master_value", "expected_disabled"),
+    [("0", True), ("1", False)],
+)
+def test_custom_ops_master_controls_hcu_custom_allreduce(
+    monkeypatch: pytest.MonkeyPatch,
+    master_value: str,
+    expected_disabled: bool,
+) -> None:
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class _NoFullGraphs:
+        @staticmethod
+        def has_full_cudagraphs() -> bool:
+            return False
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master_value)
+    config = _validation_config(HcuFeatureConfig())
+    config.compilation_config.cudagraph_mode = _NoFullGraphs()
+    config.parallel_config.distributed_executor_backend = "uni"
+    config.parallel_config.worker_cls = "auto"
+    config.parallel_config.disable_custom_all_reduce = False
+    config.cache_config = None
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda vllm_config: HcuFeatureConfig(),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.parallel_config.disable_custom_all_reduce is expected_disabled
+
+
 def test_sparse_flashmla_preserves_upstream_hybrid_block_alignment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
