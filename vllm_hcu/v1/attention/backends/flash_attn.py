@@ -148,6 +148,12 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        mode = _get_flash_attn_mode()
+        # HCU's paged varlen and CUTLASS kernels require a 64-token page.
+        # This must also constrain sliding-window specs: those specs choose
+        # their own page size from this method instead of cache_config.block_size.
+        if mode in ("varlen", "cutlass"):
+            return [64]
         vllm_config = get_current_vllm_config_or_none()
         model_config = getattr(vllm_config, "model_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
@@ -160,9 +166,6 @@ class HcuFlashAttentionBackend(AttentionBackend):
                 or cache_config.mamba_cache_dtype == "float32"
             )
         ):
-            mode = _get_flash_attn_mode()
-            if mode in ("varlen", "cutlass"):
-                return [64]
             if mode == "classic":
                 return [128]
             # NOTE(tdoublep): while in principle, FA supports

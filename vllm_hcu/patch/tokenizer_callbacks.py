@@ -121,6 +121,23 @@ def apply_kimi_k25_tokenizer(module: ModuleType) -> bool:
     return True
 
 
+def _is_step_bytelevel(path_or_repo_id: object) -> bool:
+    """Step4/Step5 checkpoints declare ``LlamaTokenizerFast`` but ship a
+    ByteLevel ``tokenizer.json``. transformers>=5 maps that class to the
+    sentencepiece-style ``LlamaTokenizer`` and rebuilds the pre-tokenizer and
+    decoder, which silently drops spaces/CJK on encode and leaves ``Ġ`` on
+    decode. Loading ``tokenizer.json`` as-is is the only correct round trip."""
+    model_path = Path(str(path_or_repo_id))
+    if not (model_path / "tokenizer.json").is_file():
+        return False
+    try:
+        with (model_path / "config.json").open("r", encoding="utf-8") as file:
+            model_type = json.load(file).get("model_type", "")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(model_type, str) and model_type.startswith(("step4", "step5"))
+
+
 def _is_deepseek_distill_llama_70b(path_or_repo_id: object) -> bool:
     return "deepseek-r1-distill-llama-70b" in str(path_or_repo_id).lower()
 
@@ -188,6 +205,19 @@ def apply_deepseek_distill_tokenizer(module: ModuleType) -> bool:
         download_dir: str | None = None,
         **kwargs,
     ):
+        if _is_step_bytelevel(path_or_repo_id):
+            from transformers import TokenizersBackend
+
+            tokenizer = TokenizersBackend.from_pretrained(
+                path_or_repo_id,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                cache_dir=download_dir,
+                **kwargs,
+            )
+            return get_cached_tokenizer(tokenizer)
+
         if not _is_deepseek_distill_llama_70b(path_or_repo_id):
             return original(
                 cls,

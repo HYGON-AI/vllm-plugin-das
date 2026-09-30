@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+import contextlib
 import importlib
 import os
 from datetime import timedelta
@@ -793,6 +794,84 @@ class HCUPlatform(Platform):
                 backend.name,
             )
 
+        # Upstream's Phase 1 (in super().update_block_size_for_backend) picks
+        # its preferred block size from a single "representative" backend:
+        # whichever non-SSM attention layer it finds first (regardless of
+        # model_config.is_hybrid, which only covers attention+mamba SSM
+        # hybrids and is False for Step5's full/sliding-window attention
+        # mix). When a model mixes distinct backend classes across layers
+        # (e.g. Triton for sliding-window layers, HCU flash-attn for
+        # full-attention layers), that representative may be the more
+        # permissive backend (Triton tolerates any MultipleOf(16)) even
+        # though another backend actually in use (HCU flash-attn
+        # varlen/cutlass) hard-requires exactly 64. Since the
+        # representative's preference silently wins (and 16 == the default,
+        # so upstream doesn't even log the override), the resulting
+        # cache_config.block_size can end up incompatible with a backend
+        # that is very much present in the model. Re-derive a block size
+        # that every distinct non-SSM backend actually used by the model can
+        # support.
+        if cache_config is not None and not cache_config.user_specified_block_size:
+            from vllm.config.vllm import (
+                get_current_vllm_config,
+                get_layers_from_vllm_config,
+                set_current_vllm_config,
+            )
+            from vllm.model_executor.layers.attention_layer_base import (
+                AttentionLayerBase,
+            )
+
+            attn_layers = get_layers_from_vllm_config(
+                vllm_config,
+                AttentionLayerBase,  # type: ignore[type-abstract]
+            )
+            backends = []
+            seen = set()
+            for layer in attn_layers.values():
+                b = layer.get_attn_backend()
+                if b.is_ssm() or b in seen:
+                    continue
+                seen.add(b)
+                backends.append(b)
+
+            if len(backends) > 1:
+
+                # get_supported_kernel_block_sizes() on some backends (e.g.
+                # HCU flash-attn) calls get_current_vllm_config() internally,
+                # which asserts unless we're inside this context. This runs
+                # from multiproc_executor.WorkerProc.__init__, before the
+                # worker has entered set_current_vllm_config itself.
+                try:
+                    get_current_vllm_config()
+                    ctx = contextlib.nullcontext()
+                except AssertionError:
+                    ctx = set_current_vllm_config(vllm_config)
+
+                def _block_size_supported(bs: int) -> bool:
+                    for b in backends:
+                        if not any(
+                            bs == s if isinstance(s, int) else bs % s.base == 0
+                            for s in b.get_supported_kernel_block_sizes()
+                        ):
+                            return False
+                    return True
+
+                with ctx:
+                    required = next(
+                        (bs for bs in (16, 32, 64, 128, 256, 512) if _block_size_supported(bs)),
+                        None,
+                    )
+                if required is not None and required != cache_config.block_size:
+                    logger.info(
+                        "Re-aligning kv cache block size from %d to %d: no "
+                        "single backend was representative for this "
+                        "model's %d distinct non-SSM attention backends (%s).",
+                        cache_config.block_size,
+                        required,
+                        len(backends),
+                        [b.get_name() for b in backends],
+                    )
+                    cache_config.block_size = required
 
     @classmethod
     def get_current_memory_usage(
