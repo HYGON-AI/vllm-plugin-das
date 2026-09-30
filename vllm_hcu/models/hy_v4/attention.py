@@ -440,7 +440,10 @@ _LINEAR_GATE_PCP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD"
 _LINEAR_GATE_PCP_GROUP_SIZE_ENV = "VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE"
 _LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE = 2
 _linear_gate_pcp_shard_logged = False
-_linear_gate_pcp_groups: dict[tuple[int, ...], object] = {}
+# Keyed by (parent PCP identity, nested subgroup ranks). Flat rank tuples collide
+# across different GROUP_SIZE partitions of the same PCP world.
+_linear_gate_pcp_groups: dict[tuple, object] = {}
+_linear_gate_pcp_cache_parent: object | None = None
 _LINEAR_GATE_ALLOWED_GROUP_SIZES = (2, 4, 8)
 
 _DCP_Q_REPLICATE_ENV = "VLLM_DCP_Q_REPLICATE"
@@ -656,6 +659,29 @@ def _linear_gate_pcp_group_ranks(
     ]
 
 
+def _linear_gate_pcp_subgroup_cache_key(
+    pcp: object,
+    group_ranks: list[list[int]],
+) -> tuple:
+    """Build a cache key that keeps subgroup boundaries and parent PCP identity.
+
+    Flattening ranks alone collides across GROUP_SIZE values that cover the same
+    rank set (e.g. PCP=8 group=2 vs group=4 both flatten to 0..7).
+    """
+    return (
+        id(pcp),
+        getattr(pcp, "unique_name", None),
+        tuple(tuple(ranks) for ranks in group_ranks),
+    )
+
+
+def clear_linear_gate_pcp_groups() -> None:
+    """Drop cached linear_gate PCP subgroups after destroy/reinit."""
+    global _linear_gate_pcp_cache_parent
+    _linear_gate_pcp_groups.clear()
+    _linear_gate_pcp_cache_parent = None
+
+
 def _get_linear_gate_pcp_group():
     """Return the PCP subgroup that K-shards one replica of linear_gate.
 
@@ -664,6 +690,7 @@ def _get_linear_gate_pcp_group():
     ``[16,24)``, and ``[24,32)`` each shard the same full weight and run
     all-to-all plus reduce-scatter inside the subgroup.
     """
+    global _linear_gate_pcp_cache_parent
     pcp = get_pcp_group()
     size = _linear_gate_pcp_group_size(pcp.world_size)
     if pcp.world_size <= 1:
@@ -678,6 +705,11 @@ def _get_linear_gate_pcp_group():
         )
     if size == pcp.world_size:
         return pcp
+    # Parent PCP GroupCoordinator was replaced (destroy/reinit); drop stale
+    # subgroups so we never reuse a destroyed device_group.
+    if _linear_gate_pcp_cache_parent is not pcp:
+        _linear_gate_pcp_groups.clear()
+        _linear_gate_pcp_cache_parent = pcp
     parallel = get_current_vllm_config().parallel_config
     group_ranks = _linear_gate_pcp_group_ranks(
         dist.get_world_size(),
@@ -687,7 +719,7 @@ def _get_linear_gate_pcp_group():
         get_tensor_model_parallel_world_size(),
         size,
     )
-    key = tuple(rank for group in group_ranks for rank in group)
+    key = _linear_gate_pcp_subgroup_cache_key(pcp, group_ranks)
     if key not in _linear_gate_pcp_groups:
         from vllm.distributed.parallel_state import init_model_parallel_group
 
