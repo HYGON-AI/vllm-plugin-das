@@ -511,10 +511,12 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 raise ValueError(
                     "HCU Channel INT8 batched DeepGEMM supports only SiLU activation"
                 )
+            # Weights are marlin_i8_masked_weight-packed in the INT8 oracle
+            # (shuffle_unique default 1). GEMM must use the matching DeepGEMM API.
+            from deepgemm import m_grouped_i8_gemm_nt_masked
             from lightop.activation import fuse_silu_mul_quant_ep
-            from lightop.gemm_ops import m_grouped_w8a8_gemm_nt_masked
 
-            m_grouped_w8a8_gemm_nt_masked(
+            m_grouped_i8_gemm_nt_masked(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
                 workspace1,
@@ -523,9 +525,9 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             )
             a2q, a2q_scale = fuse_silu_mul_quant_ep(
                 workspace1,
-                expert_num_tokens,
+                tokens_per_expert=expert_num_tokens,
             )
-            m_grouped_w8a8_gemm_nt_masked(
+            m_grouped_i8_gemm_nt_masked(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),
                 output,
