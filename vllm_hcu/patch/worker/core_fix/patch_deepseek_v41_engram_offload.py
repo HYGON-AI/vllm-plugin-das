@@ -150,6 +150,24 @@ def _engram_instance_dp_size(engram) -> int:
     return int(captured) if captured is not None else _engram_dp_size()
 
 
+def _require_engram_dp_group(dp_size: int):
+    """Return the Engram DP group, failing closed on a stale shard count.
+
+    The staged row window is indexed as `slot * group.world_size` with a
+    `dp_rank * slot` offset, so a group that no longer matches the shard
+    count captured at build time would silently read another rank rows.
+    """
+    group = _engram_dp_group()
+    world = 1 if group is None else int(group.world_size)
+    if world != dp_size:
+        raise RuntimeError(
+            "HCU Engram DP sharding requires the runtime DP group to "
+            "match the shard count captured at build time: "
+            f"group={world}, shards={dp_size}"
+        )
+    return group
+
+
 def _engram_dp_shard_info(
     tp_size: int, tp_rank: int, dp_size: int, dp_rank: int
 ) -> tuple[int, int]:
@@ -282,6 +300,7 @@ def _install_pcp_engram_methods(engram_class) -> None:
         if pcp_size > 1 and dp_size > 1:
             raise RuntimeError("HCU Engram does not yet support PCP+DP sharding")
         if dp_size > 1:
+            _require_engram_dp_group(dp_size)
             gathered, slot = _gather_padded_dp_hash_ids(hash_ids)
         else:
             gathered, slot = _gather_padded_hash_ids(hash_ids)
@@ -312,6 +331,7 @@ def _install_pcp_engram_methods(engram_class) -> None:
             raise RuntimeError("HCU Engram does not yet support PCP+DP sharding")
 
         if dp_size > 1:
+            _require_engram_dp_group(dp_size)
             local_tokens = int(
                 getattr(self, "_hcu_dp_local_tokens", hash_ids.shape[0])
             )

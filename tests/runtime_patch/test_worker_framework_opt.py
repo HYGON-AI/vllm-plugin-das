@@ -859,6 +859,85 @@ def test_forward_context_keeps_dataclass_and_attaches_runtime_fields(
         assert value == "hcu"
 
 
+@pytest.mark.parametrize(
+    ("backend", "has_counts", "capture", "expected_sync", "dp_rank"),
+    [
+        ("deepep_low_latency", True, True, False, 0),
+        ("deepep_low_latency", True, False, False, 1),
+        ("deepep_low_latency", False, False, False, 1),
+        ("allgather_reducescatter", True, False, False, 1),
+        ("allgather_reducescatter", False, False, True, 1),
+    ],
+)
+def test_forward_context_reuses_dp_counts_without_ll_coordination(
+    backend: str, has_counts: bool, capture: bool, expected_sync: bool, dp_rank: int
+):
+    from vllm_hcu.forward_context_runtime import set_forward_context
+
+    class GraphMode(enum.Enum):
+        NONE = 0
+        PIECEWISE = 1
+
+    counts = torch.tensor([3, 0], dtype=torch.int32) if has_counts else None
+    coordinated_counts = torch.tensor([3, 0], dtype=torch.int32)
+    num_tokens = int(coordinated_counts[dp_rank])
+    sync_calls = []
+    seen = []
+
+    def coordinate_batch_across_dp(**kwargs):
+        sync_calls.append(kwargs)
+        return False, coordinated_counts, GraphMode.NONE
+
+    def make_metadata(config, num_tokens, across_dp):
+        assert across_dp[config.data_parallel_rank] == num_tokens
+        return SimpleNamespace(num_tokens_across_dp_cpu=across_dp)
+
+    def create_forward_context(*args, **kwargs):
+        context = SimpleNamespace(dp_metadata=args[2], batch_descriptor=args[4])
+        seen.append(context)
+        return context
+
+    module = SimpleNamespace(
+        CUDAGraphMode=GraphMode,
+        BatchDescriptor=lambda num_tokens: SimpleNamespace(num_tokens=num_tokens),
+        DPMetadata=SimpleNamespace(make=make_metadata),
+        track_batchsize=False,
+        torch=torch,
+        coordinate_batch_across_dp=coordinate_batch_across_dp,
+        current_platform=SimpleNamespace(
+            set_additional_forward_context=lambda **kwargs: {}
+        ),
+        create_forward_context=create_forward_context,
+        override_forward_context=lambda context: contextlib.nullcontext(),
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            all2all_backend=backend,
+            data_parallel_size=2,
+            data_parallel_rank=dp_rank,
+            use_sequence_parallel_moe=False,
+            is_moe_model=True,
+        )
+    )
+    mode = GraphMode.PIECEWISE if capture else GraphMode.NONE
+    with set_forward_context(
+        module,
+        object(),
+        config,
+        num_tokens=num_tokens,
+        num_tokens_across_dp=counts,
+        cudagraph_runtime_mode=mode,
+    ):
+        assert (seen[-1].dp_metadata is not None) == (has_counts or expected_sync)
+        if seen[-1].dp_metadata is not None:
+            assert seen[-1].dp_metadata.num_tokens_across_dp_cpu is (
+                coordinated_counts if expected_sync else counts
+            )
+        if capture:
+            assert seen[-1].batch_descriptor.num_tokens == num_tokens
+    assert bool(sync_calls) == expected_sync
+
+
 def test_deepep_auto_forward_mode_requires_decode_phase_evidence():
     from vllm_hcu.forward_context_runtime import (
         choose_deepep_auto_low_latency,
@@ -1130,7 +1209,7 @@ def test_dspark_mooncake_pd_role_skips_dynamic_phase_collective(
     )
 
 
-def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
+def test_dp_coordination_deepep_low_latency_and_feature_off_delegation(monkeypatch):
     calls: list[tuple[object, ...]] = []
 
     def coordinate_batch_across_dp(
@@ -1147,16 +1226,23 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     module = _module(
         patch_dp_utils.TARGET_MODULE,
         coordinate_batch_across_dp=coordinate_batch_across_dp,
+        torch=torch,
+    )
+    monkeypatch.setattr(
+        patch_dp_utils,
+        "_max_low_latency_token_slot",
+        lambda unpadded, padded, config: 8,
     )
     patch_dp_utils.apply_to_module(module)
     low_latency = SimpleNamespace(
         data_parallel_size=4, all2all_backend="deepep_low_latency"
     )
-    assert module.coordinate_batch_across_dp(4, False, low_latency) == (
-        False,
-        None,
-        0,
+    result = module.coordinate_batch_across_dp(4, False, low_latency)
+    assert result[0] is False
+    torch.testing.assert_close(
+        result[1], torch.tensor([8, 8, 8, 8], dtype=torch.int32)
     )
+    assert result[2] == 0
     normal = SimpleNamespace(data_parallel_size=4, all2all_backend="naive")
     assert module.coordinate_batch_across_dp(4, False, normal) == (
         True,
@@ -1164,6 +1250,83 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
         2,
     )
     assert calls == [(4, normal)]
+
+
+def test_dp_coordination_deepep_low_latency_returns_max_token_slot(monkeypatch):
+    calls: list[tuple[object, ...]] = []
+
+    def coordinate_batch_across_dp(
+        num_tokens_unpadded,
+        allow_microbatching,
+        parallel_config,
+        num_tokens_padded=None,
+        uniform_decode=None,
+        cudagraph_mode=0,
+    ):
+        calls.append(
+            (
+                num_tokens_unpadded,
+                allow_microbatching,
+                parallel_config,
+                num_tokens_padded,
+                uniform_decode,
+                cudagraph_mode,
+            )
+        )
+        return True, "tokens", 2
+
+    monkeypatch.setattr(
+        patch_dp_utils,
+        "_max_low_latency_token_slot",
+        lambda unpadded, padded, config: 8,
+    )
+    module = _module(
+        patch_dp_utils.TARGET_MODULE,
+        coordinate_batch_across_dp=coordinate_batch_across_dp,
+        torch=torch,
+    )
+    patch_dp_utils.apply_to_module(module)
+    low_latency = SimpleNamespace(
+        data_parallel_size=4,
+        all2all_backend="deepep_low_latency",
+        _vllm_hcu_deepep_auto=False,
+    )
+
+    result = module.coordinate_batch_across_dp(4, False, low_latency, 8, False, 1)
+    assert result[0] is False
+    torch.testing.assert_close(
+        result[1], torch.tensor([8, 8, 8, 8], dtype=torch.int32)
+    )
+    assert result[2] == 1
+    assert calls == []
+
+
+def test_max_low_latency_token_slot_uses_dp_max(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    calls = []
+
+    class Group:
+        device = "cpu"
+        device_group = "device-group"
+        cpu_group = "cpu-group"
+
+    def all_reduce(tensor, *, op, group):
+        calls.append((op, group, tensor.clone()))
+        tensor.fill_(11)
+
+    monkeypatch.setattr(parallel_state, "get_dp_group", lambda: Group())
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    config = SimpleNamespace(disable_nccl_for_dp_synchronization=False)
+
+    assert patch_dp_utils._max_low_latency_token_slot(3, 7, config) == 11
+    assert calls == [
+        (
+            torch.distributed.ReduceOp.MAX,
+            "device-group",
+            torch.tensor([7], dtype=torch.int32),
+        )
+    ]
 
 
 def test_draft_speculator_sampling_inputs_copy_async_and_preserve_padding():
@@ -1914,3 +2077,63 @@ print('REAL_WORKER_FRAMEWORK_OK', wrapper_applied, pynccl_applied)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "REAL_WORKER_FRAMEWORK_OK" in result.stdout
     assert f"VLLM_SOURCE {target_vllm / 'vllm' / '__init__.py'}" in result.stdout
+
+
+def test_forward_context_skips_dp_metadata_for_partial_ll_counts():
+    """DeepEP-LL counts shorter than the DP world must not build dp_metadata."""
+    from vllm_hcu.forward_context_runtime import set_forward_context
+
+    class GraphMode(enum.Enum):
+        NONE = 0
+        PIECEWISE = 1
+
+    # A single-entry vector cannot describe a DP world of two, so reusing it
+    # would give each rank a different Engram token slot.
+    counts = torch.tensor([3], dtype=torch.int32)
+    seen = []
+    sync_calls = []
+
+    def coordinate_batch_across_dp(**kwargs):
+        sync_calls.append(kwargs)
+        raise AssertionError("DeepEP low-latency must not coordinate across DP")
+
+    def make_metadata(config, num_tokens, across_dp):
+        raise AssertionError("dp_metadata must stay unset for partial counts")
+
+    def create_forward_context(*args, **kwargs):
+        context = SimpleNamespace(dp_metadata=args[2])
+        seen.append(context)
+        return context
+
+    module = SimpleNamespace(
+        CUDAGraphMode=GraphMode,
+        BatchDescriptor=lambda num_tokens: SimpleNamespace(num_tokens=num_tokens),
+        DPMetadata=SimpleNamespace(make=make_metadata),
+        track_batchsize=False,
+        torch=torch,
+        coordinate_batch_across_dp=coordinate_batch_across_dp,
+        current_platform=SimpleNamespace(
+            set_additional_forward_context=lambda **kwargs: {}
+        ),
+        create_forward_context=create_forward_context,
+        override_forward_context=lambda context: contextlib.nullcontext(),
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            all2all_backend="deepep_low_latency",
+            data_parallel_size=2,
+            data_parallel_rank=0,
+            use_sequence_parallel_moe=False,
+            is_moe_model=True,
+        )
+    )
+    with set_forward_context(
+        module,
+        object(),
+        config,
+        num_tokens=3,
+        num_tokens_across_dp=counts,
+        cudagraph_runtime_mode=GraphMode.NONE,
+    ):
+        assert seen[-1].dp_metadata is None
+    assert not sync_calls
