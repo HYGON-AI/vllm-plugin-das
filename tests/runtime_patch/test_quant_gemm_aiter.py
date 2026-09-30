@@ -4244,10 +4244,10 @@ def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     call = calls[0]
     assert call["args"] == (torch.int8,)
     torch.testing.assert_close(
-        call["w1_scale"], torch.full_like(layer.w13_weight_scale, 16.0)
+        call["w1_scale"], layer.w13_weight_scale
     )
     torch.testing.assert_close(
-        call["w2_scale"], torch.full_like(layer.w2_weight_scale, 16.0)
+        call["w2_scale"], layer.w2_weight_scale
     )
     torch.testing.assert_close(layer.w13_weight_scale, torch.ones(2, 4, 1))
     torch.testing.assert_close(layer.w2_weight_scale, torch.ones(2, 2, 1))
@@ -4373,11 +4373,11 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
     assert deepgemm_quant_config is not quant_config
     torch.testing.assert_close(
         quant_config.w1_scale,
-        torch.full_like(layer.w13_weight_scale, 16.0),
+        layer.w13_weight_scale,
     )
     torch.testing.assert_close(
         quant_config.w2_scale,
-        torch.full_like(layer.w2_weight_scale, 16.0),
+        layer.w2_weight_scale,
     )
     torch.testing.assert_close(
         deepgemm_quant_config.w1_scale,
@@ -4780,11 +4780,11 @@ def test_slimquant_w4a8_installs_moe_c_layout_at_load(
     assert method.moe_quant_config is not None
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
-        torch.full_like(method.moe_quant_config.w1_scale, 16.0),
+        torch.ones_like(method.moe_quant_config.w1_scale),
     )
     torch.testing.assert_close(
         method.moe_quant_config.w2_scale,
-        torch.full_like(method.moe_quant_config.w2_scale, 16.0),
+        torch.ones_like(method.moe_quant_config.w2_scale),
     )
     torch.testing.assert_close(
         layer.w13_weight_scale, torch.ones_like(layer.w13_weight_scale)
@@ -5349,11 +5349,11 @@ def test_slimquant_w4a8_tp_aiter_keeps_selected_canonical_owner(
     assert prewarm_calls == [layer]
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
-        torch.full((1, 8, 1), 32.0),
+        torch.full((1, 8, 1), 2.0),
     )
     torch.testing.assert_close(
         method.moe_quant_config.w2_scale,
-        torch.full((1, 4, 1), 48.0),
+        torch.full((1, 4, 1), 3.0),
     )
 
 
@@ -5417,11 +5417,11 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     assert method.moe_quant_config is not None
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
-        layer.w13_weight_scale * 16.0,
+        layer.w13_weight_scale,
     )
     torch.testing.assert_close(
         method.moe_quant_config.w2_scale,
-        layer.w2_weight_scale * 16.0,
+        layer.w2_weight_scale,
     )
 
     from vllm.model_executor.layers.fused_moe import fused_moe
@@ -5444,8 +5444,12 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     )
 
     torch.testing.assert_close(result, hidden_states + 1)
-    assert kernel_calls[0]["w1_scale"] is method.moe_quant_config.w1_scale
-    assert kernel_calls[0]["w2_scale"] is method.moe_quant_config.w2_scale
+    torch.testing.assert_close(
+        kernel_calls[0]["w1_scale"], method.moe_quant_config.w1_scale * 16.0
+    )
+    torch.testing.assert_close(
+        kernel_calls[0]["w2_scale"], method.moe_quant_config.w2_scale * 16.0
+    )
 
     installed_w13 = layer.w13_weight
     installed_w2 = layer.w2_weight
@@ -5465,11 +5469,11 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     assert scale_updated_quant_config is not installed_quant_config
     torch.testing.assert_close(
         scale_updated_quant_config.w1_scale,
-        torch.full((1, 4, 1), 32.0),
+        torch.full((1, 4, 1), 2.0),
     )
     torch.testing.assert_close(
         scale_updated_quant_config.w2_scale,
-        torch.full((1, 4, 1), 48.0),
+        torch.full((1, 4, 1), 3.0),
     )
 
     layer.w13_weight = torch.nn.Parameter(packed_w13, requires_grad=False)
@@ -5485,11 +5489,11 @@ def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
     assert method.moe_quant_config is not installed_quant_config
     torch.testing.assert_close(
         method.moe_quant_config.w1_scale,
-        torch.full((1, 4, 1), 32.0),
+        torch.full((1, 4, 1), 2.0),
     )
     torch.testing.assert_close(
         method.moe_quant_config.w2_scale,
-        torch.full((1, 4, 1), 48.0),
+        torch.full((1, 4, 1), 3.0),
     )
 
 
@@ -5595,8 +5599,8 @@ def test_slimquant_w4a8_legacy_raw_weights_pin_actual_m_to_moe_c(
     w1 = torch.zeros(2, 8, 2, dtype=torch.int8)
     w2 = torch.zeros(2, 4, 2, dtype=torch.int8)
     w1._hcu_aiter_moe_m1_supported = False
-    w1_scale = torch.full((2, 8, 1), 16.0)
-    w2_scale = torch.full((2, 4, 1), 16.0)
+    w1_scale = torch.ones((2, 8, 1))
+    w2_scale = torch.ones((2, 4, 1))
     method = SimpleNamespace(
         moe=SimpleNamespace(num_experts=2),
         moe_quant_config=SimpleNamespace(
@@ -5720,8 +5724,8 @@ def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
     method = SimpleNamespace(
         moe=SimpleNamespace(num_experts=1),
         moe_quant_config=SimpleNamespace(
-            w1_scale=torch.full((1, 4, 1), 16.0),
-            w2_scale=torch.full((1, 4, 1), 16.0),
+            w1_scale=torch.ones((1, 4, 1)),
+            w2_scale=torch.ones((1, 4, 1)),
             a1_scale=None,
             a2_scale=None,
         ),
@@ -5774,6 +5778,8 @@ def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
     assert kwargs["use_int8_w8a8"] is True
     assert kwargs["use_int4_w4a16"] is False
     assert kwargs["per_channel_quant"] is True
+    torch.testing.assert_close(kwargs["w1_scale"], torch.full((1, 4, 1), 16.0))
+    torch.testing.assert_close(kwargs["w2_scale"], torch.full((1, 4, 1), 16.0))
 
 
 @pytest.mark.hcu
@@ -5806,8 +5812,8 @@ def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
         ),
     )
     method.moe_quant_config = SimpleNamespace(
-        w1_scale=torch.full((1, 4, 1), 16.0),
-        w2_scale=torch.full((1, 4, 1), 16.0),
+        w1_scale=torch.ones((1, 4, 1)),
+        w2_scale=torch.ones((1, 4, 1)),
         a1_scale=None,
         a2_scale=None,
     )
