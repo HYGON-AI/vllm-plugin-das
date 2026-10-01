@@ -17,6 +17,7 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
     patch_deepseek_v41_dspark_load_weights,
+    patch_dspark_draft_a2a,
     patch_mhc_backend,
 )
 from vllm_hcu.patch.platform.core_fix import patch_config_utils
@@ -647,3 +648,229 @@ def test_mhc_patch_rejects_missing_capability_flag() -> None:
 
     with pytest.raises(PatchCompatibilityError, match="HAS_AITER_MHC"):
         patch_mhc_backend.apply_to_module(module)
+
+
+def test_dspark_draft_parallel_config_keeps_ep_and_uses_ag_rs() -> None:
+    """The DSpark drafter keeps EP8 but avoids the target DeepEP LL backend.
+
+    Upstream keeps the target's ``enable_expert_parallel`` on the drafter, so
+    with ``--all2all-backend deepep_low_latency`` the MTP drafter also selects
+    DeepEP LL and its buffer allocation OOMs next to the target weights.  The
+    HCU patch selects AG-RS for the drafter only.  This matches SGLang's
+    speculative ``a2a=none`` behavior for DP+EP: gather DP-local token shards,
+    run the local EP expert shard, then reduce-scatter the partial outputs.
+    It must not be replaced by ``NoDPEP``, which would leave each rank with
+    only its pre-gather token shard.
+    """
+
+    from dataclasses import dataclass as _dataclass
+    from dataclasses import fields as _fields
+
+    @_dataclass
+    class ParallelConfig:
+        pipeline_parallel_size: int = 1
+        tensor_parallel_size: int = 1
+        enable_expert_parallel: bool = True
+        all2all_backend: str = "deepep_low_latency"
+        enable_eplb: bool = False
+        enable_elastic_ep: bool = False
+
+    def replace(dataclass_instance, /, **kwargs):
+        init_fields = {
+            item.name for item in _fields(dataclass_instance) if item.init
+        }
+        updated = {name: getattr(dataclass_instance, name) for name in init_fields}
+        updated.update(kwargs)
+        return type(dataclass_instance)(**updated)
+
+    def original_parallel_config(parallel_config, tensor_parallel_size):
+        return replace(
+            parallel_config,
+            tensor_parallel_size=tensor_parallel_size,
+            enable_eplb=False,
+            enable_elastic_ep=False,
+        )
+
+    def load_dspark_model(target_model, vllm_config):
+        return target_model, vllm_config
+
+    target = ParallelConfig(tensor_parallel_size=1, enable_expert_parallel=True)
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=original_parallel_config,
+        load_dspark_model=load_dspark_model,
+    )
+    patch_dspark_draft_a2a.apply_to_module(module)
+
+    result = module._get_dspark_parallel_config(target, 1)
+
+    assert result.enable_expert_parallel is True
+    assert result.all2all_backend == "allgather_reducescatter"
+    assert result.tensor_parallel_size == 1
+    assert result.enable_eplb is False
+    # idempotent: a second application must be a no-op, not a double wrap
+    assert patch_dspark_draft_a2a.apply_to_module(module) is False
+    again = module._get_dspark_parallel_config(target, 1)
+    assert again.enable_expert_parallel is True
+    assert again.all2all_backend == "allgather_reducescatter"
+
+
+def test_dspark_draft_parallel_config_keeps_dense_drafter_untouched() -> None:
+    """A drafter that already runs without EP is returned unchanged."""
+
+    from dataclasses import dataclass as _dataclass
+    from dataclasses import fields as _fields
+
+    @_dataclass
+    class ParallelConfig:
+        tensor_parallel_size: int = 1
+        enable_expert_parallel: bool = False
+
+    def replace(dataclass_instance, /, **kwargs):
+        init_fields = {
+            item.name for item in _fields(dataclass_instance) if item.init
+        }
+        updated = {name: getattr(dataclass_instance, name) for name in init_fields}
+        updated.update(kwargs)
+        return type(dataclass_instance)(**updated)
+
+    def original_parallel_config(parallel_config, tensor_parallel_size):
+        return replace(parallel_config, tensor_parallel_size=tensor_parallel_size)
+
+    def load_dspark_model(target_model, vllm_config):
+        return target_model, vllm_config
+
+    target = ParallelConfig(tensor_parallel_size=1, enable_expert_parallel=False)
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=original_parallel_config,
+        load_dspark_model=load_dspark_model,
+    )
+    patch_dspark_draft_a2a.apply_to_module(module)
+
+    result = module._get_dspark_parallel_config(target, 1)
+    assert result.enable_expert_parallel is False
+    assert result.tensor_parallel_size == 1
+
+
+def test_dspark_draft_parallel_config_rejects_signature_drift() -> None:
+    def wrong_signature(parallel_config, tensor_parallel_size, extra):
+        del parallel_config, tensor_parallel_size, extra
+
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=wrong_signature,
+        load_dspark_model=lambda target_model, vllm_config: (target_model, vllm_config),
+    )
+    with pytest.raises(PatchCompatibilityError):
+        patch_dspark_draft_a2a.apply_to_module(module)
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "deep_gemm"])
+def test_dspark_draft_load_keeps_backend_owners_consistent(backend) -> None:
+    @dataclass
+    class KernelConfig:
+        moe_backend: str = "deep_gemm"
+
+    @dataclass
+    class SpeculativeConfig:
+        moe_backend: str | None = None
+
+    @dataclass
+    class VllmConfig:
+        kernel_config: KernelConfig = field(default_factory=KernelConfig)
+        speculative_config: SpeculativeConfig = field(
+            default_factory=SpeculativeConfig
+        )
+        additional_config: dict = field(default_factory=lambda: {
+            "hcu": {"moe_backend": "deep_gemm"}, "unrelated": 7,
+        })
+
+    def original_parallel_config(parallel_config, tensor_parallel_size):
+        return parallel_config
+
+    observed: list[str] = []
+
+    def load_dspark_model(target_model, vllm_config):
+        from vllm_hcu.patch.config import get_hcu_config
+
+        observed.append(vllm_config.kernel_config.moe_backend)
+        assert get_hcu_config(vllm_config).moe_backend == (
+            "deep_gemm" if backend == "deep_gemm" else "auto"
+        )
+        assert vllm_config.additional_config["unrelated"] == 7
+        return target_model
+
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=original_parallel_config,
+        load_dspark_model=load_dspark_model,
+    )
+    patch_dspark_draft_a2a.apply_to_module(module)
+    config = VllmConfig()
+    config.speculative_config.moe_backend = backend
+
+    model = torch.nn.Module()
+    assert module.load_dspark_model(model, config) is model
+    assert observed == [backend or "triton"]
+    assert config.kernel_config.moe_backend == "deep_gemm"
+    assert config.additional_config["hcu"] == {"moe_backend": "deep_gemm"}
+
+
+def test_dspark_ag_rs_prepare_finalize_bypasses_target_manager(monkeypatch) -> None:
+    """Gather and reduce through the draft manager, including FP8 scales."""
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+
+    calls = []
+    manager = SimpleNamespace(
+        dispatch=lambda *args, **kwargs: calls.append("dispatch") or args[:3],
+        combine=lambda tensor, **kwargs: calls.append("combine") or tensor + 3,
+    )
+
+    def target_group():
+        raise AssertionError("draft must not call target DeepEP manager")
+
+    monkeypatch.setattr(naive_dp_ep, "get_ep_group", target_group)
+    monkeypatch.setattr(
+        naive_dp_ep, "_quantize_and_setup_dispatch",
+        lambda a1, config, defer: (a1, None, None),
+    )
+    monkeypatch.setattr(
+        patch_dspark_draft_a2a, "_make_draft_ag_rs_manager", lambda _: manager
+    )
+    pf = naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular(num_dispatchers=8)
+    target_manager = SimpleNamespace()
+    patch_dspark_draft_a2a._bind_draft_manager(pf, target_manager)
+    hidden = torch.ones(2, 4)
+    weights = torch.ones(2, 1)
+    ids = torch.zeros(2, 1, dtype=torch.int64)
+
+    prepared = pf.prepare(hidden, weights, ids, 128, None, False, None)
+    assert prepared[0] is hidden
+    output = torch.empty_like(hidden)
+    reducer = SimpleNamespace(apply=lambda **kwargs: hidden * 2)
+    pf.finalize(output, hidden, weights, ids, False, reducer)
+    torch.testing.assert_close(output, hidden * 5)
+    assert calls == ["dispatch", "combine"]
+    assert naive_dp_ep.get_ep_group is target_group
+
+
+def test_dspark_draft_does_not_bind_no_dp_ep() -> None:
+    """Protect the SGLang DP-gather semantics from a local-only regression."""
+
+    class MoEPrepareAndFinalizeNoDPEPModular:
+        def prepare(self):
+            pass
+
+        def finalize(self):
+            pass
+
+    target_manager = SimpleNamespace()
+    prepare_finalize = MoEPrepareAndFinalizeNoDPEPModular()
+
+    result = patch_dspark_draft_a2a.maybe_bind_draft_ag_rs(
+        prepare_finalize, target_manager
+    )
+
+    assert result is prepare_finalize
+    assert not hasattr(prepare_finalize, "_vllm_hcu_ag_rs_manager")

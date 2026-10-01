@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -167,6 +168,26 @@ def apply_to_module(module: ModuleType) -> bool:
         enable_lightly_cplb=False,
         deepep_auto_is_prefilling=None,
     ):
+        from vllm_hcu.patch.worker.core_fix.patch_dspark_draft_a2a import (
+            in_dspark_draft_forward,
+        )
+
+        if in_dspark_draft_forward():
+            # The draft uses AG-RS. Its forward must create the standard DP
+            # metadata consumed by AgRsAll2AllManager; do not enter HCU's
+            # DeepEP-LL special context merely because the target config is LL.
+            return original_set(
+                attn_metadata,
+                vllm_config,
+                num_tokens,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                batch_descriptor,
+                ubatch_slices,
+                slot_mapping,
+                skip_compiled,
+                is_padding,
+            )
         deepep_auto = get_hcu_config(vllm_config).deepep_auto
         low_latency = (
             vllm_config.parallel_config.all2all_backend == "deepep_low_latency"
@@ -226,6 +247,16 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(forward, "_vllm_hcu_original_set_forward_context", original_set)
     setattr(forward, "create_forward_context", hcu_create)
     setattr(forward, "set_forward_context", hcu_set)
+    # Speculator modules import set_forward_context by value. Keep those
+    # captured references aligned with the HCU wrapper, otherwise DSpark's
+    # draft forward bypasses the draft-aware metadata path entirely.
+    for module_name in (
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator",
+        "vllm.v1.worker.gpu.spec_decode.dspark.speculator",
+    ):
+        captured = sys.modules.get(module_name)
+        if captured is not None and hasattr(captured, "set_forward_context"):
+            captured.set_forward_context = hcu_set
     setattr(forward, _MARKER, True)
     return True
 
