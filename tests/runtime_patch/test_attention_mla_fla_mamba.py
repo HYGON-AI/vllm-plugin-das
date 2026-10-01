@@ -985,7 +985,7 @@ def _boltops_chunk_h_contract(
     initial_state_indices=None, output_final_state=True,
     inplace_final_state=False, chunk_size=64, save_new_value=True,
     cu_seqlens=None, chunk_indices=None, use_exp2=False,
-    transpose_state_layout=True, kernel_cfg=None,
+    transpose_state_layout=True, null_state_index=-1, kernel_cfg=None,
 ):
     pass
 
@@ -1002,6 +1002,51 @@ def _boltops_recompute_contract(
     k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=None,
 ):
     pass
+
+
+def _boltops_sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0,
+    scale=None, initial_state=None, inplace_final_state=True,
+    cu_seqlens=None, ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False, null_state_index=0,
+    kernel_cfg=None,
+):
+    pass
+
+
+def _boltops_recurrent_contract(
+    mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
+    ssm_state_indices, use_qk_l2norm_in_kernel=False, null_state_index=-1,
+    kernel_cfg=None,
+):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("name", "contract"),
+    (
+        ("chunk_gated_delta_rule_fwd_h", _boltops_chunk_h_contract),
+        ("fused_sigmoid_gating_delta_rule_update", _boltops_sigmoid_contract),
+        (
+            "fused_recurrent_gated_delta_rule_packed_decode",
+            _boltops_recurrent_contract,
+        ),
+    ),
+)
+def test_boltops_resolver_accepts_current_null_state_index_abi(
+    monkeypatch, name, contract
+):
+    from vllm_hcu.patch.worker.op_opt._boltops_fla import (
+        make_boltops_gdn_resolver,
+    )
+
+    def kernel(*args, **kwargs):
+        return args, kwargs
+
+    kernel.__signature__ = inspect.signature(contract)
+    _install_fake_module(monkeypatch, "boltops.fla.gdn", **{name: kernel})
+
+    assert make_boltops_gdn_resolver(name)() is kernel
 
 
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
