@@ -4424,7 +4424,7 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
+def test_slimquant_w4a8_deepep_auto_rejects_unsupported_architecture():
     from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
         slimquant_w4a8_uses_deepep_auto,
     )
@@ -4447,6 +4447,42 @@ def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
 
     with pytest.raises(ValueError, match="validated only for DeepSeek-V4"):
         slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_accepts_glm_moe_dsa(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda: None,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"]
+            )
+        ),
+    )
+
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
 
 
 @pytest.mark.hcu

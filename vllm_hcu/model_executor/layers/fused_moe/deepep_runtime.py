@@ -116,9 +116,18 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     if vllm_config is None:
         vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
     architectures = model_architectures(vllm_config)
-    if "DeepseekV4ForCausalLM" not in architectures:
+    supported_architectures = {
+        "DeepseekV4ForCausalLM",
+        # GLM's DSA model is implemented by vLLM as a direct
+        # DeepseekV2ForCausalLM subclass and uses the same SiLU routed-expert
+        # contract.  Channel SlimQuant checkpoints therefore share the
+        # DeepEP W4A8 packing and DeepGEMM execution path.
+        "GlmMoeDsaForCausalLM",
+    }
+    if supported_architectures.isdisjoint(architectures):
         raise ValueError(
-            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4; "
+            "SlimQuant W4A8 deepep_auto is validated only for DeepSeek-V4 "
+            "or GLM MoE DSA; "
             f"got architectures={architectures!r}"
         )
     activation = getattr(moe_config, "activation", None)
