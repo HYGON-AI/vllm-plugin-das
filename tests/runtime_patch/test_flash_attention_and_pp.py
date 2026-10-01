@@ -615,6 +615,50 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
     assert calls[0][1][:5] == (key, value, key_cache, value_cache, slots)
 
 
+@pytest.mark.parametrize(
+    ("requested_dtype", "operator_dtype"),
+    [
+        ("bfloat16", "auto"),
+        ("float16", "auto"),
+        ("fp8_e5m2", "fp8_e5m2"),
+    ],
+)
+def test_flash_cache_writer_normalizes_explicit_unquantized_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_dtype: str,
+    operator_dtype: str,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.hcu_ops,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+
+    tensor = torch.zeros(1, 1, 8)
+    cache = torch.zeros(1, 1, 1, 8)
+    slots = torch.tensor([0])
+    scale = torch.tensor(1.0)
+    fa_utils.reshape_and_cache_flash(
+        tensor,
+        tensor,
+        cache,
+        cache,
+        slots,
+        requested_dtype,
+        scale,
+        scale,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][5] == operator_dtype
+
+
 def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
