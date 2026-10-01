@@ -18,6 +18,7 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_rocm_wo_a_layout,
     patch_deepseek_v41_dspark_load_weights,
     patch_dspark_draft_a2a,
+    patch_dspark_query_capacity,
     patch_mhc_backend,
 )
 from vllm_hcu.patch.platform.core_fix import patch_config_utils
@@ -874,3 +875,105 @@ def test_dspark_draft_does_not_bind_no_dp_ep() -> None:
 
     assert result is prepare_finalize
     assert not hasattr(prepare_finalize, "_vllm_hcu_ag_rs_manager")
+
+
+@pytest.mark.parametrize("num_reqs", [32, 64, 256, 1024])
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
+def test_dspark_query_capacity_covers_markov_anchors(num_reqs, sample_from_anchor):
+    """Expanded queries must fit even when target profiling uses one token/req."""
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    steps = 5
+    width = steps + (not sample_from_anchor)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=num_reqs, max_num_batched_tokens=256
+        ),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=steps,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor)
+            ),
+        ),
+    )
+    draft_config = patch_dspark_query_capacity._draft_capacity_config(config)
+    capacity = draft_config.scheduler_config.max_num_batched_tokens
+    assert capacity >= num_reqs * width
+    assert config.scheduler_config.max_num_batched_tokens == 256
+
+    speculator = object.__new__(DSparkSpeculator)
+    speculator._draft_topk = None
+    speculator.num_speculative_steps = steps
+    speculator.sample_indices = torch.arange(num_reqs * steps)
+    speculator.sample_idx_mapping = torch.zeros(num_reqs * steps)
+    speculator.sample_pos = torch.zeros(num_reqs * steps)
+    speculator._anchor_idx = torch.arange(num_reqs) * width
+    ids = torch.arange(capacity, dtype=torch.int32) % 7
+    speculator.input_buffers = SimpleNamespace(input_ids=ids)
+    speculator.use_confidence_head = False
+    speculator.draft_tokens = torch.zeros(num_reqs, steps, dtype=torch.int64)
+    seen = []
+
+    def markov_embed(prev):
+        seen.append(prev.clone())
+        return prev[:, None].float()
+
+    speculator.model = SimpleNamespace(
+        compute_draft_logits=lambda hidden: hidden,
+        markov_embed=markov_embed,
+        markov_bias=lambda embed: embed,
+    )
+    speculator._sample_logits = lambda logits, *args: logits[:, 0].long() + 1
+    speculator._sample_sequential(num_reqs, torch.zeros(num_reqs * steps, 1))
+
+    anchors = ids[speculator._anchor_idx].long()
+    torch.testing.assert_close(seen[0], anchors.to(torch.int32))
+    for step in range(steps):
+        torch.testing.assert_close(
+            speculator.draft_tokens[:, step], anchors + step + 1
+        )
+    if (num_reqs - 1) * width >= 256:
+        with pytest.raises(IndexError):
+            ids[:256][speculator._anchor_idx]
+
+
+def test_dspark_query_capacity_expands_shared_slots_before_capture():
+    seen = []
+
+    class DSparkSpeculator:
+        def __init__(self, vllm_config, device):
+            self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        def set_attn(
+            self,
+            model_state,
+            kv_cache_config,
+            block_tables,
+            target_input_buffers,
+            target_attn_groups,
+        ):
+            seen.append(block_tables.slot_mappings)
+
+    module = _module(
+        patch_dspark_query_capacity.TARGET_MODULE, DSparkSpeculator=DSparkSpeculator
+    )
+    assert patch_dspark_query_capacity.apply_to_module(module)
+    assert not patch_dspark_query_capacity.apply_to_module(module)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64, max_num_batched_tokens=256),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5,
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        ),
+    )
+    drafter = DSparkSpeculator(config, "cpu")
+    slots = torch.arange(512).view(2, 256)
+    tables = SimpleNamespace(slot_mappings=slots, max_num_batched_tokens=256)
+    drafter.set_attn(None, None, tables, None, None)
+    assert tables.slot_mappings.shape == (2, 320)
+    torch.testing.assert_close(tables.slot_mappings[:, :256], slots)
+    assert torch.all(tables.slot_mappings[:, 256:] == -1)
+    assert seen[0] is tables.slot_mappings
+    drafter.set_attn(None, None, tables, None, None)
+    assert seen[1] is seen[0]
+    assert config.scheduler_config.max_num_batched_tokens == 256
