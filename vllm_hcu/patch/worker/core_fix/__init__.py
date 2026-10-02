@@ -9,6 +9,8 @@ explicit ``apply(module=None)`` convenience entry point.
 
 from . import (
     patch_deepseek_v32_config,
+    patch_deepseek_v41_channel_fp8,
+    patch_deepseek_v41_attention,
     patch_deepseek_v4_attention,
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
@@ -32,6 +34,8 @@ from . import (
 
 __all__ = [
     "patch_deepseek_v32_config",
+    "patch_deepseek_v41_channel_fp8",
+    "patch_deepseek_v41_attention",
     "patch_deepseek_v4_attention",
     "patch_deepseek_v4_dspark_target",
     "patch_deepseek_v4_load_weights",
