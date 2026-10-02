@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Adapt Channel-FP8 loading and correctness fallbacks for GLM5Next."""
+"""Adapt Channel-quantized loading and correctness fallbacks for GLM5Next."""
 
 from __future__ import annotations
 
@@ -588,13 +588,13 @@ def _dequantize_channel_fp8(
 ) -> torch.Tensor:
     if weight.ndim != 2:
         raise ValueError(
-            f"Channel-FP8 weight must be 2-D, got {tuple(weight.shape)}"
+            f"Channel-quantized weight must be 2-D, got {tuple(weight.shape)}"
         )
     if scale.ndim == 1:
         scale = scale.unsqueeze(1)
     if scale.shape != (weight.shape[0], 1):
         raise ValueError(
-            "Channel-FP8 scale must have shape (out_features, 1), got "
+            "Channel-quantized scale must have shape (out_features, 1), got "
             f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
         )
     return (weight.float() * scale.float()).to(torch.bfloat16).contiguous()
@@ -660,7 +660,15 @@ def apply_to_module(module: ModuleType) -> bool:
         target_weight = f"{target}.weight"
         target_scale = f"{target}.weight_scale"
         target_scale_inv = f"{target}.weight_scale_inv"
-        is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+        # GLM Channel checkpoints use the same per-output-channel scale
+        # contract for both FP8 and INT8 attention projections.  The official
+        # model keeps these projections in BF16, so both storage dtypes must be
+        # buffered with ``weight_scale`` and dequantized before the normal
+        # loader can cast the raw values into the BF16 parameter.
+        is_weight = name.endswith(".weight") and tensor.dtype in (
+            torch.float8_e4m3fn,
+            torch.int8,
+        )
         is_channel_scale = name.endswith(".weight_scale")
 
         # A target that remains quantized owns both tensors and must use the
