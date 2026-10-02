@@ -6,7 +6,7 @@
 
 import inspect
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -60,6 +60,31 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _pcp_gathered_padding_mask(forward_context: ForwardContext):
+    """Align the MoE padding mask with the PCP-gathered token axis.
+
+    The PCP fallback concatenates every rank's local tokens before routing, so
+    ``gating_output`` grows to ``pcp_size * num_tokens``. The router asserts the
+    mask length against that tensor, so the mask has to make the same trip.
+    Scoped to the routing call: the next layer gathers its own local mask again.
+    """
+
+    is_padding = forward_context.is_padding
+    if is_padding is None:
+        yield
+        return
+    gathered = get_pcp_group().all_gather(
+        is_padding.to(torch.uint8),
+        dim=0,
+    ).to(torch.bool)
+    forward_context.is_padding = gathered
+    try:
+        yield
+    finally:
+        forward_context.is_padding = is_padding
 
 
 def register_layer_for_moe_forward_op(
@@ -861,6 +886,18 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
         ) and not self._quant_method.supports_internal_mk
 
+    def _pcp_fallback_collective_required(self) -> bool:
+        """Whether this layer gathers tokens across PCP ranks itself.
+
+        The all-to-all kernel path already exchanges the whole batch, so the
+        fallback collectives must stay off there.
+        """
+
+        return (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        )
+
     def _maybe_dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -889,11 +926,7 @@ class MoERunner(MoERunnerInterface):
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
         # we should modify All2AllManager abstraction to better support PCP.
-        needs_fallback_pcp_collective = (
-            self.moe_config.pcp_size > 1
-            and not self.moe_config.moe_parallel_config.use_all2all_kernels
-        )
-        if needs_fallback_pcp_collective:
+        if self._pcp_fallback_collective_required():
             hidden_states = get_pcp_group().all_gather(
                 hidden_states,
                 dim=0,
@@ -987,7 +1020,16 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
-        with self._sequence_parallel_context():
+        # The PCP fallback gathers this layer's tokens before routing, so the
+        # padding mask must cover the same window or the router kernel sees a
+        # mask shorter than gating_output.
+        padding_scope = (
+            _pcp_gathered_padding_mask(get_forward_context())
+            if self._pcp_fallback_collective_required()
+            and is_forward_context_available()
+            else nullcontext()
+        )
+        with self._sequence_parallel_context(), padding_scope:
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain

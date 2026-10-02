@@ -4,6 +4,7 @@
 """HCU integration boundary for vLLM's Model Runner V2."""
 
 import functools
+import os
 from contextlib import nullcontext
 
 import torch
@@ -19,6 +20,20 @@ from vllm_hcu.forward_context_runtime import (
     set_deepep_auto_request_phase,
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+
+
+_DSV4_ARCHITECTURES = frozenset(
+    {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"}
+)
+_DSV4_PCP_EXPERIMENTAL_ENV = "VLLM_HCU_DSV4_PCP_EXPERIMENTAL"
+
+
+def _dsv4_pcp_experimental_enabled(vllm_config: object) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(architectures & _DSV4_ARCHITECTURES) and os.environ.get(
+        _DSV4_PCP_EXPERIMENTAL_ENV, ""
+    ).lower() in ("1", "true")
 
 
 def record_pp_spec_draft_index_stream(
@@ -61,7 +76,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
             self._hcu_pcp_manager_cls = make_hcu_pcp_manager_cls(
-                self.vllm_config
+                self.vllm_config,
+                runtime_owner=self,
             )
         return self._hcu_pcp_manager_cls
 
@@ -74,7 +90,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
-        if pcp_size > 1 and len(kv_cache_config.kv_cache_groups) != 1:
+        if (
+            pcp_size > 1
+            and len(kv_cache_config.kv_cache_groups) != 1
+            and not _dsv4_pcp_experimental_enabled(self.vllm_config)
+        ):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )

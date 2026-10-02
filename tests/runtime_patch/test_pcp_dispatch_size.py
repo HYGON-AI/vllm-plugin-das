@@ -61,3 +61,4 @@ def test_pcp_partition_accepts_official_runner_padding_contract() -> None:
     signature = inspect.signature(HcuPCPManager.partition_batch)
 
     assert signature.parameters["padded_num_tokens"].default is None
+    assert signature.parameters["padded_num_reqs"].default is None

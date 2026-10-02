@@ -16,8 +16,9 @@ import numpy as np
 import torch
 
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
     _validate_hcu_pcp_scope,
@@ -75,8 +76,23 @@ class PCPPlan(NamedTuple):
     ctx: PCPContextPlan | None
 
 
-class HcuPCPManager:
+class HcuPCPManager(PCPManager):
     """Build rank-local virtual rows while retaining the global step batch."""
+
+    @property
+    def pcp_size(self) -> int:
+        """Alias for the upstream ``PCPManager.pcp_world_size`` attribute.
+
+        The HCU manager historically exposed ``pcp_size`` and the upstream
+        contracts plus the merged regression tests still use that name. Keep
+        both spellings interchangeable so the two conventions cannot drift.
+        """
+
+        return self.pcp_world_size
+
+    @pcp_size.setter
+    def pcp_size(self, value: int) -> None:
+        self.pcp_world_size = value
 
     @staticmethod
     def validate_config(
@@ -85,6 +101,13 @@ class HcuPCPManager:
     ) -> None:
         if supports_mm_inputs:
             raise ValueError("HCU PCP does not support multimodal inputs.")
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is not None and bool(
+            getattr(model_config, "use_mla", False)
+        ):
+            # Reuse upstream's generic MLA PCP/DSpark/DCP validation. The HCU
+            # scope check below owns only HCU-specific model and backend gates.
+            PCPManager.validate_config(vllm_config, supports_mm_inputs=False)
         _validate_hcu_pcp_scope(vllm_config)
 
     def __init__(
@@ -98,28 +121,52 @@ class HcuPCPManager:
         dcp_group: object | None = None,
     ) -> None:
         parallel_config = vllm_config.parallel_config
-        self.pcp_size = int(parallel_config.prefill_context_parallel_size)
-        assert self.pcp_size > 1
-        self.device = device
-        self._pcp_group = pcp_group if pcp_group is not None else get_pcp_group()
-        self.pcp_rank = int(self._pcp_group.rank_in_group)
-        assert int(self._pcp_group.world_size) == self.pcp_size
-        assert 0 <= self.pcp_rank < self.pcp_size
-        self.dcp_world_size = int(parallel_config.decode_context_parallel_size)
-        self.cp_interleave = int(parallel_config.cp_kv_cache_interleave_size)
-        if self.dcp_world_size > 1:
-            self._dcp_group = (
-                dcp_group if dcp_group is not None else get_dcp_group()
-            )
-            self.dcp_rank = int(self._dcp_group.rank_in_group)
-            assert int(self._dcp_group.world_size) == self.dcp_world_size
+        pcp_size = int(parallel_config.prefill_context_parallel_size)
+        assert pcp_size > 1
+        pcp_group = pcp_group if pcp_group is not None else get_pcp_group()
+        pcp_rank = int(pcp_group.rank_in_group)
+        assert int(pcp_group.world_size) == pcp_size
+        assert 0 <= pcp_rank < pcp_size
+        dcp_world_size = int(parallel_config.decode_context_parallel_size)
+        cp_interleave = int(parallel_config.cp_kv_cache_interleave_size)
+        if dcp_world_size > 1:
+            dcp_group = dcp_group if dcp_group is not None else get_dcp_group()
+            dcp_rank = int(dcp_group.rank_in_group)
+            assert int(dcp_group.world_size) == dcp_world_size
         else:
-            self._dcp_group = dcp_group
-            self.dcp_rank = 0
+            dcp_rank = 0
+
+        scheduler_config = vllm_config.scheduler_config
+        max_num_tokens = int(scheduler_config.max_num_batched_tokens)
+        # HCU adds one virtual row when equalizing MLA/EP collective shapes.
+        # The upstream constructor derives a 2x request capacity from its
+        # argument, so pass the smallest value that covers HCU's 3x capacity.
+        hcu_max_num_reqs = 3 * int(scheduler_config.max_num_seqs)
+        upstream_max_num_reqs = (hcu_max_num_reqs + 1) // 2
+        upstream_block_tables = (
+            block_tables
+            if hasattr(block_tables, "input_block_tables")
+            else None
+        )
+        super().__init__(
+            pcp_world_size=pcp_size,
+            pcp_rank=pcp_rank,
+            device=device,
+            max_num_reqs=upstream_max_num_reqs,
+            max_num_tokens=max_num_tokens,
+            block_tables=upstream_block_tables,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            cp_interleave=cp_interleave,
+        )
+
+        # Keep the injected groups for CPU contracts and HCU's restore path.
+        self._pcp_group = pcp_group
+        self._dcp_group = dcp_group
+        self._block_tables = block_tables
         self._use_mla = bool(vllm_config.model_config.use_mla)
 
         self._req_states = req_states
-        self._block_tables = block_tables
         self._global_batch: InputBatch | None = None
         self._global_attn_ready = False
         self._hidden_restore_idx: torch.Tensor | None = None
@@ -130,11 +177,11 @@ class HcuPCPManager:
         self._local_segments: list[_BatchSegment] = []
         self._global_has_prefill = False
 
-        scheduler_config = vllm_config.scheduler_config
-        # DualChunkSwap has at most two real rows per request. HCU may need one
-        # extra virtual row to equalize eager-attention collective shapes.
-        self._max_local_reqs = 3 * int(scheduler_config.max_num_seqs)
-        self._max_local_tokens = int(scheduler_config.max_num_batched_tokens)
+        # Use the capacity allocated by the upstream InputBuffers. For an odd
+        # scheduler max_num_seqs this can be one row larger than 3x, which is
+        # harmless and avoids allocating a second buffer set in HCU.
+        self._max_local_reqs = self._input_buffers.max_num_reqs
+        self._max_local_tokens = self._input_buffers.max_num_tokens
 
         # Plugin-owned buffers must never alias the saved global InputBatch.
         self._idx_mapping = torch.empty(
@@ -143,11 +190,6 @@ class HcuPCPManager:
         self._idx_mapping_np = np.empty(self._max_local_reqs, dtype=np.int32)
         self._num_scheduled_tokens = np.empty(
             self._max_local_reqs, dtype=np.int32
-        )
-        self._input_buffers = InputBuffers(
-            self._max_local_reqs,
-            self._max_local_tokens,
-            device,
         )
         self._positions = self._input_buffers.positions
         self._seq_lens = self._input_buffers.seq_lens
@@ -180,46 +222,17 @@ class HcuPCPManager:
             self._max_local_tokens, dtype=np.int64
         )
 
-        input_block_tables = getattr(block_tables, "input_block_tables", ())
-        self._local_block_tables = tuple(
-            table.new_zeros((self._max_local_reqs, table.shape[1]))
-            for table in input_block_tables
-        )
-        self._local_block_table_ptrs = (
-            torch.tensor(
-                [table.data_ptr() for table in self._local_block_tables],
-                dtype=torch.uint64,
-                device=device,
-            )
-            if self._local_block_tables
-            else None
-        )
+        self._local_block_tables = self._local_block_tables or ()
         self._global_block_tables = tuple(
             table.new_zeros((int(scheduler_config.max_num_seqs), table.shape[1]))
-            for table in input_block_tables
+            for table in getattr(block_tables, "input_block_tables", ())
         )
         num_kv_groups = int(getattr(block_tables, "num_kv_cache_groups", 0))
-        self._global_slot_mappings = (
-            torch.empty(
-                (num_kv_groups, self._max_local_tokens),
-                dtype=torch.int64,
-                device=device,
+        if num_kv_groups and upstream_block_tables is None:
+            raise PatchCompatibilityError(
+                "HCU PCP block tables must expose the upstream input_block_tables "
+                "contract when KV cache groups are present"
             )
-            if num_kv_groups
-            else None
-        )
-        self._gathered_slot_mappings = (
-            torch.empty(
-                (num_kv_groups, self._max_local_tokens * self.pcp_size),
-                dtype=torch.int64,
-                device=device,
-            )
-            if num_kv_groups
-            else None
-        )
-        self._pad_slot_id = torch.tensor(
-            PAD_SLOT_ID, dtype=torch.int64, device=device
-        )
 
     @staticmethod
     def rank_segments(
@@ -267,15 +280,15 @@ class HcuPCPManager:
                         for segment in self.rank_segments(
                             length,
                             pcp_rank=rank,
-                            pcp_size=self.pcp_size,
+                            pcp_size=self.pcp_world_size,
                         )
                     )
-                    for rank in range(self.pcp_size)
+                    for rank in range(self.pcp_world_size)
                 )
             return num_tokens
 
         largest = 0
-        for rank in range(self.pcp_size):
+        for rank in range(self.pcp_world_size):
             local_tokens = 0
             for length_value, is_prefill_value in zip(
                 num_scheduled_tokens, is_prefilling
@@ -287,7 +300,7 @@ class HcuPCPManager:
                         for segment in self.rank_segments(
                             length,
                             pcp_rank=rank,
-                            pcp_size=self.pcp_size,
+                            pcp_size=self.pcp_world_size,
                         )
                     )
                 else:
@@ -295,9 +308,24 @@ class HcuPCPManager:
             largest = max(largest, local_tokens)
         return largest
 
-    @property
-    def input_buffers(self) -> InputBuffers:
-        return self._input_buffers
+    @staticmethod
+    def _resolve_num_reqs_after_padding(
+        input_batch: InputBatch,
+        padded_num_reqs: int | None,
+        num_local_reqs: int,
+    ) -> int:
+        """Apply the upstream MRV2 request-padding contract."""
+
+        if padded_num_reqs is None:
+            return num_local_reqs
+        if input_batch.has_prefill:
+            raise RuntimeError("PCP FULL graphs require a decode-only batch.")
+        if padded_num_reqs < num_local_reqs:
+            raise RuntimeError(
+                "PCP graph request capacity must cover the rank-local batch: "
+                f"{padded_num_reqs} < {num_local_reqs}."
+            )
+        return padded_num_reqs
 
     @staticmethod
     def _reorder_segments(
@@ -346,7 +374,7 @@ class HcuPCPManager:
             global_start = int(input_batch.query_start_loc_np[req_idx])
             if bool(input_batch.is_prefilling_np[req_idx]):
                 rank_segments = self.rank_segments(
-                    query_len, pcp_rank=rank, pcp_size=self.pcp_size
+                    query_len, pcp_rank=rank, pcp_size=self.pcp_world_size
                 )
             else:
                 rank_segments = (RankSegment(0, query_len),)
@@ -379,7 +407,7 @@ class HcuPCPManager:
     ) -> tuple[list[list[_BatchSegment]], list[int]]:
         segments_by_rank = [
             self._segments_for_rank(rank, input_batch)
-            for rank in range(self.pcp_size)
+            for rank in range(self.pcp_world_size)
         ]
 
         # The upstream PCP layout pads the model input tensor but keeps eager
@@ -419,6 +447,20 @@ class HcuPCPManager:
                 for count, rows in zip(actual_tokens, row_counts)
             ):
                 target_rows += 1
+            # Every rank-local row must carry at least one token. The upstream
+            # prefill loop walks the batch in PREFILL_CHUNK_SIZE row groups and
+            # slices each group's token range out of query_start_loc, so a
+            # zero-width row collapses a whole group to an empty slice. A rank
+            # that already holds the widest segment would otherwise receive
+            # exactly such a row, because equalizing row counts costs it no
+            # missing tokens.
+            target_tokens = max(
+                target_tokens,
+                max(
+                    actual + target_rows - rows
+                    for actual, rows in zip(actual_tokens, row_counts)
+                ),
+            )
             global_start = int(input_batch.query_start_loc_np[req_idx])
             for rank, rank_segments in enumerate(segments_by_rank):
                 missing_tokens = target_tokens - actual_tokens[rank]
@@ -430,7 +472,12 @@ class HcuPCPManager:
                             global_req_idx=req_idx,
                             global_slice=slice(global_start, global_start),
                             local_slice=slice(0, 0),
-                            padding_tokens=missing_tokens if row == 0 else 0,
+                            # Spread the padding so no added row is zero-width.
+                            padding_tokens=(
+                                missing_tokens - (missing_rows - 1)
+                                if row == 0
+                                else 1
+                            ),
                         )
                     )
 
@@ -455,7 +502,7 @@ class HcuPCPManager:
                 "official PCP dispatch padding is smaller than the HCU "
                 f"rank-local batch: {padded_num_tokens} < {required_num_tokens}"
             )
-        expanded_num_tokens = padded_num_tokens * self.pcp_size
+        expanded_num_tokens = padded_num_tokens * self.pcp_world_size
         padded_gather_idx = np.zeros(expanded_num_tokens, dtype=np.int64)
         kv_write_mask = np.zeros(expanded_num_tokens, dtype=np.bool_)
         hidden_restore_idx = np.empty(input_batch.num_tokens, dtype=np.int64)
@@ -504,6 +551,7 @@ class HcuPCPManager:
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
+        padded_num_reqs: int | None = None,
     ) -> InputBatch:
         """Return a rank-local InputBatch without mutating the global batch."""
 
@@ -538,6 +586,13 @@ class HcuPCPManager:
         num_padded_tokens = self._padded_num_tokens
         if num_local_reqs > self._max_local_reqs:
             raise RuntimeError("PCP local request count exceeds its buffer")
+        num_reqs_after_padding = self._resolve_num_reqs_after_padding(
+            input_batch,
+            padded_num_reqs,
+            num_local_reqs,
+        )
+        if num_reqs_after_padding > self._max_local_reqs:
+            raise RuntimeError("PCP padded local request count exceeds its buffer")
         if num_padded_tokens > self._max_local_tokens:
             raise RuntimeError("PCP local token count exceeds its buffer")
 
@@ -587,20 +642,8 @@ class HcuPCPManager:
             :num_padded_tokens
         ]
         replicated_slot_indices_np.fill(0)
-        rank0_decode_position = np.full(
-            input_batch.num_tokens, -1, dtype=np.int64
-        )
-        for segment in segments_by_rank[0]:
-            if (
-                segment.num_actual_tokens == 0
-                or bool(input_batch.is_prefilling_np[segment.global_req_idx])
-            ):
-                continue
-            rank0_decode_position[segment.global_slice] = np.arange(
-                segment.local_slice.start,
-                segment.local_slice.start + segment.num_actual_tokens,
-                dtype=np.int64,
-            )
+        # The restore map already names rank 0's slot for replicated decode.
+        assert self._hidden_restore_idx_np is not None
         for row, segment in enumerate(segments):
             local_slice = segment.local_slice
             if segment.num_actual_tokens == 0:
@@ -624,8 +667,10 @@ class HcuPCPManager:
                 input_batch.is_prefilling_np[segment.global_req_idx]
             ):
                 replicated_token_mask[actual_slice] = True
-                owner_positions = rank0_decode_position[segment.global_slice]
-                if np.any(owner_positions < 0):
+                owner_positions = self._hidden_restore_idx_np[segment.global_slice]
+                if np.any(
+                    (owner_positions < 0) | (owner_positions >= num_padded_tokens)
+                ):
                     raise RuntimeError(
                         "PCP rank-0 decode slot ownership is incomplete"
                     )
@@ -789,7 +834,7 @@ class HcuPCPManager:
             input_batch,
             req_ids=[input_batch.req_ids[index] for index in global_req_indices],
             num_reqs=num_local_reqs,
-            num_reqs_after_padding=num_local_reqs,
+            num_reqs_after_padding=num_reqs_after_padding,
             idx_mapping=local_idx_mapping,
             idx_mapping_np=local_idx_mapping_np,
             expanded_idx_mapping=expanded_idx_mapping,
@@ -825,22 +870,20 @@ class HcuPCPManager:
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Prepare local block rows and global-ownership slot mappings."""
 
+        assert self._block_tables is not None
+        assert self._local_block_table_ptrs is not None
         canonical_tables = getattr(self._block_tables, "block_tables", None)
-        scratch_tables = getattr(
-            self._block_tables, "input_block_tables", None
-        )
-        declared_groups = getattr(
-            self._block_tables, "num_kv_cache_groups", None
-        )
+        scratch_tables = getattr(self._block_tables, "input_block_tables", None)
+        declared_groups = getattr(self._block_tables, "num_kv_cache_groups", None)
         if not isinstance(canonical_tables, list) or not canonical_tables:
             raise PatchCompatibilityError(
-                "vLLM 0.25.1 BlockTables canonical block_tables storage is missing"
+                "vLLM BlockTables canonical block_tables storage is missing"
             )
         if not isinstance(scratch_tables, list) or not isinstance(
             declared_groups, int
         ):
             raise PatchCompatibilityError(
-                "vLLM 0.25.1 BlockTables canonical block_tables contract changed"
+                "vLLM BlockTables canonical block_tables contract changed"
             )
         group_counts = (
             len(canonical_tables),
@@ -850,49 +893,33 @@ class HcuPCPManager:
         )
         if len(set(group_counts)) != 1:
             raise PatchCompatibilityError(
-                "vLLM 0.25.1 BlockTables KV-group count mismatch: "
+                "vLLM BlockTables KV-group count mismatch: "
                 f"canonical/scratch/local/declared={group_counts}"
             )
-        source_tables = []
-        for table in canonical_tables:
-            source = getattr(table, "gpu", None)
-            if not isinstance(source, torch.Tensor):
-                raise PatchCompatibilityError(
-                    "vLLM 0.25.1 BlockTables canonical block_tables GPU "
-                    "storage is missing"
-                )
-            source_tables.append(source)
-        num_reqs = input_batch.num_reqs_after_padding
-        for source, destination in zip(
-            source_tables, self._local_block_tables
-        ):
-            torch.index_select(
-                source,
-                0,
-                input_batch.idx_mapping.to(torch.int64),
-                out=destination[:num_reqs],
-            )
-        local_tables = tuple(
-            table[:num_reqs] for table in self._local_block_tables
+        local_tables = self._block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            input_batch.num_reqs_after_padding,
+            out=self._local_block_tables,
+            out_ptrs=self._local_block_table_ptrs,
         )
         assert self._global_batch is not None
-        assert self._global_slot_mappings is not None
-        computed_slots = self._block_tables.compute_slot_mappings(
-            self._global_batch.idx_mapping,
-            self._global_batch.query_start_loc,
-            self._global_batch.positions,
-            self._global_batch.num_tokens,
-        )
-        global_slots = self._global_slot_mappings[
-            :, : self._global_batch.num_tokens
-        ]
-        global_slots.copy_(computed_slots)
         self._global_attn_ready = True
-        slot_mappings = (
-            self._convert_slot_mappings(global_slots)
-            if self._global_has_prefill
-            else global_slots
-        )
+        if self._global_has_prefill:
+            # The official path already computes global slots into the
+            # persistent parent buffer and applies the PCP gather/write mask.
+            slot_mappings = super().prepare_slot_mappings()
+        else:
+            # HCU replicated decode owns one logical PCP row. Do not use the
+            # upstream expanded mapping for this ownership mode.
+            assert self._global_batch_slot_mappings is not None
+            global_slots = self._block_tables.compute_slot_mappings(
+                self._global_batch.idx_mapping,
+                self._global_batch.query_start_loc,
+                self._global_batch.positions,
+                self._global_batch.num_tokens,
+                out=self._global_batch_slot_mappings,
+            )
+            slot_mappings = global_slots
         setattr(input_batch, "_vllm_hcu_pcp_plan", self.build_plan())
         setattr(
             input_batch,
@@ -906,11 +933,65 @@ class HcuPCPManager:
         )
         setattr(
             input_batch,
+            "_vllm_hcu_pcp_world_size",
+            self.pcp_world_size,
+        )
+        setattr(
+            input_batch,
             "_vllm_hcu_pcp_replicated_slot_indices",
             self._replicated_slot_indices[
                 : input_batch.num_tokens_after_padding
             ],
         )
+        if self._global_has_prefill:
+            global_batch = self._global_batch
+            global_num_tokens = int(global_batch.num_tokens)
+            global_num_reqs = int(global_batch.num_reqs)
+            global_query_start_loc = global_batch.query_start_loc[
+                : global_num_reqs + 1
+            ]
+            global_query_lens = (
+                global_query_start_loc[1:] - global_query_start_loc[:-1]
+            )
+            global_token_to_req_indices = torch.repeat_interleave(
+                torch.arange(
+                    global_num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                global_query_lens,
+                output_size=global_num_tokens,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_local_num_tokens",
+                self._padded_num_tokens,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_num_tokens",
+                global_num_tokens,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_restore_idx",
+                self._hidden_restore_idx,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_positions",
+                global_batch.positions[:global_num_tokens],
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_query_start_loc",
+                global_query_start_loc,
+            )
+            setattr(
+                input_batch,
+                "_vllm_hcu_pcp_global_token_to_req_indices",
+                global_token_to_req_indices,
+            )
         return local_tables, slot_mappings
 
     def prepare_global_attn(
@@ -921,46 +1002,15 @@ class HcuPCPManager:
         if not self._global_attn_ready:
             raise RuntimeError("PCP global attention slots are not prepared")
         assert self._global_batch is not None
-        assert self._global_slot_mappings is not None
+        assert self._global_batch_slot_mappings is not None
         block_tables = self._block_tables.gather_block_tables(
             self._global_batch.idx_mapping,
             num_reqs_padded=self._global_batch.num_reqs_after_padding,
         )
-        global_slots = self._global_slot_mappings[
+        global_slots = self._global_batch_slot_mappings[
             :, : self._global_batch.num_tokens
         ]
         return block_tables, global_slots
-
-    def _convert_slot_mappings(self, global_slots: torch.Tensor) -> torch.Tensor:
-        assert self._padded_gather_idx is not None
-        assert self._gathered_kv_write_mask is not None
-        assert self._gathered_slot_mappings is not None
-        num_expanded_tokens = self._padded_gather_idx.numel()
-        gathered = self._gathered_slot_mappings[:, :num_expanded_tokens]
-        torch.index_select(
-            global_slots,
-            1,
-            self._padded_gather_idx,
-            out=gathered,
-        )
-        torch.where(
-            self._gathered_kv_write_mask.unsqueeze(0),
-            gathered,
-            self._pad_slot_id,
-            out=gathered,
-        )
-        return gathered
-
-    def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
-        """Return invalid slots for a PCP-expanded dummy attention batch."""
-
-        assert self._gathered_slot_mappings is not None
-        expanded_tokens = num_tokens * self.pcp_size
-        if expanded_tokens > self._gathered_slot_mappings.shape[1]:
-            raise RuntimeError("PCP dummy slot count exceeds its buffer")
-        slots = self._gathered_slot_mappings[:, :expanded_tokens]
-        slots.fill_(PAD_SLOT_ID)
-        return slots
 
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Gather equal-width local outputs and restore global token order."""
@@ -1107,6 +1157,8 @@ def maybe_build_pcp_manager(
 
 def make_hcu_pcp_manager_cls(
     vllm_config: object,
+    *,
+    runtime_owner: object | None = None,
 ) -> type[HcuPCPManager]:
     """Bind the plugin manager to the official MRV2 manager constructor."""
 
@@ -1145,6 +1197,16 @@ def make_hcu_pcp_manager_cls(
                     "official PCP manager constructor arguments do not match "
                     f"the bound HCU config: actual={actual}, expected={expected}"
                 )
+            # Recent MRV2 no longer forwards plugin-private runtime objects to
+            # the manager constructor.  The HCU runner owns both objects, so
+            # recover them from the bound runtime owner when the official hook
+            # omits them.  Direct construction without an owner remains
+            # fail-closed.
+            if runtime_owner is not None:
+                if req_states is None:
+                    req_states = getattr(runtime_owner, "req_states", None)
+                if block_tables is None:
+                    block_tables = getattr(runtime_owner, "block_tables", None)
             if req_states is None or block_tables is None:
                 raise PatchCompatibilityError(
                     "official PCP manager constructor omitted HCU runtime state"
@@ -1160,31 +1222,10 @@ def make_hcu_pcp_manager_cls(
     return ConfiguredHcuPCPManager
 
 
-def maybe_partition_pcp_batch(
-    manager: HcuPCPManager | None, input_batch: InputBatch
-) -> InputBatch:
-    if manager is None:
-        return input_batch
-    return manager.partition_batch(input_batch)
-
-
-def maybe_restore_pcp_for_sampling(
-    manager: HcuPCPManager | None,
-    hidden_states: torch.Tensor,
-    input_batch: InputBatch,
-) -> tuple[torch.Tensor, InputBatch]:
-    if manager is None:
-        return hidden_states, input_batch
-    return manager.restore_for_sampling(hidden_states)
-
-
 __all__ = [
     "HcuPCPManager",
     "PCPContextPlan",
     "PCPPlan",
     "RankSegment",
     "make_hcu_pcp_manager_cls",
-    "maybe_build_pcp_manager",
-    "maybe_partition_pcp_batch",
-    "maybe_restore_pcp_for_sampling",
 ]

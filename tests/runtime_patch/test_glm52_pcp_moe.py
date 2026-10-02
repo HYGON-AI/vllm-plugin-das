@@ -452,3 +452,77 @@ def test_hy4_gate_runs_once_before_runner_dispatch(
     assert runner.gate.calls == 1
     assert actual.shape == hidden.shape
     torch.testing.assert_close(actual, hidden * hidden.sigmoid())
+
+
+class _PCPPaddingGroup:
+    """Two-rank PCP group whose all-gather doubles the token axis."""
+
+    def __init__(self, local: torch.Tensor) -> None:
+        self.local = local
+        self.gather_dtypes: list[torch.dtype] = []
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        assert dim == 0
+        self.gather_dtypes.append(tensor.dtype)
+        return torch.cat((tensor, self.local), dim=dim)
+
+
+def _forward_context_with_mask(mask: torch.Tensor | None) -> SimpleNamespace:
+    return SimpleNamespace(is_padding=mask)
+
+
+def test_pcp_gathered_padding_mask_covers_the_gathered_token_axis(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+) -> None:
+    """The router kernel rejects a mask shorter than the gathered tokens."""
+
+    local_mask = torch.tensor([False, True])
+    group = _PCPPaddingGroup(local_mask)
+    monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: group)
+    context = _forward_context_with_mask(local_mask)
+
+    with moe_runner_module._pcp_gathered_padding_mask(context):
+        gathered = context.is_padding
+        assert gathered.shape[0] == local_mask.shape[0] * 2
+        torch.testing.assert_close(gathered, torch.tensor([False, True, False, True]))
+        # The kernel only accepts a bool mask, and PCP ranks must agree on it.
+        assert gathered.dtype == torch.bool
+        assert group.gather_dtypes == [torch.uint8]
+
+    # The next layer gathers its own local mask again, so the local view has
+    # to be restored when the scope exits.
+    assert context.is_padding is local_mask
+
+
+def test_pcp_gathered_padding_mask_is_a_no_op_without_a_published_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+) -> None:
+    """Runs that never publish a mask must not pay a collective or crash."""
+
+    def fail() -> object:
+        raise AssertionError("no mask means no collective")
+
+    monkeypatch.setattr(moe_runner_module, "get_pcp_group", fail)
+    context = _forward_context_with_mask(None)
+
+    with moe_runner_module._pcp_gathered_padding_mask(context):
+        assert context.is_padding is None
+
+    assert context.is_padding is None
+
+
+def test_pcp_padding_mask_only_tracks_the_fallback_collective(
+    make_runner,
+) -> None:
+    """The all-to-all kernel path already exchanges the batch itself."""
+
+    runner, _ = make_runner(1, False)
+    assert runner._pcp_fallback_collective_required() is False
+
+    runner, _ = make_runner(2, False)
+    assert runner._pcp_fallback_collective_required() is True
+
+    runner, _ = make_runner(2, True)
+    assert runner._pcp_fallback_collective_required() is False
