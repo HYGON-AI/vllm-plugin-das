@@ -2206,6 +2206,40 @@ def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
     assert not adapter.apply_to_module(module)
 
 
+@pytest.mark.parametrize(
+    ("shape", "expected_shape"),
+    [
+        ((3, 1, 16, 128), (3, 16, 128)),  # LBHNC
+        ((3, 16, 1, 128), (3, 16, 128)),  # LBNHC
+        ((3, 16, 128), (3, 16, 128)),
+    ],
+)
+def test_indexer_bf16_cache_page_view_accepts_both_vllm_layouts(
+    shape,
+    expected_shape,
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    cache = torch.empty(shape, dtype=torch.bfloat16)
+
+    page_view = sparse._indexer_bf16_cache_as_page_view(cache, head_dim=128)
+
+    assert tuple(page_view.shape) == expected_shape
+    assert (
+        page_view.untyped_storage().data_ptr()
+        == cache.untyped_storage().data_ptr()
+    )
+
+
+def test_indexer_bf16_cache_page_view_rejects_multihead_cache():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    cache = torch.empty((3, 16, 2, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="single-head"):
+        sparse._indexer_bf16_cache_as_page_view(cache, head_dim=128)
+
+
 def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
     adapter = _adapter("patch_mla_indexer")
 
