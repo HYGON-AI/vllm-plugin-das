@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from types import ModuleType
 
 from ._common import (
@@ -157,6 +158,14 @@ def apply_to_module(module: ModuleType) -> bool:
             use_monolithic,
             all2all_manager,
         )
+        if prepare_finalize is not None:
+            from vllm_hcu.patch.worker.core_fix.patch_dspark_draft_a2a import (
+                maybe_bind_draft_ag_rs,
+            )
+
+            prepare_finalize = maybe_bind_draft_ag_rs(
+                prepare_finalize, all2all_manager,
+            )
         ll_class = getattr(target, "DeepEPLLPrepareAndFinalize", None)
         if ll_class is None or not isinstance(prepare_finalize, ll_class):
             return prepare_finalize
@@ -189,6 +198,23 @@ def apply_to_module(module: ModuleType) -> bool:
     target._vllm_hcu_original_maybe_roundup_layer_hidden_size = roundup
     target.maybe_make_prepare_finalize = hcu_maybe_make_prepare_finalize
     target.maybe_roundup_layer_hidden_size = hcu_roundup
+    # Several MoE oracle modules imported this helper by value before the
+    # worker callback replaced it on all2all_utils. Synchronize those captured
+    # references or draft layers continue to call the unpatched upstream
+    # function and bypass the DSpark AG-RS binding entirely.
+    for module_name in (
+        "vllm.model_executor.layers.fused_moe.oracle.fp8",
+        "vllm.model_executor.layers.fused_moe.oracle.int8",
+        "vllm.model_executor.layers.fused_moe.oracle.unquantized",
+        "vllm.model_executor.layers.fused_moe.oracle.int_wna16",
+        "vllm.model_executor.layers.fused_moe.oracle.w4a8",
+        "vllm.model_executor.layers.fused_moe.oracle.w4a8_int8",
+        "vllm.model_executor.layers.fused_moe.oracle.nvfp4",
+        "vllm.model_executor.layers.fused_moe.oracle.mxfp4",
+    ):
+        captured = sys.modules.get(module_name)
+        if captured is not None and hasattr(captured, "maybe_make_prepare_finalize"):
+            captured.maybe_make_prepare_finalize = hcu_maybe_make_prepare_finalize
     setattr(target, _MARKER, True)
     return True
 

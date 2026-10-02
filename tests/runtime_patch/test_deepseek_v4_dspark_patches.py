@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass, field, fields
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -15,8 +16,12 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_load_weights,
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
+    patch_deepseek_v41_dspark_load_weights,
+    patch_dspark_draft_a2a,
+    patch_dspark_query_capacity,
     patch_mhc_backend,
 )
+from vllm_hcu.patch.platform.core_fix import patch_config_utils
 from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
 
@@ -303,6 +308,70 @@ def test_load_weights_exposes_channel_scale_alias_only_to_official_loader() -> N
     }
 
 
+def test_dsv41_dspark_load_weights_exposes_both_channel_scale_aliases() -> None:
+    direct_parameter = torch.nn.Parameter(torch.ones(1))
+    inverse_parameter = torch.nn.Parameter(torch.ones(1))
+
+    class DSparkDeepseekV4ForCausalLM(torch.nn.Module):
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            yield "model.layers.0.attn.weight_scale", direct_parameter
+            yield "model.layers.1.attn.weight_scale_inv", inverse_parameter
+
+        def load_weights(self, weights):
+            del weights
+            params = dict(self.named_parameters())
+            assert params["model.layers.0.attn.weight_scale_inv"] is direct_parameter
+            assert params["model.layers.1.attn.weight_scale"] is inverse_parameter
+            return set(params)
+
+    module = _module(
+        patch_deepseek_v41_dspark_load_weights.TARGET_MODULE,
+        DSparkDeepseekV4ForCausalLM=DSparkDeepseekV4ForCausalLM,
+    )
+    patch_deepseek_v41_dspark_load_weights.apply_to_module(module)
+    model = DSparkDeepseekV4ForCausalLM()
+
+    assert model.load_weights([("unused", torch.tensor(1.0))]) == {
+        "model.layers.0.attn.weight_scale",
+        "model.layers.0.attn.weight_scale_inv",
+        "model.layers.1.attn.weight_scale",
+        "model.layers.1.attn.weight_scale_inv",
+    }
+    assert dict(model.named_parameters()) == {
+        "model.layers.0.attn.weight_scale": direct_parameter,
+        "model.layers.1.attn.weight_scale_inv": inverse_parameter,
+    }
+
+
+def test_config_replace_ignores_hcu_runtime_attributes() -> None:
+    @dataclass
+    class ParallelConfig:
+        tensor_parallel_size: int
+        cached_world_size: int = field(init=False, default=1)
+
+    def replace(dataclass_instance, /, **kwargs):
+        del dataclass_instance, kwargs
+        raise AssertionError("HCU wrapper should replace the upstream implementation")
+
+    def is_init_field(cls, name):
+        return next(item for item in fields(cls) if item.name == name).init
+
+    module = _module(
+        patch_config_utils.TARGET_MODULE,
+        replace=replace,
+        is_init_field=is_init_field,
+    )
+    patch_config_utils.apply_to_module(module)
+    config = ParallelConfig(tensor_parallel_size=4)
+    config._vllm_hcu_deepep_auto = True
+
+    copied = module.replace(config, tensor_parallel_size=8)
+
+    assert copied == ParallelConfig(tensor_parallel_size=8)
+    assert not hasattr(copied, "_vllm_hcu_deepep_auto")
+
+
 def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
     calls: list[tuple[object, ...]] = []
 
@@ -580,3 +649,331 @@ def test_mhc_patch_rejects_missing_capability_flag() -> None:
 
     with pytest.raises(PatchCompatibilityError, match="HAS_AITER_MHC"):
         patch_mhc_backend.apply_to_module(module)
+
+
+def test_dspark_draft_parallel_config_keeps_ep_and_uses_ag_rs() -> None:
+    """The DSpark drafter keeps EP8 but avoids the target DeepEP LL backend.
+
+    Upstream keeps the target's ``enable_expert_parallel`` on the drafter, so
+    with ``--all2all-backend deepep_low_latency`` the MTP drafter also selects
+    DeepEP LL and its buffer allocation OOMs next to the target weights.  The
+    HCU patch selects AG-RS for the drafter only.  This matches SGLang's
+    speculative ``a2a=none`` behavior for DP+EP: gather DP-local token shards,
+    run the local EP expert shard, then reduce-scatter the partial outputs.
+    It must not be replaced by ``NoDPEP``, which would leave each rank with
+    only its pre-gather token shard.
+    """
+
+    from dataclasses import dataclass as _dataclass
+    from dataclasses import fields as _fields
+
+    @_dataclass
+    class ParallelConfig:
+        pipeline_parallel_size: int = 1
+        tensor_parallel_size: int = 1
+        enable_expert_parallel: bool = True
+        all2all_backend: str = "deepep_low_latency"
+        enable_eplb: bool = False
+        enable_elastic_ep: bool = False
+
+    def replace(dataclass_instance, /, **kwargs):
+        init_fields = {
+            item.name for item in _fields(dataclass_instance) if item.init
+        }
+        updated = {name: getattr(dataclass_instance, name) for name in init_fields}
+        updated.update(kwargs)
+        return type(dataclass_instance)(**updated)
+
+    def original_parallel_config(parallel_config, tensor_parallel_size):
+        return replace(
+            parallel_config,
+            tensor_parallel_size=tensor_parallel_size,
+            enable_eplb=False,
+            enable_elastic_ep=False,
+        )
+
+    def load_dspark_model(target_model, vllm_config):
+        return target_model, vllm_config
+
+    target = ParallelConfig(tensor_parallel_size=1, enable_expert_parallel=True)
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=original_parallel_config,
+        load_dspark_model=load_dspark_model,
+    )
+    patch_dspark_draft_a2a.apply_to_module(module)
+
+    result = module._get_dspark_parallel_config(target, 1)
+
+    assert result.enable_expert_parallel is True
+    assert result.all2all_backend == "allgather_reducescatter"
+    assert result.tensor_parallel_size == 1
+    assert result.enable_eplb is False
+    # idempotent: a second application must be a no-op, not a double wrap
+    assert patch_dspark_draft_a2a.apply_to_module(module) is False
+    again = module._get_dspark_parallel_config(target, 1)
+    assert again.enable_expert_parallel is True
+    assert again.all2all_backend == "allgather_reducescatter"
+
+
+def test_dspark_draft_parallel_config_keeps_dense_drafter_untouched() -> None:
+    """A drafter that already runs without EP is returned unchanged."""
+
+    from dataclasses import dataclass as _dataclass
+    from dataclasses import fields as _fields
+
+    @_dataclass
+    class ParallelConfig:
+        tensor_parallel_size: int = 1
+        enable_expert_parallel: bool = False
+
+    def replace(dataclass_instance, /, **kwargs):
+        init_fields = {
+            item.name for item in _fields(dataclass_instance) if item.init
+        }
+        updated = {name: getattr(dataclass_instance, name) for name in init_fields}
+        updated.update(kwargs)
+        return type(dataclass_instance)(**updated)
+
+    def original_parallel_config(parallel_config, tensor_parallel_size):
+        return replace(parallel_config, tensor_parallel_size=tensor_parallel_size)
+
+    def load_dspark_model(target_model, vllm_config):
+        return target_model, vllm_config
+
+    target = ParallelConfig(tensor_parallel_size=1, enable_expert_parallel=False)
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=original_parallel_config,
+        load_dspark_model=load_dspark_model,
+    )
+    patch_dspark_draft_a2a.apply_to_module(module)
+
+    result = module._get_dspark_parallel_config(target, 1)
+    assert result.enable_expert_parallel is False
+    assert result.tensor_parallel_size == 1
+
+
+def test_dspark_draft_parallel_config_rejects_signature_drift() -> None:
+    def wrong_signature(parallel_config, tensor_parallel_size, extra):
+        del parallel_config, tensor_parallel_size, extra
+
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=wrong_signature,
+        load_dspark_model=lambda target_model, vllm_config: (target_model, vllm_config),
+    )
+    with pytest.raises(PatchCompatibilityError):
+        patch_dspark_draft_a2a.apply_to_module(module)
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "deep_gemm"])
+def test_dspark_draft_load_keeps_backend_owners_consistent(backend) -> None:
+    @dataclass
+    class KernelConfig:
+        moe_backend: str = "deep_gemm"
+
+    @dataclass
+    class SpeculativeConfig:
+        moe_backend: str | None = None
+
+    @dataclass
+    class VllmConfig:
+        kernel_config: KernelConfig = field(default_factory=KernelConfig)
+        speculative_config: SpeculativeConfig = field(
+            default_factory=SpeculativeConfig
+        )
+        additional_config: dict = field(default_factory=lambda: {
+            "hcu": {"moe_backend": "deep_gemm"}, "unrelated": 7,
+        })
+
+    def original_parallel_config(parallel_config, tensor_parallel_size):
+        return parallel_config
+
+    observed: list[str] = []
+
+    def load_dspark_model(target_model, vllm_config):
+        from vllm_hcu.patch.config import get_hcu_config
+
+        observed.append(vllm_config.kernel_config.moe_backend)
+        assert get_hcu_config(vllm_config).moe_backend == (
+            "deep_gemm" if backend == "deep_gemm" else "auto"
+        )
+        assert vllm_config.additional_config["unrelated"] == 7
+        return target_model
+
+    module = _module(
+        patch_dspark_draft_a2a.TARGET_MODULE,
+        _get_dspark_parallel_config=original_parallel_config,
+        load_dspark_model=load_dspark_model,
+    )
+    patch_dspark_draft_a2a.apply_to_module(module)
+    config = VllmConfig()
+    config.speculative_config.moe_backend = backend
+
+    model = torch.nn.Module()
+    assert module.load_dspark_model(model, config) is model
+    assert observed == [backend or "triton"]
+    assert config.kernel_config.moe_backend == "deep_gemm"
+    assert config.additional_config["hcu"] == {"moe_backend": "deep_gemm"}
+
+
+def test_dspark_ag_rs_prepare_finalize_bypasses_target_manager(monkeypatch) -> None:
+    """Gather and reduce through the draft manager, including FP8 scales."""
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+
+    calls = []
+    manager = SimpleNamespace(
+        dispatch=lambda *args, **kwargs: calls.append("dispatch") or args[:3],
+        combine=lambda tensor, **kwargs: calls.append("combine") or tensor + 3,
+    )
+
+    def target_group():
+        raise AssertionError("draft must not call target DeepEP manager")
+
+    monkeypatch.setattr(naive_dp_ep, "get_ep_group", target_group)
+    monkeypatch.setattr(
+        naive_dp_ep, "_quantize_and_setup_dispatch",
+        lambda a1, config, defer: (a1, None, None),
+    )
+    monkeypatch.setattr(
+        patch_dspark_draft_a2a, "_make_draft_ag_rs_manager", lambda _: manager
+    )
+    pf = naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular(num_dispatchers=8)
+    target_manager = SimpleNamespace()
+    patch_dspark_draft_a2a._bind_draft_manager(pf, target_manager)
+    hidden = torch.ones(2, 4)
+    weights = torch.ones(2, 1)
+    ids = torch.zeros(2, 1, dtype=torch.int64)
+
+    prepared = pf.prepare(hidden, weights, ids, 128, None, False, None)
+    assert prepared[0] is hidden
+    output = torch.empty_like(hidden)
+    reducer = SimpleNamespace(apply=lambda **kwargs: hidden * 2)
+    pf.finalize(output, hidden, weights, ids, False, reducer)
+    torch.testing.assert_close(output, hidden * 5)
+    assert calls == ["dispatch", "combine"]
+    assert naive_dp_ep.get_ep_group is target_group
+
+
+def test_dspark_draft_does_not_bind_no_dp_ep() -> None:
+    """Protect the SGLang DP-gather semantics from a local-only regression."""
+
+    class MoEPrepareAndFinalizeNoDPEPModular:
+        def prepare(self):
+            pass
+
+        def finalize(self):
+            pass
+
+    target_manager = SimpleNamespace()
+    prepare_finalize = MoEPrepareAndFinalizeNoDPEPModular()
+
+    result = patch_dspark_draft_a2a.maybe_bind_draft_ag_rs(
+        prepare_finalize, target_manager
+    )
+
+    assert result is prepare_finalize
+    assert not hasattr(prepare_finalize, "_vllm_hcu_ag_rs_manager")
+
+
+@pytest.mark.parametrize("num_reqs", [32, 64, 256, 1024])
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
+def test_dspark_query_capacity_covers_markov_anchors(num_reqs, sample_from_anchor):
+    """Expanded queries must fit even when target profiling uses one token/req."""
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    steps = 5
+    width = steps + (not sample_from_anchor)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=num_reqs, max_num_batched_tokens=256
+        ),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=steps,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor)
+            ),
+        ),
+    )
+    draft_config = patch_dspark_query_capacity._draft_capacity_config(config)
+    capacity = draft_config.scheduler_config.max_num_batched_tokens
+    assert capacity >= num_reqs * width
+    assert config.scheduler_config.max_num_batched_tokens == 256
+
+    speculator = object.__new__(DSparkSpeculator)
+    speculator._draft_topk = None
+    speculator.num_speculative_steps = steps
+    speculator.sample_indices = torch.arange(num_reqs * steps)
+    speculator.sample_idx_mapping = torch.zeros(num_reqs * steps)
+    speculator.sample_pos = torch.zeros(num_reqs * steps)
+    speculator._anchor_idx = torch.arange(num_reqs) * width
+    ids = torch.arange(capacity, dtype=torch.int32) % 7
+    speculator.input_buffers = SimpleNamespace(input_ids=ids)
+    speculator.use_confidence_head = False
+    speculator.draft_tokens = torch.zeros(num_reqs, steps, dtype=torch.int64)
+    seen = []
+
+    def markov_embed(prev):
+        seen.append(prev.clone())
+        return prev[:, None].float()
+
+    speculator.model = SimpleNamespace(
+        compute_draft_logits=lambda hidden: hidden,
+        markov_embed=markov_embed,
+        markov_bias=lambda embed: embed,
+    )
+    speculator._sample_logits = lambda logits, *args: logits[:, 0].long() + 1
+    speculator._sample_sequential(num_reqs, torch.zeros(num_reqs * steps, 1))
+
+    anchors = ids[speculator._anchor_idx].long()
+    torch.testing.assert_close(seen[0], anchors.to(torch.int32))
+    for step in range(steps):
+        torch.testing.assert_close(
+            speculator.draft_tokens[:, step], anchors + step + 1
+        )
+    if (num_reqs - 1) * width >= 256:
+        with pytest.raises(IndexError):
+            ids[:256][speculator._anchor_idx]
+
+
+def test_dspark_query_capacity_expands_shared_slots_before_capture():
+    seen = []
+
+    class DSparkSpeculator:
+        def __init__(self, vllm_config, device):
+            self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        def set_attn(
+            self,
+            model_state,
+            kv_cache_config,
+            block_tables,
+            target_input_buffers,
+            target_attn_groups,
+        ):
+            seen.append(block_tables.slot_mappings)
+
+    module = _module(
+        patch_dspark_query_capacity.TARGET_MODULE, DSparkSpeculator=DSparkSpeculator
+    )
+    assert patch_dspark_query_capacity.apply_to_module(module)
+    assert not patch_dspark_query_capacity.apply_to_module(module)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64, max_num_batched_tokens=256),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5,
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        ),
+    )
+    drafter = DSparkSpeculator(config, "cpu")
+    slots = torch.arange(512).view(2, 256)
+    tables = SimpleNamespace(slot_mappings=slots, max_num_batched_tokens=256)
+    drafter.set_attn(None, None, tables, None, None)
+    assert tables.slot_mappings.shape == (2, 320)
+    torch.testing.assert_close(tables.slot_mappings[:, :256], slots)
+    assert torch.all(tables.slot_mappings[:, 256:] == -1)
+    assert seen[0] is tables.slot_mappings
+    drafter.set_attn(None, None, tables, None, None)
+    assert seen[1] is seen[0]
+    assert config.scheduler_config.max_num_batched_tokens == 256
