@@ -4220,6 +4220,38 @@ def test_slimquant_w4a8_dispatch_preserves_linear_method():
 
 
 @pytest.mark.hcu
+def test_slimquant_linear_preserves_fused_prequantized_activation_scale():
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    class PrequantizedScheme:
+        def supports_quanted_inputs(self):
+            return True
+
+        def apply_weights(
+            self, layer, x, bias, x_and_scale_quanted=None
+        ):
+            del layer, x, bias
+            x_q, x_scale = x_and_scale_quanted
+            return x_q.float() * x_scale
+
+    method = slimquant_w4a8.SlimQuantW4A8Int8LinearMethod(
+        slimquant_w4a8.SlimQuantW4A8Int8Config()
+    )
+    layer = SimpleNamespace(scheme=PrequantizedScheme())
+    x_q = torch.tensor([[2, -3]], dtype=torch.int8)
+    x_scale = torch.tensor([[0.125]], dtype=torch.float32)
+
+    assert getattr(method, "supports_quanted_inputs", lambda: False)()
+    result = method.apply(
+        layer,
+        x_q,
+        x_and_scale_quanted=(x_q, x_scale),
+    )
+
+    torch.testing.assert_close(result, torch.tensor([[0.25, -0.375]]))
+
+
+@pytest.mark.hcu
 def test_slimquant_w4a8_dispatch_returns_none_for_unsupported_layer():
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 

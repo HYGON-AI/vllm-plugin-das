@@ -175,12 +175,28 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Apply the layer's compressed linear scheme."""
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        supports = getattr(scheme, "supports_quanted_inputs", None)
+        if (
+            x_and_scale_quanted is not None
+            and callable(supports)
+            and bool(supports())
+        ):
+            return scheme.apply_weights(
+                layer,
+                x,
+                bias=bias,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         return scheme.apply_weights(layer, x, bias=bias)
+
+    def supports_quanted_inputs(self) -> bool:
+        return True
 
 
 _SLIMQUANT_MOE_LAYOUT_TENSORS = (
