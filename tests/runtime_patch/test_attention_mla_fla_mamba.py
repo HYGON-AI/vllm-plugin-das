@@ -2158,7 +2158,19 @@ def test_e5m2_mla_cache_gather_master_off_uses_torch_fallback(
     torch.testing.assert_close(dst, expected)
 
 
-def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
+@pytest.mark.parametrize(
+    ("requested_dtype", "operator_dtype"),
+    [
+        ("bfloat16", "auto"),
+        ("float16", "auto"),
+        ("fp8_ds_mla", "fp8_ds_mla"),
+    ],
+)
+def test_sparse_mla_cache_update_uses_hcu_operator(
+    monkeypatch,
+    requested_dtype,
+    operator_dtype,
+):
     adapter = _adapter("patch_sparse_mla_attention")
     calls = []
 
@@ -2196,13 +2208,18 @@ def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
     kv_cache = torch.ones(1)
     slot_mapping = torch.tensor([[0, -1, 1, -1]], dtype=torch.int32)
     SparseMLACommonImpl().do_kv_cache_update(
-        tensor, tensor, kv_cache, slot_mapping, "fp8_ds_mla", torch.ones(1),
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        requested_dtype,
+        torch.ones(1),
     )
 
     assert len(calls) == 1
     assert calls[0][1].shape == (4, 2)
     torch.testing.assert_close(calls[0][3], slot_mapping.flatten())
-    assert calls[0][4] == "fp8_ds_mla"
+    assert calls[0][4] == operator_dtype
     assert not adapter.apply_to_module(module)
 
 

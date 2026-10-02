@@ -80,12 +80,17 @@ def apply_to_module(module: ModuleType) -> bool:
             raise RuntimeError(
                 "HCU MLA concat-and-cache operator is required but unavailable"
             ) from exc
+        operator_kv_cache_dtype = (
+            "auto"
+            if kv_cache_dtype in {"bfloat16", "float16"}
+            else kv_cache_dtype
+        )
         op(
             kv_c_normed,
             k_pe.squeeze(1),
             kv_cache,
             slot_mapping.flatten(),
-            kv_cache_dtype,
+            operator_kv_cache_dtype,
             k_scale,
         )
         return None
