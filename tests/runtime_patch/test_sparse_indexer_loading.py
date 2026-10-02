@@ -902,6 +902,7 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     )
     from vllm._aiter_ops import rocm_aiter_ops
 
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr(
@@ -932,6 +933,333 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     assert calls[0][2].dtype is torch.float32
     assert calls[0][2].is_contiguous()
     assert torch.equal(calls[0][2], weights.float().contiguous())
+
+
+@pytest.mark.parametrize("collapsed_cache", [False, True])
+@pytest.mark.parametrize("use_aiter", [False, True])
+@pytest.mark.parametrize(
+    ("block_size", "page_count", "length"),
+    [(16, 33, 513), (32, 17, 513), (64, 9, 513)],
+)
+def test_bw1100_paged_mqa_reads_preshuffled_kpool_pages_past_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    collapsed_cache: bool,
+    use_aiter: bool,
+    block_size: int,
+    page_count: int,
+    length: int,
+) -> None:
+    """Paged decode must use token scores, not page IDs or swizzled bytes."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "_ON_GFX942", False)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: SimpleNamespace(
+            deepgemm_fp8_paged_mqa_logits_stage1=lambda *_args, **_kwargs: pytest.fail(
+                "token-index stage1 received a page table"
+            )
+        ),
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: use_aiter)
+    head_dim = 128
+    logical_values = torch.zeros((page_count, block_size, head_dim))
+    logical_values[:, :, 0] = (
+        torch.arange(page_count * block_size).reshape(page_count, block_size) % 7
+    ) + 1
+    key_bytes = logical_values.to(torch.float8_e4m3fn).view(torch.uint8)
+    physical = torch.empty((page_count, block_size * head_dim), dtype=torch.uint8)
+    token = torch.arange(block_size)[:, None]
+    dim = torch.arange(head_dim)[None, :]
+    offsets = (
+        (token // 16) * 16 * head_dim
+        + (dim // 16) * 16 * 16
+        + (token % 16) * 16
+        + dim % 16
+    )
+    physical[:, offsets.reshape(-1)] = key_bytes.reshape(page_count, -1)
+    scales = (
+        torch.arange(page_count * block_size).reshape(page_count, block_size) % 3
+    ).float() + 1
+    packed = torch.cat((physical, scales.view(torch.uint8).reshape(page_count, -1)), 1)
+    cache = packed.reshape(page_count, block_size, 1, head_dim + 4)
+    table = torch.cat(
+        (
+            torch.arange(page_count - 1, -1, -1, dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+        )
+    )[None, :]
+    cache = cache[torch.arange(page_count - 1, -1, -1)]
+    if collapsed_cache:
+        cache = cache[:, :1]
+    q = torch.zeros((1, 1, 32, head_dim), dtype=torch.float32)
+    q[0, 0, 0, 0] = 1
+    q = q.to(torch.float8_e4m3fn)
+    weights = torch.zeros((1, 32), dtype=torch.float32)
+    weights[0, 0] = 1
+
+    def linear_paged_mqa(
+        query,
+        pages,
+        normalized_weights,
+        lengths,
+        page_table,
+        _schedule,
+        max_len,
+        _clean_logits,
+    ):
+        flat = pages.reshape(pages.shape[0], -1)
+        values = (
+            flat[:, : block_size * head_dim]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .reshape(-1, block_size, head_dim)
+            .float()
+        )
+        scale = (
+            flat[:, block_size * head_dim :]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(-1, block_size)
+        )
+        actual_length = int(lengths[0].max())
+        keys = values[page_table[0].long()].reshape(-1, head_dim)[:actual_length]
+        scale = scale[page_table[0].long()].reshape(-1)[:actual_length]
+        scores = (query[0, 0].float() @ keys.T).relu_()
+        scores = (scores * normalized_weights[0, :, None]).sum(0) * scale
+        result = torch.full((1, max_len), float("-inf"))
+        result[0, :actual_length] = scores
+        return result
+
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=linear_paged_mqa),
+    )
+    actual = runtime.rocm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        torch.tensor([[length]], dtype=torch.int32),
+        table,
+        torch.empty(0),
+        page_count * block_size + 16,
+    )
+
+    expected = (logical_values[:, :, 0] * scales).reshape(-1)[:length]
+    torch.testing.assert_close(actual[0, :length], expected)
+    assert torch.isneginf(actual[0, length:]).all()
+
+
+@pytest.mark.parametrize("use_aiter", [False, True])
+def test_gfx938_page_one_without_aiter_uses_torch_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    use_aiter: bool,
+) -> None:
+    """True one-token pages need the reference when AITER is unavailable."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        runtime.current_platform, "fp8_dtype", lambda: torch.float8_e4m3fn
+    )
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: use_aiter)
+    monkeypatch.setattr(runtime, "paged_mqa_logits_module", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("LightOp cannot read physical page size one"),
+    )
+    reference = runtime.fp8_paged_mqa_logits_torch
+    calls = []
+
+    def torch_reference(*args):
+        result = reference(*args)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(runtime, "fp8_paged_mqa_logits_torch", torch_reference)
+    keys = torch.zeros((2, 1, 1, 128))
+    keys[:, 0, 0, 0] = torch.tensor([2, 3])
+    cache = torch.cat(
+        (
+            keys.to(torch.float8_e4m3fn).view(torch.uint8),
+            torch.ones((2, 1, 1, 1)).view(torch.uint8),
+        ),
+        dim=-1,
+    )
+    query = torch.zeros((1, 1, 1, 128))
+    query[..., 0] = 2
+    actual = runtime.rocm_fp8_paged_mqa_logits(
+        query.to(torch.float8_e4m3fn),
+        cache,
+        torch.ones((1, 1)),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([[0, 1, -1]], dtype=torch.int32),
+        torch.empty(0),
+        4,
+    )
+
+    assert len(calls) == 1
+    assert actual is calls[0]
+    torch.testing.assert_close(
+        actual, torch.tensor([[4.0, 6.0, -float("inf"), -float("inf")]])
+    )
+
+
+def test_gfx938_page_one_forced_aiter_missing_module_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A required backend must fail clearly when its module is missing."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime, "paged_mqa_logits_module", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("forced AITER fell through to LightOp"),
+    )
+    with pytest.raises(RuntimeError, match="pa_mqa_logits Triton module"):
+        runtime.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((2, 1, 1, 132), dtype=torch.uint8),
+            torch.ones((1, 1)),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.empty(0),
+            2,
+            force_aiter_triton=True,
+        )
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 64])
+@pytest.mark.parametrize("collapsed_cache", [False, True])
+def test_gfx938_preshuffled_pages_do_not_silently_ignore_force_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+    collapsed_cache: bool,
+) -> None:
+    """Forced AITER cannot consume the gfx938 preshuffled page layout."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime, "paged_mqa_logits_module", lambda: object())
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("forced AITER was silently replaced by LightOp"),
+    )
+    cache = torch.zeros((2, block_size, 1, 132), dtype=torch.uint8)
+    if collapsed_cache:
+        cache = cache[:, :1]
+    with pytest.raises(RuntimeError, match="AITER.*preshuffled"):
+        runtime.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+            cache,
+            torch.ones((1, 1)),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
+            torch.empty(0),
+            2,
+            force_aiter_triton=True,
+        )
+
+
+def test_bw1100_paged_mqa_rejects_unsupported_physical_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject pages larger than the LightOp paged-MQA kernel supports."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=lambda *_args: None),
+    )
+    backing = torch.empty((2, 1152, 1, 132), dtype=torch.uint8)
+    cache = backing[:, :1]
+    with pytest.raises(ValueError, match="Unsupported.*page size"):
+        runtime.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 32, 128), dtype=torch.float8_e4m3fn),
+            cache,
+            torch.empty((1, 32)),
+            torch.tensor([[1153]], dtype=torch.int32),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.empty(0),
+            1168,
+        )
+
+
+def test_bw1100_linearized_cache_respects_each_batch_row_and_invalid_tail() -> None:
+    """Unequal decode lengths must not read padded page-table entries."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    backing = torch.zeros((4, 16, 1, 132), dtype=torch.uint8)
+    for page in range(4):
+        backing[page, :, :, :128] = page + 1
+    collapsed = backing[:, :1]
+    block_tables = torch.tensor(
+        [[3, 2, 1, 0, -1], [1, 0, -1, -1, -1]], dtype=torch.int32
+    )
+    context_lens = torch.tensor([[49], [17]], dtype=torch.int32)
+
+    linear, linear_table = runtime._linearize_preshuffled_paged_cache(
+        collapsed, context_lens, block_tables, 128
+    )
+
+    assert linear.shape == (10, 16, 1, 132)
+    assert linear[:, 0, 0, 0].tolist() == [4, 3, 2, 1, 1, 2, 1, 1, 1, 1]
+    assert linear_table.tolist() == [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]]
+
+
+@pytest.mark.parametrize(("is_gfx938", "block_size"), [(False, 16), (True, 1)])
+def test_token_index_paged_mqa_keeps_aiter_stage1_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    is_gfx938: bool,
+    block_size: int,
+) -> None:
+    """Token-index pages must not enter the preshuffled gfx938 route."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "_ON_GFX942", False)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("token-index pages entered the preshuffled path"),
+    )
+
+    def stage1(_q, _cache, _weights, out_qk, _lens, _table, _max_len, *, ChunkQ):
+        out_qk.fill_(0)
+        out_qk[0, 0, 0] = 7
+
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: SimpleNamespace(deepgemm_fp8_paged_mqa_logits_stage1=stage1),
+    )
+    original_full = torch.full
+
+    def cpu_full(shape, fill_value, *, device, dtype):
+        return original_full(shape, fill_value, dtype=dtype)
+
+    monkeypatch.setattr(torch, "full", cpu_full)
+    actual = runtime.rocm_fp8_paged_mqa_logits(
+        torch.empty((1, 1, 2, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((1, block_size, 1, 132), dtype=torch.uint8),
+        torch.zeros((1, 2), dtype=torch.float32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        16,
+        force_aiter_triton=True,
+    )
+    assert actual[0, 0] == 7
 
 
 def test_sparse_mla_runtime_rejects_legacy_attention_namespaces(

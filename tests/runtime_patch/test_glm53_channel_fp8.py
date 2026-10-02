@@ -310,6 +310,8 @@ def test_glm5next_forced_sparse_triton_requires_packaged_modules(
             force_aiter_triton=True,
         )
 
+    monkeypatch.setattr(sparse, "_ON_GFX942", True)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
     monkeypatch.setattr(sparse, "paged_mqa_logits_module", lambda: None)
     with pytest.raises(RuntimeError, match="pa_mqa_logits Triton module"):
         sparse.rocm_fp8_paged_mqa_logits(
