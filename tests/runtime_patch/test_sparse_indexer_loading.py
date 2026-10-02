@@ -711,15 +711,6 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
         "vllm_hcu.patch.worker.op_opt.patch_mla_indexer"
     )
 
-    def split_chunks(
-        seq_lens_cpu,
-        query_lens_cpu,
-        workspace_size,
-        max_logits_bytes,
-        request_offset=0,
-    ):
-        return [(slice(0, 1), slice(0, 1))]
-
     def split_batch(
         common_attn_metadata,
         decode_threshold=1,
@@ -729,6 +720,16 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
         return (0, 1, 0, common_attn_metadata.num_actual_tokens)
 
     class Builder:
+        @staticmethod
+        def _split_indexer_prefill_chunks(
+            compressed_seq_lens_cpu,
+            prefill_query_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+            request_offset=0,
+        ):
+            return [(slice(0, 1), slice(0, 1))]
+
         def build(
             self,
             common_prefix_len,
@@ -738,7 +739,6 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
             return SimpleNamespace(decode=None)
 
     module = ModuleType(adapter.TARGET_MODULE)
-    module.split_indexer_prefill_chunks = split_chunks
     module.split_decodes_and_prefills = split_batch
     module.DeepseekV32IndexerMetadataBuilder = Builder
     module.current_platform = SimpleNamespace(is_rocm=lambda: False)
@@ -766,22 +766,6 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
         "vllm_hcu.patch.worker.op_opt.patch_mla_indexer"
     )
 
-    def split_chunks(
-        seq_lens_cpu,
-        query_lens_cpu,
-        workspace_size,
-        max_logits_bytes,
-        request_offset=0,
-    ):
-        del (
-            seq_lens_cpu,
-            query_lens_cpu,
-            workspace_size,
-            max_logits_bytes,
-            request_offset,
-        )
-        return []
-
     def split_batch(
         common_attn_metadata,
         decode_threshold=1,
@@ -799,6 +783,23 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
     upstream_schedule = object()
 
     class Builder:
+        @staticmethod
+        def _split_indexer_prefill_chunks(
+            compressed_seq_lens_cpu,
+            prefill_query_lens_cpu,
+            workspace_size,
+            max_logits_bytes,
+            request_offset=0,
+        ):
+            del (
+                compressed_seq_lens_cpu,
+                prefill_query_lens_cpu,
+                workspace_size,
+                max_logits_bytes,
+                request_offset,
+            )
+            return []
+
         def build(
             self,
             common_prefix_len,
@@ -814,7 +815,6 @@ def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(
             )
 
     module = ModuleType(adapter.TARGET_MODULE)
-    module.split_indexer_prefill_chunks = split_chunks
     module.split_decodes_and_prefills = split_batch
     module.DeepseekV32IndexerMetadataBuilder = Builder
     module.current_platform = SimpleNamespace(is_rocm=lambda: True)

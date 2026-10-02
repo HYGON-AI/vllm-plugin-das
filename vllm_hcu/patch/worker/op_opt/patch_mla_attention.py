@@ -54,12 +54,17 @@ def apply_to_module(module: ModuleType) -> bool:
                     "v_head_dim", "q_lora_rank", "kv_lora_rank", "kv_b_proj",
                     "dcp_q_replicate", "cache_config", "quant_config", "prefix",
                     "attn_backend", "use_sparse", "indexer", "topk_indices_buffer",
+                    "index_group_builder",
                     "non_causal_multi_token_decode", "sliding_window",
                     "prefill_backend_cls"),
         defaults={"dcp_q_replicate": False, "cache_config": None,
                   "quant_config": None, "prefix": "",
                   "attn_backend": None, "use_sparse": False, "indexer": None,
                   "topk_indices_buffer": None,
+                  # vLLM main owns the sparse-MLA index-group builder; DeepSeek
+                  # V4.1 does not pass it, but the HCU wrapper must accept and
+                  # forward it for the DeepSeek V2/V3.2 sparse path.
+                  "index_group_builder": None,
                   "non_causal_multi_token_decode": False,
                   "sliding_window": None, "prefill_backend_cls": None},
         var_keyword="extra_impl_args",

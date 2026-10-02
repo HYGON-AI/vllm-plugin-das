@@ -232,6 +232,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
             use_sparse=False,
             indexer=None,
             topk_indices_buffer=None,
+            index_group_builder=None,
             non_causal_multi_token_decode=False,
             sliding_window=None,
             prefill_backend_cls=None,
