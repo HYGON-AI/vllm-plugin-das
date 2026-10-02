@@ -66,8 +66,7 @@ def _paged_logits(
         (heads[:, None] < HEADS) & (dims[None, :] < DIM),
         0.0,
     )
-    # FP8 values are exactly representable in FP16; accumulate QK in FP32.
-    dots = tl.dot(query_values.to(tl.float16), keys.to(tl.float16))
+    dots = tl.dot(query_values, keys)
     weights = tl.load(Weights + row * W_ROW + heads * W_HEAD, heads < HEADS, 0)
     scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
         tl.pointer_type(tl.float32)
