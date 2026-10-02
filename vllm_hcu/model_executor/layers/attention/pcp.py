@@ -131,29 +131,6 @@ def _pcp_world_size(metadata: object | None) -> int:
     return world_size
 
 
-def _iter_pcp_metadata(attn_metadata: object) -> Iterator[object]:
-    if isinstance(attn_metadata, dict):
-        yield from attn_metadata.values()
-    elif isinstance(attn_metadata, (list, tuple)):
-        for item in attn_metadata:
-            yield from _iter_pcp_metadata(item)
-    elif attn_metadata is not None:
-        yield attn_metadata
-
-
-def pcp_global_prefill_active(attn_metadata: object | None) -> bool:
-    """Whether this step carries a partitioned prefill that needs global rows."""
-
-    if attn_metadata is None:
-        return False
-    for metadata in _iter_pcp_metadata(attn_metadata):
-        if getattr(metadata, "pcp_has_global_prefill", False) and (
-            _pcp_world_size(metadata) > 1
-        ):
-            return True
-    return False
-
-
 def pcp_global_positions(metadata: object) -> torch.Tensor:
     """Global token positions for the current partitioned prefill step."""
 
@@ -259,12 +236,31 @@ def restore_pcp_rows_to_global(
     assert getattr(metadata, "pcp_has_global_prefill", False), (
         "global PCP row restoration is only valid for prefill batches"
     )
-    local_num_tokens = int(getattr(metadata, "pcp_local_num_tokens"))
+    return _restore_global_rows(tensor, metadata)
+
+
+def _restore_global_rows(
+    tensor: torch.Tensor,
+    metadata: object,
+    *,
+    already_expanded: bool = False,
+    fill_value: int | float = 0,
+) -> torch.Tensor:
+    """Apply the manager's shared restore map after a padded row gather."""
+
     restore_idx = _pcp_restore_index(metadata)
     assert restore_idx.numel() == int(
         getattr(metadata, "pcp_global_num_tokens")
     ), "PCP restore map length does not match the global token count"
-    gathered = _gather_pcp_rows(tensor, metadata)
+    local_num_tokens = int(getattr(metadata, "pcp_local_num_tokens"))
+    expanded_width = _pcp_world_size(metadata) * local_num_tokens
+    if already_expanded:
+        assert tensor.shape[0] == expanded_width, (
+            "PCP expanded rows do not match the rank-local token width"
+        )
+        gathered = tensor
+    else:
+        gathered = _gather_pcp_rows(tensor, metadata, fill_value=fill_value)
     return gathered.index_select(0, restore_idx).contiguous()
 
 
@@ -296,10 +292,9 @@ def globalize_pcp_slot_mapping(
         f"shape={tuple(slot_mapping.shape)}"
     )
     if slot_mapping.numel() == expanded_width:
-        gathered = slot_mapping
+        already_expanded = True
     elif slot_mapping.numel() <= local_num_tokens:
-        padded = _pad_pcp_rows(slot_mapping, local_num_tokens, fill_value=-1)
-        gathered = get_pcp_group().all_gather(padded, dim=0)
+        already_expanded = False
     else:
         raise RuntimeError(
             "Unsupported PCP cache slot layout: "
@@ -307,15 +302,9 @@ def globalize_pcp_slot_mapping(
             f"world_size={world_size}"
         )
 
-    assert gathered.numel() == expanded_width, (
-        "PCP slot gather returned an unexpected layout: "
-        f"slots={gathered.numel()}, expected={expanded_width}"
+    return _restore_global_rows(
+        slot_mapping, metadata, already_expanded=already_expanded, fill_value=-1
     )
-    restore_idx = _pcp_restore_index(metadata)
-    assert restore_idx.numel() == int(
-        getattr(metadata, "pcp_global_num_tokens")
-    ), "PCP restore map length does not match the global token count"
-    return gathered.index_select(0, restore_idx).contiguous()
 
 
 def pcp_local_slot_view(
@@ -670,7 +659,6 @@ __all__ = (
     "maybe_gather_mla_latent_cache_inputs",
     "pcp_cache_ownership_scope",
     "pcp_global_positions",
-    "pcp_global_prefill_active",
     "pcp_global_query_start_loc",
     "pcp_global_token_to_req_indices",
     "pcp_local_slot_view",

@@ -92,7 +92,6 @@ def _attach_pcp_cache_ownership(
                 "local_num_tokens",
                 "global_num_tokens",
                 "restore_idx",
-                "padded_gather_idx",
                 "global_positions",
                 "global_query_start_loc",
                 "global_token_to_req_indices",

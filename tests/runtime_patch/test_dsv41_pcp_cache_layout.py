@@ -10,6 +10,8 @@ the single-rank identity paths and the local row arithmetic directly.
 
 from __future__ import annotations
 
+from types import ModuleType, SimpleNamespace
+
 import pytest
 import torch
 
@@ -113,28 +115,6 @@ def test_restore_rejects_a_restore_map_of_the_wrong_length() -> None:
         )
 
 
-def test_pcp_global_prefill_active_detects_the_owned_step() -> None:
-    """Only a partitioned prefill may trigger global cache materialization."""
-
-    prefill = _Layout(
-        world_size=2,
-        local_num_tokens=2,
-        global_num_tokens=3,
-        restore_idx=torch.arange(3, dtype=torch.int64),
-    )
-    decode = _Layout(
-        world_size=1,
-        local_num_tokens=2,
-        global_num_tokens=2,
-        restore_idx=torch.arange(2, dtype=torch.int64),
-        has_global_prefill=False,
-    )
-
-    assert pcp.pcp_global_prefill_active({"a": prefill}) is True
-    assert pcp.pcp_global_prefill_active({"a": decode}) is False
-    assert pcp.pcp_global_prefill_active(None) is False
-
-
 def test_pcp_global_accessors_require_the_manager_layout() -> None:
     """Global accessors must fail closed when the layout is incomplete."""
 
@@ -151,6 +131,161 @@ def test_pcp_global_accessors_require_the_manager_layout() -> None:
         pcp.pcp_global_query_start_loc(layout)
     with pytest.raises(AssertionError, match="token-to-request"):
         pcp.pcp_global_token_to_req_indices(layout)
+
+
+def test_pcp_cache_writers_reuse_upstream_with_global_request_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pooling sees contiguous requests; all writers see global slots transiently."""
+
+    from vllm_hcu.patch.worker.core_fix import patch_deepseek_v41_pcp as adapter
+
+    layout = SimpleNamespace(
+        pcp_world_size=2,
+        pcp_has_global_prefill=True,
+        pcp_local_num_tokens=2,
+        pcp_global_num_tokens=4,
+        pcp_restore_idx=torch.tensor([0, 2, 1, 3]),
+        pcp_global_positions=torch.tensor([0, 1, 2, 3]),
+        pcp_global_query_start_loc=torch.tensor([0, 4]),
+        pcp_global_token_to_req_indices=torch.tensor([0, 0, 0, 0]),
+    )
+    local_slots = torch.tensor([10, 30, 20, 40])
+    metadata = {
+        name: SimpleNamespace(
+            **vars(layout),
+            slot_mapping=local_slots.clone(),
+            block_size=16,
+            query_start_loc=torch.tensor([0, 2]),
+            token_to_req_indices=torch.tensor([0, 0]),
+        )
+        for name in ("state", "kv", "indexer", "swa")
+    }
+
+    class Group:
+        world_size = 2
+        rank_in_group = 0
+
+        def all_gather(self, tensor, dim=0):
+            assert dim == 0
+            torch.testing.assert_close(tensor[:, 0], torch.tensor([2.0, 4.0]))
+            return torch.tensor([[2.0], [4.0], [3.0], [5.0]])
+
+    monkeypatch.setattr(pcp, "get_pcp_group", Group)
+    monkeypatch.setattr(adapter, "_step_metadata", lambda: metadata)
+    monkeypatch.setenv("VLLM_HCU_DSV4_PCP_EXPERIMENTAL", "1")
+    observed = []
+
+    def check_slots(name):
+        torch.testing.assert_close(
+            metadata[name].slot_mapping, torch.tensor([10, 20, 30, 40])
+        )
+        observed.append(name)
+
+    class Compressor:
+        def forward(self, kv_score, positions):
+            name = "state" if self.state_cache is not None else "kv"
+            check_slots(name)
+            torch.testing.assert_close(
+                kv_score[:, 0], torch.tensor([2.0, 3.0, 4.0, 5.0])
+            )
+            torch.testing.assert_close(positions, layout.pcp_global_positions)
+            if self.state_cache is not None:
+                torch.testing.assert_close(
+                    metadata["state"].query_start_loc,
+                    layout.pcp_global_query_start_loc,
+                )
+                torch.testing.assert_close(
+                    metadata["state"].token_to_req_indices,
+                    layout.pcp_global_token_to_req_indices,
+                )
+            return kv_score
+
+        def insert_cache(self, latent, positions, rotary_emb):
+            check_slots("kv")
+            torch.testing.assert_close(positions, layout.pcp_global_positions)
+            torch.testing.assert_close(
+                latent[:, 0], torch.tensor([2.0, 3.0, 4.0, 5.0])
+            )
+
+    class Builder:
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return None
+
+    class Indexer:
+        def _produce_k(self, latent, positions, rotary_emb):
+            check_slots("indexer")
+            torch.testing.assert_close(positions, layout.pcp_global_positions)
+
+    class Attention:
+        def _prepare_and_attn(
+            self,
+            hidden_states,
+            qr,
+            kv,
+            qr_scale,
+            kv_score,
+            indexer_weights,
+            positions,
+            attn_out,
+        ):
+            return None
+
+        def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+            assert attn_metadata["swa"].slot_mapping.numel() == 0
+            return q
+
+    compressor_module = ModuleType(adapter.COMPRESSOR_MODULE)
+    compressor_module.DeepseekCompressor = Compressor
+    compressor_module.CompressorMetadataBuilder = Builder
+    attention_module = ModuleType(adapter.TARGET_MODULE)
+    attention_module.DeepseekV4Attention = Attention
+    attention_module.DeepseekV4Indexer = Indexer
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda _: compressor_module)
+    assert adapter.apply_to_module(attention_module)
+
+    compressor = Compressor()
+    compressor.state_cache = SimpleNamespace(prefix="state")
+    compressor.k_cache_prefix = "kv"
+    score = torch.tensor([[2.], [4.]])
+    positions = torch.tensor([0, 2])
+    latent = compressor.forward(score, positions)
+    compressor.insert_cache(latent, positions, None)
+    compressor.state_cache = None
+    compressor.forward(score, positions)
+    indexer = Indexer()
+    indexer.k_cache = SimpleNamespace(prefix="indexer")
+    indexer._produce_k(latent, positions, None)
+
+    def insert_global_kv(kv, cache, slots, global_positions, *args):
+        torch.testing.assert_close(kv[:, 0], torch.tensor([2.0, 3.0, 4.0, 5.0]))
+        torch.testing.assert_close(slots, torch.tensor([10, 20, 30, 40]))
+        torch.testing.assert_close(global_positions, layout.pcp_global_positions)
+        observed.append("swa")
+
+    monkeypatch.setattr(
+        torch.ops._C, "fused_deepseek_v4_kv_rope_insert", insert_global_kv,
+        raising=False,
+    )
+    attention = Attention()
+    attention.swa_cache_layer = SimpleNamespace(
+        prefix="swa", kv_cache=torch.empty(1, dtype=torch.uint8)
+    )
+    attention.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(0))
+    attention.kv_mxfp8 = False
+    q = torch.ones(2, 1, 1)
+    assert attention._fused_qnorm_rope_kv_insert(q, score, positions, metadata) is q
+    assert observed == ["state", "kv", "kv", "indexer", "swa"]
+    for item in metadata.values():
+        torch.testing.assert_close(item.slot_mapping, local_slots)
+    torch.testing.assert_close(metadata["state"].query_start_loc, torch.tensor([0, 2]))
+    torch.testing.assert_close(
+        metadata["state"].token_to_req_indices, torch.tensor([0, 0])
+    )
+    with pytest.raises(RuntimeError, match="writer failed"):
+        with adapter._global_cache_metadata(metadata["state"], layout):
+            raise RuntimeError("writer failed")
+    torch.testing.assert_close(metadata["state"].slot_mapping, local_slots)
 
 
 def test_pcp_adapter_helpers_are_not_self_recursive() -> None:

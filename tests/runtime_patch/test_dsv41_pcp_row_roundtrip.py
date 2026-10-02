@@ -130,7 +130,6 @@ def _case(
         pcp_local_num_tokens = padded
         pcp_global_num_tokens = global_num_tokens
         pcp_restore_idx = manager._hidden_restore_idx
-        pcp_padded_gather_idx = manager._padded_gather_idx
 
     # Every rank's local rows restore the same global token order.
     for rank in range(pcp_size):

@@ -19,7 +19,9 @@ sequence.  Two row layouts are in play:
 Every cache writer therefore runs on global rows.  The manager's expanded slot
 mappings are reduced to that order through its restore map, so each global row
 is written exactly once on every rank, and replicated decode rows use the same
-slot everywhere.  Padding rows never reach a writer.
+slot everywhere.  Padding rows never reach a writer. The compressor, main-cache
+and indexer writers use their upstream implementations with temporary global
+metadata; SWA keeps local Q preparation and publishes global KV separately.
 
 Multi-stream overlap is disabled for these steps: the writers issue PCP
 collectives, and concurrent streams would let ranks enter them in different
@@ -33,8 +35,9 @@ from __future__ import annotations
 
 import importlib
 import os
+from contextlib import contextmanager
 from types import ModuleType
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -65,26 +68,6 @@ def _pcp_group() -> Any:
     from vllm.distributed.parallel_state import get_pcp_group
 
     return get_pcp_group()
-
-
-def _globalize_slots(slots: torch.Tensor, layout: object) -> torch.Tensor:
-    return _pcp_helpers().globalize_pcp_slot_mapping(slots, layout)
-
-
-def _global_rows(tensor: torch.Tensor, layout: object) -> torch.Tensor:
-    return _pcp_helpers().restore_pcp_rows_to_global(tensor, layout)
-
-
-def _global_positions(layout: object) -> torch.Tensor:
-    return _pcp_helpers().pcp_global_positions(layout)
-
-
-def _global_query_start_loc(layout: object) -> torch.Tensor:
-    return _pcp_helpers().pcp_global_query_start_loc(layout)
-
-
-def _global_token_to_req(layout: object) -> torch.Tensor:
-    return _pcp_helpers().pcp_global_token_to_req_indices(layout)
 
 
 def _metadata_world_size(configured_world_size: int) -> int:
@@ -131,14 +114,34 @@ def _metadata_for(attn_metadata: object, prefix: str) -> object | None:
     return None
 
 
-def _global_slots(metadata: object, layout: object) -> torch.Tensor:
-    """This cache's slots for every global token, written once per token."""
+@contextmanager
+def _global_cache_metadata(
+    metadata: object,
+    layout: object,
+    *,
+    compressor_state: bool = False,
+) -> Iterator[None]:
+    """Expose global rows to upstream cache writers for one synchronous call."""
 
+    pcp = _pcp_helpers()
     slots = getattr(metadata, "slot_mapping", None)
     assert isinstance(slots, torch.Tensor), (
         "PCP cache materialization requires a slot mapping"
     )
-    return _globalize_slots(slots, layout)
+    replacements = {"slot_mapping": pcp.globalize_pcp_slot_mapping(slots, layout)}
+    if compressor_state:
+        replacements.update(
+            query_start_loc=pcp.pcp_global_query_start_loc(layout),
+            token_to_req_indices=pcp.pcp_global_token_to_req_indices(layout),
+        )
+    originals = {name: getattr(metadata, name) for name in replacements}
+    try:
+        for name, value in replacements.items():
+            setattr(metadata, name, value)
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(metadata, name, value)
 
 
 def _packed_swa_cache(cache: torch.Tensor) -> None:
@@ -300,11 +303,7 @@ def apply_to_module(module: ModuleType) -> bool:
         layout = _step_layout(attn_metadata)
         if layout is None or not isinstance(attn_metadata, dict):
             return original_forward(self, kv_score, positions)
-        from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
-            fused_save_compress_norm,
-        )
-
-        state_cache: torch.Tensor | None = None
+        pcp = _pcp_helpers()
         if self.state_cache is not None:
             state_metadata = _metadata_for(
                 attn_metadata, self.state_cache.prefix
@@ -312,34 +311,18 @@ def apply_to_module(module: ModuleType) -> bool:
             assert state_metadata is not None, (
                 "PCP compressor materialization requires the state cache metadata"
             )
-            state_cache = self.state_cache.kv_cache
         else:
             state_metadata = _metadata_for(attn_metadata, self.k_cache_prefix)
             assert state_metadata is not None, (
                 "PCP compressor materialization requires the compressed-KV metadata"
             )
-        global_kv_score = _global_rows(kv_score, layout)
-        global_latent = torch.empty(
-            global_kv_score.shape[0],
-            self.head_dim,
-            dtype=torch.bfloat16,
-            device=global_kv_score.device,
-        )
-        fused_save_compress_norm(
-            global_kv_score,
-            _global_positions(layout),
-            state_cache,
-            _global_slots(state_metadata, layout),
-            _global_query_start_loc(layout) if state_cache is not None else None,
-            (
-                _global_token_to_req(layout) if state_cache is not None else None
-            ),
-            self.norm.weight,
-            self.rms_norm_eps,
-            self.compress_ratio,
-            global_latent,
-        )
-        return global_latent
+        global_kv_score = pcp.restore_pcp_rows_to_global(kv_score, layout)
+        with _global_cache_metadata(
+            state_metadata, layout, compressor_state=self.state_cache is not None
+        ):
+            return original_forward(
+                self, global_kv_score, pcp.pcp_global_positions(layout)
+            )
 
     def hcu_insert_cache(
         self: Any,
@@ -347,36 +330,35 @@ def apply_to_module(module: ModuleType) -> bool:
         positions: torch.Tensor,
         rotary_emb: Any,
     ) -> None:
+        return _publish_global_cache(
+            original_insert,
+            self,
+            self.k_cache_prefix,
+            latent,
+            positions,
+            rotary_emb,
+            "PCP compressed-KV insert requires the compressed-KV metadata",
+        )
+
+    def _publish_global_cache(
+        original: Any,
+        owner: Any,
+        prefix: str,
+        latent: torch.Tensor | None,
+        positions: torch.Tensor,
+        rotary_emb: Any,
+        missing_metadata: str,
+    ) -> None:
         attn_metadata = _step_metadata()
         layout = _step_layout(attn_metadata)
         if layout is None or latent is None or not isinstance(attn_metadata, dict):
-            return original_insert(self, latent, positions, rotary_emb)
-        from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
-            rope_quant_insert,
-        )
-
-        main_metadata = _metadata_for(attn_metadata, self.k_cache_prefix)
-        assert main_metadata is not None, (
-            "PCP compressed-KV insert requires the compressed-KV metadata"
-        )
-        k_cache_layer = self._static_forward_context[self.k_cache_prefix]
-        kv_cache = k_cache_layer.kv_cache
-        # Plain-row per-tensor fp8 caches carry the layer's scale; fp8_ds_mla
-        # and bf16 rows need none.
-        fp8_scale = (
-            getattr(k_cache_layer, "_flashinfer_fp8_kv_scale", None)
-            if kv_cache.dtype == torch.float8_e4m3fn
-            else None
-        )
-        rope_quant_insert(
-            latent,
-            _global_positions(layout),
-            rotary_emb.cos_sin_cache,
-            kv_cache,
-            _global_slots(main_metadata, layout),
-            self.compress_ratio,
-            fp8_scale=fp8_scale,
-        )
+            return original(owner, latent, positions, rotary_emb)
+        metadata = _metadata_for(attn_metadata, prefix)
+        assert metadata is not None, missing_metadata
+        with _global_cache_metadata(metadata, layout):
+            return original(
+                owner, latent, _pcp_helpers().pcp_global_positions(layout), rotary_emb
+            )
 
     def hcu_produce_k(
         self: Any,
@@ -384,32 +366,14 @@ def apply_to_module(module: ModuleType) -> bool:
         positions: torch.Tensor,
         rotary_emb: Any,
     ) -> None:
-        attn_metadata = _step_metadata()
-        layout = _step_layout(attn_metadata)
-        if layout is None or latent is None or not isinstance(attn_metadata, dict):
-            return original_produce_k(self, latent, positions, rotary_emb)
-        from vllm.models.deepseek_v41.common.ops.indexer_k_store import (
-            indexer_k_norm_rope_store,
-        )
-
-        indexer_metadata = _metadata_for(attn_metadata, self.k_cache.prefix)
-        assert indexer_metadata is not None, (
-            "PCP indexer-K materialization requires the indexer metadata"
-        )
-        assert self.owns_k
-        # Rows at non-boundary tokens hold garbage latent and are skipped by
-        # the store kernel's slot check.
-        k_pre, _ = self.wk(latent)
-        indexer_k_norm_rope_store(
-            k_pre,
-            _global_positions(layout),
-            rotary_emb.cos_sin_cache,
-            self.k_norm.weight,
-            self.k_norm.variance_epsilon,
-            self.k_cache.kv_cache,
-            _global_slots(indexer_metadata, layout),
-            self.compress_ratio,
-            self.use_fp4_kv,
+        return _publish_global_cache(
+            original_produce_k,
+            self,
+            self.k_cache.prefix,
+            latent,
+            positions,
+            rotary_emb,
+            "PCP indexer-K materialization requires the indexer metadata",
         )
 
     def hcu_fused_qnorm_rope_kv_insert(
@@ -428,42 +392,26 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         cache = self.swa_cache_layer.kv_cache
         _packed_swa_cache(cache)
-        # Q stays rank-local: the empty slot mapping keeps this launch off the
-        # cache, and the KV half below writes every rank's rows.  The quant op
-        # takes the cache as a block-contiguous 2D view, exactly as upstream.
-        cache_2d = cache.view(cache.shape[0], -1)
-        pad_to = (
-            0
-            if self.accepts_unnormed_unroped_query
-            and self.n_local_heads == self.padded_heads
-            else self.padded_heads
-        )
-        q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q,
-            kv,
-            cache_2d,
-            swa_metadata.slot_mapping.new_empty((0,)),
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            pad_to,
-            self.eps,
-            swa_metadata.block_size,
-            False,  # apply_q_norm: qr is normed before wq_b
-            self.kv_mxfp8,
-            not self.accepts_unnormed_unroped_query,  # apply_q_rope
-            self.accepts_unnormed_unroped_query,  # is_q_interleaved
-        )
+        # Upstream prepares local Q while the empty slot mapping suppresses
+        # its KV write. Publish the global KV rows in the second launch.
+        original_slots = swa_metadata.slot_mapping
+        try:
+            swa_metadata.slot_mapping = original_slots.new_empty((0,))
+            q_padded = original_insert_qkv(self, q, kv, positions, attn_metadata)
+        finally:
+            swa_metadata.slot_mapping = original_slots
+        pcp = _pcp_helpers()
         torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-            _global_rows(kv, layout),
+            pcp.restore_pcp_rows_to_global(kv, layout),
             cache,
-            _global_slots(swa_metadata, layout),
-            _global_positions(layout),
+            pcp.globalize_pcp_slot_mapping(original_slots, layout),
+            pcp.pcp_global_positions(layout),
             self.rotary_emb.cos_sin_cache,
             swa_metadata.block_size,
             None,
             self.kv_mxfp8,
         )
-        return q if pad_to == 0 else q_padded
+        return q_padded
 
     for function in (
         hcu_compressor_build,
@@ -495,7 +443,9 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(compressor_cls, "forward", hcu_compressor_forward)
     setattr(compressor_cls, "insert_cache", hcu_insert_cache)
     setattr(indexer_cls, "_produce_k", hcu_produce_k)
-    setattr(attention_cls, "_fused_qnorm_rope_kv_insert", hcu_fused_qnorm_rope_kv_insert)
+    setattr(
+        attention_cls, "_fused_qnorm_rope_kv_insert", hcu_fused_qnorm_rope_kv_insert
+    )
     setattr(module, _CLASS_MARKER, True)
     return True
 
