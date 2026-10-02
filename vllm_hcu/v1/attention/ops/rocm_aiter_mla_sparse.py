@@ -29,6 +29,9 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 
+from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
+    gfx938_fp8_paged_mqa_logits,
+)
 
 lightop_attention = None
 logger = init_logger(__name__)
@@ -704,41 +707,6 @@ def paged_mqa_logits_module():
     return None
 
 
-def _linearize_preshuffled_paged_cache(
-    cache: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather logical pages and restore the KPool writer's token-major layout."""
-    cache = _indexer_cache_as_hipc_view(cache)
-    batch_size, num_pages = block_tables.shape
-    block_size = cache.shape[1]
-    if block_size not in (16, 32, 64):
-        raise ValueError(f"Unsupported preshuffled KPool page size: {block_size}")
-    if head_dim % 16 or cache.shape[-1] != head_dim + 4:
-        raise ValueError("Unsupported preshuffled KPool page layout")
-    valid_lens = (
-        context_lens.amax(dim=-1) if context_lens.ndim == 2 else context_lens
-    )
-    page_offsets = torch.arange(num_pages, device=cache.device)
-    valid_pages = page_offsets[None, :] * block_size < valid_lens[:, None]
-    page_ids = torch.where(valid_pages, block_tables, 0).reshape(-1).long()
-    selected = cache.index_select(0, page_ids)
-    flat = selected.reshape(batch_size * num_pages, -1)
-    keys = flat[:, : block_size * head_dim]
-    keys = keys.reshape(-1, block_size // 16, head_dim // 16, 16, 16)
-    keys = keys.permute(0, 1, 3, 2, 4).contiguous().view(
-        batch_size * num_pages, block_size * head_dim
-    )
-    selected = torch.cat((keys, flat[:, block_size * head_dim :]), dim=-1)
-    selected = selected.view(batch_size * num_pages, block_size, 1, head_dim + 4)
-    linear_table = torch.arange(
-        batch_size * num_pages, device=cache.device, dtype=block_tables.dtype
-    ).view(batch_size, num_pages)
-    return selected, linear_table
-
-
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -794,24 +762,21 @@ def rocm_fp8_paged_mqa_logits(
         kv_cache_fp8 = _indexer_cache_as_hipc_view(kv_cache_fp8)
     block_size = kv_cache_fp8.shape[1]
 
+    if is_gfx938 and block_size not in (1, 16, 32, 64):
+        raise ValueError(f"Unsupported preshuffled KPool page size: {block_size}")
     use_aiter = force_aiter_triton or rocm_aiter_ops.is_enabled()
     if is_gfx938 and block_size != 1:
         if force_aiter_triton:
             raise RuntimeError(
                 "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
             )
-        linear_cache, linear_table = _linearize_preshuffled_paged_cache(
-            kv_cache_fp8, context_lens, block_tables, q_fp8.shape[-1]
-        )
-        return _get_lightop_attention().paged_mqa_logits(
+        return gfx938_fp8_paged_mqa_logits(
             q_fp8,
-            linear_cache,
-            weights.float().contiguous(),
+            kv_cache_fp8,
+            weights,
             context_lens,
-            linear_table,
-            None,
+            block_tables,
             max_model_len,
-            False,
         )
 
     aiter_paged_mqa_logits_module = None

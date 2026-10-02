@@ -465,10 +465,13 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
         )
 
     def glm5next_fp8_paged_mqa_logits(*args, **kwargs):
+        cache = args[1] if len(args) > 1 else kwargs["kv_cache_fp8"]
+        physical_page_size = hcu_sparse._indexer_cache_as_hipc_view(cache).shape[1]
+        force_aiter = not hcu_sparse.on_gfx938() or physical_page_size == 1
         return hcu_sparse.rocm_fp8_paged_mqa_logits(
             *args,
             **kwargs,
-            force_aiter_triton=True,
+            force_aiter_triton=force_aiter,
         )
 
     if not hasattr(upstream_sparse, "_vllm_hcu_original_rocm_fp8_mqa_logits"):
