@@ -13,14 +13,12 @@ import pytest
 import torch
 
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm_hcu.patch.config import HcuFeatureConfig
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.v1.pcp_manager import (
     HcuPCPManager,
     RankSegment,
-    maybe_build_pcp_manager,
-    maybe_partition_pcp_batch,
-    maybe_restore_pcp_for_sampling,
 )
 
 
@@ -58,17 +56,31 @@ class _InMemoryBlockTables:
         self.slot_mappings = torch.empty((1, 128), dtype=torch.int64)
         self.allow_global_gather = False
         self.global_gather_calls = 0
+        self.local_gather_calls = 0
         self.slot_mapping_calls = 0
 
     def gather_block_tables(
         self,
         idx_mapping: torch.Tensor,
         num_reqs_padded: int,
+        out: tuple[torch.Tensor, ...] | None = None,
+        out_ptrs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
+        if out is not None:
+            self.local_gather_calls += 1
+            assert out_ptrs is not None
+            assert len(out) == len(self.block_tables)
+            for destination, table in zip(out, self.block_tables):
+                torch.index_select(
+                    table.gpu,
+                    0,
+                    idx_mapping.to(torch.int64),
+                    out=destination[:num_reqs_padded],
+                )
+            return tuple(table[:num_reqs_padded] for table in out)
         if not self.allow_global_gather:
             raise AssertionError(
-                "PCP target attention must not gather into runner-owned "
-                "v0.25.1 input block tables"
+                "PCP global MTP attention must opt into global block-table gather"
             )
         self.global_gather_calls += 1
         assert num_reqs_padded == idx_mapping.numel()
@@ -82,15 +94,17 @@ class _InMemoryBlockTables:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
         num_tokens: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.slot_mapping_calls += 1
+        slot_mappings = self.slot_mappings if out is None else out
         for req_idx in range(idx_mapping.numel()):
             start = int(query_start_loc[req_idx])
             stop = int(query_start_loc[req_idx + 1])
-            self.slot_mappings[0, start:stop] = (
+            slot_mappings[0, start:stop] = (
                 idx_mapping[req_idx] * 100 + positions[start:stop]
             )
-        return self.slot_mappings[:, :num_tokens]
+        return slot_mappings[:, :num_tokens]
 
 
 def _make_config(pcp_size: int = 2, **overrides: object) -> object:
@@ -263,6 +277,19 @@ def _make_managers(
         for rank in range(pcp_size)
     ]
     return managers, groups
+
+
+def test_manager_reuses_upstream_common_storage() -> None:
+    """HCU keeps its layout but reuses upstream PCP storage allocation."""
+
+    manager = _make_managers(pcp_size=2)[0][0]
+
+    assert isinstance(manager, PCPManager)
+    assert manager._input_buffers is manager.input_buffers
+    assert hasattr(manager, "_global_batch_slot_mappings")
+    assert hasattr(manager, "_gathered_kv_slot_mappings")
+    assert manager._input_buffers.max_num_reqs == 3 * 16
+    assert manager._input_buffers.max_num_tokens == 128
 
 
 @pytest.mark.parametrize("length", [1, 2, 7, 8, 9, 31])
@@ -1009,27 +1036,3 @@ def test_prepare_attn_rejects_kv_group_count_mismatch() -> None:
     with pytest.raises(PatchCompatibilityError, match="KV-group count"):
         managers[0].prepare_attn(local_batch)
 
-
-def test_optional_helpers_are_true_noops_without_a_manager() -> None:
-    """PCP=1 must preserve object identity and allocate no manager or collective."""
-
-    batch = _make_batch([("decode", [42], 3, False)])
-    hidden = torch.tensor([[42.0]])
-    assert maybe_build_pcp_manager(
-        _make_config(1), torch.device("cpu"), SimpleNamespace(), []
-    ) is None
-    assert maybe_partition_pcp_batch(None, batch) is batch
-    restored_hidden, restored_batch = maybe_restore_pcp_for_sampling(
-        None, hidden, batch
-    )
-    assert restored_hidden is hidden
-    assert restored_batch is batch
-
-
-def test_build_helper_enforces_the_approved_runtime_contract() -> None:
-    """Constructing a manager after bypassing Task 1 scope validation is a bug."""
-
-    with pytest.raises((AssertionError, ValueError), match="pipeline parallel"):
-        maybe_build_pcp_manager(
-            _make_config(2, pp=2), torch.device("cpu"), SimpleNamespace(), []
-        )

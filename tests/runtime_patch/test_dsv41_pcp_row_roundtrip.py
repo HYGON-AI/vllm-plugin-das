@@ -43,7 +43,7 @@ class _FakeGroup:
 
 def _manager(pcp_size: int, use_mla: bool = True) -> HcuPCPManager:
     manager = object.__new__(HcuPCPManager)
-    manager.pcp_size = pcp_size
+    manager.pcp_world_size = pcp_size
     manager.pcp_rank = 0
     manager._use_mla = use_mla
     manager.device = torch.device("cpu")

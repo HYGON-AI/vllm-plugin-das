@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.v1 import pcp_manager
 
@@ -20,6 +21,7 @@ def _config() -> SimpleNamespace:
             decode_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
+        model_config=SimpleNamespace(use_mla=True),
         scheduler_config=SimpleNamespace(
             max_num_seqs=16,
             max_num_batched_tokens=128,
@@ -32,15 +34,26 @@ def test_hcu_manager_owns_validation_without_patching_upstream(
 ) -> None:
     config = _config()
     calls: list[object] = []
+    upstream_calls: list[object] = []
     monkeypatch.setattr(
         pcp_manager,
         "_validate_hcu_pcp_scope",
         lambda value: calls.append(value) or True,
     )
+    monkeypatch.setattr(
+        PCPManager,
+        "validate_config",
+        staticmethod(
+            lambda value, supports_mm_inputs: upstream_calls.append(
+                (value, supports_mm_inputs)
+            )
+        ),
+    )
 
     pcp_manager.HcuPCPManager.validate_config(config, False)
 
     assert calls == [config]
+    assert upstream_calls == [(config, False)]
     with pytest.raises(ValueError, match="multimodal"):
         pcp_manager.HcuPCPManager.validate_config(config, True)
 
