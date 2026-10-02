@@ -48,25 +48,47 @@ def _clear_vllm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name, raising=False)
 
 
+_NGRAM_LAYER_FIELDS = {
+    "DeepseekV41ForCausalLM": "engram_layer_ids",
+    "Qwen4ExpForCausalLM": "ple_layer_ids",
+    "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
+}
+
+
+def _model_has_engram_layers(model_config) -> bool:
+    if model_config is None:
+        return False
+    field = _NGRAM_LAYER_FIELDS.get(model_config.architecture)
+    if field is None:
+        return False
+    return bool(getattr(model_config.hf_text_config, field, None))
+
+
 def _engram_module() -> tuple[ModuleType, type]:
     class FakeEngramConfig:
         def verify_model_config(self, model_config):
             from vllm.platforms import current_platform
 
-            supported_architectures = {
-                "Qwen4ExpForCausalLM",
-                "Qwen4ExpForConditionalGeneration",
-            }
+            field = (
+                _NGRAM_LAYER_FIELDS.get(model_config.architecture)
+                if model_config is not None
+                else None
+            )
             if (
                 model_config is None
-                or model_config.architecture not in supported_architectures
+                or field is None
                 or not current_platform.is_cuda()
-                or not getattr(model_config.hf_text_config, "ple_layer_ids", None)
+                or not getattr(model_config.hf_text_config, field, None)
             ):
                 raise ValueError("unsupported Engram configuration")
 
     return (
-        _module(patch_engram_config.TARGET_MODULE, EngramConfig=FakeEngramConfig),
+        _module(
+            patch_engram_config.TARGET_MODULE,
+            EngramConfig=FakeEngramConfig,
+            _NGRAM_LAYER_FIELDS=dict(_NGRAM_LAYER_FIELDS),
+            model_has_engram_layers=_model_has_engram_layers,
+        ),
         FakeEngramConfig,
     )
 
@@ -90,19 +112,30 @@ def _install_fake_platform(
 def _model_config(
     architecture: str = "Qwen4ExpForConditionalGeneration",
     ple_layer_ids: list[int] | None = None,
+    engram_layer_ids: list[int] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         architecture=architecture,
         hf_text_config=SimpleNamespace(
-            ple_layer_ids=[1] if ple_layer_ids is None else ple_layer_ids
+            ple_layer_ids=[1] if ple_layer_ids is None else ple_layer_ids,
+            engram_layer_ids=engram_layer_ids,
         ),
     )
 
 
 @pytest.mark.parametrize("prefetch_enabled", ("0", "1"))
+@pytest.mark.parametrize(
+    ("architecture", "layer_ids"),
+    (
+        ("Qwen4ExpForConditionalGeneration", {"ple_layer_ids": [1]}),
+        ("DeepseekV41ForCausalLM", {"engram_layer_ids": [1, 14]}),
+    ),
+)
 def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     monkeypatch: pytest.MonkeyPatch,
     prefetch_enabled: str,
+    architecture: str,
+    layer_ids: dict,
 ):
     module, engram_config = _engram_module()
     original = engram_config.verify_model_config
@@ -113,7 +146,7 @@ def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
     assert patch_engram_config.apply(module) is False
     config = engram_config()
     config.embedding_across_dp = False
-    config.verify_model_config(_model_config())
+    config.verify_model_config(_model_config(architecture, **layer_ids))
 
     wrapped = engram_config.verify_model_config
     assert wrapped.__wrapped__ is original
@@ -145,6 +178,7 @@ def test_engram_config_rejects_hcu_cross_dp_embedding(
         (False, False, _model_config()),
         (False, True, _model_config("UnsupportedArchitecture")),
         (False, True, _model_config(ple_layer_ids=[])),
+        (False, True, _model_config("DeepseekV41ForCausalLM")),
         (False, True, None),
     ],
 )
@@ -187,15 +221,48 @@ def test_engram_config_rejects_signature_and_source_contract_drift():
     with pytest.raises(PatchCompatibilityError, match="incompatible source contract"):
         patch_engram_config.apply(bad_contract)
 
+    PATCH_REGISTRY.reset_for_tests()
 
-def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-):
+    class MissingMapping:
+        def verify_model_config(self, model_config):
+            from vllm.platforms import current_platform
+
+            return (
+                current_platform.is_cuda()
+                and model_config.architecture
+                and model_config.hf_text_config
+            )
+
+    bad_mapping = _module(
+        patch_engram_config.TARGET_MODULE,
+        EngramConfig=MissingMapping,
+    )
+    with pytest.raises(PatchCompatibilityError, match="_NGRAM_LAYER_FIELDS"):
+        patch_engram_config.apply(bad_mapping)
+
+    PATCH_REGISTRY.reset_for_tests()
+
+    class MissingHelper:
+        def verify_model_config(self, model_config):
+            from vllm.platforms import current_platform
+
+            return (
+                current_platform.is_cuda()
+                and model_config.architecture
+                and model_config.hf_text_config
+            )
+
+    bad_helper = _module(
+        patch_engram_config.TARGET_MODULE,
+        EngramConfig=MissingHelper,
+        _NGRAM_LAYER_FIELDS=dict(_NGRAM_LAYER_FIELDS),
+    )
+    with pytest.raises(PatchCompatibilityError, match="model_has_engram_layers"):
+        patch_engram_config.apply(bad_helper)
+
+
+def test_envs_defaults_aiter_moe_off(monkeypatch: pytest.MonkeyPatch):
     _clear_vllm_environment(monkeypatch)
-    logger = logging.getLogger("test.hcu.envs")
-
-    def original_validate(hard_fail):
-        raise AssertionError("the upstream validator should have been replaced")
 
     module = _module(
         patch_envs.TARGET_MODULE,
@@ -203,8 +270,7 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
             "VLLM_KNOWN": lambda: "known",
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
         },
-        validate_environ=original_validate,
-        logger=logger,
+        logger=logging.getLogger("test.hcu.envs"),
     )
 
     assert patch_envs.apply(module) is True
@@ -214,31 +280,46 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
     monkeypatch.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
     assert getter() is True
 
-    monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
-    monkeypatch.setenv("VLLM_KNOWN", "1")
-    module.validate_environ(hard_fail=True)
-
-    monkeypatch.setenv("VLLM_NOT_HCU", "1")
-    with pytest.raises(ValueError, match="VLLM_NOT_HCU"):
-        module.validate_environ(hard_fail=True)
-    monkeypatch.delenv("VLLM_NOT_HCU")
-    monkeypatch.setenv("VLLM_HCU", "1")
-    with caplog.at_level(logging.WARNING, logger="test.hcu.envs"):
-        module.validate_environ(hard_fail=False)
-    assert "VLLM_HCU" in caplog.text
-
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.APPLIED
 
 
-def test_envs_rejects_signature_drift_and_latches_failure():
+def test_hcu_platform_validate_environ_allows_only_hcu_namespace(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    _clear_vllm_environment(monkeypatch)
+    # Production resolves the HCU platform class from the vLLM plugin hook, so
+    # vLLM is always initialized first; importing the platform module on its
+    # own would re-enter vLLM's own import.
+    import vllm  # noqa: F401
+    from vllm_hcu.platforms.hcu import HCUPlatform
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    monkeypatch.setenv("VLLM_HCU_FEATURE", "1")
+    for name in hcu_envs.hcu_vllm_environment_variables:
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+
+    HCUPlatform.validate_environ(hard_fail=True)
+
+    monkeypatch.setenv("VLLM_NOT_HCU", "1")
+    with pytest.raises(ValueError, match="VLLM_NOT_HCU"):
+        HCUPlatform.validate_environ(hard_fail=True)
+    monkeypatch.delenv("VLLM_NOT_HCU")
+
+    monkeypatch.setenv("VLLM_HCU", "1")
+    with caplog.at_level(logging.WARNING, logger="vllm_hcu.platforms.hcu"):
+        HCUPlatform.validate_environ(hard_fail=False)
+    assert "VLLM_HCU" in caplog.text
+
+
+def test_envs_rejects_missing_aiter_moe_target():
     module = _module(
         patch_envs.TARGET_MODULE,
-        environment_variables={"VLLM_ROCM_USE_AITER_MOE": lambda: True},
-        validate_environ=lambda: None,
+        environment_variables={},
         logger=logging.getLogger("test.hcu.bad_envs"),
     )
-    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+    with pytest.raises(PatchCompatibilityError, match="VLLM_ROCM_USE_AITER_MOE"):
         patch_envs.apply(module)
     record = PATCH_REGISTRY.get(patch_envs.PATCH_ID)
     assert record is not None and record.status is PatchStatus.FAILED
