@@ -129,7 +129,7 @@ def test_all2all_dispatch_selection_contract():
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
-        eep_stage=False,
+        all2all_manager=None,
     ):
         del (
             moe,
@@ -137,7 +137,7 @@ def test_all2all_dispatch_selection_contract():
             routing_tables,
             allow_new_interface,
             use_monolithic,
-            eep_stage,
+            all2all_manager,
         )
         return prepare_finalize
 
@@ -212,7 +212,7 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
-        eep_stage=False,
+        all2all_manager=None,
     ):
         del (
             moe,
@@ -220,7 +220,7 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
             routing_tables,
             allow_new_interface,
             use_monolithic,
-            eep_stage,
+            all2all_manager,
         )
         return "official"
 
@@ -235,7 +235,7 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         patch_all2all_utils.TARGET_MODULE,
         torch=torch,
         current_platform=SimpleNamespace(fp8_dtype=lambda: torch.float8_e4m3fn),
-        get_ep_all2all_manager=lambda eep_stage=False: manager,
+        get_ep_all2all_manager=lambda: manager,
         get_current_vllm_config=lambda: SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_seqs=4),
             speculative_config=SimpleNamespace(num_speculative_tokens=2),

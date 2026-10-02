@@ -42,7 +42,11 @@ def apply_to_module(module: ModuleType) -> bool:
             "routing_tables",
             "allow_new_interface",
             "use_monolithic",
-            "eep_stage",
+            # vLLM main replaced the elastic-EP ``eep_stage`` flag with an
+            # explicit ``all2all_manager`` injection point. The HCU wrapper
+            # accepts the manager and forwards it unchanged; elastic EP is out
+            # of scope for this adaptation.
+            "all2all_manager",
         ),
     )
     roundup = require_callable(target, "maybe_roundup_layer_hidden_size", TARGETS[1])
@@ -59,14 +63,15 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
         allow_new_interface=False,
         use_monolithic=False,
-        eep_stage=False,
+        all2all_manager=None,
     ):
         if getattr(
             moe.moe_parallel_config, "use_deepep_auto_kernels", False
         ):
             if quant_config is None:
                 raise RuntimeError("DeepEP auto requires a FusedMoEQuantConfig")
-            all2all_manager = target.get_ep_all2all_manager(eep_stage)
+            if all2all_manager is None:
+                all2all_manager = target.get_ep_all2all_manager()
             if not getattr(all2all_manager, "is_deepep_auto_manager", False):
                 raise RuntimeError(
                     "DeepEP auto requires DeepEPAutoAll2AllManager"
@@ -150,7 +155,7 @@ def apply_to_module(module: ModuleType) -> bool:
             routing_tables,
             allow_new_interface,
             use_monolithic,
-            eep_stage,
+            all2all_manager,
         )
         ll_class = getattr(target, "DeepEPLLPrepareAndFinalize", None)
         if ll_class is None or not isinstance(prepare_finalize, ll_class):

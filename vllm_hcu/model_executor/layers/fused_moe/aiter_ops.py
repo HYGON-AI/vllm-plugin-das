@@ -1591,8 +1591,8 @@ class rocm_aiter_ops:
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-    _MOE_SITUV2_A8W4 = envs.VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4
-    # TODO: Consolidate under _LINEAR_ENABLED
+    # vLLM main folded the legacy A8W4 override into
+    # VLLM_ROCM_USE_AITER_MOE_SITUV2; the HCU wrapper reads no A8W4 switch.
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
     # Lazily probed: whether aiter.topk_softmax supports the
     # num_shared_experts / shared_expert_scoring_func args (7-arg form).
@@ -1620,7 +1620,6 @@ class rocm_aiter_ops:
         cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-        cls._MOE_SITUV2_A8W4 = envs.VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @staticmethod
@@ -3339,6 +3338,22 @@ class rocm_aiter_ops:
             norm_eps,
         )
         return next_residual, post_mix, comb_mix, layer_input
+
+    @staticmethod
+    def mhc_fused_post_pre_delayed_prefers_unfused(num_tokens: int) -> bool:
+        """Match vLLM main's delayed mHC batch-size heuristic."""
+
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            threshold = {
+                "gfx950": 1024,
+                "gfx942": 128,
+                "gfx1250": 1024,
+            }.get(get_gfx_runtime(), 1024)
+        except Exception:
+            threshold = 1024
+        return num_tokens >= threshold
 
 
 # ---------------------------------------------------------------------------
