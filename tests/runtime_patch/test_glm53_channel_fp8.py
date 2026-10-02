@@ -295,11 +295,13 @@ def test_kpool_indexer_uses_official_triton_path_without_aiter() -> None:
 
 
 @pytest.mark.parametrize("page_size", [1, 16, 32, 64])
-@pytest.mark.parametrize("collapsed_cache", [False, True])
-def test_glm5next_upstream_paged_mqa_forces_aiter_only_for_physical_page_one(
-    monkeypatch, page_size: int, collapsed_cache: bool
+@pytest.mark.parametrize(
+    "layout", ["regular", "collapsed", "transposed", "contiguous", "five_dim"]
+)
+def test_glm5next_upstream_paged_mqa_uses_physical_page_after_layout_normalization(
+    monkeypatch, page_size: int, layout: str
 ) -> None:
-    """The patched upstream entry must leave preshuffled pages to the reader."""
+    """The wrapper must classify the same physical page as the dispatcher."""
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
 
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
@@ -337,7 +339,13 @@ def test_glm5next_upstream_paged_mqa_forces_aiter_only_for_physical_page_one(
     monkeypatch.setattr(hcu_sparse, "rocm_fp8_paged_mqa_logits", dispatcher)
     patch_glm5next_channel_fp8._patch_sparse_indexer_kpool(kpool)
     cache = torch.empty((2, page_size, 1, 132), dtype=torch.uint8)
-    supplied_cache = cache[:, :1] if collapsed_cache else cache
+    supplied_cache = {
+        "regular": cache,
+        "collapsed": cache[:, :1],
+        "transposed": cache.transpose(1, 2),
+        "contiguous": torch.empty((2, 1, page_size, 132), dtype=torch.uint8),
+        "five_dim": cache.unsqueeze(2),
+    }[layout]
     table = torch.tensor([[1, 0]], dtype=torch.int32)
     result = upstream_sparse.rocm_fp8_paged_mqa_logits(
         torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
