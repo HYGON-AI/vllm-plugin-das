@@ -517,6 +517,75 @@ def test_channel_int8_projection_kept_in_bf16_is_dequantized() -> None:
     assert buffered == {}
 
 
+@pytest.mark.parametrize(
+    ("suffix", "target_suffix", "expected_shard_id"),
+    [
+        (".kv_b_proj.", ".kv_b_proj.weight", None),
+        (".indexer.wq_b.", ".indexer.wq_b.weight", None),
+        (".indexer.wk.", ".indexer.wk_weights_proj.weight", 0),
+    ],
+)
+def test_channel_int8_checkpoint_only_projection_is_dequantized(
+    suffix: str,
+    target_suffix: str,
+    expected_shard_id: int | None,
+) -> None:
+    module = _fake_glm_model_module()
+    module._FP8_ATTN_PROJS = {}
+
+    def official(
+        name,
+        tensor,
+        buf,
+        params_dict,
+        loaded_params,
+        kv_a_pad_size,
+    ):
+        del name, tensor, buf, params_dict, loaded_params, kv_a_pad_size
+        return False
+
+    module._try_load_fp8_attn_proj = official
+    patch_glm5next_channel_fp8.apply_to_module(module)
+
+    loaded = []
+
+    def weight_loader(param, tensor, *args):
+        del param
+        loaded.append((tensor, args[0] if args else None))
+
+    prefix = "layers.0.self_attn"
+    target = f"{prefix}{target_suffix}"
+    params = {target: SimpleNamespace(weight_loader=weight_loader)}
+    buffered = {}
+    loaded_params = set()
+    weight = torch.tensor([[10, -20], [30, 40]], dtype=torch.int8)
+    scale = torch.tensor([[0.01], [0.02]], dtype=torch.float32)
+
+    helper = module._try_load_fp8_attn_proj
+    assert helper(
+        f"{prefix}{suffix}weight",
+        weight,
+        buffered,
+        params,
+        loaded_params,
+        0,
+    )
+    assert helper(
+        f"{prefix}{suffix}weight_scale",
+        scale,
+        buffered,
+        params,
+        loaded_params,
+        0,
+    )
+
+    expected = (weight.float() * scale).to(torch.bfloat16)
+    torch.testing.assert_close(loaded[0][0], expected)
+    assert loaded[0][1] == expected_shard_id
+    assert loaded_params == {target}
+    assert buffered == {}
+
+
 def test_quantized_channel_fp8_target_stays_on_official_loader_path() -> None:
     module = _fake_glm_model_module()
     module._FP8_ATTN_PROJS = {

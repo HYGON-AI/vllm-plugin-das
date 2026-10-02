@@ -36,6 +36,22 @@ _QUANT_IGNORE_WRAPPER_MARKER = "_vllm_hcu_glm5next_quant_ignore_wrapper"
 _MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
 _MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
 
+# Channel-INT8 checkpoints quantize a few MLA/indexer projections that the
+# official FP8 checkpoint keeps in BF16, so they are intentionally absent from
+# vLLM's ``_FP8_ATTN_PROJS`` table.  The HCU loader must still dequantize them
+# into the model's BF16 parameters.  Values use the same tuple contract as the
+# upstream mapping: (buffer key, target base, fused shard id, NoPE padding).
+_CHANNEL_INT8_ONLY_PROJS = {
+    ".kv_b_proj.": ("kv_b", "kv_b_proj", None, False),
+    ".indexer.wq_b.": ("indexer_wq_b", "indexer.wq_b", None, False),
+    ".indexer.wk.": (
+        "indexer_wk",
+        "indexer.wk_weights_proj",
+        0,
+        False,
+    ),
+}
+
 
 def _native_mhc_pre(
     mhc,
@@ -573,12 +589,13 @@ def _patch_indexer_nn_layout(attention: ModuleType) -> bool:
 
 
 def _projection(module: ModuleType, name: str):
-    for suffix, info in module._FP8_ATTN_PROJS.items():
-        if suffix in name:
-            layer_prefix = name.rsplit(suffix, 1)[0]
-            key, target_base, shard_id, is_kva = info
-            target = f"{layer_prefix}.{target_base}"
-            return layer_prefix, key, target, shard_id, is_kva
+    for projections in (module._FP8_ATTN_PROJS, _CHANNEL_INT8_ONLY_PROJS):
+        for suffix, info in projections.items():
+            if suffix in name:
+                layer_prefix = name.rsplit(suffix, 1)[0]
+                key, target_base, shard_id, is_kva = info
+                target = f"{layer_prefix}.{target_base}"
+                return layer_prefix, key, target, shard_id, is_kva
     return None
 
 
