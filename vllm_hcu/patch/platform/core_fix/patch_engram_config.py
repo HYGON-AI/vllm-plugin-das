@@ -124,11 +124,11 @@ def apply_to_module(module: ModuleType) -> bool:
             and bool(has_engram_layers(model_config))
         ):
             if getattr(self, "embedding_across_dp", False):
-                raise ValueError(
-                    "HCU Engram does not support "
-                    "engram_config.embedding_across_dp; use the default "
-                    "TP-sharded embedding with embedding_across_dp=false"
-                )
+                if model_config.architecture != "DeepseekV41ForCausalLM":
+                    raise ValueError(
+                        "HCU Engram embedding_across_dp is only supported for "
+                        "DeepseekV41ForCausalLM"
+                    )
             return None
         return verify_model_config(self, model_config)
 

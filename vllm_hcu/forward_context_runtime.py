@@ -223,7 +223,7 @@ def set_forward_context(
     enable_lightly_cplb: bool = False,
     deepep_auto_use_low_latency: bool = False,
 ):
-    """Mirror v0.25.1's context manager while skipping invalid DeepEP-LL DP sync."""
+    """Mirror v0.25.1's context manager without full DeepEP-LL DP sync."""
 
     if cudagraph_runtime_mode is None:
         cudagraph_runtime_mode = module.CUDAGraphMode.NONE
@@ -237,8 +237,16 @@ def set_forward_context(
         parallel_config.all2all_backend == "deepep_low_latency"
         and not getattr(parallel_config, "_vllm_hcu_deepep_auto", False)
     )
+    # DeepEP low-latency only supplies metadata after its lightweight token-slot
+    # synchronization. A shorter vector cannot describe every DP rank and would
+    # make consumers such as the DSV4.1 Engram EDP slot disagree across ranks.
+    ll_counts_cover_dp = (
+        num_tokens_across_dp is not None
+        and int(num_tokens_across_dp.numel())
+        == parallel_config.data_parallel_size
+    )
     if (
-        not low_latency
+        (not low_latency or ll_counts_cover_dp)
         and (
             parallel_config.data_parallel_size > 1
             or parallel_config.use_sequence_parallel_moe

@@ -16,6 +16,32 @@ _MARKER = "_vllm_hcu_dp_low_latency_applied"
 _WRAPPER = "_vllm_hcu_dp_low_latency_wrapper"
 
 
+def _max_low_latency_token_slot(
+    num_tokens_unpadded, num_tokens_padded, parallel_config
+):
+    """Return one Engram-safe token slot without full DP coordination."""
+    import torch
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_dp_group
+
+    dp_group = get_dp_group()
+    if getattr(parallel_config, "disable_nccl_for_dp_synchronization", False):
+        device = "cpu"
+        process_group = dp_group.cpu_group
+    else:
+        device = dp_group.device
+        process_group = dp_group.device_group
+
+    local_tokens = (
+        num_tokens_padded
+        if num_tokens_padded is not None
+        else num_tokens_unpadded
+    )
+    token_slot = torch.tensor([local_tokens], dtype=torch.int32, device=device)
+    dist.all_reduce(token_slot, op=dist.ReduceOp.MAX, group=process_group)
+    return int(token_slot.item())
+
+
 def apply_to_module(module: ModuleType) -> bool:
     dp = load_exact_module(TARGET_MODULE, module)
     wrapped = ((dp, "coordinate_batch_across_dp", TARGETS[0], _WRAPPER),)
@@ -49,16 +75,24 @@ def apply_to_module(module: ModuleType) -> bool:
         uniform_decode=None,
         cudagraph_mode=0,
     ):
-        if (
-            parallel_config.data_parallel_size == 1
-            or (
-                parallel_config.all2all_backend == "deepep_low_latency"
-                and not getattr(
-                    parallel_config, "_vllm_hcu_deepep_auto", False
-                )
-            )
-        ):
+        if parallel_config.data_parallel_size == 1:
             return False, None, cudagraph_mode
+        if (
+            parallel_config.all2all_backend == "deepep_low_latency"
+            and not getattr(parallel_config, "_vllm_hcu_deepep_auto", False)
+        ):
+            token_slot = _max_low_latency_token_slot(
+                num_tokens_unpadded, num_tokens_padded, parallel_config
+            )
+            return (
+                False,
+                module.torch.full(
+                    (parallel_config.data_parallel_size,),
+                    token_slot,
+                    dtype=module.torch.int32,
+                ),
+                cudagraph_mode,
+            )
         return original(
             num_tokens_unpadded,
             allow_microbatching,
