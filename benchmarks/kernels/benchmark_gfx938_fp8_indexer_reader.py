@@ -80,21 +80,68 @@ def check(actual, expected, label):
     finite = torch.isfinite(expected)
     torch.testing.assert_close(actual[finite], expected[finite], rtol=1e-3, atol=1e-2)
     max_error = (actual[finite] - expected[finite]).abs().max().item()
-    checked = 0
+    checked_rows = 0
+    exact_rows = 0
+    near_tie_rows = 0
+    near_tie_members = 0
+    min_cutoff_gap = float("inf")
+    max_row_error = 0.0
     for row in range(expected.shape[0]):
-        k = min(32, int(torch.isfinite(expected[row]).sum()))
+        row_finite = finite[row]
+        finite_count = int(row_finite.sum())
+        k = min(32, finite_count)
         if not k:
             continue
-        values, indices = expected[row].topk(k)
-        chosen = actual[row].topk(k).indices
-        tolerance = 0.01 + 0.001 * values[-1].abs()
-        certain = indices[values > values[-1] + 2 * tolerance]
-        if not torch.isin(certain, chosen).all():
-            raise AssertionError(f"{label}: non-tied top-k differs at row {row}")
-        if not (expected[row, chosen] >= values[-1] - 2 * tolerance).all():
-            raise AssertionError(f"{label}: top-k includes out-of-band score")
-        checked += certain.numel()
-    print(f"correctness {label}: max_abs_error={max_error:.7g}, certain_topk={checked}")
+        checked_rows += 1
+        row_error = (
+            (actual[row, row_finite] - expected[row, row_finite]).abs().max().item()
+        )
+        max_row_error = max(max_row_error, row_error)
+        expected_top = expected[row].topk(k).indices
+        actual_top = actual[row].topk(k).indices
+        if finite_count > k:
+            cutoff = expected[row].topk(k + 1).values
+            cutoff_gap = (cutoff[k - 1] - cutoff[k]).item()
+            min_cutoff_gap = min(min_cutoff_gap, cutoff_gap)
+        else:
+            cutoff_gap = float("inf")
+        if torch.equal(expected_top.sort().values, actual_top.sort().values):
+            exact_rows += 1
+            continue
+        if finite_count <= k:
+            raise AssertionError(f"{label}: top-k set differs without a cutoff")
+        missing = expected_top[~torch.isin(expected_top, actual_top)]
+        unexpected = actual_top[~torch.isin(actual_top, expected_top)]
+        swapped_gap = (
+            expected[row, missing].min() - expected[row, unexpected].max()
+        ).item()
+        missing_error = (
+            (actual[row, missing] - expected[row, missing]).abs().max().item()
+        )
+        unexpected_error = (
+            (actual[row, unexpected] - expected[row, unexpected]).abs().max().item()
+        )
+        error_bound = missing_error + unexpected_error
+        if cutoff_gap > error_bound or swapped_gap > error_bound:
+            raise AssertionError(
+                f"{label}: row={row} top-k mismatch exceeds observed error: "
+                f"cutoff_gap={cutoff_gap:.7g}, swapped_gap={swapped_gap:.7g}, "
+                f"row_max_error={row_error:.7g}, bound={error_bound:.7g}"
+            )
+        near_tie_rows += 1
+        near_tie_members += missing.numel()
+        print(
+            f"topk near tie {label}: row={row} members={missing.numel()} "
+            f"cutoff_gap={cutoff_gap:.7g} swapped_gap={swapped_gap:.7g} "
+            f"row_max_error={row_error:.7g} bound={error_bound:.7g}"
+        )
+    print(
+        f"correctness {label}: max_abs_error={max_error:.7g}, "
+        f"max_row_error={max_row_error:.7g}, "
+        f"min_cutoff_gap={min_cutoff_gap:.7g}, "
+        f"topk_exact_rows={exact_rows}/{checked_rows}, "
+        f"near_tie_rows={near_tie_rows}, near_tie_members={near_tie_members}"
+    )
 
 
 def old_linearization(inputs):
