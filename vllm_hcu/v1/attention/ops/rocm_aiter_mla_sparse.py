@@ -744,6 +744,25 @@ def paged_mqa_logits_module():
     return None
 
 
+def _paged_mqa_cache_kernel_view(kv_cache_fp8: torch.Tensor) -> torch.Tensor:
+    """Normalize backend singleton axes before physical page recovery."""
+    if kv_cache_fp8.ndim == 5:
+        if kv_cache_fp8.shape[-2] != 1:
+            raise ValueError(
+                "HCU paged-MQA expects a singleton KV-head view, got "
+                f"shape {tuple(kv_cache_fp8.shape)}"
+            )
+        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
+    if kv_cache_fp8.ndim != 4:
+        raise ValueError(
+            "HCU paged-MQA expects a 4D kernel view, got "
+            f"shape {tuple(kv_cache_fp8.shape)}"
+        )
+    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
+        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    return kv_cache_fp8
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -780,20 +799,7 @@ def rocm_fp8_paged_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     batch_size, next_n = q_fp8.shape[:2]
-    if kv_cache_fp8.ndim == 5:
-        if kv_cache_fp8.shape[-2] != 1:
-            raise ValueError(
-                "HCU paged-MQA expects a singleton KV-head view, got "
-                f"shape {tuple(kv_cache_fp8.shape)}"
-            )
-        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
-    if kv_cache_fp8.ndim != 4:
-        raise ValueError(
-            "HCU paged-MQA expects a 4D kernel view, got "
-            f"shape {tuple(kv_cache_fp8.shape)}"
-        )
-    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
-        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    kv_cache_fp8 = _paged_mqa_cache_kernel_view(kv_cache_fp8)
     is_gfx938 = on_gfx938()
     if is_gfx938:
         kv_cache_fp8 = _indexer_cache_as_hipc_view(kv_cache_fp8)
