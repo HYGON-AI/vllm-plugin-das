@@ -935,123 +935,56 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     assert torch.equal(calls[0][2], weights.float().contiguous())
 
 
+@pytest.mark.parametrize("block_size", [16, 32, 64])
 @pytest.mark.parametrize("collapsed_cache", [False, True])
-@pytest.mark.parametrize("use_aiter", [False, True])
-@pytest.mark.parametrize(
-    ("block_size", "page_count", "length"),
-    [(16, 33, 513), (32, 17, 513), (64, 9, 513)],
-)
-def test_bw1100_paged_mqa_reads_preshuffled_kpool_pages_past_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-    collapsed_cache: bool,
-    use_aiter: bool,
-    block_size: int,
-    page_count: int,
-    length: int,
+def test_gfx938_dispatch_reads_original_physical_pages_and_table(
+    monkeypatch: pytest.MonkeyPatch, block_size: int, collapsed_cache: bool
 ) -> None:
-    """Paged decode must use token scores, not page IDs or swizzled bytes."""
+    """Decode must pass the original page backing and mapping to the reader."""
     runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
-    monkeypatch.setattr(runtime, "_ON_GFX942", False)
     monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
     monkeypatch.setattr(
         runtime,
-        "paged_mqa_logits_module",
-        lambda: SimpleNamespace(
-            deepgemm_fp8_paged_mqa_logits_stage1=lambda *_args, **_kwargs: pytest.fail(
-                "token-index stage1 received a page table"
-            )
-        ),
+        "_linearize_preshuffled_paged_cache",
+        lambda *_args: pytest.fail("decode linearized the full cache"),
+        raising=False,
     )
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: use_aiter)
-    head_dim = 128
-    logical_values = torch.zeros((page_count, block_size, head_dim))
-    logical_values[:, :, 0] = (
-        torch.arange(page_count * block_size).reshape(page_count, block_size) % 7
-    ) + 1
-    key_bytes = logical_values.to(torch.float8_e4m3fn).view(torch.uint8)
-    physical = torch.empty((page_count, block_size * head_dim), dtype=torch.uint8)
-    token = torch.arange(block_size)[:, None]
-    dim = torch.arange(head_dim)[None, :]
-    offsets = (
-        (token // 16) * 16 * head_dim
-        + (dim // 16) * 16 * 16
-        + (token % 16) * 16
-        + dim % 16
-    )
-    physical[:, offsets.reshape(-1)] = key_bytes.reshape(page_count, -1)
-    scales = (
-        torch.arange(page_count * block_size).reshape(page_count, block_size) % 3
-    ).float() + 1
-    packed = torch.cat((physical, scales.view(torch.uint8).reshape(page_count, -1)), 1)
-    cache = packed.reshape(page_count, block_size, 1, head_dim + 4)
-    table = torch.cat(
-        (
-            torch.arange(page_count - 1, -1, -1, dtype=torch.int32),
-            torch.tensor([-1], dtype=torch.int32),
-        )
-    )[None, :]
-    cache = cache[torch.arange(page_count - 1, -1, -1)]
-    if collapsed_cache:
-        cache = cache[:, :1]
-    q = torch.zeros((1, 1, 32, head_dim), dtype=torch.float32)
-    q[0, 0, 0, 0] = 1
-    q = q.to(torch.float8_e4m3fn)
-    weights = torch.zeros((1, 32), dtype=torch.float32)
-    weights[0, 0] = 1
-
-    def linear_paged_mqa(
-        query,
-        pages,
-        normalized_weights,
-        lengths,
-        page_table,
-        _schedule,
-        max_len,
-        _clean_logits,
-    ):
-        flat = pages.reshape(pages.shape[0], -1)
-        values = (
-            flat[:, : block_size * head_dim]
-            .contiguous()
-            .view(torch.float8_e4m3fn)
-            .reshape(-1, block_size, head_dim)
-            .float()
-        )
-        scale = (
-            flat[:, block_size * head_dim :]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1, block_size)
-        )
-        actual_length = int(lengths[0].max())
-        keys = values[page_table[0].long()].reshape(-1, head_dim)[:actual_length]
-        scale = scale[page_table[0].long()].reshape(-1)[:actual_length]
-        scores = (query[0, 0].float() @ keys.T).relu_()
-        scores = (scores * normalized_weights[0, :, None]).sum(0) * scale
-        result = torch.full((1, max_len), float("-inf"))
-        result[0, :actual_length] = scores
-        return result
-
     monkeypatch.setattr(
         runtime,
         "_get_lightop_attention",
-        lambda: SimpleNamespace(paged_mqa_logits=linear_paged_mqa),
+        lambda: pytest.fail("decode used LightOp"),
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    cache = torch.empty((3, block_size, 1, 132), dtype=torch.uint8)
+    supplied_cache = cache[:, :1] if collapsed_cache else cache
+    table = torch.tensor([[2, 0, -1]], dtype=torch.int32)
+    output = torch.ones((1, block_size * 3))
+    calls = []
+
+    def direct_reader(q, physical, weights, lengths, pages, max_len):
+        calls.append((physical, pages, max_len))
+        assert physical.shape == cache.shape
+        assert physical.data_ptr() == cache.data_ptr()
+        assert physical.stride() == cache.stride()
+        assert pages is table
+        return output
+
+    monkeypatch.setattr(
+        runtime, "gfx938_fp8_paged_mqa_logits", direct_reader, raising=False
     )
     actual = runtime.rocm_fp8_paged_mqa_logits(
-        q,
-        cache,
-        weights,
-        torch.tensor([[length]], dtype=torch.int32),
+        torch.empty((1, 1, 2, 128), dtype=torch.float8_e4m3fn),
+        supplied_cache,
+        torch.ones((1, 2)),
+        torch.tensor([block_size + 1], dtype=torch.int32),
         table,
         torch.empty(0),
-        page_count * block_size + 16,
+        block_size * 3,
     )
-
-    expected = (logical_values[:, :, 0] * scales).reshape(-1)[:length]
-    torch.testing.assert_close(actual[0, :length], expected)
-    assert torch.isneginf(actual[0, length:]).all()
+    assert actual is output
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("use_aiter", [False, True])
@@ -1192,27 +1125,6 @@ def test_bw1100_paged_mqa_rejects_unsupported_physical_page_size(
             torch.empty(0),
             1168,
         )
-
-
-def test_bw1100_linearized_cache_respects_each_batch_row_and_invalid_tail() -> None:
-    """Unequal decode lengths must not read padded page-table entries."""
-    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
-    backing = torch.zeros((4, 16, 1, 132), dtype=torch.uint8)
-    for page in range(4):
-        backing[page, :, :, :128] = page + 1
-    collapsed = backing[:, :1]
-    block_tables = torch.tensor(
-        [[3, 2, 1, 0, -1], [1, 0, -1, -1, -1]], dtype=torch.int32
-    )
-    context_lens = torch.tensor([[49], [17]], dtype=torch.int32)
-
-    linear, linear_table = runtime._linearize_preshuffled_paged_cache(
-        collapsed, context_lens, block_tables, 128
-    )
-
-    assert linear.shape == (10, 16, 1, 132)
-    assert linear[:, 0, 0, 0].tolist() == [4, 3, 2, 1, 1, 2, 1, 1, 1, 1]
-    assert linear_table.tolist() == [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]]
 
 
 @pytest.mark.parametrize(("is_gfx938", "block_size"), [(False, 16), (True, 1)])

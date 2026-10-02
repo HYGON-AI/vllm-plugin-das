@@ -12,10 +12,19 @@ from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
 )
 
 
-def _case(page_size, length, batch, next_n, per_query, dtype=torch.float8_e4m3fn):
+def _case(
+    page_size,
+    length,
+    batch,
+    next_n,
+    per_query,
+    dtype=torch.float8_e4m3fn,
+    heads=64,
+    dim=128,
+    metadata_dtype=torch.int32,
+):
     torch.manual_seed(123)
     device = "cuda"
-    heads, dim = 64, 128
     pages = math.ceil(length / page_size)
     tokens = pages * page_size
     # Retain original token-order values for the oracle; never unpack the cache.
@@ -46,13 +55,13 @@ def _case(page_size, length, batch, next_n, per_query, dtype=torch.float8_e4m3fn
     cache[-1, page_size * dim :] = torch.full((page_size,), 1024.0, device=device).view(
         torch.uint8
     )
-    table = torch.full((batch, pages + 1), -1, dtype=torch.int32, device=device)
+    table = torch.full((batch, pages + 1), -1, dtype=metadata_dtype, device=device)
     table[:, :pages] = permutation.reshape(batch, pages).to(torch.int32)
     if length > page_size:
         table[0, 1] = -1
     final_lengths = length - torch.arange(batch, device=device) % 3
     ends = final_lengths[:, None] - next_n + 1 + torch.arange(next_n, device=device)
-    context = ends.to(torch.int32) if per_query else final_lengths.to(torch.int32)
+    context = ends.to(metadata_dtype) if per_query else final_lengths.to(metadata_dtype)
     max_len = tokens + page_size - 3
     expected = torch.full((batch, next_n, max_len), -torch.inf, device=device)
     positions = torch.arange(tokens, device=device)
@@ -103,6 +112,16 @@ def test_direct_reader_matches_token_order_oracle(
     page_size, length, batch, next_n, per_query
 ):
     args, expected = _case(page_size, length, batch, next_n, per_query)
+    _check(gfx938_fp8_paged_mqa_logits(*args), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("per_query", [False, True])
+def test_non_power_of_two_heads_and_dim_with_int64_metadata(per_query):
+    """Tail lanes and 64-bit page indices must preserve oracle logits."""
+    args, expected = _case(
+        32, 37, 1, 3, per_query, heads=19, dim=48, metadata_dtype=torch.int64
+    )
     _check(gfx938_fp8_paged_mqa_logits(*args), expected)
 
 
