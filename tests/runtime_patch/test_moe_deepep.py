@@ -1319,10 +1319,14 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
         None, [128, 128], None, None,
     )
 
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", False, raising=False
+    )
     assert module.fused_experts_impl(*arguments) == "official"
 
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
+    )
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
     monkeypatch.setitem(sys.modules, "aiter", ModuleType("aiter"))
     monkeypatch.delitem(sys.modules, "aiter.moe", raising=False)
