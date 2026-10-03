@@ -126,6 +126,16 @@ from vllm_hcu.ops.fuse_silu_mul_quant import FusedSiluAndMulAndQuant
 logger = init_logger(__name__)
 
 
+def fused_silu_mul_quant_supported(weight: object) -> bool:
+    """Return whether LightOP can produce the linear's activation dtype."""
+
+    return getattr(weight, "dtype", None) in (
+        torch.int8,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+
+
 class DeepseekAttention(nn.Module):
     """Normal MHA implementation used by Deepseek v1."""
 
@@ -247,12 +257,13 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
 
+        weight = getattr(self.gate_up_proj, "weight", None)
         self.enable_fuse_silu_mul_quant = (
             henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
             and henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and quant_config is not None 
+            and quant_config is not None
+            and fused_silu_mul_quant_supported(weight)
         )
-        weight = getattr(self.gate_up_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None
 
         if self.enable_fuse_silu_mul_quant:
@@ -321,8 +332,12 @@ class DeepseekV2SharedMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.enable_fuse_silu_mul_quant = henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT and henvs.VLLM_HCU_USE_CUSTOM_OPS
         weight = getattr(self.gate_up_proj, "weight", None)
+        self.enable_fuse_silu_mul_quant = (
+            henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
+            and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and fused_silu_mul_quant_supported(weight)
+        )
         self.quant_dtype = weight.dtype if weight is not None else None
 
         if self.enable_fuse_silu_mul_quant:
