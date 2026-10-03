@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 import pytest
 import psutil
@@ -325,22 +325,113 @@ def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
         if not isinstance(configured, dict):
             raise TypeError("server.environment must be a mapping")
         env.update({str(name): str(value) for name, value in configured.items()})
-    # The server and EvalScope client share this environment. Preserve any
-    # configured outbound proxy while ensuring local OpenAI-compatible requests
-    # never route through it.
-    no_proxy_hosts: list[str] = []
-    for name in ("NO_PROXY", "no_proxy"):
-        for host in env.get(name, "").split(","):
-            host = host.strip()
-            if host and host not in no_proxy_hosts:
-                no_proxy_hosts.append(host)
-    for host in ("localhost", "127.0.0.1", "::1"):
-        if host not in no_proxy_hosts:
-            no_proxy_hosts.append(host)
-    no_proxy = ",".join(no_proxy_hosts)
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        env.pop(name, None)
+    no_proxy = "127.0.0.1,localhost,::1"
     env["NO_PROXY"] = no_proxy
     env["no_proxy"] = no_proxy
     return env
+
+
+def _prometheus_metric_total(metrics: str, name: str) -> float:
+    pattern = re.compile(
+        rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+"
+        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+    )
+    values = []
+    for line in metrics.splitlines():
+        match = pattern.match(line.strip())
+        if match is not None:
+            values.append(float(match.group(1)))
+    if not values:
+        raise AssertionError(f"missing Prometheus metric {name!r}")
+    return sum(values)
+
+
+def _run_prefix_probe(
+    config: dict[str, Any],
+    *,
+    host: str,
+    port: int,
+    work_dir: Path,
+) -> tuple[float, float, Path] | None:
+    probe = config.get("server", {}).get("prefix_probe")
+    if probe is None:
+        return None
+    if not isinstance(probe, dict):
+        raise TypeError("server.prefix_probe must be a mapping")
+    messages = probe.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise TypeError("server.prefix_probe.messages must be a non-empty list")
+    timeout = int(probe.get("timeout_s", 120))
+    metric = str(probe.get("metric", "vllm:prefix_cache_hits_total"))
+    served_model = str(
+        config.get("server", {}).get("served_model_name", config["model"])
+    )
+    metrics_url = f"http://{host}:{port}/metrics"
+    chat_url = f"http://{host}:{port}/v1/chat/completions"
+
+    def read_metrics() -> tuple[str, float]:
+        with _direct_urlopen(metrics_url, timeout=timeout) as response:
+            assert response.status == 200, (
+                f"prefix probe metrics request failed with {response.status}"
+            )
+            body = response.read().decode("utf-8")
+        return body, _prometheus_metric_total(body, metric)
+
+    _, before = read_metrics()
+    payload = json.dumps(
+        {
+            "model": served_model,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": int(probe.get("max_tokens", 32)),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    api_key = str(config.get("evalscope", {}).get("api_key", "EMPTY"))
+    for _ in range(2):
+        request = Request(
+            chat_url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with _direct_urlopen(request, timeout=timeout) as response:
+            assert response.status == 200, (
+                f"prefix probe chat request failed with {response.status}"
+            )
+            result = json.loads(response.read().decode("utf-8"))
+        choices = result.get("choices") if isinstance(result, dict) else None
+        content = None
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+        assert isinstance(content, str) and content.strip(), (
+            "prefix probe returned no coherent assistant content"
+        )
+
+    final_metrics, after = read_metrics()
+    metrics_path = work_dir / "logs/metrics.prom"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(final_metrics, encoding="utf-8")
+    assert after > before, (
+        f"{metric} did not increase after repeated shared-prefix requests: "
+        f"before={before}, after={after}"
+    )
+    return before, after, metrics_path
 
 
 def _report_metric(
@@ -790,6 +881,12 @@ def run_evalscope_server_test(
         )
         try:
             _wait_for_server(proc, f"http://{host}:{port}/health", startup_timeout)
+            _run_prefix_probe(
+                config,
+                host=host,
+                port=port,
+                work_dir=work_dir,
+            )
             eval_command = evalscope_command(
                 config,
                 model_env=model_env,

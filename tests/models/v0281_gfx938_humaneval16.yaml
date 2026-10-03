@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: v0281_gfx938_humaneval16
+model: /models/Qwen3-8B
+
+server:
+  host: 127.0.0.1
+  port: 10200
+  startup_timeout_s: 7200
+  shutdown_timeout_s: 180
+  served_model_name: Qwen3-8B
+  args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "2"
+    - --attention-backend
+    - FLASH_ATTN
+    - --enable-prefix-caching
+    - --max-model-len
+    - "4096"
+    - --max-num-batched-tokens
+    - "1024"
+    - --max-num-seqs
+    - "8"
+    - --generation-config
+    - vllm
+  prefix_probe:
+    metric: "vllm:prefix_cache_hits_total"
+    timeout_s: 300
+    max_tokens: 32
+    messages:
+      - role: user
+        content: >-
+          This is a deterministic shared-prefix validation request. Preserve this
+          complete paragraph as context while answering only the final instruction.
+          The runtime must reuse the same prefix on the second identical request,
+          keep the KV cache coherent, and return a short meaningful response. The
+          paragraph is intentionally repeated in meaning and structure to create a
+          reusable prefix that is large enough to be visible in server metrics.
+          Do not explain the validation protocol. Final instruction: reply OK.
+
+evalscope:
+  work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-default
+  api_key: EMPTY
+  eval_type: openai_api
+  generation_config:
+    temperature: 0
+    do_sample: false
+    max_tokens: 4096
+  stream: true
+  eval_batch_size: 1
+  timeout: 7200
+  limit: 16
+  datasets: [humaneval]
+  dataset_args:
+    humaneval: {}
+  pass_criteria:
+    dataset: humaneval
+    mean_acc: 1.0
+    mean_acc_pass@1: 1.0
+    num_predictions: 16
+    num_reviews: 16
+    normalize_code_fences: true
+  no_timestamp: true
+
+profiles:
+  deepseek_v4_flash_tp4:
+    model: /models/DeepSeek-V4-Flash-0731-FP8-Channel
+    server:
+      port: 10201
+      served_model_name: DeepSeek-V4-Flash-0731-FP8-Channel
+      args: [--trust-remote-code, --tensor-parallel-size, "4", --attention-backend, FLASHMLA_SPARSE, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm]
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-v4-flash-tp4
+
+  glm5_w8a8_tp8:
+    model: /models/GLM-5-W8A8
+    server:
+      port: 10202
+      served_model_name: GLM-5-W8A8
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASHMLA_SPARSE, --reasoning-parser, glm45, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-glm5-w8a8-tp8
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 4096
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
+
+  glm53_channel_fp8_tp8:
+    model: /models/GLM-5.3-Channel-FP8-w8a8
+    server:
+      port: 10203
+      served_model_name: GLM-5.3-Channel-FP8-w8a8
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASHMLA_SPARSE, --reasoning-parser, glm45, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"reasoning_effort":"low"}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-glm53-channel-fp8-tp8
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 4096
+        extra_body:
+          chat_template_kwargs:
+            reasoning_effort: low
+
+  glm51_channel_fp8_tp8:
+    model: /models/GLM-5___1-Channel-FP8-w8a8
+    server:
+      port: 10204
+      served_model_name: GLM-5___1-Channel-FP8-w8a8
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASHMLA_SPARSE, --reasoning-parser, glm45, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-glm51-channel-fp8-tp8
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 4096
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
+
+  hy4_preview_channel_fp8_tp8:
+    model: /models/Hy4-preview-Channel-FP8-w8a8
+    server:
+      port: 10205
+      served_model_name: Hy4-preview-Channel-FP8-w8a8
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASHMLA_SPARSE, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm]
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-hy4-preview-channel-fp8-tp8
+
+  minimax_m25_int8_tp4:
+    model: /models/MiniMax-M2.5-Channel-INT8-w8a8
+    server:
+      port: 10206
+      served_model_name: MiniMax-M2.5-Channel-INT8-w8a8
+      environment: &flash_environment
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --reasoning-parser, minimax_m2, --moe-backend, aiter, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm]
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-minimax-m25-int8-tp4
+
+  qwen2_57b_tp2:
+    model: /models/Qwen2-57B-A14B-Instruct
+    server:
+      port: 10207
+      served_model_name: Qwen2-57B-A14B-Instruct
+      environment: *flash_environment
+      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm]
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen2-57b-tp2
+
+  qwen3_30b_int8_tp2:
+    model: /models/Qwen3-30B-A3B-Channel-INT8-w8a8
+    server:
+      port: 10208
+      served_model_name: Qwen3-30B-A3B-Channel-INT8-w8a8
+      environment: *flash_environment
+      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen3-30b-int8-tp2
+      generation_config: &no_thinking_generation
+        temperature: 0
+        do_sample: false
+        max_tokens: 4096
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
+
+  qwen3_8b_tp2:
+    model: /models/Qwen3-8B
+    server:
+      port: 10209
+      served_model_name: Qwen3-8B
+      environment: *flash_environment
+      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen3-8b-tp2
+      generation_config: *no_thinking_generation
+
+  qwen35_35b_tp2:
+    model: /models/Qwen3.5-35B-A3B
+    server:
+      port: 10210
+      served_model_name: Qwen3.5-35B-A3B
+      environment: *flash_environment
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen35-35b-tp2
+      generation_config: *no_thinking_generation
+
+  qwen35_35b_w8a8_tp2:
+    model: /models/Qwen3.5-35B-A3B-W8A8
+    server:
+      port: 10211
+      served_model_name: Qwen3.5-35B-A3B-W8A8
+      environment: *flash_environment
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen35-35b-w8a8-tp2
+      generation_config: *no_thinking_generation
+
+  qwen36_27b_w8a8_tp2:
+    model: /models/Qwen3.6-27B-W8A8
+    server:
+      port: 10212
+      served_model_name: Qwen3.6-27B-W8A8
+      environment: *flash_environment
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen36-27b-w8a8-tp2
+      generation_config: *no_thinking_generation
+
+  qwen38_27b_int8_tp2:
+    model: /models/Qwen3.8-27B-Channel-INT8-w8a8
+    server:
+      port: 10213
+      served_model_name: Qwen3.8-27B-Channel-INT8-w8a8
+      environment: *flash_environment
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-27b-int8-tp2
+      generation_config: *no_thinking_generation
+
+  qwen38_flash_next_fp8_tp4:
+    model: /models/Qwen3.8-Flash-Next-FP8-Channelwise
+    server:
+      port: 10214
+      served_model_name: Qwen3.8-Flash-Next-FP8-Channelwise
+      environment: *flash_environment
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-flash-next-fp8-tp4
+      generation_config: *no_thinking_generation
+
+  qwen38_flash_next_w4a8_tp4:
+    model: /models/Qwen3.8-Flash-Next-w4a8-slimquant
+    server:
+      port: 10215
+      served_model_name: Qwen3.8-Flash-Next-w4a8-slimquant
+      environment: *flash_environment
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-flash-next-w4a8-tp4
+      generation_config: *no_thinking_generation

@@ -15,6 +15,13 @@ checkpoint or dataset fails instead of silently skipping.
 
 Available local configurations:
 
+- `v0281_gfx938_humaneval16.yaml`: selectable TP profiles for all 15
+  supported full checkpoints on the eight-card gfx938 host. Select one with
+  `VLLM_HCU_GFX938_PROFILE=<profile>` and run
+  `test_v0281_gfx938_selected_profile_humaneval16`. Every profile uses the
+  default CUDA Graph policy, prefix caching plus a metrics probe, and exact
+  HumanEval16 acceptance. FlashAttention profiles use HND/BHSD; sparse
+  FlashMLA profiles retain their native layout. DeepSeek-V4.1 is excluded.
 - `deepseek_r1_gsm8k_evalscope.yaml`: DeepSeek-R1 Channel-FP8 W8A8 server
   plus EvalScope GSM8K.
 - `deepseek_v4_flash_0731_dspark_humaneval.yaml`: DeepSeek-V4-Flash-0731

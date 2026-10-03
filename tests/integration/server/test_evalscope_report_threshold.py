@@ -54,22 +54,167 @@ def test_direct_urlopen_bypasses_environment_proxy(
         thread.join(timeout=1)
 
 
-def test_server_environment_bypasses_proxy_for_local_eval_client(
+def test_server_environment_clears_all_proxy_spellings_and_sets_local_no_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.setenv(name, "http://proxy.invalid:8080")
     monkeypatch.setenv("NO_PROXY", "example.internal")
-    monkeypatch.setenv("no_proxy", "legacy.internal,localhost")
+    monkeypatch.setenv("no_proxy", "legacy.internal")
 
     environment = _server_environment()
 
-    assert environment["NO_PROXY"].split(",") == [
-        "example.internal",
-        "legacy.internal",
-        "localhost",
-        "127.0.0.1",
-        "::1",
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        assert name not in environment
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    assert environment["no_proxy"] == "127.0.0.1,localhost,::1"
+
+
+class _ProbeResponse:
+    def __init__(self, body: str, *, status: int = 200) -> None:
+        self.status = status
+        self._body = body.encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _prefix_probe_config() -> dict:
+    return {
+        "model": "/models/Qwen3-8B",
+        "server": {
+            "served_model_name": "qwen3-8b-gfx938",
+            "prefix_probe": {
+                "metric": "vllm:prefix_cache_hits_total",
+                "timeout_s": 30,
+                "max_tokens": 32,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "shared prefix " * 256 + "return OK",
+                    }
+                ],
+            },
+        },
+    }
+
+
+def test_prefix_probe_sends_identical_requests_and_records_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict | None]] = []
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total{engine=\"0\"} 2\n",
+            "vllm:prefix_cache_hits_total{engine=\"0\"} 9\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        assert timeout == 30
+        if isinstance(target, str):
+            calls.append((target, None))
+            return _ProbeResponse(next(metrics))
+        payload = json.loads(target.data.decode())
+        calls.append((target.full_url, payload))
+        return _ProbeResponse(
+            json.dumps(
+                {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "OK"}}
+                    ]
+                }
+            )
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+    run_probe = getattr(evalscope_server, "_run_prefix_probe", None)
+    assert callable(run_probe), "prefix probe runner is not implemented"
+
+    before, after, metrics_path = run_probe(
+        _prefix_probe_config(),
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (2.0, 9.0)
+    assert metrics_path == tmp_path / "logs/metrics.prom"
+    assert metrics_path.read_text(encoding="utf-8").endswith('} 9\n')
+    request_payloads = [payload for _, payload in calls if payload is not None]
+    assert len(request_payloads) == 2
+    assert request_payloads[0] == request_payloads[1]
+    assert request_payloads[0]["model"] == "qwen3-8b-gfx938"
+    assert [url for url, _ in calls] == [
+        "http://127.0.0.1:10128/metrics",
+        "http://127.0.0.1:10128/v1/chat/completions",
+        "http://127.0.0.1:10128/v1/chat/completions",
+        "http://127.0.0.1:10128/metrics",
     ]
-    assert environment["no_proxy"] == environment["NO_PROXY"]
+
+
+def test_prefix_probe_requires_metric_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def direct_open(target, *, timeout: int):
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse("vllm:prefix_cache_hits_total 4\n")
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+    run_probe = getattr(evalscope_server, "_run_prefix_probe", None)
+    assert callable(run_probe), "prefix probe runner is not implemented"
+
+    with pytest.raises(AssertionError, match="did not increase"):
+        run_probe(
+            _prefix_probe_config(),
+            host="127.0.0.1",
+            port=10128,
+            work_dir=tmp_path,
+        )
+
+
+def test_prefix_probe_is_optional_without_network_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        evalscope_server,
+        "_direct_urlopen",
+        lambda *_args, **_kwargs: pytest.fail("optional probe used the network"),
+    )
+
+    assert evalscope_server._run_prefix_probe(
+        {"model": "/models/Qwen3-8B", "server": {}},
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    ) is None
 
 
 def test_server_environment_does_not_force_flash_attention_mode(
