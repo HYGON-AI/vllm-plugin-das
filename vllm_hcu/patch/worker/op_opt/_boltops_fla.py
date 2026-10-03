@@ -19,7 +19,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ...], dict[str, object]]] = {
             "initial_state_indices", "output_final_state",
             "inplace_final_state", "chunk_size", "save_new_value",
             "cu_seqlens", "chunk_indices", "use_exp2",
-            "transpose_state_layout", "kernel_cfg",
+            "transpose_state_layout", "null_state_index", "kernel_cfg",
         ),
         {
             "g": None,
@@ -34,6 +34,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ...], dict[str, object]]] = {
             "chunk_indices": None,
             "use_exp2": False,
             "transpose_state_layout": True,
+            "null_state_index": -1,
             "kernel_cfg": None,
         },
     ),
@@ -67,7 +68,8 @@ _CONTRACTS: dict[str, tuple[tuple[str, ...], dict[str, object]]] = {
             "A_log", "a", "b", "dt_bias", "q", "k", "v", "beta",
             "threshold", "scale", "initial_state", "inplace_final_state",
             "cu_seqlens", "ssm_state_indices", "num_accepted_tokens",
-            "use_qk_l2norm_in_kernel", "is_kda", "kernel_cfg",
+            "use_qk_l2norm_in_kernel", "is_kda", "null_state_index",
+            "kernel_cfg",
         ),
         {
             "beta": 1.0,
@@ -80,6 +82,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ...], dict[str, object]]] = {
             "num_accepted_tokens": None,
             "use_qk_l2norm_in_kernel": False,
             "is_kda": False,
+            "null_state_index": 0,
             "kernel_cfg": None,
         },
     ),
@@ -87,9 +90,13 @@ _CONTRACTS: dict[str, tuple[tuple[str, ...], dict[str, object]]] = {
         (
             "mixed_qkv", "a", "b", "A_log", "dt_bias", "scale",
             "initial_state", "out", "ssm_state_indices",
-            "use_qk_l2norm_in_kernel", "kernel_cfg",
+            "use_qk_l2norm_in_kernel", "null_state_index", "kernel_cfg",
         ),
-        {"use_qk_l2norm_in_kernel": False, "kernel_cfg": None},
+        {
+            "use_qk_l2norm_in_kernel": False,
+            "null_state_index": -1,
+            "kernel_cfg": None,
+        },
     ),
 }
 

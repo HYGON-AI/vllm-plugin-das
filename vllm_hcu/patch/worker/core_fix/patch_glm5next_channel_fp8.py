@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Adapt Channel-FP8 loading and correctness fallbacks for GLM5Next."""
+"""Adapt Channel-quantized loading and correctness fallbacks for GLM5Next."""
 
 from __future__ import annotations
 
@@ -35,6 +35,22 @@ _QUANT_IGNORE_PATCH_MARKER = "_vllm_hcu_glm5next_quant_ignore_applied"
 _QUANT_IGNORE_WRAPPER_MARKER = "_vllm_hcu_glm5next_quant_ignore_wrapper"
 _MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
 _MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
+
+# Channel-INT8 checkpoints quantize a few MLA/indexer projections that the
+# official FP8 checkpoint keeps in BF16, so they are intentionally absent from
+# vLLM's ``_FP8_ATTN_PROJS`` table.  The HCU loader must still dequantize them
+# into the model's BF16 parameters.  Values use the same tuple contract as the
+# upstream mapping: (buffer key, target base, fused shard id, NoPE padding).
+_CHANNEL_INT8_ONLY_PROJS = {
+    ".kv_b_proj.": ("kv_b", "kv_b_proj", None, False),
+    ".indexer.wq_b.": ("indexer_wq_b", "indexer.wq_b", None, False),
+    ".indexer.wk.": (
+        "indexer_wk",
+        "indexer.wk_weights_proj",
+        0,
+        False,
+    ),
+}
 
 
 def _native_mhc_pre(
@@ -573,12 +589,13 @@ def _patch_indexer_nn_layout(attention: ModuleType) -> bool:
 
 
 def _projection(module: ModuleType, name: str):
-    for suffix, info in module._FP8_ATTN_PROJS.items():
-        if suffix in name:
-            layer_prefix = name.rsplit(suffix, 1)[0]
-            key, target_base, shard_id, is_kva = info
-            target = f"{layer_prefix}.{target_base}"
-            return layer_prefix, key, target, shard_id, is_kva
+    for projections in (module._FP8_ATTN_PROJS, _CHANNEL_INT8_ONLY_PROJS):
+        for suffix, info in projections.items():
+            if suffix in name:
+                layer_prefix = name.rsplit(suffix, 1)[0]
+                key, target_base, shard_id, is_kva = info
+                target = f"{layer_prefix}.{target_base}"
+                return layer_prefix, key, target, shard_id, is_kva
     return None
 
 
@@ -588,13 +605,13 @@ def _dequantize_channel_fp8(
 ) -> torch.Tensor:
     if weight.ndim != 2:
         raise ValueError(
-            f"Channel-FP8 weight must be 2-D, got {tuple(weight.shape)}"
+            f"Channel-quantized weight must be 2-D, got {tuple(weight.shape)}"
         )
     if scale.ndim == 1:
         scale = scale.unsqueeze(1)
     if scale.shape != (weight.shape[0], 1):
         raise ValueError(
-            "Channel-FP8 scale must have shape (out_features, 1), got "
+            "Channel-quantized scale must have shape (out_features, 1), got "
             f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
         )
     return (weight.float() * scale.float()).to(torch.bfloat16).contiguous()
@@ -660,7 +677,15 @@ def apply_to_module(module: ModuleType) -> bool:
         target_weight = f"{target}.weight"
         target_scale = f"{target}.weight_scale"
         target_scale_inv = f"{target}.weight_scale_inv"
-        is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+        # GLM Channel checkpoints use the same per-output-channel scale
+        # contract for both FP8 and INT8 attention projections.  The official
+        # model keeps these projections in BF16, so both storage dtypes must be
+        # buffered with ``weight_scale`` and dequantized before the normal
+        # loader can cast the raw values into the BF16 parameter.
+        is_weight = name.endswith(".weight") and tensor.dtype in (
+            torch.float8_e4m3fn,
+            torch.int8,
+        )
         is_channel_scale = name.endswith(".weight_scale")
 
         # A target that remains quantized owns both tensors and must use the

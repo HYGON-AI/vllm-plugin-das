@@ -985,7 +985,7 @@ def _boltops_chunk_h_contract(
     initial_state_indices=None, output_final_state=True,
     inplace_final_state=False, chunk_size=64, save_new_value=True,
     cu_seqlens=None, chunk_indices=None, use_exp2=False,
-    transpose_state_layout=True, kernel_cfg=None,
+    transpose_state_layout=True, null_state_index=-1, kernel_cfg=None,
 ):
     pass
 
@@ -1002,6 +1002,51 @@ def _boltops_recompute_contract(
     k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=None,
 ):
     pass
+
+
+def _boltops_sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0,
+    scale=None, initial_state=None, inplace_final_state=True,
+    cu_seqlens=None, ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False, null_state_index=0,
+    kernel_cfg=None,
+):
+    pass
+
+
+def _boltops_recurrent_contract(
+    mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
+    ssm_state_indices, use_qk_l2norm_in_kernel=False, null_state_index=-1,
+    kernel_cfg=None,
+):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("name", "contract"),
+    (
+        ("chunk_gated_delta_rule_fwd_h", _boltops_chunk_h_contract),
+        ("fused_sigmoid_gating_delta_rule_update", _boltops_sigmoid_contract),
+        (
+            "fused_recurrent_gated_delta_rule_packed_decode",
+            _boltops_recurrent_contract,
+        ),
+    ),
+)
+def test_boltops_resolver_accepts_current_null_state_index_abi(
+    monkeypatch, name, contract
+):
+    from vllm_hcu.patch.worker.op_opt._boltops_fla import (
+        make_boltops_gdn_resolver,
+    )
+
+    def kernel(*args, **kwargs):
+        return args, kwargs
+
+    kernel.__signature__ = inspect.signature(contract)
+    _install_fake_module(monkeypatch, "boltops.fla.gdn", **{name: kernel})
+
+    assert make_boltops_gdn_resolver(name)() is kernel
 
 
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
@@ -2113,7 +2158,19 @@ def test_e5m2_mla_cache_gather_master_off_uses_torch_fallback(
     torch.testing.assert_close(dst, expected)
 
 
-def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
+@pytest.mark.parametrize(
+    ("requested_dtype", "operator_dtype"),
+    [
+        ("bfloat16", "auto"),
+        ("float16", "auto"),
+        ("fp8_ds_mla", "fp8_ds_mla"),
+    ],
+)
+def test_sparse_mla_cache_update_uses_hcu_operator(
+    monkeypatch,
+    requested_dtype,
+    operator_dtype,
+):
     adapter = _adapter("patch_sparse_mla_attention")
     calls = []
 
@@ -2151,14 +2208,53 @@ def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
     kv_cache = torch.ones(1)
     slot_mapping = torch.tensor([[0, -1, 1, -1]], dtype=torch.int32)
     SparseMLACommonImpl().do_kv_cache_update(
-        tensor, tensor, kv_cache, slot_mapping, "fp8_ds_mla", torch.ones(1),
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        requested_dtype,
+        torch.ones(1),
     )
 
     assert len(calls) == 1
     assert calls[0][1].shape == (4, 2)
     torch.testing.assert_close(calls[0][3], slot_mapping.flatten())
-    assert calls[0][4] == "fp8_ds_mla"
+    assert calls[0][4] == operator_dtype
     assert not adapter.apply_to_module(module)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_shape"),
+    [
+        ((3, 1, 16, 128), (3, 16, 128)),  # LBHNC
+        ((3, 16, 1, 128), (3, 16, 128)),  # LBNHC
+        ((3, 16, 128), (3, 16, 128)),
+    ],
+)
+def test_indexer_bf16_cache_page_view_accepts_both_vllm_layouts(
+    shape,
+    expected_shape,
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    cache = torch.empty(shape, dtype=torch.bfloat16)
+
+    page_view = sparse._indexer_bf16_cache_as_page_view(cache, head_dim=128)
+
+    assert tuple(page_view.shape) == expected_shape
+    assert (
+        page_view.untyped_storage().data_ptr()
+        == cache.untyped_storage().data_ptr()
+    )
+
+
+def test_indexer_bf16_cache_page_view_rejects_multihead_cache():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    cache = torch.empty((3, 16, 2, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="single-head"):
+        sparse._indexer_bf16_cache_as_page_view(cache, head_dim=128)
 
 
 def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():

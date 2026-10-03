@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+from copy import copy
 from types import ModuleType
 
 from ._common import (
@@ -23,6 +24,7 @@ TARGET_MODULE = (
 QUANT_CONFIG_MODULE = "vllm.model_executor.layers.fused_moe.config"
 PATCH_ID = "worker.op_opt.compressed_tensors.moe_wna16"
 TARGETS = (
+    f"{TARGET_MODULE}.CompressedTensorsWNA16MoEMethod.__init__",
     f"{TARGET_MODULE}.CompressedTensorsWNA16MoEMethod.create_weights",
     f"{TARGET_MODULE}.CompressedTensorsWNA16MoEMethod.get_fused_moe_quant_config",
 )
@@ -38,7 +40,7 @@ def _aiter_requested(layer: object | None = None) -> bool:
             is_aiter_moe_requested,
         )
 
-        moe_config = getattr(layer, "moe_config", None)
+        moe_config = getattr(layer, "moe_config", layer)
         if is_aiter_moe_explicitly_disabled(moe_config):
             return False
         return bool(henvs.VLLM_HCU_USE_CUSTOM_OPS) and bool(
@@ -71,21 +73,29 @@ def apply_to_module(module: ModuleType) -> bool:
         f"{TARGET_MODULE}.CompressedTensorsWNA16MoEMethod",
     )
     wrapped = (
-        (method_class, "create_weights", TARGETS[0], _WRAPPER_MARKER),
+        (method_class, "__init__", TARGETS[0], _WRAPPER_MARKER),
+        (method_class, "create_weights", TARGETS[1], _WRAPPER_MARKER),
         (
             method_class,
             "get_fused_moe_quant_config",
-            TARGETS[1],
+            TARGETS[2],
             _WRAPPER_MARKER,
         ),
     )
     if already_applied(method_class, _CLASS_MARKER, wrapped):
         return False
 
-    original_create = require_callable(method_class, "create_weights", TARGETS[0])
+    original_init = require_callable(method_class, "__init__", TARGETS[0])
+    require_exact_signature(
+        original_init,
+        TARGETS[0],
+        positional=("self", "weight_quant", "input_quant", "moe", "layer_name"),
+        defaults={"layer_name": None},
+    )
+    original_create = require_callable(method_class, "create_weights", TARGETS[1])
     require_exact_signature(
         original_create,
-        TARGETS[0],
+        TARGETS[1],
         positional=(
             "self",
             "layer",
@@ -97,11 +107,11 @@ def apply_to_module(module: ModuleType) -> bool:
         var_keyword="extra_weight_attrs",
     )
     original_get_config = require_callable(
-        method_class, "get_fused_moe_quant_config", TARGETS[1]
+        method_class, "get_fused_moe_quant_config", TARGETS[2]
     )
     require_exact_signature(
         original_get_config,
-        TARGETS[1],
+        TARGETS[2],
         positional=("self", "layer"),
     )
     set_weight_attrs = require_callable(
@@ -114,6 +124,39 @@ def apply_to_module(module: ModuleType) -> bool:
     from vllm_hcu.model_executor.layers.quantization import (
         compressed_tensors_moe_runtime as hcu_runtime,
     )
+
+    @functools.wraps(original_init)
+    def hcu_init(
+        self,
+        weight_quant,
+        input_quant,
+        moe,
+        layer_name=None,
+    ):
+        strategy = getattr(weight_quant, "strategy", None)
+        is_channel = str(getattr(strategy, "value", strategy)).lower() == "channel"
+        if not (is_channel and moe is not None and _aiter_requested(moe)):
+            return original_init(self, weight_quant, input_quant, moe, layer_name)
+
+        # vLLM's WNA16 oracle has no AITER enum and rejects channel-wise
+        # quantization after selecting its Triton storage/conversion path.
+        # Select that compatible N-first storage path, then restore the actual
+        # channel/AITER contract for the HCU runtime wrappers.
+        oracle_weight_quant = copy(weight_quant)
+        oracle_moe = copy(moe)
+        object.__setattr__(oracle_weight_quant, "strategy", "group")
+        object.__setattr__(oracle_moe, "moe_backend", "triton")
+        original_init(
+            self,
+            oracle_weight_quant,
+            input_quant,
+            oracle_moe,
+            layer_name,
+        )
+        self.weight_quant = weight_quant
+        self.strategy = strategy
+        self.group_size = getattr(weight_quant, "group_size", -1)
+        self.moe = moe
 
     @functools.wraps(original_create)
     def hcu_create_weights(
@@ -156,10 +199,12 @@ def apply_to_module(module: ModuleType) -> bool:
             config_builder,
         )
 
-    for function in (hcu_create_weights, hcu_get_fused_moe_quant_config):
+    for function in (hcu_init, hcu_create_weights, hcu_get_fused_moe_quant_config):
         setattr(function, _WRAPPER_MARKER, True)
+    setattr(method_class, "_vllm_hcu_original_init", original_init)
     setattr(method_class, "_vllm_hcu_original_create_weights", original_create)
     setattr(method_class, "_vllm_hcu_original_get_quant_config", original_get_config)
+    setattr(method_class, "__init__", hcu_init)
     setattr(method_class, "create_weights", hcu_create_weights)
     setattr(method_class, "get_fused_moe_quant_config", hcu_get_fused_moe_quant_config)
     setattr(method_class, _CLASS_MARKER, True)
