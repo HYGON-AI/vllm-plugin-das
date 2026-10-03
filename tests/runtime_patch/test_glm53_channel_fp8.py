@@ -294,6 +294,124 @@ def test_kpool_indexer_uses_official_triton_path_without_aiter() -> None:
     ) == "official-hip"
 
 
+@pytest.mark.parametrize("page_size", [1, 16, 32, 64])
+@pytest.mark.parametrize(
+    "layout", ["regular", "collapsed", "transposed", "contiguous", "five_dim"]
+)
+def test_glm5next_upstream_paged_mqa_uses_physical_page_after_layout_normalization(
+    monkeypatch, page_size: int, layout: str
+) -> None:
+    """The wrapper must classify the same physical page as the dispatcher."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    class SparseAttnIndexerKpool:
+        def forward_hip(
+            self,
+            hidden_states,
+            q_quant,
+            k,
+            weights,
+            *,
+            gate_score=None,
+            compress_ape=None,
+            index_kpool=1,
+            positions=None,
+        ):
+            return None
+
+    kpool = ModuleType(patch_glm5next_channel_fp8.KPOOL_MODULE)
+    kpool.SparseAttnIndexerKpool = SparseAttnIndexerKpool
+    monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        upstream_sparse,
+        "rocm_fp8_paged_mqa_logits",
+        upstream_sparse.rocm_fp8_paged_mqa_logits,
+    )
+    calls = []
+    output = torch.ones((1, 2))
+
+    def dispatcher(*args, **kwargs):
+        calls.append((args, kwargs))
+        return output
+
+    monkeypatch.setattr(hcu_sparse, "rocm_fp8_paged_mqa_logits", dispatcher)
+    patch_glm5next_channel_fp8._patch_sparse_indexer_kpool(kpool)
+    cache = torch.empty((2, page_size, 1, 132), dtype=torch.uint8)
+    supplied_cache = {
+        "regular": cache,
+        "collapsed": cache[:, :1],
+        "transposed": cache.transpose(1, 2),
+        "contiguous": torch.empty((2, 1, page_size, 132), dtype=torch.uint8),
+        "five_dim": cache.unsqueeze(2),
+    }[layout]
+    table = torch.tensor([[1, 0]], dtype=torch.int32)
+    result = upstream_sparse.rocm_fp8_paged_mqa_logits(
+        torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+        supplied_cache,
+        torch.ones((1, 1)),
+        torch.tensor([2], dtype=torch.int32),
+        table,
+        torch.empty(0),
+        2,
+    )
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0][1] is supplied_cache
+    assert calls[0][0][4] is table
+    assert calls[0][1]["force_aiter_triton"] is (page_size == 1)
+
+
+def test_glm5next_upstream_explicit_aiter_rejects_preshuffled_gfx938_pages(
+    monkeypatch,
+) -> None:
+    """Explicit AITER requests must reach the layout-aware dispatcher."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    class SparseAttnIndexerKpool:
+        def forward_hip(
+            self,
+            hidden_states,
+            q_quant,
+            k,
+            weights,
+            *,
+            gate_score=None,
+            compress_ape=None,
+            index_kpool=1,
+            positions=None,
+        ):
+            return None
+
+    kpool = ModuleType(patch_glm5next_channel_fp8.KPOOL_MODULE)
+    kpool.SparseAttnIndexerKpool = SparseAttnIndexerKpool
+    monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        upstream_sparse,
+        "rocm_fp8_paged_mqa_logits",
+        upstream_sparse.rocm_fp8_paged_mqa_logits,
+    )
+    patch_glm5next_channel_fp8._patch_sparse_indexer_kpool(kpool)
+
+    with pytest.raises(
+        RuntimeError,
+        match="AITER paged-MQA does not support gfx938 preshuffled KPool pages",
+    ):
+        upstream_sparse.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((2, 16, 1, 132), dtype=torch.uint8),
+            torch.ones((1, 1)),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[1, 0]], dtype=torch.int32),
+            torch.empty(0),
+            2,
+            force_aiter_triton=True,
+        )
+
+
 def test_glm5next_forced_sparse_triton_requires_packaged_modules(
     monkeypatch,
 ) -> None:
@@ -310,6 +428,8 @@ def test_glm5next_forced_sparse_triton_requires_packaged_modules(
             force_aiter_triton=True,
         )
 
+    monkeypatch.setattr(sparse, "_ON_GFX942", True)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
     monkeypatch.setattr(sparse, "paged_mqa_logits_module", lambda: None)
     with pytest.raises(RuntimeError, match="pa_mqa_logits Triton module"):
         sparse.rocm_fp8_paged_mqa_logits(
