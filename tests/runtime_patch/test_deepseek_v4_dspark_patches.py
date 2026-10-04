@@ -224,6 +224,158 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
 
 
 @pytest.mark.parametrize(
+    ("is_gfx938", "expected_dtype", "expected_head_dim"),
+    (
+        (False, torch.bfloat16, 128),
+        (True, torch.uint8, 132),
+    ),
+)
+def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
+    is_gfx938: bool,
+    expected_dtype: torch.dtype,
+    expected_head_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gfx936 uses the BF16 reader; gfx938 retains its quantized cache."""
+
+    class DeepseekV4Attention:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+        ):
+            del vllm_config, prefix, topk_indices_buffer, aux_stream_list
+
+        def _run_parallel_input_projections(self, hidden_states):
+            return hidden_states
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
+            return hidden_states
+
+        def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+            del kv, positions, attn_metadata
+            return q
+
+    class DeepseekV4Indexer:
+        def __init__(
+            self,
+            vllm_config,
+            config,
+            hidden_size,
+            q_lora_rank,
+            quant_config,
+            cache_config,
+            topk_indices_buffer,
+            compress_ratio=1,
+            prefix="",
+            aux_stream=None,
+        ):
+            del (
+                vllm_config,
+                config,
+                hidden_size,
+                q_lora_rank,
+                quant_config,
+                cache_config,
+                topk_indices_buffer,
+                compress_ratio,
+                prefix,
+                aux_stream,
+            )
+            self.head_dim = 128
+            self.k_cache = SimpleNamespace(dtype=torch.uint8, head_dim=132)
+
+    def fused_indexer_q_rope_quant(
+        positions,
+        index_q,
+        index_q_cos_sin_cache,
+        index_weights,
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        use_fp4=False,
+    ):
+        del (
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            use_fp4,
+        )
+        return "quantized"
+
+    module = _module(
+        patch_deepseek_v4_attention.TARGET_MODULE,
+        DeepseekV4Attention=DeepseekV4Attention,
+        DeepseekV4Indexer=DeepseekV4Indexer,
+        fused_indexer_q_rope_quant=fused_indexer_q_rope_quant,
+        execute_in_parallel=lambda *args, **kwargs: None,
+        envs=SimpleNamespace(VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=1),
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_attention,
+        "on_gfx938",
+        lambda: is_gfx938,
+        raising=False,
+    )
+
+    patch_deepseek_v4_attention.apply_to_module(module)
+    indexer = DeepseekV4Indexer(None, None, 1, 1, None, None, None)
+
+    assert indexer.k_cache.dtype is expected_dtype
+    assert indexer.k_cache.head_dim == expected_head_dim
+    q_result = module.fused_indexer_q_rope_quant(
+        torch.tensor([0]),
+        torch.ones((1, 1, 4), dtype=torch.bfloat16),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        torch.ones((1, 1)),
+        0.5,
+        0.25,
+    )
+    if is_gfx938:
+        assert q_result == "quantized"
+    else:
+        query, scaled_weights = q_result
+        assert query.dtype is torch.bfloat16
+        torch.testing.assert_close(scaled_weights, torch.tensor([[0.125]]))
+
+
+def test_deepseek_v4_bf16_indexer_query_applies_gptj_rope_and_scales_weights():
+    q = torch.tensor(
+        [[[10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0]]],
+        dtype=torch.bfloat16,
+    )
+    # rotary_dim=4: first half is cos, second half is sin. With cos=0 and
+    # sin=1, interleaved GPT-J pairs [a,b] become [-b,a].
+    cos_sin_cache = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+    weights = torch.tensor([[8.0]])
+
+    rotated_q, scaled_weights = (
+        patch_deepseek_v4_attention._bf16_indexer_q_rope(
+            torch.tensor([0]),
+            q,
+            cos_sin_cache,
+            weights,
+            softmax_scale=0.5,
+            head_scale=0.25,
+        )
+    )
+
+    torch.testing.assert_close(
+        rotated_q,
+        torch.tensor(
+            [[[10.0, 20.0, 30.0, 40.0, -2.0, 1.0, -4.0, 3.0]]],
+            dtype=torch.bfloat16,
+        ),
+    )
+    torch.testing.assert_close(scaled_weights, torch.tensor([[1.0]]))
+
+
+@pytest.mark.parametrize(
     ("quant_name", "quant_format", "expert_dtype"),
     (
         ("compressed-tensors", "float-quantized", "fp8"),
