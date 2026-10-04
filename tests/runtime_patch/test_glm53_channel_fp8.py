@@ -47,6 +47,92 @@ def _fake_glm_model_module() -> ModuleType:
     return module
 
 
+def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> None:
+    calls = []
+
+    class Kernel:
+        _hcu_fp8_backend = "lightop"
+
+        def apply_scaled_mm(self, *, A, B, As, Bs, out_dtype, bias, output_shape):
+            del A, B, As, Bs, bias
+            return torch.full(output_shape, -1, dtype=out_dtype)
+
+    def fake_module():
+        module = ModuleType(patch_glm5next_channel_fp8.TARGET_MODULE)
+
+        class Glm5NextDecoderLayer:
+            def __init__(
+                self,
+                vllm_config,
+                config,
+                layer_idx,
+                prefix="",
+                topk_indices_buffer=None,
+                is_mtp_layer=False,
+                **kwargs,
+            ):
+                del vllm_config, config, layer_idx, prefix, topk_indices_buffer, kwargs
+                self.is_mtp_layer = is_mtp_layer
+                self.other_kernel = Kernel()
+                gate = SimpleNamespace(scheme=SimpleNamespace(fp8_linear=Kernel()))
+                self.mlp = SimpleNamespace(
+                    shared_experts=SimpleNamespace(gate_up_proj=gate)
+                )
+
+        module.Glm5NextDecoderLayer = Glm5NextDecoderLayer
+        return module
+
+    deepgemm = ModuleType("deepgemm")
+
+    def fp8_gemm(activation, weight, output):
+        calls.append((activation, weight))
+        output.fill_(7)
+
+    deepgemm.fp8_gemm = fp8_gemm
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
+
+    module = fake_module()
+    assert patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(module)
+    layer = module.Glm5NextDecoderLayer(None, None, 3)
+    gate_kernel = layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    A = torch.ones((2, 4), dtype=torch.float8_e4m3fn)
+    B = torch.ones((3, 4), dtype=torch.float8_e4m3fn).t()
+    kwargs = {
+        "A": A,
+        "B": B,
+        "As": torch.ones((2, 1), dtype=torch.float32),
+        "Bs": torch.ones((3, 1), dtype=torch.float32),
+        "out_dtype": torch.bfloat16,
+        "bias": None,
+        "output_shape": (2, 3),
+    }
+    assert torch.all(gate_kernel.apply_scaled_mm(**kwargs) == 7)
+    assert len(calls) == 1
+    assert torch.all(layer.other_kernel.apply_scaled_mm(**kwargs) == -1)
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(**{**kwargs, "B": B.contiguous()}) == -1
+    )
+    assert len(calls) == 1
+
+    mtp_layer = module.Glm5NextDecoderLayer(None, None, 41, is_mtp_layer=True)
+    mtp_kernel = mtp_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    assert torch.all(mtp_kernel.apply_scaled_mm(**kwargs) == -1)
+    assert len(calls) == 1
+
+    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM")
+    disabled_module = fake_module()
+    patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        disabled_module
+    )
+    disabled_layer = disabled_module.Glm5NextDecoderLayer(None, None, 3)
+    disabled_kernel = (
+        disabled_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    )
+    assert torch.all(disabled_kernel.apply_scaled_mm(**kwargs) == -1)
+    assert len(calls) == 1
+
+
 def _fake_kda_module() -> tuple[ModuleType, type]:
     module = ModuleType(patch_glm5next_kda_conv_weight.TARGET_MODULE)
 

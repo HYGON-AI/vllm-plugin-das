@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import functools
+import os
 import sys
 from types import ModuleType
 
 import torch
+from vllm.logger import init_logger
 
 from ._common import (
     PatchCompatibilityError,
@@ -35,6 +37,10 @@ _QUANT_IGNORE_PATCH_MARKER = "_vllm_hcu_glm5next_quant_ignore_applied"
 _QUANT_IGNORE_WRAPPER_MARKER = "_vllm_hcu_glm5next_quant_ignore_wrapper"
 _MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
 _MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
+_GATE_DEEPGEMM_PATCH_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_applied"
+_GATE_DEEPGEMM_WRAPPER_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_wrapper"
+_GATE_DEEPGEMM_ENV = "VLLM_HCU_GLM53_GATE_UP_DEEPGEMM"
+_LOGGER = init_logger(__name__)
 
 # Channel-INT8 checkpoints quantize a few MLA/indexer projections that the
 # official FP8 checkpoint keeps in BF16, so they are intentionally absent from
@@ -311,6 +317,113 @@ def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
     setattr(decoder_cls, "_vllm_hcu_original_init", original)
     setattr(decoder_cls, "__init__", hcu_decoder_init)
     setattr(decoder_cls, _MHC_PATCH_MARKER, True)
+    return True
+
+
+def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
+    """Opt in to DeepGEMM only for GLM5Next shared-expert gate_up."""
+
+    if os.environ.get(_GATE_DEEPGEMM_ENV) != "1":
+        return False
+    from deepgemm import fp8_gemm
+
+    decoder_cls = vars(glm_model).get("Glm5NextDecoderLayer")
+    if not isinstance(decoder_cls, type):
+        raise PatchCompatibilityError(
+            f"required class {TARGET_MODULE}.Glm5NextDecoderLayer is missing"
+        )
+    original = require_callable(
+        decoder_cls,
+        "__init__",
+        f"{TARGET_MODULE}.Glm5NextDecoderLayer.__init__",
+    )
+    if getattr(decoder_cls, _GATE_DEEPGEMM_PATCH_MARKER, False):
+        if not getattr(original, _GATE_DEEPGEMM_WRAPPER_MARKER, False):
+            raise PatchCompatibilityError("GLM5Next gate DeepGEMM marker is stale")
+        return False
+
+    announced = False
+
+    @functools.wraps(original)
+    def hcu_decoder_init(
+        self,
+        vllm_config,
+        config,
+        layer_idx,
+        prefix="",
+        topk_indices_buffer=None,
+        is_mtp_layer=False,
+        **kwargs,
+    ):
+        original(
+            self,
+            vllm_config,
+            config,
+            layer_idx,
+            prefix,
+            topk_indices_buffer,
+            is_mtp_layer,
+            **kwargs,
+        )
+        if getattr(self, "is_mtp_layer", is_mtp_layer):
+            return
+        mlp = getattr(self, "mlp", None)
+        shared = getattr(mlp, "shared_experts", None)
+        gate = getattr(shared, "gate_up_proj", None)
+        scheme = getattr(gate, "scheme", None)
+        kernel = getattr(scheme, "fp8_linear", None)
+        if (
+            kernel is None
+            or getattr(type(kernel), "_hcu_fp8_backend", None) != "lightop"
+        ):
+            return
+        original_apply = require_callable(
+            kernel, "apply_scaled_mm", "GLM5Next shared gate_up FP8 kernel"
+        )
+
+        def deepgemm_apply(*, A, B, As, Bs, out_dtype, bias, output_shape):
+            if (
+                isinstance(A, torch.Tensor)
+                and isinstance(B, torch.Tensor)
+                and isinstance(As, torch.Tensor)
+                and isinstance(Bs, torch.Tensor)
+                and A.ndim == B.ndim == 2
+                and A.dtype == B.dtype == torch.float8_e4m3fn
+                and As.dtype == Bs.dtype == torch.float32
+                and A.device == B.device == As.device == Bs.device
+                and A.is_contiguous()
+                and B.shape[0] == A.shape[1]
+                and B.stride() == (1, A.shape[1])
+                and As.numel() == A.shape[0]
+                and Bs.numel() == B.shape[1]
+                and out_dtype in (torch.bfloat16, torch.float16)
+            ):
+                nonlocal announced
+                output = torch.empty(
+                    (A.shape[0], B.shape[1]), device=A.device, dtype=out_dtype
+                )
+                fp8_gemm((A, As), (B, Bs), output)
+                if bias is not None:
+                    output += bias
+                if not announced:
+                    announced = True
+                    _LOGGER.info("GLM5Next shared gate_up uses DeepGEMM")
+                return output.view(*output_shape)
+            return original_apply(
+                A=A,
+                B=B,
+                As=As,
+                Bs=Bs,
+                out_dtype=out_dtype,
+                bias=bias,
+                output_shape=output_shape,
+            )
+
+        kernel.apply_scaled_mm = deepgemm_apply
+
+    setattr(hcu_decoder_init, _GATE_DEEPGEMM_WRAPPER_MARKER, True)
+    decoder_cls.__init__ = hcu_decoder_init
+    setattr(decoder_cls, _GATE_DEEPGEMM_PATCH_MARKER, True)
     return True
 
 
@@ -626,6 +739,7 @@ def apply_to_module(module: ModuleType) -> bool:
     glm_model = load_exact_module(TARGET_MODULE, module)
     changed = _patch_multimodal_quant_ignore(glm_model)
     changed = _patch_glm5next_boltops_mhc(glm_model) or changed
+    changed = _patch_glm5next_shared_gate_deepgemm(glm_model) or changed
     kpool = sys.modules.get(KPOOL_MODULE)
     if isinstance(kpool, ModuleType):
         changed = _patch_sparse_indexer_kpool(kpool)
