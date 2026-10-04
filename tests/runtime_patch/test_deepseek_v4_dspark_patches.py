@@ -717,6 +717,23 @@ def test_load_weights_exposes_channel_scale_alias_only_to_official_loader() -> N
 def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
     calls: list[tuple[object, ...]] = []
 
+    class DeepseekV4DecoderLayer:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+            fuse_heterogeneous_shared_expert=False,
+        ) -> None:
+            del (
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                fuse_heterogeneous_shared_expert,
+            )
+
     class DeepseekV4Model:
         aux_hidden_state_layers: tuple[int, ...] = ()
 
@@ -736,6 +753,7 @@ def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
 
     module = _module(
         patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4DecoderLayer=DeepseekV4DecoderLayer,
         DeepseekV4Model=DeepseekV4Model,
         DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
     )
@@ -750,6 +768,147 @@ def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
     causal.set_aux_hidden_state_layers((4, 8, 12))
     assert causal.model.aux_hidden_state_layers == (4, 8, 12)
     assert causal.supports_eagle3 is True
+
+
+def test_dspark_target_binds_boltops_mhc_and_preserves_official_norm() -> None:
+    bind = getattr(
+        patch_deepseek_v4_dspark_target,
+        "_bind_deepseek_v4_boltops_mhc",
+        None,
+    )
+    assert callable(bind), "DeepSeek-V4 must expose a model-scoped mHC binder"
+
+    one = torch.tensor(1.0)
+    two = torch.tensor(2.0)
+    three = torch.tensor(3.0)
+    four = torch.tensor(4.0)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class Backend:
+        @staticmethod
+        def mhc_pre(*args):
+            calls.append(("pre", args))
+            return one, two, three
+
+        @staticmethod
+        def mhc_post(*args):
+            calls.append(("post", args))
+            return four
+
+        @staticmethod
+        def mhc_fused_post_pre(*args):
+            calls.append(("fused", args))
+            return one, two, three, four
+
+    class Op:
+        def __init__(self) -> None:
+            self._forward_method = lambda *args, **kwargs: None
+
+    layer = SimpleNamespace(
+        mhc_pre=Op(),
+        mhc_post=Op(),
+        mhc_fused_post_pre=Op(),
+    )
+    mhc = SimpleNamespace(
+        _apply_mhc_norm=lambda value, weight, eps: value + weight + eps
+    )
+    bind(layer, mhc, Backend)
+
+    pre = layer.mhc_pre._forward_method(
+        one,
+        one,
+        one,
+        one,
+        1e-5,
+        0.0,
+        0.0,
+        1.0,
+        1,
+        norm_weight=two,
+        norm_eps=0.5,
+    )
+    post = layer.mhc_post._forward_method(one, one, one, one)
+    fused = layer.mhc_fused_post_pre._forward_method(
+        one,
+        one,
+        one,
+        one,
+        one,
+        one,
+        one,
+        1e-5,
+        0.0,
+        0.0,
+        1.0,
+        1,
+        norm_weight=two,
+        norm_eps=0.5,
+    )
+
+    assert pre[:2] == (one, two)
+    assert torch.equal(pre[2], torch.tensor(5.5))
+    assert post is four
+    assert fused[:3] == (one, two, three)
+    assert torch.equal(fused[3], torch.tensor(6.5))
+    assert [name for name, _ in calls] == ["pre", "post", "fused"]
+    assert len(calls[0][1]) == 10
+    assert len(calls[2][1]) == 14
+
+
+def test_dspark_target_binds_every_constructed_decoder_mhc_instance() -> None:
+    original_forward_method = lambda *args, **kwargs: None
+
+    class Op:
+        def __init__(self) -> None:
+            self._forward_method = original_forward_method
+
+    class DeepseekV4DecoderLayer:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+            fuse_heterogeneous_shared_expert=False,
+        ) -> None:
+            del (
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                fuse_heterogeneous_shared_expert,
+            )
+            self.mhc_pre = Op()
+            self.mhc_post = Op()
+            self.mhc_fused_post_pre = Op()
+
+    class DeepseekV4Model:
+        def forward(
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds=None,
+        ):
+            del input_ids, positions, intermediate_tensors, inputs_embeds
+            return None
+
+    class DeepseekV4ForCausalLM:
+        pass
+
+    module = _module(
+        patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4DecoderLayer=DeepseekV4DecoderLayer,
+        DeepseekV4Model=DeepseekV4Model,
+        DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
+    )
+    patch_deepseek_v4_dspark_target.apply_to_module(module)
+
+    layer = DeepseekV4DecoderLayer(object(), "model.layers.0")
+
+    assert layer.mhc_pre._forward_method is not original_forward_method
+    assert layer.mhc_post._forward_method is not original_forward_method
+    assert layer.mhc_fused_post_pre._forward_method is not original_forward_method
 
 
 def test_dspark_ragged_copy_grows_to_real_nnz_without_overflow() -> None:
@@ -962,6 +1121,23 @@ def test_attention_patch_rejects_incompatible_forward_signature() -> None:
 
 
 def test_dspark_target_patch_rejects_incompatible_forward_signature() -> None:
+    class DeepseekV4DecoderLayer:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+            fuse_heterogeneous_shared_expert=False,
+        ) -> None:
+            del (
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                fuse_heterogeneous_shared_expert,
+            )
+
     class DeepseekV4Model:
         def forward(self, input_ids):
             return input_ids
@@ -971,6 +1147,7 @@ def test_dspark_target_patch_rejects_incompatible_forward_signature() -> None:
 
     module = _module(
         patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4DecoderLayer=DeepseekV4DecoderLayer,
         DeepseekV4Model=DeepseekV4Model,
         DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
     )
