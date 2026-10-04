@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import os
@@ -763,23 +764,42 @@ def _expected_evalscope_model_names(model: str) -> set[str]:
     return names
 
 
-def _normalize_humaneval_completion(completion: str) -> str:
-    """Remove one complete or truncated Markdown fence around Python code."""
+def _normalize_humaneval_completion(
+    completion: str,
+    *,
+    entry_point: str | None = None,
+) -> str:
+    """Normalize fenced code and safely unindent a complete target module."""
 
     opening = re.search(
         r"(?m)^[ \t]*```(?:python|py)?[ \t]*\r?\n",
         completion,
     )
     if opening is None:
-        return completion.strip("\r\n")
-    code = completion[opening.end() :]
-    closing = re.search(r"(?m)^[ \t]*```[ \t]*$", code)
-    if closing is not None:
-        code = code[: closing.start()]
+        code = completion
+    else:
+        code = completion[opening.end() :]
+        closing = re.search(r"(?m)^[ \t]*```[ \t]*$", code)
+        if closing is not None:
+            code = code[: closing.start()]
     # HumanEval accepts either a complete function or only the indented body.
     # Removing generic whitespace would turn a valid body-only completion into
     # an invalid top-level ``return`` statement.
-    return code.strip("\r\n")
+    code = code.strip("\r\n")
+    if entry_point and code.startswith((" ", "\t")):
+        candidate = code.lstrip(" \t")
+        try:
+            module = ast.parse(candidate)
+        except (MemoryError, RecursionError, SyntaxError):
+            pass
+        else:
+            if any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == entry_point
+                for node in module.body
+            ):
+                return candidate
+    return code
 
 
 def _check_humaneval_completion(
@@ -832,7 +852,11 @@ def _normalized_humaneval_score(
                 f"missing HumanEval prediction in {review_path}"
             )
         task_id = str(problem.get("task_id", record.get("index", "unknown")))
-        completion = _normalize_humaneval_completion(prediction)
+        entry_point = problem.get("entry_point")
+        completion = _normalize_humaneval_completion(
+            prediction,
+            entry_point=(entry_point if isinstance(entry_point, str) else None),
+        )
         result = _check_humaneval_completion(problem, completion, timeout=4)
         if bool(result.get("passed", False)):
             passed += 1
@@ -880,6 +904,20 @@ def _assert_exact_pass_criteria(
     expected_predictions = int(criteria["num_predictions"])
     expected_reviews = int(criteria["num_reviews"])
     enforce_score = bool(criteria.get("enforce_score", True))
+    normalize_code_fences = bool(
+        criteria.get("normalize_code_fences", False)
+    )
+    record_normalized_score = bool(
+        criteria.get("record_normalized_score", False)
+    )
+    sandbox = config.get("evalscope", {}).get("sandbox")
+    sandbox_enabled = (
+        isinstance(sandbox, dict) and sandbox.get("enabled") is True
+    )
+    if record_normalized_score and not normalize_code_fences:
+        raise TypeError(
+            "record_normalized_score requires normalize_code_fences"
+        )
     metric_expectations = {
         metric: float(criteria[metric])
         for metric in ("mean_acc", "mean_acc_pass@1")
@@ -910,10 +948,33 @@ def _assert_exact_pass_criteria(
         verdicts = [
             f"diagnostic criterion: {dataset} score enforcement disabled; "
             f"predictions={prediction_count}, reviews={review_count}",
+        ]
+        if record_normalized_score:
+            if dataset.casefold() != "humaneval":
+                raise TypeError(
+                    "record_normalized_score is supported only for HumanEval"
+                )
+            if sandbox_enabled:
+                raise TypeError(
+                    "record_normalized_score cannot reexecute sandboxed "
+                    "HumanEval output on the host"
+                )
+            normalized_score, normalized_report = _normalized_humaneval_score(
+                work_dir,
+                model=model,
+                dataset=dataset,
+                expected_reviews=expected_reviews,
+            )
+            verdicts.append(
+                "diagnostic normalized HumanEval "
+                f"score={normalized_score:.4f}, "
+                f"report={normalized_report}"
+            )
+        verdicts.append(
             f"artifact counts: predictions={prediction_count}, "
             f"reviews={review_count}, prediction_path={prediction_path}, "
-            f"review_path={review_path}",
-        ]
+            f"review_path={review_path}"
+        )
         with _open_log(eval_log_path) as eval_log:
             eval_log.write(("\n".join(verdicts) + "\n").encode())
         return
@@ -937,9 +998,7 @@ def _assert_exact_pass_criteria(
 
     normalized_score: float | None = None
     normalized_report: Path | None = None
-    sandbox = config.get("evalscope", {}).get("sandbox")
-    sandbox_enabled = isinstance(sandbox, dict) and sandbox.get("enabled") is True
-    if bool(criteria.get("normalize_code_fences", False)) and not sandbox_enabled:
+    if normalize_code_fences and not sandbox_enabled:
         if dataset.casefold() != "humaneval":
             raise TypeError(
                 "normalize_code_fences is supported only for HumanEval"

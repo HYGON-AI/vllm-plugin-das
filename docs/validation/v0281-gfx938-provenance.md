@@ -219,6 +219,18 @@ acceptance length 3.92 and 97.2% draft-token acceptance. The report observed
 mean TPOT. The feature route allocated 744,896 KV tokens; evidence is under
 `/tmp/vllm-hcu-evalscope/v0281-gfx938-glm52-channel-int8-tp8`.
 
+The later `/models/Kimi-K2.6` checkpoint was validated as a language-only TP8
+route with HcuGPUModelRunnerV2, regular FLASHMLA, Triton WNA16 MoE, prefix
+caching, BF16/auto LBNHC KV, and default FULL_AND_PIECEWISE Graphs. The
+checkpoint has no MTP layers. Its complete HumanEval-64 Instant-mode run used
+the checkpoint README's recommended temperature 0.6 and top-p 0.95, produced
+64 predictions and reviews, and passed 54/64 after independent fenced-code and
+full-module normalization. Greedy E4M3 and BF16 controls passed 52/64 and
+51/64 respectively; repeated failures across both KV formats, official
+sampling, and Thinking/Instant controls did not justify an HCU kernel change.
+The profile is diagnostic and makes no 64/64 accuracy claim. Full evidence and
+the exact command are in `docs/validation/kimi-k26-gfx938-humaneval64.md`.
+
 ## Source closure after runtime fixes
 
 - Changed-file focused suite after review fixes: `581 passed, 3 skipped, 14 warnings`.
@@ -230,6 +242,12 @@ mean TPOT. The feature route allocated 744,896 KV tokens; evidence is under
   with 16 predictions, reviews, and successful code executions per profile.
 - GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with
   16 predictions, reviews, and successful code executions.
+- Kimi-K2.6 live TP8 diagnostic: Instant official sampling produced 64
+  predictions/reviews and normalized HumanEval `54/64`; service, prefix,
+  default Graph, FLASHMLA/LBNHC, and Triton WNA16 routes passed.
+- Kimi changed-file focused suite: `51 passed, 1 deselected`; its diagnostic gate
+  accepted the recorded 64 predictions/reviews and recorded the normalized
+  score without enforcing a fixed stochastic result.
 - Current profile/report focused suite: `58 passed, 1 skipped`.
 - Skill validation: `Skill is valid!`; repository/skill PAT-pattern scan:
   clean; `git diff --check`: clean.
@@ -238,8 +256,10 @@ HumanEval executes model-generated code. The harness now requires an explicit
 EvalScope sandbox or the operator assertion
 `VLLM_HCU_HUMANEVAL_ISOLATED=1`; merely detecting a container is not treated
 as a security boundary. Sandbox results are not re-executed by the local
-normalizer, and diagnostic profiles check artifact counts without a second
-code execution. The evaluator receives an isolated HOME and an explicit
+normalizer. Diagnostic profiles normally check only artifact counts; an
+explicit `record_normalized_score` option may re-run HumanEval checks only at
+an already isolated host boundary, recording but not enforcing the score.
+The evaluator receives an isolated HOME and an explicit
 credential denylist. EvalScope API keys are passed through a protected
 environment to a Python launcher and do not appear in OS argv or persisted
 command logs.

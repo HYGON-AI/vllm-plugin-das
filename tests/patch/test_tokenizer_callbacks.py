@@ -66,12 +66,15 @@ def test_kimi_callback_sets_regex_only_for_target_and_is_marker_idempotent():
 
     other = tokenizer_class.from_pretrained("Qwen3-8B", custom=1)
     kimi = tokenizer_class.from_pretrained("moonshot/Kimi-K2.5", custom=2)
+    kimi_k26 = tokenizer_class.from_pretrained("/models/Kimi-K2.6", custom=3)
 
     assert other[2]["custom"] == 1
     assert "fix_mistral_regex" not in other[2]
     assert kimi[2]["custom"] == 2
     assert kimi[2]["fix_mistral_regex"] is True
-    assert len(calls) == 2
+    assert kimi_k26[2]["custom"] == 3
+    assert kimi_k26[2]["fix_mistral_regex"] is True
+    assert len(calls) == 3
 
 
 def test_kimi_callback_retries_only_the_known_backend_tokenizer_error():

@@ -30,6 +30,11 @@ Available local configurations:
   excluded.
 - `deepseek_r1_gsm8k_evalscope.yaml`: DeepSeek-R1 Channel-FP8 W8A8 server
   plus EvalScope GSM8K.
+- `kimi_k26_gfx938_humaneval64.yaml`: Kimi-K2.6 language-only TP8 route with
+  Model Runner V2, FLASHMLA, Triton WNA16 MoE, the `kimi_k2` reasoning parser,
+  prefix caching, default CUDA Graph policy, and a diagnostic HumanEval-64
+  gate that records artifact counts and a normalized score without enforcing
+  a fixed stochastic result. The profile does not claim a 64/64 accuracy pass.
 - `deepseek_v4_flash_0731_dspark_humaneval.yaml`: DeepSeek-V4-Flash-0731
   Channel-FP8 TP8 and unified DP8+EP8 DSpark server profiles plus strict
   ModelScope HumanEval-32 acceptance.

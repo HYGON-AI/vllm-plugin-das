@@ -14,6 +14,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 import psutil
@@ -884,7 +885,7 @@ def _write_exact_humaneval_artifacts(
                     "sample_score": {
                         "score": {
                             "prediction": (
-                                "```python\ndef candidate(value):\n"
+                                " def candidate(value):\n"
                                 "    return value"
                             )
                         },
@@ -921,8 +922,42 @@ def _accept_normalized_humaneval(
 
 def test_humaneval_fence_normalization_preserves_body_indentation() -> None:
     assert evalscope_server._normalize_humaneval_completion(
-        "```python\n    return value\n```"
+        "```python\n    return value\n```",
+        entry_point="candidate",
     ) == "    return value"
+
+
+def test_humaneval_normalization_removes_complete_module_leading_space() -> None:
+    assert evalscope_server._normalize_humaneval_completion(
+        " def candidate(value):\n    return value",
+        entry_point="candidate",
+    ) == "def candidate(value):\n    return value"
+
+
+def test_humaneval_normalization_preserves_indented_helper_body() -> None:
+    completion = "    def helper(value):\n        return value\n    return helper(value)"
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
+
+
+def test_humaneval_normalization_tolerates_ast_resource_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completion = " def candidate(value):\n    return value"
+    monkeypatch.setattr(
+        evalscope_server,
+        "ast",
+        SimpleNamespace(
+            parse=lambda source: (_ for _ in ()).throw(MemoryError())
+        ),
+    )
+
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
 
 
 def test_exact_humaneval_criteria_accepts_both_metrics_and_artifact_counts(
@@ -1015,7 +1050,7 @@ def test_exact_humaneval_criteria_rejects_normalized_failure(
         )
 
 
-def test_exact_humaneval_diagnostic_profile_records_score_without_failing(
+def test_exact_humaneval_diagnostic_profile_skips_normalization_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1041,6 +1076,87 @@ def test_exact_humaneval_diagnostic_profile_records_score_without_failing(
     assert "diagnostic criterion" in (
         tmp_path / "logs/evalscope.log"
     ).read_text()
+
+
+def test_exact_humaneval_diagnostic_profile_records_normalized_score(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completions = _accept_normalized_humaneval(monkeypatch)
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    criteria = config["evalscope"]["pass_criteria"]
+    criteria["enforce_score"] = False
+    criteria["record_normalized_score"] = True
+
+    _assert_pass_criteria(
+        config,
+        model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+        work_dir=tmp_path,
+        eval_log_path=tmp_path / "logs/evalscope.log",
+    )
+
+    assert completions == ["def candidate(value):\n    return value"] * 32
+    log = (tmp_path / "logs/evalscope.log").read_text()
+    assert "diagnostic normalized HumanEval score=1.0000" in log
+    assert "normalized_humaneval.json" in log
+    normalized_report = json.loads(
+        (tmp_path / "reports/normalized_humaneval.json").read_text()
+    )
+    assert normalized_report["passed"] == 32
+    assert normalized_report["score"] == 1.0
+
+
+def test_diagnostic_normalized_score_requires_normalization(
+    tmp_path: Path,
+) -> None:
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    criteria = config["evalscope"]["pass_criteria"]
+    criteria["enforce_score"] = False
+    criteria["normalize_code_fences"] = False
+    criteria["record_normalized_score"] = True
+
+    with pytest.raises(
+        TypeError,
+        match="record_normalized_score requires normalize_code_fences",
+    ):
+        _assert_pass_criteria(
+            config,
+            model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+            work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+
+def test_diagnostic_normalized_score_does_not_escape_evalscope_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    criteria = config["evalscope"]["pass_criteria"]
+    criteria["enforce_score"] = False
+    criteria["record_normalized_score"] = True
+    config["evalscope"]["sandbox"] = {
+        "enabled": True,
+        "engine": "docker",
+    }
+    monkeypatch.setattr(
+        evalscope_server,
+        "_check_humaneval_completion",
+        lambda *_args, **_kwargs: pytest.fail(
+            "sandboxed output must not be reexecuted on the host"
+        ),
+    )
+
+    with pytest.raises(TypeError, match="cannot reexecute sandboxed"):
+        _assert_pass_criteria(
+            config,
+            model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+            work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
 
 
 def test_evalscope_sandbox_does_not_reexecute_completion_on_host(

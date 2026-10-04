@@ -69,7 +69,10 @@ def _require_from_pretrained(tokenizer_class: type) -> tuple[classmethod, Any]:
 
 def _is_kimi_k25(path_or_repo_id: object) -> bool:
     model_id = str(path_or_repo_id).lower()
-    return "kimi-k2.5" in model_id or "kimi_k25" in model_id
+    return any(
+        marker in model_id
+        for marker in ("kimi-k2.5", "kimi-k2.6", "kimi_k25")
+    )
 
 
 def _is_backend_tokenizer_attr_error(error: BaseException) -> bool:
@@ -81,7 +84,7 @@ def _is_backend_tokenizer_attr_error(error: BaseException) -> bool:
 
 
 def apply_kimi_k25_tokenizer(module: ModuleType) -> bool:
-    """Install the Kimi K2.5 Mistral-regex compatibility wrapper."""
+    """Install the Kimi K2.5/K2.6 Mistral-regex compatibility wrapper."""
 
     tokenizer_module = require_exact_module(module, TARGET_MODULE)
     tokenizer_class = require_type(
