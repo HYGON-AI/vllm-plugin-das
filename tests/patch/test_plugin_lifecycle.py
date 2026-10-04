@@ -713,6 +713,16 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     assert "execute_model" in adapter.__dict__
 
 
+def test_worker_allocates_separate_dspark_workspace_lane(
+    cpu_safe_hcu_worker_module,
+):
+    spec_config = SimpleNamespace(use_dspark=lambda: True)
+    config = SimpleNamespace(speculative_config=spec_config)
+
+    assert cpu_safe_hcu_worker_module._num_workspace_lanes(config, True) == 2
+    assert cpu_safe_hcu_worker_module._num_workspace_lanes(config, False) == 1
+
+
 def test_worker_does_not_terminal_validate_after_failed_parent_load(
     monkeypatch,
     cpu_safe_hcu_worker_module,
