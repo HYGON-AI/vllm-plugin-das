@@ -394,8 +394,10 @@ def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
                 and A.is_contiguous()
                 and B.shape[0] == A.shape[1]
                 and B.stride() == (1, A.shape[1])
-                and As.numel() == A.shape[0]
-                and Bs.numel() == B.shape[1]
+                and As.shape == (A.shape[0], 1)
+                and Bs.shape == (B.shape[1], 1)
+                and As.is_contiguous()
+                and Bs.is_contiguous()
                 and out_dtype in (torch.bfloat16, torch.float16)
             ):
                 nonlocal announced

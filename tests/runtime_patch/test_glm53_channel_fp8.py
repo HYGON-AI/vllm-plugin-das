@@ -109,6 +109,33 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
     }
     assert torch.all(gate_kernel.apply_scaled_mm(**kwargs) == 7)
     assert len(calls) == 1
+    # An equal element count is insufficient: the original scaled-mm contract
+    # rejects transposed scale layouts, so they must stay on the original path.
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "As": torch.ones((1, 2), dtype=torch.float32)}
+        )
+        == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "Bs": torch.ones((1, 3), dtype=torch.float32)}
+        )
+        == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "As": torch.ones((2, 2), dtype=torch.float32)[:, :1]}
+        )
+        == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "Bs": torch.ones((3, 2), dtype=torch.float32)[:, :1]}
+        )
+        == -1
+    )
+    assert len(calls) == 1
     assert torch.all(layer.other_kernel.apply_scaled_mm(**kwargs) == -1)
     assert torch.all(
         gate_kernel.apply_scaled_mm(**{**kwargs, "B": B.contiguous()}) == -1
