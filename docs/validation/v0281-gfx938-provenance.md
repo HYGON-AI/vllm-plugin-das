@@ -111,3 +111,65 @@ python -m pytest --import-mode=importlib -q \
 ```
 
 Result: `58 passed, 14 warnings in 107.64s`.
+
+## Source-tree model matrix
+
+The following results were produced from the validation worktree with the
+pinned vLLM runtime above. All successful service launches used
+HcuGPUModelRunnerV2 and the resolved default Graph policy; no accuracy result
+was rescued with `--enforce-eager`. Exact arguments, ports, request protocol,
+and owned artifact directories are defined in
+`tests/models/v0281_gfx938_humaneval16.yaml`.
+
+| Profile | Topology and feature route | HumanEval16 | Disposition |
+| --- | --- | ---: | --- |
+| `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
+| `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass |
+| `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass |
+| `glm51_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass; EvalScope artifact ID collapses repeated underscores |
+| `hy4_preview_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass after `indexed_attention` and `reasoning_effort=no_think` fixes |
+| `minimax_m25_int8_tp4` | TP4, FLASH_ATTN, HND/BHSD kernel view, AITER, prefix | 16/16 | Pass |
+| `qwen2_57b_tp2` | TP2, FLASH_ATTN, HND/BHSD kernel view, prefix | 15/16 | Deterministic HumanEval/10 miss under both AITER and Triton MoE; retained as checkpoint/model outcome |
+| `qwen3_30b_int8_tp2` | TP2, FLASH_ATTN, HND/BHSD kernel view | 5/16 | AITER and Triton MoE both 5/16; dense route 6/16; direct INT8 kernel probes pass, so no backend-specific fix was justified |
+| `qwen3_8b_tp2` | TP2, FLASH_ATTN, native FP8 E4M3 KV, prefix | 16/16 | Pass; BF16 control also 16/16 |
+| `qwen35_35b_tp2` | TP2, FLASH_ATTN, AITER BF16 MoE, MTP3, prefix | 16/16 | Pass |
+| `qwen35_35b_w8a8_tp2` | TP2, FLASH_ATTN, AITER INT8 MoE, E4M3 KV, MTP3 | 16/16 | Pass |
+| `qwen36_27b_w8a8_tp2` | TP2, FLASH_ATTN, W8A8, prefix | 15/16 | Deterministic HumanEval/8 miss retained |
+| `qwen38_27b_int8_tp2` | TP2, FLASH_ATTN, INT8, prefix | 16/16 | Pass |
+| `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, AITER FP8 MoE, E4M3 KV, MTP3 | 16/16 | Pass; prefix hits observed |
+| `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, AITER, MTP3 | 16/16 | Pass |
+
+DeepSeek V4.1 was explicitly excluded at the requester's direction. The
+optional current-branch HY4 DP8/TP1/EP8 rerun subsequently passed 16/16 with
+MTP3, E4M3 sparse KV, DeepEP low-latency/DeepGEMM, MRV2 on all eight ranks,
+and default FULL_AND_PIECEWISE target/speculator Graph capture. Its artifacts
+are under `/tmp/vllm-hcu-evalscope/v0281-gfx938-hy4-dp8-ep8-mtp3`. The
+generic two-request prefix probe was not accepted as DP8 evidence because its
+requests landed on different ranks; no current-branch DP8 prefix-hit claim is
+made.
+
+## Source closure after runtime fixes
+
+- Changed-file focused suite after review fixes: `581 passed, 3 skipped, 14 warnings`.
+- Full `tests/runtime_patch`: `1669 passed, 14 warnings`.
+- Full `tests/models/hy_v4`: `222 passed, 14 warnings`.
+- HY4 live TP8 gate: `16/16`, 16 predictions and reviews, final observed
+  prefix hit rate about 34.3%, final-window MTP acceptance about 91.3%.
+- Skill validation: `Skill is valid!`; repository/skill PAT-pattern scan:
+  clean; `git diff --check`: clean.
+
+HumanEval executes model-generated code. The harness now requires an explicit
+EvalScope sandbox or the operator assertion
+`VLLM_HCU_HUMANEVAL_ISOLATED=1`; merely detecting a container is not treated
+as a security boundary. Sandbox results are not re-executed by the local
+normalizer, and diagnostic profiles check artifact counts without a second
+code execution. The evaluator receives an isolated HOME and an explicit
+credential denylist. EvalScope API keys are passed through a protected
+environment to a Python launcher and do not appear in OS argv or persisted
+command logs.
+Inherited outbound proxies are preserved for dataset access while loopback is
+always added to `NO_PROXY`; the vLLM server ignores inherited proxies but
+honors an explicitly configured server proxy.
+
+The final clean plugin-wheel commit, filename, SHA256, and isolated import
+roots are appended after the reviewed source changes are committed.

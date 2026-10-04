@@ -1210,6 +1210,23 @@ def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
     )
 
 
+def test_deepseek_v4_enables_breakable_cuda_graph_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variable = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+    monkeypatch.delenv(variable, raising=False)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            enforce_eager=False,
+        )
+    )
+
+    patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
+
+    assert os.environ[variable] == "1"
+
+
 @pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])
 def test_deepseek_v4_dspark_rejects_unvalidated_pd_connectors(
     connector: str,
@@ -1673,6 +1690,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
         block_size=16,
+        cache_dtype="fp8_e4m3",
         kv_cache_dtype_skip_layers=[],
     )
     config.attention_config = SimpleNamespace(
@@ -1689,6 +1707,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.block_size == 64
+    assert config.cache_config.cache_dtype == "fp8_ds_mla"
 
     config.cache_config.block_size = 16
 

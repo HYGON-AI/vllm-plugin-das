@@ -33,6 +33,7 @@ _HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "HYV4ForCausalLM",
         "HYV4MTPModel",
+        "DeepseekV4ForCausalLM",
         "Glm5NextForCausalLM",
         "Glm5NextForConditionalGeneration",
         "Glm5NextMTPModel",

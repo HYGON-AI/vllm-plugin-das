@@ -1487,6 +1487,15 @@ def rocm_aiter_sparse_attn_indexer_native(
             #     scale_fmt,
             # )
 
+    if has_prefill:
+        prefill_metadata = layer_attn_metadata.prefill
+        assert prefill_metadata is not None
+        # CUDA-graph memory profiling can advertise padded prefill tokens while
+        # producing no real prefill chunks. There is no KV gather or top-k work
+        # to perform for that placeholder metadata.
+        if not prefill_metadata.chunks:
+            has_prefill = False
+
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill

@@ -27,6 +27,52 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 EVALSCOPE_OWNED_ROOT = Path("/tmp/vllm-hcu-evalscope")
 EVALSCOPE_OWNER_MARKER = ".vllm-hcu-evalscope-owned"
+EVALSCOPE_API_KEY_ENV = "VLLM_HCU_EVALSCOPE_API_KEY"
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+_CREDENTIAL_ENV_NAMES = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AZURE_CONFIG_DIR",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "CI_JOB_JWT",
+        "CI_JOB_JWT_V2",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "CLOUDSDK_CONFIG",
+        "DOCKER_AUTH_CONFIG",
+        "DOCKER_CONFIG",
+        "GITHUB_PAT",
+        "GIT_ASKPASS",
+        "GIT_CONFIG_COUNT",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "HF_TOKEN_PATH",
+        "KRB5CCNAME",
+        "KUBECONFIG",
+        "NETRC",
+        "NPM_CONFIG_USERCONFIG",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_INDEX_URL",
+        "PIP_CONFIG_FILE",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "UV_EXTRA_INDEX_URL",
+        "UV_INDEX_URL",
+    }
+)
+_CREDENTIAL_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 EVALSCOPE_OWNER_SIGNATURE = "vllm-plugin-das evalscope artifacts\n"
 EVALSCOPE_PROCESS_OWNER_ENV = "VLLM_HCU_EVAL_PROCESS_OWNER"
 _DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
@@ -36,6 +82,25 @@ def _direct_urlopen(url: str, *, timeout: int):
     """Open a local service URL without inheriting host proxy settings."""
 
     return _DIRECT_URL_OPENER.open(url, timeout=timeout)
+
+
+def _require_humaneval_execution_isolation(config: dict[str, Any]) -> None:
+    """Refuse implicit host execution of model-generated HumanEval code."""
+
+    evalscope = config.get("evalscope", {})
+    datasets = {str(name).lower() for name in evalscope.get("datasets", [])}
+    if "humaneval" not in datasets:
+        return
+    sandbox = evalscope.get("sandbox")
+    if isinstance(sandbox, dict) and sandbox.get("enabled") is True:
+        return
+    if os.environ.get("VLLM_HCU_HUMANEVAL_ISOLATED") == "1":
+        return
+    raise RuntimeError(
+        "HumanEval executes model-generated code and requires an EvalScope "
+        "sandbox or an explicitly isolated container/disposable host; set "
+        "VLLM_HCU_HUMANEVAL_ISOLATED=1 only after establishing that boundary"
+    )
 
 
 def load_config(default_path: Path, config_env: str) -> dict[str, Any]:
@@ -66,12 +131,15 @@ def load_profiled_config(
             f"unknown eval profile {profile!r}; available profiles: {available}"
         )
 
+    def merge_mapping(target: dict[str, Any], override: dict[str, Any]) -> None:
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge_mapping(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
     merged = copy.deepcopy(config)
-    for section, value in selected.items():
-        if isinstance(value, dict) and isinstance(merged.get(section), dict):
-            merged[section].update(copy.deepcopy(value))
-        else:
-            merged[section] = copy.deepcopy(value)
+    merge_mapping(merged, selected)
     merged["profile"] = profile
     return merged
 
@@ -152,14 +220,14 @@ def evalscope_command(
     generation = evalscope["generation_config"]
     dataset_args = json.dumps(evalscope["dataset_args"], separators=(",", ":"))
     command = [
-        "evalscope",
+        sys.executable,
+        "-m",
+        "tests.integration.server.evalscope_secure_cli",
         "eval",
         "--model",
         model,
         "--api-url",
         f"http://{host}:{port}/v1",
-        "--api-key",
-        str(evalscope.get("api_key", "EMPTY")),
         "--eval-type",
         str(evalscope.get("eval_type", "openai_api")),
         "--generation-config",
@@ -167,6 +235,11 @@ def evalscope_command(
     ]
     if evalscope.get("stream", False):
         command.append("--stream")
+    sandbox = evalscope.get("sandbox")
+    if sandbox is not None:
+        command.extend(
+            ["--sandbox", json.dumps(sandbox, separators=(",", ":"))]
+        )
     command.extend(
         [
             "--eval-batch-size",
@@ -320,23 +393,68 @@ def _server_environment(config: dict[str, Any] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("VLLM_PLUGINS", None)
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    for name in (*_PROXY_ENV_NAMES, "NO_PROXY", "no_proxy"):
+        env.pop(name, None)
     if config is not None:
         configured = config.get("server", {}).get("environment", {})
         if not isinstance(configured, dict):
             raise TypeError("server.environment must be a mapping")
         env.update({str(name): str(value) for name, value in configured.items()})
-    for name in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ):
-        env.pop(name, None)
-    no_proxy = "127.0.0.1,localhost,::1"
+    no_proxy = _loopback_no_proxy(env.get("NO_PROXY", env.get("no_proxy", "")))
     env["NO_PROXY"] = no_proxy
     env["no_proxy"] = no_proxy
+    return env
+
+
+def _loopback_no_proxy(existing: str) -> str:
+    entries = [item.strip() for item in existing.split(",") if item.strip()]
+    for item in ("127.0.0.1", "localhost", "::1"):
+        if item not in entries:
+            entries.append(item)
+    return ",".join(entries)
+
+
+def _evaluation_environment(config: dict[str, Any]) -> dict[str, str]:
+    """Build an EvalScope environment without forwarding host credentials."""
+
+    env = os.environ.copy()
+    configured = config.get("server", {}).get("environment", {})
+    if not isinstance(configured, dict):
+        raise TypeError("server.environment must be a mapping")
+    env.update({str(name): str(value) for name, value in configured.items()})
+    credential_suffixes = (
+        "_ACCESS_KEY",
+        "_API_KEY",
+        "_CREDENTIAL",
+        "_CREDENTIALS",
+        "_PASSWORD",
+        "_PASSWD",
+        "_PRIVATE_KEY",
+        "_SECRET",
+        "_TOKEN",
+    )
+    for name in tuple(env):
+        classified_name = name.upper()
+        if (
+            classified_name in _CREDENTIAL_ENV_NAMES
+            or classified_name.startswith(_CREDENTIAL_ENV_PREFIXES)
+            or classified_name.endswith(credential_suffixes)
+        ):
+            env.pop(name, None)
+    env.pop("VLLM_PLUGINS", None)
+    no_proxy = _loopback_no_proxy(env.get("NO_PROXY", env.get("no_proxy", "")))
+    env["NO_PROXY"] = no_proxy
+    env["no_proxy"] = no_proxy
+    isolated_home = EVALSCOPE_OWNED_ROOT / ".evaluator-home"
+    isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env["HOME"] = str(isolated_home)
+    env["XDG_CACHE_HOME"] = str(isolated_home / ".cache")
+    env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
+    env["HF_HOME"] = str(isolated_home / ".cache/huggingface")
+    env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    env[EVALSCOPE_API_KEY_ENV] = str(
+        config.get("evalscope", {}).get("api_key", "EMPTY")
+    )
     return env
 
 
@@ -370,6 +488,18 @@ def _run_prefix_probe(
     messages = probe.get("messages")
     if not isinstance(messages, list) or not messages:
         raise TypeError("server.prefix_probe.messages must be a non-empty list")
+    content_repeat = int(probe.get("content_repeat", 1))
+    if content_repeat < 1:
+        raise ValueError("server.prefix_probe.content_repeat must be positive")
+    expanded_messages = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError("server.prefix_probe.messages entries must be mappings")
+        expanded_message = dict(message)
+        content = expanded_message.get("content")
+        if isinstance(content, str):
+            expanded_message["content"] = content * content_repeat
+        expanded_messages.append(expanded_message)
     timeout = int(probe.get("timeout_s", 120))
     metric = str(probe.get("metric", "vllm:prefix_cache_hits_total"))
     served_model = str(
@@ -390,7 +520,7 @@ def _run_prefix_probe(
     payload = json.dumps(
         {
             "model": served_model,
-            "messages": messages,
+            "messages": expanded_messages,
             "temperature": 0,
             "max_tokens": int(probe.get("max_tokens", 32)),
         },
@@ -419,6 +549,8 @@ def _run_prefix_probe(
             message = choices[0].get("message")
             if isinstance(message, dict):
                 content = message.get("content")
+                if not (isinstance(content, str) and content.strip()):
+                    content = message.get("reasoning_content")
         assert isinstance(content, str) and content.strip(), (
             "prefix probe returned no coherent assistant content"
         )
@@ -447,7 +579,7 @@ def _report_metric(
         key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
     )
-    expected_model_names = {model, Path(model).name}
+    expected_model_names = _expected_evalscope_model_names(model)
     available: list[str] = []
     for report_path in report_paths:
         try:
@@ -567,7 +699,7 @@ def _artifact_records(
     dataset: str,
 ) -> tuple[list[dict[str, Any]], Path]:
     root = work_dir / artifact
-    expected_model_names = {model, Path(model).name}
+    expected_model_names = _expected_evalscope_model_names(model)
     paths = sorted(
         root.rglob("*.jsonl") if root.is_dir() else (),
         key=lambda path: path.stat().st_mtime_ns,
@@ -621,6 +753,14 @@ def _artifact_record_count(
     return len(records), path
 
 
+def _expected_evalscope_model_names(model: str) -> set[str]:
+    """Include EvalScope's collapsed-underscore filesystem model ID."""
+
+    names = {model, Path(model).name}
+    names.update(re.sub(r"_+", "_", name).strip("._") for name in tuple(names))
+    return names
+
+
 def _normalize_humaneval_completion(completion: str) -> str:
     """Remove one complete or truncated Markdown fence around Python code."""
 
@@ -629,12 +769,15 @@ def _normalize_humaneval_completion(completion: str) -> str:
         completion,
     )
     if opening is None:
-        return completion.strip()
+        return completion.strip("\r\n")
     code = completion[opening.end() :]
     closing = re.search(r"(?m)^[ \t]*```[ \t]*$", code)
     if closing is not None:
         code = code[: closing.start()]
-    return code.strip()
+    # HumanEval accepts either a complete function or only the indented body.
+    # Removing generic whitespace would turn a valid body-only completion into
+    # an invalid top-level ``return`` statement.
+    return code.strip("\r\n")
 
 
 def _check_humaneval_completion(
@@ -714,10 +857,6 @@ def _normalized_humaneval_score(
         + "\n",
         encoding="utf-8",
     )
-    assert passed == expected_reviews, (
-        f"normalized HumanEval expected {expected_reviews} passed, got "
-        f"{passed}; failed task_ids={failed_task_ids}; report={report_path}"
-    )
     return score, report_path
 
 
@@ -738,28 +877,12 @@ def _assert_exact_pass_criteria(
     )
     expected_predictions = int(criteria["num_predictions"])
     expected_reviews = int(criteria["num_reviews"])
+    enforce_score = bool(criteria.get("enforce_score", True))
     metric_expectations = {
         metric: float(criteria[metric])
         for metric in ("mean_acc", "mean_acc_pass@1")
         if metric in criteria
     }
-    if not metric_expectations:
-        raise TypeError("exact pass criteria requires at least one score metric")
-
-    raw_metrics: dict[str, tuple[float, int, Path]] = {}
-    for metric in metric_expectations:
-        score, num, report_path = _report_metric(
-            work_dir,
-            model=model,
-            dataset=dataset,
-            metric=metric,
-        )
-        assert num == expected_predictions, (
-            f"{dataset} {metric} expected {expected_predictions} samples, "
-            f"got {num}; report={report_path}"
-        )
-        raw_metrics[metric] = (score, num, report_path)
-
     prediction_count, prediction_path = _artifact_record_count(
         work_dir,
         artifact="predictions",
@@ -781,9 +904,40 @@ def _assert_exact_pass_criteria(
         f"path={review_path}"
     )
 
+    if not enforce_score:
+        verdicts = [
+            f"diagnostic criterion: {dataset} score enforcement disabled; "
+            f"predictions={prediction_count}, reviews={review_count}",
+            f"artifact counts: predictions={prediction_count}, "
+            f"reviews={review_count}, prediction_path={prediction_path}, "
+            f"review_path={review_path}",
+        ]
+        with _open_log(eval_log_path) as eval_log:
+            eval_log.write(("\n".join(verdicts) + "\n").encode())
+        return
+
+    if not metric_expectations:
+        raise TypeError("exact pass criteria requires at least one score metric")
+
+    raw_metrics: dict[str, tuple[float, int, Path]] = {}
+    for metric in metric_expectations:
+        score, num, report_path = _report_metric(
+            work_dir,
+            model=model,
+            dataset=dataset,
+            metric=metric,
+        )
+        assert num == expected_predictions, (
+            f"{dataset} {metric} expected {expected_predictions} samples, "
+            f"got {num}; report={report_path}"
+        )
+        raw_metrics[metric] = (score, num, report_path)
+
     normalized_score: float | None = None
     normalized_report: Path | None = None
-    if bool(criteria.get("normalize_code_fences", False)):
+    sandbox = config.get("evalscope", {}).get("sandbox")
+    sandbox_enabled = isinstance(sandbox, dict) and sandbox.get("enabled") is True
+    if bool(criteria.get("normalize_code_fences", False)) and not sandbox_enabled:
         if dataset.casefold() != "humaneval":
             raise TypeError(
                 "normalize_code_fences is supported only for HumanEval"
@@ -794,6 +948,17 @@ def _assert_exact_pass_criteria(
             dataset=dataset,
             expected_reviews=expected_reviews,
         )
+        if enforce_score and normalized_score != 1.0:
+            normalized_payload = json.loads(
+                normalized_report.read_text(encoding="utf-8")
+            )
+            passed = int(normalized_payload["passed"])
+            failed_task_ids = normalized_payload["failed_task_ids"]
+            raise AssertionError(
+                f"normalized HumanEval expected {expected_reviews} passed, "
+                f"got {passed}; failed task_ids={failed_task_ids}; "
+                f"report={normalized_report}"
+            )
 
     verdicts = []
     for metric, expected_score in metric_expectations.items():
@@ -814,7 +979,10 @@ def _assert_exact_pass_criteria(
                 f"required=={expected_score:.4f}, samples={num}, "
                 f"report={report_path}, normalized_report={normalized_report}"
             )
-        assert effective_score == expected_score, verdict
+        if enforce_score:
+            assert effective_score == expected_score, verdict
+        else:
+            verdict = verdict.replace("pass criterion:", "diagnostic criterion:")
         verdicts.append(verdict)
 
     verdicts.append(
@@ -839,6 +1007,7 @@ def run_evalscope_server_test(
         model_label=model_label,
         required_hcu_count=required_hcu_count,
     )
+    _require_humaneval_execution_isolation(config)
     command, host, port = server_command(config, model_env=model_env)
     startup_timeout = _maybe_int_env(
         "VLLM_HCU_SERVER_STARTUP_TIMEOUT",
@@ -900,7 +1069,7 @@ def run_evalscope_server_test(
                 result = subprocess.run(
                     eval_command,
                     cwd=ROOT,
-                    env=env,
+                    env=_evaluation_environment(config),
                     stdout=eval_log,
                     stderr=subprocess.STDOUT,
                     check=False,

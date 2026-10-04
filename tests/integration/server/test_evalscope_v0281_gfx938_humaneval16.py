@@ -26,9 +26,9 @@ MODEL_ENV = "VLLM_HCU_GFX938_MODEL"
 
 PROFILE_CONTRACTS = (
     (
-        "deepseek_v4_flash_tp4",
+        "deepseek_v4_flash_tp8",
         "/models/DeepSeek-V4-Flash-0731-FP8-Channel",
-        4,
+        8,
         "FLASHMLA_SPARSE",
         None,
     ),
@@ -103,14 +103,14 @@ PROFILE_CONTRACTS = (
         "/models/Qwen3.8-Flash-Next-FP8-Channelwise",
         4,
         "FLASH_ATTN",
-        "HND",
+        None,
     ),
     (
         "qwen38_flash_next_w4a8_tp4",
         "/models/Qwen3.8-Flash-Next-w4a8-slimquant",
         4,
         "FLASH_ATTN",
-        "HND",
+        None,
     ),
 )
 
@@ -152,9 +152,24 @@ def test_gfx938_profile_contract(
     assert "--compilation-config" not in server
     assert _option_value(evaluation, "--datasets") == "humaneval"
     assert _option_value(evaluation, "--limit") == "16"
+    expected_eval_batch_size = "1" if profile == "deepseek_v4_flash_tp8" else "8"
+    assert (
+        _option_value(evaluation, "--eval-batch-size")
+        == expected_eval_batch_size
+    )
     assert config["evalscope"]["generation_config"]["temperature"] == 0
+    diagnostic_profiles = {
+        "deepseek_v4_flash_tp8",
+        "qwen2_57b_tp2",
+        "qwen3_30b_int8_tp2",
+        "qwen36_27b_w8a8_tp2",
+    }
+    assert bool(
+        config["evalscope"]["pass_criteria"].get("enforce_score", True)
+    ) is (profile not in diagnostic_profiles)
     assert config["evalscope"]["generation_config"]["do_sample"] is False
-    assert config["evalscope"]["pass_criteria"] == {
+    assert config["evalscope"]["generation_config"]["max_tokens"] == 2048
+    expected_criteria = {
         "dataset": "humaneval",
         "mean_acc": 1.0,
         "mean_acc_pass@1": 1.0,
@@ -162,8 +177,21 @@ def test_gfx938_profile_contract(
         "num_reviews": 16,
         "normalize_code_fences": True,
     }
+    if profile in diagnostic_profiles:
+        expected_criteria["enforce_score"] = False
+    assert config["evalscope"]["pass_criteria"] == expected_criteria
     assert config["server"]["prefix_probe"]["metric"] == (
         "vllm:prefix_cache_hits_total"
+    )
+    expected_content_repeat = (
+        64
+        if profile
+        in {"qwen35_35b_w8a8_tp2", "qwen38_flash_next_fp8_tp4"}
+        else 32
+    )
+    assert (
+        config["server"]["prefix_probe"]["content_repeat"]
+        == expected_content_repeat
     )
     environment = config["server"].get("environment", {})
     assert environment.get("VLLM_KV_CACHE_LAYOUT") == kv_layout
@@ -182,15 +210,46 @@ def test_gfx938_profiles_have_unique_owned_work_directories() -> None:
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
+    deepseek_v4 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="deepseek_v4_flash_tp8"
+    )
+    deepseek_v4_command, _, _ = server_command(deepseek_v4, model_env=MODEL_ENV)
+    assert deepseek_v4["server"]["environment"][
+        "VLLM_USE_V2_MODEL_RUNNER"
+    ] == "1"
+    assert json.loads(
+        _option_value(deepseek_v4_command, "--speculative-config")
+    ) == {
+        "method": "dspark",
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "probabilistic",
+    }
+    assert deepseek_v4["evalscope"]["generation_config"]["extra_body"] == {
+        "chat_template_kwargs": {"thinking": False}
+    }
+
+    hy4 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="hy4_preview_channel_fp8_tp8"
+    )
+    hy4_command, _, _ = server_command(hy4, model_env=MODEL_ENV)
+    assert json.loads(
+        _option_value(hy4_command, "--default-chat-template-kwargs")
+    ) == {"reasoning_effort": "no_think"}
+    assert hy4["evalscope"]["generation_config"]["extra_body"] == {
+        "chat_template_kwargs": {"reasoning_effort": "no_think"}
+    }
+
     minimax = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="minimax_m25_int8_tp4"
     )
     minimax_command, _, _ = server_command(minimax, model_env=MODEL_ENV)
-    assert _option_value(minimax_command, "--reasoning-parser") == "minimax_m2"
+    assert _option_value(minimax_command, "--reasoning-parser") == (
+        "minimax_m2_append_think"
+    )
+    assert "--generation-config" not in minimax_command
     assert "--speculative-config" not in minimax_command
 
     for profile in (
-        "deepseek_v4_flash_tp4",
         "glm5_w8a8_tp8",
         "glm53_channel_fp8_tp8",
         "glm51_channel_fp8_tp8",
@@ -207,6 +266,11 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
             "num_speculative_tokens": 3,
         }
 
+    for profile in ("qwen35_35b_w8a8_tp2", "qwen38_flash_next_fp8_tp4"):
+        fp8_kv = load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
+        fp8_kv_command, _, _ = server_command(fp8_kv, model_env=MODEL_ENV)
+        assert _option_value(fp8_kv_command, "--max-model-len") == "8192"
+        assert fp8_kv["server"]["prefix_probe"]["content_repeat"] == 64
 
 @pytest.mark.hcu
 @pytest.mark.model

@@ -662,6 +662,48 @@ def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
         )
 
 
+@pytest.mark.parametrize(
+    ("enable_dbo", "use_dspark", "expected_ubatches", "expected_lanes"),
+    (
+        (False, False, 1, 1),
+        (True, False, 2, 1),
+        (False, True, 1, 2),
+        (True, True, 2, 2),
+    ),
+)
+def test_hcu_worker_configures_independent_dspark_workspace_lane(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+    enable_dbo,
+    use_dspark,
+    expected_ubatches,
+    expected_lanes,
+):
+    calls = []
+    monkeypatch.setattr(
+        cpu_safe_hcu_worker_module,
+        "init_workspace_manager",
+        lambda *args: calls.append(args),
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_dbo=enable_dbo),
+        speculative_config=(
+            SimpleNamespace(use_dspark=lambda: use_dspark)
+            if use_dspark
+            else None
+        ),
+    )
+    device = object()
+
+    cpu_safe_hcu_worker_module._init_hcu_workspace_manager(
+        config,
+        device,
+        use_v2_model_runner=True,
+    )
+
+    assert calls == [(device, expected_ubatches, expected_lanes)]
+
+
 def test_explicit_model_runner_v2_config(monkeypatch):
     from vllm import envs
     from vllm.config import VllmConfig
@@ -909,6 +951,7 @@ def test_platform_check_uses_lazy_executor_selector(monkeypatch):
     config = SimpleNamespace(
         model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
+        attention_config=SimpleNamespace(backend=None),
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
         ),
@@ -953,6 +996,7 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
             enable_prefix_caching=True,
             user_specified_block_size=True,
         ),
+        attention_config=SimpleNamespace(backend=None),
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
         ),
