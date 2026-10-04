@@ -20,6 +20,39 @@ MODEL_SOURCE = (REPO / "vllm_hcu/models/deepseek_v2.py").read_text(
 )
 
 
+def test_deepseek_v4_indexer_threads_compress_ratio_to_sparse_op():
+    """C4A cache positions must use the same compression as allocation."""
+
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/deepseek_v4_attention.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    indexer_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekV4Indexer"
+    )
+    constructor = next(
+        node
+        for node in indexer_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    sparse_call = next(
+        node
+        for node in ast.walk(constructor)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SparseAttnIndexer"
+    )
+    keywords = {keyword.arg: keyword.value for keyword in sparse_call.keywords}
+
+    compress_ratio = keywords["compress_ratio"]
+    assert isinstance(compress_ratio, ast.Attribute)
+    assert isinstance(compress_ratio.value, ast.Name)
+    assert compress_ratio.value.id == "self"
+    assert compress_ratio.attr == "compress_ratio"
+
+
 def _load_model_helpers():
     tree = ast.parse(MODEL_SOURCE)
     selected = [
