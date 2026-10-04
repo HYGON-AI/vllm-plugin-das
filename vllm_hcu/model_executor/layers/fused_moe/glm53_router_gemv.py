@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -16,6 +17,7 @@ _HIDDEN_SIZE = 4096
 _NUM_EXPERTS = 288
 _MAX_TOKENS = 16
 _BLOCK_K = 512
+_ROUTER_GEMV_ENV = "VLLM_HCU_GLM53_ROUTER_GEMV"
 
 
 @triton.jit
@@ -131,7 +133,7 @@ def bind_glm53_router_gates(model: torch.nn.Module | None) -> int:
 
     from vllm_hcu.platforms.hcu import on_gfx938
 
-    if model is None or not on_gfx938():
+    if model is None or not on_gfx938() or os.environ.get(_ROUTER_GEMV_ENV) != "1":
         return 0
     bound = 0
     for layer in model.modules():
