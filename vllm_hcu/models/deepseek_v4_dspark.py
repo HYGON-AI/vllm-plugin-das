@@ -221,6 +221,12 @@ class DSparkDeepseekV4ForCausalLM(_dspark.DSparkDeepseekV4ForCausalLM):
             vllm_config.speculative_config.draft_model_config
         )
         self.config = self.draft_model_config.hf_config
+        self.quant_config = vllm_config.quant_config
+        self.pad_shared_expert = getattr(
+            self.quant_config,
+            "weight_block_size",
+            None,
+        ) is not None and not _dspark._use_sequence_parallel(vllm_config)
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config,
             prefix=_dspark.maybe_prefix(prefix, "model"),
