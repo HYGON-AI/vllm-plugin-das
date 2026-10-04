@@ -66,6 +66,12 @@ def fuse_silu_mul_quant(*args, **kwargs):
     return lightop_fuse_silu_mul_quant(*args, **kwargs)
 
 
+def fuse_silu_mul_clamp_quant(*args, **kwargs):
+    import lightop
+
+    return lightop.fuse_silu_mul_clamp_quant(*args, **kwargs)
+
+
 def _canonical_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:
     return (
         id(layer.w13_weight),
@@ -292,11 +298,19 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
             workspace13.view(dtype=torch.int8),
             (m_aligned, activation_out_dim),
         )
-        q_activation, q_activation_scale = fuse_silu_mul_quant(
-            gateup_output,
-            output=quant_output,
-            expert_ids=m_indices,
-        )
+        clamp_limit = self.quant_config.gemm1_clamp_limit
+        if clamp_limit is not None and clamp_limit > 0:
+            q_activation, q_activation_scale = fuse_silu_mul_clamp_quant(
+                gateup_output,
+                limit=clamp_limit,
+                output=quant_output,
+            )
+        else:
+            q_activation, q_activation_scale = fuse_silu_mul_quant(
+                gateup_output,
+                output=quant_output,
+                expert_ids=m_indices,
+            )
         down_output = _resize_cache(workspace2, (m_aligned, K))
         m_grouped_w4a8_gemm_nt_contiguous_hipc(
             (q_activation, q_activation_scale),

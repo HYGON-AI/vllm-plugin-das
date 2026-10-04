@@ -1231,12 +1231,11 @@ def make_deepep_auto_deepgemm_w4a8_moe_kernel(
         moe_quant_config.w2_bias,
         moe_quant_config.gemm1_alpha,
         moe_quant_config.gemm1_beta,
-        moe_quant_config.gemm1_clamp_limit,
     )
     if any(value is not None for value in unsupported_metadata):
         raise ValueError(
             "SlimQuant auto factory requires symmetric W4A8 without "
-            "auxiliary scales, zero points, biases, or clamps"
+            "auxiliary scales, zero points, or biases"
         )
     return _make_deepep_auto_deepgemm_moe_kernel(
         moe_quant_config=moe_quant_config,

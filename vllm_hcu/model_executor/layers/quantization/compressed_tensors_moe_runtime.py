@@ -796,10 +796,16 @@ def apply_aiter_w4a8_moe(
         getattr(layer, "expert_map", None),
     )
     expert_mask = getattr(layer, "expert_mask", None)
+    swiglu_limit = getattr(layer, "swiglu_limit", None) or None
     if aiter_config is None:
         if installed_solution not in (None, "native"):
             raise HcuCompressedTensorsMoeError(
                 "AITER has no MOE_C solution for installed W4A8 weights"
+            )
+        if swiglu_limit is not None:
+            raise HcuCompressedTensorsMoeError(
+                "SlimQuant W4A8 vLLM/Triton fallback does not support "
+                "swiglu_limit"
             )
         if explicit_vllm_layout:
             fallback_weights = (w1, w2)
@@ -873,6 +879,7 @@ def apply_aiter_w4a8_moe(
         routed_scaling_factor=1.0,
         use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
         output_dtype=hidden_states.dtype,
+        gemm1_limit=swiglu_limit,
     )
 
 

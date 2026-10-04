@@ -3818,6 +3818,207 @@ def test_slimquant_w4a8_auto_reload_pack_failure_leaves_repacking_marker(
     assert len(reload_pack_calls) == 2
 
 
+def test_slimquant_w4a8_contiguous_experts_apply_swiglu_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    experts = object.__new__(runtime.DeepEPDeepGemmW4A8ContiguousExperts)
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((1, 8), dtype=torch.float32),
+        w2_scale=torch.ones((1, 4), dtype=torch.float32),
+        block_shape=None,
+        gemm1_clamp_limit=10.0,
+    )
+    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
+
+    monkeypatch.setattr(runtime, "compute_aligned_M", lambda **_kwargs: 2)
+    monkeypatch.setattr(
+        runtime,
+        "deepgemm_moe_permute",
+        lambda **kwargs: (
+            kwargs["aq"],
+            kwargs["aq_scale"],
+            torch.zeros(2, dtype=torch.int32),
+            torch.arange(2, dtype=torch.int32),
+            256,
+        ),
+    )
+    gemm_calls = 0
+
+    def grouped_gemm(_a, _b, destination, _m_indices):
+        nonlocal gemm_calls
+        gemm_calls += 1
+        destination.fill_(gemm_calls)
+
+    monkeypatch.setattr(
+        runtime,
+        "m_grouped_w4a8_gemm_nt_contiguous_hipc",
+        grouped_gemm,
+    )
+    clamp_kwargs: dict[str, object] = {}
+
+    def clamp_quant(value, **kwargs):
+        clamp_kwargs.update(kwargs)
+        output = kwargs["output"]
+        output.fill_(3)
+        return output, torch.ones((value.size(0), 1))
+
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_clamp_quant",
+        clamp_quant,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_quant",
+        lambda *_args, **_kwargs: pytest.fail("unclamped activation used"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "deepgemm_unpermute_and_reduce",
+        lambda *, a, output, **_kwargs: output.copy_(a),
+    )
+
+    output = torch.empty((2, 4), dtype=torch.float32)
+    experts.apply(
+        output=output,
+        hidden_states=torch.ones((2, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((2, 1)),
+        a2_scale=None,
+        workspace13=torch.empty(64, dtype=torch.int8),
+        workspace2=torch.empty(32, dtype=torch.float32),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert gemm_calls == 2
+    assert clamp_kwargs["limit"] == 10.0
+
+
+def test_slimquant_w4a8_batched_experts_apply_swiglu_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe as runtime,
+    )
+
+    experts = object.__new__(runtime.BatchedDeepGemmExperts)
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((1, 8), dtype=torch.float32),
+        w2_scale=torch.ones((1, 4), dtype=torch.float32),
+        block_shape=None,
+        weight_quant_dtype="int4",
+        gemm1_clamp_limit=10.0,
+        use_int8_w8a8=False,
+        use_fp8_w8a8=False,
+    )
+    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts._hcu_logical_n = 8
+    experts._hcu_logical_k = 4
+    experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
+    experts.estimate_expected_m = lambda **_kwargs: 2
+    monkeypatch.setattr(
+        runtime.current_platform,
+        "is_rocm",
+        lambda: True,
+    )
+
+    gemm_calls = 0
+
+    def grouped_gemm(_a, _b, destination, _mask, _expected_m):
+        nonlocal gemm_calls
+        gemm_calls += 1
+        destination.fill_(gemm_calls)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            m_grouped_w4a8_gemm_nt_masked_hipc=grouped_gemm,
+        ),
+    )
+    clamp_kwargs: dict[str, object] = {}
+
+    def clamp_quant(value, **kwargs):
+        clamp_kwargs.update(kwargs)
+        return (
+            torch.zeros((1, 2, 4), dtype=torch.int8),
+            torch.ones((1, 2), dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_clamp_quant_ep",
+        clamp_quant,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_quant_ep",
+        lambda *_args, **_kwargs: pytest.fail("unclamped activation used"),
+        raising=False,
+    )
+    activation_module = _module(
+        "lightop.activation",
+        fuse_silu_mul_quant_ep=lambda *_args, **_kwargs: pytest.fail(
+            "unclamped activation used"
+        ),
+    )
+    lightop_module = _module(
+        "lightop",
+        fuse_silu_mul_clamp_quant_ep=clamp_quant,
+    )
+    lightop_module.__path__ = []
+    lightop_module.activation = activation_module
+    monkeypatch.setitem(sys.modules, "lightop", lightop_module)
+    monkeypatch.setitem(sys.modules, "lightop.activation", activation_module)
+
+    expert_num_tokens = torch.tensor([2], dtype=torch.int32)
+    experts.apply(
+        output=torch.empty((1, 2, 4), dtype=torch.float32),
+        hidden_states=torch.ones((1, 2, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((1, 2)),
+        a2_scale=None,
+        workspace13=torch.empty(64, dtype=torch.int8),
+        workspace2=torch.empty(32, dtype=torch.float32),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=expert_num_tokens,
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert gemm_calls == 2
+    assert clamp_kwargs == {
+        "limit": 10.0,
+        "mask_m": expert_num_tokens,
+        "expect_m": 2,
+    }
+
+
 def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3927,6 +4128,7 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         per_out_ch_quant=False,
         block_shape=None,
         weight_dtype="int4",
+        gemm1_clamp_limit=10.0,
     )
     moe_config = SimpleNamespace()
 
