@@ -15,7 +15,7 @@ checkpoint or dataset fails instead of silently skipping.
 
 Available local configurations:
 
-- `v0281_gfx938_humaneval16.yaml`: 19 selectable TP profiles for the 17 local
+- `v0281_gfx938_humaneval16.yaml`: 20 selectable TP profiles for the 18 local
   checkpoints in scope on the eight-card gfx938 host. DeepSeek-V3.2
   Channel-FP8 has separate TP8 baseline and TP8+MTP3+E4M3-KV profiles, while
   DeepSeek-R1 Channel-FP8 has separate TP8 baseline and TP8+MTP3 profiles.

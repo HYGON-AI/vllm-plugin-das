@@ -129,6 +129,7 @@ and owned artifact directories are defined in
 | `deepseek_r1_channel_fp8_mtp3_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; MTP draft acceptance observed throughout the concurrent run |
 | `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
 | `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass |
+| `glm52_channel_int8_tp8` | TP8, sparse MLA, Channel INT8, AITER INT8 MoE, E4M3 sparse KV, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, final-window MTP draft acceptance 97.2% |
 | `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass |
 | `glm51_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass; EvalScope artifact ID collapses repeated underscores |
 | `hy4_preview_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass after `indexed_attention` and `reasoning_effort=no_think` fixes |
@@ -200,6 +201,24 @@ producing HTTP 400 before inference. The accepted profiles use
 `--max-model-len 8192` with the same 4,096-token output budget; this was a
 request-contract correction, not a model or kernel fix.
 
+The subsequently added `/models/GLM-5.2-Channel-INT8-w8a8` checkpoint is
+704.33 GiB across 282 shards and was validated at TP8. Its combined acceptance
+profile used HcuGPUModelRunnerV2, `FLASHMLA_SPARSE`, `--reasoning-parser
+glm45`, AITER INT8 MoE, MTP3, public E4M3 KV mapped to `fp8_ds_mla`, prefix
+caching, native LBNHC layout, and default FULL_AND_PIECEWISE target/speculator
+Graphs. Raw EvalScope and the independent normalizer both passed HumanEval16
+at 16/16, with all generated programs executed successfully.
+
+The run selected the official `TritonInt8ScaledMMLinearKernel` for dense
+compressed-tensors W8A8 and AITER for MoE; this is an expected separation of
+dense and MoE providers, not a fallback of the requested MoE route. All ranks
+loaded the gfx938 `E=256,N=256` ordinary and bottom-layer AITER configs plus
+the channel-shuffle tuned table. The final metric window reported mean MTP
+acceptance length 3.92 and 97.2% draft-token acceptance. The report observed
+29.19 output tokens/s, 4.581 s mean latency, 595.19 ms mean TTFT, and 29.81 ms
+mean TPOT. The feature route allocated 744,896 KV tokens; evidence is under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-glm52-channel-int8-tp8`.
+
 ## Source closure after runtime fixes
 
 - Changed-file focused suite after review fixes: `581 passed, 3 skipped, 14 warnings`.
@@ -209,7 +228,9 @@ request-contract correction, not a model or kernel fix.
   prefix hit rate about 34.3%, final-window MTP acceptance about 91.3%.
 - DeepSeek-V3.2 live TP8 gates: plain and MTP3+E4M3-KV profiles each `16/16`,
   with 16 predictions, reviews, and successful code executions per profile.
-- Current profile/report focused suite: `57 passed, 1 skipped`.
+- GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with
+  16 predictions, reviews, and successful code executions.
+- Current profile/report focused suite: `58 passed, 1 skipped`.
 - Skill validation: `Skill is valid!`; repository/skill PAT-pattern scan:
   clean; `git diff --check`: clean.
 

@@ -135,6 +135,24 @@ profiles:
         do_sample: false
         max_tokens: 4096
 
+  glm52_channel_int8_tp8:
+    model: /models/GLM-5.2-Channel-INT8-w8a8
+    server:
+      port: 10220
+      served_model_name: GLM-5.2-Channel-INT8-w8a8
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASHMLA_SPARSE, --reasoning-parser, glm45, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-glm52-channel-int8-tp8
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 2048
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
+
   deepseek_v4_flash_tp8:
     model: /models/DeepSeek-V4-Flash-0731-FP8-Channel
     server:
