@@ -1758,6 +1758,43 @@ def test_sparse_flashmla_preserves_upstream_hybrid_block_alignment(
     assert config.cache_config.block_size == 1152
 
 
+def test_deepseek_v4_aligns_explicit_block_with_sparse_backend_and_compressor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=True,
+        block_size=64,
+        kv_cache_dtype_skip_layers=[],
+    )
+    config.attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASHMLA_SPARSE
+    )
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.model_config.hf_config = SimpleNamespace(
+        compress_ratios=[0, 4, 128, 4, 128]
+    )
+    config.model_config.is_hybrid = False
+
+    class FlashMLABackend:
+        @staticmethod
+        def get_name():
+            return "FLASHMLA_SPARSE"
+
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: FlashMLABackend),
+    )
+
+    HCUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 256
+
+
 @pytest.mark.parametrize(
     ("backend_name", "expected_path"),
     [

@@ -4,6 +4,7 @@ import importlib
 import os
 from datetime import timedelta
 from functools import cache, lru_cache
+from math import lcm
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -720,6 +721,35 @@ class HCUPlatform(Platform):
         super().update_block_size_for_backend(vllm_config)
 
         cache_config = getattr(vllm_config, "cache_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        architectures = set(getattr(model_config, "architectures", ()) or ())
+        hf_config = getattr(model_config, "hf_config", None)
+        compress_ratios = getattr(hf_config, "compress_ratios", ()) or ()
+        if "DeepseekV4ForCausalLM" in architectures and cache_config is not None:
+            # DeepSeek-V4's sparse MLA and indexer backends require 256-token
+            # kernel blocks. Its compressed cache additionally requires the
+            # manager block to be divisible by every compression ratio.
+            compressor_alignment = 256
+            for ratio in compress_ratios:
+                ratio = int(ratio)
+                if ratio > 1:
+                    compressor_alignment = lcm(compressor_alignment, ratio)
+            if cache_config.block_size % compressor_alignment:
+                old_block_size = cache_config.block_size
+                cache_config.block_size = (
+                    (old_block_size + compressor_alignment - 1)
+                    // compressor_alignment
+                    * compressor_alignment
+                )
+                logger.warning(
+                    "DeepSeek-V4 sparse backends and compressor ratios require "
+                    "a kv cache block size divisible by %d; overriding %d "
+                    "with %d.",
+                    compressor_alignment,
+                    old_block_size,
+                    cache_config.block_size,
+                )
+
         attention_config = getattr(vllm_config, "attention_config", None)
         backend = getattr(attention_config, "backend", None)
         if (
