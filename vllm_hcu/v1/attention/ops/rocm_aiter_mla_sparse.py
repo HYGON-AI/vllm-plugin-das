@@ -1381,6 +1381,13 @@ def rocm_aiter_sparse_attn_indexer_native(
     slot_mapping = layer_attn_metadata.slot_mapping[:layer_attn_metadata.num_kv_actual_tokens]
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
+    # CUDA-graph memory profiling can retain the synthetic prefill count while
+    # the indexer builder intentionally emits no real chunks.  There is no KV
+    # to gather or top-k work to perform for that profile-only shape.
+    if has_prefill:
+        profile_prefill = layer_attn_metadata.prefill
+        if profile_prefill is not None and not profile_prefill.chunks:
+            has_prefill = False
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
     device = hidden_states.device if k is None else k.device
     # HIPC cache writer/gather require the physical page axis. Keep the

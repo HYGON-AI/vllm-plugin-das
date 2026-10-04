@@ -2481,6 +2481,64 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     )
 
 
+def test_sparse_indexer_profile_prefill_with_no_chunks_is_a_noop(monkeypatch):
+    """Graph profiling can advertise prefill while providing no real chunks."""
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 1, 1), dtype=torch.bfloat16),
+        q_fp8=torch.zeros((1, 1, 1), dtype=torch.bfloat16),
+        k=None,
+        weights=torch.ones((1, 1)),
+        quant_block_size=1,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=1,
+        max_model_len=1,
+        total_seq_lens=0,
+        topk_indices_buffer=torch.full((1, 1), 7, dtype=torch.int32),
+        skip_k_cache_insert=True,
+    )
+
+    assert result.item() == -1
+
+
 def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
