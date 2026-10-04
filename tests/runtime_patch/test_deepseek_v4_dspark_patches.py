@@ -218,6 +218,78 @@ def test_compressor_mm_accepts_hcu_nn_and_upstream_nt_layouts(
     torch.testing.assert_close(result, torch.tensor([[8.0, 18.0, 28.0]]))
 
 
+def test_attention_parallel_projection_preserves_rocm_fused_weight_override() -> None:
+    """The HCU wrapper must not reinterpret a preshuffled fused Q/KV weight."""
+
+    class DeepseekV4Attention:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+        ):
+            del vllm_config, prefix, topk_indices_buffer, aux_stream_list
+            self.aux_stream_list = None
+            self.ln_events = [object(), object(), object(), object()]
+            self.compressor = None
+            self.indexer = None
+
+        def _fused_wqa_wkv_gemm(self, hidden_states):
+            return hidden_states + 7
+
+        def fused_wqa_wkv(self, hidden_states):
+            del hidden_states
+            raise AssertionError(
+                "preshuffled ROCm fused Q/KV weight used the generic linear path"
+            )
+
+        def _run_parallel_input_projections(self, hidden_states):
+            return hidden_states, None, None, None
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
+            return hidden_states
+
+        def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+            del kv, positions, attn_metadata
+            return q
+
+    def execute_in_parallel(
+        main_fn,
+        aux_fns,
+        start_event,
+        done_events,
+        aux_streams,
+        enable,
+    ):
+        del start_event, done_events, aux_streams, enable
+        return main_fn(), tuple(fn() if fn is not None else None for fn in aux_fns)
+
+    module = _module(
+        patch_deepseek_v4_attention.TARGET_MODULE,
+        DeepseekV4Attention=DeepseekV4Attention,
+        execute_in_parallel=execute_in_parallel,
+        envs=SimpleNamespace(VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=1),
+    )
+    patch_deepseek_v4_attention.apply_to_module(module)
+    attention = DeepseekV4Attention(
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(expert_dtype="fp8")
+            ),
+            quant_config=None,
+        ),
+        "layer.attn",
+    )
+    hidden_states = torch.tensor([[1.0, 2.0]])
+
+    result = attention._run_parallel_input_projections(hidden_states)
+
+    torch.testing.assert_close(result[0], hidden_states + 7)
+    assert result[1:] == (None, None, None)
+
+
 def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

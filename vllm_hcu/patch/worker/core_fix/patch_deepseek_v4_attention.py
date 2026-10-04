@@ -436,8 +436,10 @@ def apply_to_module(module: ModuleType) -> bool:
             aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-            return qr_kv
+            # Keep the current platform/model override authoritative.  The
+            # ROCm DeepSeek-V4 implementation preshuffles this fused weight
+            # in place and its override owns the compatible GEMM call.
+            return self._fused_wqa_wkv_gemm(hidden_states)
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
