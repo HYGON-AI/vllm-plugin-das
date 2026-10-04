@@ -13,6 +13,7 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_attention,
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
+    patch_deepseek_v4_bf16_compressor,
     patch_deepseek_v4_rocm_compressor_fusion,
     patch_deepseek_v4_rocm_bf16_cache,
     patch_deepseek_v4_rocm_dspark_metadata,
@@ -27,6 +28,162 @@ def _module(name: str, **attributes: object) -> ModuleType:
     for key, value in attributes.items():
         setattr(module, key, value)
     return module
+
+
+def test_bf16_compressor_never_calls_fp8_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, torch.dtype]] = []
+
+    def fp8_store(
+        state_cache,
+        num_actual,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_size,
+        state_width,
+        cos_sin_cache,
+        kv_cache,
+        k_cache_metadata,
+        pdl_kwargs,
+        head_dim,
+        rope_head_dim,
+        compress_ratio,
+        overlap,
+        use_fp4_cache,
+        rms_norm_weight,
+        rms_norm_eps,
+        quant_block,
+        token_stride,
+        scale_dim,
+    ) -> None:
+        del (
+            state_cache,
+            num_actual,
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_size,
+            state_width,
+            cos_sin_cache,
+            k_cache_metadata,
+            pdl_kwargs,
+            head_dim,
+            rope_head_dim,
+            compress_ratio,
+            overlap,
+            use_fp4_cache,
+            rms_norm_weight,
+            rms_norm_eps,
+            quant_block,
+            token_stride,
+            scale_dim,
+        )
+        calls.append(("fp8", kv_cache.dtype))
+
+    def fp8_two_stage_store(
+        state_cache,
+        num_actual,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_size,
+        state_width,
+        cos_sin_cache,
+        kv_cache,
+        k_cache_metadata,
+        pdl_kwargs,
+        head_dim,
+        rope_head_dim,
+        compress_ratio,
+        overlap,
+        use_fp4_cache,
+        rms_norm_weight,
+        rms_norm_eps,
+        quant_block,
+        token_stride,
+        scale_dim,
+        num_decode_tokens,
+        compress_scratch,
+    ) -> None:
+        del num_decode_tokens, compress_scratch
+        fp8_store(
+            state_cache,
+            num_actual,
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_size,
+            state_width,
+            cos_sin_cache,
+            kv_cache,
+            k_cache_metadata,
+            pdl_kwargs,
+            head_dim,
+            rope_head_dim,
+            compress_ratio,
+            overlap,
+            use_fp4_cache,
+            rms_norm_weight,
+            rms_norm_eps,
+            quant_block,
+            token_stride,
+            scale_dim,
+        )
+
+    module = _module(
+        patch_deepseek_v4_bf16_compressor.TARGET_MODULE,
+        compress_norm_rope_store_triton=fp8_store,
+        compress_norm_rope_store_two_stage_triton=fp8_two_stage_store,
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_bf16_compressor,
+        "compress_norm_rope_store_bf16",
+        lambda **kwargs: calls.append(("bf16", kwargs["kv_cache"].dtype)),
+    )
+    patch_deepseek_v4_bf16_compressor.apply_to_module(module)
+
+    kwargs = dict(
+        state_cache=object(),
+        num_actual=1,
+        token_to_req_indices=object(),
+        positions=object(),
+        slot_mapping=object(),
+        block_table=object(),
+        block_size=4,
+        state_width=1024,
+        cos_sin_cache=object(),
+        k_cache_metadata=object(),
+        pdl_kwargs={},
+        head_dim=512,
+        rope_head_dim=64,
+        compress_ratio=4,
+        overlap=True,
+        use_fp4_cache=False,
+        rms_norm_weight=object(),
+        rms_norm_eps=1e-6,
+        quant_block=64,
+        token_stride=576,
+        scale_dim=8,
+    )
+    module.compress_norm_rope_store_triton(
+        kv_cache=torch.empty((1, 1, 512), dtype=torch.bfloat16),
+        **kwargs,
+    )
+    module.compress_norm_rope_store_triton(
+        kv_cache=torch.empty((1,), dtype=torch.uint8),
+        **kwargs,
+    )
+
+    assert calls == [
+        ("bf16", torch.bfloat16),
+        ("fp8", torch.uint8),
+    ]
 
 
 def test_rocm_bf16_cache_uses_plain_gather(

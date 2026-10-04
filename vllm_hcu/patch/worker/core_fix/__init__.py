@@ -10,6 +10,7 @@ explicit ``apply(module=None)`` convenience entry point.
 from . import (
     patch_deepseek_v32_config,
     patch_deepseek_v4_attention,
+    patch_deepseek_v4_bf16_compressor,
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
     patch_deepseek_v4_rocm_compressor_fusion,
@@ -35,6 +36,7 @@ from . import (
 __all__ = [
     "patch_deepseek_v32_config",
     "patch_deepseek_v4_attention",
+    "patch_deepseek_v4_bf16_compressor",
     "patch_deepseek_v4_dspark_target",
     "patch_deepseek_v4_load_weights",
     "patch_deepseek_v4_rocm_compressor_fusion",
