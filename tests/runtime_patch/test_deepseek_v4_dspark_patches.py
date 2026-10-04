@@ -167,7 +167,22 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     assert torch.count_nonzero(attention.swa_cache_layer.kv_cache == 9) == 32
 
 
-def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
+@pytest.mark.parametrize(
+    ("quant_name", "quant_format", "expert_dtype"),
+    (
+        ("compressed-tensors", "int-quantized", "int8"),
+        # DeepSeek-V4-Flash-0731 mixed W4A8 checkpoints store wo_a as a
+        # standalone BF16 tensor without a weight scale.  The SlimQuant
+        # facade must therefore leave it unquantized while constructing the
+        # attention layer even though the routed experts use INT4.
+        ("slimquant_w4a8", None, "int4"),
+    ),
+)
+def test_attention_int8_wo_a_is_excluded_only_during_construction(
+    quant_name: str,
+    quant_format: str | None,
+    expert_dtype: str,
+) -> None:
     seen_ignore: list[list[str]] = []
 
     class DeepseekV4Attention:
@@ -206,12 +221,12 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
     )
     quant_config = SimpleNamespace(
         ignore=[],
-        quant_format="int-quantized",
-        get_name=lambda: "compressed-tensors",
+        quant_format=quant_format,
+        get_name=lambda: quant_name,
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(expert_dtype="int8")
+            hf_config=SimpleNamespace(expert_dtype=expert_dtype)
         ),
         quant_config=quant_config,
     )

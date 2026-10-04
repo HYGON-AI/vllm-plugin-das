@@ -51,12 +51,26 @@ def _requires_unquantized_int8_wo_a(vllm_config: object) -> bool:
     get_name = getattr(quant_config, "get_name", None)
     model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
-    return bool(
-        callable(get_name)
-        and get_name() == "compressed-tensors"
+    if not callable(get_name):
+        return False
+
+    quant_name = get_name()
+    expert_dtype = getattr(hf_config, "expert_dtype", None)
+    compressed_int8 = (
+        quant_name == "compressed-tensors"
         and getattr(quant_config, "quant_format", None) == "int-quantized"
-        and getattr(hf_config, "expert_dtype", None) == "int8"
+        and expert_dtype == "int8"
     )
+    # DeepSeek-V4-Flash mixed W4A8 checkpoints use SlimQuant for INT4 routed
+    # experts and W8A8 attention projections, but deliberately keep wo_a as a
+    # lone BF16 weight (there is no wo_a weight_scale tensor).  Without this
+    # construction-time exclusion the generic SlimQuant Linear method casts
+    # that BF16 checkpoint tensor into an INT8 parameter and corrupts every
+    # attention output.
+    slimquant_mixed_w4a8 = (
+        quant_name == "slimquant_w4a8" and expert_dtype == "int4"
+    )
+    return compressed_int8 or slimquant_mixed_w4a8
 
 
 def _bf16_indexer_q_rope(
