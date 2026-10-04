@@ -79,7 +79,7 @@ def _case(
     return (q, physical_cache, weights, context, table, max_len), expected.flatten(0, 1)
 
 
-def _check(actual, expected):
+def _check(actual, expected, topk_k=32):
     assert actual.dtype == torch.float32
     assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
     finite = torch.isfinite(expected)
@@ -88,7 +88,7 @@ def _check(actual, expected):
     checked = 0
     for row in range(expected.shape[0]):
         count = int(torch.isfinite(expected[row]).sum())
-        k = min(32, count)
+        k = min(topk_k, count)
         if not k:
             continue
         values, indices = expected[row].topk(k)
@@ -142,6 +142,61 @@ def test_long_context_reader_matches_token_order_oracle(
 ):
     args, expected = _case(page_size, 32768, batch, next_n, per_query)
     _check(gfx938_fp8_paged_mqa_logits(*args), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_kpool_writer_pages_feed_reader_at_production_topk_boundary(page_size):
+    """Read pages produced by the actual KPool writer and check 512 pools."""
+    from vllm.models.glm5next.amd.ops.kpool_compress import (
+        kpool_compress_and_write_cache,
+    )
+
+    torch.manual_seed(3301)
+    device = "cuda"
+    batch, length, pool_size, heads, dim = 2, 1024, 4, 32, 128
+    pages_per_row = length // page_size
+    num_pages = batch * pages_per_row
+    table = (
+        torch.randperm(num_pages, device=device)
+        .reshape(batch, pages_per_row)
+        .to(torch.int32)
+    )
+    slots = torch.arange(length, device=device)
+    physical_locs = (
+        table[:, slots // page_size].to(torch.int64) * page_size + slots % page_size
+    ).flatten()
+    cache = torch.zeros(
+        (num_pages, page_size, 1, dim + 4), dtype=torch.uint8, device=device
+    )
+    raw_keys = torch.randn(
+        (batch * length, pool_size, dim), dtype=torch.bfloat16, device=device
+    )
+    gate_scores = (torch.randn(raw_keys.shape, device=device) * 0.05).to(torch.bfloat16)
+    ape = torch.zeros((pool_size, dim), dtype=torch.float32, device=device)
+    keys, scales = kpool_compress_and_write_cache(
+        cache,
+        raw_keys,
+        gate_scores,
+        ape,
+        physical_locs,
+        pool_size,
+        return_compressed=True,
+    )
+    q = torch.randn((batch, 1, heads, dim), device=device).to(torch.float8_e4m3fn)
+    weights = torch.randn((batch, heads), device=device) * 0.05
+    lengths = torch.tensor([length, length - 3], dtype=torch.int32, device=device)
+    max_len = length + page_size
+    actual = gfx938_fp8_paged_mqa_logits(q, cache, weights, lengths, table, max_len)
+
+    unpacked = keys.reshape(batch, length, dim).float()
+    scores = torch.matmul(q[:, 0].float(), unpacked.transpose(1, 2))
+    scores = (scores.relu() * weights[:, :, None]).sum(1)
+    scores *= scales.reshape(batch, length)
+    expected = torch.full((batch, max_len), -torch.inf, device=device)
+    expected[:, :length] = scores
+    expected[1, length - 3 :] = -torch.inf
+    _check(actual, expected, topk_k=512)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
