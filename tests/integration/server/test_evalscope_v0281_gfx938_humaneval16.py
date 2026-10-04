@@ -12,6 +12,7 @@ import pytest
 
 from tests.integration.server.evalscope_server import (
     evalscope_command,
+    load_config,
     load_profiled_config,
     run_evalscope_server_test,
     server_command,
@@ -25,6 +26,20 @@ PROFILE_ENV = "VLLM_HCU_GFX938_PROFILE"
 MODEL_ENV = "VLLM_HCU_GFX938_MODEL"
 
 PROFILE_CONTRACTS = (
+    (
+        "deepseek_r1_channel_fp8_tp8",
+        "/models/DeepSeek-R1-Channel-FP8-w8a8",
+        8,
+        "FLASHMLA",
+        None,
+    ),
+    (
+        "deepseek_r1_channel_fp8_mtp3_tp8",
+        "/models/DeepSeek-R1-Channel-FP8-w8a8",
+        8,
+        "FLASHMLA",
+        None,
+    ),
     (
         "deepseek_v4_flash_tp8",
         "/models/DeepSeek-V4-Flash-0731-FP8-Channel",
@@ -168,7 +183,15 @@ def test_gfx938_profile_contract(
         config["evalscope"]["pass_criteria"].get("enforce_score", True)
     ) is (profile not in diagnostic_profiles)
     assert config["evalscope"]["generation_config"]["do_sample"] is False
-    assert config["evalscope"]["generation_config"]["max_tokens"] == 2048
+    r1_profiles = {
+        "deepseek_r1_channel_fp8_tp8",
+        "deepseek_r1_channel_fp8_mtp3_tp8",
+    }
+    expected_max_tokens = 4096 if profile in r1_profiles else 2048
+    assert (
+        config["evalscope"]["generation_config"]["max_tokens"]
+        == expected_max_tokens
+    )
     expected_criteria = {
         "dataset": "humaneval",
         "mean_acc": 1.0,
@@ -199,17 +222,54 @@ def test_gfx938_profile_contract(
         assert "VLLM_KV_CACHE_LAYOUT" not in environment
 
 
-def test_gfx938_profiles_have_unique_owned_work_directories() -> None:
+def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CONFIG_ENV, raising=False)
+    expected_profiles = {profile for profile, *_ in PROFILE_CONTRACTS}
+    raw_config = load_config(DEFAULT_CONFIG, CONFIG_ENV)
+    assert set(raw_config["profiles"]) == expected_profiles
+
     work_dirs = []
+    ports = []
     for profile, *_ in PROFILE_CONTRACTS:
         config = load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
         work_dir = str(config["evalscope"]["work_dir"])
         assert work_dir.startswith("/tmp/vllm-hcu-evalscope/")
         work_dirs.append(work_dir)
-    assert len(work_dirs) == len(set(work_dirs)) == 15
+        ports.append(config["server"]["port"])
+    assert len(work_dirs) == len(set(work_dirs)) == 17
+    assert len(ports) == len(set(ports)) == 17
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
+    r1_commands = {}
+    for profile in (
+        "deepseek_r1_channel_fp8_tp8",
+        "deepseek_r1_channel_fp8_mtp3_tp8",
+    ):
+        config = load_profiled_config(
+            DEFAULT_CONFIG, CONFIG_ENV, profile=profile
+        )
+        command, _, _ = server_command(config, model_env=MODEL_ENV)
+        assert config["server"]["environment"][
+            "VLLM_USE_V2_MODEL_RUNNER"
+        ] == "1"
+        assert _option_value(command, "--reasoning-parser") == "deepseek_r1"
+        assert _option_value(command, "--max-model-len") == "32768"
+        assert _option_value(command, "--max-num-batched-tokens") == "16384"
+        r1_commands[profile] = command
+
+    assert "--speculative-config" not in r1_commands[
+        "deepseek_r1_channel_fp8_tp8"
+    ]
+    assert json.loads(
+        _option_value(
+            r1_commands["deepseek_r1_channel_fp8_mtp3_tp8"],
+            "--speculative-config",
+        )
+    ) == {"method": "mtp", "num_speculative_tokens": 3}
+
     deepseek_v4 = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="deepseek_v4_flash_tp8"
     )

@@ -123,6 +123,8 @@ and owned artifact directories are defined in
 
 | Profile | Topology and feature route | HumanEval16 | Disposition |
 | --- | --- | ---: | --- |
+| `deepseek_r1_channel_fp8_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, prefix, default Graph | 16/16 | Pass; current OpenAI response `reasoning` field accepted by the prefix probe |
+| `deepseek_r1_channel_fp8_mtp3_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; MTP draft acceptance observed throughout the concurrent run |
 | `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
 | `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass |
 | `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass |
@@ -147,6 +149,27 @@ are under `/tmp/vllm-hcu-evalscope/v0281-gfx938-hy4-dp8-ep8-mtp3`. The
 generic two-request prefix probe was not accepted as DP8 evidence because its
 requests landed on different ranks; no current-branch DP8 prefix-hit claim is
 made.
+
+The subsequently added `/models/DeepSeek-R1-Channel-FP8-w8a8` checkpoint was
+validated twice on the same eight-card host. Both the plain TP8 route and the
+TP8+MTP3 route passed raw and independently normalized HumanEval16 at 16/16,
+with all 16 generated programs executed successfully. The plain run recorded
+10.33 output tokens/s and 95.18 ms mean TPOT. The MTP3 run recorded 24.30
+output tokens/s, 41.42 ms mean TPOT, and live draft acceptance rates of about
+52-65%; the two runs emitted different token counts, so this is observational
+rather than a controlled performance benchmark. The MTP3 server resolved
+`DeepSeekMTPModel`, compiled a separate `eagle_head`, warmed the three-token
+rejection sampler, captured default FULL_AND_PIECEWISE graphs, allocated
+635,200 KV tokens with LBNHC layout, and loaded AITER channel-shuffle stage1
+and stage2 kernels on all eight ranks. Artifacts are under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-r1-channel-fp8-{tp8,mtp3-tp8}`.
+
+The first plain TP8 attempt exposed a harness compatibility issue rather than
+a model failure: vLLM 0.28.1 returned reasoning-only probe output in the
+current `message.reasoning` field while the probe recognized only `content`
+and the deprecated `reasoning_content` alias. The probe now checks those three
+fields in current-protocol order, with regression coverage. After that narrow
+fix, the unchanged service route passed the prefix probe and HumanEval16.
 
 ## Source closure after runtime fixes
 

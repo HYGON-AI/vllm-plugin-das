@@ -550,6 +550,8 @@ def _run_prefix_probe(
             if isinstance(message, dict):
                 content = message.get("content")
                 if not (isinstance(content, str) and content.strip()):
+                    content = message.get("reasoning")
+                if not (isinstance(content, str) and content.strip()):
                     content = message.get("reasoning_content")
         assert isinstance(content, str) and content.strip(), (
             "prefix probe returned no coherent assistant content"

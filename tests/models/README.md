@@ -15,8 +15,9 @@ checkpoint or dataset fails instead of silently skipping.
 
 Available local configurations:
 
-- `v0281_gfx938_humaneval16.yaml`: selectable TP profiles for the 15 local
-  checkpoints in scope on the eight-card gfx938 host. Select one with
+- `v0281_gfx938_humaneval16.yaml`: 17 selectable TP profiles for the 16 local
+  checkpoints in scope on the eight-card gfx938 host. DeepSeek-R1
+  Channel-FP8 has separate TP8 baseline and TP8+MTP3 profiles. Select one with
   `VLLM_HCU_GFX938_PROFILE=<profile>` and run
   `test_v0281_gfx938_selected_profile_humaneval16`. Acceptance profiles use
   the default CUDA Graph policy and enforce HumanEval16; explicitly marked

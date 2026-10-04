@@ -437,6 +437,38 @@ def test_prefix_probe_accepts_reasoning_content(
     assert (before, after) == (0.0, 8.0)
 
 
+def test_prefix_probe_accepts_current_reasoning_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total 0\n",
+            "vllm:prefix_cache_hits_total 8\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse(next(metrics))
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":null,'
+            '"reasoning":"working"}}]}'
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+
+    before, after, _ = evalscope_server._run_prefix_probe(
+        _prefix_probe_config(),
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (0.0, 8.0)
+
+
 def test_prefix_probe_is_optional_without_network_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
