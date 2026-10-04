@@ -47,6 +47,7 @@ def dspark_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     dspark.ReplicatedLinear = StubModule
     dspark.RMSNorm = StubModule
     dspark.DSparkMarkovHead = StubModule
+    dspark.DSparkConfidenceHead = StubModule
     dspark.ParallelLMHead = StubModule
     dspark.LogitsProcessor = StubModule
     dspark.maybe_prefix = lambda prefix, name: f"{prefix}.{name}" if prefix else name
@@ -131,6 +132,7 @@ def test_dspark_adapter_construction_keeps_upstream_module_symbols(
         vocab_size=16,
         dspark_markov_rank=2,
         index_topk=2,
+        enable_confidence_head=True,
     )
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -148,6 +150,8 @@ def test_dspark_adapter_construction_keeps_upstream_module_symbols(
 
     assert model.quant_config is vllm_config.quant_config
     assert model.pad_shared_expert is expected_pad
+    assert model.model.use_sequence_parallel is False
+    assert model.model.confidence_head is not None
 
     upstream = dspark_module._dspark
     for name, original in upstream._test_originals.items():

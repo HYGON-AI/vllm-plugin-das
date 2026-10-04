@@ -54,6 +54,7 @@ class DSparkDeepseekV4Model(_dspark.DSparkDeepseekV4Model):
         self.rms_norm_eps = config.rms_norm_eps
         self.num_hidden_layers = config.num_hidden_layers
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
+        self.use_sequence_parallel = _dspark._use_sequence_parallel(vllm_config)
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
 
         self.embed_tokens = _dspark.VocabParallelEmbedding(
@@ -112,6 +113,12 @@ class DSparkDeepseekV4Model(_dspark.DSparkDeepseekV4Model):
             config.dspark_markov_rank,
             prefix=_dspark.maybe_prefix(prefix, "markov_head"),
         )
+        self.confidence_head = None
+        if getattr(config, "enable_confidence_head", True):
+            self.confidence_head = _dspark.DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                prefix=_dspark.maybe_prefix(prefix, "confidence_head"),
+            )
         self.hc_head_op = HCHeadOp()
 
     @torch.inference_mode()
