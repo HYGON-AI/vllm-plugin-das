@@ -62,6 +62,59 @@ def _normalize_hcu_model_runner(model_config: object) -> None:
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
 
+def _normalize_dspark_draft_deepep_topology(
+    vllm_config: object,
+    feature_config: HcuFeatureConfig,
+) -> HcuFeatureConfig:
+    """Reuse the target's DeepEP topology for DeepSeek-V4 DSpark layers.
+
+    Official DSpark constructs a draft ``VllmConfig`` with
+    ``SpeculativeConfig.draft_parallel_config`` while retaining the target's
+    ``additional_config`` object.  Its generic draft config intentionally drops
+    DP and EP, but the DeepSeek-V4 DSpark head contains three real MoE decoder
+    layers.  Those layers must use the same EP group and DeepEP kernels as the
+    target; otherwise they enter naive dispatch against a DeepEP manager, whose
+    pre-routing interface is intentionally unsupported.
+
+    Object identity distinguishes this internal clone from the target config.
+    Reusing the target config is safe only when both tensor-parallel sizes are
+    equal, which is also the only topology validated here.
+    """
+
+    if not feature_config.deepep_auto or not is_deepseek_v4(vllm_config):
+        return feature_config
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if getattr(speculative_config, "method", None) != "dspark":
+        return feature_config
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    draft_parallel_config = getattr(
+        speculative_config, "draft_parallel_config", None
+    )
+    target_parallel_config = getattr(
+        speculative_config, "target_parallel_config", None
+    )
+    if (
+        parallel_config is not draft_parallel_config
+        or draft_parallel_config is target_parallel_config
+    ):
+        return feature_config
+    if target_parallel_config is None:
+        raise PatchCompatibilityError(
+            "DeepSeek-V4 DSpark deepep_auto requires "
+            "SpeculativeConfig.target_parallel_config"
+        )
+    draft_tp = int(getattr(draft_parallel_config, "tensor_parallel_size", 1))
+    target_tp = int(getattr(target_parallel_config, "tensor_parallel_size", 1))
+    if draft_tp != target_tp:
+        raise ValueError(
+            "DeepSeek-V4 DSpark deepep_auto requires draft and target tensor "
+            f"parallel sizes to match; got draft_tp={draft_tp}, "
+            f"target_tp={target_tp}"
+        )
+    setattr(vllm_config, "parallel_config", target_parallel_config)
+    return feature_config
+
+
 def _normalize_hcu_breakable_cudagraph(vllm_config: object) -> None:
     """Restore upstream's graph-safe recurrent-model opt-ins on HCU."""
 
@@ -377,6 +430,9 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
+    feature_config = _normalize_dspark_draft_deepep_topology(
+        vllm_config, feature_config
+    )
     from vllm_hcu.platforms import envs as hcu_envs
 
     updates: dict[str, str | bool] = {
