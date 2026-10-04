@@ -14,6 +14,7 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
     patch_deepseek_v4_rocm_compressor_fusion,
+    patch_deepseek_v4_rocm_bf16_cache,
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
     patch_mhc_backend,
@@ -26,6 +27,56 @@ def _module(name: str, **attributes: object) -> ModuleType:
     for key, value in attributes.items():
         setattr(module, key, value)
     return module
+
+
+def test_rocm_bf16_cache_uses_plain_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def packed_fp8_gather(
+        out,
+        k_cache,
+        seq_lens,
+        gather_lens,
+        block_table,
+        block_size,
+        offset,
+        use_fnuz=False,
+    ):
+        calls.append(("fp8", (use_fnuz,)))
+
+    def bf16_gather(*args):
+        calls.append(("bf16", args))
+
+    module = _module(
+        patch_deepseek_v4_rocm_bf16_cache.TARGET_MODULE,
+        dequantize_and_gather_k_cache=packed_fp8_gather,
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_rocm_bf16_cache,
+        "gather_bf16_k_cache",
+        bf16_gather,
+    )
+    patch_deepseek_v4_rocm_bf16_cache.apply_to_module(module)
+
+    common = (object(), object(), object(), 256, 7)
+    module.dequantize_and_gather_k_cache(
+        object(),
+        torch.empty((1, 1, 512), dtype=torch.bfloat16),
+        *common,
+        use_fnuz=True,
+    )
+    module.dequantize_and_gather_k_cache(
+        object(),
+        torch.empty((1,), dtype=torch.uint8),
+        *common,
+        use_fnuz=True,
+    )
+
+    assert calls[0][0] == "bf16"
+    assert calls[0][1][-2:] == (256, 7)
+    assert calls[1] == ("fp8", (True,))
 
 
 @pytest.mark.parametrize(
