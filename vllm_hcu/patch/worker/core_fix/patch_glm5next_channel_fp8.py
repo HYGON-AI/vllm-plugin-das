@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 import os
 import sys
+from math import prod
 from types import ModuleType
 
 import torch
@@ -399,14 +400,24 @@ def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
                 and As.is_contiguous()
                 and Bs.is_contiguous()
                 and out_dtype in (torch.bfloat16, torch.float16)
+                and bias is None
+                and isinstance(output_shape, (list, tuple))
+                and len(output_shape) >= 2
+                # Match the original scaled-mm eager shape check. Avoid a
+                # symbolic equality during piecewise graph compilation.
+                and (
+                    torch.compiler.is_compiling()
+                    or (
+                        prod(output_shape[:-1]) == A.shape[0]
+                        and output_shape[-1] == B.shape[1]
+                    )
+                )
             ):
                 nonlocal announced
                 output = torch.empty(
                     (A.shape[0], B.shape[1]), device=A.device, dtype=out_dtype
                 )
                 fp8_gemm((A, As), (B, Bs), output)
-                if bias is not None:
-                    output += bias
                 if not announced:
                     announced = True
                     _LOGGER.info("GLM5Next shared gate_up uses DeepGEMM")
