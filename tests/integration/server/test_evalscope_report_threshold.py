@@ -225,6 +225,33 @@ def test_secure_cli_python_argv_does_not_change_proc_cmdline(
     assert "VLLM_HCU_EVALSCOPE_API_KEY" not in os.environ
 
 
+@pytest.mark.parametrize(
+    "api_key_args",
+    [
+        ["--api-key", "exposed-secret"],
+        ["--api-key=exposed-secret"],
+        ["--api-k=exposed-secret"],
+        ["--api-ke", "exposed-secret"],
+    ],
+)
+def test_secure_cli_rejects_command_line_api_key_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_args: list[str],
+) -> None:
+    def fail_if_evalscope_runs() -> int:
+        raise AssertionError("EvalScope must not run with an exposed API key")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evalscope-secure", "eval", *api_key_args],
+    )
+    monkeypatch.setattr(evalscope_secure_cli, "run_cmd", fail_if_evalscope_runs)
+
+    with pytest.raises(RuntimeError, match="protected environment"):
+        evalscope_secure_cli.main()
+
+
 def test_humaneval_rejects_unsandboxed_host_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

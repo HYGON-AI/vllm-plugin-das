@@ -11,9 +11,13 @@ from evalscope.cli.cli import run_cmd
 
 from tests.integration.server.evalscope_server import EVALSCOPE_API_KEY_ENV
 
+_API_KEY_OPTIONS = frozenset({"--api-k", "--api-ke", "--api-key"})
+
 
 def main() -> int:
-    if "--api-key" in sys.argv:
+    # EvalScope's argparse parser accepts the two unique long-option
+    # abbreviations in addition to the full spelling.
+    if any(arg.partition("=")[0] in _API_KEY_OPTIONS for arg in sys.argv):
         raise RuntimeError(
             "pass the EvalScope API key through the protected environment"
         )
