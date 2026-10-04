@@ -171,5 +171,29 @@ Inherited outbound proxies are preserved for dataset access while loopback is
 always added to `NO_PROXY`; the vLLM server ignores inherited proxies but
 honors an explicitly configured server proxy.
 
-The final clean plugin-wheel commit, filename, SHA256, and isolated import
-roots are appended after the reviewed source changes are committed.
+## Final reviewed plugin wheel
+
+The reviewed runtime/test change is commit
+`cdea830d36ba79a8dc2410253d871954498ab72c`. The clean tracked worktree at
+that commit produced:
+
+| Package | Filename | SHA256 |
+| --- | --- | --- |
+| vLLM HCU plugin | `vllm_hcu-0.28.1rc1.dev491+das.cdea830.dtk26041-cp310-cp310-linux_x86_64.whl` | `73898c9400f4c0476498573a243b7c9feb7494719cbe4aca1a492f26c85f37be` |
+
+It was installed with `--no-deps` under
+`/models/.installs/vllm-plugin-v0281-gfx938-cdea830`. With
+`PYTHONNOUSERSITE=1` and the pinned vLLM root first in `PYTHONPATH`, both the
+parent and a fresh child interpreter resolved:
+
+```text
+vllm      /models/.installs/vllm-v0281-gfx938-g77acaf/vllm/__init__.py
+vllm_hcu  /models/.installs/vllm-plugin-v0281-gfx938-cdea830/vllm_hcu/__init__.py
+hcu_ops   /models/.installs/vllm-plugin-v0281-gfx938-cdea830/vllm_hcu/hcu_ops.cpython-310-x86_64-linux-gnu.so
+```
+
+The installed-root compatibility, packaging, and lifecycle gate completed
+with `62 passed, 14 warnings in 126.35s`. The exact committed runtime patch
+suite completed with `1669 passed, 14 warnings in 426.33s`; the final complete
+changed-file suite completed with `581 passed, 3 skipped, 14 warnings in
+151.81s`.
