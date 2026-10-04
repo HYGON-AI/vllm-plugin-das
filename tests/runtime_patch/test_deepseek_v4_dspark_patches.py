@@ -49,9 +49,34 @@ def test_rocm_bf16_cache_uses_plain_gather(
     def bf16_gather(*args):
         calls.append(("bf16", args))
 
+    def sparse_decode(
+        q,
+        kv_cache,
+        swa_k_cache,
+        swa_only,
+        topk_indices,
+        topk_lens,
+        swa_indices,
+        swa_lens,
+        swa_ragged_indices,
+        swa_ragged_indptr,
+        topk_ragged_indices,
+        topk_ragged_indptr,
+        attn_sink,
+        scale,
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        output,
+        extra_cache_nan_free=False,
+        adaptive_splits=False,
+    ):
+        return None
+
     module = _module(
         patch_deepseek_v4_rocm_bf16_cache.TARGET_MODULE,
         dequantize_and_gather_k_cache=packed_fp8_gather,
+        rocm_sparse_attn_decode=sparse_decode,
     )
     monkeypatch.setattr(
         patch_deepseek_v4_rocm_bf16_cache,
@@ -77,6 +102,97 @@ def test_rocm_bf16_cache_uses_plain_gather(
     assert calls[0][0] == "bf16"
     assert calls[0][1][-2:] == (256, 7)
     assert calls[1] == ("fp8", (True,))
+
+
+def test_rocm_bf16_sparse_decode_uses_plain_cache_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def packed_fp8_gather(
+        out,
+        k_cache,
+        seq_lens,
+        gather_lens,
+        block_table,
+        block_size,
+        offset,
+        use_fnuz=False,
+    ):
+        return None
+
+    def fp8_sparse_decode(
+        q,
+        kv_cache,
+        swa_k_cache,
+        swa_only,
+        topk_indices,
+        topk_lens,
+        swa_indices,
+        swa_lens,
+        swa_ragged_indices,
+        swa_ragged_indptr,
+        topk_ragged_indices,
+        topk_ragged_indptr,
+        attn_sink,
+        scale,
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        output,
+        extra_cache_nan_free=False,
+        adaptive_splits=False,
+    ):
+        calls.append(("fp8", swa_k_cache.dtype))
+
+    def bf16_sparse_decode(*args, **kwargs):
+        calls.append(("bf16", kwargs["swa_k_cache"].dtype))
+
+    module = _module(
+        patch_deepseek_v4_rocm_bf16_cache.TARGET_MODULE,
+        dequantize_and_gather_k_cache=packed_fp8_gather,
+        rocm_sparse_attn_decode=fp8_sparse_decode,
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_rocm_bf16_cache,
+        "bf16_sparse_attn_decode",
+        bf16_sparse_decode,
+        raising=False,
+    )
+    patch_deepseek_v4_rocm_bf16_cache.apply_to_module(module)
+
+    common = dict(
+        q=object(),
+        kv_cache=None,
+        swa_only=True,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=object(),
+        swa_lens=object(),
+        swa_ragged_indices=None,
+        swa_ragged_indptr=None,
+        topk_ragged_indices=None,
+        topk_ragged_indptr=None,
+        attn_sink=None,
+        scale=1.0,
+        head_dim=576,
+        nope_head_dim=512,
+        rope_head_dim=64,
+        output=object(),
+    )
+    module.rocm_sparse_attn_decode(
+        swa_k_cache=torch.empty((1, 1, 576), dtype=torch.bfloat16),
+        **common,
+    )
+    module.rocm_sparse_attn_decode(
+        swa_k_cache=torch.empty((1,), dtype=torch.uint8),
+        **common,
+    )
+
+    assert calls == [
+        ("bf16", torch.bfloat16),
+        ("fp8", torch.uint8),
+    ]
 
 
 @pytest.mark.parametrize(
