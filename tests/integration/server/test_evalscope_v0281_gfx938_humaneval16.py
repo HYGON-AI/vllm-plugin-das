@@ -27,6 +27,20 @@ MODEL_ENV = "VLLM_HCU_GFX938_MODEL"
 
 PROFILE_CONTRACTS = (
     (
+        "deepseek_v32_channel_fp8_tp8",
+        "/models/DeepSeek-V3.2-channel-fp8",
+        8,
+        "FLASHMLA_SPARSE",
+        None,
+    ),
+    (
+        "deepseek_v32_channel_fp8_mtp3_kvfp8_tp8",
+        "/models/DeepSeek-V3.2-channel-fp8",
+        8,
+        "FLASHMLA_SPARSE",
+        None,
+    ),
+    (
         "deepseek_r1_channel_fp8_tp8",
         "/models/DeepSeek-R1-Channel-FP8-w8a8",
         8,
@@ -183,11 +197,13 @@ def test_gfx938_profile_contract(
         config["evalscope"]["pass_criteria"].get("enforce_score", True)
     ) is (profile not in diagnostic_profiles)
     assert config["evalscope"]["generation_config"]["do_sample"] is False
-    r1_profiles = {
+    long_output_profiles = {
+        "deepseek_v32_channel_fp8_tp8",
+        "deepseek_v32_channel_fp8_mtp3_kvfp8_tp8",
         "deepseek_r1_channel_fp8_tp8",
         "deepseek_r1_channel_fp8_mtp3_tp8",
     }
-    expected_max_tokens = 4096 if profile in r1_profiles else 2048
+    expected_max_tokens = 4096 if profile in long_output_profiles else 2048
     assert (
         config["evalscope"]["generation_config"]["max_tokens"]
         == expected_max_tokens
@@ -238,11 +254,50 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         assert work_dir.startswith("/tmp/vllm-hcu-evalscope/")
         work_dirs.append(work_dir)
         ports.append(config["server"]["port"])
-    assert len(work_dirs) == len(set(work_dirs)) == 17
-    assert len(ports) == len(set(ports)) == 17
+    assert len(work_dirs) == len(set(work_dirs)) == 19
+    assert len(ports) == len(set(ports)) == 19
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
+    v32_commands = {}
+    for profile in (
+        "deepseek_v32_channel_fp8_tp8",
+        "deepseek_v32_channel_fp8_mtp3_kvfp8_tp8",
+    ):
+        config = load_profiled_config(
+            DEFAULT_CONFIG, CONFIG_ENV, profile=profile
+        )
+        command, _, _ = server_command(config, model_env=MODEL_ENV)
+        assert config["server"]["environment"][
+            "VLLM_USE_V2_MODEL_RUNNER"
+        ] == "1"
+        assert _option_value(command, "--max-model-len") == "8192"
+        assert _option_value(command, "--max-num-batched-tokens") == "4096"
+        assert json.loads(
+            _option_value(command, "--default-chat-template-kwargs")
+        ) == {"thinking": False}
+        assert config["evalscope"]["generation_config"]["extra_body"] == {
+            "chat_template_kwargs": {"thinking": False}
+        }
+        v32_commands[profile] = command
+
+    assert "--speculative-config" not in v32_commands[
+        "deepseek_v32_channel_fp8_tp8"
+    ]
+    assert "--kv-cache-dtype" not in v32_commands[
+        "deepseek_v32_channel_fp8_tp8"
+    ]
+    assert json.loads(
+        _option_value(
+            v32_commands["deepseek_v32_channel_fp8_mtp3_kvfp8_tp8"],
+            "--speculative-config",
+        )
+    ) == {"method": "mtp", "num_speculative_tokens": 3}
+    assert _option_value(
+        v32_commands["deepseek_v32_channel_fp8_mtp3_kvfp8_tp8"],
+        "--kv-cache-dtype",
+    ) == "fp8_e4m3"
+
     r1_commands = {}
     for profile in (
         "deepseek_r1_channel_fp8_tp8",

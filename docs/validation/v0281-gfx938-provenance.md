@@ -123,6 +123,8 @@ and owned artifact directories are defined in
 
 | Profile | Topology and feature route | HumanEval16 | Disposition |
 | --- | --- | ---: | --- |
+| `deepseek_v32_channel_fp8_tp8` | TP8, sparse MLA, channel FP8 W8A8, AITER, prefix, default Graph | 16/16 | Pass; native LBNHC sparse-MLA KV layout retained |
+| `deepseek_v32_channel_fp8_mtp3_kvfp8_tp8` | TP8, sparse MLA, channel FP8 W8A8, AITER, MTP3, E4M3 sparse KV, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, MTP draft acceptance observed |
 | `deepseek_r1_channel_fp8_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, prefix, default Graph | 16/16 | Pass; current OpenAI response `reasoning` field accepted by the prefix probe |
 | `deepseek_r1_channel_fp8_mtp3_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; MTP draft acceptance observed throughout the concurrent run |
 | `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
@@ -171,6 +173,33 @@ and the deprecated `reasoning_content` alias. The probe now checks those three
 fields in current-protocol order, with regression coverage. After that narrow
 fix, the unchanged service route passed the prefix probe and HumanEval16.
 
+The later `/models/DeepSeek-V3.2-channel-fp8` checkpoint was validated through
+both a plain TP8 profile and a TP8+MTP3+E4M3-KV profile. Both passed raw and
+independently normalized HumanEval16 at 16/16, with all generated programs
+executed successfully. The plain run observed 9.31 output tokens/s and 104.13
+ms mean TPOT. The combined feature run observed 22.32 output tokens/s, 38.46
+ms mean TPOT, mean MTP acceptance length 3.17, and 72.5% draft-token
+acceptance in its final metric window. Generation lengths differed, so the
+throughput numbers are route evidence rather than a controlled benchmark.
+
+Both routes used HcuGPUModelRunnerV2, `FLASHMLA_SPARSE`, channel-wise FP8
+dense linear, tuned AITER channel-shuffle MoE, prefix caching, native LBNHC KV
+layout, and the default FULL_AND_PIECEWISE Graph policy. The combined profile
+mapped public `fp8_e4m3` to sparse-MLA `fp8_ds_mla`, allocated 981,376 KV
+tokens, compiled the `eagle_head`, warmed the three-token rejection sampler,
+and captured both target and speculator PIECEWISE/FULL graphs. Its checkpoint
+keeps `model_type=deepseek_v3`, so vLLM reports `DeepSeekMTPModel`; the plugin's
+shared HCU MTP implementation identifies V3.2 sparse attention from
+`index_topk`. Evidence directories are
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-v32-channel-fp8-tp8` and
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-v32-channel-fp8-mtp3-kvfp8-tp8`.
+
+The first plain attempt used a 4,096-token server context together with an
+EvalScope `max_tokens=4096` output budget, leaving no room for input tokens and
+producing HTTP 400 before inference. The accepted profiles use
+`--max-model-len 8192` with the same 4,096-token output budget; this was a
+request-contract correction, not a model or kernel fix.
+
 ## Source closure after runtime fixes
 
 - Changed-file focused suite after review fixes: `581 passed, 3 skipped, 14 warnings`.
@@ -178,6 +207,9 @@ fix, the unchanged service route passed the prefix probe and HumanEval16.
 - Full `tests/models/hy_v4`: `222 passed, 14 warnings`.
 - HY4 live TP8 gate: `16/16`, 16 predictions and reviews, final observed
   prefix hit rate about 34.3%, final-window MTP acceptance about 91.3%.
+- DeepSeek-V3.2 live TP8 gates: plain and MTP3+E4M3-KV profiles each `16/16`,
+  with 16 predictions, reviews, and successful code executions per profile.
+- Current profile/report focused suite: `57 passed, 1 skipped`.
 - Skill validation: `Skill is valid!`; repository/skill PAT-pattern scan:
   clean; `git diff --check`: clean.
 
