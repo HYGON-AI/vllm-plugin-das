@@ -13,6 +13,7 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_attention,
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
+    patch_deepseek_v4_rocm_compressor_fusion,
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
     patch_mhc_backend,
@@ -386,6 +387,68 @@ def test_dspark_ragged_copy_grows_to_real_nnz_without_overflow() -> None:
 
     assert ragged[:6].tolist() == list(range(6))
     assert indptr.tolist() == [0, 3, 6]
+
+
+def _compressor_fusion_attention(
+    main_weight: torch.Tensor,
+    indexer_weight: torch.Tensor,
+    calls: list[str],
+):
+    class DeepseekV4ROCMAiterMLAAttention:
+        def __init__(self) -> None:
+            self._fused_compressor_weight = None
+            self.compressor = SimpleNamespace(
+                fused_wkv_wgate=SimpleNamespace(weight=main_weight)
+            )
+            self.indexer = SimpleNamespace(
+                compressor=SimpleNamespace(
+                    fused_wkv_wgate=SimpleNamespace(weight=indexer_weight)
+                )
+            )
+
+        def prepare_compressor_gemm_fusion(self) -> bool:
+            calls.append("upstream")
+            if main_weight.shape[1] != indexer_weight.shape[1]:
+                raise ValueError("DeepSeek V4 compressor weights must share K")
+            return True
+
+    return DeepseekV4ROCMAiterMLAAttention
+
+
+def test_rocm_compressor_fusion_skips_hcu_nn_layout() -> None:
+    calls: list[str] = []
+    attention_cls = _compressor_fusion_attention(
+        torch.empty(4096, 2048),
+        torch.empty(4096, 512),
+        calls,
+    )
+    module = _module(
+        patch_deepseek_v4_rocm_compressor_fusion.TARGET_MODULE,
+        DeepseekV4ROCMAiterMLAAttention=attention_cls,
+    )
+
+    patch_deepseek_v4_rocm_compressor_fusion.apply_to_module(module)
+
+    assert attention_cls().prepare_compressor_gemm_fusion() is False
+    assert calls == []
+
+
+def test_rocm_compressor_fusion_keeps_upstream_nt_layout() -> None:
+    calls: list[str] = []
+    attention_cls = _compressor_fusion_attention(
+        torch.empty(2048, 4096),
+        torch.empty(512, 4096),
+        calls,
+    )
+    module = _module(
+        patch_deepseek_v4_rocm_compressor_fusion.TARGET_MODULE,
+        DeepseekV4ROCMAiterMLAAttention=attention_cls,
+    )
+
+    patch_deepseek_v4_rocm_compressor_fusion.apply_to_module(module)
+
+    assert attention_cls().prepare_compressor_gemm_fusion() is True
+    assert calls == ["upstream"]
 
 
 def test_rocm_wo_a_cache_accepts_hcu_nn_layout() -> None:
