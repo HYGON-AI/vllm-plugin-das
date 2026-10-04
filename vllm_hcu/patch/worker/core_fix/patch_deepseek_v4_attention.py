@@ -250,6 +250,16 @@ def apply_to_module(module: ModuleType) -> bool:
         topk_indices_buffer=None,
         aux_stream_list=None,
     ):
+        cache_config = getattr(vllm_config, "cache_config", None)
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if cache_dtype in {"bf16", "bfloat16"}:
+            # The official ROCm sparse kernels support their plain BF16 row
+            # layout, but DeepSeek V4 defaults every backend instance to the
+            # packed fp8_ds_mla layout before resolving --kv-cache-dtype.
+            # Honour an explicit BF16 request on HCU so gfx936 does not have
+            # to consume the E4M3-based packed cache format.
+            self.use_fp8_ds_mla_layout = False
+
         quant_config = getattr(vllm_config, "quant_config", None)
         if not _requires_unquantized_int8_wo_a(vllm_config):
             return original_init(

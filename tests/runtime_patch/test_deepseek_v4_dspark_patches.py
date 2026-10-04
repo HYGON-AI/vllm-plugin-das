@@ -184,6 +184,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction(
     expert_dtype: str,
 ) -> None:
     seen_ignore: list[list[str]] = []
+    seen_fp8_ds_mla_layout: list[bool] = []
 
     class DeepseekV4Attention:
         def __init__(
@@ -195,6 +196,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction(
         ):
             del prefix, topk_indices_buffer, aux_stream_list
             seen_ignore.append(list(vllm_config.quant_config.ignore))
+            seen_fp8_ds_mla_layout.append(self.use_fp8_ds_mla_layout)
 
         def _run_parallel_input_projections(self, hidden_states):
             return hidden_states
@@ -228,6 +230,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(expert_dtype=expert_dtype)
         ),
+        cache_config=SimpleNamespace(cache_dtype="bfloat16"),
         quant_config=quant_config,
     )
 
@@ -235,6 +238,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction(
     DeepseekV4Attention(vllm_config, "model.layers.3.attn")
 
     assert seen_ignore == [["model.layers.3.attn.wo_a"]]
+    assert seen_fp8_ds_mla_layout == [False]
     assert quant_config.ignore == []
 
 
