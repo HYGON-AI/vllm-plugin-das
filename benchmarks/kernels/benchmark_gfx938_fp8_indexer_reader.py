@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness-first BW1100 benchmark for the gfx938 FP8 indexer reader.
 
-The comparison path reproduces the pre-direct-reader linearization and
-LightOp call. Eager timing includes both public wrapper dispatch and output
+The synthetic comparison path linearizes paged KV data and calls LightOp.
+It is not the dispatch path from the parent commit, which called AITER/LightOp
+directly. Eager timing includes both public wrapper dispatch and output
 allocation; graph replay timing is separately labelled and excludes Python.
 """
 
@@ -144,7 +145,7 @@ def check(actual, expected, label):
     )
 
 
-def old_linearization(inputs):
+def synthetic_linearization_lightop(inputs):
     query, cache, weights, lengths, table, _, max_len = inputs
     batch, num_pages = table.shape
     page_size = cache.shape[1]
@@ -299,8 +300,8 @@ def main():
         direct = direct_wrapper(inputs)
         check(direct, expected, "direct")
         del direct
-        baseline = old_linearization(inputs)
-        check(baseline, expected, "linearization+LightOp")
+        baseline = synthetic_linearization_lightop(inputs)
+        check(baseline, expected, "synthetic linearization+LightOp")
         del baseline
         if args.diagnose_tiles:
             output = torch.empty_like(expected)
@@ -336,7 +337,10 @@ def main():
         rows = []
         for name, fn in (
             ("direct full wrapper", partial(direct_wrapper, inputs)),
-            ("linearization+LightOp", partial(old_linearization, inputs)),
+            (
+                "synthetic linearization+LightOp",
+                partial(synthetic_linearization_lightop, inputs),
+            ),
         ):
             if args.mode == "graph":
                 for _ in range(args.warmup):

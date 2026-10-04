@@ -141,6 +141,18 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
         gate_kernel.apply_scaled_mm(**{**kwargs, "B": B.contiguous()}) == -1
     )
     assert len(calls) == 1
+    # These calls must retain the original scaled-mm contract. A reshape with
+    # the same number of elements is not necessarily the requested [*, N].
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(**{**kwargs, "output_shape": (1, 6)}) == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "bias": torch.ones((3,), dtype=torch.bfloat16)}
+        )
+        == -1
+    )
+    assert len(calls) == 1
 
     mtp_layer = module.Glm5NextDecoderLayer(None, None, 41, is_mtp_layer=True)
     mtp_kernel = mtp_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
@@ -158,6 +170,12 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
     )
     assert torch.all(disabled_kernel.apply_scaled_mm(**kwargs) == -1)
     assert len(calls) == 1
+
+    # A valid batched output shape remains eligible for the fast path.
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(**{**kwargs, "output_shape": (1, 2, 3)}) == 7
+    )
+    assert len(calls) == 2
 
 
 def _fake_kda_module() -> tuple[ModuleType, type]:
