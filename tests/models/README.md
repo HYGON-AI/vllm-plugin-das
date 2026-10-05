@@ -15,10 +15,12 @@ checkpoint or dataset fails instead of silently skipping.
 
 Available local configurations:
 
-- `v0281_gfx938_humaneval16.yaml`: 20 selectable TP profiles for the 18 local
+- `v0281_gfx938_humaneval16.yaml`: 22 selectable profiles for the 19 local
   checkpoints in scope on the eight-card gfx938 host. DeepSeek-V3.2
   Channel-FP8 has separate TP8 baseline and TP8+MTP3+E4M3-KV profiles, while
   DeepSeek-R1 Channel-FP8 has separate TP8 baseline and TP8+MTP3 profiles.
+  Hy3 Channel-FP8 has a required TP8 profile and an optional
+  DP8/TP1/EP8 low-latency profile.
   Select one with
   `VLLM_HCU_GFX938_PROFILE=<profile>` and run
   `test_v0281_gfx938_selected_profile_humaneval16`. Acceptance profiles use

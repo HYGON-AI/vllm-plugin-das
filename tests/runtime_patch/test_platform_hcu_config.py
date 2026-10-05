@@ -1210,21 +1210,25 @@ def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
     )
 
 
-def test_deepseek_v4_enables_breakable_cuda_graph_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_deepseek_v4_enables_breakable_cuda_graph_by_default() -> None:
     variable = "VLLM_USE_BREAKABLE_CUDAGRAPH"
-    monkeypatch.delenv(variable, raising=False)
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            architectures=["DeepseekV4ForCausalLM"],
-            enforce_eager=False,
+    original = os.environ.get(variable)
+    with pytest.MonkeyPatch.context() as environment:
+        # Seed then delete so MonkeyPatch records how to restore an initially
+        # absent variable after the code under test writes it directly.
+        environment.setenv(variable, "test-restore-sentinel")
+        environment.delenv(variable)
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                enforce_eager=False,
+            )
         )
-    )
 
-    patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
+        patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
 
-    assert os.environ[variable] == "1"
+        assert os.environ[variable] == "1"
+    assert os.environ.get(variable) == original
 
 
 @pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])

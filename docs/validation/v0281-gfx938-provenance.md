@@ -331,7 +331,7 @@ evidence and exact commands are in
   coverage. The final deterministic profile enforces normalized score `1.0`;
   the final focused re-review passed `40` tests with one deselection and both
   static command contracts passed (`2 passed, 1 deselected`).
-- Current profile/report focused suite: `58 passed, 1 skipped`.
+- Current profile/report focused suite: `69 passed, 1 skipped`.
 - Skill validation: `Skill is valid!`; repository/skill PAT-pattern scan:
   clean; `git diff --check`: clean.
 
