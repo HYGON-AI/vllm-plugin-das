@@ -9,7 +9,6 @@ from contextlib import nullcontext
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_hcu.forward_context_runtime import (
@@ -104,62 +103,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
         with deepep_auto_request_phase_scope():
-            manager = self.cudagraph_manager
-            if not self._is_glm5next() or manager is None:
-                return super().execute_model(*args, **kwargs)
+            return super().execute_model(*args, **kwargs)
 
-            # GLM5Next's captured PIECEWISE prefill can return corrupt tokens
-            # when the padded graph size exceeds the real token count. Keep
-            # the requested graph mode for decode and run prefill eagerly.
-            dispatch = manager.dispatch
-            prior_instance_dispatch = vars(manager).get("dispatch")
-            self._hcu_prefill_for_graph = False
-
-            @functools.wraps(dispatch)
-            def dispatch_without_prefill_graph(
-                num_reqs,
-                num_tokens,
-                uniform_token_count,
-                *,
-                num_active_loras=0,
-                max_query_len=None,
-            ):
-                if self._hcu_prefill_for_graph:
-                    return BatchExecutionDescriptor(
-                        cg_mode=CUDAGraphMode.NONE,
-                        num_tokens=num_tokens,
-                        num_reqs=num_reqs,
-                        num_active_loras=num_active_loras,
-                    )
-                return dispatch(
-                    num_reqs,
-                    num_tokens,
-                    uniform_token_count,
-                    num_active_loras=num_active_loras,
-                    max_query_len=max_query_len,
-                )
-
-            manager.dispatch = dispatch_without_prefill_graph
-            try:
-                return super().execute_model(*args, **kwargs)
-            finally:
-                if prior_instance_dispatch is None:
-                    del manager.dispatch
-                else:
-                    manager.dispatch = prior_instance_dispatch
-                self._hcu_prefill_for_graph = False
-
-    def gather_batch_req_state(self, *args, **kwargs):
-        result = super().gather_batch_req_state(*args, **kwargs)
-        batch_req_state = result[0]
-        self._hcu_prefill_for_graph = (
-            self._is_glm5next()
-            and batch_req_state is not None
-            and bool(batch_req_state.is_prefilling_np.any())
-        )
-        return result
-
-    def _is_glm5next(self):
+    def _is_glm5next(self) -> bool:
         architectures = getattr(
             getattr(self.model_config, "hf_config", None), "architectures", ()
         )
@@ -170,10 +116,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if not self._is_glm5next():
             return super().capture_model(*args, **kwargs)
 
-        # The official capture path builds model_inputs with input_ids first
-        # and then expands prepare_dummy_inputs(). Real GLM5Next requests
-        # supply inputs_embeds and set input_ids=None. Match that schema so a
-        # PIECEWISE graph never replays the captured dummy token IDs.
+        # Real GLM5Next text requests supply inputs_embeds with input_ids=None.
+        # Match that argument schema during CUDA graph capture.
         prepare_dummy_inputs = self.model_state.prepare_dummy_inputs
 
         @functools.wraps(prepare_dummy_inputs)

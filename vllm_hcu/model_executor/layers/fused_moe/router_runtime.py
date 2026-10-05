@@ -81,6 +81,36 @@ def make_hcu_grouped_topk_router(base_class):
             *,
             input_ids=None,
         ):
+            topk_weights, topk_ids = self._compute_routing_unmasked(
+                hidden_states,
+                router_logits,
+                indices_type,
+                input_ids=input_ids,
+            )
+            # DeepEP LL must not dispatch padded CUDA graph rows to expert 0.
+            # Apply the mask after either the LightOp or grouped fallback path.
+            from vllm import envs
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                is_padding = get_forward_context().is_padding
+                if is_padding is not None:
+                    padding = is_padding[: topk_ids.shape[0], None]
+                    topk_ids = topk_ids.masked_fill(padding, -1)
+                    topk_weights = topk_weights.masked_fill(padding, 0.0)
+            return topk_weights, topk_ids
+
+        def _compute_routing_unmasked(
+            self,
+            hidden_states,
+            router_logits,
+            indices_type,
+            *,
+            input_ids=None,
+        ):
             from vllm_hcu.platforms import envs as henvs
 
             num_experts = router_logits.shape[-1]
