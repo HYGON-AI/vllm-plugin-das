@@ -452,7 +452,7 @@ def test_v0251_native_mhc_contract_is_not_replaced():
     } <= exports
 
 
-def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
+def test_v0251_native_hcu_deepseek_v4_uses_narrow_mtp_loader_adapter():
     exchanges = dict(module_exchange_names())
     assert "vllm.v1.attention.backends.mla.sparse_swa" in exchanges
     assert {
@@ -465,7 +465,11 @@ def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
         REPO_ROOT / "vllm_hcu/models/__init__.py"
     ).read_text(encoding="utf-8")
     assert '"DeepseekV4ForCausalLM"' not in hcu_registry
-    assert '"DeepSeekV4MTPModel"' not in hcu_registry
+    assert '"DeepSeekV4MTPModel"' in hcu_registry
+    assert (
+        '"vllm_hcu.models.deepseek_v4_mtp_compat:DeepSeekV4MTP"'
+        in hcu_registry
+    )
 
     target_registry_tree = ast.parse(
         (
