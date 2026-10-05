@@ -532,6 +532,14 @@ def test_normalize_humaneval_completion_keeps_unclosed_thinking_output() -> None
     assert evalscope_server._normalize_humaneval_completion(completion) == completion
 
 
+def test_normalize_humaneval_completion_removes_fence_joined_to_definition() -> None:
+    completion = "```def candidate(value):\n    return value\n```"
+
+    assert evalscope_server._normalize_humaneval_completion(completion) == (
+        "def candidate(value):\n    return value"
+    )
+
+
 def test_exact_humaneval_criteria_accepts_both_metrics_and_artifact_counts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

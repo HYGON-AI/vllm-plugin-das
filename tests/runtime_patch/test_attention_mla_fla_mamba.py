@@ -985,7 +985,7 @@ def _boltops_chunk_h_contract(
     initial_state_indices=None, output_final_state=True,
     inplace_final_state=False, chunk_size=64, save_new_value=True,
     cu_seqlens=None, chunk_indices=None, use_exp2=False,
-    transpose_state_layout=True, kernel_cfg=None,
+    transpose_state_layout=True, null_state_index=-1, kernel_cfg=None,
 ):
     pass
 
@@ -1082,6 +1082,7 @@ def test_fla_chunk_delta_h_uses_boltops(monkeypatch):
     assert kwargs["save_new_value"] is False
     assert kwargs["use_exp2"] is True
     assert kwargs["transpose_state_layout"] is True
+    assert kwargs["null_state_index"] == 0
 
 
 def test_fla_chunk_o_uses_boltops_and_preserves_output_buffer(monkeypatch):

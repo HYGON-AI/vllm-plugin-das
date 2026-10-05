@@ -541,7 +541,12 @@ def _normalize_humaneval_completion(completion: str) -> str:
         completion,
     )
     if opening is None:
-        return completion.strip()
+        opening = re.match(
+            r"[ \t]*```(?=(?:async[ \t]+def|def|class|from|import|@))",
+            completion,
+        )
+        if opening is None:
+            return completion.strip()
     code = completion[opening.end() :]
     closing = re.search(r"(?m)^[ \t]*```[ \t]*$", code)
     if closing is not None:
