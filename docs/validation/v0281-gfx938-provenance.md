@@ -222,13 +222,14 @@ mean TPOT. The feature route allocated 744,896 KV tokens; evidence is under
 The later `/models/Kimi-K2.6` checkpoint was validated as a language-only TP8
 route with HcuGPUModelRunnerV2, regular FLASHMLA, Triton WNA16 MoE, prefix
 caching, and BF16/auto LBNHC KV. The checkpoint has no MTP layers. Two runtime
-ownership defects explained its initial batch-sensitive repetition: BF16
-FlashMLA advertised unsafe FULL graph support for lazily planned scheduler
-metadata, and the HCU fused-MoE replacement omitted upstream ROCm's guard
-against auxiliary-stream shared-expert overlap when routed/shared inputs
-alias. BF16 now resolves the default Graph request to PIECEWISE, while WNA16's
-unquantized routed-input path serializes shared experts. The final command
-needs no debug environment switch and retains Graph capture and prefix reuse.
+ownership hypotheses were investigated, but only one reproduced the fault:
+the HCU fused-MoE replacement omitted upstream ROCm's guard against
+auxiliary-stream shared-expert overlap when routed/shared inputs alias.
+WNA16's unquantized routed-input path now serializes shared experts. Restoring
+BF16 FlashMLA's advertised full-graph capability passed the high-risk batch
+and HumanEval 64/64, disproving the scheduler-metadata hypothesis. The final
+command needs no debug environment switch and retains default
+FULL_AND_PIECEWISE Graph capture and prefix reuse.
 
 The deterministic Instant-mode run uses temperature zero, `thinking=false`,
 batch eight, and a 1,024-token output cap. It produced 64 predictions and
@@ -253,8 +254,10 @@ evidence and exact commands are in
   16 predictions, reviews, and successful code executions.
 - Kimi-K2.6 live TP8 gate: deterministic Instant mode produced 64
   predictions/reviews and normalized HumanEval `64/64`; service, prefix,
-  PIECEWISE Graph, FLASHMLA/LBNHC, and Triton WNA16 routes passed without a
-  shared-expert stream environment override.
+  FULL plus PIECEWISE Graphs, FLASHMLA/LBNHC, and Triton WNA16 routes passed
+  without a shared-expert stream environment override. The same service first
+  passed the eight high-risk prompts, for 72/72 HTTP 200 responses total and
+  no ERROR or Traceback.
 - Kimi-K2.6 explicit E4M3-KV smoke: the TP8 route resolved
   `kv_cache_dtype=fp8_e4m3`, captured FULL plus PIECEWISE Graphs, retained
   LBNHC, allocated 1,718,272 KV tokens, and completed the eight historical

@@ -91,6 +91,12 @@ def cpu_flashmla(monkeypatch):
     class QueryLenSupport:
         UNIFORM = "uniform"
 
+    class MLACommonMetadataBuilder(_GenericStub):
+        @classmethod
+        def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+            del vllm_config, kv_cache_spec
+            return cls._cudagraph_support
+
     _install_stub(monkeypatch, "vllm.envs", VLLM_BATCH_INVARIANT=False)
     _install_stub(monkeypatch, "vllm.config", VllmConfig=type("VllmConfig", (), {}))
     _install_stub(
@@ -110,7 +116,7 @@ def cpu_flashmla(monkeypatch):
         MLACommonDecodeMetadata=_GenericStub,
         MLACommonImpl=_MLACommonImplStub,
         MLACommonMetadata=_GenericStub,
-        MLACommonMetadataBuilder=_GenericStub,
+        MLACommonMetadataBuilder=MLACommonMetadataBuilder,
         QueryLenSupport=QueryLenSupport,
     )
     _install_stub(
@@ -996,16 +1002,16 @@ def test_flashmla_impl_owns_quant_query_capability(
 @pytest.mark.parametrize(
     ("cache_dtype", "expected"),
     [
-        ("auto", "never"),
-        ("float16", "never"),
-        ("bfloat16", "never"),
+        ("auto", "uniform-batch"),
+        ("float16", "uniform-batch"),
+        ("bfloat16", "uniform-batch"),
         ("fp8", "uniform-batch"),
         ("fp8_e4m3", "uniform-batch"),
         ("fp8_e5m2", "uniform-batch"),
         ("fp8_ds_mla", "uniform-batch"),
     ],
 )
-def test_flashmla_full_graph_support_requires_explicit_scheduler_metadata(
+def test_flashmla_supported_kv_dtypes_retain_full_graph_support(
     cpu_flashmla,
     cache_dtype,
     expected,

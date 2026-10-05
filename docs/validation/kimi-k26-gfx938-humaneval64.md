@@ -18,8 +18,7 @@ the operator asserted the isolated evaluation boundary with
 - Code evaluation uses `--language-model-only`, TP8, HcuGPUModelRunnerV2,
   regular `FLASHMLA`, Triton WNA16 MoE, the `kimi_k2` reasoning parser,
   prefix caching, BF16/auto KV, and the default FULL_AND_PIECEWISE Graph
-  request resolved to PIECEWISE. FLASHMLA retains its native LBNHC KV layout
-  and 64-token cache page.
+  policy. FLASHMLA retains its native LBNHC KV layout and 64-token cache page.
 
 The validated service command is:
 
@@ -44,9 +43,9 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
   --port 10223
 ```
 
-The final runtime loaded 74.92 GiB per rank, allocated an 859,840-token KV
-cache, captured five PIECEWISE graph sizes, and produced prefix-cache hits. It
-reported `CompressedTensorsWNA16MoEMethod`, `Using 'TRITON' WNA16 MoE
+The final runtime loaded 74.92 GiB per rank, allocated an 859,136-token KV
+cache, captured both FULL and PIECEWISE graph sizes, and produced prefix-cache
+hits. It reported `CompressedTensorsWNA16MoEMethod`, `Using 'TRITON' WNA16 MoE
 backend`, and `Using TritonWNA16Experts`. AITER rejects this WNA16 MoE route
 by contract, while Humming has no HIP implementation; neither is presented as
 a viable backend for this checkpoint. The command deliberately contains no
@@ -58,8 +57,7 @@ An explicit quantized-KV smoke used the same command with
 layout, and allocated 1,718,272 KV tokens. The historical high-risk concurrent
 batch `/19,/21,/25,/31,/36,/39,/46,/60` completed 8/8 HTTP 200 requests with
 normal stops between 102 and 295 output tokens. This live check confirms that
-the BF16-only FULL-graph restriction does not disable the chip's explicit
-E4M3 KV route.
+the chip's explicit E4M3 KV route also retains full-graph support.
 
 The benchmark-style Thinking run used the same command except for the two
 capacity arguments below; its full reproducible profile is
@@ -88,17 +86,7 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 
 ## Root cause and fix
 
-Two independent Graph-safety problems were present.
-
-First, BF16 HCU FlashMLA lazily creates scheduler metadata whose reuse contract
-assumes unchanged sequence lengths. Advertising FULL graph support allowed the
-default graph policy to replay stale planning state. The metadata builder now
-reports `AttentionCGSupport.NEVER` for BF16/auto KV, so vLLM keeps compilation
-and PIECEWISE graph capture but does not wrap the changing attention scheduler
-inside a FULL graph. Explicit quantized KV continues to use the backend's
-normal graph capability because that path creates graph-stable metadata.
-
-Second, the plugin's fused-MoE runner came from an older vLLM implementation
+The plugin's fused-MoE runner came from an older vLLM implementation
 and omitted current upstream ROCm's shared-expert multi-stream safety gate.
 Kimi's WNA16 path quantizes weights but leaves activations unquantized, so the
 routed-expert and shared-expert inputs alias. Running the shared expert on an
@@ -113,14 +101,18 @@ The isolation controls were decisive:
 
 - eager execution and several `max-num-seqs=1` requests passed;
 - compile-only/no-Graph execution passed HumanEval/3 and /31;
-- forcing shared-expert serialization while keeping PIECEWISE graphs made the
+- forcing shared-expert serialization while keeping Graph replay made the
   full deterministic HumanEval-64 run pass 64/64;
 - after the code fix, the unmodified command above passed /3 and /31 plus a
   concurrent high-risk batch `/19,/21,/25,/31,/36,/39,/46,/60`, all with
   normal stops between 102 and 295 output tokens; the final post-review rerun
   repeated that concurrent batch without force controls and stopped normally
   between 102 and 273 output tokens;
-- the explicit `fp8_e4m3` KV route retained FULL plus PIECEWISE capture and
+- restoring BF16 FlashMLA's advertised full-graph capability retained FULL
+  plus PIECEWISE capture and passed the same concurrent batch followed by
+  normalized HumanEval 64/64; this disproved the earlier scheduler-metadata
+  hypothesis and demonstrated that no BF16 graph downgrade is required;
+- the explicit `fp8_e4m3` KV route also retained FULL plus PIECEWISE capture and
   completed the same eight concurrent prompts with normal 102-to-295-token
   stops.
 
@@ -143,10 +135,12 @@ The accepted profile uses deterministic Instant mode:
 ```
 
 It runs batch eight and enforces an independently normalized HumanEval score
-of 1.0. The final patched-default run produced 64 predictions and reviews in
-416.67 seconds and passed normalized HumanEval 64/64 with an empty failure
-list. It measured 46.972 s mean latency, 1,871.5 ms mean TTFT, 314.3 ms mean
-TPOT, and 3.09 output tokens/s.
+of 1.0. The final FULL_AND_PIECEWISE run produced 64 predictions and reviews
+in 411.60 seconds and passed normalized HumanEval 64/64 with an empty failure
+list. It measured 46.398 s mean latency, 1,796.8 ms mean TTFT, 310.4 ms mean
+TPOT, and 3.13 output tokens/s. Together with the preceding high-risk batch,
+the same service returned 72/72 HTTP 200 responses without an ERROR or
+Traceback.
 
 EvalScope's raw checker scored only 8/64 because it does not consistently
 handle the model's complete fenced or horizontally indented module. The
@@ -177,7 +171,7 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
   --limit 64 \
   --datasets humaneval \
   --dataset-args '{"humaneval":{}}' \
-  --work-dir /tmp/vllm-hcu-evalscope/kimi-k26-gfx938-humaneval64-patched-default \
+  --work-dir /tmp/vllm-hcu-evalscope/kimi-k26-gfx938-full-and-piecewise-final \
   --no-timestamp
 ```
 
@@ -189,6 +183,7 @@ failures.
 
 Evidence directories:
 
+- `/tmp/vllm-hcu-evalscope/kimi-k26-gfx938-full-and-piecewise-final`
 - `/tmp/vllm-hcu-evalscope/kimi-k26-gfx938-humaneval64-patched-default`
 - `/tmp/vllm-hcu-evalscope/kimi-k26-gfx938-fp8-graph-smoke`
 - `/tmp/vllm-hcu-evalscope/kimi-k26-gfx938-humaneval64-shared-serial-graph`
