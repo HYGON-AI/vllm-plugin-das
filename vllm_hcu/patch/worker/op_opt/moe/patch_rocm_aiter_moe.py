@@ -262,11 +262,15 @@ def apply_to_module(module: ModuleType) -> bool:
                 return special_impl(*args, **kwargs)
             return normal_impl(*args, **kwargs)
 
+    swiglustep = getattr(moe_activation, "SWIGLUSTEP", None)
+
     @functools.wraps(supports)
     def hcu_supports_activation(activation):
         if activation == moe_activation.SWIGLUOAI_UNINTERLEAVE:
             return False
-        return activation == gelu_tanh or supports(activation)
+        # SWIGLUSTEP runs through apply_aiter_quantized_moe (HCU AITER public
+        # API, limit 7.0); hcu_is_supported_config restricts it to W8A8.
+        return activation in (gelu_tanh, swiglustep) or supports(activation)
 
     @functools.wraps(supports_quant_scheme)
     def hcu_supports_quant_scheme(weight_key, activation_key):
@@ -296,6 +300,17 @@ def apply_to_module(module: ModuleType) -> bool:
             supported, reason = is_supported_config(
                 cls, moe_config, weight_key, activation_key, activation_format
             )
+            if (
+                supported
+                and swiglustep is not None
+                and getattr(moe_config, "activation", None) == swiglustep
+                and weight_key is None
+            ):
+                # Only the W8A8 route (apply_aiter_quantized_moe) implements
+                # SWIGLUSTEP; the upstream unquantized body would reject it.
+                return False, (
+                    "HCU AITER supports SWIGLUSTEP only for W8A8 channel experts"
+                )
             mxfp4_key = getattr(target, "kMxfp4Static", None)
             if supported and mxfp4_key is not None and weight_key == mxfp4_key:
                 return False, (
