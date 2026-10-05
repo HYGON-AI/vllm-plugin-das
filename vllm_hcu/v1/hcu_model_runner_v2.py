@@ -7,16 +7,17 @@ import functools
 from contextlib import nullcontext
 
 import torch
-
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm_hcu.model_executor.layers.attention.pcp import (
-    replicated_mtp_batch_scope,
-)
+
 from vllm_hcu.forward_context_runtime import (
     deepep_auto_request_phase_scope,
     set_deepep_auto_request_phase,
+)
+from vllm_hcu.model_executor.layers.attention.pcp import (
+    replicated_mtp_batch_scope,
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 
@@ -103,7 +104,90 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
         with deepep_auto_request_phase_scope():
-            return super().execute_model(*args, **kwargs)
+            manager = self.cudagraph_manager
+            if not self._is_glm5next() or manager is None:
+                return super().execute_model(*args, **kwargs)
+
+            # GLM5Next's captured PIECEWISE prefill can return corrupt tokens
+            # when the padded graph size exceeds the real token count. Keep
+            # the requested graph mode for decode and run prefill eagerly.
+            dispatch = manager.dispatch
+            prior_instance_dispatch = vars(manager).get("dispatch")
+            self._hcu_prefill_for_graph = False
+
+            @functools.wraps(dispatch)
+            def dispatch_without_prefill_graph(
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                *,
+                num_active_loras=0,
+                max_query_len=None,
+            ):
+                if self._hcu_prefill_for_graph:
+                    return BatchExecutionDescriptor(
+                        cg_mode=CUDAGraphMode.NONE,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        num_active_loras=num_active_loras,
+                    )
+                return dispatch(
+                    num_reqs,
+                    num_tokens,
+                    uniform_token_count,
+                    num_active_loras=num_active_loras,
+                    max_query_len=max_query_len,
+                )
+
+            manager.dispatch = dispatch_without_prefill_graph
+            try:
+                return super().execute_model(*args, **kwargs)
+            finally:
+                if prior_instance_dispatch is None:
+                    del manager.dispatch
+                else:
+                    manager.dispatch = prior_instance_dispatch
+                self._hcu_prefill_for_graph = False
+
+    def gather_batch_req_state(self, *args, **kwargs):
+        result = super().gather_batch_req_state(*args, **kwargs)
+        batch_req_state = result[0]
+        self._hcu_prefill_for_graph = (
+            self._is_glm5next()
+            and batch_req_state is not None
+            and bool(batch_req_state.is_prefilling_np.any())
+        )
+        return result
+
+    def _is_glm5next(self):
+        architectures = getattr(
+            getattr(self.model_config, "hf_config", None), "architectures", ()
+        )
+        return "Glm5NextForConditionalGeneration" in architectures
+
+    @functools.wraps(GPUModelRunner.capture_model)
+    def capture_model(self, *args, **kwargs):
+        if not self._is_glm5next():
+            return super().capture_model(*args, **kwargs)
+
+        # The official capture path builds model_inputs with input_ids first
+        # and then expands prepare_dummy_inputs(). Real GLM5Next requests
+        # supply inputs_embeds and set input_ids=None. Match that schema so a
+        # PIECEWISE graph never replays the captured dummy token IDs.
+        prepare_dummy_inputs = self.model_state.prepare_dummy_inputs
+
+        @functools.wraps(prepare_dummy_inputs)
+        def hcu_dummy_inputs(*prepare_args, **prepare_kwargs):
+            return {
+                **prepare_dummy_inputs(*prepare_args, **prepare_kwargs),
+                "input_ids": None,
+            }
+
+        self.model_state.prepare_dummy_inputs = hcu_dummy_inputs
+        try:
+            return super().capture_model(*args, **kwargs)
+        finally:
+            self.model_state.prepare_dummy_inputs = prepare_dummy_inputs
 
     def profile_run(self) -> None:
         """Profile PCP with the per-rank token budget plus routing slack."""
