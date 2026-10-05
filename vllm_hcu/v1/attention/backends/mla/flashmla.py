@@ -130,6 +130,23 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
     reorder_batch_threshold: int = 128  # process small prefills with decode pathway
     # ^ TODO(matt): tune this
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        del kv_cache_spec
+        if not is_quantized_kv_cache(vllm_config.cache_config.cache_dtype):
+            # The BF16 FlashMLA extension lazily creates scheduler metadata in
+            # its first forward and documents it as reusable only while the
+            # cache sequence lengths remain unchanged. FULL graph replay skips
+            # that Python planning path as sequence lengths advance, so only
+            # PIECEWISE graphs can safely retain dynamic BF16 scheduling. The
+            # FP8 path builds and copies explicit graph-stable metadata below.
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,

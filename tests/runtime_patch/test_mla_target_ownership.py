@@ -82,6 +82,7 @@ def _install_stub(monkeypatch, name, **values):
 @pytest.fixture
 def cpu_flashmla(monkeypatch):
     class AttentionCGSupport:
+        NEVER = "never"
         UNIFORM_BATCH = "uniform-batch"
 
     class AttentionType:
@@ -990,6 +991,35 @@ def test_flashmla_impl_owns_quant_query_capability(
         kv_sharing_target_layer_name=None,
     )
     assert impl.supports_quant_query_input is expected
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [
+        ("auto", "never"),
+        ("float16", "never"),
+        ("bfloat16", "never"),
+        ("fp8", "uniform-batch"),
+        ("fp8_e4m3", "uniform-batch"),
+        ("fp8_e5m2", "uniform-batch"),
+        ("fp8_ds_mla", "uniform-batch"),
+    ],
+)
+def test_flashmla_full_graph_support_requires_explicit_scheduler_metadata(
+    cpu_flashmla,
+    cache_dtype,
+    expected,
+):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+    )
+
+    support = cpu_flashmla.FlashMLAMetadataBuilder.get_cudagraph_support(
+        config,
+        SimpleNamespace(),
+    )
+
+    assert support == expected
 
 
 def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(

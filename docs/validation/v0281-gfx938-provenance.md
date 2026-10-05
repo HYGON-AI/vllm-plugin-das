@@ -221,20 +221,29 @@ mean TPOT. The feature route allocated 744,896 KV tokens; evidence is under
 
 The later `/models/Kimi-K2.6` checkpoint was validated as a language-only TP8
 route with HcuGPUModelRunnerV2, regular FLASHMLA, Triton WNA16 MoE, prefix
-caching, BF16/auto LBNHC KV, and default FULL_AND_PIECEWISE Graphs. The
-checkpoint has no MTP layers. Its complete HumanEval-64 Instant-mode run used
-the checkpoint README's recommended temperature 0.6 and top-p 0.95, produced
-64 predictions and reviews, and passed 54/64 after independent fenced-code and
-full-module normalization. Greedy E4M3 and BF16 controls passed 52/64 and
-51/64 respectively; repeated failures across both KV formats, official
-sampling, and Thinking/Instant controls did not justify an HCU kernel change.
-The profile is diagnostic and makes no 64/64 accuracy claim. Full evidence and
-the exact command are in `docs/validation/kimi-k26-gfx938-humaneval64.md`.
+caching, and BF16/auto LBNHC KV. The checkpoint has no MTP layers. Two runtime
+ownership defects explained its initial batch-sensitive repetition: BF16
+FlashMLA advertised unsafe FULL graph support for lazily planned scheduler
+metadata, and the HCU fused-MoE replacement omitted upstream ROCm's guard
+against auxiliary-stream shared-expert overlap when routed/shared inputs
+alias. BF16 now resolves the default Graph request to PIECEWISE, while WNA16's
+unquantized routed-input path serializes shared experts. The final command
+needs no debug environment switch and retains Graph capture and prefix reuse.
+
+The deterministic Instant-mode run uses temperature zero, `thinking=false`,
+batch eight, and a 1,024-token output cap. It produced 64 predictions and
+reviews and passed independently normalized HumanEval 64/64. EvalScope's raw
+checker undercounted complete fenced or horizontally indented modules, so the
+accepted gate uses the repository's syntax-aware normalizer inside the
+explicit isolated execution boundary. Earlier 51/64, 52/64, 54/64, and 55/64
+controls remain diagnostic history from before the stream-race fix. Full
+evidence and exact commands are in
+`docs/validation/kimi-k26-gfx938-humaneval64.md`.
 
 ## Source closure after runtime fixes
 
-- Changed-file focused suite after review fixes: `581 passed, 3 skipped, 14 warnings`.
-- Full `tests/runtime_patch`: `1669 passed, 14 warnings`.
+- Full `tests/runtime_patch`: `1679 passed, 14 warnings` after the final Kimi
+  force-control fix and review updates.
 - Full `tests/models/hy_v4`: `222 passed, 14 warnings`.
 - HY4 live TP8 gate: `16/16`, 16 predictions and reviews, final observed
   prefix hit rate about 34.3%, final-window MTP acceptance about 91.3%.
@@ -242,12 +251,22 @@ the exact command are in `docs/validation/kimi-k26-gfx938-humaneval64.md`.
   with 16 predictions, reviews, and successful code executions per profile.
 - GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with
   16 predictions, reviews, and successful code executions.
-- Kimi-K2.6 live TP8 diagnostic: Instant official sampling produced 64
-  predictions/reviews and normalized HumanEval `54/64`; service, prefix,
-  default Graph, FLASHMLA/LBNHC, and Triton WNA16 routes passed.
-- Kimi changed-file focused suite: `51 passed, 1 deselected`; its diagnostic gate
-  accepted the recorded 64 predictions/reviews and recorded the normalized
-  score without enforcing a fixed stochastic result.
+- Kimi-K2.6 live TP8 gate: deterministic Instant mode produced 64
+  predictions/reviews and normalized HumanEval `64/64`; service, prefix,
+  PIECEWISE Graph, FLASHMLA/LBNHC, and Triton WNA16 routes passed without a
+  shared-expert stream environment override.
+- Kimi-K2.6 explicit E4M3-KV smoke: the TP8 route resolved
+  `kv_cache_dtype=fp8_e4m3`, captured FULL plus PIECEWISE Graphs, retained
+  LBNHC, allocated 1,718,272 KV tokens, and completed the eight historical
+  high-risk concurrent prompts with HTTP 200 and normal stops.
+- Kimi-K2.6 benchmark-style Thinking diagnostic: 64 predictions/reviews,
+  normalized HumanEval `55/64`, with four 16K reasoning-only truncations. This
+  predates the shared-expert stream-race fix and is retained only as history.
+- Kimi changed-file focused suite includes explicit BF16/FP8 FlashMLA Graph
+  capability, shared-expert stream-safety, and force-control regression
+  coverage. The final deterministic profile enforces normalized score `1.0`;
+  the final focused re-review passed `40` tests with one deselection and both
+  static command contracts passed (`2 passed, 1 deselected`).
 - Current profile/report focused suite: `58 passed, 1 skipped`.
 - Skill validation: `Skill is valid!`; repository/skill PAT-pattern scan:
   clean; `git diff --check`: clean.

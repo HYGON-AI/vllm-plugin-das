@@ -32,9 +32,15 @@ Available local configurations:
   plus EvalScope GSM8K.
 - `kimi_k26_gfx938_humaneval64.yaml`: Kimi-K2.6 language-only TP8 route with
   Model Runner V2, FLASHMLA, Triton WNA16 MoE, the `kimi_k2` reasoning parser,
-  prefix caching, default CUDA Graph policy, and a diagnostic HumanEval-64
-  gate that records artifact counts and a normalized score without enforcing
-  a fixed stochastic result. The profile does not claim a 64/64 accuracy pass.
+  prefix caching, BF16 PIECEWISE CUDA Graph capture, and a deterministic
+  Instant-mode HumanEval-64 gate. The syntax-aware normalized score is enforced
+  at 64/64; the route uses batch eight and does not need the shared-expert
+  stream debug environment switch.
+- `kimi_k26_gfx938_humaneval64_thinking.yaml`: the same Kimi-K2.6 TP8 route
+  with a 32K context, 16K output limit, batch eight, and the checkpoint
+  benchmark sampling settings (`thinking=true`, temperature/top-p 1.0). This
+  historical diagnostic predates the shared-expert stream-race fix; its
+  recorded 55/64 is not the accepted accuracy gate.
 - `deepseek_v4_flash_0731_dspark_humaneval.yaml`: DeepSeek-V4-Flash-0731
   Channel-FP8 TP8 and unified DP8+EP8 DSpark server profiles plus strict
   ModelScope HumanEval-32 acceptance.

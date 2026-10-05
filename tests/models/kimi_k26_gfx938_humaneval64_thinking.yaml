@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-name: kimi_k26_gfx938_humaneval64
+name: kimi_k26_gfx938_humaneval64_thinking
 model: /models/Kimi-K2.6
 
 server:
   host: 127.0.0.1
-  port: 10223
+  port: 10222
   startup_timeout_s: 7200
   shutdown_timeout_s: 180
   served_model_name: Kimi-K2.6
@@ -25,7 +25,7 @@ server:
     - kimi_k2
     - --enable-prefix-caching
     - --max-model-len
-    - "8192"
+    - "32768"
     - --max-num-batched-tokens
     - "4096"
     - --max-num-seqs
@@ -47,28 +47,29 @@ server:
           Final instruction: reply OK.
 
 evalscope:
-  work_dir: /tmp/vllm-hcu-evalscope/kimi-k26-gfx938-humaneval64
+  work_dir: /tmp/vllm-hcu-evalscope/kimi-k26-gfx938-humaneval64-thinking
   api_key: EMPTY
   eval_type: openai_api
   generation_config:
-    temperature: 0
-    do_sample: false
-    max_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+    do_sample: true
+    max_tokens: 16384
     extra_body:
       chat_template_kwargs:
-        thinking: false
+        thinking: true
   stream: true
   eval_batch_size: 8
-  timeout: 7200
+  timeout: 21600
   limit: 64
   datasets: [humaneval]
   dataset_args:
     humaneval: {}
   pass_criteria:
     dataset: humaneval
-    mean_acc: 1.0
-    mean_acc_pass@1: 1.0
     num_predictions: 64
     num_reviews: 64
     normalize_code_fences: true
+    record_normalized_score: true
+    enforce_score: false
   no_timestamp: true
