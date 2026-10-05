@@ -49,6 +49,10 @@ def _config(**updates: object) -> SimpleNamespace:
     return SimpleNamespace(additional_config={"hcu": values})
 
 
+def _should_share(eagle, flag, draft, target):
+    return True
+
+
 def test_hcu_downstream_config_uses_sidecar_not_upstream_only_fields():
     paths = (
         "vllm_hcu/v1/hcu_model_runner.py",
@@ -1620,6 +1624,19 @@ def test_multi_layer_mtp_preserves_distinct_trained_head():
 def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
     target_buffer = object()
 
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+
+    def config(**updates: object) -> FakeVllmConfig:
+        return FakeVllmConfig(
+            model_config=object(),
+            speculative_config=SimpleNamespace(draft_model_config=object()),
+            additional_config={"hcu": HcuFeatureConfig(**updates).to_dict()},
+        )
+
     class DraftInner:
         def __init__(self):
             self.child = SimpleNamespace(topk_indices_buffer=None)
@@ -1635,16 +1652,100 @@ def test_eagle_topk_buffer_sharing_is_multi_mtp_gated():
         return model
 
     module = _module(
-        patch_eagle_utils.TARGET_MODULE, load_eagle_model=load_eagle_model
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
     )
     patch_eagle_utils.apply_to_module(module)
     target = SimpleNamespace(model=SimpleNamespace(topk_indices_buffer=target_buffer))
-    off_model = module.load_eagle_model(target, _config())
+    off_model = module.load_eagle_model(target, config())
     assert off_model.model.child.topk_indices_buffer is None
     on_model = module.load_eagle_model(
-        target, _config(enable_multi_layers_mtp=True)
+        target, config(enable_multi_layers_mtp=True)
     )
     assert on_model.model.child.topk_indices_buffer is target_buffer
+
+
+def test_eagle_loader_installs_draft_model_config_before_construction():
+    target_model_config = object()
+    draft_model_config = object()
+    calls: list[object] = []
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+
+    def load_eagle_model(target_model, vllm_config):
+        calls.append(vllm_config)
+        return object()
+
+    module = _module(
+        patch_eagle_utils.TARGET_MODULE,
+        load_eagle_model=load_eagle_model,
+        _should_share=_should_share,
+    )
+    patch_eagle_utils.apply_to_module(module)
+    config = FakeVllmConfig(
+        model_config=target_model_config,
+        speculative_config=SimpleNamespace(
+            draft_model_config=draft_model_config,
+        ),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+    )
+
+    module.load_eagle_model(object(), config)
+
+    assert config.model_config is target_model_config
+    assert calls[0] is not config
+    assert calls[0].model_config is draft_model_config
+
+
+def test_eagle_loader_preserves_step3p5_per_layer_lm_heads():
+    trained_head = object()
+    target_head = object()
+
+    @dataclasses.dataclass
+    class FakeVllmConfig:
+        model_config: object
+        speculative_config: object
+        additional_config: dict[str, object]
+
+    def should_share(eagle, flag, draft, target):
+        return True
+
+    module = _module(patch_eagle_utils.TARGET_MODULE, _should_share=should_share)
+
+    def load_eagle_model(target_model, vllm_config):
+        layer = SimpleNamespace(shared_head=SimpleNamespace(head=trained_head))
+        draft = SimpleNamespace(
+            config=SimpleNamespace(model_type="step3p5_mtp"),
+            model=SimpleNamespace(layers={"45": layer}),
+        )
+        if module._should_share(
+            draft,
+            "has_own_lm_head",
+            None,
+            target_model.lm_head,
+        ):
+            layer.shared_head.head = target_model.lm_head
+        return draft
+
+    module.load_eagle_model = load_eagle_model
+    patch_eagle_utils.apply_to_module(module)
+    vllm_config = FakeVllmConfig(
+        model_config=object(),
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        additional_config={"hcu": HcuFeatureConfig().to_dict()},
+    )
+
+    loaded = module.load_eagle_model(
+        SimpleNamespace(lm_head=target_head),
+        vllm_config,
+    )
+
+    assert loaded.model.layers["45"].shared_head.head is trained_head
 
 
 def test_ubatch_sms_guard_disables_only_missing_compute_control(

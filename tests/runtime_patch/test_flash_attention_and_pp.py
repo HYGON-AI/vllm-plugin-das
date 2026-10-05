@@ -473,6 +473,23 @@ def test_flash_attention_prefers_vendor_kernel_page_size(
     assert backend.get_preferred_block_size(16) == expected_block_size
 
 
+def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV-cache planning queries this outside model-construction context."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+
+    sizes = backend.get_supported_kernel_block_sizes()
+
+    assert len(sizes) == 1
+    assert isinstance(sizes[0], flash_attn.MultipleOf)
+    assert sizes[0].base == 16
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_kernel_block_size"),
     [("varlen", 64), ("cutlass", 64), ("classic", 128)],
@@ -489,7 +506,7 @@ def test_hybrid_flash_attention_splits_manager_pages_to_vendor_kernel_size(
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
     monkeypatch.setattr(
         flash_attn,
-        "get_current_vllm_config",
+        "get_current_vllm_config_or_none",
         lambda: SimpleNamespace(
             model_config=SimpleNamespace(is_hybrid=True),
             cache_config=SimpleNamespace(
@@ -634,6 +651,32 @@ def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(
         device_capability=flash_attn.DeviceCapability(9, 0),
     )
     assert reason is not None and "mm_prefix" in reason
+
+
+def test_hcu_flash_attention_accepts_e5m2_sliding_window_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejecting this contract prevents Step-3.7 from constructing layers."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    reasons = backend.validate_configuration(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8_e5m2",
+        block_size=None,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=flash_attn.DeviceCapability(9, 0),
+        attn_type=flash_attn.AttentionType.DECODER,
+        has_sliding_window=True,
+    )
+
+    assert reasons == []
 
 
 def test_hcu_flash_attention_rswa_is_explicitly_fail_closed(

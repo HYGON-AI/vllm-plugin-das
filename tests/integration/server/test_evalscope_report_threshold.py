@@ -504,6 +504,34 @@ def _accept_normalized_humaneval(
     return completions
 
 
+@pytest.mark.parametrize(
+    ("completion", "expected"),
+    [
+        (
+            "reasoning about the implementation\n</think>\n"
+            "def candidate(value):\n    return value",
+            "def candidate(value):\n    return value",
+        ),
+        (
+            "<think>reasoning</think>\n```python\n"
+            "def candidate(value):\n    return value\n```",
+            "def candidate(value):\n    return value",
+        ),
+    ],
+)
+def test_normalize_humaneval_completion_removes_completed_thinking_prefix(
+    completion: str,
+    expected: str,
+) -> None:
+    assert evalscope_server._normalize_humaneval_completion(completion) == expected
+
+
+def test_normalize_humaneval_completion_keeps_unclosed_thinking_output() -> None:
+    completion = "<think>reasoning without a final answer"
+
+    assert evalscope_server._normalize_humaneval_completion(completion) == completion
+
+
 def test_exact_humaneval_criteria_accepts_both_metrics_and_artifact_counts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
