@@ -5,19 +5,28 @@
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
 
 import functools
+import os
 from collections.abc import Callable
 from inspect import signature
-from typing import Tuple
 
 import torch
-
 from vllm.logger import init_logger
+
 from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
 
+
+def _bolt_sparse_mla_requested() -> bool:
+    return os.environ.get("VLLM_HCU_SPARSE_MLA_BOLTOPS", "0").lower() in (
+        "1",
+        "true",
+    )
+
+
 try:
     from flash_mla.flash_mla_interface import flash_mla_cuda
+
     _flashmla_C_AVAILABLE = True
     _flashmla_extension_C_AVAILABLE = True
 except ImportError:
@@ -56,7 +65,7 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     from vllm_hcu.platforms import envs as henvs
 
-    if not henvs.optional_custom_op_enabled():
+    if not henvs.optional_custom_op_enabled() or _bolt_sparse_mla_requested():
         try:
             _resolve_sparse_mla_fwd()
         except RuntimeError as exc:
@@ -74,11 +83,13 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 
 
 if _is_flashmla_available()[0]:
-    from flash_mla.flash_mla_interface import (  # noqa: F401
+    from flash_mla.flash_mla_interface import (
         FlashMLASchedMeta,
-        flash_mla_sparse_fwd as _native_flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
         get_mla_metadata,
+    )
+    from flash_mla.flash_mla_interface import (
+        flash_mla_sparse_fwd as _native_flash_mla_sparse_fwd,
     )
 else:
 
@@ -104,18 +115,17 @@ _SPARSE_MLA_PARAMETERS = (
 
 @functools.cache
 def _resolve_sparse_mla_fwd() -> Callable:
-    """Resolve the sparse MLA kernel once under the custom-op master gate."""
+    """Resolve the native or explicitly requested BoltOPs sparse MLA kernel."""
     from vllm_hcu.platforms import envs as henvs
 
-    if henvs.optional_custom_op_enabled():
+    if henvs.optional_custom_op_enabled() and not _bolt_sparse_mla_requested():
         return _native_flash_mla_sparse_fwd
 
     try:
         from boltops.mla import flash_mla_sparse_fwd as boltops_sparse_mla_fwd
     except (AttributeError, ImportError) as exc:
         raise RuntimeError(
-            "VLLM_HCU_USE_CUSTOM_OPS=0 requires "
-            "boltops.mla.flash_mla_sparse_fwd"
+            "BoltOPs sparse MLA requires boltops.mla.flash_mla_sparse_fwd"
         ) from exc
 
     parameters = signature(boltops_sparse_mla_fwd).parameters
@@ -129,9 +139,7 @@ def _resolve_sparse_mla_fwd() -> Callable:
             "boltops.mla.flash_mla_sparse_fwd signature drifted from the "
             "audited BoltOPs 0.1.0 contract"
         )
-    logger.info_once(
-        "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOPs Triton sparse MLA"
-    )
+    logger.info_once("Using BoltOPs Triton sparse MLA")
     return boltops_sparse_mla_fwd
 
 
@@ -218,8 +226,8 @@ def flash_mla_with_kvcache_fp8(
         )
     else:
         if kv_cache_dtype == "fp8":
-                kv_cache_dtype = "fp8_e4m3"
-        out, softmax_lse = flash_mla_cuda.fwd_kvcache_quantization_mla( 
+            kv_cache_dtype = "fp8_e4m3"
+        out, softmax_lse = flash_mla_cuda.fwd_kvcache_quantization_mla(
             q,
             k_cache,
             None,
@@ -232,8 +240,8 @@ def flash_mla_with_kvcache_fp8(
             num_splits,
             descale_k,
             kv_cache_dtype,
-        ) 
-        
+        )
+
     return out, softmax_lse
 
 
@@ -246,11 +254,11 @@ def flash_mla_with_kvcache_fp8_with_cat(
     head_dim_v: int,
     tile_scheduler_metadata: torch.Tensor,
     num_splits: torch.Tensor,
-    softmax_scale: float | None= None,
+    softmax_scale: float | None = None,
     causal: bool = False,
     descale_q: torch.Tensor | None = None,
     descale_k: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
         q_nope: (batch_size, seq_len_q, num_heads_q, 512).

@@ -2223,6 +2223,63 @@ def test_sparse_mla_cache_update_uses_hcu_operator(
     assert not adapter.apply_to_module(module)
 
 
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_sparse_mla_fp8_nope_cache_update_zero_pads_rope(monkeypatch, preallocate):
+    adapter = _adapter("patch_sparse_mla_attention")
+    observed = {}
+
+    class SparseMLACommonImpl:
+        def do_kv_cache_update(
+            self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
+        ):
+            raise AssertionError("HCU cache update wrapper was not called")
+
+    def concat_and_cache_mla(*args):
+        observed["pe"] = args[1]
+
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(concat_and_cache_mla=concat_and_cache_mla),
+        ),
+    )
+    module = _module(
+        adapter.TARGET_MODULE,
+        SparseMLACommonImpl=SparseMLACommonImpl,
+        torch=fake_torch,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.platforms",
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        hcu_ops=object(),
+    )
+    assert adapter.apply_to_module(module)
+
+    impl = SparseMLACommonImpl()
+    if preallocate:
+        impl._fp8_nope_pe_buffer = torch.zeros((8, 64), dtype=torch.bfloat16)
+    impl.do_kv_cache_update(
+        torch.ones((4, 512), dtype=torch.bfloat16),
+        torch.empty((4, 1, 0), dtype=torch.bfloat16),
+        torch.ones(1),
+        torch.arange(4).view(1, 4),
+        "fp8_ds_mla",
+        torch.ones(1),
+    )
+
+    assert observed["pe"].shape == (4, 64)
+    assert torch.all(observed["pe"] == 0)
+    if preallocate:
+        assert (
+            observed["pe"].untyped_storage().data_ptr()
+            == impl._fp8_nope_pe_buffer.untyped_storage().data_ptr()
+        )
+
+
 @pytest.mark.parametrize(
     ("shape", "expected_shape"),
     [
