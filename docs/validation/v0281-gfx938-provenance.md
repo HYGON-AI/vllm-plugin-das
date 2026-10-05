@@ -128,9 +128,9 @@ and owned artifact directories are defined in
 | `deepseek_r1_channel_fp8_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, prefix, default Graph | 16/16 | Pass; current OpenAI response `reasoning` field accepted by the prefix probe |
 | `deepseek_r1_channel_fp8_mtp3_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; MTP draft acceptance observed throughout the concurrent run |
 | `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
-| `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass |
+| `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass; repeated on the final shared-expert code with target/draft FULL plus PIECEWISE Graphs |
 | `glm52_channel_int8_tp8` | TP8, sparse MLA, Channel INT8, AITER INT8 MoE, E4M3 sparse KV, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, final-window MTP draft acceptance 97.2% |
-| `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass |
+| `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass; repeated on the final shared-expert code and extended to HumanEval 32/32 |
 | `glm51_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass; EvalScope artifact ID collapses repeated underscores |
 | `hy4_preview_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass after `indexed_attention` and `reasoning_effort=no_think` fixes |
 | `minimax_m25_int8_tp4` | TP4, FLASH_ATTN, HND/BHSD kernel view, AITER, prefix | 16/16 | Pass |
@@ -143,6 +143,26 @@ and owned artifact directories are defined in
 | `qwen38_27b_int8_tp2` | TP2, FLASH_ATTN, INT8, prefix | 16/16 | Pass |
 | `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, AITER FP8 MoE, E4M3 KV, MTP3 | 16/16 | Pass; prefix hits observed |
 | `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, AITER, MTP3 | 16/16 | Pass |
+
+The final shared-expert stream-safety change was followed by fresh live
+regression runs for both large GLM routes. `/models/GLM-5-W8A8` used TP8,
+regular BF16/auto sparse MLA KV, AITER INT8 MoE, MTP3, prefix caching, and the
+default FULL_AND_PIECEWISE target/draft Graph policy. It passed raw and
+normalized HumanEval 16/16; all 18 API requests, including the two prefix
+probes, returned HTTP 200 with no ERROR or Traceback. The final metric window
+reported 35.2% prefix hits and 93.0% draft-token acceptance. The report
+observed 27.41 output tokens/s, 4.782 s mean latency, 591.7 ms TTFT, and
+32.1 ms TPOT. The route allocated 400,512 KV tokens; evidence remains under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-glm5-w8a8-tp8`.
+
+`/models/GLM-5.3-Channel-FP8-w8a8` used TP8, `FLASHMLA_SPARSE`, AITER FP8
+MoE, MTP3, public E4M3 KV resolved to `fp8_ds_mla`, prefix caching, and the
+default FULL_AND_PIECEWISE target/draft Graph policy. A fresh HumanEval16 gate
+passed raw and normalized 16/16. The extended accuracy gate then passed raw
+and normalized HumanEval 32/32 with 34/34 HTTP 200 responses, no ERROR or
+Traceback, 737,920 KV tokens, and a final report of 25.6 output tokens/s,
+3.082 s mean latency, 594.3 ms TTFT, and 32.2 ms TPOT. Evidence is under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-glm53-channel-fp8-tp8-humaneval32-final`.
 
 DeepSeek V4.1 was explicitly excluded at the requester's direction. The
 optional current-branch HY4 DP8/TP1/EP8 rerun subsequently passed 16/16 with
@@ -252,6 +272,12 @@ evidence and exact commands are in
   with 16 predictions, reviews, and successful code executions per profile.
 - GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with
   16 predictions, reviews, and successful code executions.
+- GLM-5 W8A8 post-shared-expert live TP8 gate: MTP3 profile `16/16`, with
+  target/draft FULL plus PIECEWISE Graphs, 18/18 HTTP 200 responses including
+  prefix probes, and no ERROR or Traceback.
+- GLM-5.3 Channel-FP8 post-shared-expert live TP8 gates: MTP3+E4M3-KV passed
+  `16/16`, then the extended accuracy gate passed `32/32`; the final service
+  recorded 34/34 HTTP 200 responses and no ERROR or Traceback.
 - Kimi-K2.6 live TP8 gate: deterministic Instant mode produced 64
   predictions/reviews and normalized HumanEval `64/64`; service, prefix,
   FULL plus PIECEWISE Graphs, FLASHMLA/LBNHC, and Triton WNA16 routes passed
