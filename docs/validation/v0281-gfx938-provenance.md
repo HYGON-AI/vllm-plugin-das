@@ -132,6 +132,8 @@ and owned artifact directories are defined in
 | `glm52_channel_int8_tp8` | TP8, sparse MLA, Channel INT8, AITER INT8 MoE, E4M3 sparse KV, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, final-window MTP draft acceptance 97.2% |
 | `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass; repeated on the final shared-expert code and extended to HumanEval 32/32 |
 | `glm51_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass; EvalScope artifact ID collapses repeated underscores |
+| `hy3_channel_fp8_mtp2_kvfp8_tp8` | TP8, FLASH_ATTN, channel FP8 W8A8, AITER, MTP2, E4M3 KV, prefix | 16/16 | Pass; HND selection resolved to the physical LBHNC cache and default target/speculator Graphs |
+| `hy3_channel_fp8_dp8_ep8_mtp2_kvfp8` | DP8/TP1/EP8, FLASH_ATTN, channel FP8 W8A8, DeepEP low-latency/DeepGEMM, MTP2, E4M3 KV, prefix | 16/16 | Pass; nine-request probe demonstrated rank-local prefix reuse |
 | `hy4_preview_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass after `indexed_attention` and `reasoning_effort=no_think` fixes |
 | `minimax_m25_int8_tp4` | TP4, FLASH_ATTN, HND/BHSD kernel view, AITER, prefix | 16/16 | Pass |
 | `qwen2_57b_tp2` | TP2, FLASH_ATTN, HND/BHSD kernel view, prefix | 15/16 | Deterministic HumanEval/10 miss under both AITER and Triton MoE; retained as checkpoint/model outcome |
@@ -172,6 +174,34 @@ are under `/tmp/vllm-hcu-evalscope/v0281-gfx938-hy4-dp8-ep8-mtp3`. The
 generic two-request prefix probe was not accepted as DP8 evidence because its
 requests landed on different ranks; no current-branch DP8 prefix-hit claim is
 made.
+
+`/models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3` was then validated on
+both the required TP8 route and the optional DP8/TP1/EP8 low-latency route. The
+checkpoint is regular GQA rather than MLA, so both profiles used
+`FLASH_ATTN`, Model Runner V2, public E4M3 KV, MTP2, prefix caching,
+`reasoning_effort=no_think`, and the default FULL_AND_PIECEWISE target and
+speculator Graph policy. `VLLM_KV_CACHE_LAYOUT=HND` selected the HND/BHSD-facing
+route and resolved to the runtime's physical LBHNC cache layout.
+
+The TP8/AITER run passed raw and independently normalized HumanEval 16/16,
+with 18/18 HTTP 200 responses and no ERROR or Traceback. It allocated
+4,860,672 KV tokens, reported a final 35.1% prefix-hit rate and 90.0% draft
+acceptance, and observed 31.23 output tokens/s, 3.024 s mean latency, 906.9 ms
+TTFT, and 21.91 ms TPOT. Evidence is under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-hy3-channel-fp8-mtp2-kvfp8-tp8`.
+
+The DP8/TP1/EP8 profile selected DeepEP low-latency and DeepGEMM, started one
+Model Runner V2 engine per device, captured FULL and PIECEWISE target/draft
+Graphs, and passed raw and normalized HumanEval 16/16. Its successful request
+window contained 25/25 HTTP 200 responses and no runtime ERROR or Traceback;
+owned SIGTERM cleanup subsequently emitted one expected cancellation-side
+`EngineDeadError`. A two-request probe initially returned zero because the
+requests landed on different DP ranks. The harness now supports a configurable
+prefix-probe request count, and this profile sends DP-size-plus-one (nine)
+identical requests; the repeated rank recorded 2,752 hit tokens. The report
+observed 32.73 output tokens/s, 2.368 s mean latency, 273.3 ms TTFT, and
+27.55 ms TPOT. Evidence is under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-hy3-channel-fp8-dp8-ep8-mtp2-kvfp8`.
 
 The subsequently added `/models/DeepSeek-R1-Channel-FP8-w8a8` checkpoint was
 validated twice on the same eight-card host. Both the plain TP8 route and the
@@ -268,6 +298,11 @@ evidence and exact commands are in
 - Full `tests/models/hy_v4`: `222 passed, 14 warnings`.
 - HY4 live TP8 gate: `16/16`, 16 predictions and reviews, final observed
   prefix hit rate about 34.3%, final-window MTP acceptance about 91.3%.
+- Hy3 Channel-FP8 live gates: TP8/AITER and DP8/TP1/EP8
+  DeepEP-low-latency/DeepGEMM profiles each passed raw and normalized
+  HumanEval `16/16` with MTP2, E4M3 KV, prefix caching, and default target and
+  draft FULL plus PIECEWISE Graphs. The DP profile used nine identical prefix
+  requests so at least one request returned to the same rank.
 - DeepSeek-V3.2 live TP8 gates: plain and MTP3+E4M3-KV profiles each `16/16`,
   with 16 predictions, reviews, and successful code executions per profile.
 - GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with

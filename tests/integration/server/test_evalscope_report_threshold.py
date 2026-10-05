@@ -381,6 +381,43 @@ def test_prefix_probe_sends_identical_requests_and_records_metrics(
     ]
 
 
+def test_prefix_probe_honors_configured_request_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_requests = 0
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total 0\n",
+            "vllm:prefix_cache_hits_total 64\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        nonlocal chat_requests
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse(next(metrics))
+        chat_requests += 1
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+        )
+
+    config = _prefix_probe_config()
+    config["server"]["prefix_probe"]["request_count"] = 9
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+
+    before, after, _ = evalscope_server._run_prefix_probe(
+        config,
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (0.0, 64.0)
+    assert chat_requests == 9
+
+
 def test_prefix_probe_requires_metric_growth(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

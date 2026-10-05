@@ -91,6 +91,20 @@ PROFILE_CONTRACTS = (
         None,
     ),
     (
+        "hy3_channel_fp8_mtp2_kvfp8_tp8",
+        "/models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3",
+        8,
+        "FLASH_ATTN",
+        "HND",
+    ),
+    (
+        "hy3_channel_fp8_dp8_ep8_mtp2_kvfp8",
+        "/models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3",
+        1,
+        "FLASH_ATTN",
+        "HND",
+    ),
+    (
         "minimax_m25_int8_tp4",
         "/models/MiniMax-M2.5-Channel-INT8-w8a8",
         4,
@@ -261,8 +275,8 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         assert work_dir.startswith("/tmp/vllm-hcu-evalscope/")
         work_dirs.append(work_dir)
         ports.append(config["server"]["port"])
-    assert len(work_dirs) == len(set(work_dirs)) == 20
-    assert len(ports) == len(set(ports)) == 20
+    assert len(work_dirs) == len(set(work_dirs)) == 22
+    assert len(ports) == len(set(ports)) == 22
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
@@ -379,6 +393,24 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
         "chat_template_kwargs": {"reasoning_effort": "no_think"}
     }
 
+    hy3 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="hy3_channel_fp8_mtp2_kvfp8_tp8"
+    )
+    hy3_command, _, _ = server_command(hy3, model_env=MODEL_ENV)
+    assert hy3["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert json.loads(
+        _option_value(hy3_command, "--speculative-config")
+    ) == {"method": "mtp", "num_speculative_tokens": 2}
+    assert _option_value(hy3_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(hy3_command, "--moe-backend") == "aiter"
+    assert _option_value(hy3_command, "--reasoning-parser") == "hy_v3"
+    assert json.loads(
+        _option_value(hy3_command, "--default-chat-template-kwargs")
+    ) == {"reasoning_effort": "no_think"}
+    assert hy3["evalscope"]["generation_config"]["extra_body"] == {
+        "chat_template_kwargs": {"reasoning_effort": "no_think"}
+    }
+
     minimax = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="minimax_m25_int8_tp4"
     )
@@ -412,6 +444,28 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
         assert _option_value(fp8_kv_command, "--max-model-len") == "8192"
         assert fp8_kv["server"]["prefix_probe"]["content_repeat"] == 64
 
+
+def test_hy3_dp8_ep8_low_latency_contract() -> None:
+    config = load_profiled_config(
+        DEFAULT_CONFIG,
+        CONFIG_ENV,
+        profile="hy3_channel_fp8_dp8_ep8_mtp2_kvfp8",
+    )
+    command, _, _ = server_command(config, model_env=MODEL_ENV)
+
+    assert _option_value(command, "--tensor-parallel-size") == "1"
+    assert _option_value(command, "--data-parallel-size") == "8"
+    assert "--enable-expert-parallel" in command
+    assert _option_value(command, "--all2all-backend") == "deepep_low_latency"
+    assert _option_value(command, "--moe-backend") == "deep_gemm"
+    assert json.loads(
+        _option_value(command, "--speculative-config")
+    ) == {"method": "mtp", "num_speculative_tokens": 2}
+    assert _option_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert config["server"]["prefix_probe"]["request_count"] == 9
+    assert "--enforce-eager" not in command
+    assert "--compilation-config" not in command
+
 @pytest.mark.hcu
 @pytest.mark.model
 @pytest.mark.multi_hcu
@@ -426,10 +480,13 @@ def test_v0281_gfx938_selected_profile_humaneval16() -> None:
     if profile not in contracts:
         pytest.fail(f"unknown {PROFILE_ENV}={profile!r}")
     _, model, tp, _, _ = contracts[profile]
+    is_hy3_dp8 = profile == "hy3_channel_fp8_dp8_ep8_mtp2_kvfp8"
+    required_hcu_count = 8 if is_hy3_dp8 else tp
+    topology_label = "DP8/TP1/EP8" if is_hy3_dp8 else f"TP{tp}"
     config = load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
     run_evalscope_server_test(
         config,
         model_env=MODEL_ENV,
-        model_label=f"{Path(model).name} gfx938 TP{tp}",
-        required_hcu_count=tp,
+        model_label=f"{Path(model).name} gfx938 {topology_label}",
+        required_hcu_count=required_hcu_count,
     )

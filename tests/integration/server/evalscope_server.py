@@ -503,6 +503,9 @@ def _run_prefix_probe(
         expanded_messages.append(expanded_message)
     timeout = int(probe.get("timeout_s", 120))
     metric = str(probe.get("metric", "vllm:prefix_cache_hits_total"))
+    request_count = int(probe.get("request_count", 2))
+    if request_count < 2:
+        raise ValueError("server.prefix_probe.request_count must be at least 2")
     served_model = str(
         config.get("server", {}).get("served_model_name", config["model"])
     )
@@ -529,7 +532,7 @@ def _run_prefix_probe(
         separators=(",", ":"),
     ).encode("utf-8")
     api_key = str(config.get("evalscope", {}).get("api_key", "EMPTY"))
-    for _ in range(2):
+    for _ in range(request_count):
         request = Request(
             chat_url,
             data=payload,

@@ -242,6 +242,46 @@ profiles:
           chat_template_kwargs:
             reasoning_effort: no_think
 
+  hy3_channel_fp8_mtp2_kvfp8_tp8:
+    model: /models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3
+    server:
+      port: 10221
+      served_model_name: Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASH_ATTN, --reasoning-parser, hy_v3, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":2}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"reasoning_effort":"no_think"}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-hy3-channel-fp8-mtp2-kvfp8-tp8
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 2048
+        extra_body:
+          chat_template_kwargs:
+            reasoning_effort: no_think
+
+  hy3_channel_fp8_dp8_ep8_mtp2_kvfp8:
+    model: /models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3
+    server:
+      port: 10222
+      served_model_name: Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3
+      prefix_probe:
+        request_count: 9
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "1", --data-parallel-size, "8", --enable-expert-parallel, --attention-backend, FLASH_ATTN, --reasoning-parser, hy_v3, --moe-backend, deep_gemm, --all2all-backend, deepep_low_latency, --speculative-config, '{"method":"mtp","num_speculative_tokens":2}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"reasoning_effort":"no_think"}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-hy3-channel-fp8-dp8-ep8-mtp2-kvfp8
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 2048
+        extra_body:
+          chat_template_kwargs:
+            reasoning_effort: no_think
+
   minimax_m25_int8_tp4:
     model: /models/MiniMax-M2.5-Channel-INT8-w8a8
     server:
