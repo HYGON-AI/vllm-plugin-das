@@ -424,7 +424,7 @@ def _indexer_k_bf16_cache_kernel(
 
 def indexer_k_bf16_cache_triton(
     k: torch.Tensor,
-    kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim] (bf16)
+    kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_tile_size=16,
     head_tile_size=16,
@@ -433,7 +433,8 @@ def indexer_k_bf16_cache_triton(
     将 BF16 类型的 K 张量写入 BF16 类型的 KV Cache
     Args:
         k: 输入 K 张量 [num_tokens, head_dim] (bf16)
-        kv_cache: KV Cache 张量 [num_blocks, block_size, head_dim] (bf16)
+        kv_cache: KV Cache 张量 [num_blocks, block_size, head_dim] 或 vLLM
+            逻辑视图 [num_blocks, 1, block_size, head_dim] (bf16)
         slot_mapping: token 到 cache slot 的映射 [num_tokens]
         block_tile_size: 块分块大小
         head_tile_size: 头维度分块大小
@@ -442,14 +443,12 @@ def indexer_k_bf16_cache_triton(
     assert k.dtype == torch.bfloat16, "k 必须是 bf16 类型"
     assert kv_cache.dtype == torch.bfloat16, "kv_cache 必须是 bf16 类型"
     
-    # 解析张量维度
-    num_blocks = kv_cache.shape[0]
-    block_size = kv_cache.shape[1]
     head_dim = k.shape[-1]
     num_tokens = slot_mapping.shape[0]
-    
-    # 验证维度合法性
-    assert kv_cache.shape[2] == head_dim, "kv_cache 的 head_dim 必须与 k 一致"
+
+    kv_cache = _indexer_cache_as_bf16_nhd_view(kv_cache, head_dim)
+    num_blocks = kv_cache.shape[0]
+    block_size = kv_cache.shape[1]
     
     # 重塑 KV Cache 为二维（便于指针计算）
     kv_cache_2d = kv_cache.view(num_blocks, -1)  # [num_blocks, block_size * head_dim]
@@ -556,7 +555,7 @@ def _cp_gather_indexer_k_bf16_cache_kernel(
     tl.store(dst_ptr, val)
 
 def cp_gather_indexer_k_bf16_cache_triton(
-    k_cache: torch.Tensor,  # [num_blocks, block_size, head_dim] (bf16)
+    k_cache: torch.Tensor,
     k_bf16: torch.Tensor,   # [num_tokens, head_dim] (bf16)
     block_table: torch.Tensor,  # [batch_size, num_blocks_per_seq]
     cu_seq_lens: torch.Tensor,  # [batch_size + 1]
@@ -566,7 +565,8 @@ def cp_gather_indexer_k_bf16_cache_triton(
     """
     BF16 K Cache 收集算子
     Args:
-        k_cache: K缓存张量 [num_blocks, block_size, head_dim] (bf16)
+        k_cache: K缓存张量 [num_blocks, block_size, head_dim] 或 vLLM
+            逻辑视图 [num_blocks, 1, block_size, head_dim] (bf16)
         k_bf16: 输出张量 [num_tokens, head_dim] (bf16)
         block_table: 块表 [batch_size, num_blocks_per_seq]
         cu_seq_lens: 序列长度累积数组 [batch_size + 1]
@@ -577,10 +577,10 @@ def cp_gather_indexer_k_bf16_cache_triton(
     assert k_cache.dtype == torch.bfloat16, "k_cache 必须是 bf16 类型"
     assert k_bf16.dtype == torch.bfloat16, "k_bf16 必须是 bf16 类型"
     
-    # 解析维度参数
     num_tokens = k_bf16.size(0)
-    block_size = k_cache.size(1)
     head_dim = k_bf16.shape[-1]
+    k_cache = _indexer_cache_as_bf16_nhd_view(k_cache, head_dim)
+    block_size = k_cache.size(1)
     num_blocks = k_cache.shape[0]
     batch_size = block_table.size(0)
     num_blocks_per_seq = block_table.size(1)
@@ -1325,6 +1325,39 @@ def _indexer_cache_as_hipc_view(kv_cache: torch.Tensor) -> torch.Tensor:
         size=(kv_cache.size(0), block_size, *kv_cache.shape[2:]),
         stride=(block_stride, token_stride, *kv_cache.stride()[2:]),
     )
+
+
+def _indexer_cache_as_bf16_nhd_view(
+    kv_cache: torch.Tensor, head_dim: int
+) -> torch.Tensor:
+    """Return the zero-copy 3D NHD view used by the BF16 Triton kernels.
+
+    vLLM 0.28 exposes each layer as logical ``[B, H, N, C]`` regardless of
+    whether the resolved physical layout is LBNHC or LBHNC. The sparse
+    indexer has one KV head, so remove that singleton logical head axis. Keep
+    compatibility with the legacy 3D view, including its collapsed page axis.
+    """
+    if kv_cache.ndim == 4:
+        if kv_cache.size(1) != 1:
+            raise ValueError(
+                "BF16 sparse-indexer cache requires exactly one KV head; "
+                f"got shape {tuple(kv_cache.shape)}"
+            )
+        kv_cache = kv_cache.squeeze(1)
+    elif kv_cache.ndim == 3:
+        kv_cache = _indexer_cache_as_hipc_view(kv_cache)
+    else:
+        raise ValueError(
+            "BF16 sparse-indexer cache must be a 3D legacy or 4D logical "
+            f"view; got shape {tuple(kv_cache.shape)}"
+        )
+
+    if kv_cache.ndim != 3 or kv_cache.size(2) != head_dim:
+        raise ValueError(
+            "BF16 sparse-indexer cache head_dim must match k; "
+            f"got shape {tuple(kv_cache.shape)} and head_dim={head_dim}"
+        )
+    return kv_cache
 
 
 def rocm_aiter_sparse_attn_indexer_native(
