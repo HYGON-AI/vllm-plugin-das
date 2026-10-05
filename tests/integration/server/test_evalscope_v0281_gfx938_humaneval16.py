@@ -25,6 +25,13 @@ CONFIG_ENV = "VLLM_HCU_GFX938_HUMANEVAL16_CONFIG"
 PROFILE_ENV = "VLLM_HCU_GFX938_PROFILE"
 MODEL_ENV = "VLLM_HCU_GFX938_MODEL"
 
+
+def _required_hcu_count(profile: str, tensor_parallel_size: int) -> int:
+    if profile == "hy3_channel_fp8_dp8_ep8_mtp2_kvfp8":
+        return 8
+    return tensor_parallel_size
+
+
 PROFILE_CONTRACTS = (
     (
         "deepseek_v32_channel_fp8_tp8",
@@ -455,6 +462,7 @@ def test_hy3_dp8_ep8_low_latency_contract() -> None:
 
     assert _option_value(command, "--tensor-parallel-size") == "1"
     assert _option_value(command, "--data-parallel-size") == "8"
+    assert config["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     assert "--enable-expert-parallel" in command
     assert _option_value(command, "--all2all-backend") == "deepep_low_latency"
     assert _option_value(command, "--moe-backend") == "deep_gemm"
@@ -465,6 +473,12 @@ def test_hy3_dp8_ep8_low_latency_contract() -> None:
     assert config["server"]["prefix_probe"]["request_count"] == 9
     assert "--enforce-eager" not in command
     assert "--compilation-config" not in command
+
+
+def test_hy3_dp8_requires_all_eight_hcus_despite_tp1() -> None:
+    assert _required_hcu_count("hy3_channel_fp8_dp8_ep8_mtp2_kvfp8", 1) == 8
+    assert _required_hcu_count("hy3_channel_fp8_mtp2_kvfp8_tp8", 8) == 8
+
 
 @pytest.mark.hcu
 @pytest.mark.model
@@ -481,7 +495,7 @@ def test_v0281_gfx938_selected_profile_humaneval16() -> None:
         pytest.fail(f"unknown {PROFILE_ENV}={profile!r}")
     _, model, tp, _, _ = contracts[profile]
     is_hy3_dp8 = profile == "hy3_channel_fp8_dp8_ep8_mtp2_kvfp8"
-    required_hcu_count = 8 if is_hy3_dp8 else tp
+    required_hcu_count = _required_hcu_count(profile, tp)
     topology_label = "DP8/TP1/EP8" if is_hy3_dp8 else f"TP{tp}"
     config = load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
     run_evalscope_server_test(
