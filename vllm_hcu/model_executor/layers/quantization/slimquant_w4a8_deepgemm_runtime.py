@@ -67,9 +67,11 @@ def fuse_silu_mul_quant(*args, **kwargs):
 
 
 def fuse_silu_mul_clamp_quant(*args, **kwargs):
-    import lightop
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe,
+    )
 
-    return lightop.fuse_silu_mul_clamp_quant(*args, **kwargs)
+    return dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant(*args, **kwargs)
 
 
 def _canonical_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:

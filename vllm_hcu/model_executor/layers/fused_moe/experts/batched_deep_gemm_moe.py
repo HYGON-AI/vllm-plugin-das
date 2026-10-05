@@ -44,12 +44,6 @@ from vllm.utils.math_utils import cdiv, round_up
 logger = init_logger(__name__)
 
 
-def fuse_silu_mul_clamp_quant_ep(*args, **kwargs):
-    import lightop
-
-    return lightop.fuse_silu_mul_clamp_quant_ep(*args, **kwargs)
-
-
 def scales_shape_stride_dtype(
     E: int, T: int, G: int, quant_scale_fmt: DeepGemmQuantScaleFMT
 ) -> tuple[tuple[int, ...], tuple[int, ...], torch.dtype]:
@@ -488,6 +482,9 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 )
             from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
             from lightop.activation import fuse_silu_mul_quant_ep
+            from vllm_hcu.model_executor.layers.fused_moe.experts import (
+                dpsk_v4_deep_gemm_moe,
+            )
 
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
@@ -498,7 +495,10 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             )
             clamp_limit = self.quant_config.gemm1_clamp_limit
             if clamp_limit is not None and clamp_limit > 0:
-                a2q, a2q_scale = fuse_silu_mul_clamp_quant_ep(
+                clamp_quant = (
+                    dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant_ep
+                )
+                a2q, a2q_scale = clamp_quant(
                     workspace1,
                     limit=clamp_limit,
                     mask_m=expert_num_tokens,

@@ -734,8 +734,8 @@ def test_lightop_paged_sparse_mqa_matches_packed_cache_reference() -> None:
 def test_lightop_deepseek_v4_fused_insert_updates_q_and_cache() -> None:
     device = _hcu_device()
     arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    if arch != "gfx938":
-        pytest.skip("LightOp DeepSeek V4 fused insert requires gfx938")
+    if arch not in {"gfx936", "gfx938"}:
+        pytest.skip("LightOp DeepSeek V4 fused insert requires gfx936 or gfx938")
     try:
         from lightop import attention as lightop_attention
 
