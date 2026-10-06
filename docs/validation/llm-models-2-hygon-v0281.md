@@ -29,6 +29,7 @@ request.
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-235B-A22B-Channel-INT8-w8a8` | TP4 and TP8 diagnostics | best 15/16; not accepted | The same corrupted identifiers survived KV, Graph, topology, dense-GEMM, and MoE-provider controls; the checkpoint has no MTP layer |
 | `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
+| `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -382,6 +383,69 @@ output tok/s. Across the service session, MTP accepted 30,794/52,617 draft
 tokens (58.5%); prefix metrics recorded 1,664 hits over 6,508 queried tokens.
 No ERROR or Traceback was logged, and teardown returned all devices to the
 measured 2 MiB idle baseline.
+
+## DeepSeek-V3.2 Channel-INT8 TP8 commands
+
+This checkpoint exposes the V3.2 sparse indexer through `index_topk` while
+retaining the `DeepseekV3ForCausalLM` and `DeepSeekMTPModel` display names.
+Use the sparse backend and let it resolve the physical cache layout.
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve \
+    /llm-models-2/hygon/DeepSeek-V3.2-Channel-INT8-w8a8 \
+  --served-model-name DeepSeek-V3.2-Channel-INT8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --attention-backend FLASHMLA_SPARSE \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"thinking":false}'
+```
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/deepseek-v32-int8-fresh-run
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model DeepSeek-V3.2-Channel-INT8-w8a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":4096,"extra_body":{"chat_template_kwargs":{"thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" --no-timestamp
+```
+
+The 642.65 GiB checkpoint loaded from 163 shards and used 85.66 GiB of model
+memory per rank. Public `fp8_e4m3` resolved to sparse-MLA `fp8_ds_mla` with
+LBNHC, and the service allocated 921,024 KV tokens. AITER selected its INT8
+MoE backend, loaded `tuned_fmoe_asm_w8a8_channel_shuffle.csv` on every rank,
+and executed the gfx938 W8A8 stage1/stage2 modules. Both HumanEval runs passed
+raw and normalized 16/16, observing 26.73 and 25.19 output tok/s. Session MTP
+counters were 3,458/4,893 accepted draft tokens (70.7%); prefix counters were
+1,600/6,476 hit/query tokens, including a 1,152-token second-request hit in
+the explicit prefix probe. The log contained no ERROR or Traceback, and all
+cards returned to 2 MiB after exact process-group teardown.
 
 ## HumanEval client command
 
