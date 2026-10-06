@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 import uuid
 from pathlib import Path
@@ -821,6 +822,38 @@ def _normalize_humaneval_completion(
                 for node in module.body
             ):
                 return candidate
+    if entry_point and code and not code.startswith((" ", "\t")):
+        try:
+            module = ast.parse(code)
+        except (MemoryError, RecursionError, SyntaxError):
+            module = None
+        if module is not None and any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == entry_point
+            for node in module.body
+        ):
+            return code
+        # Some instruction-tuned checkpoints return a syntactically valid
+        # HumanEval function body without its signature or indentation.  The
+        # official checker concatenates body-only completions to the prompt,
+        # so restore the indentation only when no target definition exists.
+        target_definition = re.search(
+            rf"(?m)^(?:async[ \t]+def|def)[ \t]+{re.escape(entry_point)}\b",
+            code,
+        )
+        if target_definition is None:
+            indented = textwrap.indent(code, "    ")
+            candidates = [indented]
+            lines = code.splitlines(keepends=True)
+            if lines:
+                candidates.append("    " + lines[0] + "".join(lines[1:]))
+            for candidate in candidates:
+                try:
+                    ast.parse("def _humaneval_candidate():\n" + candidate)
+                except (MemoryError, RecursionError, SyntaxError):
+                    continue
+                return candidate
+            return indented
     return code
 
 

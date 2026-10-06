@@ -31,6 +31,7 @@ request.
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
 | `Qwen3.5-122B-A10B-Channel-FP8-w8a8` | TP4 | 16/16 | AITER channel-FP8 MoE; MTP acceptance 1,862/1,968 (94.6%); 2,176-token manager page and third-request fine-grained hit 2,112 tokens |
+| `Qwen3.5-397B-A17B-Channel-FP8-w8a8` | TP8 | 13/16 raw; 16/16 normalized, twice | Correct bare function bodies were undercounted by raw EvalScope; AITER channel-FP8 MoE; final MTP acceptance 2,643/2,760 (95.8%); 1,088-token manager page and third-request fine-grained hit 2,624 tokens |
 | `Qwen3.6-35B-A3B-Channel-FP8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,861/1,959 (95.0%); third-request fine-grained hit 2,112 tokens |
 | `Qwen3.6-35B-A3B-Channel-INT8-w8a8` | TP2 | 16/16 | 69.34 output tok/s; MTP acceptance 1,817/1,902 (95.5%); third-request fine-grained hit 2,112 tokens |
 | `Qwen3.8-27B-Channel-FP8` | TP2 | 16/16 | 61.10 output tok/s; MTP acceptance 1,717/1,785 (96.2%); 6,016-token probe reused 4,736 tokens on the consumer request with correct output |
@@ -54,7 +55,8 @@ AITER kernel.
 
 ## Qwen3.5 and Qwen3.6 hybrid service command
 
-Use the following command for the 35B-A3B and 122B-A10B hybrid checkpoints. Replace
+Use the following command for the 35B-A3B, 122B-A10B, and 397B-A17B hybrid
+checkpoints. Replace
 `MODEL`, `SERVED`, `GPU_LIST`, `TP`, and `GPU_MEMORY_UTILIZATION` with the
 values in the result table. The accepted TP2 runs used `GPU_LIST=0,1`,
 `TP=2`, and `GPU_MEMORY_UTILIZATION=0.50`; the temporary TP4 resource-control
@@ -65,6 +67,11 @@ The accepted 122B-A10B run used `GPU_LIST=0,1,2,3`, `TP=4`, and
 `GPU_MEMORY_UTILIZATION=0.50`. Its checkpoint contains one MTP layer; the
 three-token configuration intentionally exercises the official repeated-layer
 MTP behavior.
+
+The accepted 397B-A17B run used all eight devices, `TP=8`, and
+`GPU_MEMORY_UTILIZATION=0.50`. It loaded 378.93 GiB from 94 shards and used
+50.38 GiB of model memory per rank. Its checkpoint also contains one MTP
+layer, so the same repeated-layer MTP3 behavior applies.
 
 ```bash
 env -u VLLM_PLUGINS \
@@ -279,6 +286,17 @@ env -i \
   --work-dir "$WORK_DIR" \
   --no-timestamp
 ```
+
+EvalScope may score a logically correct HumanEval completion as invalid when
+the checkpoint returns an unindented function body instead of a complete
+function. Preserve the raw report, then use the integration harness's
+syntax-aware normalizer inside the isolated execution boundary. It restores
+either all body indentation or only the stripped first line, accepting a
+transformation only when a synthetic function wrapper parses. It must not
+rewrite a completion that already defines the expected entry point. For the
+397B-A17B run, raw EvalScope scored 13/16 twice; the misses were correct bare
+bodies and the normalized official checker scored 16/16 twice. The warm
+second run observed 42.16 output tok/s.
 
 All services were started in isolated process groups. Teardown first sent
 TERM to the complete PGID, verified every process in that PGID, and escalated
