@@ -329,6 +329,12 @@ _CUDA_VALIDATION_ID = (
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
+        _adapter("framework_opt", "patch_model_loader_static_eplb"),
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_static_expert_mapping"),
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
     _CallbackSpec(
