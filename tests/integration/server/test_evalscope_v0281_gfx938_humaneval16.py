@@ -62,6 +62,13 @@ PROFILE_CONTRACTS = (
         None,
     ),
     (
+        "deepseek_r1_0528_channel_int8_kvfp8_tp8",
+        "/models/DeepSeek-R1-0528-Channel-INT8",
+        8,
+        "FLASHMLA",
+        None,
+    ),
+    (
         "glm52_channel_int8_tp8",
         "/models/GLM-5.2-Channel-INT8-w8a8",
         8,
@@ -223,6 +230,7 @@ def test_gfx938_profile_contract(
     )
     assert config["evalscope"]["generation_config"]["temperature"] == 0
     diagnostic_profiles = {
+        "deepseek_r1_0528_channel_int8_kvfp8_tp8",
         "deepseek_v4_flash_tp8",
         "qwen2_57b_tp2",
         "qwen3_30b_int8_tp2",
@@ -232,13 +240,14 @@ def test_gfx938_profile_contract(
         config["evalscope"]["pass_criteria"].get("enforce_score", True)
     ) is (profile not in diagnostic_profiles)
     assert config["evalscope"]["generation_config"]["do_sample"] is False
-    long_output_profiles = {
-        "deepseek_v32_channel_fp8_tp8",
-        "deepseek_v32_channel_fp8_mtp3_kvfp8_tp8",
-        "deepseek_r1_channel_fp8_tp8",
-        "deepseek_r1_channel_fp8_mtp3_tp8",
+    output_token_overrides = {
+        "deepseek_v32_channel_fp8_tp8": 4096,
+        "deepseek_v32_channel_fp8_mtp3_kvfp8_tp8": 4096,
+        "deepseek_r1_channel_fp8_tp8": 4096,
+        "deepseek_r1_channel_fp8_mtp3_tp8": 4096,
+        "deepseek_r1_0528_channel_int8_kvfp8_tp8": 8192,
     }
-    expected_max_tokens = 4096 if profile in long_output_profiles else 2048
+    expected_max_tokens = output_token_overrides.get(profile, 2048)
     assert (
         config["evalscope"]["generation_config"]["max_tokens"]
         == expected_max_tokens
@@ -289,8 +298,8 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         assert work_dir.startswith("/tmp/vllm-hcu-evalscope/")
         work_dirs.append(work_dir)
         ports.append(config["server"]["port"])
-    assert len(work_dirs) == len(set(work_dirs)) == 23
-    assert len(ports) == len(set(ports)) == 23
+    assert len(work_dirs) == len(set(work_dirs)) == 24
+    assert len(ports) == len(set(ports)) == 24
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
@@ -378,6 +387,7 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
     for profile in (
         "deepseek_r1_channel_fp8_tp8",
         "deepseek_r1_channel_fp8_mtp3_tp8",
+        "deepseek_r1_0528_channel_int8_kvfp8_tp8",
     ):
         config = load_profiled_config(
             DEFAULT_CONFIG, CONFIG_ENV, profile=profile
@@ -400,6 +410,12 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
             "--speculative-config",
         )
     ) == {"method": "mtp", "num_speculative_tokens": 3}
+    r1_0528_command = r1_commands[
+        "deepseek_r1_0528_channel_int8_kvfp8_tp8"
+    ]
+    assert "--speculative-config" not in r1_0528_command
+    assert _option_value(r1_0528_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(r1_0528_command, "--moe-backend") == "aiter"
 
     deepseek_v4 = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="deepseek_v4_flash_tp8"

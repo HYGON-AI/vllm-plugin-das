@@ -127,6 +127,7 @@ and owned artifact directories are defined in
 | `deepseek_v32_channel_fp8_mtp3_kvfp8_tp8` | TP8, sparse MLA, channel FP8 W8A8, AITER, MTP3, E4M3 sparse KV, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, MTP draft acceptance observed |
 | `deepseek_r1_channel_fp8_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, prefix, default Graph | 16/16 | Pass; current OpenAI response `reasoning` field accepted by the prefix probe |
 | `deepseek_r1_channel_fp8_mtp3_tp8` | TP8, regular MLA, channel FP8 W8A8, AITER, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; MTP draft acceptance observed throughout the concurrent run |
+| `deepseek_r1_0528_channel_int8_kvfp8_tp8` | TP8, regular MLA, Channel INT8 W8A8, AITER INT8 MoE, native E4M3 KV, prefix, default Graph | 15/16 | Diagnostic; HumanEval/11 exhausted the 8,192-token reasoning budget, while MTP3 controls scored 14/16 |
 | `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
 | `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass; repeated on the final shared-expert code with target/draft FULL plus PIECEWISE Graphs |
 | `glm52_channel_int8_tp8` | TP8, sparse MLA, Channel INT8, AITER INT8 MoE, E4M3 sparse KV, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, final-window MTP draft acceptance 97.2% |
@@ -224,6 +225,54 @@ current `message.reasoning` field while the probe recognized only `content`
 and the deprecated `reasoning_content` alias. The probe now checks those three
 fields in current-protocol order, with regression coverage. After that narrow
 fix, the unchanged service route passed the prefix probe and HumanEval16.
+
+The later `/models/DeepSeek-R1-0528-Channel-INT8` checkpoint was validated at
+TP8 with HcuGPUModelRunnerV2, regular `FLASHMLA`, AITER INT8 MoE, native
+`fp8_e4m3` KV, prefix caching, LBNHC MLA cache layout, and the default
+FULL_AND_PIECEWISE Graph policy. The recommended diagnostic server command is:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve /models/DeepSeek-R1-0528-Channel-INT8 \
+  --trust-remote-code --tensor-parallel-size 8 \
+  --attention-backend FLASHMLA --moe-backend aiter \
+  --reasoning-parser deepseek_r1 --kv-cache-dtype fp8_e4m3 \
+  --enable-prefix-caching --max-model-len 32768 \
+  --max-num-batched-tokens 16384 --max-num-seqs 8 \
+  --served-model-name DeepSeek-R1-0528-Channel-INT8 --port 10226
+```
+
+The matching HumanEval16 client command is:
+
+```bash
+/usr/bin/python3 -m tests.integration.server.evalscope_secure_cli eval \
+  --model DeepSeek-R1-0528-Channel-INT8 \
+  --api-url http://127.0.0.1:10226/v1 --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":8192}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-r1-0528-channel-int8-kvfp8-e4m3-8k-tp8 \
+  --no-timestamp
+```
+
+The no-MTP run produced 16 predictions/reviews, 18/18 HTTP 200 responses,
+36.7% prefix-cache hits, no runtime ERROR or Traceback, and raw plus normalized
+HumanEval 15/16 (`0.9375`). `HumanEval/11` spent all 8,192 output tokens in
+reasoning and emitted no final answer. Its report observed 11.89 output
+tokens/s, 144.14 s mean latency, 572.72 ms mean TTFT, and 83.86 ms mean TPOT.
+The checkpoint chat template exposes no supported no-thinking switch.
+
+Two MTP3 controls retained the same E4M3 KV and default target/speculator
+Graphs. With 4,096 output tokens they scored 14/16; raising the budget to
+8,192 remained 14/16 because HumanEval/1 and /11 still truncated. The 8K MTP
+run observed 28.44 output tokens/s and live draft acceptance, but its lower
+accuracy makes it unsuitable as the default profile. A first attempt using
+the requested physical name `fp8_ds_mla` was rejected before weight loading by
+the regular FLASHMLA capability contract (`kv_cache_dtype not supported`), so
+the runnable public dtype is `fp8_e4m3`; no global validation was weakened.
+Evidence is under the three owned
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-r1-0528-channel-int8-*`
+directories.
 
 The later `/models/DeepSeek-V3.2-channel-fp8` checkpoint was validated through
 both a plain TP8 profile and a TP8+MTP3+E4M3-KV profile. Both passed raw and
@@ -327,6 +376,10 @@ evidence and exact commands are in
   requests so at least one request returned to the same rank.
 - DeepSeek-V3.2 live TP8 gates: plain and MTP3+E4M3-KV profiles each `16/16`,
   with 16 predictions, reviews, and successful code executions per profile.
+- DeepSeek-R1-0528 Channel-INT8 diagnostic TP8+E4M3-KV gate: no-MTP produced
+  16 predictions/reviews and `15/16`; MTP3 produced `14/16` at both 4K and 8K
+  output budgets. All three runnable services used default Graphs and cleaned
+  back to the 2 MiB-per-card idle baseline.
 - GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with
   16 predictions, reviews, and successful code executions.
 - GLM-4.7 W8A8 live TP4 gate: MTP2+E4M3-KV profile `16/16`, with target/draft

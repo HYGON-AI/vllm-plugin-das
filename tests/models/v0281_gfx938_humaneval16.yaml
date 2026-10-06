@@ -135,6 +135,25 @@ profiles:
         do_sample: false
         max_tokens: 4096
 
+  deepseek_r1_0528_channel_int8_kvfp8_tp8:
+    model: /models/DeepSeek-R1-0528-Channel-INT8
+    server:
+      port: 10226
+      served_model_name: DeepSeek-R1-0528-Channel-INT8
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+      args: [--trust-remote-code, --tensor-parallel-size, "8", --attention-backend, FLASHMLA, --moe-backend, aiter, --reasoning-parser, deepseek_r1, --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "32768", --max-num-batched-tokens, "16384", --max-num-seqs, "8"]
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-deepseek-r1-0528-channel-int8-kvfp8-e4m3-8k-tp8
+      pass_criteria:
+        # HumanEval/11 exhausted the 8192-token reasoning budget with no final
+        # answer; retain the observed 15/16 diagnostic artifacts.
+        enforce_score: false
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 8192
+
   glm52_channel_int8_tp8:
     model: /models/GLM-5.2-Channel-INT8-w8a8
     server:
