@@ -27,7 +27,11 @@ MODEL_ENV = "VLLM_HCU_GFX938_MODEL"
 
 
 def _required_hcu_count(profile: str, tensor_parallel_size: int) -> int:
-    if profile == "hy3_channel_fp8_dp8_ep8_mtp2_kvfp8":
+    if profile in {
+        "hy3_channel_fp8_dp8_ep8_mtp2_kvfp8",
+        "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_calibration",
+        "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_static",
+    }:
         return 8
     return tensor_parallel_size
 
@@ -110,6 +114,20 @@ PROFILE_CONTRACTS = (
         8,
         "FLASHMLA_SPARSE",
         None,
+    ),
+    (
+        "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_calibration",
+        "/models/Hy4-preview-Channel-FP8-w8a8",
+        1,
+        "FLASHMLA_SPARSE",
+        "HND",
+    ),
+    (
+        "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_static",
+        "/models/Hy4-preview-Channel-FP8-w8a8",
+        1,
+        "FLASHMLA_SPARSE",
+        "HND",
     ),
     (
         "hy3_channel_fp8_mtp2_kvfp8_tp8",
@@ -278,7 +296,7 @@ def test_gfx938_profile_contract(
     )
     environment = config["server"].get("environment", {})
     assert environment.get("VLLM_KV_CACHE_LAYOUT") == kv_layout
-    if attention != "FLASH_ATTN":
+    if kv_layout is None:
         assert "VLLM_KV_CACHE_LAYOUT" not in environment
 
 
@@ -298,8 +316,71 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         assert work_dir.startswith("/tmp/vllm-hcu-evalscope/")
         work_dirs.append(work_dir)
         ports.append(config["server"]["port"])
-    assert len(work_dirs) == len(set(work_dirs)) == 24
-    assert len(ports) == len(set(ports)) == 24
+    assert len(work_dirs) == len(set(work_dirs)) == 26
+    assert len(ports) == len(set(ports)) == 26
+
+
+def test_hy4_offline_eplb_calibration_and_static_commands() -> None:
+    profiles = {
+        mode: load_profiled_config(
+            DEFAULT_CONFIG,
+            CONFIG_ENV,
+            profile=(
+                "hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_"
+                + mode
+            ),
+        )
+        for mode in ("calibration", "static")
+    }
+    commands = {
+        mode: server_command(config, model_env=MODEL_ENV)[0]
+        for mode, config in profiles.items()
+    }
+
+    artifact = "/tmp/vllm-hcu-eplb/hy4-preview-channel-fp8-dp8-ep8-mtp3.json"
+    for mode, config in profiles.items():
+        command = commands[mode]
+        assert config["server"]["environment"] == {
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_KV_CACHE_LAYOUT": "HND",
+        }
+        assert _option_value(command, "--tensor-parallel-size") == "1"
+        assert _option_value(command, "--data-parallel-size") == "8"
+        assert "--enable-expert-parallel" in command
+        assert "--enable-eplb" in command
+        assert _option_value(command, "--all2all-backend") == (
+            "deepep_low_latency"
+        )
+        assert _option_value(command, "--moe-backend") == "deep_gemm"
+        assert _option_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+        assert json.loads(
+            _option_value(command, "--speculative-config")
+        ) == {"method": "mtp", "num_speculative_tokens": 3}
+        assert json.loads(
+            _option_value(command, "--default-chat-template-kwargs")
+        ) == {"reasoning_effort": "no_think"}
+        assert "--enforce-eager" not in command
+        assert "--compilation-config" not in command
+
+    calibration = json.loads(
+        _option_value(commands["calibration"], "--eplb-config")
+    )
+    static = json.loads(_option_value(commands["static"], "--eplb-config"))
+    common = {
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+    }
+    assert calibration == {
+        **common,
+        "expert_map_record_path": artifact,
+    }
+    assert static == {
+        **common,
+        "expert_map_path": artifact,
+        "static_dispatch_policy": "locality_fair",
+    }
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:

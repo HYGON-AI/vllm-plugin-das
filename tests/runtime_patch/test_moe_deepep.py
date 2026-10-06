@@ -3132,7 +3132,7 @@ def test_channel_int8_experts_use_int8_deepgemm_weight_layout(
 
 
 @pytest.mark.parametrize("use_int8", [False, True])
-def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
+def test_eplb_channel_quant_masked_experts_keep_redundant_physical_slots(
     monkeypatch: pytest.MonkeyPatch,
     use_int8: bool,
 ):
@@ -3207,8 +3207,8 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         topk_weights=torch.ones((3, 1)),
         topk_ids=torch.zeros((3, 1), dtype=torch.int32),
         activation=MoEActivation.SILU,
-        global_num_experts=2,
-        expert_map=None,
+        global_num_experts=4,
+        expert_map=torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
         a1q_scale=torch.ones((2, 3)),
         a2_scale=None,
         workspace13=torch.empty(0),
@@ -4887,10 +4887,10 @@ def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
     ("shared_with_high_throughput", "expected_clean_calls"),
     [
         (False, []),
-        (True, [(8, 2048, 1, 128), (8, 2048, 1, 128)]),
+        (True, [(8, 2048, 4, 128), (8, 2048, 4, 128)]),
     ],
 )
-def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
+def test_eplb_deepep_ll_fp8_routes_redundant_physical_expert_ids(
     monkeypatch: pytest.MonkeyPatch,
     shared_with_high_throughput: bool,
     expected_clean_calls: list[tuple[int, int, int, int]],
@@ -4987,24 +4987,26 @@ def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     hook, _receiver = instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
-        1,
-        None,
+        torch.full((1, 1), 3, dtype=torch.int64),
+        4,
+        torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
         False,
         quant_config,
     )
     instance.prepare_async(
         torch.ones((1, 2048), dtype=torch.bfloat16),
         topk_weights,
-        torch.zeros((1, 1), dtype=torch.int64),
-        1,
-        None,
+        torch.full((1, 1), 3, dtype=torch.int64),
+        4,
+        torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
         False,
         quant_config,
     )
 
     assert callable(hook)
     assert signature_calls == 1
+    assert calls["topk_idx"].tolist() == [[3]]
+    assert calls["num_experts"] == 4
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
     assert calls["quant_group_size"] == 128

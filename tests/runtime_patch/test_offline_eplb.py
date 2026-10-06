@@ -468,6 +468,203 @@ def test_static_add_commits_plan_with_gloo_and_zero_mutation_counters(
     assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
 
 
+def test_static_committed_map_reaches_installed_deepep_and_masked_deepgemm(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm_hcu.patch.worker.op_opt.moe import (
+        patch_base_router,
+        patch_deepep_ll,
+    )
+    from vllm_hcu.platforms import envs as henvs
+
+    patch_base_router.apply()
+    patch_deepep_ll.apply()
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_ll as deepep_ll_module,
+    )
+    from vllm.model_executor.layers.fused_moe.router import (
+        base_router as base_router_module,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as deepgemm_module,
+    )
+
+    fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = (
+        "locality_fair"
+    )
+    fixture.group.rank_in_group = 1
+    fixture.group.device_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    fixture.state.add_model(fixture.model, fixture.model_config)
+    layer_state = fixture.model.moe_layers[0].eplb_state
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD", True)
+    monkeypatch.setattr(base_router_module, "dbo_current_ubatch_id", lambda: 0)
+
+    class StaticRouter(base_router_module.BaseRouter):
+        @property
+        def routing_method_type(self):
+            return RoutingMethodType.Unspecified
+
+        def _compute_routing(
+            self,
+            hidden_states,
+            router_logits,
+            indices_type,
+            *,
+            input_ids=None,
+        ):
+            del hidden_states, router_logits, indices_type, input_ids
+            return (
+                torch.ones((2, 1)),
+                torch.tensor([[1], [1]], dtype=torch.int64),
+            )
+
+    router = StaticRouter(
+        top_k=1,
+        global_num_experts=fixture.model.num_logical_experts,
+        eplb_state=layer_state,
+    )
+    _, physical_ids = router._select_experts(
+        torch.empty((2, 2048)),
+        torch.empty((2, fixture.model.num_logical_experts)),
+        torch.int64,
+    )
+
+    dispatch = {}
+    expert_x = torch.ones(
+        (2, 1, 2048),
+        dtype=torch.float8_e4m3fn,
+    )
+    expert_x_scale = torch.ones((2, 1, 1))
+    local_token_counts = torch.tensor([0, 1], dtype=torch.int32)
+
+    class Buffer:
+        def low_latency_dispatch(
+            self,
+            x,
+            topk_idx,
+            topk_weight,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            quant_type=1,
+            quant_group_size=0,
+            fp8_round_scale=False,
+            async_finish=False,
+            return_recv_hook=False,
+        ):
+            dispatch.update(
+                topk_idx=topk_idx.clone(),
+                num_experts=num_experts,
+                quant_type=quant_type,
+            )
+            del (
+                x,
+                topk_weight,
+                num_max_dispatch_tokens_per_rank,
+                quant_group_size,
+                fp8_round_scale,
+                async_finish,
+                return_recv_hook,
+            )
+            return (
+                (expert_x, expert_x_scale),
+                local_token_counts,
+                "static-handle",
+                None,
+                lambda: None,
+            )
+
+    quant_config = SimpleNamespace(
+        quant_dtype=torch.float8_e4m3fn,
+        block_shape=[1, 128],
+        per_act_token_quant=True,
+        a1_scale=None,
+        a2_scale=None,
+        a1_gscale=None,
+        w1_scale=torch.ones((2, 8)),
+        w2_scale=torch.ones((2, 2048)),
+        gemm1_clamp_limit=10.0,
+        use_int8_w8a8=False,
+    )
+    prepare_finalize = deepep_ll_module.DeepEPLLPrepareAndFinalize(
+        Buffer(),
+        max_tokens_per_rank=8,
+        num_dispatchers=1,
+        use_fp8_dispatch=True,
+    )
+    hook, receiver = prepare_finalize.prepare_async(
+        torch.ones((2, 2048), dtype=torch.bfloat16),
+        torch.ones((2, 1)),
+        physical_ids,
+        fixture.model.num_physical_experts,
+        torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+        False,
+        quant_config,
+    )
+    hook()
+    routed_x, routed_scale, metadata, routed_ids, routed_weights = receiver()
+
+    experts = object.__new__(deepgemm_module.DeepEPDeepGemmMaskedExperts)
+    experts._deepgemm_w13 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts._deepgemm_w2 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts.quant_config = quant_config
+    experts.moe_problem_size = lambda *_args: (2, 1, 8, 2048, 1)
+    gemm_calls = []
+
+    def masked_gemm(_a, _b, destination, masked_m, expected_m):
+        gemm_calls.append((masked_m.clone(), expected_m))
+        destination.fill_(len(gemm_calls))
+        return destination
+
+    monkeypatch.setattr(
+        deepgemm_module,
+        "m_grouped_fp8_gemm_nt_masked",
+        masked_gemm,
+    )
+    monkeypatch.setattr(
+        deepgemm_module,
+        "fuse_silu_mul_fp8_quant_ep",
+        lambda output, **_kwargs: (
+            output[..., :4].to(torch.float8_e4m3fn),
+            torch.ones(output.shape[:2]),
+        ),
+    )
+    output = torch.empty((2, 1, 2048))
+    experts.apply(
+        output=output,
+        hidden_states=routed_x,
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=physical_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=fixture.model.num_physical_experts,
+        expert_map=torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+        a1q_scale=routed_scale,
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty((2, 1, 2048)),
+        expert_tokens_meta=metadata,
+        apply_router_weight_on_input=False,
+    )
+
+    assert layer_state.logical_to_physical_map[1, :2].tolist() == [3, 1]
+    assert physical_ids.tolist() == [[3], [1]]
+    assert torch.equal(dispatch["topk_idx"], physical_ids)
+    assert dispatch["num_experts"] == 4
+    assert dispatch["quant_type"] == 2
+    assert routed_ids is None and routed_weights is None
+    assert [counts.tolist() for counts, _ in gemm_calls] == [[0, 1], [0, 1]]
+    assert [expected for _, expected in gemm_calls] == [1, 1]
+    assert torch.equal(output, torch.full_like(output, 2))
+    assert fixture.transfer_calls == []
+    assert fixture.state._vllm_hcu_offline_transfer_events == 0
+    assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
+
+
 def test_static_add_restores_requested_communicator_when_factory_fails(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

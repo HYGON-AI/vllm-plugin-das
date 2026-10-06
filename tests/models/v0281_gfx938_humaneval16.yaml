@@ -280,6 +280,52 @@ profiles:
           chat_template_kwargs:
             reasoning_effort: no_think
 
+  hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_calibration:
+    model: /models/Hy4-preview-Channel-FP8-w8a8
+    server:
+      port: 10227
+      served_model_name: Hy4-preview-Channel-FP8-w8a8
+      prefix_probe:
+        request_count: 9
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        # vLLM names the storage order HND; the HCU FlashAttention adapter
+        # presents that storage to the vendor kernel with layout="bhsd".
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "1", --data-parallel-size, "8", --enable-expert-parallel, --enable-eplb, --eplb-config, '{"window_size":16,"step_interval":16,"num_redundant_experts":8,"use_async":false,"expert_map_record_path":"/tmp/vllm-hcu-eplb/hy4-preview-channel-fp8-dp8-ep8-mtp3.json"}', --attention-backend, FLASHMLA_SPARSE, --moe-backend, deep_gemm, --all2all-backend, deepep_low_latency, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"reasoning_effort":"no_think"}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-hy4-preview-channel-fp8-dp8-ep8-mtp3-kvfp8-eplb-calibration
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 2048
+        extra_body:
+          chat_template_kwargs:
+            reasoning_effort: no_think
+
+  hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_static:
+    model: /models/Hy4-preview-Channel-FP8-w8a8
+    server:
+      port: 10228
+      served_model_name: Hy4-preview-Channel-FP8-w8a8
+      prefix_probe:
+        request_count: 9
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        # vLLM names the storage order HND; the HCU FlashAttention adapter
+        # presents that storage to the vendor kernel with layout="bhsd".
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "1", --data-parallel-size, "8", --enable-expert-parallel, --enable-eplb, --eplb-config, '{"window_size":16,"step_interval":16,"num_redundant_experts":8,"use_async":false,"expert_map_path":"/tmp/vllm-hcu-eplb/hy4-preview-channel-fp8-dp8-ep8-mtp3.json","static_dispatch_policy":"locality_fair"}', --attention-backend, FLASHMLA_SPARSE, --moe-backend, deep_gemm, --all2all-backend, deepep_low_latency, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"reasoning_effort":"no_think"}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-hy4-preview-channel-fp8-dp8-ep8-mtp3-kvfp8-eplb-static
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 2048
+        extra_body:
+          chat_template_kwargs:
+            reasoning_effort: no_think
+
   hy3_channel_fp8_mtp2_kvfp8_tp8:
     model: /models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3
     server:

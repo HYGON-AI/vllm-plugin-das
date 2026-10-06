@@ -483,6 +483,83 @@ print(json.dumps({
 
 
 @pytest.mark.hcu
+def test_offline_eplb_worker_callbacks_apply_once_with_serialized_mrv2_config():
+    result = _fresh_python(
+        r'''
+import importlib
+import json
+import pickle
+
+from vllm import envs
+from vllm.config import CompilationConfig, ParallelConfig, VllmConfig
+from vllm_hcu.patch import patch_report
+from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.patch.worker import apply_worker_patches
+from vllm_hcu.patch.worker.framework_opt import (
+    patch_eplb_communicator,
+    patch_model_loader_static_eplb,
+    patch_offline_eplb,
+    patch_static_expert_mapping,
+)
+
+envs.VLLM_USE_V2_MODEL_RUNNER = True
+config = object.__new__(VllmConfig)
+config.additional_config = {
+    "hcu": HcuFeatureConfig(
+        expert_map_path="/maps/hy4-static.json",
+        eplb_static_dispatch_policy="locality_fair",
+    ).to_dict()
+}
+config.compilation_config = CompilationConfig()
+config.parallel_config = ParallelConfig(all2all_backend="deepep_low_latency")
+config = pickle.loads(pickle.dumps(config))
+assert get_hcu_config(config).expert_map_path == "/maps/hy4-static.json"
+assert config.use_v2_model_runner is True
+assert type(config) is VllmConfig
+
+apply_worker_patches(config)
+apply_worker_patches(config)
+adapters = (
+    patch_model_loader_static_eplb,
+    patch_static_expert_mapping,
+    patch_offline_eplb,
+    patch_eplb_communicator,
+)
+second_apply = []
+for adapter in adapters:
+    module = importlib.import_module(adapter.TARGET_MODULE)
+    second_apply.append(adapter.apply_to_module(module))
+
+report = patch_report()["patches"]
+patch_ids = [adapter.PATCH_ID for adapter in adapters]
+print(json.dumps({
+    "statuses": {patch_id: report[patch_id]["status"] for patch_id in patch_ids},
+    "features": {
+        patch_id: report[patch_id]["feature_enabled"] for patch_id in patch_ids
+    },
+    "second_apply": second_apply,
+    "config_class": f"{type(config).__module__}.{type(config).__name__}",
+    "use_v2_model_runner": config.use_v2_model_runner,
+    "failed": {
+        patch_id: record["failure_reason"]
+        for patch_id, record in report.items()
+        if record["status"] == "failed"
+    },
+}))
+''',
+        plugins="hcu",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert set(payload["statuses"].values()) == {"applied"}
+    assert set(payload["features"].values()) == {True}
+    assert payload["second_apply"] == [False, False, False, False]
+    assert payload["config_class"] == "vllm.config.vllm.VllmConfig"
+    assert payload["use_v2_model_runner"] is True
+    assert payload["failed"] == {}
+
+
+@pytest.mark.hcu
 def test_arg_utils_first_import_applies_sidecar_before_first_construction():
     result = _fresh_python(
         "import dataclasses,json,tempfile; "
