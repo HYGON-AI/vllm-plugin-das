@@ -153,6 +153,25 @@ profiles:
           chat_template_kwargs:
             enable_thinking: false
 
+  glm47_w8a8_mtp2_kvfp8_tp4:
+    model: /models/GLM-4.7-W8A8
+    server:
+      port: 10225
+      served_model_name: GLM-4.7-W8A8
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --reasoning-parser, glm47, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":2}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+    evalscope:
+      work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-glm47-w8a8-mtp2-kvfp8-tp4
+      generation_config:
+        temperature: 0
+        do_sample: false
+        max_tokens: 2048
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
+
   deepseek_v4_flash_tp8:
     model: /models/DeepSeek-V4-Flash-0731-FP8-Channel
     server:

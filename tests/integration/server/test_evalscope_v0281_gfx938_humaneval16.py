@@ -69,6 +69,13 @@ PROFILE_CONTRACTS = (
         None,
     ),
     (
+        "glm47_w8a8_mtp2_kvfp8_tp4",
+        "/models/GLM-4.7-W8A8",
+        4,
+        "FLASH_ATTN",
+        "HND",
+    ),
+    (
         "deepseek_v4_flash_tp8",
         "/models/DeepSeek-V4-Flash-0731-FP8-Channel",
         8,
@@ -282,11 +289,34 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         assert work_dir.startswith("/tmp/vllm-hcu-evalscope/")
         work_dirs.append(work_dir)
         ports.append(config["server"]["port"])
-    assert len(work_dirs) == len(set(work_dirs)) == 22
-    assert len(ports) == len(set(ports)) == 22
+    assert len(work_dirs) == len(set(work_dirs)) == 23
+    assert len(ports) == len(set(ports)) == 23
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts() -> None:
+    glm47 = load_profiled_config(
+        DEFAULT_CONFIG,
+        CONFIG_ENV,
+        profile="glm47_w8a8_mtp2_kvfp8_tp4",
+    )
+    glm47_command, _, _ = server_command(glm47, model_env=MODEL_ENV)
+    assert glm47["server"]["environment"] == {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_KV_CACHE_LAYOUT": "HND",
+    }
+    assert json.loads(
+        _option_value(glm47_command, "--speculative-config")
+    ) == {"method": "mtp", "num_speculative_tokens": 2}
+    assert _option_value(glm47_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(glm47_command, "--moe-backend") == "aiter"
+    assert _option_value(glm47_command, "--reasoning-parser") == "glm47"
+    assert json.loads(
+        _option_value(glm47_command, "--default-chat-template-kwargs")
+    ) == {"enable_thinking": False}
+    assert glm47["evalscope"]["generation_config"]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+
     glm52 = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="glm52_channel_int8_tp8"
     )

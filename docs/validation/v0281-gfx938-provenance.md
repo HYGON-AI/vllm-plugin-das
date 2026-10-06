@@ -130,6 +130,7 @@ and owned artifact directories are defined in
 | `deepseek_v4_flash_tp8` | TP8, sparse MLA, AITER, DSpark7, prefix, default Graph | 2/16 concurrent; 1/3 serial diagnostic | Local checkpoint is the previously documented incomplete asset; DSpark smoke passed, but no full accuracy claim |
 | `glm5_w8a8_tp8` | TP8, sparse MLA, AITER INT8 MoE, MTP3, prefix | 16/16 | Pass; repeated on the final shared-expert code with target/draft FULL plus PIECEWISE Graphs |
 | `glm52_channel_int8_tp8` | TP8, sparse MLA, Channel INT8, AITER INT8 MoE, E4M3 sparse KV, MTP3, prefix, default target/speculator Graphs | 16/16 | Pass; public E4M3 mapped to `fp8_ds_mla`, final-window MTP draft acceptance 97.2% |
+| `glm47_w8a8_mtp2_kvfp8_tp4` | TP4, FLASH_ATTN, W8A8, AITER lookup with per-shape Triton fallback, MTP2, E4M3 KV, HND/BHSD, prefix, default target/speculator Graphs | 16/16 | Pass; M=1 AITER config miss and Triton MoE fallback remained explicit |
 | `glm53_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, E4M3 public KV mapped to `fp8_ds_mla`, MTP3 | 16/16 | Pass; repeated on the final shared-expert code and extended to HumanEval 32/32 |
 | `glm51_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass; EvalScope artifact ID collapses repeated underscores |
 | `hy3_channel_fp8_mtp2_kvfp8_tp8` | TP8, FLASH_ATTN, channel FP8 W8A8, AITER, MTP2, E4M3 KV, prefix | 16/16 | Pass; HND selection resolved to the physical LBHNC cache and default target/speculator Graphs |
@@ -269,6 +270,27 @@ acceptance length 3.92 and 97.2% draft-token acceptance. The report observed
 mean TPOT. The feature route allocated 744,896 KV tokens; evidence is under
 `/tmp/vllm-hcu-evalscope/v0281-gfx938-glm52-channel-int8-tp8`.
 
+The subsequently added `/models/GLM-4.7-W8A8` checkpoint is 334.08 GiB and
+was validated at TP4. Its accepted profile used HcuGPUModelRunnerV2,
+`FLASH_ATTN`, an HND selection exposed by the runtime as the physical LBHNC
+cache view, MTP2, native `fp8_e4m3` KV, prefix caching, and the unmodified
+default FULL_AND_PIECEWISE target/speculator Graph policy. Target and draft
+prefill/decode PIECEWISE and FULL captures completed. The route allocated
+998,784 KV tokens and loaded 85.93 GiB of model memory per card.
+
+Dense compressed-tensors W8A8 selected `TritonInt8ScaledMMLinearKernel`.
+The requested AITER INT8 MoE route performed its config lookup, but the
+observed M=1 `E=160,N=384` shape had no supported AITER solution and explicitly
+fell back to the official vLLM Triton MoE implementation on every rank. This
+validates the ordered lookup and fallback path, not AITER kernel execution for
+that shape. Raw EvalScope and independent normalization passed HumanEval16 at
+16/16. All 18 chat requests, including the two prefix probes, returned HTTP
+200 with no ERROR or Traceback. The final metric window reported 35.2% prefix
+hits and 85.1% draft-token acceptance. The report observed 21.21 output
+tokens/s, 6.755 s mean latency, 1.474 s mean TTFT, and 36.25 ms mean TPOT.
+Evidence is under
+`/tmp/vllm-hcu-evalscope/v0281-gfx938-glm47-w8a8-mtp2-kvfp8-tp4`.
+
 The later `/models/Kimi-K2.6` checkpoint was validated as a language-only TP8
 route with HcuGPUModelRunnerV2, regular FLASHMLA, Triton WNA16 MoE, prefix
 caching, and BF16/auto LBNHC KV. The checkpoint has no MTP layers. Two runtime
@@ -307,6 +329,9 @@ evidence and exact commands are in
   with 16 predictions, reviews, and successful code executions per profile.
 - GLM-5.2 Channel-INT8 live TP8 gate: MTP3+E4M3-KV profile `16/16`, with
   16 predictions, reviews, and successful code executions.
+- GLM-4.7 W8A8 live TP4 gate: MTP2+E4M3-KV profile `16/16`, with target/draft
+  FULL plus PIECEWISE Graphs, 18/18 HTTP 200 responses, and an explicit AITER
+  config-miss-to-Triton MoE fallback for the observed M=1 shape.
 - GLM-5 W8A8 post-shared-expert live TP8 gate: MTP3 profile `16/16`, with
   target/draft FULL plus PIECEWISE Graphs, 18/18 HTTP 200 responses including
   prefix probes, and no ERROR or Traceback.
