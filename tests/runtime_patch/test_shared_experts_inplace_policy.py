@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
+import pytest
 import torch
 
 from vllm_hcu.model_executor.layers.fused_moe.shared_experts import (
@@ -20,6 +21,25 @@ class _PolicyOnlySharedExperts(SharedExperts):
     ) -> SharedExpertsOrder:
         del hidden_states
         return self._order
+
+
+class _StreamPolicySharedExperts(SharedExperts):
+    def __init__(self, multistream_safe: bool) -> None:
+        torch.nn.Module.__init__(self)
+        self._mk_can_overlap_shared_experts = lambda: False
+        self._is_multistream_safe = lambda: multistream_safe
+        self._stream = object()
+
+    @property
+    def _disable_shared_experts_overlap(self) -> bool:
+        return False
+
+    def _should_run_shared_in_aux_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        del hidden_states
+        return True
 
 
 def test_shared_experts_inplace_policy_preserves_overlapped_alias() -> None:
@@ -44,4 +64,41 @@ def test_shared_experts_inplace_policy_preserves_overlapped_alias() -> None:
     assert serial.allows_inplace_routed_output(
         routed_input,
         aliased_shared_input,
+    )
+
+
+def test_shared_experts_serializes_unsafe_multistream_input() -> None:
+    hidden_states = torch.zeros((2, 4))
+
+    assert (
+        _StreamPolicySharedExperts(multistream_safe=False)
+        ._determine_shared_experts_order(hidden_states)
+        is SharedExpertsOrder.NO_OVERLAP
+    )
+    assert (
+        _StreamPolicySharedExperts(multistream_safe=True)
+        ._determine_shared_experts_order(hidden_states)
+        is SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+
+
+@pytest.mark.parametrize(
+    "force_flag",
+    [
+        "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH",
+        "VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE",
+    ],
+)
+def test_shared_experts_force_flags_cannot_bypass_stream_safety(
+    monkeypatch: pytest.MonkeyPatch,
+    force_flag: str,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv(force_flag, "1")
+    hidden_states = torch.zeros((2, 4))
+
+    assert (
+        _StreamPolicySharedExperts(multistream_safe=False)
+        ._determine_shared_experts_order(hidden_states)
+        is SharedExpertsOrder.NO_OVERLAP
     )

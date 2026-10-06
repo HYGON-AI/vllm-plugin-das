@@ -8,6 +8,19 @@ import torch
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 
+def test_transformers_indexed_attention_alias_is_sparse() -> None:
+    from vllm.transformers_utils.configs.hy_v4 import HYV4Config
+    from vllm_hcu.models.hy_v4.attention import _SPARSE_LAYER_TYPES
+
+    config = HYV4Config(
+        num_hidden_layers=1,
+        layer_types=["deepseek_sparse_attention"],
+    )
+
+    assert config.layer_types == ["indexed_attention"]
+    assert config.layer_types[0] in _SPARSE_LAYER_TYPES
+
+
 def test_hyv4_mla_backend_post_load_hook_runs_once(monkeypatch):
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm_hcu.models.hy_v4.attention import HYV4MLAAttentionLayer

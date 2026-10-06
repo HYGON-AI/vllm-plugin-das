@@ -10,18 +10,23 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 import psutil
 
 from tests.integration.server import evalscope_server
+from tests.integration.server import evalscope_secure_cli
 from tests.integration.server.evalscope_server import (
     _assert_pass_criteria,
     _direct_urlopen,
+    _evaluation_environment,
     _server_environment,
+    evalscope_command,
 )
 
 
@@ -54,22 +59,469 @@ def test_direct_urlopen_bypasses_environment_proxy(
         thread.join(timeout=1)
 
 
-def test_server_environment_bypasses_proxy_for_local_eval_client(
+def test_server_environment_clears_all_proxy_spellings_and_sets_local_no_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.setenv(name, "http://proxy.invalid:8080")
     monkeypatch.setenv("NO_PROXY", "example.internal")
-    monkeypatch.setenv("no_proxy", "legacy.internal,localhost")
+    monkeypatch.setenv("no_proxy", "legacy.internal")
 
     environment = _server_environment()
 
-    assert environment["NO_PROXY"].split(",") == [
-        "example.internal",
-        "legacy.internal",
-        "localhost",
-        "127.0.0.1",
-        "::1",
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        assert name not in environment
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    assert environment["no_proxy"] == "127.0.0.1,localhost,::1"
+
+
+def test_server_environment_honors_explicit_proxy_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://inherited.invalid:8080")
+
+    environment = _server_environment(
+        {"server": {"environment": {"HTTPS_PROXY": "http://explicit:8080"}}}
+    )
+
+    assert environment["HTTPS_PROXY"] == "http://explicit:8080"
+    assert "127.0.0.1" in environment["NO_PROXY"]
+
+
+def test_evaluation_environment_preserves_proxy_and_removes_host_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("GH_TOKEN", "host-secret")
+    monkeypatch.setenv("GITHUB_PAT", "host-secret")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "host-secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "host-secret")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/tmp/aws-credentials")
+    monkeypatch.setenv(
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/secret"
+    )
+    monkeypatch.setenv(
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://169.254.170.2/secret"
+    )
+    monkeypatch.setenv(
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/tmp/aws-auth-token"
+    )
+    monkeypatch.setenv("DOCKER_AUTH_CONFIG", '{"auths":{"registry":{}}}')
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/git-askpass")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "http.extraHeader")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Authorization: host-secret")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:secret@packages.invalid/simple")
+    monkeypatch.setenv(
+        "PIP_EXTRA_INDEX_URL", "https://user:secret@extra.invalid/simple"
+    )
+    monkeypatch.setenv("UV_INDEX_URL", "https://user:secret@packages.invalid/simple")
+    monkeypatch.setenv(
+        "UV_EXTRA_INDEX_URL", "https://user:secret@extra.invalid/simple"
+    )
+    monkeypatch.setenv("openai_api_key", "host-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("KUBECONFIG", "/tmp/kubeconfig")
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    original_home = os.environ.get("HOME")
+    config = {
+        "server": {"environment": {"VLLM_USE_V2_MODEL_RUNNER": "1"}},
+        "evalscope": {"api_key": "eval-secret"},
+    }
+
+    environment = _evaluation_environment(config)
+
+    assert environment["HTTPS_PROXY"] == "http://proxy.invalid:8080"
+    assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert environment["VLLM_HCU_EVALSCOPE_API_KEY"] == "eval-secret"
+    assert "GH_TOKEN" not in environment
+    assert "GITHUB_PAT" not in environment
+    assert "AWS_ACCESS_KEY_ID" not in environment
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "AWS_SHARED_CREDENTIALS_FILE" not in environment
+    assert "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" not in environment
+    assert "AWS_CONTAINER_CREDENTIALS_FULL_URI" not in environment
+    assert "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" not in environment
+    assert "DOCKER_AUTH_CONFIG" not in environment
+    assert "GIT_ASKPASS" not in environment
+    assert "GIT_CONFIG_COUNT" not in environment
+    assert "GIT_CONFIG_KEY_0" not in environment
+    assert "GIT_CONFIG_VALUE_0" not in environment
+    assert "PIP_INDEX_URL" not in environment
+    assert "PIP_EXTRA_INDEX_URL" not in environment
+    assert "UV_INDEX_URL" not in environment
+    assert "UV_EXTRA_INDEX_URL" not in environment
+    assert "openai_api_key" not in environment
+    assert "SSH_AUTH_SOCK" not in environment
+    assert "KUBECONFIG" not in environment
+    assert environment["TOKENIZERS_PARALLELISM"] == "false"
+    assert environment["HF_HUB_DISABLE_IMPLICIT_TOKEN"] == "1"
+    assert environment["HOME"] != original_home
+    assert "127.0.0.1" in environment["NO_PROXY"]
+
+
+def test_evalscope_command_keeps_api_key_out_of_argv(tmp_path: Path) -> None:
+    secret = "must-not-appear-in-process-list"
+    config = {
+        "model": "/models/Qwen3-8B",
+        "server": {"served_model_name": "Qwen3-8B"},
+        "evalscope": {
+            "api_key": secret,
+            "eval_type": "openai_api",
+            "generation_config": {"temperature": 0},
+            "dataset_args": {"humaneval": {}},
+            "eval_batch_size": 8,
+            "timeout": 60,
+            "limit": 16,
+            "datasets": ["humaneval"],
+        },
+    }
+
+    command = evalscope_command(
+        config,
+        model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+        host="127.0.0.1",
+        port=8000,
+        work_dir=tmp_path,
+    )
+
+    assert secret not in command
+    assert "--api-key" not in command
+    assert command[:3] == [
+        sys.executable,
+        "-m",
+        "tests.integration.server.evalscope_secure_cli",
     ]
-    assert environment["no_proxy"] == environment["NO_PROXY"]
+
+
+def test_secure_cli_injects_key_into_python_argv_and_clears_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = f"evalscope-secret-{uuid.uuid4()}"
+    monkeypatch.setenv("VLLM_HCU_EVALSCOPE_API_KEY", marker)
+    monkeypatch.setattr(sys, "argv", ["evalscope-secure", "eval", "--help"])
+
+    def assert_proc_cmdline_is_clean() -> int:
+        assert sys.argv[-2:] == ["--api-key", marker]
+        return 0
+
+    monkeypatch.setattr(evalscope_secure_cli, "run_cmd", assert_proc_cmdline_is_clean)
+
+    assert evalscope_secure_cli.main() == 0
+    assert "VLLM_HCU_EVALSCOPE_API_KEY" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "api_key_args",
+    [
+        ["--api-key", "exposed-secret"],
+        ["--api-key=exposed-secret"],
+        ["--api-k=exposed-secret"],
+        ["--api-ke", "exposed-secret"],
+    ],
+)
+def test_secure_cli_rejects_command_line_api_key_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_args: list[str],
+) -> None:
+    def fail_if_evalscope_runs() -> int:
+        raise AssertionError("EvalScope must not run with an exposed API key")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evalscope-secure", "eval", *api_key_args],
+    )
+    monkeypatch.setattr(evalscope_secure_cli, "run_cmd", fail_if_evalscope_runs)
+
+    with pytest.raises(RuntimeError, match="protected environment"):
+        evalscope_secure_cli.main()
+
+
+def test_humaneval_rejects_unsandboxed_host_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_HUMANEVAL_ISOLATED", raising=False)
+    config = {"evalscope": {"datasets": ["humaneval"]}}
+
+    with pytest.raises(RuntimeError, match="EvalScope sandbox.*isolated container"):
+        evalscope_server._require_humaneval_execution_isolation(config)
+
+
+def test_humaneval_allows_explicit_evalscope_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_HCU_HUMANEVAL_ISOLATED", raising=False)
+    config = {
+        "evalscope": {
+            "datasets": ["humaneval"],
+            "sandbox": {"enabled": True, "engine": "docker"},
+        }
+    }
+
+    evalscope_server._require_humaneval_execution_isolation(config)
+
+
+def test_humaneval_allows_explicit_isolated_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_HUMANEVAL_ISOLATED", "1")
+
+    evalscope_server._require_humaneval_execution_isolation(
+        {"evalscope": {"datasets": ["humaneval"]}}
+    )
+
+
+class _ProbeResponse:
+    def __init__(self, body: str, *, status: int = 200) -> None:
+        self.status = status
+        self._body = body.encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _prefix_probe_config() -> dict:
+    return {
+        "model": "/models/Qwen3-8B",
+        "server": {
+            "served_model_name": "qwen3-8b-gfx938",
+            "prefix_probe": {
+                "metric": "vllm:prefix_cache_hits_total",
+                "timeout_s": 30,
+                "max_tokens": 32,
+                "content_repeat": 4,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "shared prefix " * 256 + "return OK",
+                    }
+                ],
+            },
+        },
+    }
+
+
+def test_prefix_probe_sends_identical_requests_and_records_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict | None]] = []
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total{engine=\"0\"} 2\n",
+            "vllm:prefix_cache_hits_total{engine=\"0\"} 9\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        assert timeout == 30
+        if isinstance(target, str):
+            calls.append((target, None))
+            return _ProbeResponse(next(metrics))
+        payload = json.loads(target.data.decode())
+        calls.append((target.full_url, payload))
+        return _ProbeResponse(
+            json.dumps(
+                {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "OK"}}
+                    ]
+                }
+            )
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+    run_probe = getattr(evalscope_server, "_run_prefix_probe", None)
+    assert callable(run_probe), "prefix probe runner is not implemented"
+
+    before, after, metrics_path = run_probe(
+        _prefix_probe_config(),
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (2.0, 9.0)
+    assert metrics_path == tmp_path / "logs/metrics.prom"
+    assert metrics_path.read_text(encoding="utf-8").endswith('} 9\n')
+    request_payloads = [payload for _, payload in calls if payload is not None]
+    assert len(request_payloads) == 2
+    assert request_payloads[0] == request_payloads[1]
+    assert request_payloads[0]["model"] == "qwen3-8b-gfx938"
+    assert request_payloads[0]["messages"][0]["content"] == (
+        ("shared prefix " * 256 + "return OK") * 4
+    )
+    assert [url for url, _ in calls] == [
+        "http://127.0.0.1:10128/metrics",
+        "http://127.0.0.1:10128/v1/chat/completions",
+        "http://127.0.0.1:10128/v1/chat/completions",
+        "http://127.0.0.1:10128/metrics",
+    ]
+
+
+def test_prefix_probe_honors_configured_request_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_requests = 0
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total 0\n",
+            "vllm:prefix_cache_hits_total 64\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        nonlocal chat_requests
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse(next(metrics))
+        chat_requests += 1
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+        )
+
+    config = _prefix_probe_config()
+    config["server"]["prefix_probe"]["request_count"] = 9
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+
+    before, after, _ = evalscope_server._run_prefix_probe(
+        config,
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (0.0, 64.0)
+    assert chat_requests == 9
+
+
+def test_prefix_probe_requires_metric_growth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def direct_open(target, *, timeout: int):
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse("vllm:prefix_cache_hits_total 4\n")
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+    run_probe = getattr(evalscope_server, "_run_prefix_probe", None)
+    assert callable(run_probe), "prefix probe runner is not implemented"
+
+    with pytest.raises(AssertionError, match="did not increase"):
+        run_probe(
+            _prefix_probe_config(),
+            host="127.0.0.1",
+            port=10128,
+            work_dir=tmp_path,
+        )
+
+
+def test_prefix_probe_accepts_reasoning_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total 0\n",
+            "vllm:prefix_cache_hits_total 8\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse(next(metrics))
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":null,'
+            '"reasoning_content":"working"}}]}'
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+
+    before, after, _ = evalscope_server._run_prefix_probe(
+        _prefix_probe_config(),
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (0.0, 8.0)
+
+
+def test_prefix_probe_accepts_current_reasoning_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = iter(
+        (
+            "vllm:prefix_cache_hits_total 0\n",
+            "vllm:prefix_cache_hits_total 8\n",
+        )
+    )
+
+    def direct_open(target, *, timeout: int):
+        del timeout
+        if isinstance(target, str):
+            return _ProbeResponse(next(metrics))
+        return _ProbeResponse(
+            '{"choices":[{"message":{"role":"assistant","content":null,'
+            '"reasoning":"working"}}]}'
+        )
+
+    monkeypatch.setattr(evalscope_server, "_direct_urlopen", direct_open)
+
+    before, after, _ = evalscope_server._run_prefix_probe(
+        _prefix_probe_config(),
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    )
+
+    assert (before, after) == (0.0, 8.0)
+
+
+def test_prefix_probe_is_optional_without_network_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        evalscope_server,
+        "_direct_urlopen",
+        lambda *_args, **_kwargs: pytest.fail("optional probe used the network"),
+    )
+
+    assert evalscope_server._run_prefix_probe(
+        {"model": "/models/Qwen3-8B", "server": {}},
+        host="127.0.0.1",
+        port=10128,
+        work_dir=tmp_path,
+    ) is None
 
 
 def test_server_environment_does_not_force_flash_attention_mode(
@@ -430,8 +882,8 @@ def _write_exact_humaneval_artifacts(
     *,
     score: float = 0.90625,
     records: int = 32,
+    model: str = "DeepSeek-V4-Flash-0731-Channel-FP8-w8a8",
 ) -> None:
-    model = "DeepSeek-V4-Flash-0731-Channel-FP8-w8a8"
     report_path = work_dir / f"reports/{model}/humaneval.json"
     report_path.parent.mkdir(parents=True)
     report_path.write_text(
@@ -469,7 +921,7 @@ def _write_exact_humaneval_artifacts(
                     "sample_score": {
                         "score": {
                             "prediction": (
-                                "```python\ndef candidate(value):\n"
+                                " def candidate(value):\n"
                                 "    return value"
                             )
                         },
@@ -503,6 +955,45 @@ def _accept_normalized_humaneval(
     monkeypatch.setattr(evalscope_server, "_check_humaneval_completion", check)
     return completions
 
+
+def test_humaneval_fence_normalization_preserves_body_indentation() -> None:
+    assert evalscope_server._normalize_humaneval_completion(
+        "```python\n    return value\n```",
+        entry_point="candidate",
+    ) == "    return value"
+
+
+def test_humaneval_normalization_removes_complete_module_leading_space() -> None:
+    assert evalscope_server._normalize_humaneval_completion(
+        " def candidate(value):\n    return value",
+        entry_point="candidate",
+    ) == "def candidate(value):\n    return value"
+
+
+def test_humaneval_normalization_preserves_indented_helper_body() -> None:
+    completion = "    def helper(value):\n        return value\n    return helper(value)"
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
+
+
+def test_humaneval_normalization_tolerates_ast_resource_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completion = " def candidate(value):\n    return value"
+    monkeypatch.setattr(
+        evalscope_server,
+        "ast",
+        SimpleNamespace(
+            parse=lambda source: (_ for _ in ()).throw(MemoryError())
+        ),
+    )
+
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
 
 @pytest.mark.parametrize(
     ("completion", "expected"),
@@ -580,6 +1071,27 @@ def test_exact_humaneval_criteria_accepts_both_metrics_and_artifact_counts(
     assert normalized_report["score"] == 1.0
 
 
+def test_exact_humaneval_accepts_evalscope_sanitized_model_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _accept_normalized_humaneval(monkeypatch)
+    _write_exact_humaneval_artifacts(
+        tmp_path,
+        model="GLM-5_1-Channel-FP8-w8a8",
+    )
+    config = _exact_humaneval_config()
+    config["model"] = "/models/GLM-5___1-Channel-FP8-w8a8"
+    config["server"]["served_model_name"] = "GLM-5___1-Channel-FP8-w8a8"
+
+    _assert_pass_criteria(
+        config,
+        model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+        work_dir=tmp_path,
+        eval_log_path=tmp_path / "logs/evalscope.log",
+    )
+
+
 def test_exact_humaneval_criteria_rejects_partial_artifacts(tmp_path: Path) -> None:
     _write_exact_humaneval_artifacts(tmp_path, records=31)
 
@@ -618,3 +1130,138 @@ def test_exact_humaneval_criteria_rejects_normalized_failure(
             work_dir=tmp_path,
             eval_log_path=tmp_path / "logs/evalscope.log",
         )
+
+
+def test_exact_humaneval_diagnostic_profile_skips_normalization_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    config["evalscope"]["pass_criteria"]["enforce_score"] = False
+
+    monkeypatch.setattr(
+        evalscope_server,
+        "_check_humaneval_completion",
+        lambda *_args, **_kwargs: pytest.fail(
+            "diagnostic profiles must not execute generated code twice"
+        ),
+    )
+
+    _assert_pass_criteria(
+        config,
+        model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+        work_dir=tmp_path,
+        eval_log_path=tmp_path / "logs/evalscope.log",
+    )
+
+    assert "diagnostic criterion" in (
+        tmp_path / "logs/evalscope.log"
+    ).read_text()
+
+
+def test_exact_humaneval_diagnostic_profile_records_normalized_score(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completions = _accept_normalized_humaneval(monkeypatch)
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    criteria = config["evalscope"]["pass_criteria"]
+    criteria["enforce_score"] = False
+    criteria["record_normalized_score"] = True
+
+    _assert_pass_criteria(
+        config,
+        model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+        work_dir=tmp_path,
+        eval_log_path=tmp_path / "logs/evalscope.log",
+    )
+
+    assert completions == ["def candidate(value):\n    return value"] * 32
+    log = (tmp_path / "logs/evalscope.log").read_text()
+    assert "diagnostic normalized HumanEval score=1.0000" in log
+    assert "normalized_humaneval.json" in log
+    normalized_report = json.loads(
+        (tmp_path / "reports/normalized_humaneval.json").read_text()
+    )
+    assert normalized_report["passed"] == 32
+    assert normalized_report["score"] == 1.0
+
+
+def test_diagnostic_normalized_score_requires_normalization(
+    tmp_path: Path,
+) -> None:
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    criteria = config["evalscope"]["pass_criteria"]
+    criteria["enforce_score"] = False
+    criteria["normalize_code_fences"] = False
+    criteria["record_normalized_score"] = True
+
+    with pytest.raises(
+        TypeError,
+        match="record_normalized_score requires normalize_code_fences",
+    ):
+        _assert_pass_criteria(
+            config,
+            model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+            work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+
+def test_diagnostic_normalized_score_does_not_escape_evalscope_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_exact_humaneval_artifacts(tmp_path)
+    config = _exact_humaneval_config()
+    criteria = config["evalscope"]["pass_criteria"]
+    criteria["enforce_score"] = False
+    criteria["record_normalized_score"] = True
+    config["evalscope"]["sandbox"] = {
+        "enabled": True,
+        "engine": "docker",
+    }
+    monkeypatch.setattr(
+        evalscope_server,
+        "_check_humaneval_completion",
+        lambda *_args, **_kwargs: pytest.fail(
+            "sandboxed output must not be reexecuted on the host"
+        ),
+    )
+
+    with pytest.raises(TypeError, match="cannot reexecute sandboxed"):
+        _assert_pass_criteria(
+            config,
+            model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+            work_dir=tmp_path,
+            eval_log_path=tmp_path / "logs/evalscope.log",
+        )
+
+
+def test_evalscope_sandbox_does_not_reexecute_completion_on_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_exact_humaneval_artifacts(tmp_path, score=1.0)
+    config = _exact_humaneval_config()
+    config["evalscope"]["sandbox"] = {
+        "enabled": True,
+        "engine": "docker",
+    }
+    monkeypatch.setattr(
+        evalscope_server,
+        "_check_humaneval_completion",
+        lambda *_args, **_kwargs: pytest.fail(
+            "sandboxed EvalScope output must not be reexecuted on the host"
+        ),
+    )
+
+    _assert_pass_criteria(
+        config,
+        model_env="VLLM_HCU_TEST_UNUSED_MODEL",
+        work_dir=tmp_path,
+        eval_log_path=tmp_path / "logs/evalscope.log",
+    )

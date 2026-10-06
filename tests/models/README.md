@@ -15,8 +15,36 @@ checkpoint or dataset fails instead of silently skipping.
 
 Available local configurations:
 
+- `v0281_gfx938_humaneval16.yaml`: 24 selectable profiles for the 21 local
+  checkpoints in scope on the eight-card gfx938 host. DeepSeek-V3.2
+  Channel-FP8 has separate TP8 baseline and TP8+MTP3+E4M3-KV profiles, while
+  DeepSeek-R1 Channel-FP8 has separate TP8 baseline and TP8+MTP3 profiles.
+  DeepSeek-R1-0528 Channel-INT8 has a diagnostic TP8+E4M3-KV profile with an
+  8K output budget; its observed 15/16 result is recorded without claiming an
+  accuracy pass. GLM-4.7 W8A8 has a TP4+MTP2+E4M3-KV profile. Hy3 Channel-FP8
+  has a required TP8 profile and an optional DP8/TP1/EP8 low-latency profile.
+  Select one with
+  `VLLM_HCU_GFX938_PROFILE=<profile>` and run
+  `test_v0281_gfx938_selected_profile_humaneval16`. Acceptance profiles use
+  the default CUDA Graph policy and enforce HumanEval16; explicitly marked
+  diagnostic profiles still validate launch/artifact contracts but do not
+  claim an accuracy pass. Prefix metrics are required only where the topology
+  makes the generic probe meaningful. FlashAttention profiles use HND/BHSD;
+  sparse FlashMLA profiles retain their native layout. DeepSeek-V4.1 is
+  excluded.
 - `deepseek_r1_gsm8k_evalscope.yaml`: DeepSeek-R1 Channel-FP8 W8A8 server
   plus EvalScope GSM8K.
+- `kimi_k26_gfx938_humaneval64.yaml`: Kimi-K2.6 language-only TP8 route with
+  Model Runner V2, FLASHMLA, Triton WNA16 MoE, the `kimi_k2` reasoning parser,
+  prefix caching, BF16 FULL_AND_PIECEWISE CUDA Graph capture, and a
+  deterministic Instant-mode HumanEval-64 gate. The syntax-aware normalized
+  score is enforced at 64/64; the route uses batch eight and does not need the
+  shared-expert stream debug environment switch.
+- `kimi_k26_gfx938_humaneval64_thinking.yaml`: the same Kimi-K2.6 TP8 route
+  with a 32K context, 16K output limit, batch eight, and the checkpoint
+  benchmark sampling settings (`thinking=true`, temperature/top-p 1.0). This
+  historical diagnostic predates the shared-expert stream-race fix; its
+  recorded 55/64 is not the accepted accuracy gate.
 - `deepseek_v4_flash_0731_dspark_humaneval.yaml`: DeepSeek-V4-Flash-0731
   Channel-FP8 TP8 and unified DP8+EP8 DSpark server profiles plus strict
   ModelScope HumanEval-32 acceptance.

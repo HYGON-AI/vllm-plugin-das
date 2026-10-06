@@ -57,6 +57,19 @@ def _create_model_runner(
     return runner
 
 
+def _init_hcu_workspace_manager(
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *,
+    use_v2_model_runner: bool,
+) -> None:
+    """Match MRV2's independent target/draft workspace ownership."""
+
+    num_ubatches = 2 if vllm_config.parallel_config.enable_dbo else 1
+    num_lanes = _num_workspace_lanes(vllm_config, use_v2_model_runner)
+    init_workspace_manager(device, num_ubatches, num_lanes)
+
+
 class HcuGPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HCU.
     Each worker is associated with a single HCU. In case of
@@ -188,12 +201,10 @@ class HcuGPUWorker(Worker):
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
-        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(
+        _init_hcu_workspace_manager(
+            self.vllm_config,
             self.device,
-            num_ubatches,
-            _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
+            use_v2_model_runner=self.use_v2_model_runner,
         )
 
         # Construct the model runner

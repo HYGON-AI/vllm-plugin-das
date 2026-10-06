@@ -52,7 +52,9 @@ def dspark_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     dspark.LogitsProcessor = StubModule
     dspark.maybe_prefix = lambda prefix, name: f"{prefix}.{name}" if prefix else name
     dspark.get_current_vllm_config = lambda: SimpleNamespace()
-    dspark._use_sequence_parallel = lambda vllm_config: False
+    dspark._use_sequence_parallel = (
+        lambda vllm_config: vllm_config.parallel_config.sequence_parallel
+    )
     dspark._test_originals = {
         name: getattr(dspark, name)
         for name in (
@@ -140,6 +142,7 @@ def test_dspark_adapter_construction_keeps_upstream_module_symbols(
         ),
         model_config=SimpleNamespace(hf_config=config),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        parallel_config=SimpleNamespace(sequence_parallel=False),
         quant_config=SimpleNamespace(weight_block_size=weight_block_size),
     )
     dspark_module._dspark.get_current_vllm_config = lambda: vllm_config
@@ -156,6 +159,45 @@ def test_dspark_adapter_construction_keeps_upstream_module_symbols(
     upstream = dspark_module._dspark
     for name, original in upstream._test_originals.items():
         assert getattr(upstream, name) is original
+
+
+@pytest.mark.parametrize(
+    ("weight_block_size", "sequence_parallel", "expected_padding"),
+    (
+        ((128, 128), False, True),
+        ((128, 128), True, False),
+        (None, False, False),
+    ),
+)
+def test_dspark_adapter_initializes_upstream_shared_expert_loader_state(
+    dspark_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    weight_block_size: tuple[int, int] | None,
+    sequence_parallel: bool,
+    expected_padding: bool,
+) -> None:
+    class DraftModel(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            super().__init__()
+
+    monkeypatch.setattr(dspark_module, "DSparkDeepseekV4Model", DraftModel)
+    config = SimpleNamespace(vocab_size=16, hidden_size=4)
+    quant_config = SimpleNamespace(weight_block_size=weight_block_size)
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=config)
+        ),
+        parallel_config=SimpleNamespace(sequence_parallel=sequence_parallel),
+        quant_config=quant_config,
+    )
+
+    model = dspark_module.DSparkDeepseekV4ForCausalLM(
+        vllm_config=vllm_config,
+    )
+
+    assert model.quant_config is quant_config
+    assert model.pad_shared_expert is expected_padding
 
 
 def test_register_model_points_dspark_draft_to_hcu_adapter(

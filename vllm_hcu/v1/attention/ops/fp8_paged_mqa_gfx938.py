@@ -27,6 +27,7 @@ def _paged_logits(
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    CACHE_PAGE_STRIDE: tl.constexpr,
     NUM_PAGES: tl.constexpr,
     TABLE_WIDTH: tl.constexpr,
     MAX_LEN: tl.constexpr,
@@ -52,7 +53,7 @@ def _paged_logits(
     ).to(tl.int64)
     valid = valid & (page >= 0) & (page < NUM_PAGES)
     slot = tokens % PAGE_SIZE
-    page_base = page * (PAGE_SIZE * (DIM + 4))
+    page_base = page * CACHE_PAGE_STRIDE
     offset = (
         page_base[None, :]
         + (slot[None, :] // 16) * (16 * DIM)
@@ -92,7 +93,9 @@ def gfx938_fp8_paged_mqa_logits(
 
     Args:
         q_fp8: FP8 queries with shape [batch, next_n, heads, head_dim].
-        kv_cache_fp8: Contiguous physical HIPC pages [pages, page_size, 1, D+4].
+        kv_cache_fp8: Physical HIPC pages [pages, page_size, 1, D+4]. Pages
+            may be separated by a larger stride when the KV layout interleaves
+            layers inside each block; every individual page must remain dense.
         weights: Float32 per-query head weights [batch * next_n, heads].
         context_lens: Int32/int64 final lengths [batch] or exact ends [batch,next_n].
         block_tables: Int32/int64 logical-to-physical page IDs [batch, pages].
@@ -112,10 +115,12 @@ def gfx938_fp8_paged_mqa_logits(
         or kv_cache_fp8.shape[0] < 1
         or kv_cache_fp8.shape[1] not in (16, 32, 64)
         or kv_cache_fp8.shape[2:] != (1, dim + 4)
-        or not kv_cache_fp8.is_contiguous()
+        or kv_cache_fp8.stride(0) < kv_cache_fp8.shape[1] * (dim + 4)
+        or kv_cache_fp8.stride(1) != dim + 4
+        or kv_cache_fp8.stride(-1) != 1
         or kv_cache_fp8.dtype not in (torch.uint8, q_fp8.dtype)
     ):
-        raise ValueError("cache must contain contiguous physical HIPC FP8 pages")
+        raise ValueError("cache must contain dense physical HIPC FP8 pages")
     if weights.shape != (batch * next_n, heads) or weights.dtype != torch.float32:
         raise ValueError("weights must be float32 [batch * next_n, heads]")
     if context_lens.shape not in ((batch,), (batch, next_n)):
@@ -157,6 +162,7 @@ def gfx938_fp8_paged_mqa_logits(
         heads,
         dim,
         cache.shape[1],
+        cache.stride(0),
         cache.shape[0],
         block_tables.shape[1],
         max_model_len,

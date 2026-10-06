@@ -140,6 +140,32 @@ register_hcu_ci(
     target="tests/integration/server/test_evalscope_report_threshold.py",
     est_time=30,
 )
+register_hcu_ci(
+    job="integration-smoke-gfx938",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_v0281_gfx938_humaneval16.py::"
+        "test_v0281_gfx938_selected_profile_humaneval16"
+    ),
+    est_time=14400,
+    disabled=(
+        "the local gfx938 validation matrix requires an explicitly selected "
+        "profile and checkpoints outside the configured CI model roots"
+    ),
+)
+register_hcu_ci(
+    job="integration-smoke-gfx938",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_kimi_k26_gfx938_humaneval64.py::"
+        "test_kimi_k26_gfx938_humaneval64"
+    ),
+    est_time=14400,
+    disabled=(
+        "the Kimi-K2.6 checkpoint is unavailable in the configured CI model "
+        "roots"
+    ),
+)
 
 register_hcu_ci(
     job="qwen35-smoke",

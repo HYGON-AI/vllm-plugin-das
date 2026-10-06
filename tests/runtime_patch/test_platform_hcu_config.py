@@ -1289,6 +1289,27 @@ def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
     )
 
 
+def test_deepseek_v4_enables_breakable_cuda_graph_by_default() -> None:
+    variable = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+    original = os.environ.get(variable)
+    with pytest.MonkeyPatch.context() as environment:
+        # Seed then delete so MonkeyPatch records how to restore an initially
+        # absent variable after the code under test writes it directly.
+        environment.setenv(variable, "test-restore-sentinel")
+        environment.delenv(variable)
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                enforce_eager=False,
+            )
+        )
+
+        patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
+
+        assert os.environ[variable] == "1"
+    assert os.environ.get(variable) == original
+
+
 @pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])
 def test_deepseek_v4_dspark_rejects_unvalidated_pd_connectors(
     connector: str,
@@ -1732,6 +1753,36 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
+def test_sparse_cache_normalization_tolerates_missing_attention_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.compilation_config.cudagraph_mode = SimpleNamespace(
+        has_full_cudagraphs=lambda: False
+    )
+    config.parallel_config.worker_cls = "custom"
+    config.parallel_config.distributed_executor_backend = "uni"
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=True,
+        block_size=64,
+        cache_dtype="fp8_e4m3",
+    )
+    config.attention_config = None
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda vllm_config: HcuFeatureConfig(),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.cache_config.cache_dtype == "fp8_e4m3"
+
+
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1752,6 +1803,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
         block_size=16,
+        cache_dtype="fp8_e4m3",
         kv_cache_dtype_skip_layers=[],
     )
     config.attention_config = SimpleNamespace(
@@ -1768,6 +1820,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.block_size == 64
+    assert config.cache_config.cache_dtype == "fp8_ds_mla"
 
     config.cache_config.block_size = 16
 

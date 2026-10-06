@@ -277,6 +277,7 @@ def test_deepseek_v4_dspark_mooncake_pd_process_order(
     mooncake_proxy_source_root: Path,
 ) -> None:
     events: list[str] = []
+    monkeypatch.setenv("VLLM_HCU_HUMANEVAL_ISOLATED", "1")
     work_dir = tmp_path / "eval"
     stale_log_dir = work_dir / "logs"
     stale_log_dir.mkdir(parents=True)

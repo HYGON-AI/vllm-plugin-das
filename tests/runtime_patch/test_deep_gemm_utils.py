@@ -506,6 +506,7 @@ def test_w4a8_contiguous_runs_two_hipc_gemms_with_expert_map_and_scales(
     experts.quant_config = SimpleNamespace(
         w1_scale=w13_scale,
         w2_scale=w2_scale,
+        gemm1_clamp_limit=None,
     )
     experts.adjust_N_for_activation = lambda n, _activation: n // 2
 
@@ -762,6 +763,7 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
             use_int8_w8a8=True,
             use_fp8_w8a8=False,
             weight_quant_dtype="int4",
+            gemm1_clamp_limit=None,
         ),
         w1_scale=w13_scale,
         w2_scale=w2_scale,

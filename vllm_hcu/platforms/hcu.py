@@ -616,6 +616,23 @@ class HCUPlatform(Platform):
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
+        attention_config = vllm_config.attention_config
+        if (
+            cache_config is not None
+            and getattr(attention_config, "backend", None)
+            == AttentionBackendEnum.FLASHMLA_SPARSE
+            and cache_config.cache_dtype == "fp8_e4m3"
+        ):
+            # The public E4M3 option maps to sparse FlashMLA's packed
+            # DeepSeek-MLA representation (quantized NoPE values, per-group
+            # scales, and BF16 RoPE).  Backend selection validates the
+            # physical format name, so normalize before any attention layer
+            # asks the platform for its backend.
+            cache_config.cache_dtype = "fp8_ds_mla"
+            logger.info_once(
+                "Using fp8_ds_mla as the internal FLASHMLA_SPARSE layout "
+                "for --kv-cache-dtype fp8_e4m3."
+            )
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():

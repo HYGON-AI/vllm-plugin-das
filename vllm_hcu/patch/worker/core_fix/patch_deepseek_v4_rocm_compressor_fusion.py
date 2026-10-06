@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Keep DeepSeek-V4 compressor GEMMs separate for HCU NN weights."""
+"""Keep optional DeepSeek-V4 compressor fusion safe for HCU layouts."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_prepare_compressor_gemm_fusion(self) -> bool:
-        if self._fused_compressor_weight is not None:
+        if getattr(self, "_fused_compressor_weight", None) is not None:
             return original(self)
 
         compressor = self.compressor
@@ -57,22 +57,29 @@ def apply_to_module(module: ModuleType) -> bool:
 
         main_weight = compressor.fused_wkv_wgate.weight
         indexer_weight = indexer.compressor.fused_wkv_wgate.weight
+        if main_weight.ndim == 2 and indexer_weight.ndim == 2:
+            # The unquantized HCU NN loader stores projections as [K, N].
+            # The upstream fusion expects checkpoint-style NT [N, K].
+            hcu_nn_layout = (
+                main_weight.shape[0] == indexer_weight.shape[0]
+                and main_weight.shape[1] != indexer_weight.shape[1]
+                and main_weight.dtype == indexer_weight.dtype
+                and main_weight.device == indexer_weight.device
+            )
+            if hcu_nn_layout:
+                return False
 
-        # Upstream fuses checkpoint-style NT [N, K] weights along N.  HCU's
-        # unquantized NN loader stores both projections as [K, N], so fusing
-        # them would require concatenating a different dimension and would no
-        # longer match the upstream fused execution path.  Keep the two GEMMs
-        # separate; the HCU DeepSeek-V4 projection patch handles this layout.
-        hcu_nn_layout = (
-            main_weight.ndim == 2
-            and indexer_weight.ndim == 2
-            and main_weight.shape[0] == indexer_weight.shape[0]
-            and main_weight.shape[1] != indexer_weight.shape[1]
-            and main_weight.dtype == indexer_weight.dtype
-            and main_weight.device == indexer_weight.device
-        )
-        if hcu_nn_layout:
-            return False
+            # Heterogeneous MTP attention can also have genuinely different
+            # K dimensions in NT layout; upstream concat cannot fuse these.
+            if main_weight.shape[1] != indexer_weight.shape[1]:
+                rocm.logger.warning_once(
+                    "Skipping optional DeepSeek V4 compressor GEMM fusion "
+                    "because main and indexer K differ (%d vs %d); this is "
+                    "expected for heterogeneous MTP attention inputs.",
+                    main_weight.shape[1],
+                    indexer_weight.shape[1],
+                )
+                return False
         return original(self)
 
     setattr(hcu_prepare_compressor_gemm_fusion, _WRAPPER_MARKER, True)

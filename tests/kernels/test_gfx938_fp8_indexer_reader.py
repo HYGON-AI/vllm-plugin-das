@@ -255,6 +255,33 @@ def test_strided_inputs_match_token_order_oracle():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
+def test_layer_interleaved_physical_pages_match_oracle():
+    args, expected = _case(32, 513, 1, 3, True)
+    q, cache, weights, lengths, table, max_len = args
+    page_size = cache.shape[1]
+    backing = torch.empty(
+        (cache.shape[0], page_size + 1, *cache.shape[2:]),
+        dtype=cache.dtype,
+        device=cache.device,
+    )
+    interleaved_pages = backing[:, :page_size]
+    interleaved_pages.copy_(cache)
+    assert not interleaved_pages.is_contiguous()
+    assert interleaved_pages.stride(0) > cache.stride(0)
+
+    actual = gfx938_fp8_paged_mqa_logits(
+        q,
+        interleaved_pages,
+        weights,
+        lengths,
+        table,
+        max_len,
+    )
+
+    _check(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU GPU")
 @pytest.mark.parametrize(
     "invalid", ["page_size", "cache_stride", "dtype", "fnuz", "table"]
 )

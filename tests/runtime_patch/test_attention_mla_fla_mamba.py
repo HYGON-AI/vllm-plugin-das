@@ -68,7 +68,9 @@ def test_fla_selector_master_off_ignores_materialized_true_attribute(
     assert adapter._enabled() is False
 
 
-def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
+def _import_hcu_sparse_indexer_without_custom_op_registration(
+    monkeypatch, request
+):
     """Import the implementation after another test registered its torch op."""
     from vllm.model_executor.custom_op import CustomOp
     import vllm.utils.torch_utils as torch_utils
@@ -85,9 +87,12 @@ def _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch):
         "direct_register_custom_op",
         lambda **kwargs: None,
     )
-    return importlib.import_module(
-        "vllm_hcu.model_executor.layers.sparse_attn_indexer"
-    )
+    module_name = "vllm_hcu.model_executor.layers.sparse_attn_indexer"
+    was_cached = module_name in sys.modules
+    imported = importlib.import_module(module_name)
+    if not was_cached:
+        request.addfinalizer(lambda: sys.modules.pop(module_name, None))
+    return imported
 
 
 @pytest.mark.parametrize(
@@ -2636,7 +2641,9 @@ def test_sparse_indexer_profile_prefill_with_no_chunks_is_a_noop(monkeypatch):
     assert result.item() == -1
 
 
-def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
+def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(
+    monkeypatch, request
+):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
@@ -2714,7 +2721,9 @@ def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
         "_topk_indices_torch",
         lambda *args, **kwargs: torch.zeros((2, 1), dtype=torch.int32),
     )
-    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(
+        monkeypatch, request
+    )
     monkeypatch.setattr(indexer, "_merge_dcp_topk_global", lambda *a, **k: None)
     import vllm.utils.torch_utils as torch_utils
 
@@ -2746,7 +2755,9 @@ def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
     assert gathered_k_ptrs[0] == gathered_k_ptrs[1]
 
 
-def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(monkeypatch):
+def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(
+    monkeypatch, request
+):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
@@ -2806,7 +2817,9 @@ def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(monkeypatch):
     )
     monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
     merged: list[tuple[torch.Tensor, torch.Tensor]] = []
-    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(monkeypatch)
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(
+        monkeypatch, request
+    )
     monkeypatch.setattr(
         indexer,
         "_merge_dcp_topk_global",
@@ -2814,6 +2827,7 @@ def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(monkeypatch):
             (logits, indices.clone())
         ),
     )
+
     import vllm.utils.torch_utils as torch_utils
 
     monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
@@ -2843,7 +2857,66 @@ def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(monkeypatch):
     assert result.item() == -1
 
 
-def test_hcu_sparse_indexer_merges_dcp_decode_candidates(monkeypatch):
+def test_hcu_sparse_indexer_profile_ignores_empty_prefill_chunks(monkeypatch):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+    topk = torch.zeros((1, 2), dtype=torch.int32)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 1, 128)),
+        k=None,
+        weights=torch.ones((1, 1)),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=2,
+        head_dim=128,
+        max_model_len=64,
+        total_seq_lens=1,
+        topk_indices_buffer=topk,
+        skip_k_cache_insert=True,
+    )
+
+    assert result is topk
+    torch.testing.assert_close(topk, torch.full_like(topk, -1))
+
+
+def test_hcu_sparse_indexer_merges_dcp_decode_candidates(monkeypatch, request):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
@@ -2901,7 +2974,7 @@ def test_hcu_sparse_indexer_merges_dcp_decode_candidates(monkeypatch):
         indices.fill_(7)
 
     indexer_layer = _import_hcu_sparse_indexer_without_custom_op_registration(
-        monkeypatch
+        monkeypatch, request
     )
     monkeypatch.setattr(indexer_layer, "_merge_dcp_topk_global", merge)
     import vllm.utils.torch_utils as torch_utils

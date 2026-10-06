@@ -308,11 +308,21 @@ class MoERunner(MoERunnerInterface):
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
             can_overlap = lambda: self._quant_method.mk_can_overlap_shared_experts
+            # HCU uses ROCm stream semantics while advertising a CUDA-compatible
+            # platform to vLLM. As in upstream ROCm, an unquantized routed input
+            # aliases the shared-expert input and is not safe for multi-stream
+            # overlap. Activation quantization copies it into a distinct buffer.
+            routed_input_is_quantized = lambda: (
+                self.routed_experts.quant_method.moe_quant_config is not None
+                and self.routed_experts.quant_method.moe_quant_config.quant_dtype
+                is not None
+            )
             self._shared_experts = SharedExperts(
                 shared_experts,
                 moe_config=moe_config,
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
+                is_multistream_safe=routed_input_is_quantized,
             )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
