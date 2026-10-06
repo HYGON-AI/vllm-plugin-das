@@ -179,9 +179,18 @@ def _load_environment_lock(path: Path) -> dict[str, Any]:
     rocm = lock.get("rocm")
     if not isinstance(rocm, dict) or not all(
         isinstance(rocm.get(name), str) and rocm[name]
-        for name in ("environment", "version_file", "version")
+        for name in ("environment", "version_file")
     ):
         raise PreflightError("environment lock must declare the DTK/ROCm version file")
+    rocm.update(
+        _version_specification(
+            {
+                "match": rocm.get("match", "exact"),
+                "version": rocm.get("version"),
+            },
+            name="environment lock DTK/ROCm version",
+        )
+    )
     return lock
 
 
@@ -229,9 +238,10 @@ def _check_environment_lock(
         raise PreflightError(
             f"cannot read DTK/ROCm version from {version_path}: {exc}"
         ) from exc
-    if actual_rocm != rocm["version"]:
+    if not _matches_version(actual_rocm, rocm):
         raise PreflightError(
-            f"runner DTK/ROCm drift: expected {rocm['version']}, got {actual_rocm}"
+            "runner DTK/ROCm drift: expected "
+            f"{rocm['match']} {rocm['version']}, got {actual_rocm}"
         )
     return {
         "path": str(path.resolve()),

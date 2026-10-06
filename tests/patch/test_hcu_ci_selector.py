@@ -483,6 +483,54 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+def test_environment_lock_allows_compatible_rocm_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "dtk"
+    version_file = runtime_root / ".info" / "rocm_version"
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text("26.04.1\n", encoding="utf-8")
+    monkeypatch.setenv("TEST_HCU_RUNTIME_ROOT", str(runtime_root))
+    monkeypatch.setattr("hcu_ci_preflight.platform.python_version", lambda: "3.10.12")
+    lock = tmp_path / "environment.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "python": "3.10.12",
+                "torch_hip": {"match": "prefix", "version": "6.3."},
+                "rocm": {
+                    "environment": "TEST_HCU_RUNTIME_ROOT",
+                    "version_file": ".info/rocm_version",
+                    "match": "prefix",
+                    "version": "26.04",
+                },
+                "distributions": {
+                    "torch": {"match": "prefix", "version": "2.11.0+"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    versions = {"torch": "2.11.0+build.1"}
+
+    report = _check_environment_lock(
+        lock,
+        versions=versions,
+        torch_hip="6.3.26093",
+    )
+    assert report["rocm"] == "26.04.1"
+
+    version_file.write_text("26.05\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm drift"):
+        _check_environment_lock(
+            lock,
+            versions=versions,
+            torch_hip="6.3.26093",
+        )
+
+
 def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
     config = _config()
     evalscope_jobs = {
