@@ -12,8 +12,6 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
 )
 
-from vllm_hcu.v1.attention.ops.flashmla import _bolt_sparse_mla_requested
-
 
 class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -148,9 +146,12 @@ class HcuFlashMLASparseBackend(FlashMLASparseBackend):
     ) -> str | None:
         from vllm_hcu.platforms import envs as henvs
 
-        if (
-            not henvs.optional_custom_op_enabled() or _bolt_sparse_mla_requested()
-        ) and kv_cache_dtype not in {None, "auto", "float16", "bfloat16"}:
+        if not henvs.optional_custom_op_enabled() and kv_cache_dtype not in {
+            None,
+            "auto",
+            "float16",
+            "bfloat16",
+        }:
             return (
                 "BoltOPs sparse MLA supports only BF16/FP16 KV cache; got "
                 f"{kv_cache_dtype}."

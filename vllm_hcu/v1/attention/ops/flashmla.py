@@ -5,7 +5,6 @@
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
 
 import functools
-import os
 from collections.abc import Callable
 from inspect import signature
 
@@ -15,13 +14,6 @@ from vllm.logger import init_logger
 from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
-
-
-def _bolt_sparse_mla_requested() -> bool:
-    return os.environ.get("VLLM_HCU_SPARSE_MLA_BOLTOPS", "0").lower() in (
-        "1",
-        "true",
-    )
 
 
 try:
@@ -65,7 +57,7 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     from vllm_hcu.platforms import envs as henvs
 
-    if not henvs.optional_custom_op_enabled() or _bolt_sparse_mla_requested():
+    if not henvs.optional_custom_op_enabled():
         try:
             _resolve_sparse_mla_fwd()
         except RuntimeError as exc:
@@ -115,10 +107,10 @@ _SPARSE_MLA_PARAMETERS = (
 
 @functools.cache
 def _resolve_sparse_mla_fwd() -> Callable:
-    """Resolve the native or explicitly requested BoltOPs sparse MLA kernel."""
+    """Resolve sparse MLA from the HCU custom-op master switch."""
     from vllm_hcu.platforms import envs as henvs
 
-    if henvs.optional_custom_op_enabled() and not _bolt_sparse_mla_requested():
+    if henvs.optional_custom_op_enabled():
         return _native_flash_mla_sparse_fwd
 
     try:
