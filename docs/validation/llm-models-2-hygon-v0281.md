@@ -23,12 +23,14 @@ request.
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | 14/16 twice | 188.04 and 198.51 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 127.57 and 137.41 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 117.39 and 123.67 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 at 7,800 output tokens | `qwen3` reasoning parser; both normally stopped answers passed and 14 answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
+| `Qwen3.5-122B-A10B-Channel-FP8-w8a8` | TP4 | 16/16 | AITER channel-FP8 MoE; MTP acceptance 1,862/1,968 (94.6%); 2,176-token manager page and third-request fine-grained hit 2,112 tokens |
 | `Qwen3.6-35B-A3B-Channel-FP8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,861/1,959 (95.0%); third-request fine-grained hit 2,112 tokens |
 | `Qwen3.6-35B-A3B-Channel-INT8-w8a8` | TP2 | 16/16 | 69.34 output tok/s; MTP acceptance 1,817/1,902 (95.5%); third-request fine-grained hit 2,112 tokens |
 | `Qwen3.8-27B-Channel-FP8` | TP2 | 16/16 | 61.10 output tok/s; MTP acceptance 1,717/1,785 (96.2%); 6,016-token probe reused 4,736 tokens on the consumer request with correct output |
@@ -52,12 +54,17 @@ AITER kernel.
 
 ## Qwen3.5 and Qwen3.6 hybrid service command
 
-Use the following command for the 35B-A3B hybrid checkpoints. Replace
+Use the following command for the 35B-A3B and 122B-A10B hybrid checkpoints. Replace
 `MODEL`, `SERVED`, `GPU_LIST`, `TP`, and `GPU_MEMORY_UTILIZATION` with the
 values in the result table. The accepted TP2 runs used `GPU_LIST=0,1`,
 `TP=2`, and `GPU_MEMORY_UTILIZATION=0.50`; the temporary TP4 resource-control
 runs used `GPU_LIST=0,1,2,3`, `TP=4`, and
 `GPU_MEMORY_UTILIZATION=0.10`.
+
+The accepted 122B-A10B run used `GPU_LIST=0,1,2,3`, `TP=4`, and
+`GPU_MEMORY_UTILIZATION=0.50`. Its checkpoint contains one MTP layer; the
+three-token configuration intentionally exercises the official repeated-layer
+MTP behavior.
 
 ```bash
 env -u VLLM_PLUGINS \
@@ -205,6 +212,9 @@ The 4B Thinking checkpoint used the same command with `4B` substituted for
 `8B`. Even at the 7,800-token limit, ten samples exhausted the context inside
 reasoning; all six normally stopped samples passed. Treat its 6/16 as a
 checkpoint generation-budget limitation, not an accepted precision score.
+The 2B Thinking checkpoint was more extreme: only two answers stopped within
+7,800 tokens and both passed, while the other 14 exhausted the context. Its
+raw 2/16 score has the same budget-bound classification.
 
 The 235B-A22B Instruct MoE route used four cards and AITER:
 
