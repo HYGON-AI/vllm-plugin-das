@@ -422,6 +422,41 @@ def _indexer_k_bf16_cache_kernel(
     
     tl.store(dst_ptr + tile_offset, val)
 
+def _indexer_bf16_cache_as_page_view(
+    kv_cache: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    """Return the single-head indexer cache as ``[blocks, tokens, dim]``.
+
+    vLLM can bind a per-layer MLA cache in either LBHNC or LBNHC order, so the
+    singleton head axis can be dimension 1 or 2.  The BF16 writer operates on
+    physical pages and must not assume one global KV-cache layout.
+    """
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[-1] != head_dim:
+            raise ValueError(
+                "Indexer BF16 cache head_dim mismatch: "
+                f"expected {head_dim}, got {kv_cache.shape[-1]}"
+            )
+        if kv_cache.shape[1] == 1:
+            kv_cache = kv_cache.squeeze(1)
+        elif kv_cache.shape[2] == 1:
+            kv_cache = kv_cache.squeeze(2)
+        else:
+            raise ValueError(
+                "Indexer BF16 cache must use a single-head LBHNC or LBNHC "
+                f"layout, got shape {tuple(kv_cache.shape)}"
+            )
+
+    kv_cache = _indexer_cache_as_hipc_view(kv_cache)
+    if kv_cache.ndim != 3 or kv_cache.shape[2] != head_dim:
+        raise ValueError(
+            "Indexer BF16 cache must resolve to [blocks, tokens, head_dim], "
+            f"got shape {tuple(kv_cache.shape)} for head_dim={head_dim}"
+        )
+    return kv_cache
+
+
 def indexer_k_bf16_cache_triton(
     k: torch.Tensor,
     kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim] (bf16)
@@ -438,6 +473,8 @@ def indexer_k_bf16_cache_triton(
         block_tile_size: 块分块大小
         head_tile_size: 头维度分块大小
     """
+    kv_cache = _indexer_bf16_cache_as_page_view(kv_cache, k.shape[-1])
+
     # 输入类型校验
     assert k.dtype == torch.bfloat16, "k 必须是 bf16 类型"
     assert kv_cache.dtype == torch.bfloat16, "kv_cache 必须是 bf16 类型"
