@@ -61,7 +61,12 @@ from .fp8_kv_dequant import LightOpKVReuseState
 
 logger = init_logger(__name__)
 
-_SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
+_SPARSE_LAYER_TYPES = (
+    "sparse_attention",
+    "sparse",
+    "deepseek_sparse_attention",
+    "indexed_attention",
+)
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 

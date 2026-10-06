@@ -158,11 +158,12 @@ def test_hy_v4_config_normalizes_sparse_layer_spelling() -> None:
         layer_types=["sparse", "sparse_attention", "full_attention"],
     )
 
-    assert config.layer_types == [
+    assert config.layer_types[0] == config.layer_types[1]
+    assert config.layer_types[0] in {
         "deepseek_sparse_attention",
-        "deepseek_sparse_attention",
-        "full_attention",
-    ]
+        "indexed_attention",
+    }
+    assert config.layer_types[2] == "full_attention"
 
 
 def test_hy_v4_fp32_lm_head_uses_logits_processor_head_dtype() -> None:

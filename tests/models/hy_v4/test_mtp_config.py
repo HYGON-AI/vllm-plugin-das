@@ -28,7 +28,9 @@ def test_mtp_config_extends_one_layer_and_preserves_activation_scheme(scheme, bl
     target.quantization_config = {"activation_scheme": scheme, "weight_block_size": block}
     before = copy.deepcopy(target.to_dict())
     draft = mtp._make_mtp_layer_config(target, 2)
-    assert draft.layer_types == ["full_attention", "deepseek_sparse_attention", "deepseek_sparse_attention"]
+    sparse_layer_type = target.layer_types[1]
+    assert sparse_layer_type in {"deepseek_sparse_attention", "indexed_attention"}
+    assert draft.layer_types == ["full_attention", sparse_layer_type, sparse_layer_type]
     assert draft.mlp_layer_types == ["dense", "sparse", "sparse"]
     assert draft.num_hidden_layers == 2
     assert draft.indexer_types == ["full", "full"]

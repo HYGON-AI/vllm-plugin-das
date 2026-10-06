@@ -24,6 +24,40 @@ _DSPARK_MAX_CONTEXT_LENGTH = 4096
 _DSPARK_MAX_STATIC_KV_SCRATCH_BYTES = 584 * 1024**2
 
 
+@functools.lru_cache(maxsize=None)
+def _dspark_paged_attention_uses_extended_abi(
+    paged_attention: Callable[..., Any],
+) -> bool:
+    """Identify the two supported DSpark paged-attention ABIs."""
+    try:
+        signature = inspect.signature(paged_attention)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        positional_count = sum(
+            parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            for parameter in signature.parameters.values()
+        )
+        if positional_count in (15, 18):
+            return positional_count == 18
+
+    signature_line = (getattr(paged_attention, "__doc__", "") or "").split(
+        "\n", 1
+    )[0]
+    if "arg17:" in signature_line:
+        return True
+    if "arg14:" in signature_line and "arg15:" not in signature_line:
+        return False
+    raise RuntimeError(
+        "Unsupported flash_attn paged_attention ABI; expected 15 or 18 "
+        "positional parameters"
+    )
+
+
 def _flash_attn_layout() -> str:
     cache_layout = get_kv_cache_layout()
     if cache_layout == "HND":
@@ -217,15 +251,12 @@ def _flash_attn_varlen_func_with_dspark_capture(
         query_len=8,
         causal=True,
     )
-    use_static_varlen = (
-        _matches_dspark_attention_shape(
-            kwargs,
-            query_len=7,
-            causal=False,
-        )
-        and torch.cuda.is_current_stream_capturing()
+    use_drafter_varlen = _matches_dspark_attention_shape(
+        kwargs,
+        query_len=7,
+        causal=False,
     )
-    if not use_paged_attention and not use_static_varlen:
+    if not use_paged_attention and not use_drafter_varlen:
         return _flash_attn_varlen_func(**kwargs)
 
     from flash_attn.flash_attn_interface import flash_attn_cuda
@@ -239,15 +270,19 @@ def _flash_attn_varlen_func_with_dspark_capture(
     softmax_scale = kwargs.get("softmax_scale")
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
-    if use_static_varlen:
+    if use_drafter_varlen:
         # DSpark's non-causal draft block cannot use paged_attention, which
-        # applies a causal mask. Gather into a statically sized buffer instead
-        # of materializing seqused_k.sum() on the host during graph capture.
-        # The matcher bounds this scratch space to 584 MiB per rank, matching
-        # Qwen3-8B TP2 at its maximum admitted shape:
+        # applies a causal mask. Eager execution can size the gather buffers to
+        # the used KV tokens; graph capture uses a static upper bound instead
+        # of materializing seqused_k.sum() on the host. The matcher bounds the
+        # captured scratch space to 584 MiB per rank, matching Qwen3-8B TP2 at
+        # its maximum admitted shape:
         # 2 * floor(512 / 7) * 4096 * 4 * 128 * sizeof(bfloat16).
         max_seqlen_k = kwargs["max_seqlen_k"]
-        total_k = batch_size * max_seqlen_k
+        if torch.cuda.is_current_stream_capturing():
+            total_k = batch_size * max_seqlen_k
+        else:
+            total_k = int(kwargs["seqused_k"].sum().item())
         contiguous_k = torch.empty(
             (total_k, k.shape[-2], k.shape[-1]),
             device=k.device,
@@ -295,7 +330,7 @@ def _flash_attn_varlen_func_with_dspark_capture(
         )
         return out
 
-    flash_attn_cuda.paged_attention(
+    paged_attention_args = (
         out,
         q.reshape(batch_size, 8, q.shape[-2], q.shape[-1]),
         k,
@@ -312,6 +347,16 @@ def _flash_attn_varlen_func_with_dspark_capture(
         None,
         2,
     )
+    paged_attention = flash_attn_cuda.paged_attention
+    if _dspark_paged_attention_uses_extended_abi(paged_attention):
+        window_size = kwargs.get("window_size") or (-1, -1)
+        paged_attention(
+            *paged_attention_args,
+            *window_size,
+            kwargs["causal"],
+        )
+    else:
+        paged_attention(*paged_attention_args)
     return out
 
 

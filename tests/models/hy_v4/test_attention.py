@@ -333,6 +333,8 @@ def test_pipeline_stage_must_start_with_a_local_full_indexer() -> None:
     [
         (["full_attention", "sparse_attention", "sparse_attention"],
          ["full", "shared", "shared"], 0, 3, True),
+        (["full_attention", "indexed_attention", "indexed_attention"],
+         ["full", "shared", "shared"], 0, 3, True),
         (["sparse_attention", "full_attention", "sparse_attention"],
          ["full", "full", "shared"], 1, 3, True),
         (["sparse_attention", "full_attention", "sparse_attention"],
