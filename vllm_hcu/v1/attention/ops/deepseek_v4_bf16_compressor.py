@@ -76,6 +76,7 @@ def _compress_norm_rope_store_bf16_kernel(
         mask=load_mask,
         other=float("-inf"),
     )
+    scores = tl.where(dim_mask[None, :], scores, 0.0)
     scores = tl.softmax(scores, dim=0)
     values = tl.load(
         row_base[:, None] + dims[None, :],
@@ -97,7 +98,7 @@ def _compress_norm_rope_store_bf16_kernel(
     even, odd = tl.split(tl.reshape(normed, (num_pairs, 2)))
     pair_idx = tl.arange(0, num_pairs)
     rope_pair_idx = pair_idx - nope_pairs
-    is_rope = rope_pair_idx >= 0
+    is_rope = (rope_pair_idx >= 0) & (rope_pair_idx < half_rope)
     cos_sin_idx = tl.maximum(rope_pair_idx, 0)
     compressed_position = (position // COMPRESS_RATIO) * COMPRESS_RATIO
     cos_sin = cos_sin_cache_ptr + compressed_position * cos_sin_stride

@@ -30,6 +30,51 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def test_bf16_compressor_writes_finite_576_dim_row_at_last_rope_position() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires an HCU GPU to execute the Triton kernel")
+
+    from vllm_hcu.v1.attention.ops.deepseek_v4_bf16_compressor import (
+        compress_norm_rope_store_bf16,
+    )
+
+    device = torch.device("cuda")
+    head_dim = 576
+    state_width = head_dim
+    state_cache = torch.ones((1, 1, 2 * head_dim), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.empty((1, 1, head_dim), dtype=torch.bfloat16, device=device)
+    cos_sin_cache = torch.cat(
+        (
+            torch.ones((1, 32), dtype=torch.bfloat16, device=device),
+            torch.zeros((1, 32), dtype=torch.bfloat16, device=device),
+        ),
+        dim=1,
+    )
+    zero = torch.zeros((1,), dtype=torch.int32, device=device)
+
+    compress_norm_rope_store_bf16(
+        state_cache=state_cache,
+        num_actual=1,
+        token_to_req_indices=zero,
+        positions=zero,
+        slot_mapping=zero,
+        block_table=zero.view(1, 1),
+        block_size=1,
+        state_width=state_width,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        k_cache_metadata=SimpleNamespace(slot_mapping=zero),
+        rms_norm_weight=torch.ones((head_dim,), dtype=torch.bfloat16, device=device),
+        rms_norm_eps=1e-6,
+        head_dim=head_dim,
+        rope_head_dim=64,
+        compress_ratio=1,
+        overlap=False,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(kv_cache, torch.ones_like(kv_cache))
+
+
 def test_bf16_compressor_never_calls_fp8_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
