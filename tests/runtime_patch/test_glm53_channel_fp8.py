@@ -291,7 +291,13 @@ def test_hcu_glm5next_kpool_cache_keeps_compression_without_deepgemm_page() -> N
             del vllm_config
             raise AssertionError("DeepGEMM requires a 32-state page")
 
+    class Glm5NextTailCache:
+        def get_kv_cache_spec(self, vllm_config):
+            del vllm_config
+            raise AssertionError("tail cache is not exercised by this test")
+
     attention.Glm5NextIndexerCache = Glm5NextIndexerCache
+    attention.Glm5NextTailCache = Glm5NextTailCache
     patch_glm5next_channel_fp8._patch_glm5next_indexer_cache(attention)
 
     cache = Glm5NextIndexerCache()
@@ -301,6 +307,156 @@ def test_hcu_glm5next_kpool_cache_keeps_compression_without_deepgemm_page() -> N
     assert spec.tokens_per_state == 4
     assert spec.storage_block_size is None
     assert spec.num_states == 16
+
+
+def _patched_glm5next_tail_cache_spec(num_speculative_tokens: int):
+    from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+
+    attention = ModuleType(patch_glm5next_channel_fp8.ATTENTION_MODULE)
+
+    class DeepseekV32IndexerCache:
+        def get_kv_cache_spec(self, vllm_config):
+            del vllm_config
+            return MLAAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+            )
+
+    class Glm5NextIndexerCache(DeepseekV32IndexerCache):
+        def get_kv_cache_spec(self, vllm_config):
+            del vllm_config
+            raise AssertionError("DeepGEMM requires a 32-state page")
+
+    class Glm5NextTailCache:
+        def get_kv_cache_spec(self, vllm_config):
+            del vllm_config
+            return KpoolTailSpec(
+                block_size=self._index_kpool,
+                num_kv_heads=2,
+                head_size=self.head_dim,
+                head_size_v=0,
+                dtype=torch.bfloat16,
+                sliding_window=self._index_kpool,
+            )
+
+    attention.Glm5NextIndexerCache = Glm5NextIndexerCache
+    attention.Glm5NextTailCache = Glm5NextTailCache
+    patch_glm5next_channel_fp8._patch_glm5next_indexer_cache(attention)
+
+    cache = Glm5NextTailCache()
+    cache._index_kpool = 4
+    cache.head_dim = 128
+    cache.cache_config = SimpleNamespace(block_size=64)
+    return cache.get_kv_cache_spec(
+        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "expected_ring"),
+    [(0, 4), (1, 8), (3, 8), (4, 8), (7, 16), (13, 32)],
+)
+def test_glm5next_tail_ring_covers_pool_and_speculative_tokens(
+    num_speculative_tokens: int,
+    expected_ring: int,
+) -> None:
+    spec = _patched_glm5next_tail_cache_spec(num_speculative_tokens)
+
+    assert spec.block_size == expected_ring
+    assert spec.sliding_window == expected_ring
+    assert 64 % expected_ring == 0
+
+
+def test_glm5next_tail_ring_preserves_rejected_completing_draft_redo() -> None:
+    pool_size = 4
+    ring_size = _patched_glm5next_tail_cache_spec(3).block_size
+    keys = [None] * ring_size
+
+    def stash(position: int, value: int) -> None:
+        keys[position % ring_size] = value
+
+    def complete(position: int, current: int) -> tuple[int, ...]:
+        start = position - (pool_size - 1)
+        values = tuple(
+            keys[(start + offset) % ring_size] for offset in range(pool_size)
+        )
+        return (*values[:-1], current)
+
+    for position in range(4, 7):
+        stash(position, position)
+    expected = complete(7, 7)
+
+    # Draft 7 completes the pool but is rejected. Drafts 8..10 must not
+    # overwrite positions 4..6 before the accepted redo of position 7.
+    for position in range(7, 11):
+        stash(position, 900 + position)
+    redo = complete(7, 7)
+
+    assert redo == expected == (4, 5, 6, 7)
+
+
+class _FakeKernelLauncher:
+    def __init__(self):
+        self.grid = None
+        self.args = None
+        self.kwargs = None
+
+    def __getitem__(self, grid):
+        self.grid = grid
+        return self
+
+    def __call__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+def test_glm5next_tail_ring_kernel_launch_keeps_pool_and_ring_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        from vllm_hcu.v1.attention.ops import glm5next_kpool_ring as ring_ops
+    except ImportError:
+        pytest.fail("GLM5Next speculative tail-ring backport is not installed")
+
+    seed = _FakeKernelLauncher()
+    decode = _FakeKernelLauncher()
+    monkeypatch.setattr(ring_ops, "_kpool_tail_seed_ring_kernel", seed)
+    monkeypatch.setattr(ring_ops, "_kpool_decode_update_batched_ring_kernel", decode)
+
+    tail = torch.zeros(2, 2, 8, 128, dtype=torch.bfloat16)
+    key = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    score = torch.zeros_like(key)
+    tail_slot = torch.zeros(1, 4, dtype=torch.int32)
+    slot = torch.full((1, 4), -1, dtype=torch.int32)
+    positions = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+    ape = torch.zeros(4, 128, dtype=torch.float32)
+    kv = torch.zeros(2, 64, 132, dtype=torch.uint8)
+
+    ring_ops.kpool_seed_tail_cache(
+        tail,
+        key.reshape(-1, 128),
+        score.reshape(-1, 128),
+        tail_slot.reshape(-1),
+        4,
+    )
+    ring_ops.kpool_decode_update_and_maybe_write_cache_batched(
+        kv,
+        tail,
+        tail_slot,
+        key,
+        score,
+        ape,
+        slot,
+        positions,
+        4,
+    )
+
+    assert seed.kwargs["KPOOL"] == 4
+    assert seed.kwargs["RING"] == 8
+    assert decode.kwargs["POOL_SIZE"] == 4
+    assert decode.kwargs["RING"] == 8
 
 
 @pytest.mark.parametrize(
@@ -381,7 +537,29 @@ def test_rocm_sparse_builder_disables_missing_aiter_metadata_api(
             self._use_persistent_metadata = True
             self.metadata_info = get_mla_metadata_info_v1("unused")
 
+    def _use_rocm_sparse_triton(
+        *,
+        kv_cache_dtype,
+        head_size,
+        kv_lora_rank,
+        num_prefills,
+        num_decodes,
+        num_decode_tokens,
+        max_query_len,
+    ):
+        del (
+            kv_cache_dtype,
+            head_size,
+            kv_lora_rank,
+            num_prefills,
+            num_decodes,
+            num_decode_tokens,
+            max_query_len,
+        )
+        return False
+
     module.ROCMAiterMLASparseMetadataBuilder = ROCMAiterMLASparseMetadataBuilder
+    module._use_rocm_sparse_triton = _use_rocm_sparse_triton
     patch_rocm_mla_sparse_metadata.apply_to_module(module)
 
     builder = ROCMAiterMLASparseMetadataBuilder()
@@ -390,9 +568,123 @@ def test_rocm_sparse_builder_disables_missing_aiter_metadata_api(
     assert not hasattr(aiter, "get_mla_metadata_info_v1")
 
 
+@pytest.mark.parametrize(
+    (
+        "kv_cache_dtype",
+        "head_size",
+        "num_prefills",
+        "num_decodes",
+        "num_decode_tokens",
+        "max_query_len",
+        "expected",
+    ),
+    [
+        ("auto", 512, 1, 0, 0, 32, True),
+        ("auto", 512, 0, 2, 2, 1, True),
+        ("auto", 512, 0, 2, 4, 2, True),
+        ("auto", 512, 0, 2, 12, 6, True),
+        ("fp8", 512, 0, 2, 4, 2, False),
+        ("auto", 576, 0, 2, 4, 2, False),
+        ("auto", 512, 0, 0, 0, 0, False),
+    ],
+)
+def test_rocm_sparse_route_keeps_mtp_verify_on_ragged_triton(
+    kv_cache_dtype: str,
+    head_size: int,
+    num_prefills: int,
+    num_decodes: int,
+    num_decode_tokens: int,
+    max_query_len: int,
+    expected: bool,
+) -> None:
+    module = ModuleType(patch_rocm_mla_sparse_metadata.TARGET_MODULE)
+
+    class ROCMAiterMLASparseMetadataBuilder:
+        def __init__(self):
+            self._use_persistent_metadata = True
+
+    def _use_rocm_sparse_triton(
+        *,
+        kv_cache_dtype,
+        head_size,
+        kv_lora_rank,
+        num_prefills,
+        num_decodes,
+        num_decode_tokens,
+        max_query_len,
+    ):
+        plain_decode = num_decode_tokens == num_decodes
+        return (
+            not kv_cache_dtype.startswith("fp8")
+            and head_size == kv_lora_rank
+            and plain_decode
+            and (num_prefills > 0 or (num_decodes > 0 and max_query_len == 1))
+        )
+
+    module.ROCMAiterMLASparseMetadataBuilder = ROCMAiterMLASparseMetadataBuilder
+    module._use_rocm_sparse_triton = _use_rocm_sparse_triton
+    patch_rocm_mla_sparse_metadata.apply_to_module(module)
+
+    assert (
+        module._use_rocm_sparse_triton(
+            kv_cache_dtype=kv_cache_dtype,
+            head_size=head_size,
+            kv_lora_rank=512,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            max_query_len=max_query_len,
+        )
+        is expected
+    )
+
+
 def test_kpool_indexer_uses_official_triton_path_without_aiter() -> None:
     module = ModuleType(patch_glm5next_channel_fp8.KPOOL_MODULE)
     module.rocm_aiter_ops = SimpleNamespace(is_enabled=lambda: False)
+    module.kpool_ops = ModuleType("fake_glm5next_kpool_ops")
+
+    def kpool_seed_tail_cache(
+        tail_kv_cache,
+        key,
+        gate_score,
+        tslot,
+        kpool,
+        head_dim=128,
+    ):
+        del tail_kv_cache, key, gate_score, tslot, kpool, head_dim
+
+    def kpool_decode_update_and_maybe_write_cache_batched(
+        kv_cache,
+        tail_kv_cache,
+        tail_slot_mapping,
+        key,
+        slot_score,
+        ape,
+        slot_mapping,
+        positions,
+        pool_size,
+        head_dim=128,
+        round_scale=True,
+    ):
+        del (
+            kv_cache,
+            tail_kv_cache,
+            tail_slot_mapping,
+            key,
+            slot_score,
+            ape,
+            slot_mapping,
+            positions,
+            pool_size,
+            head_dim,
+            round_scale,
+        )
+
+    module.kpool_ops.kpool_seed_tail_cache = kpool_seed_tail_cache
+    module.kpool_ops.kpool_decode_update_and_maybe_write_cache_batched = (
+        kpool_decode_update_and_maybe_write_cache_batched
+    )
 
     class SparseAttnIndexerKpool:
         def forward_hip(

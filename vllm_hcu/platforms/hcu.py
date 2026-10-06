@@ -616,6 +616,13 @@ class HCUPlatform(Platform):
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
+        if not henvs.custom_ops_enabled():
+            if not parallel_config.disable_custom_all_reduce:
+                logger.warning_once(
+                    "VLLM_HCU_USE_CUSTOM_OPS=0: disabling HCU custom "
+                    "all-reduce and using the configured collective fallback."
+                )
+            parallel_config.disable_custom_all_reduce = True
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
