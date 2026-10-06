@@ -20,6 +20,10 @@ request.
 | `Qwen3-8B-Channel-INT8-w8a8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-14B-Channel-INT8-w8a8` | TP2 | 15/16 | E4M3 KV |
 | `Qwen3-4B-Thinking-2507-Channel-FP8` | TP2 | diagnostic only | The checkpoint template always emits a thinking segment; disabling thinking is not a valid accuracy contract |
+| `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | 14/16 twice | 188.04 and 198.51 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 127.57 and 137.41 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 117.39 and 123.67 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -32,6 +36,11 @@ The TP4 resource-control runs were used only while unrelated stale KFD
 contexts constrained available memory. TP remained enabled, and later runs
 returned to TP2 after complete process-group cleanup released the stale
 contexts.
+
+The Qwen3-VL Instruct runs were completed at the pre-integration branch head
+`dd65c88`. After the integration branch was rebased, the 8B Thinking profile
+and its 8K budget gate were run again from the new remote head `040f351` on a
+clean follow-up branch. Both heads used the same pinned vLLM wheel.
 
 The Flash-Next run selected QSA successfully, but the AITER MoE backend did
 not have tuned entries for every `E=512, N=160, K=2560` shape and logged
@@ -130,6 +139,65 @@ valid layouts: ['BLNHC', 'BLHNC']
 
 Unsetting the forced layout started the service successfully and selected
 `BLNHC`. No plugin runtime change was needed.
+
+## Qwen3-VL text-only service commands
+
+The Instruct checkpoints use the ordinary text-only FLASH_ATTN profile. Set
+`SIZE` to `2B`, `4B`, or `8B`, and adjust memory utilization if required.
+
+```bash
+env -u VLLM_PLUGINS \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve "/llm-models-2/hygon/Qwen3-VL-${SIZE}-Instruct-Channel-FP8" \
+  --served-model-name "Qwen3-VL-${SIZE}-Instruct-Channel-FP8" \
+  --port 10234 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.35 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+The Thinking checkpoint must expose reasoning separately and needs a realistic
+reasoning budget. The final 8B gate used:
+
+```bash
+env -u VLLM_PLUGINS \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3-VL-8B-Thinking-Channel-FP8 \
+  --served-model-name Qwen3-VL-8B-Thinking-Channel-FP8 \
+  --port 10234 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.35 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --reasoning-parser qwen3
+```
+
+Use `max_tokens=7800` in the HumanEval client for that 8K Thinking profile.
+At 2,048 and 3,800 tokens, every failed sample was an output-budget
+exhaustion. At 7,800, 15 normally stopped samples passed and HumanEval/1
+remained in a repetitive reasoning loop until the limit; this is checkpoint
+generation behavior rather than a plugin execution failure.
 
 ## HumanEval client command
 
