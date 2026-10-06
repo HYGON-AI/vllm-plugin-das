@@ -56,6 +56,8 @@ def _make_pcp_config(**overrides: object) -> object:
     hybrid = overrides.pop("hybrid", False)
     kv_offload = overrides.pop("kv_offload", False)
     kv_transfer = overrides.pop("kv_transfer", False)
+    kv_role = overrides.pop("kv_role", "kv_both")
+    kv_connector = overrides.pop("kv_connector", "MooncakeConnector")
     enable_lightly_cp = overrides.pop("enable_lightly_cp", False)
     enable_multi_layers_mtp = overrides.pop("enable_multi_layers_mtp", False)
     all2all_backend = overrides.pop(
@@ -104,7 +106,8 @@ def _make_pcp_config(**overrides: object) -> object:
             cache_dtype=cache_dtype,
         ),
         kv_transfer_config=(
-            SimpleNamespace(kv_connector="MooncakeConnector") if kv_transfer else None
+            SimpleNamespace(kv_connector=kv_connector, kv_role=kv_role)
+            if kv_transfer else None
         ),
         additional_config={
             "hcu": HcuFeatureConfig(
@@ -720,6 +723,78 @@ def test_dsv41_pcp_keeps_the_glm52_hard_constraints(
                 enforce_eager=False,
             )
         )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"kv_role": "kv_consumer"},
+        {"kv_role": "kv_both"},
+        {"kv_connector": "NixlConnector"},
+        {"tp": 2, "pcp": 4},
+        {"num_speculative_tokens": 3},
+        {"all2all_backend": "deepep_low_latency"},
+    ],
+)
+def test_dsv41_pcp_dspark_pd_is_scoped_to_cp8_producer(
+    monkeypatch, make_pcp_config, overrides
+):
+    """Only the replicated PCP8 HT producer may use DSpark5 with Mooncake."""
+    monkeypatch.setenv(patch_vllm_config._DSV4_PCP_EXPERIMENTAL_ENV, "1")
+    settings = {
+        "architecture": "DeepseekV41ForCausalLM",
+        "tp": 1,
+        "pcp": 8,
+        "speculative": True,
+        "speculative_method": "dspark",
+        "num_speculative_tokens": 5,
+        "kv_transfer": True,
+        "kv_role": "kv_producer",
+    }
+    settings.update(overrides)
+    config = make_pcp_config(**settings)
+    if not overrides:
+        assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+    else:
+        with pytest.raises(ValueError):
+            patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"architecture": "DeepseekV4ForCausalLM"},
+        {"tp": 2, "pcp": 4},
+        {"num_speculative_tokens": 3},
+        {"all2all_backend": "deepep_low_latency"},
+        {"enforce_eager": False},
+        {"dp": 2},
+    ],
+)
+def test_dsv41_pcp_dspark_standalone_keeps_compute_contract(
+    monkeypatch, make_pcp_config, overrides
+):
+    """The no-connector diagnostic uses the same narrow DSpark5 topology."""
+    monkeypatch.setenv(patch_vllm_config._DSV4_PCP_EXPERIMENTAL_ENV, "1")
+    settings = {
+        "architecture": "DeepseekV41ForCausalLM",
+        "tp": 1,
+        "pcp": 8,
+        "speculative": True,
+        "speculative_method": "dspark",
+        "num_speculative_tokens": 5,
+        "kv_transfer": False,
+    }
+    settings.update(overrides)
+    config = make_pcp_config(**settings)
+    assert not patch_vllm_config._dsv41_pcp_mooncake_producer(config)
+    if not overrides:
+        assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+    else:
+        with pytest.raises(ValueError):
+            patch_vllm_config._validate_hcu_pcp_scope(config)
 
 
 class _LifecycleCompilationConfig:

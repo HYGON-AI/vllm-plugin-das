@@ -234,6 +234,38 @@ def _text_only_multimodal(model_config: object) -> bool:
         return bool(getattr(mm_config, "language_model_only", False))
 
 
+def _dsv41_pcp_dspark(vllm_config: object) -> bool:
+    """Identify the experimental PCP8 DSpark5 compute contract."""
+    model = getattr(vllm_config, "model_config", None)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    speculative = getattr(vllm_config, "speculative_config", None)
+    return (
+        _dsv4_pcp_experimental()
+        and getattr(model, "architectures", None) == ["DeepseekV41ForCausalLM"]
+        and getattr(model, "use_mla", False)
+        and getattr(model, "enforce_eager", False)
+        and getattr(parallel, "tensor_parallel_size", None) == 1
+        and getattr(parallel, "prefill_context_parallel_size", None) == 8
+        and getattr(parallel, "decode_context_parallel_size", None) == 1
+        and getattr(parallel, "pipeline_parallel_size", None) == 1
+        and getattr(parallel, "data_parallel_size", None) == 1
+        and getattr(parallel, "enable_expert_parallel", False)
+        and getattr(parallel, "all2all_backend", None) == "deepep_high_throughput"
+        and getattr(speculative, "method", None) == "dspark"
+        and getattr(speculative, "num_speculative_tokens", None) == 5
+    )
+
+
+def _dsv41_pcp_mooncake_producer(vllm_config: object) -> bool:
+    """Identify the replicated-cache PCP8 producer bring-up contract."""
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    return (
+        _dsv41_pcp_dspark(vllm_config)
+        and getattr(transfer, "kv_connector", None) == "MooncakeConnector"
+        and getattr(transfer, "kv_role", None) == "kv_producer"
+    )
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -345,14 +377,15 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         method = _require_hcu_pcp_attribute(
             speculative_config, "method", "SpeculativeConfig"
         )
-        if method != "mtp":
+        dspark_pcp = _dsv41_pcp_dspark(vllm_config)
+        if method != "mtp" and not dspark_pcp:
             raise ValueError(f"{mla_model_name} PCP only supports built-in MTP.")
         num_speculative_tokens = _require_hcu_pcp_attribute(
             speculative_config,
             "num_speculative_tokens",
             "SpeculativeConfig",
         )
-        if num_speculative_tokens not in (1, 2, 3):
+        if num_speculative_tokens not in (1, 2, 3) and not dspark_pcp:
             raise ValueError(
                 f"{mla_model_name} PCP+MTP requires one to three speculative tokens."
             )
@@ -385,7 +418,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if kv_transfer_config is not None and _require_hcu_pcp_attribute(
         kv_transfer_config, "kv_connector", "KVTransferConfig"
     ) is not None:
-        raise ValueError("HCU PCP does not support P/D disaggregation.")
+        if not _dsv41_pcp_mooncake_producer(vllm_config):
+            raise ValueError("HCU PCP does not support P/D disaggregation.")
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:

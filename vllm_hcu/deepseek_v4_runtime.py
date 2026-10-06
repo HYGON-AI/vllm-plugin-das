@@ -5,6 +5,13 @@
 from __future__ import annotations
 
 
+# V4 and V4.1 share the MLA/MoE runtime contracts the callers below gate on,
+# so both names belong to the family predicate.
+_DSV4_ARCHITECTURES = frozenset(
+    {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"}
+)
+
+
 def model_architectures(vllm_config: object | None) -> tuple[str, ...]:
     model_config = getattr(vllm_config, "model_config", None)
     architectures = getattr(model_config, "architectures", None)
@@ -15,7 +22,8 @@ def model_architectures(vllm_config: object | None) -> tuple[str, ...]:
 
 
 def is_deepseek_v4(vllm_config: object | None) -> bool:
-    return "DeepseekV4ForCausalLM" in model_architectures(vllm_config)
+    """Whether the model belongs to the DeepSeek-V4/V4.1 family."""
+    return bool(_DSV4_ARCHITECTURES.intersection(model_architectures(vllm_config)))
 
 
 def is_dspark_enabled(vllm_config: object | None) -> bool:

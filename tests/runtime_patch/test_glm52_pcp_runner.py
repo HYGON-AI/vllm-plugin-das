@@ -161,6 +161,11 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                 )
             assert self.execute_model_state.hidden_states is self.expected_hidden
             assert self.execute_model_state.input_batch is self.expected_batch
+            if hasattr(self, "expected_aux_hidden_states"):
+                torch.testing.assert_close(
+                    self.execute_model_state.aux_hidden_states,
+                    self.expected_aux_hidden_states,
+                )
             if hasattr(self, "expected_attn_metadata"):
                 assert (
                     self.execute_model_state.attn_metadata
@@ -371,9 +376,11 @@ def test_pcp_runner_replaces_immutable_execute_model_state(
     assert runner.execute_model_state.hidden_states is global_hidden
 
 
+@pytest.mark.parametrize("with_aux", [False, True])
 def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
+    with_aux: bool,
 ) -> None:
     """Reusing rank-local target metadata corrupts the global MTP proposal."""
 
@@ -382,8 +389,15 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     local_batch = object()
     global_hidden = object()
     local_hidden = object()
+    local_aux = [torch.tensor([[2.], [0.]])] if with_aux else None
+    global_aux = [torch.tensor([[0.], [1.], [2.], [3.]])]
 
     class Manager:
+        def restore_hidden_states(self, states):
+            events.append("restore_aux_hidden_states")
+            assert states is local_aux[0]
+            return global_aux[0]
+
         def restore_for_sampling(self, hidden_states):
             events.append("restore_for_sampling")
             assert hidden_states is local_hidden
@@ -434,12 +448,14 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     runner.expected_batch = global_batch
     runner.expected_attn_metadata = "global-mtp-attn-metadata"
     runner.expected_slot_mappings_by_layer = "global-mtp-slots-by-layer"
+    if with_aux:
+        runner.expected_aux_hidden_states = global_aux
     runner.execute_model_state = _MTPExecuteModelState(
         input_batch=local_batch,
         attn_metadata="local-attn-metadata",
         slot_mappings_by_layer="local-slots-by-layer",
         hidden_states=local_hidden,
-        aux_hidden_states=None,
+        aux_hidden_states=local_aux,
         finished_req_ids=set(),
     )
     events.clear()
@@ -447,6 +463,7 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
     assert runner.sample_tokens("grammar") == "sampled"
     assert events == [
         "restore_for_sampling",
+        *(["restore_aux_hidden_states"] if with_aux else []),
         "pcp.prepare_global_attn",
         "build_global_slot_mappings_by_layer",
         "model_state.prepare_global_mtp_attn",
@@ -1276,6 +1293,44 @@ def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
     assert runner.max_num_tokens == 16384
 
 
+def test_ll_profile_reserve_finishes_before_any_peer_forward(
+    pcp_runner_module, monkeypatch
+):
+    """Allocator priming must release scratch and synchronize peers before LL forward."""
+    runner_module, events = pcp_runner_module
+    monkeypatch.setenv("VLLM_HCU_LL_PROFILE_RESERVE_GIB", "12")
+    config = _config(1)
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.kv_transfer_config = SimpleNamespace(kv_role="kv_consumer")
+    runner = runner_module.HcuGPUModelRunnerV2(config, "hcu:0")
+
+    class Scratch:
+        def __del__(self):
+            events.append("release")
+
+    def allocate(size, *, dtype, device):
+        assert size == 12 * 1024**3
+        assert dtype == torch.uint8 and device == "hcu:0"
+        events.append("allocate")
+        return Scratch()
+
+    monkeypatch.setattr(runner_module.torch, "empty", allocate)
+    monkeypatch.setattr(
+        runner_module.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(
+        runner_module, "get_ep_group",
+        lambda: SimpleNamespace(barrier=lambda: events.append("barrier")),
+    )
+    monkeypatch.setattr(
+        runner_module.GPUModelRunner, "profile_run", lambda self: events.append("forward"),
+        raising=False,
+    )
+    events.clear()
+    runner.profile_run()
+    assert events == ["allocate", "sync", "release", "barrier", "forward"]
+
+
 def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     pcp_runner_module,
     monkeypatch: pytest.MonkeyPatch,
@@ -1301,6 +1356,7 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
     speculator.input_buffers = object()
     speculator.prefill_cudagraph_manager = None
+    speculator.pcp_manager = None
     speculator.dp_size = 1
     speculator.dp_rank = 0
     speculator.draft_tokens = torch.zeros((16, 1), dtype=torch.int64)

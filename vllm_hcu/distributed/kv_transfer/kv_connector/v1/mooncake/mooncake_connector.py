@@ -4,10 +4,12 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import asyncio
 import logging
+import queue
 import re
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
@@ -19,8 +21,6 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-
-import vllm_hcu.platforms.envs as henvs
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -43,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -55,7 +57,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -69,7 +70,10 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
-logger = init_logger(__name__)
+import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
+
+logger = init_logger(f"vllm.{__name__}")
 
 _CMPL_UUID_RE = re.compile(
     r"cmpl-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -617,6 +621,7 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    failed: bool = False
 
 
 @dataclass
@@ -763,6 +768,16 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_transfer_results()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1159,8 +1174,7 @@ class MooncakeConnectorWorker:
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank, self.tp_size = _get_mooncake_transfer_rank(vllm_config)
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -1221,6 +1235,15 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
+        self._is_hma_required = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and any(
+                not isinstance(g.kv_cache_spec, FullAttentionSpec)
+                for g in kv_cache_config.transfer_groups
+            )
+        )
+        self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1431,7 +1454,10 @@ class MooncakeConnectorWorker:
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
-        if meta.remote_tp_size <= 0 or not 0 <= meta.remote_tp_rank < meta.remote_tp_size:
+        if (
+            meta.remote_tp_size <= 0
+            or not 0 <= meta.remote_tp_rank < meta.remote_tp_size
+        ):
             await reject_metadata(
                 "Mooncake remote TP size/rank is invalid: "
                 f"size={meta.remote_tp_size}, rank={meta.remote_tp_rank}."
@@ -2161,6 +2187,29 @@ class MooncakeConnectorWorker:
 
         return finished_sending_reqs or None, finished_recving_reqs or None
 
+    def get_transfer_results(self) -> KVConnectorTransferResults:
+        finished_sending, finished_recving = self.get_finished()
+        failed_recving: set[ReqId] = set()
+        while True:
+            try:
+                failed_recving.add(self._failed_recv_reqs.get_nowait())
+            except queue.Empty:
+                break
+        return KVConnectorTransferResults(
+            finished_sending=set(finished_sending or ()),
+            finished_recving=set(finished_recving or ()),
+            failed_recving=failed_recving,
+        )
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        result: set[int] = set()
+        while True:
+            try:
+                result.update(self._invalid_block_ids.get_nowait())
+            except queue.Empty:
+                break
+        return result
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return transfer stats collected since the last call, or None
         if nothing has been recorded in this interval."""
@@ -2213,19 +2262,9 @@ class MooncakeConnectorWorker:
                     ret_msg = await sock.recv()
                     response = self._xfer_resp_decoder.decode(ret_msg)
                     if response.status == MooncakeXferResponseStatus.ERROR:
-                        logger.error(
-                            "Error happens during transferring kvcache for %s: %s",
-                            req_ids,
-                            response.err_msg,
+                        self._handle_failed_recv(
+                            pull_metas, req_ids, response.err_msg or "transfer error"
                         )
-                        if not response.err_reqs:
-                            response = MooncakeXferResponse(
-                                status=MooncakeXferResponseStatus.ERROR,
-                                err_reqs=list(pull_metas),
-                                err_msg=response.err_msg,
-                            )
-                        self.process_pulling_result(response, pull_metas)
-                        self.xfer_stats.record_failed_recv()
                         return
                     self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.FINISH:
@@ -2235,8 +2274,35 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self._fail_pull_metas(pull_metas, str(e))
-            self.xfer_stats.record_failed_recv()
             return
+
+    def _handle_failed_recv(
+        self,
+        pull_metas: dict[ReqId, PullReqMeta],
+        req_ids: Collection[ReqId],
+        reason: str,
+    ) -> None:
+        """Report load failures; empty-block pulls only release producer blocks."""
+        failed: list[ReqId] = []
+        for req_id in req_ids:
+            pull_meta = pull_metas.get(req_id)
+            if pull_meta is None or pull_meta.failed:
+                continue
+            pull_meta.failed = True
+            failed.append(req_id)
+            self.xfer_stats.record_failed_recv()
+            invalid = {b for group in pull_meta.local_block_ids for b in group}
+            if not invalid:
+                # Rejected/unscheduled requests need P cleanup, but have no
+                # scheduler-owned D request to report as finished receiving.
+                continue
+            if self._is_hma_required:
+                self._failed_recv_reqs.put(pull_meta.d_req_id)
+            else:
+                self._invalid_block_ids.put(invalid)
+            self.finished_recving_reqs.add(pull_meta.d_req_id)
+        if failed:
+            logger.error("pulling kv_caches for %s failed: %s", failed, reason)
 
     def process_pulling_result(
         self,
@@ -2244,13 +2310,13 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         ok_reqs: list[ReqId] = response.ok_reqs or []
-        err_reqs: list[ReqId] = response.err_reqs or []
-
-        for req_id in dict.fromkeys((*ok_reqs, *err_reqs)):
+        for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
+            if pull_meta.failed:
+                continue
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
-            if pull_meta.pull_tasks_count == 0:
+            if pull_meta.pull_tasks_count == 0 and any(pull_meta.local_block_ids):
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
                 log_ttft_event(
                     "d_kv_ready",
@@ -2261,28 +2327,15 @@ class MooncakeConnectorWorker:
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
 
-        if err_reqs:
-            logger.error(
-                "pulling kv_caches for %s failed: %s",
-                err_reqs,
-                response.err_msg,
+        if response.err_reqs:
+            self._handle_failed_recv(
+                pull_metas, response.err_reqs, response.err_msg or "unknown error"
             )
 
     def _fail_pull_metas(
         self, pull_metas: dict[ReqId, PullReqMeta], err_msg: str
     ) -> None:
-        """Finish one failed receive task so scheduler-owned blocks can progress."""
-        for pull_meta in pull_metas.values():
-            if pull_meta.pull_tasks_count <= 0:
-                pull_meta.pull_tasks_count = 1
-        self.process_pulling_result(
-            MooncakeXferResponse(
-                status=MooncakeXferResponseStatus.ERROR,
-                err_reqs=list(pull_metas),
-                err_msg=err_msg,
-            ),
-            pull_metas,
-        )
+        self._handle_failed_recv(pull_metas, set(pull_metas), err_msg)
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
@@ -2529,12 +2582,35 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
     loop.run_forever()
 
 
+def _get_mooncake_transfer_rank(vllm_config: VllmConfig) -> tuple[int, int]:
+    """Expose replicated PCP workers as distinct Mooncake handshake ranks."""
+    parallel = vllm_config.parallel_config
+    pcp_size = parallel.prefill_context_parallel_size
+    if pcp_size > 1:
+        from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
+            _dsv41_pcp_mooncake_producer,
+        )
+
+        if not _dsv41_pcp_mooncake_producer(vllm_config):
+            raise ValueError("Mooncake PCP requires the V4.1 PCP8 DSpark producer.")
+        # V4.1's HCU PCP writers materialize full KV on every rank. D performs
+        # all eight handshakes for completion, but only rank zero writes bytes
+        # through the existing replicated-MLA transfer plan.
+        return get_pcp_group().rank_in_group, pcp_size
+    return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+
+
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
     # Only the TP=0, PP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    if (
+        parallel_config.prefill_context_parallel_size > 1
+        and get_pcp_group().rank_in_group != 0
+    ):
         return False
 
     # In hybrid or external LB mode,

@@ -10,6 +10,8 @@ from contextlib import nullcontext
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_ep_group
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_hcu.model_executor.layers.attention.pcp import (
@@ -26,6 +28,7 @@ _DSV4_ARCHITECTURES = frozenset(
     {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"}
 )
 _DSV4_PCP_EXPERIMENTAL_ENV = "VLLM_HCU_DSV4_PCP_EXPERIMENTAL"
+logger = init_logger("vllm.hcu.runner")
 
 
 def _dsv4_pcp_experimental_enabled(vllm_config: object) -> bool:
@@ -128,6 +131,29 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def profile_run(self) -> None:
         """Profile PCP with the per-rank token budget plus routing slack."""
 
+        reserve_gib = int(os.environ.get("VLLM_HCU_LL_PROFILE_RESERVE_GIB", "0"))
+        if reserve_gib > 0:
+            config = self.vllm_config
+            if (
+                config.parallel_config.prefill_context_parallel_size != 1
+                or config.parallel_config.all2all_backend != "deepep_low_latency"
+                or getattr(config.kv_transfer_config, "kv_role", None) != "kv_consumer"
+            ):
+                raise ValueError("LL profile allocator reserve requires the D LL role.")
+            # Prime the regular caching allocator before any peer launches an
+            # LL collective: hipMalloc may synchronize a stream waiting on a
+            # peer that is still allocating its receive tensor. Keep the peak
+            # in memory profiling so the resulting KV budget is conservative.
+            scratch = torch.empty(
+                reserve_gib * 1024**3, dtype=torch.uint8, device=self.device
+            )
+            torch.accelerator.synchronize()
+            del scratch
+            get_ep_group().barrier()
+            logger.info(
+                "Primed LL profile allocator with %s GiB on all EP ranks", reserve_gib
+            )
+
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
@@ -209,6 +235,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 input_batch=restored_input_batch,
             )
             self.execute_model_state = execute_model_state
+            # DSpark consumes auxiliary target layers in global token order.
+            # The upstream restore is hidden below together with PCPManager,
+            # so restore these tensors here before handing off to the drafter.
+            aux_hidden_states = getattr(execute_model_state, "aux_hidden_states", None)
+            if use_replicated_mtp_batch and aux_hidden_states is not None:
+                execute_model_state = execute_model_state._replace(
+                    aux_hidden_states=[
+                        self.pcp_manager.restore_hidden_states(states)
+                        for states in aux_hidden_states
+                    ]
+                )
+                self.execute_model_state = execute_model_state
         input_batch = (
             None
             if execute_model_state is None

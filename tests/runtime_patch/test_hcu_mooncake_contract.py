@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import queue
 from types import SimpleNamespace
 
 import msgspec
@@ -58,6 +59,10 @@ def _worker(
     worker.tp_rank = 0
     worker.tp_size = 2
     worker.finished_recving_reqs = set()
+    worker._failed_recv_reqs = queue.Queue()
+    worker._invalid_block_ids = queue.Queue()
+    worker._is_hma_required = True
+    worker.xfer_stats = mooncake.MooncakeKVConnectorStats()
     return worker
 
 
@@ -550,7 +555,7 @@ def test_transfer_planning_rejects_incompatible_block_tables(
     assert error is not None and message in error
 
 
-def test_failed_pull_result_completes_the_receive_task(mooncake):
+def test_failed_pull_reports_request_failure_instead_of_kv_ready(mooncake):
     worker = _worker(mooncake, blocks_first=True)
     pull_meta = mooncake.PullReqMeta(
         d_req_id="d",
@@ -570,8 +575,16 @@ def test_failed_pull_result_completes_the_receive_task(mooncake):
         {"d": pull_meta},
     )
 
-    assert pull_meta.pull_tasks_count == 0
+    assert pull_meta.failed
     assert worker.finished_recving_reqs == {"d"}
+    worker.get_finished = lambda: (
+        None,
+        asyncio.run(worker.fetch_finished_recving_reqs()),
+    )
+    results = worker.get_transfer_results()
+    assert results.finished_recving == {"d"}
+    assert results.failed_recving == {"d"}
+    assert worker.get_transfer_results().failed_recving == set()
 
 
 def test_bootstrap_failure_completes_pull_without_started_tasks(mooncake):
@@ -586,8 +599,80 @@ def test_bootstrap_failure_completes_pull_without_started_tasks(mooncake):
 
     worker._fail_pull_metas({"d": pull_meta}, "engine not found")
 
-    assert pull_meta.pull_tasks_count == 0
+    assert pull_meta.failed
     assert worker.finished_recving_reqs == {"d"}
+    assert worker._failed_recv_reqs.get_nowait() == "d"
+
+
+@pytest.mark.parametrize("success", [False, True])
+@pytest.mark.parametrize("blocks", [[], [[]], [[], []]])
+def test_cleanup_pull_never_reports_an_unscheduled_decode_request(
+    mooncake, success, blocks
+):
+    """Empty-block notifications must not poison Scheduler.finished_recving."""
+    worker = _worker(mooncake, blocks_first=True)
+    meta = mooncake.PullReqMeta(
+        d_req_id="rejected",
+        transfer_id="x",
+        local_block_ids=blocks,
+        remote_engine_id="engine",
+        remote_bootstrap_addr="bootstrap",
+        pull_tasks_count=1,
+    )
+    worker.process_pulling_result(
+        mooncake.MooncakeXferResponse(
+            status=mooncake.MooncakeXferResponseStatus.FINISH,
+            ok_reqs=["rejected"] if success else None,
+            err_reqs=None if success else ["rejected"],
+            err_msg=None if success else "P ready timeout",
+        ),
+        {"rejected": meta},
+    )
+    assert worker.finished_recving_reqs == set()
+    assert worker._failed_recv_reqs.empty()
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_failed_multi_worker_pull_ignores_late_success_and_duplicate_failure(
+    mooncake,
+):
+    worker = _worker(mooncake, blocks_first=True)
+    meta = mooncake.PullReqMeta(
+        d_req_id="d",
+        transfer_id="x",
+        local_block_ids=[[0], [2]],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="bootstrap",
+        pull_tasks_count=2,
+    )
+    worker._fail_pull_metas({"d": meta}, "first peer failed")
+    assert asyncio.run(worker.fetch_finished_recving_reqs()) == {"d"}
+    assert worker._failed_recv_reqs.get_nowait() == "d"
+    worker.process_pulling_result(
+        mooncake.MooncakeXferResponse(
+            status=mooncake.MooncakeXferResponseStatus.FINISH, ok_reqs=["d"]
+        ),
+        {"d": meta},
+    )
+    worker._fail_pull_metas({"d": meta}, "duplicate peer failure")
+    assert worker.finished_recving_reqs == set()
+    assert worker._failed_recv_reqs.empty()
+
+
+def test_single_group_failed_pull_invalidates_blocks_including_block_zero(mooncake):
+    worker = _worker(mooncake, blocks_first=True)
+    worker._is_hma_required = False
+    meta = mooncake.PullReqMeta(
+        d_req_id="d",
+        transfer_id="x",
+        local_block_ids=[[0, 3]],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="bootstrap",
+    )
+    worker._fail_pull_metas({"d": meta}, "transfer failed")
+    assert worker.get_block_ids_with_load_errors() == {0, 3}
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert worker._failed_recv_reqs.empty()
 
 
 def test_transfer_planning_uses_only_uncached_suffix(mooncake):
@@ -742,6 +827,7 @@ def test_bootstrap_launch_is_owned_by_designated_tp_pp_dp_rank(
             local_engines_only=local_only,
             data_parallel_rank_local=dp_local,
             data_parallel_index=dp_index,
+            prefill_context_parallel_size=1,
         )
     )
 
@@ -770,6 +856,61 @@ def test_bootstrap_address_follows_engine_topology(
     )
 
     assert mooncake.get_mooncake_bootstrap_addr(config) == (expected_host, 9876)
+
+
+def test_pcp_producer_has_unique_handshakes_and_one_replicated_kv_writer(
+    mooncake, monkeypatch
+):
+    """Eight CP workers must complete, without eight duplicate RDMA writes."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+
+    monkeypatch.setenv("VLLM_HCU_DSV4_PCP_EXPERIMENTAL", "1")
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=8,
+        decode_context_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=True,
+        all2all_backend="deepep_high_throughput",
+        local_engines_only=False,
+        data_parallel_index=0,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["DeepseekV41ForCausalLM"],
+            use_mla=True,
+            enforce_eager=True,
+        ),
+        parallel_config=parallel,
+        speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=5),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_producer",
+        ),
+    )
+    monkeypatch.setattr(mooncake, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+    writes = []
+    bootstrap_owners = []
+    for rank in range(8):
+        monkeypatch.setattr(
+            mooncake, "get_pcp_group",
+            lambda rank=rank: SimpleNamespace(rank_in_group=rank),
+        )
+        assert mooncake._get_mooncake_transfer_rank(config) == (rank, 8)
+        bootstrap_owners.append(mooncake.should_launch_bootstrap_server(config))
+        writes.append(mooncake._compute_sender_transfer_plan(
+            rank, 8, 0, 1, 64, 64, True,
+        )[0])
+    assert bootstrap_owners == [True] + [False] * 7
+    assert writes == [True] + [False] * 7
+    decoder = object.__new__(TransferTopology)
+    decoder.tp_rank = 0
+    decoder.tp_size = 1
+    assert decoder.handshake_target_ranks(8) == list(range(8))
 
 
 def test_receive_kv_selects_matching_remote_pp_workers(mooncake):
