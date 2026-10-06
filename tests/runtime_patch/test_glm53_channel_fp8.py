@@ -208,6 +208,7 @@ def test_glm5next_shared_gate_deepgemm_defaults_under_master(monkeypatch) -> Non
     assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         fake_module()
     )
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
     monkeypatch.setattr(hcu, "on_gfx938", lambda: False)
     assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         fake_module()

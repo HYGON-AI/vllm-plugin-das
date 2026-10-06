@@ -3128,16 +3128,22 @@ def test_channel_int8_experts_use_int8_deepgemm_weight_layout(
 
 
 @pytest.mark.parametrize("use_int8", [False, True])
+@pytest.mark.parametrize("master_enabled", [False, True])
 def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
     monkeypatch: pytest.MonkeyPatch,
     use_int8: bool,
+    master_enabled: bool,
 ):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_hcu.model_executor.layers.fused_moe.experts import (
         dpsk_v4_deep_gemm_moe as module,
     )
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", master_enabled)
 
     experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    experts.num_dispatchers = 4
     experts._deepgemm_w13 = torch.empty((1, 1, 1, 1, 1, 1))
     experts._deepgemm_w2 = torch.empty((1, 1, 1, 1, 1, 1))
     experts.quant_config = SimpleNamespace(
@@ -3149,15 +3155,17 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
     experts.moe_problem_size = lambda *_args: (2, 3, 8, 4, 1)
 
     call_number = 0
+    expected_m_values: list[int] = []
 
     def public_masked_kernel(
         _a,
         _b,
         destination: torch.Tensor,
         _masked_m,
-        _expected_m_per_group,
+        expected_m_per_group,
     ) -> torch.Tensor:
         nonlocal call_number
+        expected_m_values.append(expected_m_per_group)
         call_number += 1
         destination.fill_(call_number)
         return destination
@@ -3203,7 +3211,7 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         topk_weights=torch.ones((3, 1)),
         topk_ids=torch.zeros((3, 1), dtype=torch.int32),
         activation=MoEActivation.SILU,
-        global_num_experts=2,
+        global_num_experts=288,
         expert_map=None,
         a1q_scale=torch.ones((2, 3)),
         a2_scale=None,
@@ -3217,6 +3225,9 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
 
     assert torch.equal(output, torch.full_like(output, 2))
     assert activation_kwargs["limit"] == 10.0
+    assert expected_m_values == (
+        [3, 3] if use_int8 or not master_enabled else [1, 1]
+    )
 
 
 @pytest.mark.parametrize("use_int8", [False, True])
