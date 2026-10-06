@@ -23,7 +23,9 @@ request.
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | 14/16 twice | 188.04 and 198.51 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 127.57 and 137.41 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 117.39 and 123.67 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
+| `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -198,6 +200,42 @@ At 2,048 and 3,800 tokens, every failed sample was an output-budget
 exhaustion. At 7,800, 15 normally stopped samples passed and HumanEval/1
 remained in a repetitive reasoning loop until the limit; this is checkpoint
 generation behavior rather than a plugin execution failure.
+
+The 4B Thinking checkpoint used the same command with `4B` substituted for
+`8B`. Even at the 7,800-token limit, ten samples exhausted the context inside
+reasoning; all six normally stopped samples passed. Treat its 6/16 as a
+checkpoint generation-budget limitation, not an accepted precision score.
+
+The 235B-A22B Instruct MoE route used four cards and AITER:
+
+```bash
+env -u VLLM_PLUGINS \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve \
+    /llm-models-2/hygon/Qwen3-VL-235B-A22B-Instruct-Channel-FP8 \
+  --served-model-name Qwen3-VL-235B-A22B-Instruct-Channel-FP8 \
+  --port 10234 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend aiter \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.70 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+This route loaded 221.40 GiB across 24 checkpoint shards, consumed 56.96 GiB
+of model memory per TP rank, selected AITER FP8 MoE and its channel-shuffle
+tuned CSV on all ranks, and captured both FULL and PIECEWISE Graphs. No MoE
+provider fallback, ERROR, or Traceback was logged.
 
 ## HumanEval client command
 
