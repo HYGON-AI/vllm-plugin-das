@@ -178,3 +178,47 @@ complete or truncated Markdown fence; normalized `mean_acc` and
   accuracy/pass@1 was 29/32 (`0.9062`), and normalized accuracy/pass@1 was
   32/32 (`1.0000`). The end-to-end pytest gate passed in 545.06 seconds;
   EvalScope reported 4.061-second average latency and 29.98 output tokens/s.
+
+## gfx936 v0.25.1 operator parity (2026-10-05)
+
+The current v0.28.1 HCU path was compared on one live gfx936 device with the
+operator sources extracted from
+`vllm==0.25.1+das185.dtk2604.torch2110.2608171710.g7b108a`. The same seeded
+inputs produced byte-identical `fp8_ds_mla` cache writes, element-identical
+gather/dequant output, identical active-token top-k mapping, and identical
+combined sparse indices. The current top-k helper intentionally writes `-1`
+for padding rows whose length is zero; v0.25.1 left ignored values there.
+
+The v0.25.1 optimized Triton path and the current HCU reference path differed
+by at most `0.0078125` for sparse prefill, `0.00390625` for SWA-only sparse
+decode, and `0.0078125` for combined compressed-KV-plus-SWA sparse decode,
+within the recorded BF16 gate (`rtol=0.02`, `atol=0.03`). The current
+categorized LightOp fused QNorm/RoPE/KVNorm/cache insert generated cache bytes
+identical to the v0.25.1 cache contract on gfx936; its fused query output had a
+maximum absolute difference of `0.015567779541015625` from the unfused FP32
+reference and passed `rtol=0.01`, `atol=0.01`.
+
+Reproduce the cross-version comparison with:
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+PYTHONPATH=/data/models/vllm-plugin-das/.worktrees/fix-remaining-language-model-validation \
+python /data/models/model-language-validation/dsv4-flash-0731-w4a8/compare_v0251_operator_parity.py
+```
+
+The live gfx936 regression gate is:
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+PYTHONPATH=/data/models/vllm-plugin-das/.worktrees/fix-remaining-language-model-validation \
+pytest -q -s \
+  tests/accuracy/deepseek_v4_dspark_ops_cases.py::test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache \
+  tests/accuracy/deepseek_v4_dspark_ops_cases.py::test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference \
+  tests/accuracy/test_hcu_kernel_accuracy.py::test_lightop_deepseek_v4_fused_insert_updates_q_and_cache \
+  tests/accuracy/test_hcu_kernel_accuracy.py::test_lightop_sparse_mqa_matches_fp32_reference \
+  tests/accuracy/test_hcu_kernel_accuracy.py::test_lightop_paged_sparse_mqa_matches_packed_cache_reference
+```
+
+Observed result: `5 passed`. These cache and sparse-MQA cases are valid on
+gfx936; the Channel-FP8/INT8 DeepGEMM cases in the shared accuracy module remain
+gfx938-only.

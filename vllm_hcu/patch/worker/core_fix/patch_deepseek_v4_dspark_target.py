@@ -20,18 +20,142 @@ PATCH_ID = "worker.core_fix.deepseek_v4_amd.dspark_target_interface"
 TARGET_SYMBOL = f"{TARGET_MODULE}.DeepseekV4ForCausalLM"
 _MARKER = "_vllm_hcu_dspark_target_interface_applied"
 _WRAPPER_MARKER = "_vllm_hcu_dspark_target_forward_wrapper"
+_DECODER_WRAPPER_MARKER = "_vllm_hcu_deepseek_v4_boltops_mhc_wrapper"
+
+
+def _boltops_mhc_pre(
+    backend,
+    mhc,
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    norm_weight=None,
+    norm_eps=0.0,
+):
+    post_mix, comb_mix, layer_input = backend.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+    return (
+        post_mix,
+        comb_mix,
+        mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps),
+    )
+
+
+def _boltops_mhc_post(
+    backend,
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+):
+    return backend.mhc_post(x, residual, post_layer_mix, comb_res_mix)
+
+
+def _boltops_mhc_fused_post_pre(
+    backend,
+    mhc,
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    tile_n=1,
+    norm_weight=None,
+    norm_eps=0.0,
+):
+    residual_cur, post_mix, comb_mix, layer_input = backend.mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        tile_n,
+    )
+    return (
+        residual_cur,
+        post_mix,
+        comb_mix,
+        mhc._apply_mhc_norm(layer_input, norm_weight, norm_eps),
+    )
+
+
+def _bind_deepseek_v4_boltops_mhc(layer, mhc, backend) -> None:
+    """Bind one DeepSeek-V4 target/MTP block to the audited HCU provider."""
+
+    layer.mhc_pre._forward_method = functools.partial(
+        _boltops_mhc_pre, backend, mhc
+    )
+    layer.mhc_post._forward_method = functools.partial(
+        _boltops_mhc_post, backend
+    )
+    layer.mhc_fused_post_pre._forward_method = functools.partial(
+        _boltops_mhc_fused_post_pre,
+        backend,
+        mhc,
+    )
 
 
 def apply_to_module(module: ModuleType) -> bool:
     amd_model = load_exact_module(TARGET_MODULE, module)
     model_cls = require_class(amd_model, "DeepseekV4Model", TARGET_SYMBOL)
     causal_cls = require_class(amd_model, "DeepseekV4ForCausalLM", TARGET_SYMBOL)
+    decoder_cls = require_class(
+        amd_model,
+        "DeepseekV4DecoderLayer",
+        f"{TARGET_MODULE}.DeepseekV4DecoderLayer",
+    )
     original_forward = require_callable(
         model_cls, "forward", f"{TARGET_MODULE}.DeepseekV4Model.forward"
     )
+    original_decoder_init = require_callable(
+        decoder_cls,
+        "__init__",
+        f"{TARGET_MODULE}.DeepseekV4DecoderLayer.__init__",
+    )
     if getattr(causal_cls, _MARKER, False):
         current = vars(model_cls).get("forward")
-        if not getattr(current, _WRAPPER_MARKER, False):
+        current_decoder_init = vars(decoder_cls).get("__init__")
+        if not (
+            getattr(current, _WRAPPER_MARKER, False)
+            and getattr(
+                current_decoder_init,
+                _DECODER_WRAPPER_MARKER,
+                False,
+            )
+        ):
             raise PatchCompatibilityError(
                 f"required HCU patch marker for {TARGET_SYMBOL} is stale"
             )
@@ -48,6 +172,45 @@ def apply_to_module(module: ModuleType) -> bool:
         ),
         defaults={"inputs_embeds": None},
     )
+    require_exact_signature(
+        original_decoder_init,
+        f"{TARGET_MODULE}.DeepseekV4DecoderLayer.__init__",
+        positional=(
+            "self",
+            "vllm_config",
+            "prefix",
+            "topk_indices_buffer",
+            "aux_stream_list",
+            "fuse_heterogeneous_shared_expert",
+        ),
+        defaults={
+            "topk_indices_buffer": None,
+            "aux_stream_list": None,
+            "fuse_heterogeneous_shared_expert": False,
+        },
+    )
+
+    @functools.wraps(original_decoder_init)
+    def hcu_decoder_init(
+        self,
+        vllm_config,
+        prefix,
+        topk_indices_buffer=None,
+        aux_stream_list=None,
+        fuse_heterogeneous_shared_expert=False,
+    ):
+        original_decoder_init(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer,
+            aux_stream_list,
+            fuse_heterogeneous_shared_expert,
+        )
+        from vllm.model_executor.layers import mhc
+        from vllm_hcu.model_executor.layers import mhc as boltops_mhc
+
+        _bind_deepseek_v4_boltops_mhc(self, mhc, boltops_mhc)
 
     @functools.wraps(original_forward)
     def hcu_dspark_target_forward(
@@ -132,6 +295,13 @@ def apply_to_module(module: ModuleType) -> bool:
         return ()
 
     setattr(hcu_dspark_target_forward, _WRAPPER_MARKER, True)
+    setattr(hcu_decoder_init, _DECODER_WRAPPER_MARKER, True)
+    setattr(
+        decoder_cls,
+        "_vllm_hcu_original_deepseek_v4_decoder_init",
+        original_decoder_init,
+    )
+    setattr(decoder_cls, "__init__", hcu_decoder_init)
     setattr(model_cls, "aux_hidden_state_layers", ())
     setattr(model_cls, "_vllm_hcu_original_dspark_target_forward", original_forward)
     setattr(model_cls, "forward", hcu_dspark_target_forward)

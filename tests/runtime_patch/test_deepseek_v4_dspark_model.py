@@ -47,10 +47,12 @@ def dspark_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     dspark.ReplicatedLinear = StubModule
     dspark.RMSNorm = StubModule
     dspark.DSparkMarkovHead = StubModule
+    dspark.DSparkConfidenceHead = StubModule
     dspark.ParallelLMHead = StubModule
     dspark.LogitsProcessor = StubModule
     dspark.maybe_prefix = lambda prefix, name: f"{prefix}.{name}" if prefix else name
     dspark.get_current_vllm_config = lambda: SimpleNamespace()
+    dspark._use_sequence_parallel = lambda vllm_config: False
     dspark._test_originals = {
         name: getattr(dspark, name)
         for name in (
@@ -92,9 +94,15 @@ def test_dspark_adapter_import_keeps_upstream_module_symbols(
         assert getattr(upstream, name) is original
 
 
+@pytest.mark.parametrize(
+    ("weight_block_size", "expected_pad"),
+    ((None, False), ((128, 128), True)),
+)
 def test_dspark_adapter_construction_keeps_upstream_module_symbols(
     dspark_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
+    weight_block_size: tuple[int, int] | None,
+    expected_pad: bool,
 ) -> None:
     class AMDDeepseekV4DecoderLayer(nn.Module):
         def __init__(self, *args, **kwargs) -> None:
@@ -124,6 +132,7 @@ def test_dspark_adapter_construction_keeps_upstream_module_symbols(
         vocab_size=16,
         dspark_markov_rank=2,
         index_topk=2,
+        enable_confidence_head=True,
     )
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -131,13 +140,18 @@ def test_dspark_adapter_construction_keeps_upstream_module_symbols(
         ),
         model_config=SimpleNamespace(hf_config=config),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
-        quant_config=None,
+        quant_config=SimpleNamespace(weight_block_size=weight_block_size),
     )
     dspark_module._dspark.get_current_vllm_config = lambda: vllm_config
 
-    dspark_module.DSparkDeepseekV4ForCausalLM(
+    model = dspark_module.DSparkDeepseekV4ForCausalLM(
         vllm_config=vllm_config,
     )
+
+    assert model.quant_config is vllm_config.quant_config
+    assert model.pad_shared_expert is expected_pad
+    assert model.model.use_sequence_parallel is False
+    assert model.model.confidence_head is not None
 
     upstream = dspark_module._dspark
     for name, original in upstream._test_originals.items():

@@ -26,6 +26,9 @@ Available local configurations:
 - `glm52_pcp_humaneval_evalscope.yaml`: GLM-5.2 Channel-FP8 W8A8
   model-runner-v2 server with TP=4, PCP=2, EP, and EvalScope HumanEval (32
   deterministic samples).
+- `kimi_k25_humaneval_evalscope.yaml`: Kimi-K2.5 language-only TP8+EP8
+  W4A16 server with E5M2 KV, Kimi tool/reasoning parsers, and EvalScope's
+  dataset-scoped official `remove_whitespace` HumanEval filter.
 - `qwen3_8b_gsm8k_evalscope.yaml`: Qwen3-8B server plus EvalScope GSM8K.
 - `qwen35_9b_gsm8k_evalscope.yaml`: Qwen3.5-9B server plus EvalScope GSM8K.
 - `qwen3_vl_8b_mmmu_evalscope.yaml`: Qwen3-VL-8B-Instruct server plus

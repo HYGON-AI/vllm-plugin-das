@@ -280,6 +280,77 @@ def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
     assert key.stride() == original_stride
 
 
+def test_hcu_fa_boundary_uses_bshd_compat_view_for_hnd_128_pages(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    physical = torch.linspace(-2, 2, 3 * 2 * 128 * 8).reshape(3, 2, 128, 8)
+    logical = physical.transpose(1, 2)
+
+    def vendor(q, k, v, layout="bshd"):
+        return k, v, layout
+
+    actual_key, actual_value, actual_layout = fa_utils._with_kv_cache_layout(
+        vendor, "probe"
+    )(q=None, k=logical, v=logical)
+
+    assert actual_layout == "bshd"
+    assert actual_key.shape == logical.shape
+    assert actual_value.shape == logical.shape
+    assert actual_key.stride() == logical.stride()
+    assert actual_value.stride() == logical.stride()
+    assert actual_key.data_ptr() == physical.data_ptr()
+    assert actual_value.data_ptr() == physical.data_ptr()
+
+
+def test_hcu_fa_boundary_supplies_global_descales_for_hnd_128_fp8_cache(
+    monkeypatch,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    logical = torch.zeros(
+        3, 2, 128, 8, dtype=torch.float8_e5m2
+    ).transpose(1, 2)
+    k_descale = torch.tensor(0.25).expand(3, 2)
+    v_descale = torch.tensor(0.75).expand(3, 2)
+
+    def vendor(
+        q,
+        k,
+        v,
+        layout="bshd",
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    ):
+        return layout, q_descale, k_descale, v_descale
+
+    layout, q_descale, actual_k_descale, actual_v_descale = (
+        fa_utils._with_kv_cache_layout(vendor, "probe")(
+            q=torch.zeros(1, 4, 8),
+            k=logical,
+            v=logical,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+    )
+
+    assert layout == "bshd"
+    torch.testing.assert_close(q_descale, torch.ones(1))
+    torch.testing.assert_close(actual_k_descale, torch.tensor([0.25]))
+    torch.testing.assert_close(actual_v_descale, torch.tensor([0.75]))
+    assert q_descale.numel() == 1
+    assert actual_k_descale.numel() == 1
+    assert actual_v_descale.numel() == 1
+    assert actual_k_descale.untyped_storage().data_ptr() == (
+        k_descale.untyped_storage().data_ptr()
+    )
+    assert actual_v_descale.untyped_storage().data_ptr() == (
+        v_descale.untyped_storage().data_ptr()
+    )
+
+
 def test_hcu_fa_boundary_preserves_nonpaged_kv_axes(monkeypatch):
     fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
     key = torch.zeros(64, 2, 8)
@@ -473,6 +544,23 @@ def test_flash_attention_prefers_vendor_kernel_page_size(
     assert backend.get_preferred_block_size(16) == expected_block_size
 
 
+def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV-cache planning queries this outside model-construction context."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+
+    sizes = backend.get_supported_kernel_block_sizes()
+
+    assert len(sizes) == 1
+    assert isinstance(sizes[0], flash_attn.MultipleOf)
+    assert sizes[0].base == 16
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_kernel_block_size"),
     [("varlen", 64), ("cutlass", 64), ("classic", 128)],
@@ -489,7 +577,7 @@ def test_hybrid_flash_attention_splits_manager_pages_to_vendor_kernel_size(
     monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
     monkeypatch.setattr(
         flash_attn,
-        "get_current_vllm_config",
+        "get_current_vllm_config_or_none",
         lambda: SimpleNamespace(
             model_config=SimpleNamespace(is_hybrid=True),
             cache_config=SimpleNamespace(
@@ -678,6 +766,32 @@ def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(
         device_capability=flash_attn.DeviceCapability(9, 0),
     )
     assert reason is not None and "mm_prefix" in reason
+
+
+def test_hcu_flash_attention_accepts_e5m2_sliding_window_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejecting this contract prevents Step-3.7 from constructing layers."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    reasons = backend.validate_configuration(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8_e5m2",
+        block_size=None,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=flash_attn.DeviceCapability(9, 0),
+        attn_type=flash_attn.AttentionType.DECODER,
+        has_sliding_window=True,
+    )
+
+    assert reasons == []
 
 
 def test_hcu_flash_attention_rswa_is_explicitly_fail_closed(

@@ -336,6 +336,7 @@ class DeepseekV2SharedMLP(nn.Module):
         self.enable_fuse_silu_mul_quant = (
             henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT
             and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and quant_config is not None
             and fused_silu_mul_quant_supported(weight)
         )
         self.quant_dtype = weight.dtype if weight is not None else None

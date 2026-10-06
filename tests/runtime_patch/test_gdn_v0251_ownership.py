@@ -311,14 +311,16 @@ def _boltops_sigmoid_contract(
     A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0,
     scale=None, initial_state=None, inplace_final_state=True,
     cu_seqlens=None, ssm_state_indices=None, num_accepted_tokens=None,
-    use_qk_l2norm_in_kernel=False, is_kda=False, kernel_cfg=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False, null_state_index=0,
+    kernel_cfg=None,
 ):
     pass
 
 
 def _boltops_packed_recurrent_contract(
     mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
-    ssm_state_indices, use_qk_l2norm_in_kernel=False, kernel_cfg=None,
+    ssm_state_indices, use_qk_l2norm_in_kernel=False, null_state_index=-1,
+    kernel_cfg=None,
 ):
     pass
 
@@ -390,6 +392,7 @@ def test_qwen_sigmoid_uses_boltops_for_mixed_dtype(monkeypatch):
     )
     assert result == "boltops"
     assert len(calls) == 1
+    assert calls[0][1]["null_state_index"] == 0
 
 
 def test_qwen_packed_recurrent_uses_boltops(monkeypatch):
@@ -428,6 +431,7 @@ def test_qwen_packed_recurrent_uses_boltops(monkeypatch):
     assert result == ("boltops-out", "boltops-state")
     assert len(calls) == 1
     assert calls[0][0][-1] is True
+    assert calls[0][1]["null_state_index"] == 0
 
 
 def test_qwen_sigmoid_missing_boltops_symbol_falls_back(monkeypatch):

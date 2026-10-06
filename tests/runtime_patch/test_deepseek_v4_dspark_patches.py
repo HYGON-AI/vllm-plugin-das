@@ -13,6 +13,9 @@ from vllm_hcu.patch.worker.core_fix import (
     patch_deepseek_v4_attention,
     patch_deepseek_v4_dspark_target,
     patch_deepseek_v4_load_weights,
+    patch_deepseek_v4_bf16_compressor,
+    patch_deepseek_v4_rocm_compressor_fusion,
+    patch_deepseek_v4_rocm_bf16_cache,
     patch_deepseek_v4_rocm_dspark_metadata,
     patch_deepseek_v4_rocm_wo_a_layout,
     patch_mhc_backend,
@@ -25,6 +28,373 @@ def _module(name: str, **attributes: object) -> ModuleType:
     for key, value in attributes.items():
         setattr(module, key, value)
     return module
+
+
+def test_bf16_compressor_writes_finite_576_dim_row_at_last_rope_position() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires an HCU GPU to execute the Triton kernel")
+
+    from vllm_hcu.v1.attention.ops.deepseek_v4_bf16_compressor import (
+        compress_norm_rope_store_bf16,
+    )
+
+    device = torch.device("cuda")
+    head_dim = 576
+    state_width = head_dim
+    state_cache = torch.ones((1, 1, 2 * head_dim), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.empty((1, 1, head_dim), dtype=torch.bfloat16, device=device)
+    cos_sin_cache = torch.cat(
+        (
+            torch.ones((1, 32), dtype=torch.bfloat16, device=device),
+            torch.zeros((1, 32), dtype=torch.bfloat16, device=device),
+        ),
+        dim=1,
+    )
+    zero = torch.zeros((1,), dtype=torch.int32, device=device)
+
+    compress_norm_rope_store_bf16(
+        state_cache=state_cache,
+        num_actual=1,
+        token_to_req_indices=zero,
+        positions=zero,
+        slot_mapping=zero,
+        block_table=zero.view(1, 1),
+        block_size=1,
+        state_width=state_width,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        k_cache_metadata=SimpleNamespace(slot_mapping=zero),
+        rms_norm_weight=torch.ones((head_dim,), dtype=torch.bfloat16, device=device),
+        rms_norm_eps=1e-6,
+        head_dim=head_dim,
+        rope_head_dim=64,
+        compress_ratio=1,
+        overlap=False,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(kv_cache, torch.ones_like(kv_cache))
+
+
+def test_bf16_compressor_never_calls_fp8_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, torch.dtype]] = []
+
+    def fp8_store(
+        state_cache,
+        num_actual,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_size,
+        state_width,
+        cos_sin_cache,
+        kv_cache,
+        k_cache_metadata,
+        pdl_kwargs,
+        head_dim,
+        rope_head_dim,
+        compress_ratio,
+        overlap,
+        use_fp4_cache,
+        rms_norm_weight,
+        rms_norm_eps,
+        quant_block,
+        token_stride,
+        scale_dim,
+    ) -> None:
+        del (
+            state_cache,
+            num_actual,
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_size,
+            state_width,
+            cos_sin_cache,
+            k_cache_metadata,
+            pdl_kwargs,
+            head_dim,
+            rope_head_dim,
+            compress_ratio,
+            overlap,
+            use_fp4_cache,
+            rms_norm_weight,
+            rms_norm_eps,
+            quant_block,
+            token_stride,
+            scale_dim,
+        )
+        calls.append(("fp8", kv_cache.dtype))
+
+    def fp8_two_stage_store(
+        state_cache,
+        num_actual,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_size,
+        state_width,
+        cos_sin_cache,
+        kv_cache,
+        k_cache_metadata,
+        pdl_kwargs,
+        head_dim,
+        rope_head_dim,
+        compress_ratio,
+        overlap,
+        use_fp4_cache,
+        rms_norm_weight,
+        rms_norm_eps,
+        quant_block,
+        token_stride,
+        scale_dim,
+        num_decode_tokens,
+        compress_scratch,
+    ) -> None:
+        del num_decode_tokens, compress_scratch
+        fp8_store(
+            state_cache,
+            num_actual,
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_size,
+            state_width,
+            cos_sin_cache,
+            kv_cache,
+            k_cache_metadata,
+            pdl_kwargs,
+            head_dim,
+            rope_head_dim,
+            compress_ratio,
+            overlap,
+            use_fp4_cache,
+            rms_norm_weight,
+            rms_norm_eps,
+            quant_block,
+            token_stride,
+            scale_dim,
+        )
+
+    module = _module(
+        patch_deepseek_v4_bf16_compressor.TARGET_MODULE,
+        compress_norm_rope_store_triton=fp8_store,
+        compress_norm_rope_store_two_stage_triton=fp8_two_stage_store,
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_bf16_compressor,
+        "compress_norm_rope_store_bf16",
+        lambda **kwargs: calls.append(("bf16", kwargs["kv_cache"].dtype)),
+    )
+    patch_deepseek_v4_bf16_compressor.apply_to_module(module)
+
+    kwargs = dict(
+        state_cache=object(),
+        num_actual=1,
+        token_to_req_indices=object(),
+        positions=object(),
+        slot_mapping=object(),
+        block_table=object(),
+        block_size=4,
+        state_width=1024,
+        cos_sin_cache=object(),
+        k_cache_metadata=object(),
+        pdl_kwargs={},
+        head_dim=512,
+        rope_head_dim=64,
+        compress_ratio=4,
+        overlap=True,
+        use_fp4_cache=False,
+        rms_norm_weight=object(),
+        rms_norm_eps=1e-6,
+        quant_block=64,
+        token_stride=576,
+        scale_dim=8,
+    )
+    module.compress_norm_rope_store_triton(
+        kv_cache=torch.empty((1, 1, 512), dtype=torch.bfloat16),
+        **kwargs,
+    )
+    module.compress_norm_rope_store_triton(
+        kv_cache=torch.empty((1,), dtype=torch.uint8),
+        **kwargs,
+    )
+
+    assert calls == [
+        ("bf16", torch.bfloat16),
+        ("fp8", torch.uint8),
+    ]
+
+
+def test_rocm_bf16_cache_uses_plain_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def packed_fp8_gather(
+        out,
+        k_cache,
+        seq_lens,
+        gather_lens,
+        block_table,
+        block_size,
+        offset,
+        use_fnuz=False,
+    ):
+        calls.append(("fp8", (use_fnuz,)))
+
+    def bf16_gather(*args):
+        calls.append(("bf16", args))
+
+    def sparse_decode(
+        q,
+        kv_cache,
+        swa_k_cache,
+        swa_only,
+        topk_indices,
+        topk_lens,
+        swa_indices,
+        swa_lens,
+        swa_ragged_indices,
+        swa_ragged_indptr,
+        topk_ragged_indices,
+        topk_ragged_indptr,
+        attn_sink,
+        scale,
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        output,
+        extra_cache_nan_free=False,
+        adaptive_splits=False,
+    ):
+        return None
+
+    module = _module(
+        patch_deepseek_v4_rocm_bf16_cache.TARGET_MODULE,
+        dequantize_and_gather_k_cache=packed_fp8_gather,
+        rocm_sparse_attn_decode=sparse_decode,
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_rocm_bf16_cache,
+        "gather_bf16_k_cache",
+        bf16_gather,
+    )
+    patch_deepseek_v4_rocm_bf16_cache.apply_to_module(module)
+
+    common = (object(), object(), object(), 256, 7)
+    module.dequantize_and_gather_k_cache(
+        object(),
+        torch.empty((1, 1, 512), dtype=torch.bfloat16),
+        *common,
+        use_fnuz=True,
+    )
+    module.dequantize_and_gather_k_cache(
+        object(),
+        torch.empty((1,), dtype=torch.uint8),
+        *common,
+        use_fnuz=True,
+    )
+
+    assert calls[0][0] == "bf16"
+    assert calls[0][1][-2:] == (256, 7)
+    assert calls[1] == ("fp8", (True,))
+
+
+def test_rocm_bf16_sparse_decode_uses_plain_cache_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def packed_fp8_gather(
+        out,
+        k_cache,
+        seq_lens,
+        gather_lens,
+        block_table,
+        block_size,
+        offset,
+        use_fnuz=False,
+    ):
+        return None
+
+    def fp8_sparse_decode(
+        q,
+        kv_cache,
+        swa_k_cache,
+        swa_only,
+        topk_indices,
+        topk_lens,
+        swa_indices,
+        swa_lens,
+        swa_ragged_indices,
+        swa_ragged_indptr,
+        topk_ragged_indices,
+        topk_ragged_indptr,
+        attn_sink,
+        scale,
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        output,
+        extra_cache_nan_free=False,
+        adaptive_splits=False,
+    ):
+        calls.append(("fp8", swa_k_cache.dtype))
+
+    def bf16_sparse_decode(*args, **kwargs):
+        calls.append(("bf16", kwargs["swa_k_cache"].dtype))
+
+    module = _module(
+        patch_deepseek_v4_rocm_bf16_cache.TARGET_MODULE,
+        dequantize_and_gather_k_cache=packed_fp8_gather,
+        rocm_sparse_attn_decode=fp8_sparse_decode,
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_rocm_bf16_cache,
+        "bf16_sparse_attn_decode",
+        bf16_sparse_decode,
+        raising=False,
+    )
+    patch_deepseek_v4_rocm_bf16_cache.apply_to_module(module)
+
+    common = dict(
+        q=object(),
+        kv_cache=None,
+        swa_only=True,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=object(),
+        swa_lens=object(),
+        swa_ragged_indices=None,
+        swa_ragged_indptr=None,
+        topk_ragged_indices=None,
+        topk_ragged_indptr=None,
+        attn_sink=None,
+        scale=1.0,
+        head_dim=576,
+        nope_head_dim=512,
+        rope_head_dim=64,
+        output=object(),
+    )
+    module.rocm_sparse_attn_decode(
+        swa_k_cache=torch.empty((1, 1, 576), dtype=torch.bfloat16),
+        **common,
+    )
+    module.rocm_sparse_attn_decode(
+        swa_k_cache=torch.empty((1,), dtype=torch.uint8),
+        **common,
+    )
+
+    assert calls == [
+        ("bf16", torch.bfloat16),
+        ("fp8", torch.uint8),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -48,6 +418,78 @@ def test_compressor_mm_accepts_hcu_nn_and_upstream_nt_layouts(
     result = patch_deepseek_v4_attention._compressor_mm(hidden, weight)
 
     torch.testing.assert_close(result, torch.tensor([[8.0, 18.0, 28.0]]))
+
+
+def test_attention_parallel_projection_preserves_rocm_fused_weight_override() -> None:
+    """The HCU wrapper must not reinterpret a preshuffled fused Q/KV weight."""
+
+    class DeepseekV4Attention:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+        ):
+            del vllm_config, prefix, topk_indices_buffer, aux_stream_list
+            self.aux_stream_list = None
+            self.ln_events = [object(), object(), object(), object()]
+            self.compressor = None
+            self.indexer = None
+
+        def _fused_wqa_wkv_gemm(self, hidden_states):
+            return hidden_states + 7
+
+        def fused_wqa_wkv(self, hidden_states):
+            del hidden_states
+            raise AssertionError(
+                "preshuffled ROCm fused Q/KV weight used the generic linear path"
+            )
+
+        def _run_parallel_input_projections(self, hidden_states):
+            return hidden_states, None, None, None
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
+            return hidden_states
+
+        def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+            del kv, positions, attn_metadata
+            return q
+
+    def execute_in_parallel(
+        main_fn,
+        aux_fns,
+        start_event,
+        done_events,
+        aux_streams,
+        enable,
+    ):
+        del start_event, done_events, aux_streams, enable
+        return main_fn(), tuple(fn() if fn is not None else None for fn in aux_fns)
+
+    module = _module(
+        patch_deepseek_v4_attention.TARGET_MODULE,
+        DeepseekV4Attention=DeepseekV4Attention,
+        execute_in_parallel=execute_in_parallel,
+        envs=SimpleNamespace(VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=1),
+    )
+    patch_deepseek_v4_attention.apply_to_module(module)
+    attention = DeepseekV4Attention(
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(expert_dtype="fp8")
+            ),
+            quant_config=None,
+        ),
+        "layer.attn",
+    )
+    hidden_states = torch.tensor([[1.0, 2.0]])
+
+    result = attention._run_parallel_input_projections(hidden_states)
+
+    torch.testing.assert_close(result[0], hidden_states + 7)
+    assert result[1:] == (None, None, None)
 
 
 def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
@@ -166,8 +608,24 @@ def test_attention_fp8_ds_mla_insert_uses_non_pcp_lightop(
     assert torch.count_nonzero(attention.swa_cache_layer.kv_cache == 9) == 32
 
 
-def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
+@pytest.mark.parametrize(
+    ("quant_name", "quant_format", "expert_dtype"),
+    (
+        ("compressed-tensors", "int-quantized", "int8"),
+        # DeepSeek-V4-Flash-0731 mixed W4A8 checkpoints store wo_a as a
+        # standalone BF16 tensor without a weight scale.  The SlimQuant
+        # facade must therefore leave it unquantized while constructing the
+        # attention layer even though the routed experts use INT4.
+        ("slimquant_w4a8", None, "int4"),
+    ),
+)
+def test_attention_int8_wo_a_is_excluded_only_during_construction(
+    quant_name: str,
+    quant_format: str | None,
+    expert_dtype: str,
+) -> None:
     seen_ignore: list[list[str]] = []
+    seen_fp8_ds_mla_layout: list[bool] = []
 
     class DeepseekV4Attention:
         def __init__(
@@ -179,6 +637,7 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
         ):
             del prefix, topk_indices_buffer, aux_stream_list
             seen_ignore.append(list(vllm_config.quant_config.ignore))
+            seen_fp8_ds_mla_layout.append(self.use_fp8_ds_mla_layout)
 
         def _run_parallel_input_projections(self, hidden_states):
             return hidden_states
@@ -205,13 +664,14 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
     )
     quant_config = SimpleNamespace(
         ignore=[],
-        quant_format="int-quantized",
-        get_name=lambda: "compressed-tensors",
+        quant_format=quant_format,
+        get_name=lambda: quant_name,
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(expert_dtype="int8")
+            hf_config=SimpleNamespace(expert_dtype=expert_dtype)
         ),
+        cache_config=SimpleNamespace(cache_dtype="bfloat16"),
         quant_config=quant_config,
     )
 
@@ -219,7 +679,160 @@ def test_attention_int8_wo_a_is_excluded_only_during_construction() -> None:
     DeepseekV4Attention(vllm_config, "model.layers.3.attn")
 
     assert seen_ignore == [["model.layers.3.attn.wo_a"]]
+    assert seen_fp8_ds_mla_layout == [False]
     assert quant_config.ignore == []
+
+
+@pytest.mark.parametrize(
+    ("is_gfx938", "expected_dtype", "expected_head_dim"),
+    (
+        (False, torch.bfloat16, 128),
+        (True, torch.uint8, 132),
+    ),
+)
+def test_deepseek_v4_indexer_cache_matches_hcu_reader_contract(
+    is_gfx938: bool,
+    expected_dtype: torch.dtype,
+    expected_head_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gfx936 uses the BF16 reader; gfx938 retains its quantized cache."""
+
+    class DeepseekV4Attention:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+        ):
+            del vllm_config, prefix, topk_indices_buffer, aux_stream_list
+
+        def _run_parallel_input_projections(self, hidden_states):
+            return hidden_states
+
+        def forward(self, positions, hidden_states, llama_4_scaling=None):
+            del positions, llama_4_scaling
+            return hidden_states
+
+        def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+            del kv, positions, attn_metadata
+            return q
+
+    class DeepseekV4Indexer:
+        def __init__(
+            self,
+            vllm_config,
+            config,
+            hidden_size,
+            q_lora_rank,
+            quant_config,
+            cache_config,
+            topk_indices_buffer,
+            compress_ratio=1,
+            prefix="",
+            aux_stream=None,
+        ):
+            del (
+                vllm_config,
+                config,
+                hidden_size,
+                q_lora_rank,
+                quant_config,
+                cache_config,
+                topk_indices_buffer,
+                compress_ratio,
+                prefix,
+                aux_stream,
+            )
+            self.head_dim = 128
+            self.k_cache = SimpleNamespace(dtype=torch.uint8, head_dim=132)
+
+    def fused_indexer_q_rope_quant(
+        positions,
+        index_q,
+        index_q_cos_sin_cache,
+        index_weights,
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        use_fp4=False,
+    ):
+        del (
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            use_fp4,
+        )
+        return "quantized"
+
+    module = _module(
+        patch_deepseek_v4_attention.TARGET_MODULE,
+        DeepseekV4Attention=DeepseekV4Attention,
+        DeepseekV4Indexer=DeepseekV4Indexer,
+        fused_indexer_q_rope_quant=fused_indexer_q_rope_quant,
+        execute_in_parallel=lambda *args, **kwargs: None,
+        envs=SimpleNamespace(VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=1),
+    )
+    monkeypatch.setattr(
+        patch_deepseek_v4_attention,
+        "on_gfx938",
+        lambda: is_gfx938,
+        raising=False,
+    )
+
+    patch_deepseek_v4_attention.apply_to_module(module)
+    indexer = DeepseekV4Indexer(None, None, 1, 1, None, None, None)
+
+    assert indexer.k_cache.dtype is expected_dtype
+    assert indexer.k_cache.head_dim == expected_head_dim
+    q_result = module.fused_indexer_q_rope_quant(
+        torch.tensor([0]),
+        torch.ones((1, 1, 4), dtype=torch.bfloat16),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        torch.ones((1, 1)),
+        0.5,
+        0.25,
+    )
+    if is_gfx938:
+        assert q_result == "quantized"
+    else:
+        query, scaled_weights = q_result
+        assert query.dtype is torch.bfloat16
+        torch.testing.assert_close(scaled_weights, torch.tensor([[0.125]]))
+
+
+def test_deepseek_v4_bf16_indexer_query_applies_gptj_rope_and_scales_weights():
+    q = torch.tensor(
+        [[[10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0]]],
+        dtype=torch.bfloat16,
+    )
+    # rotary_dim=4: first half is cos, second half is sin. With cos=0 and
+    # sin=1, interleaved GPT-J pairs [a,b] become [-b,a].
+    cos_sin_cache = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+    weights = torch.tensor([[8.0]])
+
+    rotated_q, scaled_weights = (
+        patch_deepseek_v4_attention._bf16_indexer_q_rope(
+            torch.tensor([0]),
+            q,
+            cos_sin_cache,
+            weights,
+            softmax_scale=0.5,
+            head_scale=0.25,
+        )
+    )
+
+    torch.testing.assert_close(
+        rotated_q,
+        torch.tensor(
+            [[[10.0, 20.0, 30.0, 40.0, -2.0, 1.0, -4.0, 3.0]]],
+            dtype=torch.bfloat16,
+        ),
+    )
+    torch.testing.assert_close(scaled_weights, torch.tensor([[1.0]]))
 
 
 @pytest.mark.parametrize(
@@ -306,6 +919,23 @@ def test_load_weights_exposes_channel_scale_alias_only_to_official_loader() -> N
 def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
     calls: list[tuple[object, ...]] = []
 
+    class DeepseekV4DecoderLayer:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+            fuse_heterogeneous_shared_expert=False,
+        ) -> None:
+            del (
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                fuse_heterogeneous_shared_expert,
+            )
+
     class DeepseekV4Model:
         aux_hidden_state_layers: tuple[int, ...] = ()
 
@@ -325,6 +955,7 @@ def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
 
     module = _module(
         patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4DecoderLayer=DeepseekV4DecoderLayer,
         DeepseekV4Model=DeepseekV4Model,
         DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
     )
@@ -339,6 +970,147 @@ def test_dspark_target_keeps_original_forward_without_aux_layers() -> None:
     causal.set_aux_hidden_state_layers((4, 8, 12))
     assert causal.model.aux_hidden_state_layers == (4, 8, 12)
     assert causal.supports_eagle3 is True
+
+
+def test_dspark_target_binds_boltops_mhc_and_preserves_official_norm() -> None:
+    bind = getattr(
+        patch_deepseek_v4_dspark_target,
+        "_bind_deepseek_v4_boltops_mhc",
+        None,
+    )
+    assert callable(bind), "DeepSeek-V4 must expose a model-scoped mHC binder"
+
+    one = torch.tensor(1.0)
+    two = torch.tensor(2.0)
+    three = torch.tensor(3.0)
+    four = torch.tensor(4.0)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class Backend:
+        @staticmethod
+        def mhc_pre(*args):
+            calls.append(("pre", args))
+            return one, two, three
+
+        @staticmethod
+        def mhc_post(*args):
+            calls.append(("post", args))
+            return four
+
+        @staticmethod
+        def mhc_fused_post_pre(*args):
+            calls.append(("fused", args))
+            return one, two, three, four
+
+    class Op:
+        def __init__(self) -> None:
+            self._forward_method = lambda *args, **kwargs: None
+
+    layer = SimpleNamespace(
+        mhc_pre=Op(),
+        mhc_post=Op(),
+        mhc_fused_post_pre=Op(),
+    )
+    mhc = SimpleNamespace(
+        _apply_mhc_norm=lambda value, weight, eps: value + weight + eps
+    )
+    bind(layer, mhc, Backend)
+
+    pre = layer.mhc_pre._forward_method(
+        one,
+        one,
+        one,
+        one,
+        1e-5,
+        0.0,
+        0.0,
+        1.0,
+        1,
+        norm_weight=two,
+        norm_eps=0.5,
+    )
+    post = layer.mhc_post._forward_method(one, one, one, one)
+    fused = layer.mhc_fused_post_pre._forward_method(
+        one,
+        one,
+        one,
+        one,
+        one,
+        one,
+        one,
+        1e-5,
+        0.0,
+        0.0,
+        1.0,
+        1,
+        norm_weight=two,
+        norm_eps=0.5,
+    )
+
+    assert pre[:2] == (one, two)
+    assert torch.equal(pre[2], torch.tensor(5.5))
+    assert post is four
+    assert fused[:3] == (one, two, three)
+    assert torch.equal(fused[3], torch.tensor(6.5))
+    assert [name for name, _ in calls] == ["pre", "post", "fused"]
+    assert len(calls[0][1]) == 10
+    assert len(calls[2][1]) == 14
+
+
+def test_dspark_target_binds_every_constructed_decoder_mhc_instance() -> None:
+    original_forward_method = lambda *args, **kwargs: None
+
+    class Op:
+        def __init__(self) -> None:
+            self._forward_method = original_forward_method
+
+    class DeepseekV4DecoderLayer:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+            fuse_heterogeneous_shared_expert=False,
+        ) -> None:
+            del (
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                fuse_heterogeneous_shared_expert,
+            )
+            self.mhc_pre = Op()
+            self.mhc_post = Op()
+            self.mhc_fused_post_pre = Op()
+
+    class DeepseekV4Model:
+        def forward(
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds=None,
+        ):
+            del input_ids, positions, intermediate_tensors, inputs_embeds
+            return None
+
+    class DeepseekV4ForCausalLM:
+        pass
+
+    module = _module(
+        patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4DecoderLayer=DeepseekV4DecoderLayer,
+        DeepseekV4Model=DeepseekV4Model,
+        DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
+    )
+    patch_deepseek_v4_dspark_target.apply_to_module(module)
+
+    layer = DeepseekV4DecoderLayer(object(), "model.layers.0")
+
+    assert layer.mhc_pre._forward_method is not original_forward_method
+    assert layer.mhc_post._forward_method is not original_forward_method
+    assert layer.mhc_fused_post_pre._forward_method is not original_forward_method
 
 
 def test_dspark_ragged_copy_grows_to_real_nnz_without_overflow() -> None:
@@ -386,6 +1158,68 @@ def test_dspark_ragged_copy_grows_to_real_nnz_without_overflow() -> None:
 
     assert ragged[:6].tolist() == list(range(6))
     assert indptr.tolist() == [0, 3, 6]
+
+
+def _compressor_fusion_attention(
+    main_weight: torch.Tensor,
+    indexer_weight: torch.Tensor,
+    calls: list[str],
+):
+    class DeepseekV4ROCMAiterMLAAttention:
+        def __init__(self) -> None:
+            self._fused_compressor_weight = None
+            self.compressor = SimpleNamespace(
+                fused_wkv_wgate=SimpleNamespace(weight=main_weight)
+            )
+            self.indexer = SimpleNamespace(
+                compressor=SimpleNamespace(
+                    fused_wkv_wgate=SimpleNamespace(weight=indexer_weight)
+                )
+            )
+
+        def prepare_compressor_gemm_fusion(self) -> bool:
+            calls.append("upstream")
+            if main_weight.shape[1] != indexer_weight.shape[1]:
+                raise ValueError("DeepSeek V4 compressor weights must share K")
+            return True
+
+    return DeepseekV4ROCMAiterMLAAttention
+
+
+def test_rocm_compressor_fusion_skips_hcu_nn_layout() -> None:
+    calls: list[str] = []
+    attention_cls = _compressor_fusion_attention(
+        torch.empty(4096, 2048),
+        torch.empty(4096, 512),
+        calls,
+    )
+    module = _module(
+        patch_deepseek_v4_rocm_compressor_fusion.TARGET_MODULE,
+        DeepseekV4ROCMAiterMLAAttention=attention_cls,
+    )
+
+    patch_deepseek_v4_rocm_compressor_fusion.apply_to_module(module)
+
+    assert attention_cls().prepare_compressor_gemm_fusion() is False
+    assert calls == []
+
+
+def test_rocm_compressor_fusion_keeps_upstream_nt_layout() -> None:
+    calls: list[str] = []
+    attention_cls = _compressor_fusion_attention(
+        torch.empty(2048, 4096),
+        torch.empty(512, 4096),
+        calls,
+    )
+    module = _module(
+        patch_deepseek_v4_rocm_compressor_fusion.TARGET_MODULE,
+        DeepseekV4ROCMAiterMLAAttention=attention_cls,
+    )
+
+    patch_deepseek_v4_rocm_compressor_fusion.apply_to_module(module)
+
+    assert attention_cls().prepare_compressor_gemm_fusion() is True
+    assert calls == ["upstream"]
 
 
 def test_rocm_wo_a_cache_accepts_hcu_nn_layout() -> None:
@@ -489,6 +1323,23 @@ def test_attention_patch_rejects_incompatible_forward_signature() -> None:
 
 
 def test_dspark_target_patch_rejects_incompatible_forward_signature() -> None:
+    class DeepseekV4DecoderLayer:
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            topk_indices_buffer=None,
+            aux_stream_list=None,
+            fuse_heterogeneous_shared_expert=False,
+        ) -> None:
+            del (
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                fuse_heterogeneous_shared_expert,
+            )
+
     class DeepseekV4Model:
         def forward(self, input_ids):
             return input_ids
@@ -498,6 +1349,7 @@ def test_dspark_target_patch_rejects_incompatible_forward_signature() -> None:
 
     module = _module(
         patch_deepseek_v4_dspark_target.TARGET_MODULE,
+        DeepseekV4DecoderLayer=DeepseekV4DecoderLayer,
         DeepseekV4Model=DeepseekV4Model,
         DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
     )

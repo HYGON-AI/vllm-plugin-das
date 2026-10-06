@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from vllm_hcu.platforms.hcu import on_gfx938
+
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
@@ -34,6 +36,8 @@ _INIT_WRAPPER_MARKER = "_vllm_hcu_int8_wo_a_ignore_wrapper"
 _FORWARD_WRAPPER_MARKER = "_vllm_hcu_raw_kv_caller_wrapper"
 _WRAPPER_MARKER = "_vllm_hcu_compressor_weight_layout_wrapper"
 _INSERT_WRAPPER_MARKER = "_vllm_hcu_fp8_ds_mla_lightop_insert_wrapper"
+_INDEXER_INIT_WRAPPER_MARKER = "_vllm_hcu_indexer_cache_dtype_wrapper"
+_INDEXER_Q_WRAPPER_MARKER = "_vllm_hcu_bf16_indexer_query_wrapper"
 
 
 def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -47,34 +51,154 @@ def _requires_unquantized_int8_wo_a(vllm_config: object) -> bool:
     get_name = getattr(quant_config, "get_name", None)
     model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
-    return bool(
-        callable(get_name)
-        and get_name() == "compressed-tensors"
+    if not callable(get_name):
+        return False
+
+    quant_name = get_name()
+    expert_dtype = getattr(hf_config, "expert_dtype", None)
+    compressed_int8 = (
+        quant_name == "compressed-tensors"
         and getattr(quant_config, "quant_format", None) == "int-quantized"
-        and getattr(hf_config, "expert_dtype", None) == "int8"
+        and expert_dtype == "int8"
     )
+    # DeepSeek-V4-Flash mixed W4A8 checkpoints use SlimQuant for INT4 routed
+    # experts and W8A8 attention projections, but deliberately keep wo_a as a
+    # lone BF16 weight (there is no wo_a weight_scale tensor).  Without this
+    # construction-time exclusion the generic SlimQuant Linear method casts
+    # that BF16 checkpoint tensor into an INT8 parameter and corrupts every
+    # attention output.
+    slimquant_mixed_w4a8 = (
+        quant_name == "slimquant_w4a8" and expert_dtype == "int4"
+    )
+    return compressed_int8 or slimquant_mixed_w4a8
+
+
+def _bf16_indexer_q_rope(
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply interleaved GPT-J RoPE without introducing FP8 on gfx936."""
+    rotary_dim = cos_sin_cache.shape[-1]
+    if rotary_dim % 2 or rotary_dim > q.shape[-1]:
+        raise ValueError(
+            "DeepSeek V4 indexer RoPE requires an even rotary dimension no "
+            f"larger than head_dim, got rotary_dim={rotary_dim}, "
+            f"head_dim={q.shape[-1]}"
+        )
+
+    half_rotary_dim = rotary_dim // 2
+    selected = cos_sin_cache.index_select(0, positions.to(torch.long))
+    cos = selected[:, :half_rotary_dim].unsqueeze(1)
+    sin = selected[:, half_rotary_dim:].unsqueeze(1)
+    q_rot = q[..., -rotary_dim:].float()
+    q_even = q_rot[..., 0::2]
+    q_odd = q_rot[..., 1::2]
+    rotated = torch.stack(
+        (q_even * cos - q_odd * sin, q_odd * cos + q_even * sin),
+        dim=-1,
+    ).flatten(-2)
+    rotated = rotated.to(q.dtype)
+    if rotary_dim < q.shape[-1]:
+        rotated = torch.cat((q[..., :-rotary_dim], rotated), dim=-1)
+
+    scaled_weights = weights.float() * softmax_scale * head_scale
+    return rotated, scaled_weights
 
 
 def apply_to_module(module: ModuleType) -> bool:
     attention = load_exact_module(TARGET_MODULE, module)
     cls = require_class(attention, "DeepseekV4Attention", TARGET_SYMBOL)
+    indexer_cls = getattr(attention, "DeepseekV4Indexer", None)
+    current_indexer_q = getattr(attention, "fused_indexer_q_rope_quant", None)
     original = require_callable(cls, "_run_parallel_input_projections", TARGET_SYMBOL)
     if getattr(cls, _CLASS_MARKER, False):
         current_init = vars(cls).get("__init__")
         current_forward = vars(cls).get("forward")
         current = vars(cls).get("_run_parallel_input_projections")
         current_insert = vars(cls).get("_fused_qnorm_rope_kv_insert")
+        current_indexer_init = (
+            vars(indexer_cls).get("__init__") if indexer_cls is not None else None
+        )
         if not (
             getattr(current_init, _INIT_WRAPPER_MARKER, False)
             and getattr(current_forward, _FORWARD_WRAPPER_MARKER, False)
             and getattr(current, _WRAPPER_MARKER, False)
             and getattr(current_insert, _INSERT_WRAPPER_MARKER, False)
+            and (
+                indexer_cls is None
+                or getattr(
+                    current_indexer_init,
+                    _INDEXER_INIT_WRAPPER_MARKER,
+                    False,
+                )
+            )
+            and (
+                indexer_cls is None
+                or getattr(
+                    current_indexer_q,
+                    _INDEXER_Q_WRAPPER_MARKER,
+                    False,
+                )
+            )
         ):
             raise PatchCompatibilityError(
                 f"required HCU patch marker for {TARGET_SYMBOL} is stale"
             )
         return False
     original_init = require_callable(cls, "__init__", _INIT_TARGET_SYMBOL)
+    original_indexer_init = None
+    original_indexer_q = None
+    if indexer_cls is not None:
+        original_indexer_init = require_callable(
+            indexer_cls,
+            "__init__",
+            f"{TARGET_MODULE}.DeepseekV4Indexer.__init__",
+        )
+        require_exact_signature(
+            original_indexer_init,
+            f"{TARGET_MODULE}.DeepseekV4Indexer.__init__",
+            positional=(
+                "self",
+                "vllm_config",
+                "config",
+                "hidden_size",
+                "q_lora_rank",
+                "quant_config",
+                "cache_config",
+                "topk_indices_buffer",
+                "compress_ratio",
+                "prefix",
+                "aux_stream",
+            ),
+            defaults={
+                "compress_ratio": 1,
+                "prefix": "",
+                "aux_stream": None,
+            },
+        )
+        original_indexer_q = require_callable(
+            attention,
+            "fused_indexer_q_rope_quant",
+            f"{TARGET_MODULE}.fused_indexer_q_rope_quant",
+        )
+        require_exact_signature(
+            original_indexer_q,
+            f"{TARGET_MODULE}.fused_indexer_q_rope_quant",
+            positional=(
+                "positions",
+                "index_q",
+                "index_q_cos_sin_cache",
+                "index_weights",
+                "index_weights_softmax_scale",
+                "index_weights_head_scale",
+                "use_fp4",
+            ),
+            defaults={"use_fp4": False},
+        )
     require_exact_signature(
         original_init,
         _INIT_TARGET_SYMBOL,
@@ -126,6 +250,16 @@ def apply_to_module(module: ModuleType) -> bool:
         topk_indices_buffer=None,
         aux_stream_list=None,
     ):
+        cache_config = getattr(vllm_config, "cache_config", None)
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if cache_dtype in {"bf16", "bfloat16"}:
+            # The official ROCm sparse kernels support their plain BF16 row
+            # layout, but DeepSeek V4 defaults every backend instance to the
+            # packed fp8_ds_mla layout before resolving --kv-cache-dtype.
+            # Honour an explicit BF16 request on HCU so gfx936 does not have
+            # to consume the E4M3-based packed cache format.
+            self.use_fp8_ds_mla_layout = False
+
         quant_config = getattr(vllm_config, "quant_config", None)
         if not _requires_unquantized_int8_wo_a(vllm_config):
             return original_init(
@@ -154,6 +288,77 @@ def apply_to_module(module: ModuleType) -> bool:
             quant_config.ignore = previous_ignore
 
     setattr(hcu_attention_init, _INIT_WRAPPER_MARKER, True)
+
+    if original_indexer_init is not None:
+
+        @functools.wraps(original_indexer_init)
+        def hcu_indexer_init(
+            self,
+            vllm_config,
+            config,
+            hidden_size,
+            q_lora_rank,
+            quant_config,
+            cache_config,
+            topk_indices_buffer,
+            compress_ratio=1,
+            prefix="",
+            aux_stream=None,
+        ):
+            original_indexer_init(
+                self,
+                vllm_config,
+                config,
+                hidden_size,
+                q_lora_rank,
+                quant_config,
+                cache_config,
+                topk_indices_buffer,
+                compress_ratio,
+                prefix,
+                aux_stream,
+            )
+            # gfx938 has the quantized indexer cache reader. gfx936 selects
+            # the BF16 HIPC writer/gather path, so its allocation contract
+            # must contain raw BF16 keys rather than FP8 bytes plus scales.
+            if not on_gfx938():
+                self.k_cache.dtype = torch.bfloat16
+                self.k_cache.head_dim = self.head_dim
+
+        setattr(hcu_indexer_init, _INDEXER_INIT_WRAPPER_MARKER, True)
+
+    if original_indexer_q is not None:
+
+        @functools.wraps(original_indexer_q)
+        def hcu_indexer_q_rope_quant(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            use_fp4=False,
+        ):
+            if on_gfx938() or use_fp4:
+                return original_indexer_q(
+                    positions,
+                    index_q,
+                    index_q_cos_sin_cache,
+                    index_weights,
+                    index_weights_softmax_scale,
+                    index_weights_head_scale,
+                    use_fp4,
+                )
+            return _bf16_indexer_q_rope(
+                positions,
+                index_q,
+                index_q_cos_sin_cache,
+                index_weights,
+                index_weights_softmax_scale,
+                index_weights_head_scale,
+            )
+
+        setattr(hcu_indexer_q_rope_quant, _INDEXER_Q_WRAPPER_MARKER, True)
 
     @functools.wraps(original_forward)
     def hcu_attention_forward(
@@ -231,8 +436,10 @@ def apply_to_module(module: ModuleType) -> bool:
             aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-            return qr_kv
+            # Keep the current platform/model override authoritative.  The
+            # ROCm DeepSeek-V4 implementation preshuffles this fused weight
+            # in place and its override owns the compatible GEMM call.
+            return self._fused_wqa_wkv_gemm(hidden_states)
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
@@ -305,6 +512,16 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "_vllm_hcu_original_forward", original_forward)
     setattr(cls, "_vllm_hcu_original_run_parallel_input_projections", original)
     setattr(cls, "_vllm_hcu_original_fused_qnorm_rope_kv_insert", original_insert)
+    if indexer_cls is not None and original_indexer_init is not None:
+        setattr(indexer_cls, "_vllm_hcu_original_init", original_indexer_init)
+        setattr(indexer_cls, "__init__", hcu_indexer_init)
+    if original_indexer_q is not None:
+        setattr(
+            attention,
+            "_vllm_hcu_original_fused_indexer_q_rope_quant",
+            original_indexer_q,
+        )
+        setattr(attention, "fused_indexer_q_rope_quant", hcu_indexer_q_rope_quant)
     setattr(cls, "__init__", hcu_attention_init)
     setattr(cls, "forward", hcu_attention_forward)
     setattr(cls, "_run_parallel_input_projections", hcu_run_parallel_input_projections)

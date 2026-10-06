@@ -159,7 +159,11 @@ def apply_to_module(module: ModuleType) -> bool:
         if _boltops_enabled():
             boltops_kernel = resolve_boltops_sigmoid()
             if boltops_kernel is not None:
-                return boltops_kernel(*bound.args, **bound.kwargs)
+                return boltops_kernel(
+                    *bound.args,
+                    **bound.kwargs,
+                    null_state_index=0,
+                )
         return official_sigmoid(*bound.args, **bound.kwargs)
 
     @functools.wraps(official_recurrent)
@@ -169,7 +173,11 @@ def apply_to_module(module: ModuleType) -> bool:
         if _boltops_enabled():
             boltops_kernel = resolve_boltops_recurrent()
             if boltops_kernel is not None:
-                return boltops_kernel(*bound.args, **bound.kwargs)
+                return boltops_kernel(
+                    *bound.args,
+                    **bound.kwargs,
+                    null_state_index=0,
+                )
         return official_recurrent(*bound.args, **bound.kwargs)
 
     if aiter_available:

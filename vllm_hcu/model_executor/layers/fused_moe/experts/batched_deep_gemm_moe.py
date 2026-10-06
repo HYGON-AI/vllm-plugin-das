@@ -482,6 +482,9 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 )
             from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
             from lightop.activation import fuse_silu_mul_quant_ep
+            from vllm_hcu.model_executor.layers.fused_moe.experts import (
+                dpsk_v4_deep_gemm_moe,
+            )
 
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
@@ -490,10 +493,22 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expert_num_tokens,
                 expected_m,
             )
-            a2q, a2q_scale = fuse_silu_mul_quant_ep(
-                workspace1,
-                tokens_per_expert=expert_num_tokens,
-            )
+            clamp_limit = self.quant_config.gemm1_clamp_limit
+            if clamp_limit is not None and clamp_limit > 0:
+                clamp_quant = (
+                    dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant_ep
+                )
+                a2q, a2q_scale = clamp_quant(
+                    workspace1,
+                    limit=clamp_limit,
+                    mask_m=expert_num_tokens,
+                    expect_m=expected_m,
+                )
+            else:
+                a2q, a2q_scale = fuse_silu_mul_quant_ep(
+                    workspace1,
+                    tokens_per_expert=expert_num_tokens,
+                )
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a2q, a2q_scale),
                 (self._deepgemm_w2, self.w2_scale),

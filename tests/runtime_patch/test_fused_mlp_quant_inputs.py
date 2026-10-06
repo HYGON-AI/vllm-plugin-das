@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -111,6 +112,58 @@ def _load_top_level_function(relative_path: str, function_name: str):
     return namespace[function_name]
 
 
+def _load_deepseek_shared_mlp_class():
+    path = REPO_ROOT / "vllm_hcu/models/deepseek_v2.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "DeepseekV2SharedMLP"
+    )
+
+    class _LinearStub(nn.Module):
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+            self.weight = torch.ones(1, dtype=torch.int8)
+
+    class _FusedActStub(nn.Module):
+        pass
+
+    class _FloatActStub(nn.Module):
+        pass
+
+    namespace = {
+        "torch": torch,
+        "nn": nn,
+        "MergedColumnParallelLinear": _LinearStub,
+        "RowParallelLinear": _LinearStub,
+        "henvs": SimpleNamespace(
+            VLLM_HCU_USE_FUSED_SILU_MUL_QUANT=True,
+            VLLM_HCU_USE_CUSTOM_OPS=True,
+        ),
+        "FusedSiluAndMulAndQuant": _FusedActStub,
+        "fused_silu_mul_quant_supported": _load_top_level_function(
+            "vllm_hcu/models/deepseek_v2.py",
+            "fused_silu_mul_quant_supported",
+        ),
+        "SiluAndMul": _FloatActStub,
+    }
+    class_module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias("annotations")],
+                level=0,
+            ),
+            class_node,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(class_module)
+    exec(compile(class_module, str(path), "exec"), namespace)
+    return namespace["DeepseekV2SharedMLP"], _FusedActStub, _FloatActStub
+
 @pytest.mark.parametrize(
     ("dtype", "expected"),
     (
@@ -181,6 +234,28 @@ def test_feature_off_mlp_down_projection_uses_float_activation(
 
     assert result is output
     assert down.calls == [(activated, None)]
+
+
+def test_deepseek_bf16_shared_mlp_does_not_enable_quantized_activation():
+    shared_mlp, fused_act, float_act = _load_deepseek_shared_mlp_class()
+
+    bf16_layer = shared_mlp(
+        hidden_size=4,
+        intermediate_size=8,
+        hidden_act="silu",
+        quant_config=None,
+    )
+    quantized_layer = shared_mlp(
+        hidden_size=4,
+        intermediate_size=8,
+        hidden_act="silu",
+        quant_config=object(),
+    )
+
+    assert not bf16_layer.enable_fuse_silu_mul_quant
+    assert isinstance(bf16_layer.act_fn, float_act)
+    assert quantized_layer.enable_fuse_silu_mul_quant
+    assert isinstance(quantized_layer.act_fn, fused_act)
 
 
 @pytest.mark.parametrize(

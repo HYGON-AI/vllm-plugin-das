@@ -26,6 +26,20 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _num_workspace_lanes(
+    vllm_config: VllmConfig,
+    use_v2_model_runner: bool,
+) -> int:
+    spec_config = vllm_config.speculative_config
+    return (
+        2
+        if use_v2_model_runner
+        and spec_config is not None
+        and spec_config.use_dspark()
+        else 1
+    )
+
+
 def _create_model_runner(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -176,7 +190,11 @@ class HcuGPUWorker(Worker):
 
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        init_workspace_manager(
+            self.device,
+            num_ubatches,
+            _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
+        )
 
         # Construct the model runner
         self.model_runner: GPUModelRunner = _create_model_runner(  # type: ignore

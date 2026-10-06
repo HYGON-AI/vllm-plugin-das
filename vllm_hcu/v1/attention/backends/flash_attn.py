@@ -55,7 +55,6 @@ if is_flash_attn_varlen_func_available():
 import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
-    get_current_vllm_config,
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
@@ -149,11 +148,12 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        vllm_config = get_current_vllm_config()
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
         if (
             model_config
+            and cache_config
             and model_config.is_hybrid
             and (
                 cache_config.mamba_ssm_cache_dtype == "float32"
@@ -191,6 +191,10 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
         return True
 
     @classmethod

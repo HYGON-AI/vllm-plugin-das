@@ -531,14 +531,24 @@ def _artifact_record_count(
 
 
 def _normalize_humaneval_completion(completion: str) -> str:
-    """Remove one complete or truncated Markdown fence around Python code."""
+    """Remove a completed thinking prefix and one Python Markdown fence."""
+
+    closing_think = completion.find("</think>")
+    first_fence = completion.find("```")
+    if closing_think >= 0 and (first_fence < 0 or closing_think < first_fence):
+        completion = completion[closing_think + len("</think>") :]
 
     opening = re.search(
         r"(?m)^[ \t]*```(?:python|py)?[ \t]*\r?\n",
         completion,
     )
     if opening is None:
-        return completion.strip()
+        opening = re.match(
+            r"[ \t]*```(?=(?:async[ \t]+def|def|class|from|import|@))",
+            completion,
+        )
+        if opening is None:
+            return completion.strip()
     code = completion[opening.end() :]
     closing = re.search(r"(?m)^[ \t]*```[ \t]*$", code)
     if closing is not None:
