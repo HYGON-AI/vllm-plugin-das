@@ -47,6 +47,153 @@ def _fake_glm_model_module() -> ModuleType:
     return module
 
 
+def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> None:
+    calls = []
+
+    class Kernel:
+        _hcu_fp8_backend = "lightop"
+
+        def apply_scaled_mm(self, *, A, B, As, Bs, out_dtype, bias, output_shape):
+            del A, B, As, Bs, bias
+            return torch.full(output_shape, -1, dtype=out_dtype)
+
+    def fake_module():
+        module = ModuleType(patch_glm5next_channel_fp8.TARGET_MODULE)
+
+        class Glm5NextDecoderLayer:
+            def __init__(
+                self,
+                vllm_config,
+                config,
+                layer_idx,
+                prefix="",
+                topk_indices_buffer=None,
+                is_mtp_layer=False,
+                **kwargs,
+            ):
+                del vllm_config, config, layer_idx, prefix, topk_indices_buffer, kwargs
+                self.is_mtp_layer = is_mtp_layer
+                self.other_kernel = Kernel()
+                gate = SimpleNamespace(scheme=SimpleNamespace(fp8_linear=Kernel()))
+                self.mlp = SimpleNamespace(
+                    shared_experts=SimpleNamespace(gate_up_proj=gate)
+                )
+
+        module.Glm5NextDecoderLayer = Glm5NextDecoderLayer
+        return module
+
+    deepgemm = ModuleType("deepgemm")
+
+    def fp8_gemm(activation, weight, output):
+        calls.append((activation, weight))
+        output.fill_(7)
+
+    deepgemm.fp8_gemm = fp8_gemm
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+    from vllm_hcu.platforms import hcu
+
+    monkeypatch.setattr(hcu, "on_gfx938", lambda: True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
+
+    module = fake_module()
+    assert patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(module)
+    layer = module.Glm5NextDecoderLayer(None, None, 3)
+    gate_kernel = layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    A = torch.ones((2, 4), dtype=torch.float8_e4m3fn)
+    B = torch.ones((3, 4), dtype=torch.float8_e4m3fn).t()
+    kwargs = {
+        "A": A,
+        "B": B,
+        "As": torch.ones((2, 1), dtype=torch.float32),
+        "Bs": torch.ones((3, 1), dtype=torch.float32),
+        "out_dtype": torch.bfloat16,
+        "bias": None,
+        "output_shape": (2, 3),
+    }
+    assert torch.all(gate_kernel.apply_scaled_mm(**kwargs) == 7)
+    assert len(calls) == 1
+    # An equal element count is insufficient: the original scaled-mm contract
+    # rejects transposed scale layouts, so they must stay on the original path.
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "As": torch.ones((1, 2), dtype=torch.float32)}
+        )
+        == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "Bs": torch.ones((1, 3), dtype=torch.float32)}
+        )
+        == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "As": torch.ones((2, 2), dtype=torch.float32)[:, :1]}
+        )
+        == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "Bs": torch.ones((3, 2), dtype=torch.float32)[:, :1]}
+        )
+        == -1
+    )
+    assert len(calls) == 1
+    assert torch.all(layer.other_kernel.apply_scaled_mm(**kwargs) == -1)
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(**{**kwargs, "B": B.contiguous()}) == -1
+    )
+    assert len(calls) == 1
+    # These calls must retain the original scaled-mm contract. A reshape with
+    # the same number of elements is not necessarily the requested [*, N].
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(**{**kwargs, "output_shape": (1, 6)}) == -1
+    )
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(
+            **{**kwargs, "bias": torch.ones((3,), dtype=torch.bfloat16)}
+        )
+        == -1
+    )
+    assert len(calls) == 1
+
+    mtp_layer = module.Glm5NextDecoderLayer(None, None, 41, is_mtp_layer=True)
+    mtp_kernel = mtp_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    assert torch.all(mtp_kernel.apply_scaled_mm(**kwargs) == -1)
+    assert len(calls) == 1
+
+    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM")
+    disabled_module = fake_module()
+    patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        disabled_module
+    )
+    disabled_layer = disabled_module.Glm5NextDecoderLayer(None, None, 3)
+    disabled_kernel = (
+        disabled_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    )
+    assert torch.all(disabled_kernel.apply_scaled_mm(**kwargs) == -1)
+    assert len(calls) == 1
+
+    # A valid batched output shape remains eligible for the fast path.
+    assert torch.all(
+        gate_kernel.apply_scaled_mm(**{**kwargs, "output_shape": (1, 2, 3)}) == 7
+    )
+    assert len(calls) == 2
+
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        fake_module()
+    )
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(hcu, "on_gfx938", lambda: False)
+    assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        fake_module()
+    )
+
+
 def _fake_kda_module() -> tuple[ModuleType, type]:
     module = ModuleType(patch_glm5next_kda_conv_weight.TARGET_MODULE)
 
@@ -294,6 +441,124 @@ def test_kpool_indexer_uses_official_triton_path_without_aiter() -> None:
     ) == "official-hip"
 
 
+@pytest.mark.parametrize("page_size", [1, 16, 32, 64])
+@pytest.mark.parametrize(
+    "layout", ["regular", "collapsed", "transposed", "contiguous", "five_dim"]
+)
+def test_glm5next_upstream_paged_mqa_uses_physical_page_after_layout_normalization(
+    monkeypatch, page_size: int, layout: str
+) -> None:
+    """The wrapper must classify the same physical page as the dispatcher."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    class SparseAttnIndexerKpool:
+        def forward_hip(
+            self,
+            hidden_states,
+            q_quant,
+            k,
+            weights,
+            *,
+            gate_score=None,
+            compress_ape=None,
+            index_kpool=1,
+            positions=None,
+        ):
+            return None
+
+    kpool = ModuleType(patch_glm5next_channel_fp8.KPOOL_MODULE)
+    kpool.SparseAttnIndexerKpool = SparseAttnIndexerKpool
+    monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        upstream_sparse,
+        "rocm_fp8_paged_mqa_logits",
+        upstream_sparse.rocm_fp8_paged_mqa_logits,
+    )
+    calls = []
+    output = torch.ones((1, 2))
+
+    def dispatcher(*args, **kwargs):
+        calls.append((args, kwargs))
+        return output
+
+    monkeypatch.setattr(hcu_sparse, "rocm_fp8_paged_mqa_logits", dispatcher)
+    patch_glm5next_channel_fp8._patch_sparse_indexer_kpool(kpool)
+    cache = torch.empty((2, page_size, 1, 132), dtype=torch.uint8)
+    supplied_cache = {
+        "regular": cache,
+        "collapsed": cache[:, :1],
+        "transposed": cache.transpose(1, 2),
+        "contiguous": torch.empty((2, 1, page_size, 132), dtype=torch.uint8),
+        "five_dim": cache.unsqueeze(2),
+    }[layout]
+    table = torch.tensor([[1, 0]], dtype=torch.int32)
+    result = upstream_sparse.rocm_fp8_paged_mqa_logits(
+        torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+        supplied_cache,
+        torch.ones((1, 1)),
+        torch.tensor([2], dtype=torch.int32),
+        table,
+        torch.empty(0),
+        2,
+    )
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0][1] is supplied_cache
+    assert calls[0][0][4] is table
+    assert calls[0][1]["force_aiter_triton"] is (page_size == 1)
+
+
+def test_glm5next_upstream_explicit_aiter_rejects_preshuffled_gfx938_pages(
+    monkeypatch,
+) -> None:
+    """Explicit AITER requests must reach the layout-aware dispatcher."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    class SparseAttnIndexerKpool:
+        def forward_hip(
+            self,
+            hidden_states,
+            q_quant,
+            k,
+            weights,
+            *,
+            gate_score=None,
+            compress_ape=None,
+            index_kpool=1,
+            positions=None,
+        ):
+            return None
+
+    kpool = ModuleType(patch_glm5next_channel_fp8.KPOOL_MODULE)
+    kpool.SparseAttnIndexerKpool = SparseAttnIndexerKpool
+    monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        upstream_sparse,
+        "rocm_fp8_paged_mqa_logits",
+        upstream_sparse.rocm_fp8_paged_mqa_logits,
+    )
+    patch_glm5next_channel_fp8._patch_sparse_indexer_kpool(kpool)
+
+    with pytest.raises(
+        RuntimeError,
+        match="AITER paged-MQA does not support gfx938 preshuffled KPool pages",
+    ):
+        upstream_sparse.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((2, 16, 1, 132), dtype=torch.uint8),
+            torch.ones((1, 1)),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[1, 0]], dtype=torch.int32),
+            torch.empty(0),
+            2,
+            force_aiter_triton=True,
+        )
+
+
 def test_glm5next_forced_sparse_triton_requires_packaged_modules(
     monkeypatch,
 ) -> None:
@@ -310,6 +575,8 @@ def test_glm5next_forced_sparse_triton_requires_packaged_modules(
             force_aiter_triton=True,
         )
 
+    monkeypatch.setattr(sparse, "_ON_GFX942", True)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
     monkeypatch.setattr(sparse, "paged_mqa_logits_module", lambda: None)
     with pytest.raises(RuntimeError, match="pa_mqa_logits Triton module"):
         sparse.rocm_fp8_paged_mqa_logits(
@@ -455,6 +722,133 @@ def test_channel_fp8_projection_kept_in_bf16_is_dequantized() -> None:
     )
     torch.testing.assert_close(loaded[0][0], expected)
     assert loaded[0][1] == 1
+    assert loaded_params == {target}
+    assert buffered == {}
+
+
+def test_channel_int8_projection_kept_in_bf16_is_dequantized() -> None:
+    module = _fake_glm_model_module()
+    module._FP8_ATTN_PROJS = {
+        ".q_a_proj.": ("q_a", "fused_qkv_a_proj", 0, False)
+    }
+
+    def official(
+        name,
+        tensor,
+        buf,
+        params_dict,
+        loaded_params,
+        kv_a_pad_size,
+    ):
+        del name, tensor, buf, params_dict, loaded_params, kv_a_pad_size
+        return False
+
+    module._try_load_fp8_attn_proj = official
+    patch_glm5next_channel_fp8.apply_to_module(module)
+
+    loaded = []
+
+    def weight_loader(param, tensor, shard_id):
+        del param
+        loaded.append((tensor, shard_id))
+
+    target = "layers.0.self_attn.fused_qkv_a_proj.weight"
+    params = {target: SimpleNamespace(weight_loader=weight_loader)}
+    buffered = {}
+    loaded_params = set()
+    weight = torch.tensor([[10, -20], [30, 40]], dtype=torch.int8)
+    scale = torch.tensor([[0.01], [0.02]], dtype=torch.float32)
+
+    helper = module._try_load_fp8_attn_proj
+    assert helper(
+        "layers.0.self_attn.q_a_proj.weight",
+        weight,
+        buffered,
+        params,
+        loaded_params,
+        0,
+    )
+    assert helper(
+        "layers.0.self_attn.q_a_proj.weight_scale",
+        scale,
+        buffered,
+        params,
+        loaded_params,
+        0,
+    )
+
+    expected = (weight.float() * scale).to(torch.bfloat16)
+    torch.testing.assert_close(loaded[0][0], expected)
+    assert loaded[0][1] == 0
+    assert loaded_params == {target}
+    assert buffered == {}
+
+
+@pytest.mark.parametrize(
+    ("suffix", "target_suffix", "expected_shard_id"),
+    [
+        (".kv_b_proj.", ".kv_b_proj.weight", None),
+        (".indexer.wq_b.", ".indexer.wq_b.weight", None),
+        (".indexer.wk.", ".indexer.wk_weights_proj.weight", 0),
+    ],
+)
+def test_channel_int8_checkpoint_only_projection_is_dequantized(
+    suffix: str,
+    target_suffix: str,
+    expected_shard_id: int | None,
+) -> None:
+    module = _fake_glm_model_module()
+    module._FP8_ATTN_PROJS = {}
+
+    def official(
+        name,
+        tensor,
+        buf,
+        params_dict,
+        loaded_params,
+        kv_a_pad_size,
+    ):
+        del name, tensor, buf, params_dict, loaded_params, kv_a_pad_size
+        return False
+
+    module._try_load_fp8_attn_proj = official
+    patch_glm5next_channel_fp8.apply_to_module(module)
+
+    loaded = []
+
+    def weight_loader(param, tensor, *args):
+        del param
+        loaded.append((tensor, args[0] if args else None))
+
+    prefix = "layers.0.self_attn"
+    target = f"{prefix}{target_suffix}"
+    params = {target: SimpleNamespace(weight_loader=weight_loader)}
+    buffered = {}
+    loaded_params = set()
+    weight = torch.tensor([[10, -20], [30, 40]], dtype=torch.int8)
+    scale = torch.tensor([[0.01], [0.02]], dtype=torch.float32)
+
+    helper = module._try_load_fp8_attn_proj
+    assert helper(
+        f"{prefix}{suffix}weight",
+        weight,
+        buffered,
+        params,
+        loaded_params,
+        0,
+    )
+    assert helper(
+        f"{prefix}{suffix}weight_scale",
+        scale,
+        buffered,
+        params,
+        loaded_params,
+        0,
+    )
+
+    expected = (weight.float() * scale).to(torch.bfloat16)
+    torch.testing.assert_close(loaded[0][0], expected)
+    assert loaded[0][1] == expected_shard_id
     assert loaded_params == {target}
     assert buffered == {}
 

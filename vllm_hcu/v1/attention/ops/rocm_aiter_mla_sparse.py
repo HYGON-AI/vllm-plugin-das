@@ -29,6 +29,9 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 
+from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
+    gfx938_fp8_paged_mqa_logits,
+)
 
 lightop_attention = None
 logger = init_logger(__name__)
@@ -422,6 +425,41 @@ def _indexer_k_bf16_cache_kernel(
     
     tl.store(dst_ptr + tile_offset, val)
 
+def _indexer_bf16_cache_as_page_view(
+    kv_cache: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    """Return the single-head indexer cache as ``[blocks, tokens, dim]``.
+
+    vLLM can bind a per-layer MLA cache in either LBHNC or LBNHC order, so the
+    singleton head axis can be dimension 1 or 2.  The BF16 writer operates on
+    physical pages and must not assume one global KV-cache layout.
+    """
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[-1] != head_dim:
+            raise ValueError(
+                "Indexer BF16 cache head_dim mismatch: "
+                f"expected {head_dim}, got {kv_cache.shape[-1]}"
+            )
+        if kv_cache.shape[1] == 1:
+            kv_cache = kv_cache.squeeze(1)
+        elif kv_cache.shape[2] == 1:
+            kv_cache = kv_cache.squeeze(2)
+        else:
+            raise ValueError(
+                "Indexer BF16 cache must use a single-head LBHNC or LBNHC "
+                f"layout, got shape {tuple(kv_cache.shape)}"
+            )
+
+    kv_cache = _indexer_cache_as_hipc_view(kv_cache)
+    if kv_cache.ndim != 3 or kv_cache.shape[2] != head_dim:
+        raise ValueError(
+            "Indexer BF16 cache must resolve to [blocks, tokens, head_dim], "
+            f"got shape {tuple(kv_cache.shape)} for head_dim={head_dim}"
+        )
+    return kv_cache
+
+
 def indexer_k_bf16_cache_triton(
     k: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -439,6 +477,8 @@ def indexer_k_bf16_cache_triton(
         block_tile_size: 块分块大小
         head_tile_size: 头维度分块大小
     """
+    kv_cache = _indexer_bf16_cache_as_page_view(kv_cache, k.shape[-1])
+
     # 输入类型校验
     assert k.dtype == torch.bfloat16, "k 必须是 bf16 类型"
     assert kv_cache.dtype == torch.bfloat16, "kv_cache 必须是 bf16 类型"
@@ -704,6 +744,25 @@ def paged_mqa_logits_module():
     return None
 
 
+def _paged_mqa_cache_kernel_view(kv_cache_fp8: torch.Tensor) -> torch.Tensor:
+    """Normalize backend singleton axes before physical page recovery."""
+    if kv_cache_fp8.ndim == 5:
+        if kv_cache_fp8.shape[-2] != 1:
+            raise ValueError(
+                "HCU paged-MQA expects a singleton KV-head view, got "
+                f"shape {tuple(kv_cache_fp8.shape)}"
+            )
+        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
+    if kv_cache_fp8.ndim != 4:
+        raise ValueError(
+            "HCU paged-MQA expects a 4D kernel view, got "
+            f"shape {tuple(kv_cache_fp8.shape)}"
+        )
+    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
+        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    return kv_cache_fp8
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -739,26 +798,32 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
-    aiter_paged_mqa_logits_module = None
-    # if rocm_aiter_ops.is_enabled():
     batch_size, next_n = q_fp8.shape[:2]
-    if kv_cache_fp8.ndim == 5:
-        if kv_cache_fp8.shape[-2] != 1:
-            raise ValueError(
-                "HCU paged-MQA expects a singleton KV-head view, got "
-                f"shape {tuple(kv_cache_fp8.shape)}"
-            )
-        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
-    if kv_cache_fp8.ndim != 4:
-        raise ValueError(
-            "HCU paged-MQA expects a 4D kernel view, got "
-            f"shape {tuple(kv_cache_fp8.shape)}"
-        )
-    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
-        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    kv_cache_fp8 = _paged_mqa_cache_kernel_view(kv_cache_fp8)
+    is_gfx938 = on_gfx938()
+    if is_gfx938:
+        kv_cache_fp8 = _indexer_cache_as_hipc_view(kv_cache_fp8)
     block_size = kv_cache_fp8.shape[1]
 
-    if force_aiter_triton or rocm_aiter_ops.is_enabled():
+    if is_gfx938 and block_size not in (1, 16, 32, 64):
+        raise ValueError(f"Unsupported preshuffled KPool page size: {block_size}")
+    use_aiter = force_aiter_triton or rocm_aiter_ops.is_enabled()
+    if is_gfx938 and block_size != 1:
+        if force_aiter_triton:
+            raise RuntimeError(
+                "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
+            )
+        return gfx938_fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+
+    aiter_paged_mqa_logits_module = None
+    if use_aiter:
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
     if force_aiter_triton and aiter_paged_mqa_logits_module is None:
         raise RuntimeError(
@@ -813,6 +878,10 @@ def rocm_fp8_paged_mqa_logits(
             ChunkQ=heads,
         )
         return out_qk.sum(dim=0)
+    elif is_gfx938 and block_size == 1:
+        return fp8_paged_mqa_logits_torch(
+            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+        )
     elif current_platform.is_rocm():
         return _get_lightop_attention().paged_mqa_logits(
             q_fp8, 

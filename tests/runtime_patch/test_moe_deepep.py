@@ -67,6 +67,48 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def _fake_triton_wna16_experts_class():
+    class TritonWNA16Experts:
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            del (
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
+            return "upstream-wna16"
+
+    return TritonWNA16Experts
+
+
 def _install_lightop_moe(
     monkeypatch: pytest.MonkeyPatch, **exports: object
 ) -> ModuleType:
@@ -1198,6 +1240,7 @@ def test_aiter_and_triton_expert_capability_contract(
         kInt8StaticChannelSym=weight_key,
         kInt8DynamicTokenSym=activation_key,
         TritonExperts=TritonExperts,
+        TritonWNA16Experts=_fake_triton_wna16_experts_class(),
     )
     assert patch_triton_moe.apply_to_module(triton_module) is True
     assert TritonExperts._supports_quant_scheme(weight_key, activation_key) is True
@@ -1959,6 +2002,7 @@ def test_triton_moe_rebinds_hcu_moe_alignment(
     triton_module = _module(
         patch_triton_moe.TARGET_MODULE,
         TritonExperts=TritonExperts,
+        TritonWNA16Experts=_fake_triton_wna16_experts_class(),
         current_platform=SimpleNamespace(is_rocm=lambda: False),
         kInt8StaticChannelSym=object(),
         kInt8DynamicTokenSym=object(),
@@ -1967,6 +2011,203 @@ def test_triton_moe_rebinds_hcu_moe_alignment(
 
     assert patch_triton_moe.apply_to_module(triton_module) is True
     assert triton_module.moe_align_block_size is align_module.moe_align_block_size
+
+
+def test_triton_wna16_channel_uses_aiter_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class TritonExperts:
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+    TritonWNA16Experts = _fake_triton_wna16_experts_class()
+    triton_module = _module(
+        patch_triton_moe.TARGET_MODULE,
+        TritonExperts=TritonExperts,
+        TritonWNA16Experts=TritonWNA16Experts,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        kInt8StaticChannelSym=object(),
+        kInt8DynamicTokenSym=object(),
+        moe_align_block_size=lambda *args, **kwargs: None,
+    )
+    patch_triton_moe.apply_to_module(triton_module)
+    calls: list[dict[str, object]] = []
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    def fake_apply(**kwargs):
+        calls.append(kwargs)
+        return torch.full_like(kwargs["hidden_states"], 7)
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a16_moe",
+        fake_apply,
+        raising=False,
+    )
+    experts = TritonWNA16Experts()
+    experts.quant_config = SimpleNamespace(
+        use_int4_w4a16=True,
+        block_shape=[0, 64],
+        _hcu_channel_w4a16=True,
+        _hcu_aiter_w4a16_available=True,
+        w1_scale=torch.ones(2, 8, 1),
+        w2_scale=torch.ones(2, 4, 1),
+        w1_zp=torch.full((2, 4, 1), 0x88, dtype=torch.uint8),
+        w2_zp=torch.full((2, 2, 1), 0x88, dtype=torch.uint8),
+    )
+    experts.moe_config = SimpleNamespace(moe_backend="aiter")
+    output = torch.zeros(3, 4)
+    hidden = torch.ones(3, 4)
+    w1 = torch.ones(2, 8, 2, dtype=torch.uint8)
+    w2 = torch.ones(2, 4, 4, dtype=torch.uint8)
+    topk_weights = torch.ones(3, 1)
+    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
+
+    result = experts.apply(
+        output,
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        SimpleNamespace(value="silu"),
+        2,
+        None,
+        None,
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        None,
+        False,
+    )
+
+    assert result is None
+    assert torch.all(output == 7)
+    assert len(calls) == 1
+    assert calls[0]["quant_config"] is experts.quant_config
+    assert calls[0]["vllm_moe_config"] is experts.moe_config
+
+    experts.quant_config._hcu_aiter_w4a16_available = False
+    assert (
+        experts.apply(
+            output,
+            hidden,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            SimpleNamespace(value="silu"),
+            2,
+            None,
+            None,
+            None,
+            torch.empty(0),
+            torch.empty(0),
+            None,
+            False,
+        )
+        == "upstream-wna16"
+    )
+    assert len(calls) == 1
+
+
+def test_triton_wna16_channel_falls_back_when_runtime_m_has_no_aiter_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    class MoeQuantType:
+        W4A16 = "w4a16"
+
+    selected_m: list[int] = []
+
+    def select_config(**kwargs):
+        selected_m.append(kwargs["M"])
+        if kwargs["M"] == 1:
+            return True, SimpleNamespace(need_shuffle=False)
+        return False, None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=select_config,
+        ),
+    )
+
+    class TritonExperts:
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+    TritonWNA16Experts = _fake_triton_wna16_experts_class()
+    triton_module = _module(
+        patch_triton_moe.TARGET_MODULE,
+        TritonExperts=TritonExperts,
+        TritonWNA16Experts=TritonWNA16Experts,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        kInt8StaticChannelSym=object(),
+        kInt8DynamicTokenSym=object(),
+        moe_align_block_size=lambda *args, **kwargs: None,
+    )
+    patch_triton_moe.apply_to_module(triton_module)
+
+    w1 = torch.zeros(2, 8, 2, dtype=torch.uint8)
+    w2 = torch.zeros(2, 4, 4, dtype=torch.uint8)
+    moe_config = SimpleNamespace(
+        experts_per_token=1,
+        hidden_dim=4,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="aiter",
+    )
+    quant_config = SimpleNamespace(
+        use_int4_w4a16=True,
+        block_shape=[0, 4],
+        _hcu_channel_w4a16=True,
+        _hcu_aiter_w4a16_available=False,
+    )
+    compressed_tensors_moe_runtime.prewarm_aiter_w4a16_moe(
+        SimpleNamespace(moe=moe_config),
+        SimpleNamespace(w13_weight_packed=w1, w2_weight_packed=w2),
+        quant_config,
+    )
+    assert quant_config._hcu_aiter_w4a16_available is True
+
+    experts = TritonWNA16Experts()
+    experts.quant_config = quant_config
+    experts.moe_config = moe_config
+    output = torch.zeros(2, 4, dtype=torch.bfloat16)
+    hidden = torch.ones(2, 4, dtype=torch.bfloat16)
+    result = experts.apply(
+        output,
+        hidden,
+        w1,
+        w2,
+        torch.ones(2, 1),
+        torch.zeros(2, 1, dtype=torch.int32),
+        moe_config.activation,
+        2,
+        None,
+        None,
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        None,
+        False,
+    )
+
+    assert result == "upstream-wna16"
+    assert selected_m == [1, 2]
 
 
 def test_fused_moe_rebinds_hcu_moe_alignment(

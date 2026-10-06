@@ -534,7 +534,7 @@ def prewarm_aiter_w4a16_moe(
             "AITER W4A16 prewarm requires an activation"
         )
     block_shape = getattr(quant_config, "block_shape", None)
-    if not block_shape or len(block_shape) < 2:
+    if block_shape is not None and len(block_shape) < 2:
         raise HcuCompressedTensorsMoeError(
             "AITER W4A16 prewarm requires a two-dimensional block shape"
         )
@@ -552,14 +552,135 @@ def prewarm_aiter_w4a16_moe(
         N2=int(w2.shape[1]),
         K=hidden_dim,
         top_k=top_k,
-        block_size=int(block_shape[1]),
+        # AITER names channel-wise W4A16 with block_size=0.  The vLLM
+        # Triton fallback receives a one-group block shape separately.
+        block_size=(
+            0
+            if bool(getattr(quant_config, "_hcu_channel_w4a16", False))
+            else int(block_shape[1])
+        ),
         dtype=dtype,
         device=w1.device,
         quant_type=quant_type,
         activation=str(activation),
-        use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
+        # AITER's W4A16 path does not support shuffled weights.
+        use_shuffle=False,
     )
-    return prewarm_aiter_moe_config(problem, cache_owner=w1)
+    config = prewarm_aiter_moe_config(problem, cache_owner=w1)
+    if bool(getattr(quant_config, "_hcu_channel_w4a16", False)):
+        quant_config._hcu_aiter_w4a16_available = config is not None
+    return config
+
+
+def apply_aiter_w4a16_moe(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: object,
+    global_num_experts: int,
+    expert_map: torch.Tensor | None,
+    quant_config: object,
+    vllm_moe_config: object,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor | None:
+    """Execute channel-wise W4A16 through AITER when a solution exists."""
+
+    if apply_router_weight_on_input:
+        raise HcuCompressedTensorsMoeError(
+            "AITER channel-wise W4A16 does not support router weights on input"
+        )
+    if not bool(getattr(quant_config, "_hcu_channel_w4a16", False)):
+        raise HcuCompressedTensorsMoeError(
+            "AITER channel-wise W4A16 requires channel-wise metadata"
+        )
+    if not bool(getattr(quant_config, "use_int4_w4a16", False)):
+        raise HcuCompressedTensorsMoeError(
+            "AITER channel-wise W4A16 requires an INT4 quantization config"
+        )
+    if (
+        hidden_states.ndim != 2
+        or w1.ndim != 3
+        or w2.ndim != 3
+        or topk_weights.ndim != 2
+        or topk_ids.shape != topk_weights.shape
+        or topk_ids.shape[0] != hidden_states.shape[0]
+        or w1.shape[0] != w2.shape[0]
+        or hidden_states.shape[1] // 2 != w1.shape[2]
+        or hidden_states.shape[1] != w2.shape[1]
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "AITER channel-wise W4A16 received incompatible tensor shapes"
+        )
+
+    from aiter.moe import MoeQuantType
+
+    quant_type = getattr(MoeQuantType, "W4A16", None)
+    if quant_type is None:
+        raise HcuCompressedTensorsMoeError(
+            "AITER does not expose required MoeQuantType.W4A16"
+        )
+    activation_name = str(getattr(activation, "value", activation))
+    problem = AiterMoeProblem(
+        M=int(hidden_states.shape[0]),
+        E=int(w1.shape[0]),
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=int(hidden_states.shape[1]),
+        top_k=int(topk_ids.shape[1]),
+        block_size=0,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        quant_type=quant_type,
+        activation=activation_name,
+        use_shuffle=False,
+    )
+    config = select_aiter_moe_config(problem, cache_owner=w1)
+    if config is None:
+        return None
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        config,
+        cache_owner=w1,
+        block_shape=None,
+    )
+    w1_scale, w2_scale = prepare_aiter_moe_scales(
+        _required_tensor(quant_config, "w1_scale"),
+        _required_tensor(quant_config, "w2_scale"),
+        config,
+        cache_owner=quant_config,
+    )
+    native_expert_map, expert_mask = resolve_aiter_expert_maps(
+        expert_map,
+        int(global_num_experts),
+    )
+    aiter_expert_map = aiter_expert_map_for_solution(
+        native_expert_map,
+        config,
+        int(global_num_experts),
+        expert_mask=expert_mask,
+    )
+    return execute_aiter_moe(
+        config,
+        hidden_states=hidden_states,
+        w1=prepared_w1,
+        w2=prepared_w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=activation_name,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=_required_tensor(quant_config, "w1_zp"),
+        w2_zp=_required_tensor(quant_config, "w2_zp"),
+        block_shape=None,
+        global_num_experts=global_num_experts,
+        expert_map=aiter_expert_map,
+        use_weight_shuffle=bool(getattr(config, "need_shuffle", False)),
+        output_dtype=hidden_states.dtype,
+    )
 
 
 def _slimquant_w4a8_metadata(
@@ -1326,20 +1447,27 @@ def create_aiter_w4a16_qzeros(
             "VLLM_HCU_USE_AITER_W4A16_MOE requires 4-bit weights"
         )
     group_size = getattr(method, "group_size", None)
-    if not isinstance(group_size, int) or group_size <= 0:
+    strategy = _enum_token(getattr(method, "strategy", None)).lower()
+    is_channel = strategy == "channel" and group_size == -1
+    if not is_channel and (not isinstance(group_size, int) or group_size <= 0):
         raise HcuCompressedTensorsMoeError(
-            "AITER W4A16 MoE requires a positive integer group_size"
+            "AITER W4A16 MoE requires channel-wise weights or a positive "
+            "integer group_size"
         )
     if min(num_experts, hidden_size, intermediate_size_per_partition) <= 0:
         raise HcuCompressedTensorsMoeError(
             "AITER W4A16 MoE weight dimensions must be positive"
         )
-    if hidden_size % group_size or intermediate_size_per_partition % group_size:
+    if not is_channel and (
+        hidden_size % group_size or intermediate_size_per_partition % group_size
+    ):
         raise HcuCompressedTensorsMoeError(
             "AITER W4A16 MoE K dimensions must be divisible by group_size"
         )
-    hidden_groups = hidden_size // group_size
-    intermediate_groups = intermediate_size_per_partition // group_size
+    hidden_groups = 1 if is_channel else hidden_size // group_size
+    intermediate_groups = (
+        1 if is_channel else intermediate_size_per_partition // group_size
+    )
     if hasattr(layer, "w13_qzeros") or hasattr(layer, "w2_qzeros"):
         raise HcuCompressedTensorsMoeError(
             "AITER W4A16 MoE zero-point parameters already exist"
@@ -1407,23 +1535,45 @@ def build_aiter_w4a16_quant_config(
             "VLLM_HCU_USE_AITER_W4A16_MOE requires 4-bit weights"
         )
     group_size = getattr(method, "group_size", None)
-    if not isinstance(group_size, int) or group_size <= 0:
+    strategy = _enum_token(getattr(method, "strategy", None)).lower()
+    is_channel = strategy == "channel" and group_size == -1
+    if not is_channel and (not isinstance(group_size, int) or group_size <= 0):
         raise HcuCompressedTensorsMoeError(
-            "AITER W4A16 MoE requires a positive integer group_size"
+            "AITER W4A16 MoE requires channel-wise weights or a positive "
+            "integer group_size"
         )
+    block_shape: list[int]
+    if is_channel:
+        moe = getattr(method, "moe", None)
+        hidden_dim = getattr(moe, "hidden_dim", None)
+        intermediate_dim = getattr(moe, "intermediate_size_per_partition", None)
+        if not isinstance(hidden_dim, int) or hidden_dim <= 0:
+            hidden_dim = int(_required_tensor(layer, "w13_weight_packed").shape[2]) * 2
+        if not isinstance(intermediate_dim, int) or intermediate_dim <= 0:
+            w2_packed = _required_tensor(layer, "w2_weight_packed")
+            intermediate_dim = int(w2_packed.shape[2]) * 2
+        # vLLM Triton interprets this as one scale group for both GEMMs.  The
+        # group covers their largest K dimension, exactly representing the
+        # original channel-wise (one scale per output channel) checkpoint.
+        block_shape = [0, max(hidden_dim, intermediate_dim)]
+    else:
+        block_shape = [0, group_size]
     config = config_builder(
         w1_scale=_required_tensor(layer, "w13_weight_scale"),
         w2_scale=_required_tensor(layer, "w2_weight_scale"),
         w1_zp=_required_tensor(layer, "w13_qzeros"),
         w2_zp=_required_tensor(layer, "w2_qzeros"),
-        block_shape=[0, group_size],
+        block_shape=block_shape,
     )
+    config._hcu_channel_w4a16 = is_channel
+    config._hcu_aiter_w4a16_available = False
     prewarm_aiter_w4a16_moe(method, layer, config)
     return config
 
 
 __all__ = [
     "HcuCompressedTensorsMoeError",
+    "apply_aiter_w4a16_moe",
     "apply_aiter_quantized_moe",
     "apply_aiter_w4a8_moe",
     "apply_aiter_w8a8_fp8_moe",

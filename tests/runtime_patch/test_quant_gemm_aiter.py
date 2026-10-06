@@ -4458,7 +4458,7 @@ def test_slimquant_w4a8_deepep_auto_uses_w4a8_deepgemm_factory_not_aiter(
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
+def test_slimquant_w4a8_deepep_auto_rejects_unsupported_architecture():
     from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
         slimquant_w4a8_uses_deepep_auto,
     )
@@ -4481,6 +4481,42 @@ def test_slimquant_w4a8_deepep_auto_rejects_non_deepseek_v4_architecture():
 
     with pytest.raises(ValueError, match="validated only for DeepSeek-V4"):
         slimquant_w4a8_uses_deepep_auto(moe)
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_deepep_auto_accepts_glm_moe_dsa(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    monkeypatch.setattr(
+        deepep_runtime,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepep_runtime,
+        "_require_slimquant_w4a8_hipc_runtime",
+        lambda: None,
+    )
+    moe = SimpleNamespace(
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(
+            dp_size=2,
+            use_ep=True,
+            all2all_backend="deepep_auto",
+            use_deepep_auto_kernels=True,
+        ),
+        _hcu_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"]
+            )
+        ),
+    )
+
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is True
 
 
 @pytest.mark.hcu
@@ -7769,6 +7805,22 @@ def _fake_moe_wna16_module():
         return SimpleNamespace(**kwargs)
 
     class CompressedTensorsWNA16MoEMethod:
+        def __init__(
+            self,
+            weight_quant,
+            input_quant,
+            moe,
+            layer_name=None,
+        ):
+            del input_quant, layer_name
+            if weight_quant is not None:
+                self.weight_quant = weight_quant
+                self.num_bits = weight_quant.num_bits
+                self.group_size = weight_quant.group_size
+                self.strategy = weight_quant.strategy
+            if moe is not None:
+                self.moe = moe
+
         def create_weights(
             self,
             layer,
@@ -7817,11 +7869,17 @@ def _fake_moe_wna16_module():
 
 
 def _wna16_method(module, *, gated: bool, num_bits: int = 4):
-    method = module.CompressedTensorsWNA16MoEMethod()
+    method = module.CompressedTensorsWNA16MoEMethod.__new__(
+        module.CompressedTensorsWNA16MoEMethod
+    )
     method.num_bits = num_bits
     method.group_size = 4
     method.strategy = "group"
-    method.moe = SimpleNamespace(is_act_and_mul=gated)
+    method.moe = SimpleNamespace(
+        is_act_and_mul=gated,
+        hidden_dim=16,
+        intermediate_size_per_partition=24,
+    )
     return method
 
 
@@ -7901,6 +7959,218 @@ def test_moe_wna16_allocates_correct_initialized_qzeros(
         "is_transposed": True,
         "quant_method": "group",
     }
+
+
+def test_moe_wna16_channel_allocates_one_scale_group_qzeros(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module, attrs_calls, _ = _fake_moe_wna16_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_wna16,
+        "_aiter_requested",
+        lambda _layer=None: True,
+    )
+    patch_compressed_tensors_moe_wna16.apply_to_module(module)
+    method = _wna16_method(module, gated=True)
+    method.group_size = -1
+    method.strategy = "channel"
+    layer = torch.nn.Module()
+
+    method.create_weights(layer, 2, 16, 24, torch.bfloat16, loader="test")
+
+    assert layer.w13_qzeros.shape == (2, 24, 1)
+    assert layer.w2_qzeros.shape == (2, 8, 1)
+    assert torch.all(layer.w13_qzeros == 0x88)
+    assert torch.all(layer.w2_qzeros == 0x88)
+    assert attrs_calls[-2][1]["quant_method"] == "channel"
+
+
+def test_moe_wna16_channel_builds_per_channel_aiter_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module, _, config_calls = _fake_moe_wna16_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_wna16,
+        "_resolve_config_builder",
+        lambda target: target.int4_w4a16_moe_quant_config,
+    )
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_wna16,
+        "_aiter_requested",
+        lambda _layer=None: True,
+    )
+    patch_compressed_tensors_moe_wna16.apply_to_module(module)
+    method = _wna16_method(module, gated=True)
+    method.group_size = -1
+    method.strategy = "channel"
+    layer = torch.nn.Module()
+    method.create_weights(layer, 2, 16, 24, torch.bfloat16)
+    prewarm_calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a16_moe",
+        lambda owner, target_layer, config: prewarm_calls.append(
+            (owner, target_layer, config)
+        ),
+    )
+
+    config = method.get_fused_moe_quant_config(layer)
+
+    assert config.block_shape == [0, 24]
+    assert config._hcu_channel_w4a16 is True
+    assert config._hcu_aiter_w4a16_available is False
+    assert config_calls == [
+        {
+            "w1_scale": layer.w13_weight_scale,
+            "w2_scale": layer.w2_weight_scale,
+            "w1_zp": layer.w13_qzeros,
+            "w2_zp": layer.w2_qzeros,
+            "block_shape": [0, 24],
+        }
+    ]
+    assert prewarm_calls == [(method, layer, config)]
+
+
+@pytest.mark.parametrize("selected", [None, SimpleNamespace(solution_type="ASM")])
+def test_moe_wna16_channel_prewarm_records_aiter_availability(
+    monkeypatch: pytest.MonkeyPatch,
+    selected: object | None,
+):
+    problems: list[AiterMoeProblem] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_moe_config",
+        lambda problem, cache_owner: problems.append(problem) or selected,
+    )
+    layer = SimpleNamespace(
+        w13_weight_packed=torch.ones(2, 24, 8, dtype=torch.uint8),
+        w2_weight_packed=torch.ones(2, 16, 12, dtype=torch.uint8),
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(
+            experts_per_token=1,
+            hidden_dim=16,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+        )
+    )
+    quant_config = SimpleNamespace(
+        block_shape=[0, 24],
+        _hcu_channel_w4a16=True,
+        _hcu_aiter_w4a16_available=False,
+    )
+
+    result = compressed_tensors_moe_runtime.prewarm_aiter_w4a16_moe(
+        method,
+        layer,
+        quant_config,
+    )
+
+    assert result is selected
+    assert quant_config._hcu_aiter_w4a16_available is (selected is not None)
+    assert len(problems) == 1
+    assert problems[0].block_size == 0
+    assert problems[0].use_shuffle is False
+
+
+def test_moe_wna16_explicit_aiter_channel_init_bridges_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module, _, _ = _fake_moe_wna16_module()
+    observed: list[tuple[object, object]] = []
+    original_init = module.CompressedTensorsWNA16MoEMethod.__init__
+
+    def rejecting_init(self, weight_quant, input_quant, moe, layer_name=None):
+        observed.append((weight_quant.strategy, moe.moe_backend))
+        assert weight_quant.strategy == "group"
+        assert moe.moe_backend == "triton"
+        original_init(self, weight_quant, input_quant, moe, layer_name)
+
+    module.CompressedTensorsWNA16MoEMethod.__init__ = rejecting_init
+    monkeypatch.setattr(
+        patch_compressed_tensors_moe_wna16,
+        "_aiter_requested",
+        lambda layer=None: getattr(layer, "moe_backend", None) == "aiter",
+    )
+    patch_compressed_tensors_moe_wna16.apply_to_module(module)
+    weight_quant = SimpleNamespace(
+        strategy="channel",
+        group_size=-1,
+        num_bits=4,
+    )
+    moe = SimpleNamespace(moe_backend="aiter")
+
+    method = module.CompressedTensorsWNA16MoEMethod(
+        weight_quant,
+        None,
+        moe,
+        "model.layers.0.mlp.experts",
+    )
+
+    assert observed == [("group", "triton")]
+    assert method.weight_quant is weight_quant
+    assert method.strategy == "channel"
+    assert method.group_size == -1
+    assert method.moe is moe
+
+
+def test_channel_w4a16_runtime_selects_block_zero_aiter_route(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    selected: list[AiterMoeProblem] = []
+    executed: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        solution_type="ASM",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "select_aiter_moe_config",
+        lambda problem, cache_owner: selected.append(problem) or config,
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "execute_aiter_moe",
+        lambda selected_config, **kwargs: executed.append(
+            {"config": selected_config, **kwargs}
+        )
+        or torch.full_like(kwargs["hidden_states"], 5),
+    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
+    hidden = torch.ones(3, 16, dtype=torch.bfloat16)
+    w1 = torch.ones(2, 24, 8, dtype=torch.uint8)
+    w2 = torch.ones(2, 16, 12, dtype=torch.uint8)
+    quant_config = SimpleNamespace(
+        use_int4_w4a16=True,
+        block_shape=[0, 64],
+        _hcu_channel_w4a16=True,
+        w1_scale=torch.ones(2, 24, 1, dtype=torch.bfloat16),
+        w2_scale=torch.ones(2, 16, 1, dtype=torch.bfloat16),
+        w1_zp=torch.full((2, 12, 1), 0x88, dtype=torch.uint8),
+        w2_zp=torch.full((2, 8, 1), 0x88, dtype=torch.uint8),
+    )
+
+    result = compressed_tensors_moe_runtime.apply_aiter_w4a16_moe(
+        hidden_states=hidden,
+        w1=w1,
+        w2=w2,
+        topk_weights=torch.ones(3, 1),
+        topk_ids=torch.zeros(3, 1, dtype=torch.int32),
+        activation=SimpleNamespace(value="silu"),
+        global_num_experts=2,
+        expert_map=None,
+        quant_config=quant_config,
+        vllm_moe_config=SimpleNamespace(moe_backend="aiter"),
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.all(result == 5)
+    assert len(selected) == 1
+    assert selected[0].block_size == 0
+    assert selected[0].K == 16
+    assert executed[0]["block_shape"] is None
+    assert executed[0]["w1_zp"] is quant_config.w1_zp
 
 
 def test_moe_wna16_quant_config_requires_registered_qzeros(

@@ -106,7 +106,7 @@ def _load_top_level_function(relative_path: str, function_name: str):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == function_name
     )
-    namespace = {}
+    namespace = {"torch": torch}
     ast.fix_missing_locations(function)
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace[function_name]
@@ -143,6 +143,10 @@ def _load_deepseek_shared_mlp_class():
             VLLM_HCU_USE_CUSTOM_OPS=True,
         ),
         "FusedSiluAndMulAndQuant": _FusedActStub,
+        "fused_silu_mul_quant_supported": _load_top_level_function(
+            "vllm_hcu/models/deepseek_v2.py",
+            "fused_silu_mul_quant_supported",
+        ),
         "SiluAndMul": _FloatActStub,
     }
     class_module = ast.Module(
@@ -159,6 +163,28 @@ def _load_deepseek_shared_mlp_class():
     ast.fix_missing_locations(class_module)
     exec(compile(class_module, str(path), "exec"), namespace)
     return namespace["DeepseekV2SharedMLP"], _FusedActStub, _FloatActStub
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    (
+        (torch.int8, True),
+        (torch.float8_e4m3fn, True),
+        (torch.float8_e5m2, True),
+        (torch.uint8, False),
+        (torch.bfloat16, False),
+        (torch.float16, False),
+    ),
+)
+def test_deepseek_fused_silu_quant_requires_supported_weight_dtype(
+    dtype: torch.dtype,
+    expected: bool,
+):
+    supports = _load_top_level_function(
+        "vllm_hcu/models/deepseek_v2.py",
+        "fused_silu_mul_quant_supported",
+    )
+
+    assert supports(SimpleNamespace(dtype=dtype)) is expected
 
 
 def _make_layer(*, fused: bool, mode: str):

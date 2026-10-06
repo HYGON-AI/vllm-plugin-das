@@ -177,13 +177,18 @@ def reshape_and_cache_flash(
     supported cache dtype and both NHD and HND storage. Keep cache writes
     independent of the vendor AITER package; AITER is an MoE backend here.
     """
+    operator_kv_cache_dtype = (
+        "auto"
+        if kv_cache_dtype in {"bfloat16", "float16"}
+        else kv_cache_dtype
+    )
     torch.ops.hcu_ops.reshape_and_cache_flash(
         key,
         value,
         key_cache,
         value_cache,
         slot_mapping,
-        kv_cache_dtype,
+        operator_kv_cache_dtype,
         k_scale,
         v_scale,
     )
