@@ -134,6 +134,10 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.op_opt.quantization.lightop_autoawq"
     ] == "always"
     framework_order = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.offline_expert_map",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
@@ -188,6 +192,34 @@ def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
         "vllm.v1.worker.gpu.model_states.default",
     ) in worker_dispatcher.worker_callback_names()
     assert worker_dispatcher._patch_features()[patch_id] == "always"
+
+
+def test_offline_eplb_callbacks_are_enabled_only_by_map_paths():
+    patch_ids = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.offline_expert_map",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
+    )
+    features = worker_dispatcher._patch_features()
+    assert all(features[patch_id] == "offline_eplb" for patch_id in patch_ids)
+
+    disabled = worker_dispatcher._feature_states(
+        None, worker_dispatcher.HcuFeatureConfig()
+    )
+    static = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(expert_map_path="/tmp/map.json"),
+    )
+    record = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(
+            expert_map_record_path="/tmp/record.json"
+        ),
+    )
+    assert disabled["offline_eplb"] is False
+    assert static["offline_eplb"] is True
+    assert record["offline_eplb"] is True
 
 
 def test_cold_replacement_metadata_matches_lazy_adapter_contracts():

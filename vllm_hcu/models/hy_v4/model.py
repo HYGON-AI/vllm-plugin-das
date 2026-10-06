@@ -84,7 +84,11 @@ from .attention import (
     require_local_indexer_producer,
 )
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
-from .moe import HYV4FeedForward, HYV4MoEFused
+from .moe import (
+    HYV4FeedForward,
+    HYV4MoEFused,
+    validate_hyv4_offline_eplb_mode,
+)
 
 logger = init_logger(__name__)
 
@@ -237,7 +241,62 @@ def _try_load_hyv4_fp8_projection(
 
 
 def _require_hyv4_static_plan(model):
-    raise NotImplementedError("HYV4 EPLB requires a validated static placement plan")
+    from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
+        StaticEplbPlan,
+    )
+
+    inner = getattr(model, "model", None)
+    mode = getattr(model, "_vllm_hcu_offline_eplb_mode", None)
+    if mode is None and inner is not None:
+        mode = getattr(inner, "_vllm_hcu_offline_eplb_mode", None)
+    if mode not in ("static", "record"):
+        raise NotImplementedError(
+            "HYV4 EPLB state requires a validated static placement plan "
+            "or record mode"
+        )
+
+    plan = getattr(model, "_vllm_hcu_static_eplb_plan", None)
+    if plan is None and inner is not None:
+        plan = getattr(inner, "_vllm_hcu_static_eplb_plan", None)
+    if mode == "static" and not isinstance(plan, StaticEplbPlan):
+        raise NotImplementedError(
+            "HYV4 static EPLB requires a validated placement plan"
+        )
+    if plan is not None and not isinstance(plan, StaticEplbPlan):
+        raise ValueError("HYV4 static EPLB plan has an invalid type")
+    if mode == "record" and plan is not None:
+        raise ValueError("HYV4 record EPLB cannot consume a static plan")
+
+    layers = tuple(model.moe_layers)
+    if len(layers) != model.num_moe_layers:
+        raise ValueError("HYV4 offline EPLB local MoE layer count mismatch")
+    logical = model.num_logical_experts
+    physical = model.num_physical_experts
+    redundant = model.num_redundant_experts
+    if logical + redundant != physical:
+        raise ValueError("HYV4 offline EPLB expert counts disagree")
+    if plan is None:
+        return None
+    if (
+        plan.num_logical_experts != logical
+        or plan.num_physical_experts != physical
+        or plan.num_redundant_experts != redundant
+        or len(plan._map_values) != len(layers)
+    ):
+        raise ValueError(
+            "HYV4 static EPLB metadata does not match the bound plan"
+        )
+    for index, layer in enumerate(layers):
+        row = getattr(
+            getattr(layer, "routed_experts", None),
+            "_vllm_hcu_static_eplb_row",
+            None,
+        )
+        if row != plan.layer_map(index):
+            raise ValueError(
+                "HYV4 static EPLB layer row does not match the bound plan"
+            )
+    return plan
 
 
 class _HYV4CheckpointAccounting:
@@ -254,6 +313,13 @@ class _HYV4CheckpointAccounting:
         self.fp8_pending: dict[tuple[str, int | None], dict[str, torch.Tensor]] = {}
         self.fp8_received: set[tuple[tuple[str, int | None], str]] = set()
         num_experts = getattr(model.config, "num_experts", 0)
+        num_physical_experts = getattr(
+            model,
+            "num_physical_experts",
+            num_experts,
+        )
+        if num_physical_experts <= 0:
+            num_physical_experts = num_experts
         for name, param in model.named_parameters():
             if isinstance(param, KVCacheScaleParameter):
                 continue
@@ -264,7 +330,7 @@ class _HYV4CheckpointAccounting:
                 owner = getattr(getattr(param, "weight_loader", None), "__self__", None)
                 manager = getattr(owner, "expert_map_manager", None)
                 local = (
-                    [i for i in range(num_experts)
+                    [i for i in range(num_physical_experts)
                      if manager.map_global_to_local(i) >= 0]
                     if manager is not None else list(range(num_experts))
                 )
@@ -456,8 +522,12 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
         eplb_config = parallel_config.eplb_config
-        if parallel_config.enable_eplb or eplb_config.num_redundant_experts:
-            raise NotImplementedError("HYV4 EPLB is outside this MR")
+        self._vllm_hcu_offline_eplb_mode = (
+            validate_hyv4_offline_eplb_mode(
+                vllm_config,
+                enable_eplb=parallel_config.enable_eplb,
+            )
+        )
         self.num_redundant_experts = eplb_config.num_redundant_experts
         self.device = current_platform.device_type
         self.vocab_size = config.vocab_size
@@ -571,10 +641,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
-        plan = _require_hyv4_static_plan(self)
-        if (num_physical_experts != plan.num_physical_experts
-                or num_local_physical_experts != self.num_local_physical_experts):
-            raise ValueError("HYV4 static EPLB cannot change physical expert counts")
+        _require_hyv4_static_plan(self)
+        if (
+            num_physical_experts != self.num_physical_experts
+            or num_local_physical_experts != self.num_local_physical_experts
+        ):
+            raise ValueError(
+                "HYV4 offline EPLB cannot change physical expert counts"
+            )
 
     def set_eplb_state(
         self,
@@ -582,17 +656,20 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
-        plan = _require_hyv4_static_plan(self)
-        layers = len(plan._map_values)
-        logical = plan.num_logical_experts
+        _require_hyv4_static_plan(self)
+        layers = self.num_moe_layers
+        logical = self.num_logical_experts
+        physical = self.num_physical_experts
         if (not isinstance(expert_load_view, torch.Tensor)
-                or expert_load_view.shape != (layers, plan.num_physical_experts)
+                or expert_load_view.shape != (layers, physical)
                 or not isinstance(logical_to_physical_map, torch.Tensor)
                 or logical_to_physical_map.ndim != 3
                 or logical_to_physical_map.shape[:2] != (layers, logical)
                 or not isinstance(logical_replica_count, torch.Tensor)
                 or logical_replica_count.shape != (layers, logical)):
-            raise ValueError("HYV4 static EPLB state does not match the bound plan")
+            raise ValueError(
+                "HYV4 offline EPLB state does not match expert metadata"
+            )
         MixtureOfExperts.set_eplb_state(self, expert_load_view,
                                        logical_to_physical_map, logical_replica_count)
 
@@ -665,7 +742,13 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             )
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        # Static direct loading wraps the RoutedExperts loader and fans each
+        # logical checkpoint row out to every planned physical replica. Record
+        # mode has no bound rows yet, so initialize the official default
+        # redundant slots explicitly using the logical modulo mapping.
         num_checkpoint_experts = num_experts
+        if not hasattr(self, "_vllm_hcu_static_eplb_plan"):
+            num_checkpoint_experts += num_redundant_experts
         loaded_local_expert = False
         for expert_id in range(num_checkpoint_experts):
             logical_expert_id = expert_id % num_experts
@@ -968,6 +1051,9 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
 
         self.model = HYV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self._vllm_hcu_offline_eplb_mode = (
+            getattr(self.model, "_vllm_hcu_offline_eplb_mode", None)
         )
         if get_pp_group().is_last_rank:
             lm_head_prefix = maybe_prefix(prefix, "lm_head")
