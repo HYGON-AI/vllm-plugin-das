@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass as official_dataclass
@@ -536,21 +537,34 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(add_cli_args)
     def hcu_add_cli_args(parser):
         result = add_cli_args(parser)
-        for action in getattr(result, "_actions", ()):
-            if getattr(action, "dest", None) != "all2all_backend":
-                continue
-            choices = getattr(action, "choices", None)
-            if choices is None:
-                raise PatchCompatibilityError(
-                    "--all2all-backend CLI action has no audited choices"
-                )
-            if _DEEPEP_AUTO_BACKEND not in choices:
-                action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
-            break
-        else:
+        actions = {
+            getattr(action, "dest", None): action
+            for action in getattr(result, "_actions", ())
+        }
+        all2all_action = actions.get("all2all_backend")
+        if all2all_action is None:
             raise PatchCompatibilityError(
                 "EngineArgs.add_cli_args did not install --all2all-backend"
             )
+        choices = getattr(all2all_action, "choices", None)
+        if choices is None:
+            raise PatchCompatibilityError(
+                "--all2all-backend CLI action has no audited choices"
+            )
+        if _DEEPEP_AUTO_BACKEND not in choices:
+            all2all_action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
+
+        eplb_action = actions.get("eplb_config")
+        if eplb_action is None or not callable(getattr(eplb_action, "type", None)):
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install an audited "
+                "--eplb-config converter"
+            )
+        # Upstream eagerly constructs EPLBConfig inside argparse.  Delay that
+        # validation so the wrapped EngineArgs constructor can first extract
+        # the HCU-owned offline fields and then pass only official fields to
+        # EPLBConfig.
+        eplb_action.type = json.loads
         return result
 
     setattr(engine_args, "_vllm_hcu_original_add_cli_args", add_cli_descriptor)

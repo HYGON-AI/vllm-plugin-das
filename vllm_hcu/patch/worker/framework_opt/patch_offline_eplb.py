@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_hcu.model_executor.layers.fused_moe.static_eplb import (
     StaticEplbPlan,
@@ -49,6 +50,7 @@ _RECORD_PROPOSAL_ALLOWED = ContextVar(
     "hcu_eplb_record_proposal_allowed",
     default=True,
 )
+logger = init_logger("vllm.hcu.offline_eplb")
 
 
 def _ep_rank() -> int:
@@ -505,6 +507,22 @@ def apply_to_module(module) -> bool:
             )
             model_state.logical_to_physical_map.copy_(ordered)
             self._vllm_hcu_static_source_sha256 = plan.source_sha256
+            logger.info(
+                "Committed static EPLB runtime map: model=%s "
+                "source_sha256=%s shape=%s dispatch_policy=%s "
+                "ep_rank=%d/%d transfer_events=%d rearrangement_events=%d",
+                model_state._hcu_offline_model_key,
+                plan.source_sha256,
+                (
+                    len(plan.physical_to_logical_map),
+                    plan.num_physical_experts,
+                ),
+                policy,
+                group.rank(),
+                group.size(),
+                self._vllm_hcu_offline_transfer_events,
+                self._vllm_hcu_offline_rearrangement_events,
+            )
         else:
             record_offline_expert_map(
                 record_path,

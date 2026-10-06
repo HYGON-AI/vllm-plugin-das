@@ -362,6 +362,10 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         feature="deepep_low_latency",
     ),
     _CallbackSpec(
+        _adapter("framework_opt", "patch_gpu_dp_utils"),
+        feature="deepep_low_latency",
+    ),
+    _CallbackSpec(
         _adapter("framework_opt", "patch_forward_context"),
         feature="forward_context",
     ),
@@ -428,6 +432,7 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.op_opt.moe.all2all_utils",
         "worker.op_opt.mla.lightly_cp_wrapper",
         "worker.framework_opt.dp.deepep_low_latency",
+        "worker.framework_opt.dp.gpu_deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
         "worker.framework_opt.communicator.pynccl_wrapper_all_to_all",

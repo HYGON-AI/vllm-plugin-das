@@ -560,6 +560,50 @@ print(json.dumps({
 
 
 @pytest.mark.hcu
+def test_installed_cli_defers_hcu_offline_eplb_fields_until_engine_args():
+    result = _fresh_python(
+        r'''
+import json
+
+from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm_hcu.patch.config import get_hcu_config
+
+parser = FlexibleArgumentParser()
+EngineArgs.add_cli_args(parser)
+namespace = parser.parse_args([
+    "--model", "/models/Hy4-preview-Channel-FP8-w8a8",
+    "--eplb-config", json.dumps({
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+        "expert_map_record_path": "/maps/hy4-calibration.json",
+    }),
+])
+engine_args = EngineArgs.from_cli_args(namespace)
+print(json.dumps({
+    "parsed_type": type(namespace.eplb_config).__name__,
+    "engine_type": type(engine_args.eplb_config).__name__,
+    "window_size": engine_args.eplb_config.window_size,
+    "use_async": engine_args.eplb_config.use_async,
+    "record_path": get_hcu_config(engine_args).expert_map_record_path,
+}))
+''',
+        plugins="hcu",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "parsed_type": "dict",
+        "engine_type": "EPLBConfig",
+        "window_size": 16,
+        "use_async": False,
+        "record_path": "/maps/hy4-calibration.json",
+    }
+
+
+@pytest.mark.hcu
 def test_arg_utils_first_import_applies_sidecar_before_first_construction():
     result = _fresh_python(
         "import dataclasses,json,tempfile; "

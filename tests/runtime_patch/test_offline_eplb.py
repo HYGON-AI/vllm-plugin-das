@@ -468,6 +468,43 @@ def test_static_add_commits_plan_with_gloo_and_zero_mutation_counters(
     assert fixture.state._vllm_hcu_offline_rearrangement_events == 0
 
 
+def test_static_add_logs_committed_runtime_map_fingerprint(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_hcu.patch.worker.framework_opt.patch_offline_eplb as api
+
+    fixture = _setup_state(tmp_path, monkeypatch, mode="static")
+    fixture.state.parallel_config._vllm_hcu_eplb_static_dispatch_policy = (
+        "locality_fair"
+    )
+    fixture.group.device_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    info_calls = []
+    monkeypatch.setattr(
+        api,
+        "logger",
+        SimpleNamespace(info=lambda *args: info_calls.append(args)),
+    )
+
+    fixture.state.add_model(fixture.model, fixture.model_config)
+
+    assert info_calls == [
+        (
+            "Committed static EPLB runtime map: model=%s source_sha256=%s "
+            "shape=%s dispatch_policy=%s ep_rank=%d/%d "
+            "transfer_events=%d rearrangement_events=%d",
+            "GenericMoE",
+            fixture.model._vllm_hcu_static_eplb_plan.source_sha256,
+            (2, 4),
+            "locality_fair",
+            1,
+            2,
+            0,
+            0,
+        )
+    ]
+
+
 def test_static_committed_map_reaches_installed_deepep_and_masked_deepgemm(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

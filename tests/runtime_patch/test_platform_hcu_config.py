@@ -131,10 +131,22 @@ def _make_arg_utils_module() -> ModuleType:
 
         @staticmethod
         def add_cli_args(parser: argparse.ArgumentParser):
+            def parse_official_eplb(value: str) -> dict[str, Any]:
+                payload = json.loads(value)
+                unexpected = set(payload) & patch_engine_args._HCU_EPLB_FIELDS.keys()
+                if unexpected:
+                    raise ValueError(f"unexpected EPLB fields: {sorted(unexpected)}")
+                return payload
+
             parser.add_argument(
                 "--all2all-backend",
                 choices=("allgather_reducescatter", "deepep_low_latency"),
                 default="allgather_reducescatter",
+            )
+            parser.add_argument(
+                "--eplb-config",
+                type=parse_official_eplb,
+                default={},
             )
             return parser
 
@@ -264,6 +276,36 @@ def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:
 
     assert args.eplb_config == {}
     assert get_hcu_config(args).expert_map_record_path == "/maps/record.json"
+
+
+def test_engine_args_cli_delays_offline_eplb_validation_until_hcu_init() -> None:
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+    parser = module.EngineArgs.add_cli_args(argparse.ArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--eplb-config",
+            json.dumps(
+                {
+                    "window_size": 16,
+                    "step_interval": 16,
+                    "num_redundant_experts": 8,
+                    "use_async": False,
+                    "expert_map_record_path": "/maps/hy4.json",
+                }
+            ),
+        ]
+    )
+    args = module.EngineArgs.from_cli_args(namespace)
+
+    assert args.eplb_config == {
+        "window_size": 16,
+        "step_interval": 16,
+        "num_redundant_experts": 8,
+        "use_async": False,
+    }
+    assert get_hcu_config(args).expert_map_record_path == "/maps/hy4.json"
 
 
 def test_engine_args_rejects_conflicting_nested_offline_eplb_sidecar() -> None:

@@ -353,6 +353,9 @@ def test_hy4_offline_eplb_calibration_and_static_commands() -> None:
         )
         assert _option_value(command, "--moe-backend") == "deep_gemm"
         assert _option_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+        assert _option_value(command, "--kv-cache-memory-bytes") == "536870912"
+        assert _option_value(command, "--gpu-memory-utilization") == "0.95"
+        assert _option_value(command, "--max-num-batched-tokens") == "64"
         assert json.loads(
             _option_value(command, "--speculative-config")
         ) == {"method": "mtp", "num_speculative_tokens": 3}
