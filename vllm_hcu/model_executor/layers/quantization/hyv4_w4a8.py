@@ -202,10 +202,11 @@ class HYV4W4A8LinearMethod(SlimQuantW4A8Int8LinearMethod):
 class HYV4W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
     """Normalize serialized pieces before the current loader/layout lifecycle.
 
-    Current SlimQuant multiplies canonical channel scales by 16 for INT4
-    kernels. HYV4 serializes signed-INT4 multipliers, so divide on loading.
-    No post-load conversion can accidentally swap an installed AITER layout.
-    supports_eplb remains the current owner's False capability.
+    HIPC kernels consume high-nibble packed weights, so their canonical scale
+    is the serialized signed-INT4 multiplier divided by 16. The unpacked
+    Triton fallback restores that factor only at its call site. No post-load
+    conversion can accidentally swap an installed AITER layout. supports_eplb
+    remains the current owner's False capability.
     """
 
     def create_weights(self, layer, num_experts, hidden_size,
