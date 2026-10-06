@@ -81,6 +81,9 @@ def _constructed_indexer(monkeypatch, world_size, metadata, cache, inputs, group
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.dcp_rank = 0
+        self.dcp_world_size = 1
+        self.cp_kv_cache_interleave_size = 1
         self.pcp_world_size = world_size
         self._forward_method = self.forward_hip
 
