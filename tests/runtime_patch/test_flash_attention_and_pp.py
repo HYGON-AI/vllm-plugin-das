@@ -280,6 +280,77 @@ def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
     assert key.stride() == original_stride
 
 
+def test_hcu_fa_boundary_uses_bshd_compat_view_for_hnd_128_pages(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    physical = torch.linspace(-2, 2, 3 * 2 * 128 * 8).reshape(3, 2, 128, 8)
+    logical = physical.transpose(1, 2)
+
+    def vendor(q, k, v, layout="bshd"):
+        return k, v, layout
+
+    actual_key, actual_value, actual_layout = fa_utils._with_kv_cache_layout(
+        vendor, "probe"
+    )(q=None, k=logical, v=logical)
+
+    assert actual_layout == "bshd"
+    assert actual_key.shape == logical.shape
+    assert actual_value.shape == logical.shape
+    assert actual_key.stride() == logical.stride()
+    assert actual_value.stride() == logical.stride()
+    assert actual_key.data_ptr() == physical.data_ptr()
+    assert actual_value.data_ptr() == physical.data_ptr()
+
+
+def test_hcu_fa_boundary_supplies_global_descales_for_hnd_128_fp8_cache(
+    monkeypatch,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    logical = torch.zeros(
+        3, 2, 128, 8, dtype=torch.float8_e5m2
+    ).transpose(1, 2)
+    k_descale = torch.tensor(0.25).expand(3, 2)
+    v_descale = torch.tensor(0.75).expand(3, 2)
+
+    def vendor(
+        q,
+        k,
+        v,
+        layout="bshd",
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    ):
+        return layout, q_descale, k_descale, v_descale
+
+    layout, q_descale, actual_k_descale, actual_v_descale = (
+        fa_utils._with_kv_cache_layout(vendor, "probe")(
+            q=torch.zeros(1, 4, 8),
+            k=logical,
+            v=logical,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+    )
+
+    assert layout == "bshd"
+    torch.testing.assert_close(q_descale, torch.ones(1))
+    torch.testing.assert_close(actual_k_descale, torch.tensor([0.25]))
+    torch.testing.assert_close(actual_v_descale, torch.tensor([0.75]))
+    assert q_descale.numel() == 1
+    assert actual_k_descale.numel() == 1
+    assert actual_v_descale.numel() == 1
+    assert actual_k_descale.untyped_storage().data_ptr() == (
+        k_descale.untyped_storage().data_ptr()
+    )
+    assert actual_v_descale.untyped_storage().data_ptr() == (
+        v_descale.untyped_storage().data_ptr()
+    )
+
+
 def test_hcu_fa_boundary_preserves_nonpaged_kv_axes(monkeypatch):
     fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
     key = torch.zeros(64, 2, 8)

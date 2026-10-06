@@ -78,23 +78,55 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
     def wrapped(*args: Any, **kwargs: Any):
         layout = _flash_attn_layout()
         if layout == "bhsd":
+            key_cache = args[1] if len(args) > 1 else kwargs.get("k")
+            # The gfx936 vendor varlen_fwd ABI does not receive pa_layout.
+            # For 128-token pages it consequently reads dim 1 as the page
+            # size. Keep the zero-copy logical bshd view so dim 1 remains the
+            # page axis; 64-token pages use the native bhsd paged/gather path.
+            use_bshd_compat = (
+                isinstance(key_cache, torch.Tensor)
+                and key_cache.ndim == 4
+                and key_cache.shape[1] == 128
+            )
+            if use_bshd_compat:
+                layout = "bshd"
+                # vLLM expands each layer-global KV scale to [batch, heads],
+                # while this vendor path accepts exactly one scalar. Recover
+                # a zero-copy scalar view of the shared backing value.
+                for descale_name in ("q_descale", "k_descale", "v_descale"):
+                    descale = kwargs.get(descale_name)
+                    if isinstance(descale, torch.Tensor) and descale.numel() > 1:
+                        kwargs[descale_name] = descale.as_strided(
+                            (1,), (1,), descale.storage_offset()
+                        )
+                # The vendor compatibility path casts BF16 queries directly
+                # to the FP8 cache dtype before dispatch. That cast has an
+                # implicit unit scale, but the kernel requires all three
+                # descale tensors whenever K/V descales are present.
+                if (
+                    key_cache.dtype == torch.float8_e5m2
+                    and kwargs.get("q_descale") is None
+                    and isinstance(kwargs.get("k_descale"), torch.Tensor)
+                ):
+                    kwargs["q_descale"] = torch.ones_like(kwargs["k_descale"])
             # vLLM exposes logical [block, token, head, channel] views even
             # when the backing storage is HND. The vendor bhsd interface
             # also requires the head/token axes in that order in the shape.
-            positional = list(args)
-            for position, parameter in ((1, "k"), (2, "v")):
-                cache = (
-                    positional[position]
-                    if len(positional) > position
-                    else kwargs.get(parameter)
-                )
-                if isinstance(cache, torch.Tensor) and cache.ndim == 4:
-                    native_view = cache.transpose(1, 2)
-                    if len(positional) > position:
-                        positional[position] = native_view
-                    else:
-                        kwargs[parameter] = native_view
-            args = tuple(positional)
+            else:
+                positional = list(args)
+                for position, parameter in ((1, "k"), (2, "v")):
+                    cache = (
+                        positional[position]
+                        if len(positional) > position
+                        else kwargs.get(parameter)
+                    )
+                    if isinstance(cache, torch.Tensor) and cache.ndim == 4:
+                        native_view = cache.transpose(1, 2)
+                        if len(positional) > position:
+                            positional[position] = native_view
+                        else:
+                            kwargs[parameter] = native_view
+                args = tuple(positional)
         if layout_position is not None and len(args) > layout_position:
             positional = list(args)
             positional[layout_position] = layout
