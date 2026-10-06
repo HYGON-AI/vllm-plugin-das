@@ -20,9 +20,11 @@ from urllib.request import Request
 from tests.integration.server.evalscope_server import (
     _assert_pass_criteria,
     _direct_urlopen,
+    _evaluation_environment,
     _open_log,
     _owned_process_environment,
     _require_runtime,
+    _require_humaneval_execution_isolation,
     _reset_evalscope_artifacts,
     _server_environment,
     _terminate_process_group,
@@ -315,6 +317,7 @@ def run_evalscope_pd_server_test(
         model_label=model_label,
         required_hcu_count=required_hcu_count,
     )
+    _require_humaneval_execution_isolation(config)
     commands = pd_commands(config, model_env=model_env)
     startup_timeout = int(
         os.environ.get(
@@ -425,7 +428,7 @@ def run_evalscope_pd_server_test(
             result = subprocess.run(
                 eval_command,
                 cwd=ROOT,
-                env=commands.proxy_env,
+                env=_evaluation_environment(eval_config),
                 stdout=eval_log,
                 stderr=subprocess.STDOUT,
                 check=False,

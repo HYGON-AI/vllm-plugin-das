@@ -355,6 +355,7 @@ def test_real_qsa_backend_accepts_fp8_capability_contract():
     env["VLLM_PLUGINS"] = "hcu"
     code = """
 import torch
+import vllm
 
 from vllm_hcu.patch.worker import prepare_worker_patches
 

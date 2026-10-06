@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: kimi_k26_gfx938_humaneval64
+model: /models/Kimi-K2.6
+
+server:
+  host: 127.0.0.1
+  port: 10223
+  startup_timeout_s: 7200
+  shutdown_timeout_s: 180
+  served_model_name: Kimi-K2.6
+  environment:
+    VLLM_USE_V2_MODEL_RUNNER: "1"
+  args:
+    - --trust-remote-code
+    - --language-model-only
+    - --tensor-parallel-size
+    - "8"
+    - --attention-backend
+    - FLASHMLA
+    - --moe-backend
+    - triton
+    - --reasoning-parser
+    - kimi_k2
+    - --enable-prefix-caching
+    - --max-model-len
+    - "8192"
+    - --max-num-batched-tokens
+    - "4096"
+    - --max-num-seqs
+    - "8"
+    - --generation-config
+    - vllm
+  prefix_probe:
+    metric: "vllm:prefix_cache_hits_total"
+    timeout_s: 300
+    max_tokens: 32
+    content_repeat: 32
+    messages:
+      - role: user
+        content: >-
+          This is a deterministic shared-prefix validation request. Preserve this
+          paragraph as context while answering only the final instruction. The
+          runtime must reuse the same prefix on the second identical request,
+          keep the KV cache coherent, and return a short meaningful response.
+          Final instruction: reply OK.
+
+evalscope:
+  work_dir: /tmp/vllm-hcu-evalscope/kimi-k26-gfx938-humaneval64
+  api_key: EMPTY
+  eval_type: openai_api
+  generation_config:
+    temperature: 0
+    do_sample: false
+    max_tokens: 1024
+    extra_body:
+      chat_template_kwargs:
+        thinking: false
+  stream: true
+  eval_batch_size: 8
+  timeout: 7200
+  limit: 64
+  datasets: [humaneval]
+  dataset_args:
+    humaneval: {}
+  pass_criteria:
+    dataset: humaneval
+    mean_acc: 1.0
+    mean_acc_pass@1: 1.0
+    num_predictions: 64
+    num_reviews: 64
+    normalize_code_fences: true
+  no_timestamp: true

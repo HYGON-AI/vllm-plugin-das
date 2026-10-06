@@ -82,6 +82,7 @@ def _install_stub(monkeypatch, name, **values):
 @pytest.fixture
 def cpu_flashmla(monkeypatch):
     class AttentionCGSupport:
+        NEVER = "never"
         UNIFORM_BATCH = "uniform-batch"
 
     class AttentionType:
@@ -89,6 +90,12 @@ def cpu_flashmla(monkeypatch):
 
     class QueryLenSupport:
         UNIFORM = "uniform"
+
+    class MLACommonMetadataBuilder(_GenericStub):
+        @classmethod
+        def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+            del vllm_config, kv_cache_spec
+            return cls._cudagraph_support
 
     _install_stub(monkeypatch, "vllm.envs", VLLM_BATCH_INVARIANT=False)
     _install_stub(monkeypatch, "vllm.config", VllmConfig=type("VllmConfig", (), {}))
@@ -109,7 +116,7 @@ def cpu_flashmla(monkeypatch):
         MLACommonDecodeMetadata=_GenericStub,
         MLACommonImpl=_MLACommonImplStub,
         MLACommonMetadata=_GenericStub,
-        MLACommonMetadataBuilder=_GenericStub,
+        MLACommonMetadataBuilder=MLACommonMetadataBuilder,
         QueryLenSupport=QueryLenSupport,
     )
     _install_stub(
@@ -990,6 +997,35 @@ def test_flashmla_impl_owns_quant_query_capability(
         kv_sharing_target_layer_name=None,
     )
     assert impl.supports_quant_query_input is expected
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [
+        ("auto", "uniform-batch"),
+        ("float16", "uniform-batch"),
+        ("bfloat16", "uniform-batch"),
+        ("fp8", "uniform-batch"),
+        ("fp8_e4m3", "uniform-batch"),
+        ("fp8_e5m2", "uniform-batch"),
+        ("fp8_ds_mla", "uniform-batch"),
+    ],
+)
+def test_flashmla_supported_kv_dtypes_retain_full_graph_support(
+    cpu_flashmla,
+    cache_dtype,
+    expected,
+):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+    )
+
+    support = cpu_flashmla.FlashMLAMetadataBuilder.get_cudagraph_support(
+        config,
+        SimpleNamespace(),
+    )
+
+    assert support == expected
 
 
 def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(

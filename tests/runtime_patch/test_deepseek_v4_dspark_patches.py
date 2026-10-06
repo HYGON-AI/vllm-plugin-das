@@ -30,6 +30,45 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def test_rocm_compressor_fusion_skips_mtp_k_mismatch() -> None:
+    original_calls: list[object] = []
+    warnings: list[tuple[str, tuple[object, ...]]] = []
+
+    class DeepseekV4ROCMAiterMLAAttention:
+        def __init__(self, main_k: int, indexer_k: int) -> None:
+            self.compressor = SimpleNamespace(
+                fused_wkv_wgate=SimpleNamespace(weight=torch.empty(8, main_k))
+            )
+            self.indexer = SimpleNamespace(
+                compressor=SimpleNamespace(
+                    fused_wkv_wgate=SimpleNamespace(
+                        weight=torch.empty(4, indexer_k)
+                    )
+                )
+            )
+
+        def prepare_compressor_gemm_fusion(self) -> bool:
+            original_calls.append(self)
+            return True
+
+    module = _module(
+        patch_deepseek_v4_rocm_compressor_fusion.TARGET_MODULE,
+        DeepseekV4ROCMAiterMLAAttention=DeepseekV4ROCMAiterMLAAttention,
+        logger=SimpleNamespace(
+            warning_once=lambda message, *args: warnings.append((message, args))
+        ),
+    )
+
+    assert patch_deepseek_v4_rocm_compressor_fusion.apply_to_module(module) is True
+    compatible = DeepseekV4ROCMAiterMLAAttention(16, 16)
+    incompatible = DeepseekV4ROCMAiterMLAAttention(32, 16)
+
+    assert compatible.prepare_compressor_gemm_fusion() is True
+    assert incompatible.prepare_compressor_gemm_fusion() is False
+    assert original_calls == [compatible]
+    assert warnings and warnings[0][1] == (32, 16)
+
+
 def test_bf16_compressor_writes_finite_576_dim_row_at_last_rope_position() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires an HCU GPU to execute the Triton kernel")

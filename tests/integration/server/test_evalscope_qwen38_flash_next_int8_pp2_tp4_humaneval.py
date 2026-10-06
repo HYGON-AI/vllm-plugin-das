@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -87,14 +88,14 @@ def test_qwen38_flash_next_int8_pp2_tp4_command_contract(
         "VLLM_HCU_PLE_PREFETCH_STREAM": "1",
     }
     assert evaluation == [
-        "evalscope",
+        sys.executable,
+        "-m",
+        "tests.integration.server.evalscope_secure_cli",
         "eval",
         "--model",
         model.rsplit("/", 1)[-1],
         "--api-url",
         "http://127.0.0.1:10134/v1",
-        "--api-key",
-        "EMPTY",
         "--eval-type",
         "openai_api",
         "--generation-config",
