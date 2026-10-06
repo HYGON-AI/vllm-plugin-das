@@ -98,7 +98,7 @@ def config_and_map(
                         "record_kind": "proposal",
                         "model_name": "generic-test",
                         "model_class": key,
-                        "num_moe_layers": 2,
+                        "num_moe_layers": len(rows),
                         "num_logical_experts": 3,
                         "num_physical_experts": 4,
                         "num_redundant_experts": 1,
