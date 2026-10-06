@@ -765,7 +765,7 @@ Evidence:
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8-run1`
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8-run2`
 
-## DeepSeek-V4-Pro-0813 SlimQuant W4A8 single-node TP8 smoke
+## DeepSeek-V4-Pro-0813 SlimQuant W4A8 single-node TP8 validation
 
 The 66-shard checkpoint is 789.42 GiB on disk, or 98.68 GiB/rank before
 runtime overhead at TP8. The following profile completed a cold NFS load,
@@ -814,6 +814,30 @@ curl --noproxy '*' -sS \
   }'
 ```
 
+Run HumanEval16 from a new result directory and bypass all proxy variables:
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/deepseek-v4-pro-0813-w4a8-fresh-run
+test ! -e "$work_dir"
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model DeepSeek-V4-Pro-0813-Channel-INT4-w4a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"thinking":false}}}' \
+  --stream --eval-batch-size 1 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" --no-timestamp
+```
+
 All ranks constructed `HcuGPUModelRunnerV2`. Public E4M3 resolved to the
 DeepSeek sparse `fp8_ds_mla` format with BLHNC storage. The target resolved
 `FULL_AND_PIECEWISE`; target and DSpark PIECEWISE/FULL captures completed
@@ -824,6 +848,12 @@ allocated about 21.4--21.6 GiB/rank to KV cache at 0.90 utilization. The
 smoke request returned HTTP 200 with 64 generated tokens; DSpark accepted
 41/168 drafted tokens during this short request.
 
+The fresh HumanEval16 run passed raw Accuracy and Pass@1 at 16/16. All 16
+requests finished with `stop`; none exhausted the 2,048-token budget or
+errored, so no syntax-aware normalization was needed. It observed 16.88
+output tok/s, 620.9 ms mean TTFT, and 54.5 ms mean TPOT. The run generated
+2,057 tokens and accepted 1,726/2,303 DSpark draft tokens (75.0%).
+
 `DeepSeek-V4-Pro-0813-INT4-Channel` has the same config hash, index hash,
 66-shard count, total physical size, and sampled shard sizes. It is a separate
 directory rather than hard links, so it was classified as a metadata-equivalent
@@ -831,13 +861,17 @@ artifact and was not cold-started again. In contrast,
 `DeepSeek-V4-Pro-0813-INT8-Channel` occupies 1,545.42 GiB physically, or
 193.18 GiB/rank at TP8 before runtime overhead, and cannot fit on this
 eight-card node with 143.98 GiB usable per card. It requires at least TP16 or
-a higher-memory topology. HumanEval was not part of this startup-only gate.
+a higher-memory topology. The HumanEval result applies only to the launched
+`Channel-INT4-w4a8` representative, not to the unlaunched metadata-equivalent
+directory or the capacity-blocked INT8 artifact.
 
 Evidence:
 
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8.log`
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-smoke-direct.json`
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-metrics.txt`
+- `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8-humaneval16.log`
+- `/tmp/vllm-hcu-evalscope/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8-run1-20261007`
 
 ## GLM-5.3 Flash Channel-INT8 TP4 commands
 
