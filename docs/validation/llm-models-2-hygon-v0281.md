@@ -27,6 +27,7 @@ request.
 | `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-235B-A22B-Channel-INT8-w8a8` | TP4 and TP8 diagnostics | best 15/16; not accepted | The same corrupted identifiers survived KV, Graph, topology, dense-GEMM, and MoE-provider controls; the checkpoint has no MTP layer |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -253,6 +254,68 @@ This route loaded 221.40 GiB across 24 checkpoint shards, consumed 56.96 GiB
 of model memory per TP rank, selected AITER FP8 MoE and its channel-shuffle
 tuned CSV on all ranks, and captured both FULL and PIECEWISE Graphs. No MoE
 provider fallback, ERROR, or Traceback was logged.
+
+## Qwen3-235B INT8 diagnostic command and accuracy boundary
+
+The best complete HumanEval16 result used TP4, public E4M3 KV, default
+FULL_AND_PIECEWISE Graphs, the plugin's default dense INT8 route, and Triton
+MoE. It scored raw and normalized 15/16. HumanEval/2 stopped after the invalid
+text `def truncate游戏副本`, so this route is diagnostic and is not an accepted
+precision result.
+
+```bash
+env -u VLLM_PLUGINS \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve \
+    /llm-models-2/hygon/Qwen3-235B-A22B-Channel-INT8-w8a8 \
+  --served-model-name Qwen3-235B-A22B-Channel-INT8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend triton \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.50 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The complete control matrix was:
+
+| Dense route | MoE | KV | Execution | TP | Result |
+| --- | --- | --- | --- | ---: | ---: |
+| plugin default LightOp redirect | AITER | E4M3 | default Graph | 4 | 12/16 |
+| plugin default LightOp redirect | Triton | E4M3 | default Graph | 4 | 15/16 |
+| plugin default LightOp redirect | Triton | auto/BF16 | default Graph | 4 | 14/16 |
+| plugin default LightOp redirect | Triton | E4M3 | default Graph | 8 | 14/16 |
+| plugin default LightOp redirect | Triton | E4M3 | eager | 4 | targeted failures reproduced |
+| official Triton (`VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM=0`) | Triton | E4M3 | eager | 4 | HumanEval/2 and /11 still failed in the targeted replay |
+| official Triton (`VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM=0`) | AITER | E4M3 | eager | 4 | HumanEval/0, /2, and /12 still failed in the targeted replay |
+
+Changing to BF16 KV or TP8 did not improve the complete score, and eager
+targeted replays did not eliminate the failures. Disabling the plugin dense
+INT8 redirect improved some individual prompts but did not remove the fixed
+HumanEval/2 corruption. AITER MoE used
+the gfx938 `int8_w8a8/E=128,N=384` ordinary and bottom-layer configurations;
+it also did not remove the failure. The checkpoint config declares
+`Qwen3MoeForCausalLM` with 94 hidden layers and no MTP/next-N layer, so MTP3
+is not applicable.
+
+Do not infer the dense execution provider from
+`Selected TritonInt8ScaledMMLinearKernel` alone. The plugin wraps the same
+compressed-tensors scheme and, while
+`VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM` retains its default true value,
+redirects `apply_weights` to `apply_int8_linear` and the LightOp-backed HCU
+path. Set that environment variable to `0` and inspect the effective patch
+route before claiming official Triton execution. Since the corruption crossed
+all controls above, no model-specific runtime workaround was added.
 
 ## HumanEval client command
 
