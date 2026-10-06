@@ -25,3 +25,15 @@ def test_nope_query_is_zero_padded_for_ds_fp8_mla(monkeypatch):
     assert observed["q"].shape == (1, 64, 576)
     assert torch.all(observed["q"][..., :512] == 1)
     assert torch.all(observed["q"][..., 512:] == 0)
+
+
+def test_nope_fp8_padding_only_applies_to_512_wide_query(monkeypatch):
+    def init_with_other_head_size(self, *args, **kwargs):
+        self.kv_cache_dtype = "fp8_ds_mla"
+        self.qk_rope_head_dim = 0
+        self.q_concat_buffer = torch.zeros((1, 64, 384), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(FlashMLASparseImpl, "__init__", init_with_other_head_size)
+    impl = HcuFlashMLASparseImpl()
+    assert not impl._fp8_nope
+    assert impl.q_concat_buffer.shape[-1] == 384

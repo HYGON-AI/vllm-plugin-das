@@ -41,7 +41,9 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fp8_nope = (
-            self.kv_cache_dtype == "fp8_ds_mla" and self.qk_rope_head_dim == 0
+            self.kv_cache_dtype == "fp8_ds_mla"
+            and self.qk_rope_head_dim == 0
+            and self.q_concat_buffer.shape[-1] == 512
         )
         if self._fp8_nope:
             # FlashMLA's packed DS FP8 kernel expects a 576-wide query even

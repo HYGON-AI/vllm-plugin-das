@@ -15,6 +15,7 @@ def test_router_binding_keeps_fallback_and_mtp(monkeypatch):
     if not torch.cuda.is_available() or not on_gfx938():
         pytest.skip("requires gfx938")
     monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.delenv(runtime._ROUTER_GEMV_ENV, raising=False)
     calls = []
 
@@ -52,10 +53,13 @@ def test_router_binding_keeps_fallback_and_mtp(monkeypatch):
             )
 
     model = Model()
-    assert runtime.bind_glm53_router_gates(model) == 0
-    monkeypatch.setenv(runtime._ROUTER_GEMV_ENV, "1")
     assert runtime.bind_glm53_router_gates(model) == 1
     assert runtime.bind_glm53_router_gates(model) == 0
+    monkeypatch.setenv(runtime._ROUTER_GEMV_ENV, "0")
+    assert runtime.bind_glm53_router_gates(Model()) == 0
+    monkeypatch.setenv(runtime._ROUTER_GEMV_ENV, "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert runtime.bind_glm53_router_gates(Model()) == 0
     torch.testing.assert_close(
         model.layers[0].mlp.gate._hcu_router_gemv_weight,
         model.layers[0].mlp.gate.weight.T.contiguous(),

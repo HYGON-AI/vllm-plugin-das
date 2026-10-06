@@ -133,7 +133,13 @@ def bind_glm53_router_gates(model: torch.nn.Module | None) -> int:
 
     from vllm_hcu.platforms.hcu import on_gfx938
 
-    if model is None or not on_gfx938() or os.environ.get(_ROUTER_GEMV_ENV) != "1":
+    if (
+        model is None
+        or not henvs.optional_custom_op_enabled(
+            os.environ.get(_ROUTER_GEMV_ENV, "1").lower() in ("1", "true")
+        )
+        or not on_gfx938()
+    ):
         return 0
     bound = 0
     for layer in model.modules():

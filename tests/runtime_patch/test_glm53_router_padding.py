@@ -2,26 +2,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Padding rows must not enter DeepEP low-latency expert dispatch."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import torch
 from vllm import envs, forward_context
+from vllm_hcu.model_executor.layers.fused_moe import router_runtime
 from vllm_hcu.model_executor.layers.fused_moe.router_runtime import (
     make_hcu_grouped_topk_router,
 )
 
 
-def test_hcu_grouped_router_masks_padding_after_routing(monkeypatch):
-    class BaseRouter:
-        pass
+def test_hcu_grouped_router_masks_padding_after_lightop(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
 
-    router = make_hcu_grouped_topk_router(BaseRouter)()
+    class BaseRouter:
+        def _compute_routing(self, *args, **kwargs):
+            raise AssertionError("LightOp success should not use official fallback")
+
     weights = torch.tensor([[0.25, 0.75], [0.4, 0.6], [0.3, 0.7]])
     ids = torch.tensor([[1, 2], [3, 4], [5, 6]])
-    router._compute_routing_unmasked = lambda *args, **kwargs: (
-        weights.clone(),
-        ids.clone(),
-    )
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []
+    moe = ModuleType("lightop.moe")
+    moe.moe_fused_gate = lambda *args, **kwargs: (weights.clone(), ids.clone())
+    lightop.moe = moe
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.moe", moe)
+    monkeypatch.setattr(router_runtime, "lightop_moe_gate_kwargs", lambda *args: {})
+    monkeypatch.setattr(henvs, "optional_custom_op_enabled", lambda *args: True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSE_MOE_GATE", True)
+
+    router = make_hcu_grouped_topk_router(BaseRouter)()
+    router.num_expert_group = 2
+    router.topk_group = 1
+    router.top_k = 2
+    router.e_score_correction_bias = torch.ones(4)
+    router.routed_scaling_factor = 1.0
+    router.scoring_func = "sigmoid"
+    router.renormalize = True
     monkeypatch.setattr(envs, "VLLM_MOE_SKIP_PADDING", True)
     monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(
@@ -30,13 +49,46 @@ def test_hcu_grouped_router_masks_padding_after_routing(monkeypatch):
         lambda: SimpleNamespace(is_padding=torch.tensor([False, True, False])),
     )
 
-    masked_weights, masked_ids = router._compute_routing(None, None, None)
+    masked_weights, masked_ids = router._compute_routing(
+        None, torch.ones((3, 4)), None
+    )
     torch.testing.assert_close(masked_ids[0], ids[0])
     torch.testing.assert_close(masked_ids[1], torch.tensor([-1, -1]))
     torch.testing.assert_close(masked_ids[2], ids[2])
     torch.testing.assert_close(masked_weights[1], torch.zeros(2))
 
     monkeypatch.setattr(envs, "VLLM_MOE_SKIP_PADDING", False)
-    normal_weights, normal_ids = router._compute_routing(None, None, None)
+    normal_weights, normal_ids = router._compute_routing(
+        None, torch.ones((3, 4)), None
+    )
     torch.testing.assert_close(normal_weights, weights)
     torch.testing.assert_close(normal_ids, ids)
+
+
+def test_hcu_grouped_router_fallback_does_not_remask(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+
+    weights = torch.tensor([[0.25, 0.75]])
+    ids = torch.tensor([[1, 2]])
+
+    class BaseRouter:
+        def _compute_routing(self, *args, **kwargs):
+            return weights, ids
+
+    router = make_hcu_grouped_topk_router(BaseRouter)()
+    router.e_score_correction_bias = None
+    router.num_expert_group = 2
+    monkeypatch.setattr(henvs, "optional_custom_op_enabled", lambda *args: False)
+    monkeypatch.setattr(envs, "VLLM_MOE_SKIP_PADDING", True)
+
+    def unexpected_context_check():
+        raise AssertionError("fallback routing must not apply a second padding mask")
+
+    monkeypatch.setattr(
+        forward_context, "is_forward_context_available", unexpected_context_check
+    )
+    actual_weights, actual_ids = router._compute_routing(
+        None, torch.ones((1, 4)), None
+    )
+    assert actual_weights is weights
+    assert actual_ids is ids
