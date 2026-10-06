@@ -533,8 +533,10 @@ def _artifact_record_count(
 def _normalize_humaneval_completion(completion: str) -> str:
     """Remove a completed thinking prefix and one Python Markdown fence."""
 
-    if "</think>" in completion:
-        completion = completion.rsplit("</think>", maxsplit=1)[1]
+    closing_think = completion.find("</think>")
+    first_fence = completion.find("```")
+    if closing_think >= 0 and (first_fence < 0 or closing_think < first_fence):
+        completion = completion[closing_think + len("</think>") :]
 
     opening = re.search(
         r"(?m)^[ \t]*```(?:python|py)?[ \t]*\r?\n",

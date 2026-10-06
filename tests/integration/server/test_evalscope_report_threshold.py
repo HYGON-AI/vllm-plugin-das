@@ -526,6 +526,17 @@ def test_normalize_humaneval_completion_removes_completed_thinking_prefix(
     assert evalscope_server._normalize_humaneval_completion(completion) == expected
 
 
+@pytest.mark.parametrize("thinking_prefix", ["", "<think>reasoning</think>\n"])
+def test_normalize_humaneval_completion_preserves_think_literal_inside_fence(
+    thinking_prefix: str,
+) -> None:
+    fence = "```"
+    code = 'def candidate(value):\n    return "</think>" + value'
+    completion = f"{thinking_prefix}{fence}python\n{code}\n{fence}"
+
+    assert evalscope_server._normalize_humaneval_completion(completion) == code
+
+
 def test_normalize_humaneval_completion_keeps_unclosed_thinking_output() -> None:
     completion = "<think>reasoning without a final answer"
 
