@@ -29,6 +29,9 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 
+from vllm_hcu.v1.attention.ops.fp8_paged_mqa_gfx938 import (
+    gfx938_fp8_paged_mqa_logits,
+)
 
 lightop_attention = None
 logger = init_logger(__name__)
@@ -741,6 +744,25 @@ def paged_mqa_logits_module():
     return None
 
 
+def _paged_mqa_cache_kernel_view(kv_cache_fp8: torch.Tensor) -> torch.Tensor:
+    """Normalize backend singleton axes before physical page recovery."""
+    if kv_cache_fp8.ndim == 5:
+        if kv_cache_fp8.shape[-2] != 1:
+            raise ValueError(
+                "HCU paged-MQA expects a singleton KV-head view, got "
+                f"shape {tuple(kv_cache_fp8.shape)}"
+            )
+        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
+    if kv_cache_fp8.ndim != 4:
+        raise ValueError(
+            "HCU paged-MQA expects a 4D kernel view, got "
+            f"shape {tuple(kv_cache_fp8.shape)}"
+        )
+    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
+        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    return kv_cache_fp8
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -776,26 +798,32 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
-    aiter_paged_mqa_logits_module = None
-    # if rocm_aiter_ops.is_enabled():
     batch_size, next_n = q_fp8.shape[:2]
-    if kv_cache_fp8.ndim == 5:
-        if kv_cache_fp8.shape[-2] != 1:
-            raise ValueError(
-                "HCU paged-MQA expects a singleton KV-head view, got "
-                f"shape {tuple(kv_cache_fp8.shape)}"
-            )
-        kv_cache_fp8 = kv_cache_fp8.squeeze(-2)
-    if kv_cache_fp8.ndim != 4:
-        raise ValueError(
-            "HCU paged-MQA expects a 4D kernel view, got "
-            f"shape {tuple(kv_cache_fp8.shape)}"
-        )
-    if kv_cache_fp8.shape[1] == 1 and kv_cache_fp8.shape[2] != 1:
-        kv_cache_fp8 = kv_cache_fp8.transpose(1, 2)
+    kv_cache_fp8 = _paged_mqa_cache_kernel_view(kv_cache_fp8)
+    is_gfx938 = on_gfx938()
+    if is_gfx938:
+        kv_cache_fp8 = _indexer_cache_as_hipc_view(kv_cache_fp8)
     block_size = kv_cache_fp8.shape[1]
 
-    if force_aiter_triton or rocm_aiter_ops.is_enabled():
+    if is_gfx938 and block_size not in (1, 16, 32, 64):
+        raise ValueError(f"Unsupported preshuffled KPool page size: {block_size}")
+    use_aiter = force_aiter_triton or rocm_aiter_ops.is_enabled()
+    if is_gfx938 and block_size != 1:
+        if force_aiter_triton:
+            raise RuntimeError(
+                "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
+            )
+        return gfx938_fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+
+    aiter_paged_mqa_logits_module = None
+    if use_aiter:
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
     if force_aiter_triton and aiter_paged_mqa_logits_module is None:
         raise RuntimeError(
@@ -850,6 +878,10 @@ def rocm_fp8_paged_mqa_logits(
             ChunkQ=heads,
         )
         return out_qk.sum(dim=0)
+    elif is_gfx938 and block_size == 1:
+        return fp8_paged_mqa_logits_torch(
+            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+        )
     elif current_platform.is_rocm():
         return _get_lightop_attention().paged_mqa_logits(
             q_fp8, 
