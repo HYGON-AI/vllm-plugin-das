@@ -765,6 +765,80 @@ Evidence:
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8-run1`
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8-run2`
 
+## DeepSeek-V4-Pro-0813 SlimQuant W4A8 single-node TP8 smoke
+
+The 66-shard checkpoint is 789.42 GiB on disk, or 98.68 GiB/rank before
+runtime overhead at TP8. The following profile completed a cold NFS load,
+target and DSpark graph capture, API startup, and a 64-token completion on one
+eight-card gfx938 node:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve \
+    /llm-models-2/hygon/DeepSeek-V4-Pro-0813-Channel-INT4-w4a8 \
+  --served-model-name DeepSeek-V4-Pro-0813-Channel-INT4-w4a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tokenizer-mode deepseek_v4 \
+  --distributed-executor-backend mp \
+  --tensor-parallel-size 8 \
+  --quantization slimquant_w4a8 \
+  --moe-backend aiter \
+  --speculative-config \
+    '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --block-size 256 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 512 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+Use a direct local client. This host's proxy environment returns an empty
+proxy-generated HTTP 502 unless loopback is explicitly bypassed:
+
+```bash
+curl --noproxy '*' -sS \
+  http://127.0.0.1:10234/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"DeepSeek-V4-Pro-0813-Channel-INT4-w4a8",
+    "prompt":"Write a Python function add(a, b) that returns the sum.\n",
+    "max_tokens":64,
+    "temperature":0
+  }'
+```
+
+All ranks constructed `HcuGPUModelRunnerV2`. Public E4M3 resolved to the
+DeepSeek sparse `fp8_ds_mla` format with BLHNC storage. The target resolved
+`FULL_AND_PIECEWISE`; target and DSpark PIECEWISE/FULL captures completed
+without eager fallback. The cold NFS load took 912.7--913.2 seconds and used
+104.97 GiB/rank. Final consumed weights plus non-Torch memory was about
+106.7--106.9 GiB/rank, graph memory was 0.76--0.79 GiB/rank, and the service
+allocated about 21.4--21.6 GiB/rank to KV cache at 0.90 utilization. The
+smoke request returned HTTP 200 with 64 generated tokens; DSpark accepted
+41/168 drafted tokens during this short request.
+
+`DeepSeek-V4-Pro-0813-INT4-Channel` has the same config hash, index hash,
+66-shard count, total physical size, and sampled shard sizes. It is a separate
+directory rather than hard links, so it was classified as a metadata-equivalent
+artifact and was not cold-started again. In contrast,
+`DeepSeek-V4-Pro-0813-INT8-Channel` occupies 1,545.42 GiB physically, or
+193.18 GiB/rank at TP8 before runtime overhead, and cannot fit on this
+eight-card node with 143.98 GiB usable per card. It requires at least TP16 or
+a higher-memory topology. HumanEval was not part of this startup-only gate.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8.log`
+- `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-smoke-direct.json`
+- `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-metrics.txt`
+
 ## GLM-5.3 Flash Channel-INT8 TP4 commands
 
 This 315.23 GiB, 50-shard GLM5Next checkpoint has native NoPE sparse MLA
