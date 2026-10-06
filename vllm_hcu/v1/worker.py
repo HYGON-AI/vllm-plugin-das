@@ -103,8 +103,17 @@ class HcuGPUWorker(Worker):
         """Load the model, then require every enabled patch chain to be live."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
+            bind_glm53_router_gates,
+        )
         from vllm_hcu.patch.worker import validate_worker_patches
 
+        model = getattr(self.model_runner, "model", None)
+        num_router_gates = bind_glm53_router_gates(model)
+        if num_router_gates:
+            runner_logger.info(
+                "GLM5Next FP32 router GEMV bound to %d layers", num_router_gates
+            )
         validate_worker_patches(require_applied=True)
 
     def compile_or_warm_up_model(self):
