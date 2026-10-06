@@ -33,6 +33,7 @@ from .model import (
     _is_modelopt_layer_excluded,
     _normalize_hyv4_config,
     _rewrite_hyv4_weight_name,
+    enable_hyv4_gate_a2a_overlap,
 )
 
 
@@ -232,6 +233,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        gate_a2a_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -243,6 +245,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
             config=mtp_config, vllm_config=vllm_config, cache_config=cache_config,
             quant_config=quant_config, prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
+            gate_a2a_stream=gate_a2a_stream,
         )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -292,6 +295,12 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
                 vllm_config.scheduler_config.max_num_batched_tokens, config.index_topk,
                 dtype=torch.int32, device=current_platform.device_type,
             )
+        self.gate_a2a_stream = (
+            torch.cuda.Stream()
+            if getattr(config, "gated_mla", False)
+            and enable_hyv4_gate_a2a_overlap(vllm_config)
+            else None
+        )
         # Keep the embedding canonical in named_parameters when the head is
         # tied, matching the target's strict checkpoint accounting.
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
@@ -301,6 +310,7 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
                 vllm_config=vllm_config, model_config=draft_config,
                 cache_config=vllm_config.cache_config, quant_config=self.quant_config,
                 topk_indices_buffer=self.topk_indices_buffer,
+                gate_a2a_stream=self.gate_a2a_stream,
             ),
         })
         if config.tie_word_embeddings:

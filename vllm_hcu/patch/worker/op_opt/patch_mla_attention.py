@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+from contextvars import ContextVar
 from dataclasses import replace
 from types import ModuleType
 
@@ -24,6 +25,7 @@ TARGETS = (
     f"{TARGET_MODULE}.MLACommonMetadataBuilder.build",
     f"{TARGET_MODULE}.split_decodes_and_prefills",
     f"{TARGET_MODULE}.MLAAttention.get_kv_cache_spec",
+    f"{TARGET_MODULE}.dcp_a2a_lse_reduce",
 )
 _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
@@ -43,6 +45,7 @@ def apply_to_module(module: ModuleType) -> bool:
         (builder_cls, "build", TARGETS[5], _WRAPPER),
         (mla, "split_decodes_and_prefills", TARGETS[6], _WRAPPER),
         (cls, "get_kv_cache_spec", TARGETS[7], _WRAPPER),
+        (mla, "dcp_a2a_lse_reduce", TARGETS[8], _WRAPPER),
     )
     if already_applied(mla, _MARKER, wrapped):
         return False
@@ -110,6 +113,11 @@ def apply_to_module(module: ModuleType) -> bool:
             "treat_short_extends_as_decodes": True,
         },
     )
+    original_dcp_a2a_lse_reduce = require_callable(
+        mla,
+        "dcp_a2a_lse_reduce",
+        TARGETS[8],
+    )
     get_forward_context = require_callable(
         mla,
         "get_forward_context",
@@ -125,6 +133,10 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch dependency {TARGET_MODULE}.torch is missing"
         )
+    overlap_layer = ContextVar(
+        "vllm_hcu_mla_dcp_a2a_overlap_layer",
+        default=None,
+    )
 
     def configured_pcp_world_size(vllm_config) -> int:
         if vllm_config is None:
@@ -268,12 +280,18 @@ def apply_to_module(module: ModuleType) -> bool:
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
         q_dcp_replicated = getattr(self, "_hcu_q_dcp_replicated", None)
+        dcp_a2a_overlap_fn = getattr(self, "_hcu_dcp_a2a_overlap_fn", None)
         if not config.enable_lightly_cp and q_dcp_replicated is None:
-            return original_forward(
-                self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
-                output_scale, output_block_scale, quant_group_size,
-                quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
-            )
+            token = overlap_layer.set(self) if dcp_a2a_overlap_fn else None
+            try:
+                return original_forward(
+                    self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
+                    output_scale, output_block_scale, quant_group_size,
+                    quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+                )
+            finally:
+                if token is not None:
+                    overlap_layer.reset(token)
         from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
         if q_dcp_replicated is None:
@@ -287,6 +305,22 @@ def apply_to_module(module: ModuleType) -> bool:
             output_scale, output_block_scale, quant_group_size,
             quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
             q_dcp_replicated=q_dcp_replicated,
+        )
+
+    @functools.wraps(original_dcp_a2a_lse_reduce)
+    def hcu_dcp_a2a_lse_reduce(*args, **kwargs):
+        layer = overlap_layer.get()
+        if layer is None:
+            return original_dcp_a2a_lse_reduce(*args, **kwargs)
+        from vllm_hcu.model_executor.layers.mla_runtime import (
+            _dcp_a2a_lse_reduce_with_overlap,
+        )
+
+        return _dcp_a2a_lse_reduce_with_overlap(
+            original_dcp_a2a_lse_reduce,
+            layer,
+            *args,
+            **kwargs,
         )
 
     @functools.wraps(process)
@@ -355,6 +389,7 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_metadata_init,
         hcu_build,
         hcu_split_batch,
+        hcu_dcp_a2a_lse_reduce,
     ):
         setattr(function, _WRAPPER, True)
     setattr(cls, "_vllm_hcu_original_init", original_init)
@@ -365,6 +400,11 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(metadata_cls, "_vllm_hcu_original_init", metadata_init)
     setattr(builder_cls, "_vllm_hcu_original_build", builder)
     setattr(mla, "_vllm_hcu_original_split_decodes_and_prefills", split_batch)
+    setattr(
+        mla,
+        "_vllm_hcu_original_dcp_a2a_lse_reduce",
+        original_dcp_a2a_lse_reduce,
+    )
     setattr(cls, "__init__", hcu_init)
     setattr(cls, "forward", hcu_full_forward)
     setattr(cls, "forward_impl", hcu_forward)
@@ -373,6 +413,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(metadata_cls, "__init__", hcu_metadata_init)
     setattr(builder_cls, "build", hcu_build)
     setattr(mla, "split_decodes_and_prefills", hcu_split_batch)
+    setattr(mla, "dcp_a2a_lse_reduce", hcu_dcp_a2a_lse_reduce)
     setattr(mla, _MARKER, True)
     return True
 

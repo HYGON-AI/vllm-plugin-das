@@ -333,6 +333,7 @@ def _fake_mla_module(adapter, target_calls, event_log=None):
     module.MLACommonMetadata = MLACommonMetadata
     module.MLACommonMetadataBuilder = MLACommonMetadataBuilder
     module.split_decodes_and_prefills = split_decodes_and_prefills
+    module.dcp_a2a_lse_reduce = lambda *args, **kwargs: (args, kwargs)
     module.split_calls = split_calls
     module.full_forward_calls = full_forward_calls
     module.get_forward_context = lambda: pytest.fail(
@@ -439,6 +440,105 @@ def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
     warmup = SimpleNamespace(is_prefilling=None)
     assert module.split_decodes_and_prefills(warmup, 3, True, True) is True
     assert module.split_calls[-1] == (warmup, 3, True, True)
+
+
+def test_mla_dcp_a2a_overlap_keeps_official_fp8_forward(monkeypatch):
+    adapter = _adapter()
+    events = []
+    module = _fake_mla_module(adapter, [])
+
+    def dcp_a2a_lse_reduce(*args, **kwargs):
+        events.append(("reduce", args, kwargs))
+        return "official-a2a-result"
+
+    def official_forward(
+        self,
+        q,
+        k_c_normed,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale=None,
+        output_block_scale=None,
+        quant_group_size=None,
+        quant_scale_ue8m0=None,
+        quant_col_major=None,
+        quant_tma_aligned=None,
+    ):
+        del (
+            q,
+            k_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+            quant_group_size,
+            quant_scale_ue8m0,
+            quant_col_major,
+            quant_tma_aligned,
+        )
+        events.append("official-forward")
+        return module.dcp_a2a_lse_reduce(
+            "attn-out",
+            "lse",
+            "group",
+            ctx="ctx",
+            return_lse=True,
+            is_lse_base_on_e=False,
+        )
+
+    module.MLAAttention.forward_impl = official_forward
+    module.dcp_a2a_lse_reduce = dcp_a2a_lse_reduce
+
+    def overlap_reduce(reduce_fn, layer, *args, **kwargs):
+        events.append(("overlap", layer, args, kwargs))
+        return reduce_fn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mla_runtime,
+        "_dcp_a2a_lse_reduce_with_overlap",
+        overlap_reduce,
+    )
+    monkeypatch.setattr(
+        mla_runtime,
+        "mla_forward_impl",
+        lambda *args, **kwargs: pytest.fail(
+            "FP8 DCP overlap replaced the official MLA forward"
+        ),
+    )
+    assert adapter.apply_to_module(module) is True
+
+    instance = object.__new__(module.MLAAttention)
+    instance._hcu_feature_config = SimpleNamespace(enable_lightly_cp=False)
+    instance._hcu_dcp_a2a_overlap_fn = lambda: None
+    args = _forward_args()
+
+    assert instance.forward_impl(*args) == "official-a2a-result"
+    assert events == [
+        "official-forward",
+        (
+            "overlap",
+            instance,
+            ("attn-out", "lse", "group"),
+            {
+                "ctx": "ctx",
+                "return_lse": True,
+                "is_lse_base_on_e": False,
+            },
+        ),
+        (
+            "reduce",
+            ("attn-out", "lse", "group"),
+            {
+                "ctx": "ctx",
+                "return_lse": True,
+                "is_lse_base_on_e": False,
+            },
+        ),
+    ]
 
 
 def test_mla_qrep_uses_hcu_runtime_without_lightly_cp(monkeypatch):

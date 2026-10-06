@@ -96,6 +96,16 @@ HYV4_PACKED_MODULES_MAPPING = {
 }
 
 
+def enable_hyv4_gate_a2a_overlap(vllm_config: VllmConfig) -> bool:
+    """Return whether HY V4 may overlap g_proj with DCP A2A."""
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        henvs.VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP
+        and parallel_config.decode_context_parallel_size > 1
+        and parallel_config.dcp_comm_backend == "a2a"
+    )
+
+
 def _is_modelopt_layer_excluded(
     quant_config: QuantizationConfig | None,
     prefix: str,
@@ -352,6 +362,7 @@ class HYV4DecoderLayer(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         lightop_kv_reuse_state: LightOpKVReuseState | None = None,
+        gate_a2a_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -378,6 +389,7 @@ class HYV4DecoderLayer(nn.Module):
             layer_idx=layer_idx,
             topk_indices_buffer=topk_indices_buffer,
             lightop_kv_reuse_state=lightop_kv_reuse_state,
+            gate_a2a_stream=gate_a2a_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
@@ -495,6 +507,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         self.config = config
         self.quant_config = quant_config
         self.enable_ihc = getattr(config, "enable_ihc", False)
+        self.gate_a2a_stream = (
+            torch.cuda.Stream()
+            if getattr(config, "gated_mla", False)
+            and enable_hyv4_gate_a2a_overlap(vllm_config)
+            else None
+        )
+        if self.gate_a2a_stream is not None:
+            logger.info("HY V4 gated-MLA g_proj/DCP A2A overlap enabled")
 
         if get_pp_group().is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -517,6 +537,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 lightop_kv_reuse_state=self.lightop_kv_reuse_state,
+                gate_a2a_stream=self.gate_a2a_stream,
             ),
             prefix=f"{prefix}.layers",
         )

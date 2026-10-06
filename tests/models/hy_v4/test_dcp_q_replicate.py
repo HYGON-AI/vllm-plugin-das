@@ -5,13 +5,79 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
+from vllm_hcu.model_executor.layers.mla_runtime import (
+    _dcp_a2a_lse_reduce_with_overlap,
+    mla_forward_impl,
+)
 from vllm_hcu.models.hy_v4.attention import (
     DCPGroupColumnParallelLinear,
     dcp_q_replication_enabled,
     resolve_dcp_q_replication_topology,
 )
 from vllm_hcu.models.hy_v4 import attention as attention_module
+
+
+def test_dcp_a2a_overlap_launches_gate_after_local_attention(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeEvent:
+        def __init__(self, name: str):
+            self.name = name
+
+        def record(self, stream) -> None:
+            events.append(f"record_{self.name}_{stream.name}")
+
+    class FakeStream:
+        def __init__(self, name: str):
+            self.name = name
+
+        def wait_event(self, event) -> None:
+            events.append(f"{self.name}_wait_{event.name}")
+
+    class StreamContext:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            events.append(f"enter_{self.stream.name}")
+
+        def __exit__(self, *_args):
+            events.append(f"exit_{self.stream.name}")
+
+    main = FakeStream("main")
+    aux = FakeStream("aux")
+    start = FakeEvent("start")
+    done = FakeEvent("done")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: StreamContext(stream))
+    layer = SimpleNamespace(
+        _hcu_dcp_a2a_overlap_fn=lambda: events.append("gate"),
+        _hcu_dcp_a2a_overlap_stream=aux,
+        _hcu_dcp_a2a_overlap_start_event=start,
+        _hcu_dcp_a2a_overlap_done_event=done,
+    )
+    reduce_fn = lambda *args, **kwargs: events.append("a2a") or "out"
+
+    result = _dcp_a2a_lse_reduce_with_overlap(
+        reduce_fn,
+        layer,
+        torch.empty(0),
+        torch.empty(0),
+        object(),
+        is_lse_base_on_e=True,
+    )
+
+    assert result == "out"
+    assert events == [
+        "record_start_main",
+        "enter_aux",
+        "aux_wait_start",
+        "gate",
+        "record_done_aux",
+        "exit_aux",
+        "a2a",
+        "main_wait_done",
+    ]
 
 
 def test_dcp_q_replication_uses_official_environment_flag(monkeypatch) -> None:
