@@ -28,6 +28,7 @@ request.
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-235B-A22B-Channel-INT8-w8a8` | TP4 and TP8 diagnostics | best 15/16; not accepted | The same corrupted identifiers survived KV, Graph, topology, dense-GEMM, and MoE-provider controls; the checkpoint has no MTP layer |
+| `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -316,6 +317,71 @@ redirects `apply_weights` to `apply_int8_linear` and the LightOp-backed HCU
 path. Set that environment variable to `0` and inspect the effective patch
 route before claiming official Triton execution. Since the corruption crossed
 all controls above, no model-specific runtime workaround was added.
+
+## DeepSeek-R1 W4A8 TP8 service and client commands
+
+The accepted W4A8 route used regular FLASHMLA, not the V3.2/V4 sparse
+backend. Leave the KV layout unset so FLASHMLA resolves LBNHC.
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve /llm-models-2/hygon/DeepSeek-R1-W4A8-V2_6 \
+  --served-model-name DeepSeek-R1-W4A8-V2_6 \
+  --port 10234 \
+  --trust-remote-code \
+  --quantization slimquant_w4a8 \
+  --tensor-parallel-size 8 \
+  --attention-backend FLASHMLA \
+  --moe-backend aiter \
+  --reasoning-parser deepseek_r1 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.70 \
+  --max-model-len 16384 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+Use the isolated client with an 8,192-token reasoning budget and no invented
+`enable_thinking` override:
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/deepseek-r1-w4a8-fresh-run
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model DeepSeek-R1-W4A8-V2_6 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":8192}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" --no-timestamp
+```
+
+The checkpoint loaded 333 GiB from 70 shards and consumed 44.27 GiB of model
+memory per rank. The runtime selected HcuGPUModelRunnerV2, FLASHMLA with a
+64-token block, LBNHC E4M3 KV, and the gfx938 AITER
+`int8_w4a8/E=256,N=256` configuration on every rank. The target and MTP3
+speculator both captured FULL and PIECEWISE Graphs. The two independent runs
+passed raw and normalized HumanEval16 at 16/16 and observed 29.50 and 29.52
+output tok/s. Across the service session, MTP accepted 30,794/52,617 draft
+tokens (58.5%); prefix metrics recorded 1,664 hits over 6,508 queried tokens.
+No ERROR or Traceback was logged, and teardown returned all devices to the
+measured 2 MiB idle baseline.
 
 ## HumanEval client command
 
