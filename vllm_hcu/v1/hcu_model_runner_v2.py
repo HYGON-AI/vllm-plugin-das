@@ -7,16 +7,16 @@ import functools
 from contextlib import nullcontext
 
 import torch
-
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm_hcu.model_executor.layers.attention.pcp import (
-    replicated_mtp_batch_scope,
-)
+
 from vllm_hcu.forward_context_runtime import (
     deepep_auto_request_phase_scope,
     set_deepep_auto_request_phase,
+)
+from vllm_hcu.model_executor.layers.attention.pcp import (
+    replicated_mtp_batch_scope,
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 
@@ -104,6 +104,34 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def execute_model(self, *args, **kwargs):
         with deepep_auto_request_phase_scope():
             return super().execute_model(*args, **kwargs)
+
+    def _is_glm5next(self) -> bool:
+        architectures = getattr(
+            getattr(self.model_config, "hf_config", None), "architectures", ()
+        )
+        return "Glm5NextForConditionalGeneration" in architectures
+
+    @functools.wraps(GPUModelRunner.capture_model)
+    def capture_model(self, *args, **kwargs):
+        if not self._is_glm5next():
+            return super().capture_model(*args, **kwargs)
+
+        # Real GLM5Next text requests supply inputs_embeds with input_ids=None.
+        # Match that argument schema during CUDA graph capture.
+        prepare_dummy_inputs = self.model_state.prepare_dummy_inputs
+
+        @functools.wraps(prepare_dummy_inputs)
+        def hcu_dummy_inputs(*prepare_args, **prepare_kwargs):
+            return {
+                **prepare_dummy_inputs(*prepare_args, **prepare_kwargs),
+                "input_ids": None,
+            }
+
+        self.model_state.prepare_dummy_inputs = hcu_dummy_inputs
+        try:
+            return super().capture_model(*args, **kwargs)
+        finally:
+            self.model_state.prepare_dummy_inputs = prepare_dummy_inputs
 
     def profile_run(self) -> None:
         """Profile PCP with the per-rank token budget plus routing slack."""
