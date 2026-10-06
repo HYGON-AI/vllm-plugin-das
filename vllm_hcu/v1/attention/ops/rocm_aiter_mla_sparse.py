@@ -1275,6 +1275,12 @@ def _lightop_topk_indices_prefill(
     topk_indices: torch.Tensor,
     topk_tokens: int,
 ) -> None:
+    # LightOp's 512-wide selector can publish invalid indices at tied cutoffs.
+    if topk_tokens == 512:
+        topk_indices.copy_(
+            _topk_indices_torch(logits, topk_tokens, row_starts, row_ends)
+        )
+        return
     num_rows = topk_indices.shape[0]
     if logits.dim() != 2:
         raise RuntimeError(f"Prefill topk expects 2D logits, got {logits.shape}")
@@ -1332,6 +1338,11 @@ def _lightop_topk_indices_decode(
     topk_tokens: int,
 ) -> None:
     row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
+    if topk_tokens == 512:
+        topk_indices.copy_(
+            _topk_indices_torch(logits, topk_tokens, row_ends=row_ends)
+        )
+        return
     _get_lightop_attention().top_k_per_row_decode(
         logits,
         1,

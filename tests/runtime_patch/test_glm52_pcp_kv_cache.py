@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
@@ -120,6 +121,24 @@ def patched_cache_modules():
         coordinator=kv_cache_coordinator,
         resolve=kv_cache_utils.resolve_kv_cache_block_sizes,
         manager=single_type_kv_cache_manager,
+    )
+
+
+@pytest.mark.parametrize("prefix_match_unit, expected_hash_size", [(None, 64), (16, 16)])
+def test_pcp_pd_hash_sizing_accepts_current_cache_config(
+    patched_cache_modules, prefix_match_unit, expected_hash_size
+):
+    """PD enables hashing even without APC; CacheConfig no longer has hash_block_size."""
+    from vllm.config import CacheConfig
+
+    config = _vllm_config(block_size=64, dcp=1, pcp=8, enable_prefix_caching=False)
+    config.cache_config = CacheConfig(
+        block_size=64, enable_prefix_caching=False,
+        prefix_match_unit=prefix_match_unit,
+    )
+    config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeConnector")
+    assert patched_cache_modules.resolve(_kv_cache_config(64, 256), config) == (
+        256, expected_hash_size,
     )
 
 
@@ -341,6 +360,7 @@ def test_mrv2_block_table_capacity_already_depends_on_dcp_only(
     runner.dcp_rank = 0
     runner.cp_interleave = 1
     runner.speculator = None
+    runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
     runner.model_state = SimpleNamespace(
         get_additional_cg_support=lambda: (),
         num_new_sampled_tokens_per_step=1,

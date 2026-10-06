@@ -275,3 +275,114 @@ def test_prefill_logits_graph_replay():
         expected.masked_fill_((offsets[None, :] < lo[:, None]) |
                               (offsets[None, :] >= hi[:, None]), -torch.inf)
         torch.testing.assert_close(out, expected)
+
+
+def _load_topk_helpers():
+    path = (
+        Path(__file__).resolve().parents[2]
+        / 'vllm_hcu/v1/attention/ops/rocm_aiter_mla_sparse.py'
+    )
+    names = {
+        '_topk_indices_torch', '_decode_row_ends_from_seq_lens',
+        '_lightop_topk_indices_prefill', '_lightop_topk_indices_decode',
+    }
+    nodes = [
+        n for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    namespace = dict(
+        torch=torch,
+        _get_lightop_attention=lambda: pytest.fail(
+            'unsafe LightOp 512-topk selector called'
+        ),
+    )
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace
+    )
+    return namespace
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('prefill', [False, True])
+def test_topk512_ties_produce_distinct_in_range_indices(device, prefill):
+    """Tied cutoffs must select 512 real positions, never stale scratch data."""
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('GPU required')
+    helpers = _load_topk_helpers()
+    torch.manual_seed(19)
+    for width in (513, 535, 579, 32768):
+        scores = torch.randn(6, width, device=device).round()
+        starts = (
+            torch.arange(6, dtype=torch.int32, device=device) if prefill
+            else torch.zeros(6, dtype=torch.int32, device=device)
+        )
+        ends = torch.tensor(
+            [min(width, n) for n in (0, 129, 512, 513, 529, width)],
+            device=device, dtype=torch.int32,
+        )
+        output = torch.full((6, 512), 0x6c7868eb, device=device, dtype=torch.int32)
+        # Outside-window scores are deliberately larger than valid scores.
+        cols = torch.arange(width, device=device)
+        valid = (cols[None, :] >= starts[:, None]) & (cols[None, :] < ends[:, None])
+        scores.masked_fill_(~valid, 1e6)
+        if prefill:
+            helpers['_lightop_topk_indices_prefill'](scores, starts, ends, output, 512)
+        else:
+            helpers['_lightop_topk_indices_decode'](
+                scores, ends.reshape(1, 6), 6, output, 512
+            )
+        for row in range(6):
+            length = max(int(ends[row]) - int(starts[row]), 0)
+            indices = output[row][output[row] >= 0].long()
+            assert indices.numel() == min(length, 512)
+            assert indices.unique().numel() == indices.numel()
+            assert (indices < length).all()
+            if length <= 512:
+                torch.testing.assert_close(
+                    indices, torch.arange(length, device=device)
+                )
+                assert (output[row, length:] == -1).all()
+            else:
+                selected_scores = scores[row, indices + starts[row]].sort().values
+                expected_scores = (
+                    scores[row, starts[row]:ends[row]].topk(512).values.sort().values
+                )
+                torch.testing.assert_close(selected_scores, expected_scores)
+
+
+def test_topk512_ties_graph_replay_updates_lengths_and_scores():
+    """A captured selector must use current per-query DSpark lengths and logits."""
+    if not torch.cuda.is_available():
+        pytest.skip('GPU graph test requires a visible GPU')
+    fn = _load_topk_helpers()['_lightop_topk_indices_decode']
+    scores = torch.zeros((6, 1024), device='cuda')
+    ends = torch.full((1, 6), 535, dtype=torch.int32, device='cuda')
+    output = torch.empty((6, 512), dtype=torch.int32, device='cuda')
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fn(scores, ends, 6, output, 512)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(scores, ends, 6, output, 512)
+    for step in range(3):
+        scores.copy_(torch.randn_like(scores).round())
+        lengths = (
+            [0, 129, 512, 513, 535, 579] if step % 2
+            else [579, 535, 513, 512, 129, 0]
+        )
+        ends.copy_(torch.tensor([lengths], device='cuda', dtype=torch.int32))
+        output.fill_(0x6c7868eb)
+        graph.replay()
+        for row, length in enumerate(lengths):
+            indices = output[row][output[row] >= 0].long()
+            assert indices.numel() == min(length, 512)
+            assert indices.unique().numel() == indices.numel()
+            assert (indices < length).all()
+            if length > 512:
+                torch.testing.assert_close(
+                    scores[row, indices].sort().values,
+                    scores[row, :length].topk(512).values.sort().values,
+                )

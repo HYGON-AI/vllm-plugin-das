@@ -241,7 +241,7 @@ def test_pcp_padding_rows_are_never_zero_width() -> None:
     assert len(set(totals)) == 1, f"rank token totals diverged: {totals}"
 
 
-def test_pcp_swa_local_view_bounds_an_expanded_mapping() -> None:
+def test_pcp_swa_local_view_bounds_an_expanded_mapping(monkeypatch) -> None:
     """A mixed batch keeps SWA at 1026 local rows, not 8208 expanded rows.
 
     ``run/20260924_104811`` crashed with ``tensor a (8192)`` versus
@@ -263,6 +263,7 @@ def test_pcp_swa_local_view_bounds_an_expanded_mapping() -> None:
 
     # One equal-width segment per rank, as `_convert_slot_mappings` builds.
     expanded_slots = torch.arange(8208, dtype=torch.int64)
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: SimpleNamespace(rank_in_group=0))
 
     with pcp.logical_pcp_metadata_scope(pcp_size):
         local_slots = pcp.pcp_local_slot_view(
@@ -288,3 +289,39 @@ def test_pcp_swa_local_view_bounds_an_expanded_mapping() -> None:
             sum(segment.num_tokens for segment in rank_segments)
             <= local_slots.shape[0]
         )
+
+
+def test_swa_validity_uses_owned_prefill_and_replicated_decode_slots(monkeypatch):
+    """Short fragments and padding differ by rank even in a DSpark decode block."""
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    manager = _manager(8)
+    batch = _input_batch([6, 5, 13], [False, True, True])
+    segments_by_rank, _ = manager._build_batch_layout(batch)
+    width = manager._padded_num_tokens
+    slots = _local_rows(
+        segments_by_rank,
+        torch.arange(batch.num_tokens, dtype=torch.int64),
+        padded=width,
+        fill=-1,
+    )
+    expected = [row.clone() for row in slots]
+    masks = []
+    for rank, segments in enumerate(segments_by_rank):
+        replicated = torch.zeros(width, dtype=torch.bool)
+        for segment in segments:
+            if not batch.is_prefilling_np[segment.global_req_idx]:
+                replicated[segment.local_slice] = True
+                if rank != 0:
+                    slots[rank][segment.local_slice] = -1
+        masks.append(replicated)
+    expanded = torch.cat(slots)
+    for rank in range(8):
+        monkeypatch.setattr(
+            pcp, "get_pcp_group", lambda r=rank: SimpleNamespace(rank_in_group=r)
+        )
+        with pcp.logical_pcp_metadata_scope(8):
+            actual = pcp.pcp_local_slot_view(
+                expanded, 8, replicated_token_mask=masks[rank]
+            )
+        torch.testing.assert_close(actual, expected[rank])

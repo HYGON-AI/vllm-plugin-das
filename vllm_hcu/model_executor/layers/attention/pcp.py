@@ -310,6 +310,8 @@ def globalize_pcp_slot_mapping(
 def pcp_local_slot_view(
     slot_mapping: torch.Tensor,
     configured_world_size: int,
+    *,
+    replicated_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Bound an expanded PCP slot mapping to the rank-local token width.
 
@@ -318,10 +320,9 @@ def pcp_local_slot_view(
     batch whose per-token buffers are sized by ``max_num_batched_tokens``, so
     metadata kernels must consume the local width instead of the expansion.
 
-    Validity is derived from the leading segment, exactly as the unexpanded
-    path does: replicated decode rows and every rank's prefill rows carry a
-    real slot there, while virtual padding rows carry the pad slot.  A
-    non-partitioned step is already local width and is returned unchanged.
+    Prefill validity follows this rank's segment; virtual padding can occur
+    at different local offsets on each rank. Replicated decode rows use the
+    rank-zero write owner's slots. A non-partitioned step is returned unchanged.
     """
 
     world_size = effective_pcp_metadata_world_size(configured_world_size)
@@ -337,7 +338,18 @@ def pcp_local_slot_view(
         "PCP expanded slot mapping must contain one equal-width segment per "
         f"rank: slots={slot_mapping.numel()}, world_size={world_size}"
     )
-    return slot_mapping.narrow(0, 0, local_num_tokens)
+    rank = int(get_pcp_group().rank_in_group)
+    assert 0 <= rank < world_size, f"invalid PCP rank {rank}/{world_size}"
+    local_slots = slot_mapping.narrow(0, rank * local_num_tokens, local_num_tokens)
+    if replicated_token_mask is None:
+        return local_slots
+    assert replicated_token_mask.dtype == torch.bool
+    assert replicated_token_mask.shape == (local_num_tokens,)
+    return torch.where(
+        replicated_token_mask,
+        slot_mapping[:local_num_tokens],
+        local_slots,
+    )
 
 
 def _rank_slot_slice(

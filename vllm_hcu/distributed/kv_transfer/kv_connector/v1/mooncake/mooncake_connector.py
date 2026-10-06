@@ -1262,6 +1262,21 @@ class MooncakeConnectorWorker:
         self._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
 
+    def _kv_layout_splits_kv_in_blocks(self) -> bool:
+        """Whether each block must register separate K and V sub-regions.
+
+        Upstream dropped ``TransferTopology.virtually_split_kv_in_blocks`` and
+        ``_cross_layers_blocks`` in the KV-cache layout refactor (#44456,
+        #51718); K and V are now packed into the content dimension, so
+        attention layers never split. Only Mamba still keeps two separately
+        indexable state regions, and cross-layer blocks never half-split.
+        Reproduce the removed predicate so the transfer plan stays byte-exact
+        for the models that still need it (this port keeps the Mamba path).
+        """
+        return bool(self.transfer_topo.is_mamba) and not bool(
+            getattr(self.transfer_topo, "cross_layers_blocks", False)
+        )
+
     def _sync_block_size_with_kernel(self) -> None:
         # When speculative decoding (e.g. Eagle) is enabled, the main model
         # and draft model may use different attention backends with different
@@ -1951,12 +1966,21 @@ class MooncakeConnectorWorker:
                 conv, _ = cache_or_caches
                 cache_list = [conv]
             else:
-                cache_list = list(
-                    self.transfer_topo.get_transfer_cache_regions(
-                        cache_or_caches,
-                        layer_spec,
-                    )
-                )
+                # Upstream #44456 dropped
+                # ``TransferTopology.get_transfer_cache_regions`` after packing
+                # K and V into the content dimension. Inline the equivalent
+                # logic, keeping the hybrid-SSM transpose the helper applied.
+                cache = cache_or_caches
+                if (
+                    self.transfer_topo.is_mamba
+                    and cache.ndim >= 1
+                    and cache.shape[0] == 2
+                ):
+                    # With MAMBA present every backend is blocks-first so that
+                    # attention and mamba layers can share blocks; the runner
+                    # already made num_blocks the leading dim, so swap back.
+                    cache = cache.transpose(0, 1)
+                cache_list = [cache]
 
             logger.debug(
                 "registering layer %s with %d cache tensor(s)",
@@ -1976,7 +2000,7 @@ class MooncakeConnectorWorker:
 
                 if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
                     kv_block_len = layer_spec.page_size_bytes
-                elif self.transfer_topo.virtually_split_kv_in_blocks and not isinstance(
+                elif self._kv_layout_splits_kv_in_blocks() and not isinstance(
                     layer_spec, MambaSpec
                 ):
                     dense_block_len = (
@@ -2009,7 +2033,7 @@ class MooncakeConnectorWorker:
                         )
                     kv_block_len = dense_bytes // cache.shape[0]
                 payload_span = kv_block_len * (
-                    2 if self.transfer_topo.virtually_split_kv_in_blocks else 1
+                    2 if self._kv_layout_splits_kv_in_blocks() else 1
                 )
                 if payload_span > block_len:
                     raise ValueError(
@@ -2419,7 +2443,8 @@ class MooncakeConnectorWorker:
                 for layer_name in layer_names
             ]
         split_kv_regions = None
-        if self.transfer_topo.virtually_split_kv_in_blocks:
+        splits_in_blocks = self._kv_layout_splits_kv_in_blocks()
+        if splits_in_blocks:
             split_kv_regions = [
                 not isinstance(
                     self._layer_specs[layer_name],
@@ -2433,7 +2458,7 @@ class MooncakeConnectorWorker:
             kv_block_lens=kv_block_lens,
             layer_names=layer_names,
             layer_indices=layer_indices,
-            is_kv_layout_blocks_first=self.transfer_topo.virtually_split_kv_in_blocks,
+            is_kv_layout_blocks_first=splits_in_blocks,
             group_indices=group_indices,
             split_kv_regions=split_kv_regions,
         )

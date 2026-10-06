@@ -41,6 +41,7 @@ def _worker(
     worker.shutdown = lambda: None
     worker.use_mla = use_mla
     worker.transfer_topo = SimpleNamespace(
+        is_mamba=False,
         virtually_split_kv_in_blocks=blocks_first,
         is_kv_layout_blocks_first=blocks_first,
         split_k_and_v=split_k_and_v,
@@ -419,7 +420,7 @@ def test_registration_preserves_padded_stride_and_deduplicates_storage(mooncake)
     worker.register_kv_caches(caches)
 
     assert worker.block_len_per_layer == [32, 32]
-    assert worker.kv_block_len_per_layer == [8, 8]
+    assert worker.kv_block_len_per_layer == [16, 16]
     assert worker.registered_layer_indices == [0, 1]
     assert worker.kv_caches_base_addr == [first.data_ptr(), second.data_ptr()]
     assert worker.engine.calls == [

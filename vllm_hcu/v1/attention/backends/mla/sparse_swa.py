@@ -590,8 +590,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         configured_pcp_world_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
+        replicated_token_mask = None
+        if (
+            configured_pcp_world_size > 1
+            and common_attn_metadata.is_prefilling is not None
+        ):
+            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            replicated_token_mask = torch.repeat_interleave(
+                ~common_attn_metadata.is_prefilling.cpu(), query_lens_cpu
+            ).to(device=slot_mapping.device)
         local_slot_mapping = pcp_local_slot_view(
-            slot_mapping, configured_pcp_world_size
+            slot_mapping,
+            configured_pcp_world_size,
+            replicated_token_mask=replicated_token_mask,
         )
 
         # Split into decode and prefill portions using configurable threshold

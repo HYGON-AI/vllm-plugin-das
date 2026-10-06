@@ -97,7 +97,9 @@ def apply_to_module(module: ModuleType) -> bool:
         ):
             return scheduler_block_size, scheduler_block_size
 
-        requested = cache_config.hash_block_size
+        requested = getattr(cache_config, "prefix_match_unit", None)
+        if requested is None:
+            requested = getattr(cache_config, "hash_block_size", None)
         hash_block_size = (
             requested
             if requested is not None
