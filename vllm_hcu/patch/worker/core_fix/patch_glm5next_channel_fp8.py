@@ -323,8 +323,12 @@ def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
 
 def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
     """Opt in to DeepGEMM only for GLM5Next shared-expert gate_up."""
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.platforms.hcu import on_gfx938
 
-    if os.environ.get(_GATE_DEEPGEMM_ENV) != "1":
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get(_GATE_DEEPGEMM_ENV) == "1"
+    ) or not on_gfx938():
         return False
     from deepgemm import fp8_gemm
 

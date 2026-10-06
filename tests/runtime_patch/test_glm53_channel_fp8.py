@@ -90,6 +90,10 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
 
     deepgemm.fp8_gemm = fp8_gemm
     monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+    from vllm_hcu.platforms import hcu
+
+    monkeypatch.setattr(hcu, "on_gfx938", lambda: True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
 
     module = fake_module()
@@ -176,6 +180,18 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
         gate_kernel.apply_scaled_mm(**{**kwargs, "output_shape": (1, 2, 3)}) == 7
     )
     assert len(calls) == 2
+
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        fake_module()
+    )
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(hcu, "on_gfx938", lambda: False)
+    assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        fake_module()
+    )
 
 
 def _fake_kda_module() -> tuple[ModuleType, type]:
