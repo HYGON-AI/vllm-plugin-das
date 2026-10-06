@@ -28,13 +28,85 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_dp_utils,
     patch_draft_speculator_inputs,
     patch_eagle_utils,
+    patch_eplb_communicator,
     patch_forward_context,
+    patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
     patch_pynccl,
     patch_pynccl_wrapper,
     patch_ubatch_utils,
 )
+
+
+def test_gloo_eplb_communicator_skips_only_device_profile_reservation() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    class TorchDistNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    class PyNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+        TorchDistNcclEplbCommunicator=TorchDistNcclEplbCommunicator,
+        PyNcclEplbCommunicator=PyNcclEplbCommunicator,
+    )
+
+    assert patch_eplb_communicator.apply_to_module(module)
+    assert not object.__new__(
+        TorchDistGlooStagedEplbCommunicator
+    ).needs_profile_buffer_reservation
+    assert object.__new__(
+        TorchDistNcclEplbCommunicator
+    ).needs_profile_buffer_reservation
+    assert object.__new__(PyNcclEplbCommunicator).needs_profile_buffer_reservation
+    assert patch_eplb_communicator.apply_to_module(module) is False
+
+
+def test_gloo_eplb_communicator_rejects_stale_property_marker() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+        TorchDistNcclEplbCommunicator=type(
+            "TorchDistNcclEplbCommunicator", (EplbCommunicator,), {}
+        ),
+        PyNcclEplbCommunicator=type(
+            "PyNcclEplbCommunicator", (EplbCommunicator,), {}
+        ),
+    )
+    patch_eplb_communicator.apply_to_module(module)
+    TorchDistGlooStagedEplbCommunicator.needs_profile_buffer_reservation = (
+        EplbCommunicator.needs_profile_buffer_reservation
+    )
+
+    with pytest.raises(
+        patch_eplb_communicator.PatchCompatibilityError,
+        match="stale",
+    ):
+        patch_eplb_communicator.apply_to_module(module)
 
 
 def _module(name: str, **attributes: object) -> ModuleType:
@@ -1191,6 +1263,62 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
+def test_gpu_dp_cudagraph_sync_skips_only_fixed_deepep_low_latency():
+    from vllm_hcu.patch.worker.framework_opt import patch_gpu_dp_utils
+
+    calls: list[tuple[object, ...]] = []
+
+    def sync_cudagraph_and_dp_padding(
+        cudagraph_manager,
+        desired_batch_desc,
+        num_tokens,
+        num_reqs,
+        uniform_token_count,
+        dp_size,
+        dp_rank,
+        max_query_len=None,
+        num_active_loras=0,
+        parallel_config=None,
+        allow_ubatching=False,
+        uniform_decode=False,
+    ):
+        calls.append((desired_batch_desc, parallel_config))
+        return "synced", "state"
+
+    module = _module(
+        patch_gpu_dp_utils.TARGET_MODULE,
+        sync_cudagraph_and_dp_padding=sync_cudagraph_and_dp_padding,
+    )
+    assert patch_gpu_dp_utils.apply_to_module(module) is True
+    assert patch_gpu_dp_utils.apply_to_module(module) is False
+    fixed = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        _vllm_hcu_deepep_auto=False,
+    )
+    auto = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        _vllm_hcu_deepep_auto=True,
+    )
+    normal = SimpleNamespace(all2all_backend="naive")
+    args = (None, "local_desc", 4, 2, None, 8, 3)
+
+    assert module.sync_cudagraph_and_dp_padding(
+        *args,
+        max_query_len=4,
+        num_active_loras=1,
+        parallel_config=fixed,
+        allow_ubatching=True,
+        uniform_decode=True,
+    ) == ("local_desc", None)
+    assert module.sync_cudagraph_and_dp_padding(
+        *args, parallel_config=auto
+    ) == ("synced", "state")
+    assert module.sync_cudagraph_and_dp_padding(
+        *args, parallel_config=normal
+    ) == ("synced", "state")
+    assert calls == [("local_desc", auto), ("local_desc", normal)]
+
+
 def test_draft_speculator_sampling_inputs_copy_async_and_preserve_padding():
     class _Buffer:
         def copy_(self, other, *, non_blocking=False):
@@ -1984,13 +2112,14 @@ print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
     patch_dp_utils, patch_draft_speculator_inputs, patch_eagle_utils,
-    patch_forward_context,
+    patch_forward_context, patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_draft_speculator_inputs,
+    patch_llm_base_proposer, patch_dp_utils, patch_gpu_dp_utils,
+    patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )

@@ -3179,6 +3179,46 @@ def test_channel_fp8_experts_repack_reloaded_weights_in_declared_layout(
     assert replacement._deepgemm_w2 is layer.w2_weight
 
 
+def test_channel_quant_experts_decode_gfx938_pair32_packed_shape():
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmContiguousExperts,
+    )
+
+    # Shapes observed from the gfx938 pair32 packer for the Hy4 model.
+    w13 = torch.empty((33, 96, 128, 2, 4, 16, 16), device="meta")
+    w2 = torch.empty((33, 32, 192, 2, 4, 16, 16), device="meta")
+
+    assert DeepEPDeepGemmContiguousExperts._packed_deepgemm_problem_shape(
+        w13,
+        w2,
+    ) == (33, 4096, 6144)
+
+
+def test_channel_quant_experts_restore_gfx938_pair32_packed_weights():
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmMaskedExperts,
+    )
+
+    experts = object.__new__(DeepEPDeepGemmMaskedExperts)
+    experts._deepgemm_w13 = None
+    experts._deepgemm_w2 = None
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.empty((1, 96, 128, 2, 4, 16, 16), device="meta"),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.empty((1, 32, 192, 2, 4, 16, 16), device="meta"),
+        requires_grad=False,
+    )
+    layer._dsv4_channel_deepgemm_layout = "masked"
+
+    experts.process_weights_after_loading(layer)
+
+    assert experts._deepgemm_w13 is layer.w13_weight
+    assert experts._deepgemm_w2 is layer.w2_weight
+
+
 @pytest.mark.parametrize(
     ("experts_name", "packer_name"),
     (
@@ -3341,6 +3381,99 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         if use_int8 or not master_enabled
         else [enabled_expected_m, enabled_expected_m]
     )
+
+
+@pytest.mark.parametrize("use_int8", [False, True])
+def test_eplb_channel_quant_masked_experts_keep_redundant_physical_slots(
+    monkeypatch: pytest.MonkeyPatch,
+    use_int8: bool,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    experts.num_dispatchers = 4
+    experts._deepgemm_w13 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts._deepgemm_w2 = torch.empty((1, 1, 1, 1, 1, 1))
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((2, 8)),
+        w2_scale=torch.ones((2, 4)),
+        gemm1_clamp_limit=10.0,
+        use_int8_w8a8=use_int8,
+    )
+    experts.moe_problem_size = lambda *_args: (2, 3, 8, 4, 1)
+
+    call_number = 0
+
+    def public_masked_kernel(
+        _a,
+        _b,
+        destination: torch.Tensor,
+        _masked_m,
+        _expected_m_per_group,
+    ) -> torch.Tensor:
+        nonlocal call_number
+        call_number += 1
+        destination.fill_(call_number)
+        return destination
+
+    kernel_name = (
+        "m_grouped_i8_gemm_nt_masked"
+        if use_int8
+        else "m_grouped_fp8_gemm_nt_masked"
+    )
+    monkeypatch.setattr(module, kernel_name, public_masked_kernel, raising=False)
+    monkeypatch.setattr(
+        module,
+        (
+            "m_grouped_fp8_gemm_nt_masked"
+            if use_int8
+            else "m_grouped_i8_gemm_nt_masked"
+        ),
+        lambda *_args, **_kwargs: pytest.fail("wrong quantized masked GEMM used"),
+        raising=False,
+    )
+    activation_kwargs: dict[str, object] = {}
+
+    def quantize_activation(output, **kwargs):
+        activation_kwargs.update(kwargs)
+        return (
+            output[..., :4].to(torch.int8),
+            torch.ones(output.shape[:2]),
+        )
+
+    quantizer_name = (
+        "fuse_silu_mul_clamp_quant_ep"
+        if use_int8
+        else "fuse_silu_mul_fp8_quant_ep"
+    )
+    monkeypatch.setattr(module, quantizer_name, quantize_activation, raising=False)
+
+    output = torch.empty((2, 3, 4))
+    experts.apply(
+        output=output,
+        hidden_states=torch.ones((2, 3, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((3, 1)),
+        topk_ids=torch.zeros((3, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=4,
+        expert_map=torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+        a1q_scale=torch.ones((2, 3)),
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty((2, 3, 8)),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=torch.tensor([2, 1], dtype=torch.int32)
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.equal(output, torch.full_like(output, 2))
+    assert activation_kwargs["limit"] == 10.0
 
 
 @pytest.mark.parametrize("use_int8", [False, True])

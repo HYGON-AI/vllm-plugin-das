@@ -19,7 +19,54 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_hcu.patch.config import get_hcu_config
+
 logger = init_logger(__name__)
+
+
+def validate_hyv4_offline_eplb_mode(
+    vllm_config: VllmConfig,
+    *,
+    enable_eplb: bool,
+) -> str | None:
+    """Return the validated HY4 offline EPLB mode, if requested."""
+
+    parallel = vllm_config.parallel_config
+    eplb = getattr(parallel, "eplb_config", None)
+    redundant = getattr(eplb, "num_redundant_experts", 0)
+    if (
+        not enable_eplb
+        and not redundant
+        and not hasattr(vllm_config, "additional_config")
+    ):
+        return None
+    hcu = get_hcu_config(vllm_config)
+    load_path = hcu.expert_map_path
+    record_path = hcu.expert_map_record_path
+    requested = bool(enable_eplb or redundant or load_path or record_path)
+    if not requested:
+        return None
+    if not enable_eplb or not parallel.enable_eplb:
+        raise ValueError("HYV4 offline EPLB requires enable_eplb=True")
+    if type(redundant) is not int or redundant <= 0:
+        raise ValueError(
+            "HYV4 offline EPLB requires a positive redundant expert count"
+        )
+    if not parallel.enable_expert_parallel:
+        raise ValueError("HYV4 offline EPLB requires expert parallel")
+    if not load_path and not record_path:
+        raise ValueError(
+            "HYV4 EPLB requires exactly one offline map path"
+        )
+    if getattr(eplb, "use_async", False):
+        raise ValueError("HYV4 offline EPLB does not support async EPLB")
+    if getattr(parallel, "enable_elastic_ep", False):
+        raise ValueError("HYV4 offline EPLB does not support elastic EP")
+    if getattr(parallel, "pipeline_parallel_size", 1) != 1:
+        raise ValueError("HYV4 offline EPLB does not support pipeline parallel")
+    if getattr(parallel, "enable_ep_weight_filter", False):
+        raise ValueError("HYV4 offline EPLB cannot use EP weight filtering")
+    return "static" if load_path else "record"
 
 
 class HYV4FeedForward(nn.Module):
@@ -77,11 +124,10 @@ class HYV4MoEFused(nn.Module):
         super().__init__()
         if vllm_config is None:
             vllm_config = get_current_vllm_config()
-        if (
-            enable_eplb
-            or vllm_config.parallel_config.eplb_config.num_redundant_experts
-        ):
-            raise NotImplementedError("HYV4 EPLB is not supported in this MR")
+        self.offline_eplb_mode = validate_hyv4_offline_eplb_mode(
+            vllm_config,
+            enable_eplb=enable_eplb,
+        )
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_group = get_ep_group().device_group
