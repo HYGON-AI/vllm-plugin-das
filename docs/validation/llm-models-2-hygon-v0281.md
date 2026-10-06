@@ -31,6 +31,7 @@ request.
 | `DeepSeek-V4-Flash-0731-Channel-INT8-w8a8` | TP8 | raw 14/16; normalized 16/16, twice | DSpark7; public E4M3-to-`fp8_ds_mla`; tuned AITER W8A8 MoE; target FULL plus PIECEWISE and DSpark FULL Graphs; this is V4-Flash-0731, not excluded V4.1 |
 | `DeepSeek-V4-Flash-0731-Channel-FP8-w8a8` | TP8 | raw 13/16; normalized 16/16, twice | DSpark7; BLHNC E4M3 KV; channel-wise FP8 dense and tuned AITER FP8 MoE; target FULL plus PIECEWISE and DSpark FULL Graphs |
 | `DeepSeek-V4-Flash-0731-W4A8-INT4-Channel-Attn-W8A8-INT8-Channel` | TP8 | 16/16 raw and normalized, twice | SlimQuant W4A8 MoE; W8A8 attention; BLHNC E4M3 KV; DSpark7; target FULL plus PIECEWISE and DSpark FULL Graphs |
+| `DeepSeek-V4-Flash-Channel-FP8-w8a8` | TP8 | raw 15/16; normalized 16/16, twice | no DSpark metadata; MTP3; BLHNC E4M3 KV; AITER FP8 MoE; target and MTP prefill FULL plus PIECEWISE, MTP decode FULL Graphs |
 | `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
 | `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
 | `GLM-5.3-Flash-Channel-INT8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; FP8 KV is blocked because the installed sparse FlashMLA FP8 kernel rejects `Dqk=512` |
@@ -687,6 +688,82 @@ Evidence:
 - `/tmp/vllm-hcu-validation/deepseek-v4-flash-0731-w4a8-tp8-dspark7-kvfp8.log`
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-0731-w4a8-tp8-dspark7-kvfp8-run1`
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-0731-w4a8-tp8-dspark7-kvfp8-run2`
+
+## DeepSeek-V4-Flash Channel-FP8 TP8 commands
+
+Unlike the 0731 checkpoints, this 274.13 GiB, 46-shard checkpoint has one
+next-N layer but no `dspark_*` metadata. Use generic MTP3 and retain the
+official repeated-single-layer warning; do not copy the 0731 DSpark7 command.
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve \
+    /llm-models-2/hygon/DeepSeek-V4-Flash-Channel-FP8-w8a8 \
+  --served-model-name DeepSeek-V4-Flash-Channel-FP8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tokenizer-mode deepseek_v4 \
+  --distributed-executor-backend mp \
+  --tensor-parallel-size 8 \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --block-size 256 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 512 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-fresh-run
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model DeepSeek-V4-Flash-Channel-FP8-w8a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"thinking":false}}}' \
+  --stream --eval-batch-size 1 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" --no-timestamp
+```
+
+Model loading used 38.31 GiB/rank and the service allocated 868,343 KV
+tokens. Public E4M3 resolved to `fp8_ds_mla` with BLHNC physical storage.
+Dense layers selected `ChannelWiseTorchFP8ScaledMMLinearKernel`; AITER FP8
+MoE loaded the gfx938 `fp8_w8a8/E=256,N=256` ordinary and bottom-layer
+configurations plus the channel-shuffle table on all ranks. The target and
+MTP prefill captured FULL and PIECEWISE Graphs; MTP decode captured FULL
+Graphs.
+
+Both HumanEval16 runs scored raw 15/16 and independently normalized 16/16 at
+27.70 and 28.01 output tok/s. HumanEval/9 was complete, valid Python under an
+opening but unclosed Markdown fence in both raw reports. The duplicate-prefix
+probe returned `17` twice and added 2,816/6,148 hit/query tokens. Session MTP
+counters were 2,770/3,894 accepted/drafted tokens (71.1%). The log contained
+no ERROR or Traceback, and teardown returned every card to 2 MiB.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8-run1`
+- `/tmp/vllm-hcu-evalscope/deepseek-v4-flash-fp8-tp8-mtp3-kvfp8-run2`
 
 ## GLM-5.3 Flash Channel-INT8 TP4 commands
 
