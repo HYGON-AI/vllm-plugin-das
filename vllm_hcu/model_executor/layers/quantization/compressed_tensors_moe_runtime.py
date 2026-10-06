@@ -585,8 +585,8 @@ def apply_aiter_w4a16_moe(
     quant_config: object,
     vllm_moe_config: object,
     apply_router_weight_on_input: bool,
-) -> torch.Tensor:
-    """Execute channel-wise compressed-tensors W4A16 through AITER."""
+) -> torch.Tensor | None:
+    """Execute channel-wise W4A16 through AITER when a solution exists."""
 
     if apply_router_weight_on_input:
         raise HcuCompressedTensorsMoeError(
@@ -639,9 +639,7 @@ def apply_aiter_w4a16_moe(
     )
     config = select_aiter_moe_config(problem, cache_owner=w1)
     if config is None:
-        raise HcuCompressedTensorsMoeError(
-            "AITER has no supported channel-wise W4A16 MoE solution"
-        )
+        return None
     prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
         w1,
         w2,

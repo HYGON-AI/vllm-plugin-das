@@ -88,44 +88,46 @@ def apply_to_module(module: ModuleType) -> bool:
             and getattr(quant_config, "_hcu_aiter_w4a16_available", False)
             and getattr(moe_config, "moe_backend", None) == "aiter"
         )
-        if not is_channel_aiter:
-            return original_wna16_apply(
-                self,
-                output,
-                hidden_states,
-                w1,
-                w2,
-                topk_weights,
-                topk_ids,
-                activation,
-                global_num_experts,
-                expert_map,
-                a1q_scale,
-                a2_scale,
-                workspace13,
-                workspace2,
-                expert_tokens_meta,
-                apply_router_weight_on_input,
+        if is_channel_aiter:
+            from vllm_hcu.model_executor.layers.quantization import (
+                compressed_tensors_moe_runtime as hcu_runtime,
             )
-        from vllm_hcu.model_executor.layers.quantization import (
-            compressed_tensors_moe_runtime as hcu_runtime,
-        )
 
-        result = hcu_runtime.apply_aiter_w4a16_moe(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            quant_config=quant_config,
-            vllm_moe_config=moe_config,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            result = hcu_runtime.apply_aiter_w4a16_moe(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                quant_config=quant_config,
+                vllm_moe_config=moe_config,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            if result is not None:
+                output.copy_(result)
+                return None
+
+        return original_wna16_apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
         )
-        output.copy_(result)
-        return None
 
     cls._vllm_hcu_original_supports_quant_scheme = original
     cls._supports_quant_scheme = staticmethod(hcu_supports_quant_scheme)
