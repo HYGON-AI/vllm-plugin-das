@@ -28,6 +28,7 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_dp_utils,
     patch_draft_speculator_inputs,
     patch_eagle_utils,
+    patch_eplb_communicator,
     patch_forward_context,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
@@ -35,6 +36,76 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_pynccl_wrapper,
     patch_ubatch_utils,
 )
+
+
+def test_gloo_eplb_communicator_skips_only_device_profile_reservation() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    class TorchDistNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    class PyNcclEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+        TorchDistNcclEplbCommunicator=TorchDistNcclEplbCommunicator,
+        PyNcclEplbCommunicator=PyNcclEplbCommunicator,
+    )
+
+    assert patch_eplb_communicator.apply_to_module(module)
+    assert not object.__new__(
+        TorchDistGlooStagedEplbCommunicator
+    ).needs_profile_buffer_reservation
+    assert object.__new__(
+        TorchDistNcclEplbCommunicator
+    ).needs_profile_buffer_reservation
+    assert object.__new__(PyNcclEplbCommunicator).needs_profile_buffer_reservation
+    assert patch_eplb_communicator.apply_to_module(module) is False
+
+
+def test_gloo_eplb_communicator_rejects_stale_property_marker() -> None:
+    class EplbCommunicator:
+        @property
+        def needs_profile_buffer_reservation(self) -> bool:
+            return True
+
+    class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
+        pass
+
+    module = _module(
+        patch_eplb_communicator.TARGET_MODULE,
+        EplbCommunicator=EplbCommunicator,
+        TorchDistGlooStagedEplbCommunicator=(
+            TorchDistGlooStagedEplbCommunicator
+        ),
+        TorchDistNcclEplbCommunicator=type(
+            "TorchDistNcclEplbCommunicator", (EplbCommunicator,), {}
+        ),
+        PyNcclEplbCommunicator=type(
+            "PyNcclEplbCommunicator", (EplbCommunicator,), {}
+        ),
+    )
+    patch_eplb_communicator.apply_to_module(module)
+    TorchDistGlooStagedEplbCommunicator.needs_profile_buffer_reservation = (
+        EplbCommunicator.needs_profile_buffer_reservation
+    )
+
+    with pytest.raises(
+        patch_eplb_communicator.PatchCompatibilityError,
+        match="stale",
+    ):
+        patch_eplb_communicator.apply_to_module(module)
 
 
 def _module(name: str, **attributes: object) -> ModuleType:

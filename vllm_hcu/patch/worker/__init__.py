@@ -55,6 +55,7 @@ FeatureKey = Literal[
     "forward_context",
     "lightly_cp",
     "multi_layers_mtp",
+    "offline_eplb",
     "proposer",
     "pynccl_all_to_all",
 ]
@@ -330,9 +331,19 @@ _CUDA_VALIDATION_ID = (
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_model_loader_static_eplb"),
+        feature="offline_eplb",
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_static_expert_mapping"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_offline_eplb"),
+        feature="offline_eplb",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_eplb_communicator"),
+        feature="offline_eplb",
     ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
@@ -746,6 +757,9 @@ def _feature_states(
         ),
         "lightly_cp": config.enable_lightly_cp,
         "multi_layers_mtp": config.enable_multi_layers_mtp,
+        "offline_eplb": bool(
+            config.expert_map_path or config.expert_map_record_path
+        ),
         "proposer": bool(
             config.enable_lightly_cp or config.enable_multi_layers_mtp
         ),
@@ -773,8 +787,11 @@ def _bind_deserialized_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     from vllm_hcu.patch.platform.core_fix.patch_compilation_config import (
         bind_hcu_config,
     )
+    from vllm_hcu.patch.config import bind_hcu_eplb_config
 
-    return bind_hcu_config(vllm_config)
+    normalized = bind_hcu_config(vllm_config)
+    bind_hcu_eplb_config(vllm_config)
+    return normalized
 
 
 def apply_worker_patches(vllm_config: object | None = None) -> None:
