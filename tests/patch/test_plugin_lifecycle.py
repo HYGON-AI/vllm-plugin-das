@@ -596,12 +596,27 @@ def test_worker_drains_and_terminal_validates_after_successful_warmup(
         lambda self: events.append("parent_warmup") or "warmup-result",
         raising=False,
     )
+    config = SimpleNamespace(speculative_config=None)
+
+    @contextmanager
+    def current_config(value):
+        assert value is config
+        events.append("config_enter")
+        try:
+            yield
+        finally:
+            events.append("config_exit")
+
+    monkeypatch.setattr(worker_module, "set_current_vllm_config", current_config)
     worker = object.__new__(worker_module.HcuGPUWorker)
     worker.use_v2_model_runner = False
+    worker.vllm_config = config
 
     assert worker.compile_or_warm_up_model() == "warmup-result"
     assert events == [
+        "config_enter",
         "parent_warmup",
+        "config_exit",
         "drain",
         ("validate", True, "runtime"),
     ]
@@ -614,6 +629,7 @@ def test_worker_does_not_validate_after_failed_warmup(
     from vllm_hcu.patch import import_coordinator, worker as worker_dispatcher
 
     worker_module = cpu_safe_hcu_worker_module
+    events: list[str] = []
 
     class FakeCoordinator:
         def drain_ready_callbacks(self):
@@ -629,17 +645,35 @@ def test_worker_does_not_validate_after_failed_warmup(
         "validate_worker_patches",
         lambda **kwargs: pytest.fail("validation ran after failed warmup"),
     )
+    def failed_warmup(self):
+        events.append("parent_warmup")
+        raise RuntimeError("warmup failed")
+
     monkeypatch.setattr(
         worker_module.Worker,
         "compile_or_warm_up_model",
-        lambda self: (_ for _ in ()).throw(RuntimeError("warmup failed")),
+        failed_warmup,
         raising=False,
     )
+    config = SimpleNamespace(speculative_config=None)
+
+    @contextmanager
+    def current_config(value):
+        assert value is config
+        events.append("config_enter")
+        try:
+            yield
+        finally:
+            events.append("config_exit")
+
+    monkeypatch.setattr(worker_module, "set_current_vllm_config", current_config)
     worker = object.__new__(worker_module.HcuGPUWorker)
     worker.use_v2_model_runner = False
+    worker.vllm_config = config
 
     with pytest.raises(RuntimeError, match="warmup failed"):
         worker.compile_or_warm_up_model()
+    assert events == ["config_enter", "parent_warmup", "config_exit"]
 
 
 @pytest.mark.parametrize(
