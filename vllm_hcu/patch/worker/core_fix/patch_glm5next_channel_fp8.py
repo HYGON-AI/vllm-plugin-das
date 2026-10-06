@@ -41,6 +41,8 @@ _MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
 _GATE_DEEPGEMM_PATCH_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_applied"
 _GATE_DEEPGEMM_WRAPPER_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_wrapper"
 _GATE_DEEPGEMM_ENV = "VLLM_HCU_GLM53_GATE_UP_DEEPGEMM"
+_BF16_NN_PATCH_MARKER = "_vllm_hcu_glm5next_bf16_nn_padding_applied"
+_BF16_NN_WRAPPER_MARKER = "_vllm_hcu_glm5next_bf16_nn_padding_wrapper"
 _LOGGER = init_logger(__name__)
 
 # Channel-INT8 checkpoints quantize a few MLA/indexer projections that the
@@ -448,6 +450,91 @@ def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
     return True
 
 
+def _bind_glm5next_bf16_nn_padding(decoder) -> None:
+    from vllm_hcu.model_executor.layers.linear import UnquantizedLinearMethod
+
+    for projection in decoder.modules():
+        method = getattr(projection, "quant_method", None)
+        weight = getattr(projection, "weight", None)
+        # Bind only the HCU NN implementation, not a quantized method or an
+        # already-imported upstream method with a different weight layout.
+        if (
+            type(method) is not UnquantizedLinearMethod
+            or not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2
+            or weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or getattr(method.apply, _BF16_NN_WRAPPER_MARKER, False)
+        ):
+            continue
+
+        def wrap_apply(original):
+            @functools.wraps(original)
+            def padded_apply(layer, x, bias=None):
+                if (
+                    x.ndim == 2
+                    and layer.weight.ndim == 2
+                    and x.dtype == layer.weight.dtype == torch.bfloat16
+                    and layer.weight.is_contiguous()
+                    and x.shape[1] == layer.weight.shape[0]
+                    and (bias is None or bias.ndim == 1)
+                ):
+                    rows = x.shape[0]
+                    extra_rows = (-rows) % 16
+                    if extra_rows:
+                        # gfx938 BF16 NN GEMM has excessive rounding error for
+                        # some partial row tiles (reproduced at M=119..127).
+                        # Zero rows are independent of the valid projections.
+                        x_padded = torch.nn.functional.pad(
+                            x, (0, 0, 0, extra_rows)
+                        )
+                        return original(layer, x_padded, bias)[:rows]
+                return original(layer, x, bias)
+
+            setattr(padded_apply, _BF16_NN_WRAPPER_MARKER, True)
+            return padded_apply
+
+        method.apply = wrap_apply(method.apply)
+
+
+def _patch_glm5next_bf16_nn_padding(glm_model: ModuleType) -> bool:
+    from vllm import envs
+
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.platforms.hcu import on_gfx938
+
+    if (
+        not henvs.optional_custom_op_enabled()
+        or not on_gfx938()
+        or not henvs.VLLM_USE_NN
+        or envs.VLLM_BATCH_INVARIANT
+    ):
+        return False
+    decoder_cls = vars(glm_model).get("Glm5NextDecoderLayer")
+    if not isinstance(decoder_cls, type):
+        raise PatchCompatibilityError(
+            f"required class {TARGET_MODULE}.Glm5NextDecoderLayer is missing"
+        )
+    original = require_callable(
+        decoder_cls, "__init__", f"{TARGET_MODULE}.Glm5NextDecoderLayer.__init__"
+    )
+    if getattr(decoder_cls, _BF16_NN_PATCH_MARKER, False):
+        if not getattr(original, _BF16_NN_WRAPPER_MARKER, False):
+            raise PatchCompatibilityError("GLM5Next BF16 NN padding marker is stale")
+        return False
+
+    @functools.wraps(original)
+    def hcu_decoder_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _bind_glm5next_bf16_nn_padding(self)
+
+    setattr(hcu_decoder_init, _BF16_NN_WRAPPER_MARKER, True)
+    decoder_cls.__init__ = hcu_decoder_init
+    setattr(decoder_cls, _BF16_NN_PATCH_MARKER, True)
+    _LOGGER.info("GLM5Next BF16 NN GEMM pads rows to multiples of 16")
+    return True
+
+
 def _expand_glm5next_multimodal_ignore_aliases(ignore: list[str]) -> list[str]:
     """Add runtime aliases for checkpoint-rooted GLM5Next regex ignores."""
     expanded = list(ignore)
@@ -761,6 +848,7 @@ def apply_to_module(module: ModuleType) -> bool:
     changed = _patch_multimodal_quant_ignore(glm_model)
     changed = _patch_glm5next_boltops_mhc(glm_model) or changed
     changed = _patch_glm5next_shared_gate_deepgemm(glm_model) or changed
+    changed = _patch_glm5next_bf16_nn_padding(glm_model) or changed
     kpool = sys.modules.get(KPOOL_MODULE)
     if isinstance(kpool, ModuleType):
         changed = _patch_sparse_indexer_kpool(kpool)
