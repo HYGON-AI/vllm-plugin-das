@@ -32,6 +32,7 @@ request.
 | `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
 | `GLM-5.3-Flash-Channel-INT8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; FP8 KV is blocked because the installed sparse FlashMLA FP8 kernel rejects `Dqk=512` |
 | `GLM-5.3-Flash-Channel-FP8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | FP8 weights; NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; 2,247/2,340 session draft tokens accepted |
+| `MiniMax-M2.5-Channel-INT8-w8a8` | TP4 | 16/16 twice at 3,800 output tokens | E4M3 KV; AITER W8A8 MoE; target FULL plus PIECEWISE Graphs; built-in MTP is not registered for MiniMax M2 in vLLM 0.28.1 |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -594,6 +595,73 @@ Two fresh HumanEval16 runs passed raw 16/16 at 16.12 and 28.06 output tok/s.
 The duplicate-prefix probe returned `17` twice and accumulated 2,304/12,110
 prefix hit/query tokens. Session MTP acceptance was 2,247/2,340 (96.0%). The
 log had no ERROR or Traceback, and exact teardown returned all cards to 2 MiB.
+
+## MiniMax M2.5 Channel-INT8 TP4 commands
+
+MiniMax M2.5 exposes `num_mtp_modules=3`, but vLLM 0.28.1 does not register a
+MiniMax M2 built-in MTP draft architecture. Its main-model loader deliberately
+drops the appended prediction layers, so `method=mtp` is rejected during
+configuration. The accepted TP route therefore omits speculative decoding.
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve \
+    /llm-models-2/hygon/MiniMax-M2.5-Channel-INT8-w8a8 \
+  --served-model-name MiniMax-M2.5-Channel-INT8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASH_ATTN \
+  --reasoning-parser minimax_m2_append_think \
+  --moe-backend aiter \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.70 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/minimax-m25-int8-tp4-kvfp8-fresh-run
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model MiniMax-M2.5-Channel-INT8-w8a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":3800}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" --no-timestamp
+```
+
+The 214.37 GiB checkpoint used 56.15 GiB of model memory per rank. Dense INT8
+selected official Triton scaled-MM, while MoE loaded the gfx938 AITER
+`E=256,N=384` ordinary and bottom-layer configs plus the channel-shuffle
+table. MRV2 captured default FULL and PIECEWISE Graphs, and public E4M3 used
+LBNHC with 64-token blocks and 1,487,936 KV tokens.
+
+At a 2,048-token client limit the raw score was 14/16: HumanEval/1 and /10
+both stopped at `max_tokens` inside reasoning. Raising only the client limit
+to 3,800 produced raw 16/16 twice at 49.66 and 49.47 output tok/s. Duplicate
+prefix requests both returned `17`; session prefix counters reached
+6,656/11,954 hit/query tokens. The successful log had no ERROR or Traceback,
+and exact teardown returned all cards to 2 MiB.
 
 ## HumanEval client command
 
