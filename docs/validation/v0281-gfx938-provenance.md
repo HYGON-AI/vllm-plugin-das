@@ -362,6 +362,12 @@ controls remain diagnostic history from before the stream-race fix. Full
 evidence and exact commands are in
 `docs/validation/kimi-k26-gfx938-humaneval64.md`.
 
+Additional checkpoints under `/llm-models-2/hygon` were then exercised with
+the same pinned runtime. The detailed score matrix, exact server/client
+commands, hybrid fine-grained prefix evidence, Qwen3.8 long-prefix regression,
+and the Qwen4Exp BLNHC layout exception are recorded in
+`docs/validation/llm-models-2-hygon-v0281.md`.
+
 ## Source closure after runtime fixes
 
 - Full `tests/runtime_patch`: `1679 passed, 14 warnings` after the final Kimi
