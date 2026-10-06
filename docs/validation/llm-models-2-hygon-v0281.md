@@ -31,6 +31,7 @@ request.
 | `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
 | `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
 | `GLM-5.3-Flash-Channel-INT8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; FP8 KV is blocked because the installed sparse FlashMLA FP8 kernel rejects `Dqk=512` |
+| `GLM-5.3-Flash-Channel-FP8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | FP8 weights; NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; 2,247/2,340 session draft tokens accepted |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -524,6 +525,75 @@ RoPE component. A zero-tail writer experiment was not retained: direct calls
 to the installed FlashMLA sparse FP8 kernel rejected `Dqk=512` with either a
 656-byte DS-MLA page or a 528-byte NoPE page. This is a provider capability
 gap; constructing a page the consumer cannot execute would not be a fix.
+
+## GLM-5.3 Flash Channel-FP8 TP4 commands
+
+This FP8-weight sibling uses the same native NoPE sparse-MLA contract. Its
+accepted route also uses auto/BF16 KV; the provider boundary documented above
+applies equally to public E4M3 KV.
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve \
+    /llm-models-2/hygon/GLM-5.3-Flash-Channel-FP8-w8a8 \
+  --served-model-name GLM-5.3-Flash-Channel-FP8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASHMLA_SPARSE \
+  --reasoning-parser glm45 \
+  --moe-backend aiter \
+  --speculative-config \
+    '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}' \
+  --enable-prefix-caching \
+  --gpu-memory-utilization 0.80 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"reasoning_effort":"low"}'
+```
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/glm53-flash-fp8-bf16-fresh-run
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model GLM-5.3-Flash-Channel-FP8-w8a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"low"}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" --no-timestamp
+```
+
+The TP4 run loaded 306.33 GiB of checkpoint data and used 78.99 GiB of model
+memory per rank. It selected MRV2, LBHNC, a 64-token FlashMLA kernel page, a
+1,152-token hybrid-manager page, and 503,398 KV tokens. GLM5Next selected
+Mamba align automatically. Target and MTP3 speculator captured the default
+FULL and PIECEWISE Graphs, and local argmax was active. The requested AITER
+FP8 MoE route had no supported
+`M=1,E=288,N1=1024,N2=4096,K=4096,top_k=8` solution, so that decode shape
+fell back to official vLLM Triton.
+
+Two fresh HumanEval16 runs passed raw 16/16 at 16.12 and 28.06 output tok/s.
+The duplicate-prefix probe returned `17` twice and accumulated 2,304/12,110
+prefix hit/query tokens. Session MTP acceptance was 2,247/2,340 (96.0%). The
+log had no ERROR or Traceback, and exact teardown returned all cards to 2 MiB.
 
 ## HumanEval client command
 
