@@ -1055,6 +1055,7 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
         FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+        FlashMLASparseMetadataBuilder=type("UpstreamSparseMetadataBuilder", (), {}),
     )
     module_name = "_vllm_hcu_cpu_test_flashmla_sparse_backend"
     source = (
@@ -1083,6 +1084,11 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
     class UpstreamFlashMLASparseImpl:
         supports_pcp = False
         can_return_lse_for_decode = False
+
+        def __init__(self):
+            self.kv_cache_dtype = "auto"
+            self.qk_rope_head_dim = 1
+            self.q_concat_buffer = torch.empty(2, 4, 4)
 
         def forward_mqa(self, q, kv_cache, attn_metadata, layer):
             calls.append(("upstream", q, kv_cache, attn_metadata, layer))
@@ -1164,6 +1170,7 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
         FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+        FlashMLASparseMetadataBuilder=type("UpstreamSparseMetadataBuilder", (), {}),
     )
     _install_stub(monkeypatch, "vllm._custom_ops", concat_mla_q=concat_mla_q)
     _install_stub(

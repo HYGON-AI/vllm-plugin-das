@@ -116,6 +116,23 @@ class HcuGPUWorker(Worker):
             )
         validate_worker_patches(require_applied=True)
 
+    def reload_weights(self, *args, **kwargs) -> None:
+        super().reload_weights(*args, **kwargs)
+        from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
+            refresh_glm53_router_gates,
+        )
+
+        refresh_glm53_router_gates(self.model_runner.model)
+
+    def finish_weight_update(self) -> None:
+        super().finish_weight_update()
+        if not self._weight_update_is_draft:
+            from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
+                refresh_glm53_router_gates,
+            )
+
+            refresh_glm53_router_gates(self.model_runner.model)
+
     def compile_or_warm_up_model(self):
         if (
             self.use_v2_model_runner

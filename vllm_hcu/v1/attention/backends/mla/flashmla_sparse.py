@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseImpl,
     FlashMLASparseMetadataBuilder,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 
 class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
@@ -45,10 +46,15 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         )
         if self._fp8_nope:
             # FlashMLA's packed DS FP8 kernel expects a 576-wide query even
-            # though GLM5Next's native query is 512-wide. Keep its fake RoPE
-            # component zero in a fixed buffer so CUDA Graph replay is safe.
+            # though GLM5Next's native query is 512-wide. Reserve it in the
+            # shared workspace rather than keeping a full query per layer.
             shape = (*self.q_concat_buffer.shape[:-1], 576)
-            self.q_concat_buffer = self.q_concat_buffer.new_zeros(shape)
+            self._fp8_nope_query_spec = (shape, self.q_concat_buffer.dtype)
+            (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
+                self._fp8_nope_query_spec
+            )
+            # This small cache-writer input must stay zero independently of
+            # other operators reusing the query workspace.
             self._fp8_nope_pe_buffer = self.q_concat_buffer.new_zeros((shape[0], 64))
 
     def forward_mqa(
@@ -63,9 +69,19 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         # so materialize the zero-RoPE query in the preallocated graph buffer.
         if isinstance(q, tuple) and q[1].shape[-1] == 0:
             ql_nope, _ = q
-            q_buffer = self.q_concat_buffer[: ql_nope.shape[0]]
+            if self._fp8_nope:
+                # Resolve the current (ubatch, target/draft lane) on every
+                # invocation. FULL capture retains that slot's stable address.
+                (buffer,) = current_workspace_manager().get_simultaneous(
+                    self._fp8_nope_query_spec
+                )
+            else:
+                buffer = self.q_concat_buffer
+            q_buffer = buffer[: ql_nope.shape[0]]
             q_buffer[:, : ql_nope.shape[1], : ql_nope.shape[-1]].copy_(ql_nope)
             q = q_buffer[:, : ql_nope.shape[1], :]
+            if self._fp8_nope:
+                q[..., ql_nope.shape[-1]:].zero_()
         if self.dcp_world_size <= 1:
             return super().forward_mqa(
                 q,

@@ -151,3 +151,23 @@ def bind_glm53_router_gates(model: torch.nn.Module | None) -> int:
         if gate is not None:
             bound += _bind_gate(gate)
     return bound
+
+
+@torch.no_grad()
+def refresh_glm53_router_gates(model: torch.nn.Module | None) -> None:
+    """Refresh loaded weights without invalidating CUDA Graph buffer addresses."""
+    if model is None:
+        return
+    for gate in model.modules():
+        if not getattr(gate, "_vllm_hcu_glm53_router_gemv_bound", False):
+            continue
+        weight = gate.weight
+        packed = gate._hcu_router_gemv_weight
+        if (
+            weight.shape != (_HIDDEN_SIZE, _NUM_EXPERTS)
+            or weight.dtype != packed.dtype
+            or weight.device != packed.device
+        ):
+            raise RuntimeError("reloaded GLM-5.3 router weight has incompatible layout")
+        # The forward closure and captured graphs both retain this allocation.
+        packed.copy_(weight.T)
