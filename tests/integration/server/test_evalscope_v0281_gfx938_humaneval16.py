@@ -484,6 +484,14 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
     assert _option_value(qwen2_command, "--moe-backend") == "aiter"
     assert "--speculative-config" not in qwen2_command
 
+    qwen3 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen3_8b_tp2"
+    )
+    qwen3_command, _, _ = server_command(qwen3, model_env=MODEL_ENV)
+    assert qwen3["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(qwen3_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert "--speculative-config" not in qwen3_command
+
     qwen36 = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="qwen36_27b_w8a8_tp2"
     )

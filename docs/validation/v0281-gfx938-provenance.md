@@ -895,6 +895,85 @@ Evidence:
 - `/tmp/vllm-hcu-validation/qwen38-27b-channel-int8-current-tp2-mtp3-kvfp8-fine.log`
 - `/tmp/vllm-hcu-evalscope/qwen38-27b-channel-int8-current-tp2-mtp3-kvfp8-fine-run1-20261007`
 
+### Qwen3 8B current-head E4M3 rerun
+
+The `/models/Qwen3-8B` checkpoint was rerun at MR head `9d6e4ef`. The
+accepted service command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  VLLM_CACHE_ROOT=/tmp/vllm-cache-qwen3-8b-current \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /models/Qwen3-8B \
+  --served-model-name Qwen3-8B \
+  --port 10247 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.35 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The matching isolated HumanEval16 client command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen3-8b \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-8B \
+  --api-url http://127.0.0.1:10247/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream \
+  --eval-batch-size 8 \
+  --timeout 7200 \
+  --limit 16 \
+  --datasets humaneval \
+  --dataset-args '{"humaneval":{}}' \
+  --work-dir \
+    /tmp/vllm-hcu-evalscope/qwen3-8b-current-tp2-kvfp8-run1-20261007 \
+  --no-timestamp
+```
+
+Both ranks constructed `HcuGPUModelRunnerV2`; the engine resolved
+`kv_cache_dtype=fp8_e4m3`, physical `LBHNC`, and a 64-token FLASH_ATTN block.
+Default compilation selected `FULL_AND_PIECEWISE`, and both PIECEWISE and FULL
+graphs were captured. The service allocated 1,163,200 KV tokens. This dense
+checkpoint has no MTP layer, so no speculative configuration was added.
+
+HumanEval raw Accuracy and Pass@1 both passed 16/16. The report observed
+105.03 output tok/s, 113.2 ms mean TTFT, 8.7 ms mean TPOT, and 1.23 s mean
+latency. Two identical long-prefix requests returned coherent content and
+increased `vllm:prefix_cache_hits_total` from 0 to 2,688 tokens; the final
+session counters were 2,688/7,588 hit/query tokens. All 18 chat requests
+returned HTTP 200, and the log contained no ERROR, Traceback, VM fault, or
+dead engine. Ctrl-C teardown returned cards 0 and 1 to the 2 MiB baseline.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-8b-current-tp2-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-8b-current-tp2-kvfp8-run1-20261007`
+
 Additional checkpoints under `/llm-models-2/hygon` were then exercised with
 the same pinned runtime. The detailed score matrix, exact server/client
 commands, hybrid fine-grained prefix evidence, Qwen3.8 long-prefix regression,

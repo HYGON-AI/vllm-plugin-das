@@ -372,7 +372,9 @@ profiles:
     server:
       port: 10209
       served_model_name: Qwen3-8B
-      environment: *flash_environment
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
       args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen3-8b-tp2
