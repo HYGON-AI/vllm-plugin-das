@@ -146,7 +146,7 @@ and owned artifact directories are defined in
 | `qwen36_27b_w8a8_tp2` | TP2, FLASH_ATTN, W8A8, prefix | 15/16 | Deterministic HumanEval/8 miss retained |
 | `qwen38_27b_int8_tp2` | TP2, FLASH_ATTN, INT8, prefix | 16/16 | Pass |
 | `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, AITER FP8 MoE, E4M3 KV, MTP3 | 16/16 | Pass; prefix hits observed |
-| `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, AITER, MTP3 | 16/16 | Pass |
+| `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun also proved 3,200 prefix-hit tokens and 88.9% MTP acceptance |
 
 The final shared-expert stream-safety change was followed by fresh live
 regression runs for both large GLM routes. `/models/GLM-5-W8A8` used TP8,
@@ -361,6 +361,95 @@ explicit isolated execution boundary. Earlier 51/64, 52/64, 54/64, and 55/64
 controls remain diagnostic history from before the stream-race fix. Full
 evidence and exact commands are in
 `docs/validation/kimi-k26-gfx938-humaneval64.md`.
+
+### Qwen3.8 Flash-Next SlimQuant W4A8 current-head rerun
+
+The `/models/Qwen3.8-Flash-Next-w4a8-slimquant` checkpoint was rerun at branch
+head `6ebd45f` with the pinned vLLM 0.28.1 wheel. The accepted service command
+was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve /models/Qwen3.8-Flash-Next-w4a8-slimquant \
+  --served-model-name Qwen3.8-Flash-Next-w4a8-slimquant \
+  --port 10237 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend aiter \
+  --quantization slimquant_w4a8 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --kv-cache-dtype fp8_e4m3 \
+  --enable-prefix-caching \
+  --mamba-cache-mode align \
+  --gpu-memory-utilization 0.60 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The matching isolated HumanEval16 client was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3.8-Flash-Next-w4a8-slimquant \
+  --api-url http://127.0.0.1:10237/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream \
+  --eval-batch-size 8 \
+  --timeout 7200 \
+  --limit 16 \
+  --datasets humaneval \
+  --dataset-args '{"humaneval":{}}' \
+  --work-dir \
+    /tmp/vllm-hcu-evalscope/qwen38-flash-next-w4a8-current-tp4-mtp3-kvfp8-run1-20261007 \
+  --no-timestamp
+```
+
+All four ranks constructed `HcuGPUModelRunnerV2`. The public E4M3 route
+selected the QSA FP8 sparse-GQA reader, native `BLNHC`, a 64-token HCU kernel
+page, and a 1,600-token hybrid manager page. The default policy captured
+target and MTP prefill PIECEWISE/FULL Graphs and MTP decode FULL Graphs. Model
+loading used 63.67 GiB/rank and the service allocated 666,586 KV tokens.
+
+HumanEval raw Accuracy and Pass@1 both passed 16/16. The report observed
+25.32 output tok/s, 3,107.4 ms mean TTFT, and 17.4 ms mean TPOT. Three
+identical 3,525-token prompts all returned `17` with a normal stop and added
+3,200 prefix-hit tokens, which covers two 1,600-token manager pages. The
+complete request window accepted 1,673/1,881 MTP draft tokens (88.9%).
+
+The explicit AITER lookup found no supported target W4A8 solution for
+`E=512,N=160,K=2560,top_k=10` and no supported W16A16 solution for the MTP
+layer, so both shapes fell back to official vLLM Triton. Record this as
+ordered backend lookup plus fallback, not AITER kernel coverage. No ERROR,
+Traceback, VM fault, or dead engine occurred, and exact process-group teardown
+returned all eight cards to the 2 MiB idle baseline.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen38-flash-next-w4a8-current-tp4-mtp3-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/qwen38-flash-next-w4a8-current-tp4-mtp3-kvfp8-run1-20261007`
 
 Additional checkpoints under `/llm-models-2/hygon` were then exercised with
 the same pinned runtime. The detailed score matrix, exact server/client
