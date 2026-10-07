@@ -160,7 +160,10 @@ class HcuGPUWorker(Worker):
         ).strip().lower() in ("1", "true", "yes", "on")
         speculative_config = getattr(self.vllm_config, "speculative_config", None)
         flash_mla_reserve = (
-            (2 << 30) if _shard_enabled and speculative_config is not None else 0
+            (2 << 30)
+            if _shard_enabled
+            and getattr(speculative_config, "method", None) == "mtp"
+            else 0
         )
         self.available_kv_cache_memory_bytes = (
             self.requested_memory

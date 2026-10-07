@@ -565,6 +565,75 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     )
 
 
+@pytest.mark.parametrize(
+    ("speculative_method", "expected_available_memory"),
+    [
+        (None, 10 << 30),
+        ("ngram", 10 << 30),
+        ("eagle", 10 << 30),
+        ("medusa", 10 << 30),
+        ("mtp", 8 << 30),
+    ],
+)
+def test_worker_flash_mla_reserve_only_applies_to_mtp(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+    speculative_method,
+    expected_available_memory,
+):
+    worker_module = cpu_safe_hcu_worker_module
+    profile_result = SimpleNamespace(
+        before_profile=SimpleNamespace(torch_peak=0),
+        after_profile=SimpleNamespace(free_memory=10 << 30),
+        non_torch_increase=0,
+    )
+
+    @contextmanager
+    def profile_memory(*args, **kwargs):
+        del args, kwargs
+        yield profile_result
+
+    @contextmanager
+    def current_config(config):
+        del config
+        yield
+
+    monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
+    monkeypatch.setattr(worker_module, "memory_profiling", profile_memory)
+    monkeypatch.setattr(worker_module, "set_current_vllm_config", current_config)
+    monkeypatch.setattr(worker_module.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        worker_module.torch.accelerator,
+        "memory_stats",
+        lambda device: {
+            "allocated_bytes.all.peak": 0,
+            "allocated_bytes.all.current": 0,
+        },
+    )
+
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.rank = 0
+    worker.device = "cpu"
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None)
+    worker.model_runner = SimpleNamespace(
+        model_memory_usage=0,
+        profile_run=lambda: None,
+    )
+    worker.init_snapshot = SimpleNamespace(free_memory=10 << 30)
+    worker.requested_memory = 10 << 30
+    worker.vllm_config = SimpleNamespace(
+        speculative_config=(
+            None
+            if speculative_method is None
+            else SimpleNamespace(method=speculative_method)
+        )
+    )
+    worker._reserve_mm_ipc_gpu_memory = lambda memory: memory
+
+    assert worker.determine_available_memory() == expected_available_memory
+    assert worker.available_kv_cache_memory_bytes == expected_available_memory
+
+
 def test_worker_drains_and_terminal_validates_after_successful_warmup(
     monkeypatch,
     cpu_safe_hcu_worker_module,

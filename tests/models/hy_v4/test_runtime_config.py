@@ -39,6 +39,7 @@ def test_hyv4_is_a_default_model_runner_v2_architecture() -> None:
     [
         ("0", 2, "a2a", False),
         ("1", 1, "ag_rs", False),
+        ("1", 1, "a2a", False),
         ("1", 2, "ag_rs", False),
         ("1", 2, "a2a", True),
     ],
