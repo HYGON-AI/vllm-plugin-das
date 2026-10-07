@@ -124,7 +124,10 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
         device=device,
         dtype=torch.float32,
     ).add_(0.01)
-    hipc_scale = checkpoint_scale * 16.0
+    # HIPC kernels interpret the packed high nibble directly, while this
+    # reference explicitly unpacks signed INT4 values and therefore applies
+    # the equivalent x16 scale compensation itself.
+    unpacked_reference_scale = checkpoint_scale * 16.0
 
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(canonical_w13, requires_grad=False)
@@ -170,7 +173,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
     )
     m_grouped_w4a8_gemm_nt_contiguous_hipc(
         (activation, activation_scale),
-        (ht_weight, hipc_scale),
+        (ht_weight, checkpoint_scale),
         ht_output,
         torch.zeros(tokens, device=device, dtype=torch.int32),
     )
@@ -188,7 +191,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
             .expand(experts, -1, -1)
             .contiguous(),
         ),
-        (ll_weight, hipc_scale),
+        (ll_weight, checkpoint_scale),
         ll_output,
         torch.tensor([tokens, 0], device=device, dtype=torch.int32),
         tokens,
@@ -196,7 +199,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
 
     unpacked_w13 = _unpack_signed_int4_high_low(raw_w13)
     reference = (activation.float() * activation_scale) @ (
-        unpacked_w13[0].float() * hipc_scale[0]
+        unpacked_w13[0].float() * unpacked_reference_scale[0]
     ).T
     torch.testing.assert_close(ht_output.float(), reference, rtol=3e-2, atol=0.1)
     torch.testing.assert_close(

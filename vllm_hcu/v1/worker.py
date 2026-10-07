@@ -11,7 +11,12 @@ from vllm import envs
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.utils.torch_utils import set_random_seed
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
-from vllm.config import CUDAGraphMode, VllmConfig, CacheConfig
+from vllm.config import (
+    CUDAGraphMode,
+    CacheConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
@@ -90,7 +95,9 @@ class HcuGPUWorker(Worker):
             flush=True,
         )
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            self.model_runner.profile_run()
+            # MRV2 profile_run/execute_model do not install config context.
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner.profile_run()
             logger.info(
                 "Initial free memory %s GiB, reserved %s GiB for KV cache",
                 format_gib(self.init_snapshot.free_memory),
@@ -102,7 +109,8 @@ class HcuGPUWorker(Worker):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner.profile_run()
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
             )
@@ -144,10 +152,24 @@ class HcuGPUWorker(Worker):
             f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
             f"current free memory {format_gib(free_gpu_memory)} GiB."
         )
+        # FlashMLA KV reserve: only when LINEAR_GATE_PCP_SHARD + MTP (OOM regime).
+        # Read the env flag directly to avoid importing hy_v4.attention (heavy deps
+        # / circular import risk during worker memory profiling and CPU-safe tests).
+        _shard_enabled = os.environ.get(
+            "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        flash_mla_reserve = (
+            (2 << 30)
+            if _shard_enabled
+            and getattr(speculative_config, "method", None) == "mtp"
+            else 0
+        )
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - flash_mla_reserve
         )
         memory_summary = (
             "HCU memory profile: "
@@ -160,6 +182,7 @@ class HcuGPUWorker(Worker):
             f"total_consumed={format_gib(total_consumed)} GiB "
             f"transient_peak_headroom={format_gib(transient_peak_headroom)} GiB "
             f"non_kv_cache_memory={format_gib(profile_result.non_kv_cache_memory)} GiB "
+            f"flash_mla_reserve={format_gib(flash_mla_reserve)} GiB "
             f"cudagraph_estimate={format_gib(cudagraph_memory_estimate)} GiB "
             f"requested={format_gib(self.requested_memory)} GiB "
             f"available_kv={format_gib(self.available_kv_cache_memory_bytes)} GiB"
@@ -185,10 +208,12 @@ class HcuGPUWorker(Worker):
                 suppress_pp_v2_warmup_sample_broadcast,
             )
 
-            with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
+            with set_current_vllm_config(self.vllm_config), \
+                    suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
                 result = super().compile_or_warm_up_model()
         else:
-            result = super().compile_or_warm_up_model()
+            with set_current_vllm_config(self.vllm_config):
+                result = super().compile_or_warm_up_model()
 
         from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
         from vllm_hcu.patch.worker import validate_worker_patches

@@ -166,9 +166,15 @@ def test_hcu_varlen_routes_dspark_q_len_8_to_paged_attention(
         kv_cache_layout="NHD",
     )
     paged_attention_calls: list[tuple[object, ...]] = []
+
+    def paged_attention(*args: object) -> None:
+        assert len(args) == 18
+        paged_attention_calls.append(args)
+
+    paged_attention.__doc__ = "paged_attention(arg0: Tensor, arg17: bool)"
     flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
     flash_attn_interface.flash_attn_cuda = SimpleNamespace(
-        paged_attention=lambda *args: paged_attention_calls.append(args)
+        paged_attention=paged_attention,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -209,7 +215,6 @@ def test_hcu_varlen_routes_dspark_q_len_8_to_paged_attention(
     assert calls["flash_attn_varlen_func"] == []
     assert len(paged_attention_calls) == 1
     paged_args = paged_attention_calls[0]
-    assert len(paged_args) == 15
     assert paged_args[0] is out
     assert paged_args[1].shape == (2, 8, 4, 128)
     assert paged_args[2] is k
@@ -221,7 +226,156 @@ def test_hcu_varlen_routes_dspark_q_len_8_to_paged_attention(
     assert paged_args[9] is q_descale
     assert paged_args[10] is k_descale
     assert paged_args[11] is v_descale
-    assert paged_args[12:] == (128, None, 2)
+    assert paged_args[12:] == (128, None, 2, -1, -1, True)
+
+
+def test_hcu_varlen_supports_legacy_dspark_paged_attention_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, calls = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    paged_attention_calls: list[tuple[object, ...]] = []
+
+    def legacy_paged_attention(*args: object) -> None:
+        if len(args) != 15:
+            raise TypeError("legacy paged_attention expects 15 arguments")
+        paged_attention_calls.append(args)
+
+    legacy_paged_attention.__doc__ = "paged_attention(arg0: Tensor, arg14: int)"
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        paged_attention=legacy_paged_attention,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    query_len = 8
+    q = torch.zeros((query_len, 4, 128), dtype=torch.bfloat16)
+    k = torch.zeros((1, 64, 2, 128), dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    fa_utils.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=torch.zeros_like(k),
+        out=out,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([64], dtype=torch.int32),
+        max_seqlen_k=64,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    assert calls["flash_attn_varlen_func"] == []
+    assert len(paged_attention_calls) == 1
+    assert paged_attention_calls[0][12:] == (64, None, 2)
+
+
+@pytest.mark.parametrize(
+    ("include_window_size", "window_size"),
+    [(False, None), (True, None)],
+    ids=["omitted", "none"],
+)
+def test_hcu_varlen_normalizes_unbounded_window_for_extended_dspark_abi(
+    monkeypatch: pytest.MonkeyPatch,
+    include_window_size: bool,
+    window_size: None,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    paged_attention_calls: list[tuple[object, ...]] = []
+
+    def paged_attention(*args: object) -> None:
+        paged_attention_calls.append(args)
+
+    paged_attention.__doc__ = "paged_attention(arg0: Tensor, arg17: bool)"
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        paged_attention=paged_attention,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    query_len = 8
+    q = torch.zeros((query_len, 4, 128), dtype=torch.bfloat16)
+    k = torch.zeros((1, 64, 2, 128), dtype=torch.bfloat16)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": torch.zeros_like(k),
+        "out": torch.empty_like(q),
+        "cu_seqlens_q": torch.tensor([0, query_len], dtype=torch.int32),
+        "max_seqlen_q": query_len,
+        "seqused_k": torch.tensor([64], dtype=torch.int32),
+        "max_seqlen_k": 64,
+        "causal": True,
+        "block_table": torch.zeros((1, 1), dtype=torch.int32),
+    }
+    if include_window_size:
+        kwargs["window_size"] = window_size
+
+    fa_utils.flash_attn_varlen_func(**kwargs)
+
+    assert len(paged_attention_calls) == 1
+    assert paged_attention_calls[0][-3:] == (-1, -1, True)
+
+
+def test_hcu_varlen_does_not_treat_kernel_type_error_as_legacy_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    paged_attention_calls: list[tuple[object, ...]] = []
+
+    def paged_attention(*args: object) -> None:
+        paged_attention_calls.append(args)
+        if len(args) == 18:
+            raise TypeError("extended kernel body rejected the input")
+
+    paged_attention.__doc__ = "paged_attention(arg0: Tensor, arg17: bool)"
+    flash_attn_interface = ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.flash_attn_cuda = SimpleNamespace(
+        paged_attention=paged_attention,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        flash_attn_interface.__name__,
+        flash_attn_interface,
+    )
+
+    query_len = 8
+    q = torch.zeros((query_len, 4, 128), dtype=torch.bfloat16)
+    k = torch.zeros((1, 64, 2, 128), dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="extended kernel body"):
+        fa_utils.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=torch.zeros_like(k),
+            out=torch.empty_like(q),
+            cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+            max_seqlen_q=query_len,
+            seqused_k=torch.tensor([64], dtype=torch.int32),
+            max_seqlen_k=64,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=torch.zeros((1, 1), dtype=torch.int32),
+        )
+
+    assert len(paged_attention_calls) == 1
+    assert len(paged_attention_calls[0]) == 18
 
 
 def test_hcu_varlen_q_len_8_falls_back_above_paged_attention_head_limit(
@@ -307,7 +461,7 @@ def test_hcu_varlen_drafter_route_respects_static_kv_scratch_limit(
 
 
 @pytest.mark.parametrize("batch_size", [1, 64, 73])
-def test_hcu_varlen_drafter_uses_vendor_path_outside_graph_capture(
+def test_hcu_varlen_drafter_uses_only_required_kv_scratch_outside_capture(
     monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
 ) -> None:
@@ -340,11 +494,12 @@ def test_hcu_varlen_drafter_uses_vendor_path_outside_graph_capture(
         dtype=torch.bfloat16,
     )
     k = torch.zeros((1, 64, 2, 128), dtype=torch.bfloat16)
-    fa_utils.flash_attn_varlen_func(
+    seqused_k = torch.full((batch_size,), 64, dtype=torch.int32)
+    result = fa_utils.flash_attn_varlen_func(
         q=q,
         k=k,
         v=torch.zeros_like(k),
-        out=torch.empty_like(q),
+        out=(out := torch.empty_like(q)),
         cu_seqlens_q=torch.arange(
             0,
             (batch_size + 1) * query_len,
@@ -352,16 +507,25 @@ def test_hcu_varlen_drafter_uses_vendor_path_outside_graph_capture(
             dtype=torch.int32,
         ),
         max_seqlen_q=query_len,
-        seqused_k=torch.full((batch_size,), 64, dtype=torch.int32),
+        seqused_k=seqused_k,
         max_seqlen_k=4096,
         causal=False,
         window_size=(-1, -1),
         block_table=torch.zeros((batch_size, 64), dtype=torch.int32),
     )
 
-    assert len(calls["flash_attn_varlen_func"]) == 1
-    assert gather_calls == []
-    assert varlen_calls == []
+    assert result is out
+    assert calls["flash_attn_varlen_func"] == []
+    assert len(gather_calls) == 1
+    gathered_k, gathered_v = gather_calls[0][:2]
+    assert gathered_k.shape == (batch_size * 64, 2, 128)
+    assert gathered_v.shape == gathered_k.shape
+    assert gather_calls[0][2] is k
+    assert gather_calls[0][5] is seqused_k
+    assert gather_calls[0][7:] == (4096, 2)
+    assert len(varlen_calls) == 1
+    assert varlen_calls[0][1] is gathered_k
+    assert varlen_calls[0][2] is gathered_v
 
 
 def test_hcu_varlen_routes_dspark_drafter_q_len_7_to_static_varlen(

@@ -809,6 +809,11 @@ def apply_aiter_w4a8_moe(
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_experts_impl,
         )
+        # Triton consumes unpacked signed INT4 weights, so compensate for the
+        # packed high-nibble convention here. AITER/DeepGEMM receive the raw
+        # checkpoint scales from the shared quantization config.
+        fallback_w1_scale = w1_scale * 16.0
+        fallback_w2_scale = w2_scale * 16.0
         return fused_experts_impl(
             hidden_states,
             fallback_w1,
@@ -824,8 +829,8 @@ def apply_aiter_w4a8_moe(
             per_channel_quant=True,
             global_num_experts=global_num_experts,
             expert_map=native_expert_map,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
+            w1_scale=fallback_w1_scale,
+            w2_scale=fallback_w2_scale,
             a1_scale=getattr(quant_config, "a1_scale", None),
             a2_scale=getattr(quant_config, "a2_scale", None),
             block_shape=None,

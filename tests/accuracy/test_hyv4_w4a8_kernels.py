@@ -93,7 +93,7 @@ def test_moe_load_converts_nibbles_and_scale_before_current_dispatch(tmp_path, m
                 param.weight_loader(param, value[expert], name, "w2", expert)
     torch.testing.assert_close(layer.w13_weight_scale, torch.full((2, 4, 1), 1/32))
     qconfig = method.get_fused_moe_quant_config(layer)
-    torch.testing.assert_close(qconfig.w1_scale, torch.full((2, 4, 1), .5))
+    torch.testing.assert_close(qconfig.w1_scale, torch.full((2, 4, 1), 1/32))
     # Keep current postprocessing, fallback layout and routed runtime real.
     # Only tuned device lookup and the final Triton device call are replaced.
     import sys
