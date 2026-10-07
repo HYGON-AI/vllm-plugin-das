@@ -221,6 +221,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_engram_hash")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_model_state")),
     _CallbackSpec(_adapter("core_fix", "patch_hcu_uva_buffer")),
+    _CallbackSpec(_adapter("core_fix", "patch_hcu_uva_offloader")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v41_pcp")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_pcp")),

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
 
 from ._common import (
@@ -68,7 +69,28 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def hcu_process_weights_after_loading(self, layer) -> None:
+        uva_parameters = {}
+        if (
+            os.getenv("VLLM_HCU_REGISTERED_CPU_OFFLOAD", "0") == "1"
+            and _selected_backend_name(self) == "HCU_DEEPGEMM"
+        ):
+            uva_parameters = {
+                name: parameter
+                for name, parameter in layer.named_parameters()
+                if getattr(parameter, "_vllm_is_uva_offloaded", False)
+            }
         original(self, layer)
+        for name, parameter in layer.named_parameters() if uva_parameters else ():
+            old_parameter = uva_parameters.get(name)
+            if (
+                old_parameter is not None
+                and parameter.device == old_parameter.device
+                and parameter.dtype == old_parameter.dtype
+                and parameter.data_ptr() == old_parameter.data_ptr()
+                and parameter.numel() == old_parameter.numel()
+            ):
+                # In-place packing changes shape, but retains registered storage.
+                parameter._vllm_is_uva_offloaded = True
         if _selected_backend_name(self) != "AITER":
             return
         quant_config = getattr(self, "moe_quant_config", None)
