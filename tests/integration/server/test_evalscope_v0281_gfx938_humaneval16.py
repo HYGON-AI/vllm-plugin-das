@@ -234,7 +234,6 @@ def test_gfx938_profile_contract(
         "deepseek_v4_flash_tp8",
         "qwen2_57b_tp2",
         "qwen3_30b_int8_tp2",
-        "qwen36_27b_w8a8_tp2",
     }
     assert bool(
         config["evalscope"]["pass_criteria"].get("enforce_score", True)
@@ -476,6 +475,18 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
     )
     assert "--generation-config" not in minimax_command
     assert "--speculative-config" not in minimax_command
+
+    qwen36 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen36_27b_w8a8_tp2"
+    )
+    qwen36_command, _, _ = server_command(qwen36, model_env=MODEL_ENV)
+    assert json.loads(
+        _option_value(qwen36_command, "--speculative-config")
+    ) == {"method": "mtp", "num_speculative_tokens": 3}
+    assert _option_value(qwen36_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(qwen36_command, "--mamba-cache-mode") == "align"
+    assert _option_value(qwen36_command, "--prefix-match-unit") == "64"
+    assert "--enable-mamba-fine-grained-prefix-cache" in qwen36_command
 
     for profile in (
         "glm5_w8a8_tp8",
