@@ -148,6 +148,38 @@ and owned artifact directories are defined in
 | `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, channel FP8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun proved 3,200 manager-page prefix hits and 90.62% MTP acceptance |
 | `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun also proved 3,200 prefix-hit tokens and 88.9% MTP acceptance |
 
+### `v0.28.1-dev` base-alignment rerun
+
+PR #188 was retargeted to `v0.28.1-dev` after merging remote commit
+`0bd777db91fa01c10f8a85910ee7057456ebf3ab`. The alignment merge is
+`76e6ea7bb4e0f06f41763abcf5732d9264cf7066`; its tree
+`e64f6bc2e9c055a6425c4c8127a6edf487d22eba` is byte-for-byte the same as the
+pre-merge follow-up tree, so the merge established ancestry without changing
+the candidate contents. The focused static gate passed `84 passed, 1 skipped`.
+
+Three fresh cold-start HumanEval16 gates were then run on gfx938 with the
+pinned `0.28.1+das.77acaf6.dtk2604` runtime:
+
+| Profile | Runtime evidence | HumanEval16 | Report evidence |
+| --- | --- | ---: | --- |
+| `qwen3_8b_tp2` | TP2, HcuGPUModelRunnerV2, HND-facing/LBHNC physical E4M3 KV, 64-token page, prefix cache, default FULL plus PIECEWISE Graphs | 16/16 | 105.43 output tok/s; 2,688/5,466 prefix hit/query tokens |
+| `qwen38_flash_next_fp8_tp4` | TP4, HcuGPUModelRunnerV2, native BLNHC hybrid cache, E4M3 KV, QSA, MTP3, default target/speculator FULL plus PIECEWISE Graphs; AITER lookup fell back per unsupported shape to official Triton | 16/16 | 42.03 output tok/s; 3,200/10,906 prefix hit/query tokens; 1,782/1,953 accepted/drafted MTP tokens (91.24%) |
+| `qwen35_35b_w8a8_tp2` | TP2, HcuGPUModelRunnerV2, E4M3 KV, MTP3, `mamba-cache-mode=align`, 64-token fine-grained prefix controls, default target/speculator FULL plus PIECEWISE Graphs | 16/16 | 60.31 output tok/s; 2,176/10,906 prefix hit/query tokens; 1,164/1,245 accepted/drafted MTP tokens (93.49%) |
+
+All three pytest acceptance invocations passed. Qwen3.8 Flash-Next required
+the harness's 180-second forced-cleanup fallback after the API parent exited;
+the owned workers were removed and cards 0--3 returned to the 4 MiB idle
+reading. This is recorded as teardown latency, not an inference failure. Cards
+4--7 were occupied by an unrelated workload and were not touched, so the
+existing GLM-5.3 TP8 result remains the current same-tree evidence rather than
+being mislabeled as a fresh aligned-head run.
+
+Fresh artifacts:
+
+- `/tmp/vllm-hcu-evalscope/v0281-gfx938-qwen3-8b-tp2`
+- `/tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-flash-next-fp8-tp4`
+- `/tmp/vllm-hcu-evalscope/v0281-gfx938-qwen35-35b-w8a8-tp2`
+
 ### Qwen2-57B-A14B current-head rerun
 
 The `/models/Qwen2-57B-A14B-Instruct` checkpoint was rerun at plugin commit
