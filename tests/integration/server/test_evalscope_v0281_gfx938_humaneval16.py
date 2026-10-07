@@ -301,6 +301,25 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
     assert len(ports) == len(set(ports)) == 24
 
 
+def test_minimax_profile_uses_accepted_bf16_kv_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CONFIG_ENV, raising=False)
+    config = load_profiled_config(
+        DEFAULT_CONFIG,
+        CONFIG_ENV,
+        profile="minimax_m25_int8_tp4",
+    )
+    command, _, _ = server_command(config, model_env=MODEL_ENV)
+
+    assert config["server"]["environment"] == {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_KV_CACHE_LAYOUT": "HND",
+    }
+    assert "--kv-cache-dtype" not in command
+    assert config["evalscope"]["generation_config"]["max_tokens"] == 2048
+
+
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -441,6 +460,9 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
         DEFAULT_CONFIG, CONFIG_ENV, profile="hy4_preview_channel_fp8_tp8"
     )
     hy4_command, _, _ = server_command(hy4, model_env=MODEL_ENV)
+    assert hy4["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(hy4_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(hy4_command, "--block-size") == "64"
     assert json.loads(
         _option_value(hy4_command, "--default-chat-template-kwargs")
     ) == {"reasoning_effort": "no_think"}

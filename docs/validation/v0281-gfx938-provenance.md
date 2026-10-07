@@ -137,7 +137,7 @@ and owned artifact directories are defined in
 | `hy3_channel_fp8_mtp2_kvfp8_tp8` | TP8, FLASH_ATTN, channel FP8 W8A8, AITER, MTP2, E4M3 KV, prefix | 16/16 | Pass; HND selection resolved to the physical LBHNC cache and default target/speculator Graphs |
 | `hy3_channel_fp8_dp8_ep8_mtp2_kvfp8` | DP8/TP1/EP8, FLASH_ATTN, channel FP8 W8A8, DeepEP low-latency/DeepGEMM, MTP2, E4M3 KV, prefix | 16/16 | Pass; nine-request probe demonstrated rank-local prefix reuse |
 | `hy4_preview_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass after `indexed_attention` and `reasoning_effort=no_think` fixes |
-| `minimax_m25_int8_tp4` | TP4, FLASH_ATTN, HND/BHSD kernel view, AITER, prefix | 16/16 | Pass |
+| `minimax_m25_int8_tp4` | TP4, FLASH_ATTN, HND/BHSD kernel view, AITER, auto/BF16 KV, prefix | 16/16 | Accepted current-head route; two E4M3/3,800-token diagnostics scored 15/16 and 14/16 |
 | `qwen2_57b_tp2` | TP2, FLASH_ATTN, HND/LBHNC kernel view, AITER W16A16 MoE, E4M3 KV, prefix, default Graph | 16/16 | Pass; current-head rerun loaded the gfx938 AITER stage1/stage2 modules and reused 2,496 prefix tokens |
 | `qwen3_30b_int8_tp2` | TP2, FLASH_ATTN, HND/LBHNC kernel view, E4M3 KV, default LightOp dense W8A8, AITER INT8 MoE, prefix, default Graph | 5/16 | Current-head controls: BF16 TP2 and TP1 6/16; official Triton dense and Triton MoE 4/16; repeated 2,433-token request hit 2,432 tokens, so service features pass but accuracy is not accepted |
 | `qwen3_8b_tp2` | TP2, FLASH_ATTN, native FP8 E4M3 KV, prefix | 16/16 | Pass; BF16 control also 16/16 |
@@ -157,7 +157,7 @@ PR #188 was retargeted to `v0.28.1-dev` after merging remote commit
 pre-merge follow-up tree, so the merge established ancestry without changing
 the candidate contents. The focused static gate passed `84 passed, 1 skipped`.
 
-Four fresh cold-start HumanEval16 gates were then run on gfx938 with the
+Six fresh cold-start HumanEval16 gates were then run on gfx938 with the
 pinned `0.28.1+das.77acaf6.dtk2604` runtime:
 
 | Profile | Runtime evidence | HumanEval16 | Report evidence |
@@ -166,8 +166,10 @@ pinned `0.28.1+das.77acaf6.dtk2604` runtime:
 | `qwen38_flash_next_fp8_tp4` | TP4, HcuGPUModelRunnerV2, native BLNHC hybrid cache, E4M3 KV, QSA, MTP3, default target/speculator FULL plus PIECEWISE Graphs; AITER lookup fell back per unsupported shape to official Triton | 16/16 | 42.03 output tok/s; 3,200/10,906 prefix hit/query tokens; 1,782/1,953 accepted/drafted MTP tokens (91.24%) |
 | `qwen35_35b_w8a8_tp2` | TP2, HcuGPUModelRunnerV2, E4M3 KV, MTP3, `mamba-cache-mode=align`, 64-token fine-grained prefix controls, default target/speculator FULL plus PIECEWISE Graphs | 16/16 | 60.31 output tok/s; 2,176/10,906 prefix hit/query tokens; 1,164/1,245 accepted/drafted MTP tokens (93.49%) |
 | `glm53_channel_fp8_tp8` | TP8, HcuGPUModelRunnerV2, `FLASHMLA_SPARSE`, public E4M3 resolved to `fp8_ds_mla`, LBNHC, AITER FP8 MoE, MTP3, prefix cache, default target/speculator FULL plus PIECEWISE Graphs | 16/16 | 17.24 output tok/s; 2,624/5,466 prefix hit/query tokens; 884/966 accepted/drafted MTP tokens (91.51%) |
+| `Qwen3.5-122B-A10B-Channel-FP8-w8a8` | TP4, HcuGPUModelRunnerV2, Channel-FP8 dense, AITER FP8 MoE, E4M3 KV, MTP3, 64-token fine-grained hybrid prefix controls, default target/speculator Graphs | 16/16 | 54.04 output tok/s; three-suffix probe reused 3,264 tokens below the 2,176-token manager-page granularity; 1,794/1,878 accepted/drafted MTP tokens (95.53%) |
+| `Qwen3.6-35B-A3B-Channel-FP8-w8a8` | TP4 resource-control run, HcuGPUModelRunnerV2, Channel-FP8 dense, AITER FP8 MoE, E4M3 KV, MTP3, fine-grained hybrid prefix controls, default target/speculator Graphs | 16/16 | 46.11 output tok/s; three-suffix probe reused 5,440 tokens below the 2,176-token manager-page granularity; 1,845/1,938 accepted/drafted MTP tokens (95.20%) |
 
-All four pytest acceptance invocations passed. Qwen3.8 Flash-Next required
+The first four pytest acceptance invocations passed. Qwen3.8 Flash-Next required
 the harness's 180-second forced-cleanup fallback after the API parent exited;
 the owned workers were removed and cards 0--3 returned to the 4 MiB idle
 reading. This is recorded as teardown latency, not an inference failure. After
@@ -182,6 +184,41 @@ Fresh artifacts:
 - `/tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-flash-next-fp8-tp4`
 - `/tmp/vllm-hcu-evalscope/v0281-gfx938-qwen35-35b-w8a8-tp2`
 - `/tmp/vllm-hcu-evalscope/v0281-gfx938-glm53-channel-fp8-tp8`
+- `/tmp/vllm-hcu-evalscope/qwen35-122b-channel-fp8-current-tp4-mtp3-kvfp8-run2-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen36-35b-a3b-channel-fp8-current-tp4-mtp3-kvfp8-run2-20261007`
+
+An aligned-head HY4 TP8 retry was also launched with explicit MRV2, public
+E4M3 KV, a 64-token sparse-MLA block, MTP3, and the default graph policy.
+Argument resolution correctly mapped E4M3 to `fp8_ds_mla`, and ranks 0--3
+constructed HcuGPUModelRunnerV2 with Channel-FP8, sparse MLA, and AITER. The
+run stopped before weight loading because four external host processes began
+using about 141.6 GB each on cards 4--7; those ranks had only about 57 GB free
+against the 132.47 GB startup requirement. This is recorded as resource
+contention, not an HY4 runtime regression, and no external process or device
+was reset.
+
+### MiniMax-M2.5 current-head KV control
+
+`/models/MiniMax-M2.5-Channel-INT8-w8a8` was rerun at PR head `cba51cb`
+after the `v0.28.1-dev` alignment. The TP4 auto/BF16-KV profile used
+HcuGPUModelRunnerV2, FLASH_ATTN, LBHNC, AITER INT8 MoE, prefix caching, and
+the default FULL plus PIECEWISE Graph policy. HumanEval passed raw and
+normalized 16/16 with a 2,048-token output budget. Throughput was 48.45
+output tok/s, mean TTFT was 210.2 ms, and mean TPOT was 20.7 ms.
+
+Two controls changed only KV storage to public `fp8_e4m3` and raised the
+output budget to 3,800. They scored 15/16 and 14/16. The first exhausted the
+budget on HumanEval/2; the second exhausted it on HumanEval/1 and /10, while
+/2 stopped normally after 1,111 tokens. All requests returned HTTP 200 and
+the runtime route remained clean, so this is a current-head generation
+accuracy instability rather than a startup or kernel failure. The executable
+acceptance profile therefore keeps auto/BF16 KV and 2,048 output tokens; the
+older E4M3 16/16 runs remain historical evidence, not the current gate.
+
+Current evidence:
+
+- `/tmp/vllm-hcu-evalscope/v0281-gfx938-minimax-m25-int8-tp4`
+- `/tmp/vllm-hcu-evalscope/v0281-gfx938-minimax-m25-int8-tp4/reports/normalized_humaneval.json`
 
 ### Qwen2-57B-A14B current-head rerun
 
