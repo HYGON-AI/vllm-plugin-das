@@ -19,7 +19,7 @@ request.
 | `Qwen3-8B-Channel-FP8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-8B-Channel-INT8-w8a8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-14B-Channel-INT8-w8a8` | TP2 | 15/16 twice | Current-head repeat reproduced the same checkpoint-level HumanEval/10 logic error; E4M3 KV and prefix reuse passed |
-| `Qwen3-4B-Thinking-2507-Channel-FP8` | TP2 | diagnostic only | The checkpoint template always emits a thinking segment; disabling thinking is not a valid accuracy contract |
+| `Qwen3-4B-Thinking-2507-Channel-FP8` | TP2 | 16/16 at 7,800 output tokens | `qwen3` reasoning parser; thinking enabled at both server and request; E4M3 KV; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | E4M3 KV 14/16 twice, then 15/16; auto/BF16 KV 15/16, then 14/16 | E4M3 retained: no BF16 accuracy gain, 200.42 output tok/s, and twice the KV-token capacity |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
@@ -141,6 +141,65 @@ Evidence:
 - `/tmp/vllm-hcu-evalscope/qwen3-0.6b-current-tp2-kvfp8-run3-20261007`
 - `/tmp/vllm-hcu-validation/qwen3-0.6b-current-tp2-kvauto-run3-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-0.6b-current-tp2-kvauto-run3-20261007`
+
+## Qwen3-4B Thinking-2507 current-head acceptance
+
+The earlier diagnostic disabled thinking at the server while requests enabled
+it, so it was not the checkpoint's valid protocol. The current-head run used
+the `qwen3` reasoning parser, enabled thinking consistently, and provided an
+8K context with a 7,800-token output budget:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3-4B-Thinking-2507-Channel-FP8 \
+  --served-model-name Qwen3-4B-Thinking-2507-Channel-FP8 \
+  --port 10250 --trust-remote-code --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN --reasoning-parser qwen3 \
+  --enable-prefix-caching --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.35 --max-model-len 8192 \
+  --max-num-batched-tokens 1024 --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":true}'
+```
+
+```bash
+env -i HOME=/tmp/vllm-hcu-eval-home PATH="$PATH" \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-4B-Thinking-2507-Channel-FP8 \
+  --api-url http://127.0.0.1:10250/v1 --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":7800,"extra_body":{"chat_template_kwargs":{"enable_thinking":true}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-4b-thinking-2507-current-tp2-kvfp8-run3-max7800-20261007 \
+  --no-timestamp
+```
+
+Raw Accuracy and Pass@1 passed 16/16. All completions stopped below the
+7,800-token limit; the longest used 7,431 tokens and still returned correct
+code. Performance was 144.15 output tok/s, 93.3 ms mean TTFT, 6.9 ms mean
+TPOT, and 16.723 s mean latency. Both 2,423-token prefix probes returned `17`,
+and the second added 2,368 hit tokens. TP2/MRV2, Channel-FP8 dense loading,
+HND-facing/LBHNC E4M3 KV with 64-token blocks, prefix caching, and default
+FULL plus PIECEWISE Graphs all passed without a runtime error. No plugin code
+change is needed; the fix is the service/client protocol and adequate budget.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-4b-thinking-2507-current-tp2-kvfp8-run3-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-4b-thinking-2507-current-tp2-kvfp8-run3-max7800-20261007`
 
 ## Qwen3-14B Channel-INT8 current-head repeat
 
