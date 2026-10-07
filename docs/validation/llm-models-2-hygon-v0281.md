@@ -23,7 +23,7 @@ request.
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | E4M3 KV 14/16 twice, then 15/16; auto/BF16 KV 15/16, then 14/16 | E4M3 retained: no BF16 accuracy gain, 200.42 output tok/s, and twice the KV-token capacity |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
-| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 twice at 7,800 output tokens | Current-head repeat: both normally stopped answers passed, 14 answers exhausted the 8K context, and repeated prompt reused 2,368 tokens |
+| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 twice at 7,800; 2/16 at 15,800 output tokens | The 16K control disproved a simple 8K shortage: two answers stopped and passed, while 14 generated exactly 15,800 tokens; the 8K repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
@@ -920,20 +920,89 @@ The 4B Thinking checkpoint used the same command with `4B` substituted for
 reasoning; all six normally stopped samples passed. Treat its 6/16 as a
 checkpoint generation-budget limitation, not an accepted precision score.
 The 2B Thinking checkpoint was more extreme: only two answers stopped within
-7,800 tokens and both passed, while the other 14 exhausted the context. Its
-raw 2/16 score has the same budget-bound classification. A current-head repeat
-at commit `d46231d` reproduced that exact 2/16 split with thinking enabled at
-both the server and request boundaries: HumanEval/3 and /4 stopped at 1,752
-and 1,190 tokens and passed, while all other samples generated exactly 7,800
-tokens. The report measured 187.52 output tok/s, 86.5 ms mean TTFT, 5.3 ms
-mean TPOT, and 37.376 s mean latency. Two 2,423-token probes stopped normally
-with final output `17`; the second added 2,368 prefix-hit tokens. The service
-had no runtime error, so no code change is needed.
+7,800 tokens and both passed, while the other 14 exhausted the context. A
+current-head repeat at commit `d46231d` reproduced that exact 2/16 split with
+thinking enabled at both the server and request boundaries: HumanEval/3 and
+/4 stopped at 1,752 and 1,190 tokens and passed, while all other samples
+generated exactly 7,800 tokens. The report measured 187.52 output tok/s,
+86.5 ms mean TTFT, 5.3 ms mean TPOT, and 37.376 s mean latency. Two
+2,423-token probes stopped normally with final output `17`; the second added
+2,368 prefix-hit tokens.
+
+The same checkpoint was then repeated from commit `18ae001` with only the
+server context raised to 16,384 and the client budget raised to 15,800. The
+score remained 2/16: HumanEval/3 and /9 stopped at 751 and 1,493 tokens and
+passed, while the other 14 responses generated exactly 15,800 tokens and
+reported `stop_reason=max_tokens`. The report measured 166.16 output tok/s,
+89.3 ms mean TTFT, 5.9 ms mean TPOT, 84.047 s mean latency, and 13,965 mean
+output tokens. This controlled doubling shows that the 8K result was not a
+simple context shortage. Classify the gate as checkpoint-level reasoning
+non-convergence under this protocol, not as a plugin runtime failure; merely
+increasing the context again is not an acceptance path and no code change is
+indicated.
+
+The exact 16K server command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3-VL-2B-Thinking-Channel-FP8 \
+  --served-model-name Qwen3-VL-2B-Thinking-Channel-FP8 \
+  --port 10252 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --reasoning-parser qwen3 \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.35 \
+  --max-model-len 16384 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":true}'
+```
+
+The matching client command was:
+
+```bash
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-VL-2B-Thinking-Channel-FP8 \
+  --api-url http://127.0.0.1:10252/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":15800,"extra_body":{"chat_template_kwargs":{"enable_thinking":true}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-16k-max15800-20261007 \
+  --no-timestamp
+```
 
 Current-head 2B Thinking evidence:
 
 - `/tmp/vllm-hcu-validation/qwen3-vl-2b-thinking-current-tp2-kvfp8-run2-retry-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-run2-max7800-20261007`
+- `/tmp/vllm-hcu-validation/qwen3-vl-2b-thinking-current-tp2-kvfp8-16k-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-16k-max15800-20261007`
 
 The 235B-A22B Instruct MoE route used four cards and AITER:
 
