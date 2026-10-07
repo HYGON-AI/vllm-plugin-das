@@ -45,7 +45,7 @@ request.
 | `Hy3-Channel-INT8-w8a8` | TP4 | 16/16 twice | E4M3 KV; MTP2; target/speculator FULL plus PIECEWISE Graphs; AITER config miss fell back to official Triton for the observed `M=1` MoE shape |
 | `Hy4-preview-Channel-FP8-w8a8` | TP8 | 16/16 | FLASHMLA_SPARSE, LBNHC E4M3 KV, tuned AITER FP8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 1,549/1,689 draft tokens accepted |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | Current-head rerun: 53.32 output tok/s; MTP acceptance 1,337/1,449 (92.27%); fine-grained third-request prefix hit 3,136 tokens |
-| `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
+| `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16; current-head rerun 16/16 | Tuned AITER channel-FP8 MoE; 35.71 output tok/s; current-head MTP acceptance 1,096/1,170 (93.68%); fine-grained sibling hit 2,112 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
 | `Qwen3.5-122B-A10B-Channel-FP8-w8a8` | TP4 | 16/16 | AITER channel-FP8 MoE; MTP acceptance 1,862/1,968 (94.6%); 2,176-token manager page and third-request fine-grained hit 2,112 tokens |
 | `Qwen3.5-397B-A17B-Channel-FP8-w8a8` | TP8 | 13/16 raw; 16/16 normalized, twice | Correct bare function bodies were undercounted by raw EvalScope; AITER channel-FP8 MoE; final MTP acceptance 2,643/2,760 (95.8%); 1,088-token manager page and third-request fine-grained hit 2,624 tokens |
@@ -208,6 +208,92 @@ Evidence:
 
 - `/tmp/vllm-hcu-validation/qwen35-27b-channel-fp8-current-tp2-mtp3-kvfp8-fine.log`
 - `/tmp/vllm-hcu-evalscope/qwen35-27b-channel-fp8-current-tp2-mtp3-kvfp8-fine-run1-20261007`
+
+### Qwen3.5-35B-A3B Channel-FP8 current-head rerun
+
+The MoE checkpoint was independently cold-started at plugin commit `8350f24`.
+The exact server command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3.5-35B-A3B-Channel-FP8-w8a8 \
+  --served-model-name Qwen3.5-35B-A3B-Channel-FP8-w8a8 \
+  --port 10242 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-cache-mode align \
+  --prefix-match-unit 64 \
+  --enable-mamba-fine-grained-prefix-cache \
+  --gpu-memory-utilization 0.50 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The exact isolated HumanEval client command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen35-35b \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3.5-35B-A3B-Channel-FP8-w8a8 \
+  --api-url http://127.0.0.1:10242/v1 \
+  --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen35-35b-a3b-channel-fp8-current-tp2-mtp3-kvfp8-fine-run1-20261007 \
+  --no-timestamp
+```
+
+Both TP ranks constructed `HcuGPUModelRunnerV2`. Dense FP8 selected
+`ChannelWiseTorchFP8ScaledMMLinearKernel`; MoE selected AITER and loaded both
+the ordinary and bottom-layer gfx938 `E=256,N=256,dtype=fp8_w8a8` configs plus
+the channel-shuffle tuned CSV. No provider fallback was logged. The public
+E4M3 cache resolved to LBHNC, with a 64-token FLASH_ATTN page and a
+2,176-token hybrid manager page. Target and MTP prefill captured PIECEWISE and
+FULL Graphs, MTP decode captured FULL Graphs, and the service allocated
+1,104,474 KV tokens.
+
+Raw Accuracy and Pass@1 were 16/16, so the older one-off HumanEval/10 miss did
+not reproduce at the current head. Mean output throughput was 35.71 tok/s,
+TTFT 1,241 ms, TPOT 16.5 ms, and latency 2.569 s. The accepted fresh
+owner/junction/sibling requests were each 3,655 prompt tokens, returned `17`,
+and produced hit deltas of 0/0/2,112. The sibling hit is 33 x 64 but is not
+divisible by 2,176, directly proving fine-grained junction reuse.
+Complete-session MTP counters were 1,096/1,170 accepted drafts (93.68%). One
+initial over-context diagnostic was rejected with HTTP 400 before model
+execution and was excluded; the 20 accepted inference requests returned HTTP
+200. No fatal/error marker occurred. Exact PGID teardown closed port 10242 and
+released the two cards used by this service; unrelated external contexts were
+then visible only on cards 4-7 and were left untouched.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen35-35b-a3b-channel-fp8-current-tp2-mtp3-kvfp8-fine.log`
+- `/tmp/vllm-hcu-evalscope/qwen35-35b-a3b-channel-fp8-current-tp2-mtp3-kvfp8-fine-run1-20261007`
 
 ## Qwen3.8 Flash-Next service command
 
