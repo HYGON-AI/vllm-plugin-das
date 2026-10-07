@@ -50,7 +50,7 @@ request.
 | `Qwen3.5-122B-A10B-Channel-FP8-w8a8` | TP4 | 16/16 | AITER channel-FP8 MoE; MTP acceptance 1,862/1,968 (94.6%); 2,176-token manager page and third-request fine-grained hit 2,112 tokens |
 | `Qwen3.5-397B-A17B-Channel-FP8-w8a8` | TP8 | 13/16 raw; 16/16 normalized, twice | Correct bare function bodies were undercounted by raw EvalScope; AITER channel-FP8 MoE; final MTP acceptance 2,643/2,760 (95.8%); 1,088-token manager page and third-request fine-grained hit 2,624 tokens |
 | `Qwen3.6-35B-A3B-Channel-FP8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,861/1,959 (95.0%); third-request fine-grained hit 2,112 tokens |
-| `Qwen3.6-35B-A3B-Channel-INT8-w8a8` | TP2 | 16/16 | 69.34 output tok/s; MTP acceptance 1,817/1,902 (95.5%); third-request fine-grained hit 2,112 tokens |
+| `Qwen3.6-35B-A3B-Channel-INT8-w8a8` | TP2 and current-head TP4 | 16/16 | TP4 at `5717e40`: E4M3 KV, tuned AITER INT8 MoE, target/speculator FULL plus PIECEWISE Graphs, 1,088-token manager page, 2,112-token fine-grained sibling hit, and 1,830/1,926 complete-session MTP acceptance |
 | `Qwen3.8-27B-Channel-FP8` | TP2 | 16/16 | 61.10 output tok/s; MTP acceptance 1,717/1,785 (96.2%); 6,016-token probe reused 4,736 tokens on the consumer request with correct output |
 | `Qwen3.8-Flash-Next-Channel-FP8` | TP4 | 16/16 | BLNHC hybrid cache; 25.69 output tok/s; MTP acceptance 1,771/1,974 (89.7%); align-only probe reused 3,200 tokens |
 
@@ -2430,7 +2430,10 @@ rewrite a completion that already defines the expected entry point. For the
 bodies and the normalized official checker scored 16/16 twice. The warm
 second run observed 42.16 output tok/s.
 
-All services were started in isolated process groups. Teardown first sent
-TERM to the complete PGID, verified every process in that PGID, and escalated
-only the Flash-Next PGID after its workers exceeded the grace period. The
-final device state was 2 MiB used on every card.
+The services in the earlier validation batch were started in isolated process
+groups. Teardown first sent TERM to the complete PGID, verified every process
+in that PGID, and escalated only the Flash-Next PGID after its workers exceeded
+the grace period. That earlier batch ended at 2 MiB used on every card. Later
+current-head reruns retain their own teardown evidence: the Qwen3-VL-235B and
+Qwen3.6-35B-A3B Channel-INT8 TP4 runs each returned their owned cards 0--3 to
+the measured 4 MiB idle reading without disturbing unrelated cards 4--7.
