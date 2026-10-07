@@ -23,7 +23,7 @@ request.
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | E4M3 KV 14/16 twice, then 15/16; auto/BF16 KV 15/16, then 14/16 | E4M3 retained: no BF16 accuracy gain, 200.42 output tok/s, and twice the KV-token capacity |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
-| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 twice at 7,800; 2/16 at 15,800 output tokens | The 16K control disproved a simple 8K shortage: two answers stopped and passed, while 14 generated exactly 15,800 tokens; the 8K repeated prompt reused 2,368 tokens |
+| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | FLASH_ATTN 2/16 twice at 7,800 and 2/16 at 15,800; TRITON_ATTN 3/16 at 15,800 | The 16K and attention-backend controls retained 13-14 exact-limit reasoning loops; Triton was 32% slower in output throughput and is not an acceptance route |
 | `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
@@ -941,6 +941,21 @@ non-convergence under this protocol, not as a plugin runtime failure; merely
 increasing the context again is not an acceptance path and no code change is
 indicated.
 
+An official `TRITON_ATTN` control from commit `5b0a1e5` changed only
+`--attention-backend FLASH_ATTN` to `--attention-backend TRITON_ATTN` in the
+same 16K server command; the client command and 15,800-token budget were
+unchanged. It scored 3/16: HumanEval/0, /3, and /14 stopped at 1,058, 1,776,
+and 952 tokens and passed, while the other 13 responses generated exactly
+15,800 tokens with `stop_reason=max_tokens`. The service captured default FULL
+and PIECEWISE graphs, allocated 1,763,024 E4M3 KV tokens, and returned HTTP
+200 for all 16 requests without a runtime error. Performance regressed to
+112.78 output tok/s, 360.5 ms mean TTFT, 8.4 ms mean TPOT, and 115.924 s mean
+latency, versus FLASH_ATTN's 166.16 tok/s, 89.3 ms, 5.9 ms, and 84.047 s.
+The one-sample score movement is accompanied by different naturally stopped
+sample identities across deterministic-looking repeats and does not resolve
+the dominant 13/16 non-convergence rate. Retain FLASH_ATTN as the service
+route; do not add a backend switch or runtime patch for this checkpoint.
+
 The exact 16K server command was:
 
 ```bash
@@ -1003,6 +1018,8 @@ Current-head 2B Thinking evidence:
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-run2-max7800-20261007`
 - `/tmp/vllm-hcu-validation/qwen3-vl-2b-thinking-current-tp2-kvfp8-16k-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-16k-max15800-20261007`
+- `/tmp/vllm-hcu-validation/qwen3-vl-2b-thinking-current-tp2-tritonattn-kvfp8-16k-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-tritonattn-kvfp8-16k-max15800-20261007`
 
 The 235B-A22B Instruct MoE route used four cards and AITER:
 
