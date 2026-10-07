@@ -18,7 +18,7 @@ request.
 | `Qwen3-4B-Channel-INT8-w8a8` | TP2 | 15/16 | E4M3 KV |
 | `Qwen3-8B-Channel-FP8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-8B-Channel-INT8-w8a8` | TP2 | 16/16 | E4M3 KV |
-| `Qwen3-14B-Channel-INT8-w8a8` | TP2 | 15/16 | E4M3 KV |
+| `Qwen3-14B-Channel-INT8-w8a8` | TP2 | 15/16 twice | Current-head repeat reproduced the same checkpoint-level HumanEval/10 logic error; E4M3 KV and prefix reuse passed |
 | `Qwen3-4B-Thinking-2507-Channel-FP8` | TP2 | diagnostic only | The checkpoint template always emits a thinking segment; disabling thinking is not a valid accuracy contract |
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | 14/16 twice | 188.04 and 198.51 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 127.57 and 137.41 output tok/s; repeated batch reused 1,600 prefix tokens |
@@ -69,6 +69,83 @@ not have tuned entries for every `E=512, N=160, K=2560` shape and logged
 shape-local fallback to the official Triton MoE implementation. The result is
 therefore end-to-end route evidence, not a claim that every MoE layer used an
 AITER kernel.
+
+## Qwen3-14B Channel-INT8 current-head repeat
+
+The non-reasoning 14B checkpoint was independently cold-started again at
+plugin commit `20dc8cc`. The exact server command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3-14B-Channel-INT8-w8a8 \
+  --served-model-name Qwen3-14B-Channel-INT8-w8a8 \
+  --port 10244 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.50 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The exact isolated HumanEval client command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen3-14b \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-14B-Channel-INT8-w8a8 \
+  --api-url http://127.0.0.1:10244/v1 \
+  --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-14b-channel-int8-current-tp2-kvfp8-run2-20261007 \
+  --no-timestamp
+```
+
+Both TP ranks constructed `HcuGPUModelRunnerV2`; HND resolved to physical
+LBHNC, and the default `FULL_AND_PIECEWISE` policy captured both FULL and
+PIECEWISE Graphs. The public E4M3 cache used 64-token pages. The startup
+message naming `TritonInt8ScaledMMLinearKernel` is the upstream frontend
+object, not proof that the executed dense GEMM bypassed the plugin: with both
+custom-op switches unset, the default HCU wrapper still sends dense W8A8 to
+LightOp per-token quantization and hipBLASLt GEMM.
+
+Raw Accuracy and Pass@1 were 15/16 (93.8%), matching the earlier run. Both
+runs failed only HumanEval/10 and emitted the same incorrect loop: it checks
+the empty suffix first and therefore returns the unmodified string. This is a
+stable checkpoint generation error, not an E4M3, Graph, TP, or dense-kernel
+failure. The report observed 86.68 output tok/s, 124.2 ms mean TTFT, 10.6 ms
+mean TPOT, and 1.48 s mean latency. Two identical 2,425-token prefix probes
+both returned `17`; the second added 2,368 cache-hit tokens (37 x 64). All 18
+chat requests returned HTTP 200 and the log contained no ERROR, Traceback, or
+RuntimeError.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-14b-channel-int8-current-tp2-kvfp8-run2-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-14b-channel-int8-current-tp2-kvfp8-run2-20261007`
 
 ## Qwen3.5 and Qwen3.6 hybrid service command
 
