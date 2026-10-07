@@ -24,8 +24,8 @@ request.
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | FLASH_ATTN 2/16 twice at 7,800 and 2/16 at 15,800; TRITON_ATTN 3/16 at 15,800 | The 16K and attention-backend controls retained 13-14 exact-limit reasoning loops; Triton was 32% slower in output throughput and is not an acceptance route |
-| `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
-| `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
+| `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at both 7,800 and 15,800 output tokens | `qwen3` reasoning parser; both budgets produced six stopped/passed answers and ten exact-limit reasoning loops; longer context is not an acceptance route |
+| `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800; 14/16 twice at 15,800 | Every normally stopped answer passed; 16K reproducibly put HumanEval/1 and /10 into exact-limit loops, so retain the better 8K/7,800 profile |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-235B-A22B-Channel-INT8-w8a8` | TP4 and TP8 diagnostics | best 15/16; not accepted | The same corrupted identifiers survived KV, Graph, topology, dense-GEMM, and MoE-provider controls; the checkpoint has no MTP layer |
 | `DeepSeek-V4-Flash-0731-Channel-INT8-w8a8` | TP8 | raw 14/16; normalized 16/16, twice | DSpark7; public E4M3-to-`fp8_ds_mla`; tuned AITER W8A8 MoE; target FULL plus PIECEWISE and DSpark FULL Graphs; this is V4-Flash-0731, not excluded V4.1 |
@@ -917,8 +917,23 @@ generation behavior rather than a plugin execution failure.
 
 The 4B Thinking checkpoint used the same command with `4B` substituted for
 `8B`. Even at the 7,800-token limit, ten samples exhausted the context inside
-reasoning; all six normally stopped samples passed. Treat its 6/16 as a
-checkpoint generation-budget limitation, not an accepted precision score.
+reasoning; all six normally stopped samples passed. A current-head 16K control
+then raised `max_model_len` to 16,384 and the client budget to 15,800, but
+reproduced the exact 6/16 split: HumanEval/3, /7, /8, /13, /14, and /15
+stopped and passed, while the other ten generated exactly 15,800 tokens with
+`stop_reason=max_tokens`. The run measured 121.54 output tok/s, 102.4 ms mean
+TTFT, 8.0 ms mean TPOT, and 88.373 s mean latency. Treat this as checkpoint
+reasoning non-convergence, not a simple 8K budget limitation or a plugin error.
+
+The 8B checkpoint also received a current-head 16K control. Two consecutive
+runs scored 14/16, below the accepted 8K result of 15/16. In both 16K runs,
+HumanEval/1 and /10 generated exactly 15,800 tokens and failed, while the
+other 14 samples stopped normally and passed. The repeats measured 130.1 and
+129.6 output tok/s. Increasing the budget therefore does not monotonically
+improve this checkpoint's deterministic-looking batched generation. Retain
+the 8K/7,800 profile as the service recommendation; do not switch the default
+to 16K to chase the original HumanEval/1 loop.
+
 The 2B Thinking checkpoint was more extreme: only two answers stopped within
 7,800 tokens and both passed, while the other 14 exhausted the context. A
 current-head repeat at commit `d46231d` reproduced that exact 2/16 split with
@@ -1020,6 +1035,14 @@ Current-head 2B Thinking evidence:
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-16k-max15800-20261007`
 - `/tmp/vllm-hcu-validation/qwen3-vl-2b-thinking-current-tp2-tritonattn-kvfp8-16k-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-tritonattn-kvfp8-16k-max15800-20261007`
+
+Current-head 4B/8B Thinking 16K evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-vl-4b-thinking-current-tp2-kvfp8-16k-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-4b-thinking-current-tp2-kvfp8-16k-max15800-20261007`
+- `/tmp/vllm-hcu-validation/qwen3-vl-8b-thinking-current-tp2-kvfp8-16k-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-8b-thinking-current-tp2-kvfp8-16k-max15800-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-8b-thinking-current-tp2-kvfp8-16k-max15800-run2-20261007`
 
 The 235B-A22B Instruct MoE route used four cards and AITER:
 
