@@ -13,7 +13,7 @@ request.
 
 | Checkpoint | Topology | HumanEval | Additional evidence |
 | --- | --- | ---: | --- |
-| `Qwen3-0.6B-Channel-FP8` | TP2 | auto KV 12/16 twice; E4M3 8/16 and 9/16 | Service passed; checkpoint is accuracy-sensitive at this size |
+| `Qwen3-0.6B-Channel-FP8` | TP2 | auto KV 12/16 twice, current-head 11/16; E4M3 8/16, 9/16, current-head 8/16 | Use auto/BF16 KV for this 0.6B checkpoint; the repeated E4M3 gap is model-scale sensitivity, not a service failure |
 | `Qwen3-4B-Channel-FP8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-4B-Channel-INT8-w8a8` | TP2 | 15/16 initially; current-head repeat 16/16 | E4M3 KV; repeated prompt reused 2,368 tokens |
 | `Qwen3-8B-Channel-FP8` | TP2 | 16/16 | E4M3 KV |
@@ -69,6 +69,78 @@ not have tuned entries for every `E=512, N=160, K=2560` shape and logged
 shape-local fallback to the official Triton MoE implementation. The result is
 therefore end-to-end route evidence, not a claim that every MoE layer used an
 AITER kernel.
+
+## Qwen3-0.6B Channel-FP8 current-head KV control
+
+The small dense checkpoint was cold-started at commit `8b1dcd9` with the
+following E4M3 service command:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3-0.6B-Channel-FP8 \
+  --served-model-name Qwen3-0.6B-Channel-FP8 \
+  --port 10249 --trust-remote-code --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 --gpu-memory-utilization 0.30 \
+  --max-model-len 4096 --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The BF16 control used the identical command with only
+`--kv-cache-dtype auto`. Both services used TP2, MRV2, HND-facing/LBHNC
+FLASH_ATTN, Channel-FP8 weights, 64-token cache blocks, prefix caching, and
+default FULL plus PIECEWISE Graphs.
+
+The exact isolated client was:
+
+```bash
+env -i HOME=/tmp/vllm-hcu-eval-home PATH="$PATH" \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-0.6B-Channel-FP8 \
+  --api-url http://127.0.0.1:10249/v1 --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir "$WORK_DIR" --no-timestamp
+```
+
+Current-head E4M3 scored 8/16 (50%), matching the earlier 8/16 and 9/16
+runs. Current-head auto/BF16 scored 11/16 (68.8%), close to the two earlier
+12/16 controls. This repeated three-pair gap makes auto/BF16 the accuracy
+route for this checkpoint; it does not override the E4M3 acceptance decision
+for the separately tested 2B and larger models. The auto run measured 213.57
+output tok/s, 88.3 ms mean TTFT, 4.0 ms mean TPOT, and 0.597 s mean latency.
+Two identical 2,425-token probes returned `8 + 9 = 17`; the second added
+2,368 prefix-hit tokens.
+
+The checkpoint declares `kv_cache_scheme: null` and contains weight scales
+but no calibrated KV scales. The pinned vLLM 0.28.1 has removed the deprecated
+`--calculate-kv-scales` interface and defaults uncalibrated FP8 KV scales to
+1.0. Do not restore the removed one-batch dynamic-scale mechanism in the
+plugin. Use auto/BF16 for this unusually small checkpoint, or provide a
+checkpoint calibrated with an FP8 KV scheme. There was no HTTP/runtime error,
+so no plugin code change is needed.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-0.6b-current-tp2-kvfp8-run3-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-0.6b-current-tp2-kvfp8-run3-20261007`
+- `/tmp/vllm-hcu-validation/qwen3-0.6b-current-tp2-kvauto-run3-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-0.6b-current-tp2-kvauto-run3-20261007`
 
 ## Qwen3-14B Channel-INT8 current-head repeat
 
