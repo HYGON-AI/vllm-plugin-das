@@ -353,11 +353,12 @@ profiles:
       port: 10208
       served_model_name: Qwen3-30B-A3B-Channel-INT8-w8a8
       environment: *flash_environment
-      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --enable-prefix-caching, --kv-cache-dtype, fp8_e4m3, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen3-30b-int8-tp2
       pass_criteria:
-        # AITER, Triton MoE, and dense controls reproduce the low score.
+        # E4M3/BF16, TP2/TP1, AITER/Triton MoE, and dense controls all
+        # reproduce the checkpoint's low no-thinking HumanEval score.
         enforce_score: false
       generation_config: &no_thinking_generation
         temperature: 0

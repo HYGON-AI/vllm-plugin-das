@@ -139,7 +139,7 @@ and owned artifact directories are defined in
 | `hy4_preview_channel_fp8_tp8` | TP8, sparse MLA, AITER FP8 MoE, MTP3, prefix | 16/16 | Pass after `indexed_attention` and `reasoning_effort=no_think` fixes |
 | `minimax_m25_int8_tp4` | TP4, FLASH_ATTN, HND/BHSD kernel view, AITER, prefix | 16/16 | Pass |
 | `qwen2_57b_tp2` | TP2, FLASH_ATTN, HND/BHSD kernel view, prefix | 15/16 | Deterministic HumanEval/10 miss under both AITER and Triton MoE; retained as checkpoint/model outcome |
-| `qwen3_30b_int8_tp2` | TP2, FLASH_ATTN, HND/BHSD kernel view | 5/16 | AITER and Triton MoE both 5/16; dense route 6/16; direct INT8 kernel probes pass, so no backend-specific fix was justified |
+| `qwen3_30b_int8_tp2` | TP2, FLASH_ATTN, HND/LBHNC kernel view, E4M3 KV, default LightOp dense W8A8, AITER INT8 MoE, prefix, default Graph | 5/16 | Current-head controls: BF16 TP2 and TP1 6/16; official Triton dense and Triton MoE 4/16; repeated 2,433-token request hit 2,432 tokens, so service features pass but accuracy is not accepted |
 | `qwen3_8b_tp2` | TP2, FLASH_ATTN, native FP8 E4M3 KV, prefix | 16/16 | Pass; BF16 control also 16/16 |
 | `qwen35_35b_tp2` | TP2, FLASH_ATTN, AITER BF16 MoE, MTP3, prefix | 16/16 | Pass |
 | `qwen35_35b_w8a8_tp2` | TP2, FLASH_ATTN, AITER INT8 MoE, E4M3 KV, MTP3 | 16/16 | Pass |
@@ -147,6 +147,104 @@ and owned artifact directories are defined in
 | `qwen38_27b_int8_tp2` | TP2, FLASH_ATTN, INT8, MTP3, E4M3 KV, fine-grained hybrid prefix, default target/speculator Graphs | 16/16 | Pass; current MR-head rerun proved a 3,136-token fine-grained sibling hit and 95.86% MTP acceptance |
 | `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, channel FP8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun proved 3,200 manager-page prefix hits and 90.62% MTP acceptance |
 | `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun also proved 3,200 prefix-hit tokens and 88.9% MTP acceptance |
+
+### Qwen3-30B-A3B Channel-INT8 current-head diagnostic
+
+The checkpoint was rerun at plugin commit `9a28f4e` with the pinned vLLM
+0.28.1 wheel. The exact primary TP2/E4M3 server command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM -u VLLM_CACHE_ROOT \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /models/Qwen3-30B-A3B-Channel-INT8-w8a8 \
+  --served-model-name Qwen3-30B-A3B-Channel-INT8-w8a8 \
+  --port 10244 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend aiter \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.50 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The exact isolated HumanEval16 command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen3-30b \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-30B-A3B-Channel-INT8-w8a8 \
+  --api-url http://127.0.0.1:10244/v1 \
+  --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-30b-a3b-channel-int8-tp2-kvfp8-run1-20261007 \
+  --no-timestamp
+```
+
+All service routes used HcuGPUModelRunnerV2 and default
+FULL_AND_PIECEWISE Graph capture. The controlled results were:
+
+| Dense W8A8 | MoE | KV | Topology | HumanEval16 | Passing tasks |
+| --- | --- | --- | --- | ---: | --- |
+| default LightOp redirect | AITER | E4M3 | TP2 | 5/16 | 0, 2, 3, 4, 13 |
+| default LightOp redirect | AITER | BF16/auto | TP2 | 6/16 | 0, 2, 3, 4, 10, 13 |
+| official Triton control | AITER | BF16/auto | TP2 | 4/16 | 0, 3, 10, 13 |
+| default LightOp redirect | official Triton | BF16/auto | TP2 | 4/16 | 0, 3, 10, 13 |
+| default LightOp redirect | AITER | BF16/auto | TP1 diagnostic | 6/16 | 0, 2, 3, 4, 10, 13 |
+
+The TP1 and TP2 BF16 pass sets were identical. Changing KV dtype, dense
+provider, MoE provider, or tensor parallelism did not remove the repeated
+invalid pseudocode, semantic errors, or reasoning loops. The checkpoint's own
+README reports GSM8K rather than HumanEval, and no unquantized sibling exists
+locally for a checkpoint-level comparison. This is therefore retained as an
+unaccepted checkpoint/no-thinking generation outcome; the cross-provider
+evidence does not justify a plugin model-specific workaround.
+
+The primary TP2 route still passed its runtime feature gates. Both ranks used
+MRV2; dense W8A8 executed the default LightOp redirect despite the upstream
+`Selected TritonInt8ScaledMMLinearKernel` frontend message; AITER loaded the
+ordinary and bottom gfx938 `E=128,N=384,dtype=int8_w8a8` configs plus the
+channel-shuffle table; public E4M3 used a 64-token LBHNC cache; and target
+prefill/decode captured PIECEWISE and FULL Graphs. Two valid 2,433-token
+requests returned `17`; the second request hit 2,432 tokens, exactly 38 cache
+pages. One deliberately over-context probe returned HTTP 400 before execution
+and was excluded. Exact teardown returned all cards to idle.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-30b-a3b-channel-int8-tp2-kvfp8.log`
+- `/tmp/vllm-hcu-validation/qwen3-30b-a3b-channel-int8-tp2-kvfp8-prefix-rerun.log`
+- `/tmp/vllm-hcu-validation/qwen3-30b-a3b-channel-int8-tp2-kvauto.log`
+- `/tmp/vllm-hcu-validation/qwen3-30b-a3b-channel-int8-tp2-kvauto-triton-dense.log`
+- `/tmp/vllm-hcu-validation/qwen3-30b-a3b-channel-int8-tp2-kvauto-triton-moe.log`
+- `/tmp/vllm-hcu-validation/qwen3-30b-a3b-channel-int8-tp1-kvauto.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-30b-a3b-channel-int8-tp2-kvfp8-run1-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-30b-a3b-channel-int8-tp2-kvauto-run1-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-30b-a3b-channel-int8-tp2-kvauto-triton-dense-run1-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-30b-a3b-channel-int8-tp2-kvauto-triton-moe-run1-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-30b-a3b-channel-int8-tp1-kvauto-run1-20261007`
 
 The final shared-expert stream-safety change was followed by fresh live
 regression runs for both large GLM routes. `/models/GLM-5-W8A8` used TP8,
