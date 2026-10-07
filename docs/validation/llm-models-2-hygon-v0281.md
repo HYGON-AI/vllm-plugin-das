@@ -33,7 +33,7 @@ request.
 | `DeepSeek-V4-Flash-0731-W4A8-INT4-Channel-Attn-W8A8-INT8-Channel` | TP8 | 16/16 raw and normalized, twice | SlimQuant W4A8 MoE; W8A8 attention; BLHNC E4M3 KV; DSpark7; target FULL plus PIECEWISE and DSpark FULL Graphs |
 | `DeepSeek-V4-Flash-Channel-FP8-w8a8` | TP8 | raw 15/16; normalized 16/16, twice | no DSpark metadata; MTP3; BLHNC E4M3 KV; AITER FP8 MoE; target and MTP prefill FULL plus PIECEWISE, MTP decode FULL Graphs |
 | `DeepSeek-V4-Pro-0813-Channel-INT4-w4a8` | TP8 | 16/16 | SlimQuant W4A8 MoE; W8A8 attention; BLHNC E4M3 KV; DSpark7; target FULL plus PIECEWISE and DSpark FULL Graphs; 1,726/2,303 draft tokens accepted |
-| `DeepSeek-V4-Pro-0813-INT4-Channel` | not rerun | metadata-equivalent | Same config/index hashes, 66-shard size list, and 789.42 GiB size as the launched W4A8 representative; separate files, so no inherited runtime claim |
+| `DeepSeek-V4-Pro-0813-INT4-Channel` | TP8 | 16/16 | Independently cold-started at current MR head; SlimQuant W4A8 MoE, W8A8 attention, BLHNC E4M3 KV, DSpark7, target FULL plus PIECEWISE and DSpark FULL Graphs; 1,726/2,303 HumanEval draft tokens accepted |
 | `DeepSeek-V4-Pro-0813-INT8-Channel` | TP8 capacity gate | not launched | 1,545.42 GiB total and 193.18 GiB/rank before runtime overhead exceed the available 143.98 GiB/card; requires TP16 or larger-memory devices |
 | `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
 | `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
@@ -859,16 +859,86 @@ errored, so no syntax-aware normalization was needed. It observed 16.88
 output tok/s, 620.9 ms mean TTFT, and 54.5 ms mean TPOT. The run generated
 2,057 tokens and accepted 1,726/2,303 DSpark draft tokens (75.0%).
 
-`DeepSeek-V4-Pro-0813-INT4-Channel` has the same config hash, index hash,
-66-shard count, total physical size, and sampled shard sizes. It is a separate
-directory rather than hard links, so it was classified as a metadata-equivalent
-artifact and was not cold-started again. In contrast,
-`DeepSeek-V4-Pro-0813-INT8-Channel` occupies 1,545.42 GiB physically, or
-193.18 GiB/rank at TP8 before runtime overhead, and cannot fit on this
-eight-card node with 143.98 GiB usable per card. It requires at least TP16 or
-a higher-memory topology. The HumanEval result applies only to the launched
-`Channel-INT4-w4a8` representative, not to the unlaunched metadata-equivalent
-directory or the capacity-blocked INT8 artifact.
+The separately stored `DeepSeek-V4-Pro-0813-INT4-Channel` checkpoint was then
+independently cold-started at current MR head `6733c6e`. Its exact server
+command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve \
+    /llm-models-2/hygon/DeepSeek-V4-Pro-0813-INT4-Channel \
+  --served-model-name DeepSeek-V4-Pro-0813-INT4-Channel \
+  --port 10239 \
+  --trust-remote-code \
+  --tokenizer-mode deepseek_v4 \
+  --distributed-executor-backend mp \
+  --tensor-parallel-size 8 \
+  --quantization slimquant_w4a8 \
+  --moe-backend aiter \
+  --speculative-config \
+    '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --block-size 256 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 512 \
+  --max-num-seqs 8 \
+  --generation-config vllm
+```
+
+Its isolated HumanEval16 command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-v4pro-int4 \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model DeepSeek-V4-Pro-0813-INT4-Channel \
+  --api-url http://127.0.0.1:10239/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"thinking":false}}}' \
+  --stream --eval-batch-size 1 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir \
+    /tmp/vllm-hcu-evalscope/deepseek-v4-pro-0813-int4-channel-current-tp8-dspark7-kvfp8-run1-20261007 \
+  --no-timestamp
+```
+
+All ranks again constructed `HcuGPUModelRunnerV2`. The target cold load took
+863.98 seconds; total model initialization used 104.97 GiB/rank and about
+901.1 seconds. Public E4M3 resolved to `fp8_ds_mla` with BLHNC storage. The
+gfx938 AITER ordinary and bottom-layer W4A8 configurations both loaded. The
+target captured PIECEWISE and FULL Graphs and DSpark7 captured FULL Graphs;
+the service allocated 143,064 KV tokens.
+
+Raw HumanEval Accuracy and Pass@1 passed 16/16. The report observed 19.03
+output tok/s, 447.8 ms mean TTFT, 49.3 ms mean TPOT, and 6.755 s mean latency.
+The HumanEval window accepted 1,726/2,303 DSpark draft tokens (75.0%). Two
+2,506-token prefix probes added 2,048 hits over 5,012 queried tokens. Because
+the requested DSpark profile uses probabilistic draft sampling, the two short
+probe continuations differed; this is recorded only as prefix-reuse evidence,
+not a deterministic-output claim. No ERROR, Traceback, VM fault, or OOM
+occurred, and exact teardown returned all cards to 2 MiB.
+
+`DeepSeek-V4-Pro-0813-INT8-Channel` remains capacity-blocked: it occupies
+1,545.42 GiB physically, or 193.18 GiB/rank at TP8 before runtime overhead,
+and cannot fit this node's 143.98 GiB/card. It requires at least TP16 or a
+higher-memory topology.
 
 Evidence:
 
@@ -877,6 +947,8 @@ Evidence:
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-metrics.txt`
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8-humaneval16.log`
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8-run1-20261007`
+- `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-int4-channel-current-tp8-dspark7-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/deepseek-v4-pro-0813-int4-channel-current-tp8-dspark7-kvfp8-run1-20261007`
 
 ## GLM-5.3 Channel-FP8 TP8 commands
 
