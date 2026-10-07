@@ -516,10 +516,25 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expert_num_tokens,
                 expected_m,
             )
-            a2q, a2q_scale = fuse_silu_mul_quant_ep(
-                workspace1,
-                expert_num_tokens,
-            )
+            # Clamp gate/up by the model's swiglu_limit before the activation,
+            # matching the Triton path; the EP kernel masks by expert token
+            # counts so padded slots stay untouched. expect_m is the padded
+            # per-expert token extent that controls the launch grid.
+            clamp_limit = self.activation_config.clamp_limit
+            if clamp_limit is not None and clamp_limit > 0:
+                from lightop import fuse_silu_mul_clamp_quant_ep
+
+                a2q, a2q_scale = fuse_silu_mul_clamp_quant_ep(
+                    workspace1,
+                    limit=clamp_limit,
+                    mask_m=expert_num_tokens,
+                    expect_m=max_num_tokens,
+                )
+            else:
+                a2q, a2q_scale = fuse_silu_mul_quant_ep(
+                    workspace1,
+                    expert_num_tokens,
+                )
             m_grouped_i8_gemm_nt_masked(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),

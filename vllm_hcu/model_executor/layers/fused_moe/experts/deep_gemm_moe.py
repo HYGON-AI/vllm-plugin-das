@@ -432,6 +432,9 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     )
                 from deepgemm import m_grouped_i8_gemm_nt_contiguous
                 from lightop.activation import fuse_silu_mul_quant
+                from vllm_hcu.model_executor.layers.fused_moe.experts import (
+                    dpsk_v4_deep_gemm_moe,
+                )
 
                 m_grouped_i8_gemm_nt_contiguous(
                     (a1q, a1q_scale),
@@ -444,11 +447,22 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     workspace13.view(dtype=torch.int8),
                     (M_sum, activation_out_dim),
                 )
-                a2q, a2q_scale = fuse_silu_mul_quant(
-                    mm1_out,
-                    output=quant_out,
-                    expert_ids=expert_ids,
-                )
+                clamp_limit = self.quant_config.gemm1_clamp_limit
+                if clamp_limit is not None and clamp_limit > 0:
+                    clamp_quant = (
+                        dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant
+                    )
+                    a2q, a2q_scale = clamp_quant(
+                        mm1_out,
+                        limit=clamp_limit,
+                        output=quant_out,
+                    )
+                else:
+                    a2q, a2q_scale = fuse_silu_mul_quant(
+                        mm1_out,
+                        output=quant_out,
+                        expert_ids=expert_ids,
+                    )
                 mm2_out = _resize_cache(workspace2, (M_sum, K))
                 m_grouped_i8_gemm_nt_contiguous(
                     (a2q, a2q_scale),
