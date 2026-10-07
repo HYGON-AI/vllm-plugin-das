@@ -29,7 +29,10 @@ TARGETS = (
 _MARKER = "_vllm_hcu_pcp_model_state_applied"
 _WRAPPER = "_vllm_hcu_pcp_model_state_wrapper"
 _V028_PREPARE_ATTN_SOURCE_SHA256 = (
-    "10d3722dbbed9652003fbc634b5183d344d5b9464bef8e2bcf35a615cae324c6"
+    # Re-audited after prepare_attn gained the host seq_lens / block table
+    # mirror pass-through (seq_lens_cpu, num_computed_tokens_cpu,
+    # block_tables_np); the PCP wrapper below is unaffected.
+    "81017edcd386afc0200784e14e376deecaea6b9e623c0d035b112ca8dd46dde9"
 )
 
 
