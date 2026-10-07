@@ -813,24 +813,26 @@ def _normalize_humaneval_completion(
         candidate = code.lstrip(" \t")
         try:
             module = ast.parse(candidate)
-        except (MemoryError, RecursionError, SyntaxError):
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
             pass
         else:
             if any(
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name == entry_point
-                for node in module.body
+                for node in ast.walk(module)
             ):
                 return candidate
     if entry_point and code and not code.startswith((" ", "\t")):
         try:
             module = ast.parse(code)
+        except ValueError:
+            return code
         except (MemoryError, RecursionError, SyntaxError):
             module = None
         if module is not None and any(
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == entry_point
-            for node in module.body
+            for node in ast.walk(module)
         ):
             return code
         # Some instruction-tuned checkpoints return a syntactically valid
@@ -850,6 +852,8 @@ def _normalize_humaneval_completion(
             for candidate in candidates:
                 try:
                     ast.parse("def _humaneval_candidate():\n" + candidate)
+                except ValueError:
+                    return code
                 except (MemoryError, RecursionError, SyntaxError):
                     continue
                 return candidate

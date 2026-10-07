@@ -181,11 +181,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The matching isolated HumanEval16 client command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen2-57b \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -261,11 +263,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The exact isolated HumanEval16 command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen3-30b \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -364,11 +368,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The matching isolated HumanEval16 client command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen36-27b \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -512,7 +518,17 @@ vllm serve /models/DeepSeek-R1-0528-Channel-INT8 \
 The matching HumanEval16 client command is:
 
 ```bash
-/usr/bin/python3 -m tests.integration.server.evalscope_secure_cli eval \
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home-deepseek-r1-0528 \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
   --model DeepSeek-R1-0528-Channel-INT8 \
   --api-url http://127.0.0.1:10226/v1 --eval-type openai_api \
   --generation-config '{"temperature":0,"do_sample":false,"max_tokens":8192}' \
@@ -667,11 +683,13 @@ env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
 The matching isolated HumanEval16 client was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -754,11 +772,13 @@ env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
 The matching isolated HumanEval16 client was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen38-flash-fp8 \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -844,11 +864,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The matching isolated HumanEval16 client command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen38-27b \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -928,11 +950,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The matching isolated HumanEval16 client command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen3-8b \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -1013,11 +1037,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The matching isolated HumanEval16 client command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen35-35b-w8a8 \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
@@ -1111,11 +1137,13 @@ env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
 The matching isolated HumanEval16 client command was:
 
 ```bash
-env \
+env -i \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   -u http_proxy -u https_proxy -u all_proxy \
   -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
   HOME=/tmp/vllm-hcu-eval-home-qwen35-35b \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
   VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \

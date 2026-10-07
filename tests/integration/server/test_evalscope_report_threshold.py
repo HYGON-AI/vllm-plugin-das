@@ -995,6 +995,29 @@ def test_humaneval_normalization_tolerates_ast_resource_failure(
         entry_point="candidate",
     ) == completion
 
+
+def test_humaneval_normalization_preserves_source_rejected_by_ast() -> None:
+    completion = "return 'embedded" + chr(0) + "null'"
+
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
+
+
+def test_humaneval_normalization_preserves_nested_entry_definition() -> None:
+    completion = (
+        "if True:\n"
+        "    def candidate(value):\n"
+        "        return value"
+    )
+
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
+
+
 @pytest.mark.parametrize(
     ("completion", "expected"),
     [

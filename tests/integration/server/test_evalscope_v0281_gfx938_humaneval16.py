@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -550,6 +551,74 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
         fp8_kv_command, _, _ = server_command(fp8_kv, model_env=MODEL_ENV)
         assert _option_value(fp8_kv_command, "--max-model-len") == "8192"
         assert fp8_kv["server"]["prefix_probe"]["content_repeat"] == 64
+
+    qwen38_expectations = {
+        "qwen38_27b_int8_tp2": {
+            "kv_layout": "HND",
+            "quantization": None,
+            "fine_grained_prefix": True,
+        },
+        "qwen38_flash_next_fp8_tp4": {
+            "kv_layout": None,
+            "quantization": None,
+            "fine_grained_prefix": False,
+        },
+        "qwen38_flash_next_w4a8_tp4": {
+            "kv_layout": None,
+            "quantization": "slimquant_w4a8",
+            "fine_grained_prefix": False,
+        },
+    }
+    for profile, expected in qwen38_expectations.items():
+        config = load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
+        command, _, _ = server_command(config, model_env=MODEL_ENV)
+        environment = config["server"]["environment"]
+        assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        assert environment.get("VLLM_KV_CACHE_LAYOUT") == expected["kv_layout"]
+        assert json.loads(_option_value(command, "--speculative-config")) == {
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+        }
+        assert _option_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+        assert _option_value(command, "--mamba-cache-mode") == "align"
+        assert _option_value(command, "--max-model-len") == "8192"
+        assert _option_value(command, "--max-num-batched-tokens") == "2048"
+        assert _option_value(command, "--max-num-seqs") == "8"
+        assert "--enable-prefix-caching" in command
+        if expected["quantization"] is None:
+            assert "--quantization" not in command
+        else:
+            assert (
+                _option_value(command, "--quantization")
+                == expected["quantization"]
+            )
+        if expected["fine_grained_prefix"]:
+            assert _option_value(command, "--prefix-match-unit") == "64"
+            assert "--enable-mamba-fine-grained-prefix-cache" in command
+        else:
+            assert "--prefix-match-unit" not in command
+            assert "--enable-mamba-fine-grained-prefix-cache" not in command
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "docs/validation/llm-models-2-hygon-v0281.md",
+        "docs/validation/v0281-gfx938-provenance.md",
+    ],
+)
+def test_documented_humaneval_clients_use_allowlisted_environments(
+    relative_path: str,
+) -> None:
+    document = (ROOT / relative_path).read_text(encoding="utf-8")
+    client_blocks = [
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", document, re.DOTALL)
+        if "tests.integration.server.evalscope_secure_cli eval" in block
+    ]
+
+    assert client_blocks
+    assert all("env -i" in block for block in client_blocks)
 
 
 def test_hy3_dp8_ep8_low_latency_contract() -> None:

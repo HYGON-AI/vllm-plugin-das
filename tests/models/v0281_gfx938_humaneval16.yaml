@@ -426,8 +426,10 @@ profiles:
     server:
       port: 10213
       served_model_name: Qwen3.8-27B-Channel-INT8-w8a8
-      environment: *flash_environment
-      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --mamba-cache-mode, align, --prefix-match-unit, "64", --enable-mamba-fine-grained-prefix-cache, --max-model-len, "8192", --max-num-batched-tokens, "2048", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-27b-int8-tp2
       generation_config: *no_thinking_generation
@@ -437,7 +439,9 @@ profiles:
     server:
       port: 10214
       served_model_name: Qwen3.8-Flash-Next-FP8-Channelwise
-      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "8192", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --mamba-cache-mode, align, --max-model-len, "8192", --max-num-batched-tokens, "2048", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
       prefix_probe:
         content_repeat: 64
     evalscope:
@@ -449,7 +453,9 @@ profiles:
     server:
       port: 10215
       served_model_name: Qwen3.8-Flash-Next-w4a8-slimquant
-      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "4", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --quantization, slimquant_w4a8, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --mamba-cache-mode, align, --max-model-len, "8192", --max-num-batched-tokens, "2048", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen38-flash-next-w4a8-tp4
       generation_config: *no_thinking_generation
