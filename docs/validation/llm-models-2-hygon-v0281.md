@@ -22,7 +22,7 @@ request.
 | `Qwen3-4B-Thinking-2507-Channel-FP8` | TP2 | diagnostic only | The checkpoint template always emits a thinking segment; disabling thinking is not a valid accuracy contract |
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | 14/16 twice | 188.04 and 198.51 output tok/s; repeated batch reused 1,600 prefix tokens |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
-| `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 twice | 117.39 and 123.67 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 at 7,800 output tokens | `qwen3` reasoning parser; both normally stopped answers passed and 14 answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
@@ -653,6 +653,48 @@ Current-head evidence:
 
 - `/tmp/vllm-hcu-validation/qwen3-vl-4b-instruct-current-tp2-kvfp8-run3-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-4b-instruct-current-tp2-kvfp8-run3-20261007`
+
+The 8B Instruct checkpoint was then repeated at current PR commit `b9f2f13`
+with `SIZE=8B` and port `10247` in the same server template. Its isolated
+client differed only in the model, port, HOME, and work directory:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen3-vl-8b-instruct \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-VL-8B-Instruct-Channel-FP8 \
+  --api-url http://127.0.0.1:10247/v1 \
+  --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":2048}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-vl-8b-instruct-current-tp2-kvfp8-run3-20261007 \
+  --no-timestamp
+```
+
+The same language-only TP2 MRV2, Channel-FP8, HND/LBHNC, E4M3, M-RoPE,
+prefix-cache, and default Graph route passed. HumanEval remained 15/16
+(93.8%) for the third run, and all three runs failed only HumanEval/1. The
+current completion uses `paren_string[start:i-1]` after advancing `i` past
+the closing parenthesis, so every returned group omits that parenthesis; this
+is a generated off-by-one semantic error. Performance was 116.02 output
+tok/s, 119.2 ms mean TTFT, 7.0 ms mean TPOT, and 0.601 s mean latency. Two
+identical 2,421-token probes returned `17`; the second reused 2,368 tokens.
+All 18 chat requests returned HTTP 200 and no ERROR, Traceback, or
+RuntimeError was logged. No runtime-code change is needed.
+
+Current-head evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-vl-8b-instruct-current-tp2-kvfp8-run3-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-8b-instruct-current-tp2-kvfp8-run3-20261007`
 
 The Thinking checkpoint must expose reasoning separately and needs a realistic
 reasoning budget. The final 8B gate used:
