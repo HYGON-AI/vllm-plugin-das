@@ -1387,6 +1387,98 @@ Evidence:
 - `/tmp/vllm-hcu-validation/llm-models-2-hy4-preview-channel-fp8-tp8-mtp3-kvfp8.log`
 - `/tmp/vllm-hcu-evalscope/llm-models-2-hy4-preview-channel-fp8-tp8-mtp3-kvfp8-run1-20261007`
 
+## Hy4 preview Channel-FP8 DP8/EP8 command
+
+The same `/llm-models-2` checkpoint also passed a dynamic DP8/TP1/EP8 run
+with DeepEP low latency, DeepGEMM, MTP3, public E4M3 sparse KV, Model Runner
+V2, and the default `FULL_AND_PIECEWISE` Graph policy:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve /llm-models-2/hygon/Hy4-preview-Channel-FP8-w8a8 \
+  --served-model-name Hy4-preview-Channel-FP8-w8a8 \
+  --api-server-count 8 \
+  --port 10236 \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --enable-expert-parallel \
+  --attention-backend FLASHMLA_SPARSE \
+  --moe-backend deep_gemm \
+  --all2all-backend deepep_low_latency \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --kv-cache-dtype fp8_e4m3 \
+  --block-size 64 \
+  --kv-cache-memory-bytes 536870912 \
+  --gpu-memory-utilization 0.95 \
+  --enable-prefix-caching \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 256 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}'
+```
+
+Use the following client command for the matching HumanEval16 result:
+
+```bash
+NO_PROXY=127.0.0.1,localhost \
+no_proxy=127.0.0.1,localhost \
+HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+http_proxy= https_proxy= all_proxy= \
+EVALSCOPE_API_KEY=EMPTY \
+VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Hy4-preview-Channel-FP8-w8a8 \
+  --api-url http://127.0.0.1:10236/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \
+  --stream \
+  --eval-batch-size 8 \
+  --timeout 7200 \
+  --limit 16 \
+  --datasets humaneval \
+  --dataset-args '{"humaneval":{}}' \
+  --work-dir \
+    /tmp/vllm-hcu-evalscope/llm-models-2-hy4-dp8-ep8-mtp3-kvfp8-bt256-run1-20261007 \
+  --no-timestamp
+```
+
+The run passed raw Accuracy and Pass@1 at 16/16, with all 16 requests ending
+in `stop`. HumanEval traffic accepted 1,489/1,602 MTP draft tokens (92.9%).
+Nine identical long-prefix requests then produced 4,992 aggregate prefix-hit
+tokens, proving reuse after the load balancer repeated DP ranks. All eight
+ranks used `HcuGPUModelRunnerV2`, `DeepEPLLAll2AllManager`,
+`DeepEPLLPrepareAndFinalize`, and the low-latency
+`DeepEPDeepGemmMaskedExperts` route. Public `fp8_e4m3` resolved to
+`fp8_ds_mla` with LBNHC storage and 9,792 KV tokens per engine. The log had
+no ERROR, Traceback, VM fault, or dead engine.
+
+Keep `--max-num-batched-tokens 256` for this dynamic DP8/EP8 profile. A
+single-variable run at 64 returned HTTP 200 for every request but scored only
+1/16, generated long multilingual/repetitive completions, and accepted only
+10,763/35,658 MTP draft tokens (30.2%). Restoring 256 recovered 16/16 and
+92.9% MTP acceptance. This is an observed command boundary, not evidence of
+an internal root cause.
+
+The current branch does not contain the historical offline static-EPLB source
+modules. Therefore, do not treat an older static-map run or its 64-token
+scheduler setting as evidence for this dynamic profile or as proof that this
+MR supports static EPLB.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/llm-models-2-hy4-dp8-ep8-mtp3-kvfp8-bt256.log`
+- `/tmp/vllm-hcu-evalscope/llm-models-2-hy4-dp8-ep8-mtp3-kvfp8-bt256-run1-20261007`
+- `/tmp/vllm-hcu-validation/llm-models-2-hy4-dp8-ep8-mtp3-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/llm-models-2-hy4-dp8-ep8-mtp3-kvfp8-run1-20261007`
+
 ## HumanEval client command
 
 Each score above used a fresh work directory and proxy-free loopback access.
