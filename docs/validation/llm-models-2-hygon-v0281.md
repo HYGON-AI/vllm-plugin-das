@@ -32,6 +32,9 @@ request.
 | `DeepSeek-V4-Flash-0731-Channel-FP8-w8a8` | TP8 | raw 13/16; normalized 16/16, twice | DSpark7; BLHNC E4M3 KV; channel-wise FP8 dense and tuned AITER FP8 MoE; target FULL plus PIECEWISE and DSpark FULL Graphs |
 | `DeepSeek-V4-Flash-0731-W4A8-INT4-Channel-Attn-W8A8-INT8-Channel` | TP8 | 16/16 raw and normalized, twice | SlimQuant W4A8 MoE; W8A8 attention; BLHNC E4M3 KV; DSpark7; target FULL plus PIECEWISE and DSpark FULL Graphs |
 | `DeepSeek-V4-Flash-Channel-FP8-w8a8` | TP8 | raw 15/16; normalized 16/16, twice | no DSpark metadata; MTP3; BLHNC E4M3 KV; AITER FP8 MoE; target and MTP prefill FULL plus PIECEWISE, MTP decode FULL Graphs |
+| `DeepSeek-V4-Pro-0813-Channel-INT4-w4a8` | TP8 | 16/16 | SlimQuant W4A8 MoE; W8A8 attention; BLHNC E4M3 KV; DSpark7; target FULL plus PIECEWISE and DSpark FULL Graphs; 1,726/2,303 draft tokens accepted |
+| `DeepSeek-V4-Pro-0813-INT4-Channel` | not rerun | metadata-equivalent | Same config/index hashes, 66-shard size list, and 789.42 GiB size as the launched W4A8 representative; separate files, so no inherited runtime claim |
+| `DeepSeek-V4-Pro-0813-INT8-Channel` | TP8 capacity gate | not launched | 1,545.42 GiB total and 193.18 GiB/rank before runtime overhead exceed the available 143.98 GiB/card; requires TP16 or larger-memory devices |
 | `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
 | `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
 | `GLM-5.3-Channel-FP8-w8a8` | TP8 | 16/16 | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, channel-wise FP8 dense and AITER FP8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 875/963 draft tokens accepted |
