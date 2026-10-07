@@ -40,6 +40,7 @@ request.
 | `MiniMax-M2.5-Channel-INT8-w8a8` | TP4 | 16/16 twice at 3,800 output tokens | E4M3 KV; AITER W8A8 MoE; target FULL plus PIECEWISE Graphs; built-in MTP is not registered for MiniMax M2 in vLLM 0.28.1 |
 | `Hy3-Channel-FP8-w8a8` | TP4 | 16/16 twice | Channel-wise FP8 dense; E4M3 KV; MTP2; target/speculator FULL plus PIECEWISE Graphs; AITER config miss fell back to official Triton for the observed `M=1` MoE shape |
 | `Hy3-Channel-INT8-w8a8` | TP4 | 16/16 twice | E4M3 KV; MTP2; target/speculator FULL plus PIECEWISE Graphs; AITER config miss fell back to official Triton for the observed `M=1` MoE shape |
+| `Hy4-preview-Channel-FP8-w8a8` | TP8 | 16/16 | FLASHMLA_SPARSE, LBNHC E4M3 KV, tuned AITER FP8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 1,549/1,689 draft tokens accepted |
 | `Qwen3.5-27B-Channel-FP8` | TP2 | 16/16 | MTP3; fine-grained third-request prefix hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-FP8-w8a8` | TP2 | 15/16, then 16/16 | MTP3; the single HumanEval/10 miss did not reproduce; fine-grained hit 2,240 tokens |
 | `Qwen3.5-35B-A3B-Channel-INT8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,274/1,341 (95.0%); third-request fine-grained hit 2,240 tokens |
@@ -1304,6 +1305,84 @@ The duplicate-prefix probe returned `17` twice and added 2,304/4,738 prefix
 hit/query tokens. Session MTP counters were 1,301/1,682 accepted/drafted
 tokens (77.3%). The successful log had no ERROR or Traceback, and exact
 teardown returned all cards to 2 MiB.
+
+## Hy4 preview Channel-FP8 TP8 commands
+
+The `/llm-models-2/hygon` copy is 736.24 GiB over 131 shards. Its config,
+weight-index, and filename-plus-size-list hashes match the previously
+validated `/models/Hy4-preview-Channel-FP8-w8a8` artifact. The files are not
+hard links, so this path was independently cold-started and evaluated:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve /llm-models-2/hygon/Hy4-preview-Channel-FP8-w8a8 \
+  --served-model-name Hy4-preview-Channel-FP8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --attention-backend FLASHMLA_SPARSE \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --kv-cache-dtype fp8_e4m3 \
+  --block-size 64 \
+  --enable-prefix-caching \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"reasoning_effort":"no_think"}'
+```
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/hy4-preview-channel-fp8-tp8-mtp3-fresh-run
+test ! -e "$work_dir"
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Hy4-preview-Channel-FP8-w8a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \
+  --stream \
+  --eval-batch-size 8 \
+  --timeout 7200 \
+  --limit 16 \
+  --datasets humaneval \
+  --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" \
+  --no-timestamp
+```
+
+All eight ranks constructed `HcuGPUModelRunnerV2`. Public `fp8_e4m3`
+resolved to `fp8_ds_mla` with LBNHC storage. Dense layers selected
+`ChannelWiseTorchFP8ScaledMMLinearKernel`; AITER loaded the gfx938
+`fp8_w8a8/E=256,N=256` ordinary and bottom-layer configurations plus the
+channel-shuffle table. The plugin auto-enabled breakable CUDA Graph for HY4.
+The target and MTP prefill captured FULL and PIECEWISE Graphs; MTP decode
+captured FULL Graphs. The cold NFS load took 876.09 seconds, total model
+loading used 98.24 GiB/rank, and the service allocated 662,976 KV tokens.
+
+The fresh HumanEval16 run passed raw Accuracy and Pass@1 at 16/16. All 16
+requests finished with `stop`; none reached the length limit or errored. It
+observed 26.23 output tok/s, 1,001.1 ms mean TTFT, and 30.8 ms mean TPOT.
+MTP accepted 1,549/1,689 drafted tokens (91.7%). The server log contained no
+ERROR or Traceback, and teardown returned all eight cards to 2 MiB.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/llm-models-2-hy4-preview-channel-fp8-tp8-mtp3-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/llm-models-2-hy4-preview-channel-fp8-tp8-mtp3-kvfp8-run1-20261007`
 
 ## HumanEval client command
 
