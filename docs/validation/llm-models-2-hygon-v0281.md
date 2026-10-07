@@ -15,7 +15,7 @@ request.
 | --- | --- | ---: | --- |
 | `Qwen3-0.6B-Channel-FP8` | TP2 | auto KV 12/16 twice; E4M3 8/16 and 9/16 | Service passed; checkpoint is accuracy-sensitive at this size |
 | `Qwen3-4B-Channel-FP8` | TP2 | 16/16 | E4M3 KV |
-| `Qwen3-4B-Channel-INT8-w8a8` | TP2 | 15/16 | E4M3 KV |
+| `Qwen3-4B-Channel-INT8-w8a8` | TP2 | 15/16 initially; current-head repeat 16/16 | E4M3 KV; repeated prompt reused 2,368 tokens |
 | `Qwen3-8B-Channel-FP8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-8B-Channel-INT8-w8a8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-14B-Channel-INT8-w8a8` | TP2 | 15/16 twice | Current-head repeat reproduced the same checkpoint-level HumanEval/10 logic error; E4M3 KV and prefix reuse passed |
@@ -146,6 +146,75 @@ Evidence:
 
 - `/tmp/vllm-hcu-validation/qwen3-14b-channel-int8-current-tp2-kvfp8-run2-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-14b-channel-int8-current-tp2-kvfp8-run2-20261007`
+
+## Qwen3-4B Channel-INT8 current-head repeat
+
+The 4B INT8 checkpoint was then cold-started at plugin commit `518dbcb` with
+the same accepted dense-Qwen route. The exact server command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /llm-models-2/hygon/Qwen3-4B-Channel-INT8-w8a8 \
+  --served-model-name Qwen3-4B-Channel-INT8-w8a8 \
+  --port 10245 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.50 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The exact isolated HumanEval client command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen3-4b-int8 \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-4B-Channel-INT8-w8a8 \
+  --api-url http://127.0.0.1:10245/v1 \
+  --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-4b-channel-int8-current-tp2-kvfp8-run2-20261007 \
+  --no-timestamp
+```
+
+Both TP ranks constructed `HcuGPUModelRunnerV2`, HND resolved to physical
+LBHNC, public E4M3 used 64-token pages, and the default
+`FULL_AND_PIECEWISE` policy captured both Graph forms. Raw Accuracy and
+Pass@1 passed 16/16, replacing the earlier 15/16 observation. The report
+measured 141.82 output tok/s, 101.5 ms mean TTFT, 6.3 ms mean TPOT, and
+0.894 s mean latency. Two identical 2,425-token requests both returned
+`8 + 9 = 17`; the second added 2,368 prefix-hit tokens. All 18 chat requests
+returned HTTP 200 and the log contained no ERROR, Traceback, or RuntimeError.
+No runtime-code change is needed.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-4b-channel-int8-current-tp2-kvfp8-run2-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-4b-channel-int8-current-tp2-kvfp8-run2-20261007`
 
 ## Qwen3.5 and Qwen3.6 hybrid service command
 
