@@ -398,7 +398,47 @@ def test_sparse_mla_uses_categorized_mqa_abi_with_fp32_contiguous_weights(
     assert supplied_weights.dtype is torch.float32
     assert supplied_weights.is_contiguous()
     assert torch.equal(supplied_weights, weights.float().contiguous())
-    assert calls[0][5] is (scale if is_gfx938 else None)
+    assert calls[0][5] is None
+
+
+@pytest.mark.parametrize("is_gfx936", (False, True))
+def test_sparse_mla_lightop_preserves_fp8_scale_off_gfx938(monkeypatch, is_gfx936):
+    """Device family must not discard FP8 scales and reverse key ranking."""
+    runtime = _runtime()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
+    monkeypatch.setattr(runtime, "on_gfx93x", lambda: is_gfx936)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+
+    def lightop_reference(q, k, weights, starts, ends, scales):
+        if is_gfx936:
+            assert q.dtype == k.dtype == torch.bfloat16
+            assert scales is None
+        return runtime.fp8_mqa_logits_torch(
+            q, (k, scales), weights, starts, ends
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "lightop_attention",
+        SimpleNamespace(mqa_logits=lightop_reference),
+    )
+    q = torch.ones((1, 32, 128), dtype=torch.float8_e4m3fn)
+    k = torch.stack((
+        torch.ones(128, dtype=torch.float8_e4m3fn),
+        torch.full((128,), 2.0, dtype=torch.float8_e4m3fn),
+    ))
+    weights = torch.zeros((1, 32), dtype=torch.float32)
+    weights[0, 0] = 1
+    logits = runtime.rocm_fp8_mqa_logits(
+        q, (k, torch.tensor([4.0, 1.0])), weights,
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+    torch.testing.assert_close(logits, torch.tensor([[512.0, 256.0]]))
 
 
 def test_sparse_mla_does_not_retry_legacy_namespace(monkeypatch):

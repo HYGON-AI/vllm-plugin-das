@@ -2486,6 +2486,70 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
     )
 
 
+def test_hcu_sparse_indexer_packed_fp8_prefill_off_gfx938(monkeypatch):
+    """V4.1 byte storage must gather FP8 values and retain scaled key ranking."""
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setenv("VLLM_HCU_DSV41_LIGHTOP_PAGED_NORMAL", "1")
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda x: x)
+    chunk = SimpleNamespace(
+        total_seq_lens=2,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 2], dtype=torch.int32),
+        token_to_seq=torch.zeros(2, dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([2], dtype=torch.int32),
+        token_start=0,
+        token_end=1,
+    )
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([0], dtype=torch.int32),
+        num_kv_actual_tokens=1,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        prefill=SimpleNamespace(chunks=[chunk]),
+    )
+    monkeypatch.setattr(
+        sparse, "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer": metadata}),
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8)
+    flat = cache.reshape(1, -1)
+    values = flat[:, :64 * 128].view(torch.float8_e4m3fn).reshape(64, 128)
+    values.copy_(torch.ones((64, 128), dtype=torch.float8_e4m3fn))
+    values[1].copy_(torch.full((128,), 2.0, dtype=torch.float8_e4m3fn))
+    scales = flat[:, 64 * 128:].view(torch.float32).reshape(64)
+    scales.fill_(1)
+    scales[0] = 4
+
+    def gather(cache, keys, key_scales, *_args):
+        assert keys.dtype == torch.float8_e4m3fn
+        flat = cache.reshape(1, -1)
+        keys.copy_(flat[:, :64 * 128].view(keys.dtype).reshape(64, 128)[:2])
+        key_scales.view(torch.float32).reshape(-1).copy_(
+            flat[:, 64 * 128:].view(torch.float32).reshape(-1)[:2]
+        )
+
+    monkeypatch.setattr(sparse, "_gather_normal_indexer_k_cache", gather)
+    monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", sparse.fp8_mqa_logits_torch)
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    weights = torch.zeros((1, 32))
+    weights[0, 0] = 1
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 128)), k_cache_prefix="layer",
+        kv_cache=cache, q_fp8=torch.ones((1, 32, 128), dtype=torch.float8_e4m3fn),
+        k=None, weights=weights, quant_block_size=128, scale_fmt="e4m3",
+        topk_tokens=1, head_dim=128, max_model_len=64, total_seq_lens=2,
+        topk_indices_buffer=torch.full((1, 1), -1, dtype=torch.int32),
+        skip_k_cache_insert=True,
+    )
+    assert result.item() == 0
+
+
 def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(monkeypatch):
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 

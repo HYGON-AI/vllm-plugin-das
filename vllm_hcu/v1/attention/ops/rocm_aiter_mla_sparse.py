@@ -32,7 +32,7 @@ else:
     
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerPrefillMetadata
 import vllm_hcu.platforms.envs as henvs 
-from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.platforms.hcu import on_gfx938, on_gfx93x
 from vllm_hcu.v1.attention.ops.decode_topk import get_decode_topk_output_buffer
 
 
@@ -407,7 +407,7 @@ def _gather_normal_indexer_k_cache(
     num_blocks, block_size = kv_cache.shape[:2]
     head_dim = k_fp8.shape[-1]
     cache = kv_cache.view(num_blocks, -1)
-    values = cache[:, : block_size * head_dim].view(current_platform.fp8_dtype())
+    values = cache[:, : block_size * head_dim].view(k_fp8.dtype)
     scales = cache[:, block_size * head_dim :].view(torch.float32)
     kernel_args = (
         values,
@@ -1131,7 +1131,14 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
     elif current_platform.is_rocm():
         k_fp8, scale = kv
-        kernel_scale = scale if on_gfx938() else None
+        kernel_scale = _mqa_scale_for_k(k_fp8, scale)
+        if on_gfx93x() and not on_gfx938() and k_fp8.dtype in (
+            torch.float8_e4m3fn, torch.float8_e4m3fnuz
+        ):
+            # gfx936 LightOp prefill MQA implements the BF16 input path.
+            q = q.to(torch.bfloat16)
+            k_fp8 = (k_fp8.float() * scale.reshape(-1, 1)).to(torch.bfloat16)
+            kernel_scale = None
         return _get_lightop_attention().mqa_logits(
             q,
             k_fp8,
@@ -1454,8 +1461,11 @@ def rocm_aiter_sparse_attn_indexer_native(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
+    packed_fp8_cache = skip_k_cache_insert and kv_cache.dtype == torch.uint8
     fp8_dtype = (
-        current_platform.fp8_dtype()
+        q_fp8.dtype
+        if packed_fp8_cache
+        else current_platform.fp8_dtype()
         if not current_platform.is_rocm() or on_gfx938()
         else kv_cache.dtype if k is None else k.dtype
     )
@@ -1572,23 +1582,14 @@ def rocm_aiter_sparse_attn_indexer_native(
             k_fp8 = k_fp8_full[:chunk_max_local_seq_lens]
             k_scale = k_scale_full[:chunk_max_local_seq_lens]
             if normal_indexer_k and local_total_seq_lens > 0:
-                if on_gfx938():
-                    _gather_normal_indexer_k_cache(
-                        kv_cache,
-                        k_fp8,
-                        k_scale,
-                        chunk.block_table,
-                        chunk.cu_seq_lens,
-                        chunk.token_to_seq,
-                    )
-                else:
-                    ops.cp_gather_indexer_k_quant_cache(
-                        hipc_kv_cache,
-                        k_fp8,
-                        k_scale,
-                        chunk.block_table,
-                        chunk.cu_seq_lens,
-                    )
+                _gather_normal_indexer_k_cache(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    chunk.token_to_seq,
+                )
             elif not skip_kv_gather and local_total_seq_lens > 0:
                 if not current_platform.is_rocm() or on_gfx938():
                     # The indexer K cache is written with the 16x16 SHUFFLE
