@@ -145,7 +145,7 @@ and owned artifact directories are defined in
 | `qwen35_35b_w8a8_tp2` | TP2, FLASH_ATTN, AITER INT8 MoE, E4M3 KV, MTP3 | 16/16 | Pass |
 | `qwen36_27b_w8a8_tp2` | TP2, FLASH_ATTN, W8A8, prefix | 15/16 | Deterministic HumanEval/8 miss retained |
 | `qwen38_27b_int8_tp2` | TP2, FLASH_ATTN, INT8, MTP3, E4M3 KV, fine-grained hybrid prefix, default target/speculator Graphs | 16/16 | Pass; current MR-head rerun proved a 3,136-token fine-grained sibling hit and 95.86% MTP acceptance |
-| `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, AITER FP8 MoE, E4M3 KV, MTP3 | 16/16 | Pass; prefix hits observed |
+| `qwen38_flash_next_fp8_tp4` | TP4, hybrid BLNHC layout, channel FP8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun proved 3,200 manager-page prefix hits and 90.62% MTP acceptance |
 | `qwen38_flash_next_w4a8_tp4` | TP4, hybrid BLNHC layout, SlimQuant W4A8, public E4M3 KV, MTP3, ordered AITER lookup with Triton fallback | 16/16 | Pass; current MR-head rerun also proved 3,200 prefix-hit tokens and 88.9% MTP acceptance |
 
 The final shared-expert stream-safety change was followed by fresh live
@@ -450,6 +450,95 @@ Evidence:
 
 - `/tmp/vllm-hcu-validation/qwen38-flash-next-w4a8-current-tp4-mtp3-kvfp8.log`
 - `/tmp/vllm-hcu-evalscope/qwen38-flash-next-w4a8-current-tp4-mtp3-kvfp8-run1-20261007`
+
+### Qwen3.8 Flash-Next Channel-FP8 current-head rerun
+
+The `/models/Qwen3.8-Flash-Next-FP8-Channelwise` checkpoint was independently
+rerun at current MR head `87ef138`. The accepted server command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve /models/Qwen3.8-Flash-Next-FP8-Channelwise \
+  --served-model-name Qwen3.8-Flash-Next-FP8-Channelwise \
+  --port 10240 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-cache-mode align \
+  --gpu-memory-utilization 0.60 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The matching isolated HumanEval16 client was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen38-flash-fp8 \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3.8-Flash-Next-FP8-Channelwise \
+  --api-url http://127.0.0.1:10240/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir \
+    /tmp/vllm-hcu-evalscope/qwen38-flash-next-fp8-channelwise-current-tp4-mtp3-kvfp8-run1-20261007 \
+  --no-timestamp
+```
+
+All four ranks constructed `HcuGPUModelRunnerV2` and selected the QSA FP8
+sparse-GQA reader. Leaving `VLLM_KV_CACHE_LAYOUT` unset resolved native
+`BLNHC`, a 64-token HCU kernel page, and a 1,600-token hybrid manager page.
+Model loading used 58.35 GiB/rank. The first exact-shape target and MTP AOT
+compilations took 262.94 and 132.01 seconds; total engine initialization was
+553.99 seconds, including 394.95 seconds of compilation. Target and MTP
+prefill captured PIECEWISE/FULL Graphs, MTP decode captured FULL Graphs, and
+the service allocated 680,542 KV tokens.
+
+The ordered AITER lookup loaded the channel-shuffle table but found no
+supported FP8 solution for `E=512,N=160,K=2560,top_k=10`; the observed shape
+therefore fell back explicitly to official vLLM Triton MoE. This is fallback
+coverage, not an AITER kernel-hit claim.
+
+HumanEval raw Accuracy and Pass@1 passed 16/16. The report observed 23.74
+output tok/s, 2,914.5 ms mean TTFT, 22.8 ms mean TPOT, and 6.343 s mean
+latency. Three identical 3,521-token prompts returned `17`; the second and
+third each reused one 1,600-token manager page, adding 3,200 prefix-hit tokens
+in total. This align-only route proves whole-manager-page reuse and does not
+claim fine-grained matching. The complete request window accepted
+1,778/1,962 MTP draft tokens (90.62%). No ERROR, Traceback, VM fault, OOM, or
+dead engine occurred. Exact PGID teardown closed the port and returned the
+owned cards 0--3 to the 3 MiB idle reading; unrelated contexts appeared on
+cards 4--7 during the run and were not modified or attributed to this test.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen38-flash-next-fp8-channelwise-current-tp4-mtp3-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/qwen38-flash-next-fp8-channelwise-current-tp4-mtp3-kvfp8-run1-20261007`
 
 ### Qwen3.8 27B Channel INT8 current-head rerun
 
