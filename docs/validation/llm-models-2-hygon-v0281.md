@@ -34,6 +34,7 @@ request.
 | `DeepSeek-V4-Flash-Channel-FP8-w8a8` | TP8 | raw 15/16; normalized 16/16, twice | no DSpark metadata; MTP3; BLHNC E4M3 KV; AITER FP8 MoE; target and MTP prefill FULL plus PIECEWISE, MTP decode FULL Graphs |
 | `DeepSeek-R1-W4A8-V2_6` | TP8 | 16/16 raw and normalized, twice | FLASHMLA, LBNHC E4M3 KV, AITER W4A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 30,794/52,617 session draft tokens accepted |
 | `DeepSeek-V3.2-Channel-INT8-w8a8` | TP8 | 16/16 raw and normalized, twice | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, AITER W8A8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 3,458/4,893 session draft tokens accepted |
+| `GLM-5.3-Channel-FP8-w8a8` | TP8 | 16/16 | FLASHMLA_SPARSE, LBNHC public-E4M3-to-`fp8_ds_mla`, channel-wise FP8 dense and AITER FP8 MoE, MTP3, target/speculator FULL plus PIECEWISE Graphs; 875/963 draft tokens accepted |
 | `GLM-5.3-Flash-Channel-INT8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; FP8 KV is blocked because the installed sparse FlashMLA FP8 kernel rejects `Dqk=512` |
 | `GLM-5.3-Flash-Channel-FP8-w8a8` | TP4 | auto/BF16 KV 16/16 twice | FP8 weights; NoPE `Dqk=512`; MTP3 local argmax; target/speculator FULL plus PIECEWISE Graphs; 2,247/2,340 session draft tokens accepted |
 | `MiniMax-M2.5-Channel-INT8-w8a8` | TP4 | 16/16 twice at 3,800 output tokens | E4M3 KV; AITER W8A8 MoE; target FULL plus PIECEWISE Graphs; built-in MTP is not registered for MiniMax M2 in vLLM 0.28.1 |
@@ -872,6 +873,84 @@ Evidence:
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-metrics.txt`
 - `/tmp/vllm-hcu-validation/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8-humaneval16.log`
 - `/tmp/vllm-hcu-evalscope/deepseek-v4-pro-0813-w4a8-tp8-dspark7-kvfp8-run1-20261007`
+
+## GLM-5.3 Channel-FP8 TP8 commands
+
+The `/llm-models-2/hygon` copy is 707.90 GiB over 141 shards. Its config,
+weight-index, and filename-plus-size-list hashes match the previously
+validated `/models/GLM-5.3-Channel-FP8-w8a8` artifact. It is a separate copy,
+so the following run independently cold-started and evaluated this path:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_KV_CACHE_LAYOUT \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  vllm serve /llm-models-2/hygon/GLM-5.3-Channel-FP8-w8a8 \
+  --served-model-name GLM-5.3-Channel-FP8-w8a8 \
+  --port 10234 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --attention-backend FLASHMLA_SPARSE \
+  --reasoning-parser glm45 \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --kv-cache-dtype fp8_e4m3 \
+  --enable-prefix-caching \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"reasoning_effort":"low"}'
+```
+
+Run the client from a fresh directory and bypass the host proxy for loopback:
+
+```bash
+work_dir=/tmp/vllm-hcu-evalscope/glm53-channel-fp8-tp8-mtp3-fresh-run
+test ! -e "$work_dir"
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model GLM-5.3-Channel-FP8-w8a8 \
+  --api-url http://127.0.0.1:10234/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"low"}}}' \
+  --stream \
+  --eval-batch-size 8 \
+  --timeout 7200 \
+  --limit 16 \
+  --datasets humaneval \
+  --dataset-args '{"humaneval":{}}' \
+  --work-dir "$work_dir" \
+  --no-timestamp
+```
+
+All eight ranks constructed `HcuGPUModelRunnerV2`. Public `fp8_e4m3`
+resolved to `fp8_ds_mla` with LBNHC storage. Dense layers selected
+`ChannelWiseTorchFP8ScaledMMLinearKernel`; AITER selected FP8 MoE and loaded
+the gfx938 `fp8_w8a8/E=256,N=256` ordinary and bottom-layer configurations
+plus the channel-shuffle table. The target and MTP prefill captured FULL and
+PIECEWISE Graphs, while MTP decode captured FULL Graphs. Model loading used
+94.38 GiB/rank, and the service allocated 728,768 KV tokens.
+
+The fresh HumanEval16 run passed raw Accuracy and Pass@1 at 16/16. All 16
+requests finished with `stop`; none reached the length limit or errored. It
+observed 14.86 output tok/s, 2,273.8 ms mean TTFT, and 37.0 ms mean TPOT.
+MTP accepted 875/963 drafted tokens (90.9%). The server log contained no
+ERROR or Traceback, and teardown returned all eight cards to 2 MiB.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/llm-models-2-glm53-channel-fp8-tp8-mtp3-kvfp8.log`
+- `/tmp/vllm-hcu-evalscope/llm-models-2-glm53-channel-fp8-tp8-mtp3-kvfp8-run1-20261007`
 
 ## GLM-5.3 Flash Channel-INT8 TP4 commands
 
