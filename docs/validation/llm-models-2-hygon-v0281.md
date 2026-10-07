@@ -23,7 +23,7 @@ request.
 | `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | E4M3 KV 14/16 twice, then 15/16; auto/BF16 KV 15/16, then 14/16 | E4M3 retained: no BF16 accuracy gain, 200.42 output tok/s, and twice the KV-token capacity |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
-| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 at 7,800 output tokens | `qwen3` reasoning parser; both normally stopped answers passed and 14 answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
+| `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 twice at 7,800 output tokens | Current-head repeat: both normally stopped answers passed, 14 answers exhausted the 8K context, and repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-4B-Thinking-Channel-FP8` | TP2 | 6/16 at 7,800 output tokens | `qwen3` reasoning parser; all six normally stopped answers passed and ten answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
 | `Qwen3-VL-8B-Thinking-Channel-FP8` | TP2 | 9/16 at 2,048; 11/16 at 3,800; 15/16 at 7,800 output tokens | `qwen3` reasoning parser; every normally stopped answer passed; the final miss was a checkpoint reasoning loop on HumanEval/1; duplicate long prompt reused 960 tokens |
 | `Qwen3-VL-235B-A22B-Instruct-Channel-FP8` | TP4 | 16/16 twice | AITER channel-FP8 MoE with no logged provider fallback; 18.60 and 25.05 output tok/s; repeated batch reused 1,600 prefix tokens |
@@ -905,7 +905,8 @@ env -u VLLM_PLUGINS \
   --max-num-batched-tokens 1024 \
   --max-num-seqs 8 \
   --generation-config vllm \
-  --reasoning-parser qwen3
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":true}'
 ```
 
 Use `max_tokens=7800` in the HumanEval client for that 8K Thinking profile.
@@ -920,7 +921,19 @@ reasoning; all six normally stopped samples passed. Treat its 6/16 as a
 checkpoint generation-budget limitation, not an accepted precision score.
 The 2B Thinking checkpoint was more extreme: only two answers stopped within
 7,800 tokens and both passed, while the other 14 exhausted the context. Its
-raw 2/16 score has the same budget-bound classification.
+raw 2/16 score has the same budget-bound classification. A current-head repeat
+at commit `d46231d` reproduced that exact 2/16 split with thinking enabled at
+both the server and request boundaries: HumanEval/3 and /4 stopped at 1,752
+and 1,190 tokens and passed, while all other samples generated exactly 7,800
+tokens. The report measured 187.52 output tok/s, 86.5 ms mean TTFT, 5.3 ms
+mean TPOT, and 37.376 s mean latency. Two 2,423-token probes stopped normally
+with final output `17`; the second added 2,368 prefix-hit tokens. The service
+had no runtime error, so no code change is needed.
+
+Current-head 2B Thinking evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-vl-2b-thinking-current-tp2-kvfp8-run2-retry-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-thinking-current-tp2-kvfp8-run2-max7800-20261007`
 
 The 235B-A22B Instruct MoE route used four cards and AITER:
 
