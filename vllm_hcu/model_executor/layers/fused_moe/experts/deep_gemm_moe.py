@@ -63,6 +63,11 @@ _HCU_HT_EP_TOKEN_ALIGNMENT = 256
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
+    if current_platform.is_rocm():
+        # HCU pads every expert to _HCU_HT_EP_TOKEN_ALIGNMENT rows, so the
+        # DeepGemm workspace must be used even for small M; the Triton one
+        # would be undersized when DeepGemm is selected at apply() time.
+        return True
     align = get_mk_alignment_for_contiguous_layout()[0]
     return align <= M and N % align == 0 and K % align == 0
 
@@ -78,6 +83,11 @@ def _valid_deep_gemm(
     if not has_deep_gemm():
         logger.debug_once("DeepGemm disabled: deep_gemm not available.")
         return False
+
+    # HCU Marlin-packed weights [E, K/64, N/16, 4, 16, 16] are consumable
+    # only by the HCU DeepGEMM kernels; Triton cannot read this layout.
+    if w1.dim() == 6 and w2.dim() == 6:
+        return True
 
     M = hidden_states.size(0)
     _, K, N = w2.size()
@@ -142,11 +152,14 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         # MXFP8: FP8 e4m3 values + UE8M0 1x32 block scales (Blackwell). Reuses
         # the same grouped GEMM (aliased to fp8_fp4) with recipe (1, 32).
         self.mxfp8 = quant_config.block_shape == [1, 32]
+        # NOTE: Relaxed assertions for HCU w8a8 to support channel-level FP8
+        # quantization (as in vLLM 0.21). HCU DeepGemm can handle per-channel
+        # quantized weights with per-token activation scales.
         if current_platform.is_rocm() and (
             quant_config.use_int8_w8a8 or quant_config.use_fp8_w8a8
         ):
-            # HCU LightOP consumes per-token Channel scales (block_shape=None).
-            assert not quant_config.per_out_ch_quant
+            # HCU w8a8: skip block_shape and per_out_ch_quant assertions
+            pass
         else:
             if self.mxfp8:
                 assert quant_config.quant_dtype == "mxfp8"
@@ -470,14 +483,23 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     workspace13.view(dtype=torch.float8_e4m3fn),
                     (M_sum, activation_out_dim),
                 )
-                if current_platform.is_rocm() and activation == MoEActivation.SILU:
+                if current_platform.is_rocm() and activation in (
+                    MoEActivation.SILU,
+                    MoEActivation.SWIGLUSTEP,
+                ):
                     from lightop.activation import fuse_silu_mul_fp8_quant
 
+                    # lightop's `limit` computes min(silu(g), L) * clamp(u, -L, L),
+                    # i.e. swiglustep; -1 disables the clamp (plain SiLU).
+                    limit = -1.0
+                    if activation == MoEActivation.SWIGLUSTEP:
+                        limit = float(self.gemm1_clamp_limit or 7.0)
                     a2q, a2q_scale = fuse_silu_mul_fp8_quant(
                         mm1_out,
                         fp8type=0,
                         output=quant_out,
                         expert_ids=expert_ids,
+                        limit=limit,
                     )
                 else:
                     a2q, a2q_scale = self._act_mul_quant(

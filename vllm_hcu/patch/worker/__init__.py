@@ -282,6 +282,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
     _CallbackSpec(_adapter("op_opt", "patch_deep_gemm")),
+    _CallbackSpec(_adapter("op_opt", "patch_deep_gemm_transform")),
     _CallbackSpec(_adapter("op_opt", "patch_scaled_mm_linear_kernel")),
     _CallbackSpec(_adapter("op_opt", "patch_input_quant_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_w8a8_utils")),
@@ -412,6 +413,11 @@ _ALL_CALLBACK_GROUPS: tuple[tuple[_CallbackSpec, ...], ...] = (
 # must not fail merely because a Qwen-VL/GPT-OSS/Mamba module was never
 # imported.  These entries, in contrast, are required whenever their recorded
 # feature state is true.
+#
+# ``worker.framework_opt.spec_decode.hcu_proposer`` is deliberately absent: it
+# targets the Model Runner V1 ``vllm.v1.spec_decode.llm_base_proposer``, which
+# the MRV2-only worker never imports, so it legitimately stays armed.  The MRV2
+# multi-layer MTP terminal is ``eagle_topk_buffer`` (``load_eagle_model``).
 _REQUIRED_TERMINAL_IDS = frozenset(
     {
         "worker.op_opt.moe.oracle.fp8_dpsk",
@@ -424,7 +430,6 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.framework_opt.communicator.base_custom_sp",
         "worker.framework_opt.communicator.pynccl_wrapper_all_to_all",
         "worker.framework_opt.communicator.pynccl_all_to_all",
-        "worker.framework_opt.spec_decode.hcu_proposer",
         "worker.framework_opt.spec_decode.eagle_topk_buffer",
         "worker.framework_opt.communicator.deep_ep_runtime",
     }

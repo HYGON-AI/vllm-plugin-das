@@ -265,6 +265,31 @@ def apply_to_module(module: ModuleType) -> bool:
         if fp8_backend in (hcu_enum.DEEPGEMM, hcu_enum.BATCHED_DEEPGEMM) and getattr(
             layer, "weight_block_size", None
         ) is None:
+            # Channel-FP8 on HCU DeepGemmExperts: the deepgemm FP8 grouped
+            # kernels consume the Marlin 6D layout [E, K/64, N/16, 4, 16, 16],
+            # mirroring hcu_convert_to_int8_moe_kernel_format.
+            if w13.dim() == 6 and w2.dim() == 6:
+                return w13, w2, w13_scale, w2_scale
+            import torch
+            from deepgemm import (
+                marlin_fp8_contiguous_weight,
+                marlin_fp8_masked_weight,
+            )
+
+            pack_weight = (
+                marlin_fp8_masked_weight
+                if fp8_backend == hcu_enum.BATCHED_DEEPGEMM
+                else marlin_fp8_contiguous_weight
+            )
+            with torch.no_grad():
+                w13 = pack_weight(w13).detach()
+                w2 = pack_weight(w2).detach()
+            # The kernels index channel scales as [E, N]; the trailing unit
+            # dim from CompressedTensors' [E, N, 1] layout corrupts output.
+            if w13_scale.ndim == 3 and w13_scale.size(-1) == 1:
+                w13_scale = w13_scale.squeeze(-1).contiguous()
+            if w2_scale.ndim == 3 and w2_scale.size(-1) == 1:
+                w2_scale = w2_scale.squeeze(-1).contiguous()
             return w13, w2, w13_scale, w2_scale
         return convert(
             fp8_backend,
