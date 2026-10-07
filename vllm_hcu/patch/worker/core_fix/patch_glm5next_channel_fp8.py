@@ -32,6 +32,8 @@ _INDEXER_PATCH_MARKER = "_vllm_hcu_glm5next_indexer_nn_layout_applied"
 _INDEXER_WRAPPER_MARKER = "_vllm_hcu_glm5next_indexer_nn_layout_wrapper"
 _KPOOL_PATCH_MARKER = "_vllm_hcu_sparse_indexer_kpool_triton_applied"
 _KPOOL_WRAPPER_MARKER = "_vllm_hcu_sparse_indexer_kpool_triton_wrapper"
+_KPOOL_ORDER_PATCH_MARKER = "_vllm_hcu_glm5next_kpool_index_order_applied"
+_KPOOL_ORDER_WRAPPER_MARKER = "_vllm_hcu_glm5next_kpool_index_order_wrapper"
 _INDEXER_CACHE_PATCH_MARKER = "_vllm_hcu_glm5next_indexer_cache_applied"
 _INDEXER_CACHE_WRAPPER_MARKER = "_vllm_hcu_glm5next_indexer_cache_wrapper"
 _QUANT_IGNORE_PATCH_MARKER = "_vllm_hcu_glm5next_quant_ignore_applied"
@@ -651,6 +653,129 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
     return True
 
 
+def _canonicalize_kpool_indices(indices: torch.Tensor, num_rows: int) -> None:
+    # Selected token sets can be identical while their order changes between
+    # launches, changing low-precision sparse MLA reductions. Preserve the
+    # selection and shared output buffer; put -1 padding after valid tokens.
+    active = indices[:num_rows]
+    sentinel = torch.iinfo(indices.dtype).max
+    ordered = torch.sort(torch.where(active >= 0, active, sentinel), dim=-1).values
+    active.copy_(torch.where(ordered == sentinel, -1, ordered))
+
+
+def _patch_kpool_index_order(kpool: ModuleType) -> bool:
+    from vllm_hcu.platforms.hcu import on_gfx938
+
+    if not on_gfx938() or os.getenv("VLLM_HCU_USE_CUSTOM_OPS", "1") != "1":
+        return False
+    original = require_callable(
+        kpool, "sparse_attn_indexer_kpool", f"{KPOOL_MODULE}.sparse_attn_indexer_kpool"
+    )
+    if getattr(kpool, _KPOOL_ORDER_PATCH_MARKER, False):
+        if not getattr(original, _KPOOL_ORDER_WRAPPER_MARKER, False):
+            raise PatchCompatibilityError("GLM5Next kpool index-order marker is stale")
+        return False
+    require_exact_signature(
+        original,
+        f"{KPOOL_MODULE}.sparse_attn_indexer_kpool",
+        positional=(
+            "hidden_states",
+            "k_cache_prefix",
+            "kv_cache",
+            "q_quant",
+            "q_scale",
+            "k",
+            "weights",
+            "quant_block_size",
+            "scale_fmt",
+            "topk_tokens",
+            "head_dim",
+            "max_model_len",
+            "total_seq_lens",
+            "topk_indices_buffer",
+            "skip_k_cache_insert",
+            "use_fp4_cache",
+            "gate_score",
+            "compress_ape",
+            "index_kpool",
+            "positions",
+            "tail_kv_cache",
+            "tail_prefix",
+        ),
+        defaults={
+            "use_fp4_cache": False,
+            "gate_score": None,
+            "compress_ape": None,
+            "index_kpool": 1,
+            "positions": None,
+            "tail_kv_cache": None,
+            "tail_prefix": None,
+        },
+    )
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+    # Keep normalization inside the indexer's existing capture boundary:
+    # PIECEWISE executes it with selection, and FULL records both GPU operations.
+    @eager_break_during_capture
+    @functools.wraps(original)
+    def hcu_sparse_attn_indexer_kpool(
+        hidden_states,
+        k_cache_prefix,
+        kv_cache,
+        q_quant,
+        q_scale,
+        k,
+        weights,
+        quant_block_size,
+        scale_fmt,
+        topk_tokens,
+        head_dim,
+        max_model_len,
+        total_seq_lens,
+        topk_indices_buffer,
+        skip_k_cache_insert,
+        use_fp4_cache=False,
+        gate_score=None,
+        compress_ape=None,
+        index_kpool=1,
+        positions=None,
+        tail_kv_cache=None,
+        tail_prefix=None,
+    ):
+        result = original(
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            q_quant,
+            q_scale,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+            skip_k_cache_insert,
+            use_fp4_cache,
+            gate_score,
+            compress_ape,
+            index_kpool,
+            positions,
+            tail_kv_cache,
+            tail_prefix,
+        )
+        if index_kpool > 1:
+            _canonicalize_kpool_indices(result, hidden_states.shape[0])
+        return result
+
+    setattr(hcu_sparse_attn_indexer_kpool, _KPOOL_ORDER_WRAPPER_MARKER, True)
+    kpool.sparse_attn_indexer_kpool = hcu_sparse_attn_indexer_kpool
+    setattr(kpool, _KPOOL_ORDER_PATCH_MARKER, True)
+    return True
+
+
 def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
     from vllm_hcu.v1.attention.ops.lightop_kpool_topk_transform import (
         install_lightop_kpool_topk_transform,
@@ -852,6 +977,7 @@ def apply_to_module(module: ModuleType) -> bool:
     kpool = sys.modules.get(KPOOL_MODULE)
     if isinstance(kpool, ModuleType):
         changed = _patch_sparse_indexer_kpool(kpool)
+        changed = _patch_kpool_index_order(kpool) or changed
     attention = sys.modules.get(ATTENTION_MODULE)
     if isinstance(attention, ModuleType):
         changed = _patch_glm5next_indexer_cache(attention) or changed
