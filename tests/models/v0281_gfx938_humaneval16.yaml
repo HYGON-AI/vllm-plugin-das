@@ -339,13 +339,12 @@ profiles:
     server:
       port: 10207
       served_model_name: Qwen2-57B-A14B-Instruct
-      environment: *flash_environment
-      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm]
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --enable-prefix-caching, --kv-cache-dtype, fp8_e4m3, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm]
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen2-57b-tp2
-      pass_criteria:
-        # HumanEval/10 is a deterministic cross-provider model miss.
-        enforce_score: false
 
   qwen3_30b_int8_tp2:
     model: /models/Qwen3-30B-A3B-Channel-INT8-w8a8

@@ -232,7 +232,6 @@ def test_gfx938_profile_contract(
     diagnostic_profiles = {
         "deepseek_r1_0528_channel_int8_kvfp8_tp8",
         "deepseek_v4_flash_tp8",
-        "qwen2_57b_tp2",
         "qwen3_30b_int8_tp2",
     }
     assert bool(
@@ -475,6 +474,15 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
     )
     assert "--generation-config" not in minimax_command
     assert "--speculative-config" not in minimax_command
+
+    qwen2 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen2_57b_tp2"
+    )
+    qwen2_command, _, _ = server_command(qwen2, model_env=MODEL_ENV)
+    assert qwen2["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(qwen2_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(qwen2_command, "--moe-backend") == "aiter"
+    assert "--speculative-config" not in qwen2_command
 
     qwen36 = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="qwen36_27b_w8a8_tp2"
