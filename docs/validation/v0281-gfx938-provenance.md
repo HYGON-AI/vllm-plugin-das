@@ -141,7 +141,7 @@ and owned artifact directories are defined in
 | `qwen2_57b_tp2` | TP2, FLASH_ATTN, HND/LBHNC kernel view, AITER W16A16 MoE, E4M3 KV, prefix, default Graph | 16/16 | Pass; current-head rerun loaded the gfx938 AITER stage1/stage2 modules and reused 2,496 prefix tokens |
 | `qwen3_30b_int8_tp2` | TP2, FLASH_ATTN, HND/LBHNC kernel view, E4M3 KV, default LightOp dense W8A8, AITER INT8 MoE, prefix, default Graph | 5/16 | Current-head controls: BF16 TP2 and TP1 6/16; official Triton dense and Triton MoE 4/16; repeated 2,433-token request hit 2,432 tokens, so service features pass but accuracy is not accepted |
 | `qwen3_8b_tp2` | TP2, FLASH_ATTN, native FP8 E4M3 KV, prefix | 16/16 | Pass; BF16 control also 16/16 |
-| `qwen35_35b_tp2` | TP2, FLASH_ATTN, AITER BF16 MoE, MTP3, prefix | 16/16 | Pass |
+| `qwen35_35b_tp2` | TP2, FLASH_ATTN, AITER BF16 MoE, E4M3 KV, MTP3, fine-grained hybrid prefix, default target/speculator Graphs | 16/16 | Pass; current-head rerun proved a 2,112-token fine-grained sibling hit and 93.43% HumanEval MTP acceptance |
 | `qwen35_35b_w8a8_tp2` | TP2, FLASH_ATTN, AITER INT8 MoE, E4M3 KV, MTP3, fine-grained hybrid prefix, default target/speculator Graphs | 16/16 | Pass; current-head rerun proved a 2,112-token fine-grained sibling hit and 92.19% HumanEval MTP acceptance |
 | `qwen36_27b_w8a8_tp2` | TP2, FLASH_ATTN, W8A8, MTP3, E4M3 KV, fine-grained hybrid prefix, default target/speculator Graphs | 16/16 | Pass; current-head rerun proved a 3,136-token fine-grained sibling hit and 94.39% MTP acceptance |
 | `qwen38_27b_int8_tp2` | TP2, FLASH_ATTN, INT8, MTP3, E4M3 KV, fine-grained hybrid prefix, default target/speculator Graphs | 16/16 | Pass; current MR-head rerun proved a 3,136-token fine-grained sibling hit and 95.86% MTP acceptance |
@@ -1071,6 +1071,96 @@ Evidence:
 
 - `/tmp/vllm-hcu-validation/qwen35-35b-w8a8-current-tp2-mtp3-kvfp8-fine.log`
 - `/tmp/vllm-hcu-evalscope/qwen35-35b-w8a8-current-tp2-mtp3-kvfp8-fine-run1-20261007`
+
+### Qwen3.5 35B A3B BF16 current-head E4M3 fine-prefix rerun
+
+The `/models/Qwen3.5-35B-A3B` checkpoint was rerun at plugin commit `e3fcf0c`.
+The accepted service command was:
+
+```bash
+env -u VLLM_PLUGINS -u VLLM_USE_BREAKABLE_CUDAGRAPH \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
+  VLLM_KV_CACHE_LAYOUT=HND \
+  VLLM_CACHE_ROOT=/tmp/vllm-cache-qwen35-35b-current \
+  HIP_VISIBLE_DEVICES=0,1 \
+  vllm serve /models/Qwen3.5-35B-A3B \
+  --served-model-name Qwen3.5-35B-A3B \
+  --port 10249 \
+  --trust-remote-code \
+  --language-model-only \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --moe-backend aiter \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-cache-mode align \
+  --prefix-match-unit 64 \
+  --enable-mamba-fine-grained-prefix-cache \
+  --gpu-memory-utilization 0.55 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 8 \
+  --generation-config vllm \
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+```
+
+The matching isolated HumanEval16 client command was:
+
+```bash
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  -u GH_TOKEN -u GITHUB_TOKEN -u OPENAI_API_KEY \
+  HOME=/tmp/vllm-hcu-eval-home-qwen35-35b \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3.5-35B-A3B \
+  --api-url http://127.0.0.1:10249/v1 \
+  --eval-type openai_api \
+  --generation-config \
+    '{"temperature":0,"do_sample":false,"max_tokens":2048,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}' \
+  --stream \
+  --eval-batch-size 8 \
+  --timeout 7200 \
+  --limit 16 \
+  --datasets humaneval \
+  --dataset-args '{"humaneval":{}}' \
+  --work-dir \
+    /tmp/vllm-hcu-evalscope/qwen35-35b-current-tp2-mtp3-kvfp8-fine-run1-20261007 \
+  --no-timestamp
+```
+
+Both ranks constructed `HcuGPUModelRunnerV2`. AITER selected
+`AiterExperts`, loaded its tuned ASM shuffle table, and successfully loaded
+gfx938 BF16 W16A16 stage1/stage2 HSA modules. Public E4M3 KV resolved to
+physical LBHNC with a 64-token kernel block and a 2,176-token hybrid manager
+page. Target and MTP prefill captured PIECEWISE and FULL Graphs, MTP decode
+captured FULL Graphs, and the service allocated 916,540 KV tokens.
+
+Raw HumanEval Accuracy and Pass@1 passed 16/16. The report observed 88.52
+output tok/s, 386.4 ms mean TTFT, 7.9 ms mean TPOT, and 1.12 s mean latency.
+The HumanEval window accepted 1,166/1,248 MTP draft tokens (93.43%).
+
+The three 3,651-token owner/junction/sibling prompts had an actual 2,291-token
+common prefix and all returned `17`. Their prefix-hit deltas were 0, 0, and
+2,112 tokens; the sibling hit is 33 times 64 and is not divisible by the
+2,176-token manager page, proving fine-grained junction reuse. All 19 chat
+requests returned HTTP 200. Complete-session MTP counters were 1,175/1,257
+(93.48%), and the log contained no ERROR, Traceback, VM fault, or dead engine.
+Ctrl-C teardown returned all cards to the 2 MiB idle baseline.
+
+Evidence:
+
+- `/tmp/vllm-hcu-validation/qwen35-35b-current-tp2-mtp3-kvfp8-fine.log`
+- `/tmp/vllm-hcu-evalscope/qwen35-35b-current-tp2-mtp3-kvfp8-fine-run1-20261007`
 
 Additional checkpoints under `/llm-models-2/hygon` were then exercised with
 the same pinned runtime. The detailed score matrix, exact server/client

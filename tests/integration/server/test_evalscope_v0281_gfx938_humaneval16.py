@@ -492,6 +492,16 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
     assert _option_value(qwen3_command, "--kv-cache-dtype") == "fp8_e4m3"
     assert "--speculative-config" not in qwen3_command
 
+    qwen35 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen35_35b_tp2"
+    )
+    qwen35_command, _, _ = server_command(qwen35, model_env=MODEL_ENV)
+    assert qwen35["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(qwen35_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(qwen35_command, "--mamba-cache-mode") == "align"
+    assert _option_value(qwen35_command, "--prefix-match-unit") == "64"
+    assert "--enable-mamba-fine-grained-prefix-cache" in qwen35_command
+
     qwen35_w8a8 = load_profiled_config(
         DEFAULT_CONFIG, CONFIG_ENV, profile="qwen35_35b_w8a8_tp2"
     )

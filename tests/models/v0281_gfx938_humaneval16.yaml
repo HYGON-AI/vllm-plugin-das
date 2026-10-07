@@ -385,8 +385,10 @@ profiles:
     server:
       port: 10210
       served_model_name: Qwen3.5-35B-A3B
-      environment: *flash_environment
-      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --enable-prefix-caching, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+      environment:
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --mamba-cache-mode, align, --prefix-match-unit, "64", --enable-mamba-fine-grained-prefix-cache, --max-model-len, "4096", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
     evalscope:
       work_dir: /tmp/vllm-hcu-evalscope/v0281-gfx938-qwen35-35b-tp2
       generation_config: *no_thinking_generation
