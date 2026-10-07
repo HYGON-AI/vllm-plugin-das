@@ -51,7 +51,7 @@ request.
 | `Qwen3.5-397B-A17B-Channel-FP8-w8a8` | TP8 | 13/16 raw; 16/16 normalized, twice | Correct bare function bodies were undercounted by raw EvalScope; AITER channel-FP8 MoE; final MTP acceptance 2,643/2,760 (95.8%); 1,088-token manager page and third-request fine-grained hit 2,624 tokens |
 | `Qwen3.6-35B-A3B-Channel-FP8-w8a8` | TP4 resource-control run | 16/16 | MTP acceptance 1,861/1,959 (95.0%); third-request fine-grained hit 2,112 tokens |
 | `Qwen3.6-35B-A3B-Channel-INT8-w8a8` | TP2 and current-head TP4 | 16/16 | TP4 at `5717e40`: E4M3 KV, tuned AITER INT8 MoE, target/speculator FULL plus PIECEWISE Graphs, 1,088-token manager page, 2,112-token fine-grained sibling hit, and 1,830/1,926 complete-session MTP acceptance |
-| `Qwen3.8-27B-Channel-FP8` | TP2 | 16/16 | 61.10 output tok/s; MTP acceptance 1,717/1,785 (96.2%); 6,016-token probe reused 4,736 tokens on the consumer request with correct output |
+| `Qwen3.8-27B-Channel-FP8` | TP2 and current-head TP4 | 16/16 | TP4 at `1f1c517`: 80.25 output tok/s; 1,600-token manager page; fine-grained sibling hit 1,536 tokens; complete-session MTP acceptance 1,732/1,794 (96.54%) |
 | `Qwen3.8-Flash-Next-Channel-FP8` | TP4 | 16/16 | BLNHC hybrid cache; 25.69 output tok/s; MTP acceptance 1,771/1,974 (89.7%); align-only probe reused 3,200 tokens |
 
 The TP4 resource-control runs were used only while unrelated stale KFD
