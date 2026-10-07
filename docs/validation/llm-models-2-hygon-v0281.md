@@ -20,7 +20,7 @@ request.
 | `Qwen3-8B-Channel-INT8-w8a8` | TP2 | 16/16 | E4M3 KV |
 | `Qwen3-14B-Channel-INT8-w8a8` | TP2 | 15/16 twice | Current-head repeat reproduced the same checkpoint-level HumanEval/10 logic error; E4M3 KV and prefix reuse passed |
 | `Qwen3-4B-Thinking-2507-Channel-FP8` | TP2 | diagnostic only | The checkpoint template always emits a thinking segment; disabling thinking is not a valid accuracy contract |
-| `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | 14/16 twice | 188.04 and 198.51 output tok/s; repeated batch reused 1,600 prefix tokens |
+| `Qwen3-VL-2B-Instruct-Channel-FP8` | TP2 | E4M3 KV 14/16 twice, then 15/16; auto/BF16 KV 15/16, then 14/16 | E4M3 retained: no BF16 accuracy gain, 200.42 output tok/s, and twice the KV-token capacity |
 | `Qwen3-VL-4B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 131.4 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-8B-Instruct-Channel-FP8` | TP2 | 15/16 three times | Current-head repeat again missed only HumanEval/1; 116.02 output tok/s; repeated prompt reused 2,368 tokens |
 | `Qwen3-VL-2B-Thinking-Channel-FP8` | TP2 | 2/16 at 7,800 output tokens | `qwen3` reasoning parser; both normally stopped answers passed and 14 answers exhausted the 8K context; duplicate long prompt reused 832 tokens |
@@ -695,6 +695,61 @@ Current-head evidence:
 
 - `/tmp/vllm-hcu-validation/qwen3-vl-8b-instruct-current-tp2-kvfp8-run3-20261007.log`
 - `/tmp/vllm-hcu-evalscope/qwen3-vl-8b-instruct-current-tp2-kvfp8-run3-20261007`
+
+The 2B Instruct checkpoint was repeated at current PR commit `b05e98c` with
+`SIZE=2B`, port `10248`, and the same service template. The exact isolated
+client command was:
+
+```bash
+env -i \
+  HOME=/tmp/vllm-hcu-eval-home \
+  PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= \
+  http_proxy= https_proxy= all_proxy= \
+  VLLM_HCU_EVALSCOPE_API_KEY=EMPTY \
+  VLLM_HCU_HUMANEVAL_ISOLATED=1 \
+  PYTHONPATH=/models/.worktrees/vllm-plugin-das-v0281-gfx938-validation \
+  python -m tests.integration.server.evalscope_secure_cli eval \
+  --model Qwen3-VL-2B-Instruct-Channel-FP8 \
+  --api-url http://127.0.0.1:10248/v1 \
+  --eval-type openai_api \
+  --generation-config '{"temperature":0,"do_sample":false,"max_tokens":2048}' \
+  --stream --eval-batch-size 8 --timeout 7200 --limit 16 \
+  --datasets humaneval --dataset-args '{"humaneval":{}}' \
+  --work-dir /tmp/vllm-hcu-evalscope/qwen3-vl-2b-instruct-current-tp2-kvfp8-run3-20261007 \
+  --no-timestamp
+```
+
+The current E4M3 run passed 15/16 (93.8%) at 200.42 output tok/s, 78.8 ms
+mean TTFT, 4.6 ms mean TPOT, and 1.251 s mean latency. HumanEval/10 produced
+an incorrect implementation and repeated until its 2,048-token limit. Raising
+only the client limit to 3,800 did not repair it: the score fell to 14/16 and
+two answers repeated until the new limit. This is not evidence that a larger
+output budget fixes the checkpoint.
+
+To test whether KV quantization caused the miss, the service was cold-started
+again with the exact command above except that
+`--kv-cache-dtype fp8_e4m3` became `--kv-cache-dtype auto`. This changes only
+the KV cache to BF16; the checkpoint weights remain Channel-FP8. The two fresh
+auto-KV HumanEval runs scored 15/16 and 14/16, so BF16 KV did not improve
+accuracy. Both auto-KV runs still missed HumanEval/10, and the second also
+missed HumanEval/1. The first auto run measured 187.34 output tok/s, while the
+second measured 196.36 output tok/s. At identical 46.6 GiB cache memory, E4M3
+allocated 1,747,840 KV tokens versus 872,576 for auto/BF16. Retain public
+`--kv-cache-dtype fp8_e4m3`; there is no evidence-backed reason to disable it
+for this checkpoint. No runtime-code change is needed.
+
+Current-head evidence:
+
+- `/tmp/vllm-hcu-validation/qwen3-vl-2b-instruct-current-tp2-kvfp8-run3-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-instruct-current-tp2-kvfp8-run3-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-instruct-current-tp2-kvfp8-run4-max3800-20261007`
+- `/tmp/vllm-hcu-validation/qwen3-vl-2b-instruct-current-tp2-kvauto-run1-20261007.log`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-instruct-current-tp2-kvauto-run1-20261007`
+- `/tmp/vllm-hcu-evalscope/qwen3-vl-2b-instruct-current-tp2-kvauto-run2-20261007`
 
 The Thinking checkpoint must expose reasoning separately and needs a realistic
 reasoning budget. The final 8B gate used:
