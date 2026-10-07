@@ -129,8 +129,12 @@ def test_platform_and_master_guards_are_independent(monkeypatch, master, gfx938)
     assert torch.equal(result, source)
 
 
-def test_master_defaults_to_enabled_without_child_environment(enabled, monkeypatch):
-    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS")
+@pytest.mark.parametrize("master", [None, "1", "true", "True"])
+def test_master_enabled_spellings_activate_ordering(enabled, monkeypatch, master):
+    if master is None:
+        monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS")
+    else:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
     source = torch.tensor([[3, -1, 1]], dtype=torch.int32)
     module = _boundary(source)
     patch._patch_kpool_index_order(module)

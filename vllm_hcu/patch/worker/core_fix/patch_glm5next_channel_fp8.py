@@ -664,9 +664,10 @@ def _canonicalize_kpool_indices(indices: torch.Tensor, num_rows: int) -> None:
 
 
 def _patch_kpool_index_order(kpool: ModuleType) -> bool:
+    from vllm_hcu.platforms import envs as henvs
     from vllm_hcu.platforms.hcu import on_gfx938
 
-    if not on_gfx938() or os.getenv("VLLM_HCU_USE_CUSTOM_OPS", "1") != "1":
+    if not on_gfx938() or not henvs.optional_custom_op_enabled():
         return False
     original = require_callable(
         kpool, "sparse_attn_indexer_kpool", f"{KPOOL_MODULE}.sparse_attn_indexer_kpool"
