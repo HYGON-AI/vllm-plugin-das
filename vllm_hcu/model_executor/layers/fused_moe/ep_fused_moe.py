@@ -1,0 +1,274 @@
+"""EP-aware replacement for boltops fused_experts_impl (fp8 W8A8 per-channel, expert_map set).
+
+With an expert_map, boltops fused_experts_impl does work proportional to *all* M*topk routes
+although only ~1/EP of them are local:
+  - torch.zeros of cache13 (M*topk*4096) and intermediate_cache2 (M*topk*1536), plus fill_(0)
+  - activation and per-token quant over all M*topk rows (fused act+quant is disabled for EP)
+  - moe_sum reading all M*topk*4096 values
+At M=16384 that is ~4.5 ms of a 7.6 ms MoE call.
+
+This path always uses the expert-sorted bridge layout (GEMM1 c_sorted, GEMM2 a_sorted), so
+local routes are contiguous in [0, num_tokens_post_padded). Then:
+  - fused swiglustep + fp8 per-token quant runs only on rows < num_tokens_post_padded (read on
+    device: CUDA-graph safe), folding the router weight into the per-row scale
+  - GEMM2 writes route rows (t*topk+k) of an uninitialised buffer
+  - a masked moe_sum reads only routes whose expert is local
+  - nothing is zero-filled
+Padding rows in the sorted layout hold garbage; every kernel treats rows independently and the
+GEMMs mask padding rows on store, so garbage never reaches the output.
+"""
+import functools
+import json
+import os
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+from boltops.fused_moe.triton.moe_op import fused_moe as invoke_fused_moe_kernel
+from boltops.fused_moe.triton.moe_config_utils import try_get_optimal_moe_config
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
+from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
+
+FP8 = torch.float8_e4m3fn
+_announced = False
+
+
+@triton.jit
+def _ep_swiglu_chunk(in_ptr, offs, m2, LIMIT: tl.constexpr, D: tl.constexpr):
+    x = tl.load(in_ptr + offs, mask=m2, other=0.0)
+    up = tl.load(in_ptr + offs + D, mask=m2, other=0.0)
+    xf = x.to(tl.float32)
+    # fdiv_fast: the IEEE divide alone costs ~20% of this memory-bound kernel.
+    silu = tl.math.fdiv_fast(xf, 1.0 + tl.exp(-xf))
+    y = tl.minimum(silu, LIMIT) * tl.minimum(tl.maximum(up.to(tl.float32), -LIMIT), LIMIT)
+    return y.to(x.dtype)
+
+
+@triton.jit
+def _ep_swiglustep_quant_kernel(
+    q_ptr, scale_ptr, in_ptr, w_ptr, nvalid_ptr,
+    D: tl.constexpr, LIMIT: tl.constexpr, DTYPE_MAX: tl.constexpr,
+    BLOCK_M: tl.constexpr, CH: tl.constexpr,
+):
+    # Same math as boltops activation_quant_kernel(GATED_SWIGLU_STEP, row multiplier),
+    # but grid-strided over the device-side valid row count. D = 3*CH: a power-of-2
+    # BLOCK_D=2048 tile for D=1536 masks a quarter of the lanes and runs at ~0.6 TB/s.
+    tl.static_assert(D == 3 * CH)
+    n = tl.load(nvalid_ptr)
+    cols = tl.arange(0, CH)
+    step = tl.num_programs(0) * BLOCK_M
+    for start in range(tl.program_id(0) * BLOCK_M, n, step):
+        rows = start + tl.arange(0, BLOCK_M)
+        row_mask = rows < n
+        m2 = row_mask[:, None]
+        offs = rows[:, None].to(tl.int64) * (2 * D) + cols[None, :]
+        y0 = _ep_swiglu_chunk(in_ptr, offs, m2, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, m2, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, m2, LIMIT, D)
+        absmax = tl.maximum(tl.maximum(tl.max(tl.abs(y0), axis=-1), tl.max(tl.abs(y1), axis=-1)),
+                            tl.max(tl.abs(y2), axis=-1))
+        scale = tl.maximum(absmax.to(tl.float32), 1.0e-10) / DTYPE_MAX
+        inv = (1.0 / scale)[:, None]
+        w = tl.load(w_ptr + rows, mask=row_mask, other=0.0)
+        q_offs = rows[:, None].to(tl.int64) * D + cols[None, :]
+        tl.store(q_ptr + q_offs, (y0 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + CH, (y1 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(scale_ptr + rows, scale * w, mask=row_mask)
+
+
+@triton.jit
+def _ep_masked_moe_sum_kernel(
+    out_ptr, in_ptr, ids_ptr, emap_ptr, stride_ids,
+    N: tl.constexpr, TOPK: tl.constexpr, SCALE: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    t = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        e = tl.load(ids_ptr + t * stride_ids + k)
+        if tl.load(emap_ptr + e) >= 0:
+            acc += tl.load(in_ptr + (t.to(tl.int64) * TOPK + k) * N + offs).to(tl.float32)
+    if SCALE != 1.0:
+        acc *= SCALE
+    tl.store(out_ptr + t.to(tl.int64) * N + offs, acc.to(out_ptr.dtype.element_ty))
+
+
+@functools.lru_cache(maxsize=None)
+def _num_cus(dev):
+    return torch.cuda.get_device_properties(dev).multi_processor_count
+
+
+ACT_CFG = {"BLOCK_M": 2, "num_warps": 1, "CTAS_PER_CU": 64}
+SUM_CFG = {"BLOCK_N": 4096, "num_warps": 4}
+
+
+def ep_swiglustep_quant(cache1, sorted_weights, nvalid, rows, limit=7.0, q=None):
+    D = cache1.shape[1] // 2
+    if q is None:
+        q = torch.empty((rows, D), dtype=FP8, device=cache1.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=cache1.device)
+    bm = ACT_CFG["BLOCK_M"]
+    grid = (max(1, min(triton.cdiv(rows, bm), _num_cus(cache1.device.index) * ACT_CFG["CTAS_PER_CU"])),)
+    assert D % 3 == 0 and triton.next_power_of_2(D // 3) == D // 3
+    _ep_swiglustep_quant_kernel[grid](
+        q, scale, cache1, sorted_weights, nvalid,
+        D=D, LIMIT=float(limit), DTYPE_MAX=torch.finfo(FP8).max,
+        BLOCK_M=bm, CH=D // 3, num_warps=ACT_CFG["num_warps"], num_stages=1)
+    return q, scale
+
+
+def ep_masked_moe_sum(cache3, out, topk_ids, expert_map, scale=1.0):
+    M, topk, N = cache3.shape
+    bn = SUM_CFG["BLOCK_N"]
+    assert N % bn == 0 and topk_ids.stride(1) == 1
+    _ep_masked_moe_sum_kernel[(M, N // bn)](
+        out, cache3, topk_ids, expert_map, topk_ids.stride(0),
+        N=N, TOPK=topk, SCALE=float(scale), BLOCK_N=bn, num_warps=SUM_CFG["num_warps"])
+
+
+def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm):
+    """moe_sorting_ck with buffers bounded by the *local* expert count.
+
+    Only local experts occupy the sorted layout, so its length is at most
+    M*topk + min(M*topk, local_E)*(bm-1) rounded up to bm; the GEMM grid is sized from
+    sorted_ids.size(0), which in boltops is padded for all global experts.
+    No moe_buf: the sorting kernel would only zero it, and nothing here reads it.
+    """
+    dev = topk_ids.device
+    M, topk = topk_ids.shape
+    routes = M * topk
+    full = routes + global_E * bm - topk
+    bound = min(full, triton.cdiv(routes + min(routes, local_E) * (bm - 1), bm) * bm)
+    sorted_ids = torch.empty((full,), dtype=torch.int32, device=dev)
+    sorted_w = torch.empty((full,), dtype=torch.float32, device=dev)
+    expert_ids = torch.empty((triton.cdiv(full, bm),), dtype=torch.int32, device=dev)
+    tpe = torch.empty((global_E * 2,), dtype=torch.int32, device=dev)
+    nvalid = torch.empty((1,), dtype=torch.int32, device=dev)
+    moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_w, expert_ids, tpe, nvalid,
+                    None, global_E, bm, expert_mask)
+    return sorted_ids[:bound], sorted_w, expert_ids, nvalid, bound
+
+
+def lib_configs(w1, w2, topk, M):
+    c1 = try_get_optimal_moe_config(tuple(w1.shape), topk, "fp8_w8a8", M)
+    c2, _ = try_get_optimal_moe_config(tuple(w2.shape), topk, "fp8_w8a8", M, is_bottom=True)
+    return c1, c2
+
+
+# Tuned for this path by bench_moe/tune_ep.py + select_ep.py:
+# {"E=..,N=..,K=..,topk=..": {M: [gemm1_cfg, gemm2_cfg]}}, nearest M wins (same rule as boltops).
+# Shapes without an entry fall back to the library tables.
+EP_TABLE_PATH = os.environ.get(
+    "EP_FUSED_MOE_TABLE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ep_table.json"))
+
+
+@functools.lru_cache(maxsize=None)
+def _ep_table(key):
+    if not os.path.exists(EP_TABLE_PATH):
+        return None
+    t = json.load(open(EP_TABLE_PATH)).get(key)
+    return {int(m): (c1, c2) for m, (c1, c2) in t.items()} if t else None
+
+
+def pick_configs(w1, w2, topk, M):
+    E, N, K = w1.shape
+    t = _ep_table(f"E={E},N={N},K={K},topk={topk}")
+    if t:
+        return t[min(t, key=lambda x: abs(x - M))]
+    return lib_configs(w1, w2, topk, M)
+
+
+# Largest M per call; vLLM's MoE chunk size, so normally a single chunk.
+CHUNK = int(os.environ.get("EP_FUSED_MOE_CHUNK", "32768"))
+
+
+def _carve(ws, shape, dtype, device):
+    """`shape` of `dtype` at the start of workspace `ws` (any dtype), or fresh if it won't fit."""
+    nbytes = dtype.itemsize
+    for d in shape:
+        nbytes *= d
+    if ws is None or not ws.is_contiguous() or ws.numel() * ws.element_size() < nbytes:
+        return torch.empty(shape, dtype=dtype, device=device)
+    return ws.view(-1).view(torch.uint8)[:nbytes].view(dtype).view(shape)
+
+
+def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
+                     w1_scale, w2_scale, a1_scale=None, global_num_experts=-1,
+                     output_dtype=None, gemm1_limit=None, routed_scaling_factor=1.0,
+                     configs=None, expert_mask=None, out=None, workspace13=None,
+                     workspace2=None):
+    # out/workspace13/workspace2: caller-owned buffers (vLLM modular-kernel workspaces).
+    # cache1 then cache3 live in workspace13, act_q in workspace2.
+    out_dtype = output_dtype or (out.dtype if out is not None else hidden_states.dtype)
+    compute_type = tl.bfloat16 if out_dtype == torch.bfloat16 else (
+        tl.float16 if out_dtype == torch.float16 else tl.float32)
+    M = hidden_states.shape[0]
+    E, N, _ = w1.shape
+    K = w2.shape[1]
+    topk = topk_ids.shape[1]
+    G = global_num_experts if global_num_experts > 0 else expert_map.numel()
+    if expert_mask is None:
+        expert_mask = (expert_map >= 0).to(torch.int32)
+    cfg1, cfg2 = configs if configs is not None else pick_configs(w1, w2, topk, M)
+    bm = cfg1["BLOCK_SIZE_M"]
+    assert cfg2["BLOCK_SIZE_M"] == bm
+    use_mls = bool(cfg2.get("bottom_a_use_mls_load", False))
+    cfg2 = {k: v for k, v in cfg2.items() if k not in ("bottom_a_use_mls_load", "a_sorted")}
+
+    if hidden_states.dtype in (torch.bfloat16, torch.float16):
+        a_q, a_s = per_token_quant_triton(hidden_states, quant_dtype=FP8)
+    else:
+        a_q, a_s = hidden_states, a1_scale.view(-1, 1) if a1_scale.numel() > 1 else a1_scale
+
+    sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(
+        topk_ids, topk_weights, expert_mask, G, E, bm)
+
+    dev = hidden_states.device
+    cache1 = _carve(workspace13, (rows, N), out_dtype, dev)
+    invoke_fused_moe_kernel(a_q, w1, cache1, a_s, w1_scale, None, topk_weights, topk_ids,
+                            sorted_ids, sorted_w, expert_ids, nvalid, False, topk,
+                            compute_type=compute_type, use_fp8_w8a8=True, per_channel_quant=True,
+                            c_sorted=True, ck_sorting=True, ck_topk=topk, config=cfg1)
+    act_q, act_s = ep_swiglustep_quant(cache1, sorted_w, nvalid, rows,
+                                       7.0 if gemm1_limit is None else gemm1_limit,
+                                       q=_carve(workspace2, (rows, N // 2), FP8, dev))
+    del cache1
+    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev)
+    invoke_fused_moe_kernel(act_q, w2, cache3, act_s, w2_scale, None, topk_weights, topk_ids,
+                            sorted_ids, sorted_w, expert_ids, nvalid, False, 1,
+                            compute_type=compute_type, use_fp8_w8a8=True, per_channel_quant=True,
+                            a_sorted=True, bottom_a_use_mls_load=use_mls, ck_sorting=True,
+                            ck_topk=topk, scale_bias_with_routed_weight=True, config=cfg2)
+    if out is None:
+        out = torch.empty((M, K), dtype=out_dtype, device=dev)
+    ep_masked_moe_sum(cache3, out, topk_ids, expert_map, routed_scaling_factor)
+    return out
+
+
+def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, w1_scale, w2_scale,
+                     **kw):
+    global _announced
+    if not _announced:
+        _announced = True
+        print(f"[ep_fused_moe] active: w1={tuple(w1.shape)} table={EP_TABLE_PATH}", flush=True)
+    M = hidden_states.shape[0]
+    if M <= CHUNK:
+        return _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
+                                 w1_scale, w2_scale, **kw)
+    a1 = kw.pop("a1_scale", None)
+    out = kw.pop("out", None)
+    if out is not None:
+        for s in range(0, M, CHUNK):
+            _ep_fused_experts(hidden_states[s:s + CHUNK], w1, w2, topk_weights[s:s + CHUNK],
+                              topk_ids[s:s + CHUNK], expert_map, w1_scale, w2_scale,
+                              a1_scale=None if a1 is None or a1.numel() == 1 else a1[s:s + CHUNK],
+                              out=out[s:s + CHUNK], **kw)
+        return out
+    return torch.cat([
+        _ep_fused_experts(hidden_states[s:s + CHUNK], w1, w2, topk_weights[s:s + CHUNK],
+                          topk_ids[s:s + CHUNK], expert_map, w1_scale, w2_scale,
+                          a1_scale=None if a1 is None or a1.numel() == 1 else a1[s:s + CHUNK], **kw)
+        for s in range(0, M, CHUNK)])

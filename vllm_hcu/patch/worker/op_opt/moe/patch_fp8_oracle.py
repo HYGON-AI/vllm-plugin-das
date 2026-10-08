@@ -281,9 +281,18 @@ def apply_to_module(module: ModuleType) -> bool:
                 if fp8_backend == hcu_enum.BATCHED_DEEPGEMM
                 else marlin_fp8_contiguous_weight
             )
-            with torch.no_grad():
-                w13 = pack_weight(w13).detach()
-                w2 = pack_weight(w2).detach()
+            # VLLM_HCU_EP_FUSED_MOE=1: DeepGemmExperts runs ep_fused_moe, which
+            # reads plain [E, N, K] weights; keep them unpacked.
+            import os
+
+            ep_fused = (
+                os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
+                and fp8_backend == hcu_enum.DEEPGEMM
+            )
+            if not ep_fused:
+                with torch.no_grad():
+                    w13 = pack_weight(w13).detach()
+                    w2 = pack_weight(w2).detach()
             # The kernels index channel scales as [E, N]; the trailing unit
             # dim from CompressedTensors' [E, N, 1] layout corrupts output.
             if w13_scale.ndim == 3 and w13_scale.size(-1) == 1:

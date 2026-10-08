@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+import os
 from contextlib import nullcontext
 
 import torch
@@ -60,6 +61,11 @@ logger = init_logger(__name__)
 
 # DeepEP high-throughput kernels on HCU require 256-row expert slices.
 _HCU_HT_EP_TOKEN_ALIGNMENT = 256
+
+# Opt-in: run Channel-FP8 EP MoE through ep_fused_moe (expert-sorted Triton GEMMs,
+# work bounded by local routes) instead of DeepGEMM. patch_fp8_oracle then keeps
+# the weights as plain [E, N, K].
+_EP_FUSED_MOE = os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
@@ -345,6 +351,49 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             act_out, block_k, column_major_scales=True, out_q=output
         )
 
+    def _apply_ep_fused(
+        self, output, a1q, w1, w2, topk_weights, topk_ids, activation,
+        global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
+        apply_router_weight_on_input,
+    ):
+        if not (
+            self.quant_config.use_fp8_w8a8
+            and activation == MoEActivation.SWIGLUSTEP
+            and expert_map is not None
+            and not apply_router_weight_on_input
+        ):
+            raise NotImplementedError(
+                "VLLM_HCU_EP_FUSED_MOE supports only Channel-FP8 swiglustep with "
+                f"expert parallelism (activation={activation}, "
+                f"expert_map={expert_map is not None})"
+            )
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+            ep_fused_experts,
+        )
+
+        mask = getattr(self, "_ep_fused_mask", None)
+        if mask is None or self._ep_fused_mask_src is not expert_map:
+            mask = (expert_map >= 0).to(torch.int32)
+            self._ep_fused_mask, self._ep_fused_mask_src = mask, expert_map
+        ep_fused_experts(
+            a1q,
+            w1,
+            w2,
+            topk_weights.to(torch.float32),
+            topk_ids.to(torch.int32).contiguous(),
+            expert_map,
+            self.w1_scale,
+            self.w2_scale,
+            a1_scale=a1q_scale,
+            global_num_experts=int(global_num_experts),
+            output_dtype=output.dtype,
+            gemm1_limit=float(self.gemm1_clamp_limit or 7.0),
+            expert_mask=mask,
+            out=output,
+            workspace13=workspace13,
+            workspace2=workspace2,
+        )
+
     def apply(
         self,
         output: torch.Tensor,
@@ -379,6 +428,14 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+
+        if w1.dim() == 3 and _EP_FUSED_MOE:
+            self._apply_ep_fused(
+                output, a1q, w1, w2, topk_weights, topk_ids, activation,
+                global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
+                apply_router_weight_on_input,
+            )
+            return
 
         if current_platform.is_rocm():
             N = self._hcu_logical_n
