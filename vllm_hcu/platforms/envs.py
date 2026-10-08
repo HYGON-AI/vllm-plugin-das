@@ -361,6 +361,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                     ("true", "1")),
 
     # FlashMLA sparse attention for native ROCm DeepSeek-V4.
+    # Both adapter paths also require VLLM_HCU_USE_CUSTOM_OPS; disabling
+    # the master retains the original ROCm/AITER attention and metadata builders.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE":
         lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "True").lower()
         in ("true", "1"),

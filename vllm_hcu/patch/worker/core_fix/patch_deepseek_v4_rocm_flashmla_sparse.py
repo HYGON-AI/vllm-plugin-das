@@ -25,6 +25,22 @@ _PREFILL_MARKER = "_vllm_hcu_flashmla_sparse_prefill_applied"
 _FLASHMLA_PREFILL_HEAD_COUNTS = (64, 128)
 
 
+def _flashmla_decode_enabled() -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+    )
+
+
+def _flashmla_prefill_enabled() -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL
+    )
+
+
 def _flashmla_decode_supports_heads(num_heads: int) -> bool:
     return 0 < num_heads <= 16 or num_heads in (64, 128)
 
@@ -92,9 +108,7 @@ def _require_flashmla_prefill_ready() -> None:
 
 
 def _apply_decode_to_module(module: ModuleType) -> bool:
-    from vllm_hcu.platforms import envs as henvs
-
-    if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE:
+    if not _flashmla_decode_enabled():
         return False
     rocm = load_exact_module(TARGET_MODULE, module)
     attention_cls = require_class(rocm, "DeepseekV4ROCMAiterMLAAttention", TARGET_MODULE)
@@ -162,7 +176,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     def swa_builder_init(self, *args, **kwargs):
         original_swa_init(self, *args, **kwargs)
         if (
-            henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            _flashmla_decode_enabled()
             and _builder_uses_flashmla_decode(self)
         ):
             # FlashMLA consumes the dense SWA indices; release the AITER-only
@@ -174,7 +188,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     def mla_builder_init(self, *args, **kwargs):
         original_mla_init(self, *args, **kwargs)
         if (
-            henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            _flashmla_decode_enabled()
             and _builder_uses_flashmla_decode(self)
         ):
             self.c128a_decode_topk_ragged_indices_buffer = None
@@ -188,7 +202,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         if replay_start is not None and not swa_has_replay_start:
             raise PatchCompatibilityError("this vLLM SWA builder does not support replay_start")
         if (
-            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            not _flashmla_decode_enabled()
             or not _builder_uses_flashmla_decode(self)
         ):
             return original_swa_build(
@@ -204,7 +218,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_mla_build)
     def build_mla_metadata(self, common_prefix_len, common_attn_metadata, fast_build=False):
         if (
-            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            not _flashmla_decode_enabled()
             or not _builder_uses_flashmla_decode(self)
         ):
             return original_mla_build(self, common_prefix_len, common_attn_metadata, fast_build)
@@ -219,7 +233,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     def build_tile_scheduler(self, num_decode_tokens):
         result = original_scheduler(self, num_decode_tokens)
         if (
-            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            not _flashmla_decode_enabled()
             or not _builder_uses_flashmla_decode(self)
             or num_decode_tokens == 0
         ):
@@ -241,7 +255,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         )
 
         if (
-            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
+            not _flashmla_decode_enabled()
             or self.swa_cache_layer.kv_cache.dtype != torch.uint8
             or self.swa_cache_layer.kv_cache.shape[-1] != 584
             or (q.ndim == 3 and not _flashmla_decode_supports_heads(q.shape[1]))
@@ -351,9 +365,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
 
 
 def _apply_prefill_to_module(module: ModuleType) -> bool:
-    from vllm_hcu.platforms import envs as henvs
-
-    if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL:
+    if not _flashmla_prefill_enabled():
         return False
     rocm = load_exact_module(TARGET_MODULE, module)
     original = require_callable(rocm, "rocm_sparse_attn_prefill", TARGET_MODULE)
@@ -379,7 +391,7 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
     ):
         # Native ROCm uses unpadded local heads; sparse prefill supports 64/128.
         if (
-            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL
+            not _flashmla_prefill_enabled()
             or indices is None or topk_length is None or attn_sink is None
             or (
                 q.ndim == 3
@@ -429,11 +441,9 @@ def apply_to_module(module: ModuleType) -> bool:
 
 
 def apply(module: ModuleType | None = None) -> bool:
-    from vllm_hcu.platforms import envs as henvs
-
     if not (
-        henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
-        or henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL
+        _flashmla_decode_enabled()
+        or _flashmla_prefill_enabled()
     ):
         return False
     return apply_to_module(load_exact_module(TARGET_MODULE, module))
