@@ -47,7 +47,7 @@ def _fake_glm_model_module() -> ModuleType:
     return module
 
 
-def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> None:
+def test_glm5next_shared_gate_deepgemm_defaults_under_master(monkeypatch) -> None:
     calls = []
 
     class Kernel:
@@ -163,7 +163,7 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
     assert torch.all(mtp_kernel.apply_scaled_mm(**kwargs) == -1)
     assert len(calls) == 1
 
-    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM")
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "0")
     disabled_module = fake_module()
     patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         disabled_module
@@ -181,13 +181,34 @@ def test_glm5next_shared_gate_uses_deepgemm_only_when_opted_in(monkeypatch) -> N
     )
     assert len(calls) == 2
 
+    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM")
+    default_module = fake_module()
+    assert patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        default_module
+    )
+    default_layer = default_module.Glm5NextDecoderLayer(None, None, 3)
+    default_kernel = default_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    assert torch.all(default_kernel.apply_scaled_mm(**kwargs) == 7)
+
     monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "1")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    master_off_module = fake_module()
+    assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
+        master_off_module
+    )
+    master_off_layer = master_off_module.Glm5NextDecoderLayer(None, None, 3)
+    master_off_kernel = (
+        master_off_layer.mlp.shared_experts.gate_up_proj.scheme.fp8_linear
+    )
+    assert torch.all(master_off_kernel.apply_scaled_mm(**kwargs) == -1)
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM")
+    monkeypatch.setitem(sys.modules, "deepgemm", None)
     assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         fake_module()
     )
-
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
     monkeypatch.setattr(hcu, "on_gfx938", lambda: False)
     assert not patch_glm5next_channel_fp8._patch_glm5next_shared_gate_deepgemm(
         fake_module()
@@ -885,3 +906,57 @@ def test_quantized_channel_fp8_target_stays_on_official_loader_path() -> None:
         set(),
         0,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires the HCU NN GEMM backend"
+)
+def test_glm5next_default_projection_matches_unwrapped_nn(monkeypatch):
+    """GLM loading must retain the established NN output for partial row tiles."""
+    import importlib.util
+    from pathlib import Path
+
+    from vllm import envs
+    from vllm.model_executor.custom_op import PluggableLayer
+
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.platforms import hcu
+
+    if not hcu.on_gfx938():
+        pytest.skip("requires gfx938")
+    name = "vllm_hcu.model_executor.layers.linear"
+    path = Path(__file__).resolve().parents[2] / "vllm_hcu/model_executor/layers/linear.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    linear = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, linear)
+    with monkeypatch.context() as registration:
+        registration.setattr(PluggableLayer, "register", lambda name: lambda cls: cls)
+        spec.loader.exec_module(linear)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_GLM53_GATE_UP_DEEPGEMM", "0")
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    patch = patch_glm5next_channel_fp8
+    for module_name in (patch.KPOOL_MODULE, patch.ATTENTION_MODULE, patch.MTP_MODULE):
+        monkeypatch.setitem(sys.modules, module_name, None)
+
+    generator = torch.Generator().manual_seed(185)
+    weight = (torch.randn(4096, 24896, generator=generator) * 0.02).bfloat16().cuda()
+    x = (torch.randn(120, 4096, generator=generator) * 0.25).bfloat16().cuda()
+    projection = torch.nn.Module()
+    projection.weight = torch.nn.Parameter(weight, requires_grad=False)
+    projection.quant_method = linear.UnquantizedLinearMethod()
+    module = _fake_glm_model_module()
+    module.Glm5NextDecoderLayer.modules = lambda self: iter((projection,))
+
+    def loader(name, tensor, buf, params_dict, loaded_params, kv_a_pad_size):
+        return False
+
+    module._try_load_fp8_attn_proj = loader
+    patch.apply_to_module(module)
+    module.Glm5NextDecoderLayer(None, None, 0)
+    actual = projection.quant_method.apply(projection, x)
+    # Compare real kernel results against the existing unwrapped NN method.
+    # This checks path compatibility, not accuracy against an FP32 oracle.
+    expected = linear.UnquantizedLinearMethod().apply(projection, x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -5,9 +5,8 @@
 from __future__ import annotations
 
 import functools
+from copy import copy
 from types import ModuleType
-
-from vllm.config import replace
 
 from vllm_hcu.patch.config import get_hcu_config
 
@@ -60,10 +59,11 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_load_eagle_model(target_model, vllm_config):
         speculative_config = vllm_config.speculative_config
         draft_model_config = speculative_config.draft_model_config
-        draft_vllm_config = replace(
-            vllm_config,
-            model_config=draft_model_config,
-        )
+        # Draft construction needs its own model context, while the engine
+        # configs and runtime state still belong to the initialized target.
+        # replace() reruns VllmConfig hooks and mutates those shared configs.
+        draft_vllm_config = copy(vllm_config)
+        draft_vllm_config.model_config = draft_model_config
         eagle_model = original(target_model, draft_vllm_config)
         if not get_hcu_config(vllm_config).enable_multi_layers_mtp:
             return eagle_model

@@ -6,15 +6,56 @@
 from __future__ import annotations
 
 import torch
-
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     FlashMLASparseImpl,
+    FlashMLASparseMetadataBuilder,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
+
+
+class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if (
+            self.use_fp8_kv_cache
+            and kv_cache_spec.head_size == 512
+            and getattr(
+                vllm_config.model_config.hf_text_config,
+                "qk_rope_head_dim",
+                None,
+            )
+            == 0
+        ):
+            # GLM5Next has no RoPE. Use the existing packed FP8 kernel for
+            # both prefill and decode, avoiding the BF16 prefill workspace
+            # whose model head size is only 512 rather than the packed 576.
+            self.fp8_use_mixed_batch = True
+
 
 class HcuFlashMLASparseImpl(FlashMLASparseImpl):
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fp8_nope = (
+            self.kv_cache_dtype == "fp8_ds_mla"
+            and self.qk_rope_head_dim == 0
+            and self.q_concat_buffer.shape[-1] == 512
+        )
+        if self._fp8_nope:
+            # FlashMLA's packed DS FP8 kernel expects a 576-wide query even
+            # though GLM5Next's native query is 512-wide. Reserve it in the
+            # shared workspace rather than keeping a full query per layer.
+            shape = (*self.q_concat_buffer.shape[:-1], 576)
+            self._fp8_nope_query_spec = (shape, self.q_concat_buffer.dtype)
+            (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
+                self._fp8_nope_query_spec
+            )
+            # This small cache-writer input must stay zero independently of
+            # other operators reusing the query workspace.
+            self._fp8_nope_pe_buffer = self.q_concat_buffer.new_zeros((shape[0], 64))
 
     def forward_mqa(
         self,
@@ -28,9 +69,19 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         # so materialize the zero-RoPE query in the preallocated graph buffer.
         if isinstance(q, tuple) and q[1].shape[-1] == 0:
             ql_nope, _ = q
-            q_buffer = self.q_concat_buffer[: ql_nope.shape[0]]
-            q_buffer[:, : ql_nope.shape[1], :].copy_(ql_nope)
+            if self._fp8_nope:
+                # Resolve the current (ubatch, target/draft lane) on every
+                # invocation. FULL capture retains that slot's stable address.
+                (buffer,) = current_workspace_manager().get_simultaneous(
+                    self._fp8_nope_query_spec
+                )
+            else:
+                buffer = self.q_concat_buffer
+            q_buffer = buffer[: ql_nope.shape[0]]
+            q_buffer[:, : ql_nope.shape[1], : ql_nope.shape[-1]].copy_(ql_nope)
             q = q_buffer[:, : ql_nope.shape[1], :]
+            if self._fp8_nope:
+                q[..., ql_nope.shape[-1]:].zero_()
         if self.dcp_world_size <= 1:
             return super().forward_mqa(
                 q,
@@ -45,6 +96,7 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         from vllm.v1.attention.backends.mla.sparse_utils import (
             triton_filter_and_convert_dcp_index,
         )
+
         from vllm_hcu.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         # DCP gathers the query-head dimension before this call. Keep every
@@ -58,20 +110,16 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
         num_actual_toks = q.shape[0]
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
-        topk_indices, topk_length = (
-            triton_filter_and_convert_dcp_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(
-                    attn_metadata.cp_kv_cache_interleave_size
-                ),
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
+        topk_indices, topk_length = triton_filter_and_convert_dcp_index(
+            attn_metadata.req_id_per_token[:num_actual_toks],
+            attn_metadata.block_table,
+            topk_indices,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
         )
         cache = kv_c_and_k_pe_cache.view(
             -1,
@@ -95,6 +143,10 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
 
 class HcuFlashMLASparseBackend(FlashMLASparseBackend):
+    @staticmethod
+    def get_builder_cls() -> type[HcuFlashMLASparseMetadataBuilder]:
+        return HcuFlashMLASparseMetadataBuilder
+
     @classmethod
     def supports_combination(
         cls,
@@ -110,13 +162,14 @@ class HcuFlashMLASparseBackend(FlashMLASparseBackend):
     ) -> str | None:
         from vllm_hcu.platforms import envs as henvs
 
-        if (
-            not henvs.optional_custom_op_enabled()
-            and kv_cache_dtype not in {None, "auto", "float16", "bfloat16"}
-        ):
+        if not henvs.optional_custom_op_enabled() and kv_cache_dtype not in {
+            None,
+            "auto",
+            "float16",
+            "bfloat16",
+        }:
             return (
-                "VLLM_HCU_USE_CUSTOM_OPS=0 routes sparse MLA through "
-                "BoltOPs, which supports only BF16/FP16 KV cache; got "
+                "BoltOPs sparse MLA supports only BF16/FP16 KV cache; got "
                 f"{kv_cache_dtype}."
             )
         return super().supports_combination(

@@ -180,6 +180,20 @@ def make_hcu_grouped_topk_router(base_class):
                 )
             if indices_type is not None and topk_ids.dtype != indices_type:
                 topk_ids = topk_ids.to(indices_type)
+            # The official fallback already skips padded rows. LightOp needs
+            # the same mask before DeepEP low-latency dispatch.
+            from vllm import envs
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                is_padding = get_forward_context().is_padding
+                if is_padding is not None:
+                    padding = is_padding[: topk_ids.shape[0], None]
+                    topk_ids = topk_ids.masked_fill(padding, -1)
+                    topk_weights = topk_weights.masked_fill(padding, 0.0)
             return topk_weights, topk_ids
 
     HcuGroupedTopKRouter.__name__ = "HcuGroupedTopKRouter"
