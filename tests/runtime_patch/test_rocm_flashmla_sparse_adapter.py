@@ -349,6 +349,8 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
         (16, 64, True),
         (32, 64, True),
         (64, 64, True),
+        (65, 128, True),
+        (96, 128, True),
         (128, 128, True),
         (129, None, False),
     ],
