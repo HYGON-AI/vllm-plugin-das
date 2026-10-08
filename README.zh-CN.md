@@ -92,15 +92,6 @@ vllm-hcu-doctor
 只检查元数据和源码、不注册平台补丁时，可使用 `vllm-hcu-doctor --no-arm --json`。
 默认模式还检查当前进程的平台补丁注册状态，但两种模式都不能代替模型精度或设备执行验证。
 
-正常使用时无需设置 `VLLM_PLUGINS`，让 vLLM 自动加载三个 HCU 入口。
-若需要显式限制插件列表，应包含所有 HCU 入口：
-
-```bash
-export VLLM_PLUGINS=hcu,hcu_model,hcu_ops
-```
-
-仅设置 `VLLM_PLUGINS=hcu` 会加载平台插件，但排除 HCU 模型和算子插件。
-
 ## 运行配置
 
 当前 [HCU Worker](vllm_hcu/v1/worker.py) 使用 `HcuGPUModelRunnerV2`，
@@ -114,15 +105,29 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 
 | 配置项 | 当前行为 |
 | --- | --- |
-| `VLLM_PLUGINS` | 通常不设置；显式启用 HCU 入口时需包含 `hcu,hcu_model,hcu_ops`。 |
 | `VLLM_USE_V2_MODEL_RUNNER` | 必须选择 V2，HCU Worker 没有旧 runner 回退路径。 |
 | `VLLM_HCU_USE_CUSTOM_OPS` | 默认启用；设为 `0` 关闭受总开关控制的可选 HCU 优化路径，不等于禁用整个插件或移除全部原生依赖。 |
-| `VLLM_HCU_GLM53_GATE_UP_DEEPGEMM` | 设为 `1` 显式启用 GLM5Next 共享专家 gate/up 投影优化；还需满足适配器中的硬件、量化检查，启用算子总开关，并安装匹配的 DeepGEMM。默认不开启。 |
 
-具体开关参见 [环境配置](vllm_hcu/platforms/envs.py) 和
-[GLM5Next 适配器](vllm_hcu/patch/worker/core_fix/patch_glm5next_channel_fp8.py)。
+HCU 专用开关参见 [环境配置](vllm_hcu/platforms/envs.py)。
 Attention/MoE 后端、KV cache 格式、推测解码及并行拓扑应按对应模型配置选择，
 并非所有组合都经过验证。
+
+### MHA/GQA 使用 FlashAttention
+
+对于使用 `--attention-backend FLASH_ATTN` 的 MHA/GQA 模型，建议在模型选用的
+所有后端均支持 HND 布局时设置 `VLLM_KV_CACHE_LAYOUT=HND`，与对应的
+[模型配置](tests/models/) 保持一致：
+
+```bash
+VLLM_KV_CACHE_LAYOUT=HND vllm serve /path/to/model \
+  --attention-backend FLASH_ATTN
+```
+
+这是支持该布局的 FlashAttention 路径的推荐配置，并非所有模型和后端的通用要求。
+混合注意力模型即使指定了 `FLASH_ATTN`，也可能同时使用不支持 HND 的其他注意力后端。
+此时应取消设置 `VLLM_KV_CACHE_LAYOUT`，由 vLLM 解析共同支持的布局。
+MLA 等其他后端应遵循对应模型配置，不要全局强制使用 HND；模型特定限制参见
+[验证记录](docs/validation/)。
 
 ## 运行时集成
 

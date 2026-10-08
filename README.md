@@ -116,16 +116,6 @@ For metadata/source diagnostics without arming platform patches, use
 `vllm-hcu-doctor --no-arm --json`. The default doctor also checks process-local
 platform patch activation; neither mode proves model accuracy or GPU execution.
 
-Leave `VLLM_PLUGINS` unset for normal use so vLLM loads all three HCU entry
-points.  If a plugin allow-list is required, include every HCU entry point:
-
-```bash
-export VLLM_PLUGINS=hcu,hcu_model,hcu_ops
-```
-
-Setting only `VLLM_PLUGINS=hcu` loads the platform plugin but excludes the HCU
-model and operator general plugins.
-
 ## Runtime Settings
 
 This branch's [HCU worker](vllm_hcu/v1/worker.py) constructs
@@ -140,16 +130,32 @@ The following settings are not interchangeable:
 
 | Setting | Current behavior |
 | --- | --- |
-| `VLLM_PLUGINS` | Normally unset; an explicit HCU allow-list needs `hcu,hcu_model,hcu_ops`. |
 | `VLLM_USE_V2_MODEL_RUNNER` | Must resolve to V2; the HCU worker has no legacy-runner fallback. |
 | `VLLM_HCU_USE_CUSTOM_OPS` | Enabled by default; `0` disables optional HCU optimized paths governed by the master switch, not the entire plugin or all native dependencies. |
-| `VLLM_HCU_GLM53_GATE_UP_DEEPGEMM` | Explicit opt-in with `1` for GLM5Next shared-expert gate/up projection, subject to the adapter's hardware and quantization checks; also requires the custom-op master and a matching DeepGEMM installation. Not enabled by default. |
 
-See [environment settings](vllm_hcu/platforms/envs.py) and the
-[GLM5Next adapter](vllm_hcu/patch/worker/core_fix/patch_glm5next_channel_fp8.py)
-for the corresponding gates. Select attention/MoE backends, KV-cache format,
-speculative decoding, and parallel topology from a matching model profile;
-these options are not validated in every combination.
+See [environment settings](vllm_hcu/platforms/envs.py) for HCU-specific
+switches. Select attention/MoE backends, KV-cache format, speculative decoding,
+and parallel topology from a matching model profile; these options are not
+validated in every combination.
+
+### MHA/GQA With FlashAttention
+
+For MHA/GQA models using `--attention-backend FLASH_ATTN`, set
+`VLLM_KV_CACHE_LAYOUT=HND` when all of the model's selected backends support
+that layout, as in the matching [model profiles](tests/models/):
+
+```bash
+VLLM_KV_CACHE_LAYOUT=HND vllm serve /path/to/model \
+  --attention-backend FLASH_ATTN
+```
+
+This is a recommended layout for the supported FlashAttention routes, not a
+requirement for every model or backend. Hybrid models can select additional
+attention backends that do not support HND even with `FLASH_ATTN` specified.
+In those cases, leave `VLLM_KV_CACHE_LAYOUT` unset and let vLLM resolve a common
+supported layout. For MLA and other backends, follow the model profile rather
+than applying HND globally; see the [validation records](docs/validation/) for
+model-specific constraints.
 
 ## Runtime Integration
 
