@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: bool = True
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
+    VLLM_HCU_INDEXER_KCACHE_LAYOUT: str = "preshuffle"
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
@@ -125,6 +126,29 @@ def lightop_awq_enabled() -> bool:
     return optional_custom_op_enabled(
         _environment_flag(os.environ.get("VLLM_HCU_USE_LIGHTOP_AWQ", "False"))
     )
+
+
+INDEXER_KCACHE_LAYOUT_ENV = "VLLM_HCU_INDEXER_KCACHE_LAYOUT"
+INDEXER_KCACHE_LAYOUTS = ("preshuffle", "normal")
+
+
+def indexer_kcache_layout() -> str:
+    """Resolve the gfx938 GLM5Next sparse-indexer K-cache page layout.
+
+    ``preshuffle`` keeps the official 16x16 tiled KPool pages, decoded by the
+    HCU Triton direct reader. ``normal`` writes token-major pages and decodes
+    them with LightOp ``paged_mqa_logits``. The layout is part of the KV-cache
+    contents, so every rank and every disaggregated prefill/decode peer must
+    use the same value.
+    """
+
+    raw = os.environ.get(INDEXER_KCACHE_LAYOUT_ENV, "preshuffle").strip().lower()
+    if raw not in INDEXER_KCACHE_LAYOUTS:
+        raise ValueError(
+            f"{INDEXER_KCACHE_LAYOUT_ENV} must be one of "
+            f"{INDEXER_KCACHE_LAYOUTS}, got {raw!r}"
+        )
+    return raw
 
 
 def ple_prefetch_enabled() -> bool:
@@ -515,6 +539,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
+    # (official 16x16 tiles, HCU Triton decode reader) or "normal"
+    # (token-major pages, LightOp decode reader).
+    "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
+        indexer_kcache_layout,
 }
 
 # end-env-vars-definition
