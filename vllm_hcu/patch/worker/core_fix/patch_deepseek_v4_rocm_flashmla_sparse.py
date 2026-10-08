@@ -39,29 +39,26 @@ def _builder_uses_flashmla_decode(builder) -> bool:
     return _flashmla_decode_supports_heads(num_heads // tp_size)
 
 
-@functools.cache
-def _require_flashmla_ready() -> None:
-    """Fail loudly, once, if the FlashMLA sparse decode path cannot run here.
-
-    ``is_flashmla_sparse_supported`` only proves the Python package imports.
-    The decode call additionally needs the compiled ``sparse_decode_fwd``
-    entry point, and the FP8 cache bytes must be OCP E4M3: FlashMLA decodes
-    the 584-byte fp8_ds_mla rows as OCP, while the SWA cache writer follows
-    ``current_platform.is_fp8_fnuz()`` (FNUZ on gfx942-class parts), which
-    would silently misscale by ~1.87x.
-    """
+def _require_flashmla_sparse_kernel(path: str) -> None:
     from vllm_hcu.v1.attention.ops.flashmla import is_flashmla_sparse_supported
 
     supported, reason = is_flashmla_sparse_supported()
     if not supported:
-        raise RuntimeError(f"DeepSeek-V4 FlashMLA decode unavailable: {reason}")
+        raise RuntimeError(f"DeepSeek-V4 FlashMLA {path} unavailable: {reason}")
     import flash_mla.cuda as flash_mla_cuda
 
-    if not callable(getattr(flash_mla_cuda, "sparse_decode_fwd", None)):
+    entry_point = f"sparse_{path}_fwd"
+    if not callable(getattr(flash_mla_cuda, entry_point, None)):
         raise RuntimeError(
-            "DeepSeek-V4 FlashMLA decode unavailable: the installed flash_mla "
-            "extension does not export sparse_decode_fwd"
+            f"DeepSeek-V4 FlashMLA {path} unavailable: the installed flash_mla "
+            f"extension does not export {entry_point}"
         )
+
+
+@functools.cache
+def _require_flashmla_ready() -> None:
+    # Packed cache bytes must be OCP E4M3; FNUZ silently changes their scale.
+    _require_flashmla_sparse_kernel("decode")
     from vllm.platforms import current_platform
 
     if current_platform.is_fp8_fnuz():
@@ -74,18 +71,7 @@ def _require_flashmla_ready() -> None:
 @functools.cache
 def _require_flashmla_prefill_ready() -> None:
     """Validate the compiled sparse-prefill entry point before model execution."""
-    from vllm_hcu.v1.attention.ops.flashmla import is_flashmla_sparse_supported
-
-    supported, reason = is_flashmla_sparse_supported()
-    if not supported:
-        raise RuntimeError(f"DeepSeek-V4 FlashMLA prefill unavailable: {reason}")
-    import flash_mla.cuda as flash_mla_cuda
-
-    if not callable(getattr(flash_mla_cuda, "sparse_prefill_fwd", None)):
-        raise RuntimeError(
-            "DeepSeek-V4 FlashMLA prefill unavailable: the installed flash_mla "
-            "extension does not export sparse_prefill_fwd"
-        )
+    _require_flashmla_sparse_kernel("prefill")
     if not torch.cuda.is_available():
         raise RuntimeError("DeepSeek-V4 FlashMLA prefill requires an available ROCm device")
     arch = str(torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName)
@@ -157,21 +143,16 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             **({"replay_start": None} if swa_has_replay_start else {}),
         },
     )
-    for fn, name in (
-        (original_mla_build, "DeepseekV4ROCMAiterMLASparseMetadataBuilder.build"),
-    ):
-        require_exact_signature(
-            fn,
-            f"{TARGET_MODULE}.{name}",
-            positional=("self", "common_prefix_len", "common_attn_metadata", "fast_build"),
-            defaults={"fast_build": False},
-        )
+    require_exact_signature(
+        original_mla_build,
+        f"{TARGET_MODULE}.DeepseekV4ROCMAiterMLASparseMetadataBuilder.build",
+        positional=("self", "common_prefix_len", "common_attn_metadata", "fast_build"),
+        defaults={"fast_build": False},
+    )
 
     @functools.wraps(original_swa_init)
     def swa_builder_init(self, *args, **kwargs):
         original_swa_init(self, *args, **kwargs)
-        from vllm_hcu.platforms import envs as henvs
-
         if (
             henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
             and _builder_uses_flashmla_decode(self)
@@ -184,8 +165,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_mla_init)
     def mla_builder_init(self, *args, **kwargs):
         original_mla_init(self, *args, **kwargs)
-        from vllm_hcu.platforms import envs as henvs
-
         if (
             henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
             and _builder_uses_flashmla_decode(self)
@@ -197,8 +176,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     def build_swa_metadata(
         self, common_prefix_len, common_attn_metadata, fast_build=False, replay_start=None
     ):
-        from vllm_hcu.platforms import envs as henvs
-
         replay_kwargs = {"replay_start": replay_start} if swa_has_replay_start else {}
         if replay_start is not None and not swa_has_replay_start:
             raise PatchCompatibilityError("this vLLM SWA builder does not support replay_start")
@@ -218,8 +195,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_mla_build)
     def build_mla_metadata(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        from vllm_hcu.platforms import envs as henvs
-
         if (
             not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
             or not _builder_uses_flashmla_decode(self)
@@ -235,8 +210,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_scheduler)
     def build_tile_scheduler(self, num_decode_tokens):
         result = original_scheduler(self, num_decode_tokens)
-        from vllm_hcu.platforms import envs as henvs
-
         if (
             not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
             or not _builder_uses_flashmla_decode(self)
@@ -255,8 +228,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output,
         adaptive_splits=False,
     ):
-        from vllm_hcu.platforms import envs as henvs
-
         decode_kwargs = (
             {"adaptive_splits": adaptive_splits} if decode_has_adaptive_splits else {}
         )
@@ -265,15 +236,11 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE
             or self.swa_cache_layer.kv_cache.dtype != torch.uint8
             or self.swa_cache_layer.kv_cache.shape[-1] != 584
+            or (q.ndim == 3 and not _flashmla_decode_supports_heads(q.shape[1]))
         ):
             return original_decode(
                 self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output, **decode_kwargs
             )
-        if q.ndim == 3 and not _flashmla_decode_supports_heads(q.shape[1]):
-            return original_decode(
-                self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output, **decode_kwargs
-            )
-
         _require_flashmla_ready()
         from vllm.models.deepseek_v4.common.ops import (
             compute_global_topk_indices_and_lens,
@@ -283,11 +250,6 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         num_tokens = swa_metadata.num_decode_tokens
         if q.ndim != 3 or q.shape[0] != num_tokens or q.shape[-1] != 512 or output.shape != q.shape:
             raise ValueError("FlashMLA decode requires one 512-wide output per query")
-        if (
-            self.swa_cache_layer.kv_cache.dtype != torch.uint8
-            or self.swa_cache_layer.kv_cache.shape[-1] != 584
-        ):
-            raise ValueError("FlashMLA decode requires 584-byte fp8_ds_mla SWA cache rows")
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
         if swa_indices is None or swa_lens is None:
@@ -356,9 +318,10 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
         )
-        if out.squeeze(1).shape != output.shape:
+        out = out.squeeze(1)
+        if out.shape != output.shape:
             raise RuntimeError("FlashMLA returned an unexpected output shape")
-        output.copy_(out.squeeze(1).to(output.dtype))
+        output.copy_(out.to(output.dtype))
 
     for fn in (
         forward_decode,
@@ -406,23 +369,18 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
         q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
         rope_head_dim, attn_sink, output, ragged_indices=None, ragged_indptr=None,
     ):
-        from vllm_hcu.platforms import envs as henvs
-
+        # Native ROCm uses unpadded local heads; sparse prefill supports 64/128.
         if (
             not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL
             or indices is None or topk_length is None or attn_sink is None
-        ):
-            return original(
-                q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
-                rope_head_dim, attn_sink, output, ragged_indices, ragged_indptr,
+            or (
+                q.ndim == 3
+                and (
+                    q.shape[1] not in _FLASHMLA_PREFILL_HEAD_COUNTS
+                    or q.shape[-1] != 512
+                    or q.dtype != torch.bfloat16
+                )
             )
-        # The compiled sparse-prefill kernels only instantiate h_q=64/128.
-        # Native ROCm keeps the actual per-rank head count instead of padding,
-        # so TP configurations such as TP2/TP4 must retain the AITER path.
-        if (
-            q.ndim == 3
-            and (q.shape[1] not in _FLASHMLA_PREFILL_HEAD_COUNTS
-                 or q.shape[-1] != 512 or q.dtype != torch.bfloat16)
         ):
             return original(
                 q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
@@ -433,8 +391,6 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
 
         if q.ndim != 3 or q.shape[-1] != 512 or output.shape != q.shape:
             raise ValueError("FlashMLA prefill requires [tokens, heads, 512] q/output")
-        if q.dtype != torch.bfloat16:
-            raise TypeError(f"FlashMLA sparse prefill requires bfloat16 q, got {q.dtype}")
         if kv.ndim != 3 or kv.shape[-2:] != (1, 512):
             raise ValueError("FlashMLA prefill requires [tokens, 1, 512] KV")
         if indices.ndim != 2 or indices.shape[0] != q.shape[0]:
