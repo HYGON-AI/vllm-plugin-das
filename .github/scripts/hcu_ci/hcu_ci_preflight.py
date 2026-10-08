@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -182,6 +183,13 @@ def _load_environment_lock(path: Path) -> dict[str, Any]:
         for name in ("environment", "version_file", "version")
     ):
         raise PreflightError("environment lock must declare the DTK/ROCm version file")
+    rocm_match = rocm.get("match", "exact")
+    if rocm_match not in ("exact", "release_line"):
+        raise PreflightError("DTK/ROCm must declare match=exact|release_line")
+    if rocm_match == "release_line" and not re.fullmatch(
+        r"[0-9]+\.[0-9]+", rocm["version"]
+    ):
+        raise PreflightError("DTK/ROCm release line must have major.minor form")
     return lock
 
 
@@ -229,9 +237,19 @@ def _check_environment_lock(
         raise PreflightError(
             f"cannot read DTK/ROCm version from {version_path}: {exc}"
         ) from exc
-    if actual_rocm != rocm["version"]:
+    rocm_match = rocm.get("match", "exact")
+    matches_rocm = actual_rocm == rocm["version"]
+    if rocm_match == "release_line":
+        # Keep a component boundary: 26.040 is not in the 26.04 release line.
+        pattern = (
+            re.escape(rocm["version"])
+            + r"(?:\.[0-9]+)*(?:[-+][A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*)?"
+        )
+        matches_rocm = re.fullmatch(pattern, actual_rocm) is not None
+    if not matches_rocm:
         raise PreflightError(
-            f"runner DTK/ROCm drift: expected {rocm['version']}, got {actual_rocm}"
+            "runner DTK/ROCm drift: expected "
+            f"{rocm_match} {rocm['version']}, got {actual_rocm}"
         )
     return {
         "path": str(path.resolve()),
