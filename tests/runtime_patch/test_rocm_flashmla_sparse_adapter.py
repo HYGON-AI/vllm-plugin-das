@@ -345,6 +345,7 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
 @pytest.mark.parametrize(
     ("heads", "kernel_heads", "uses_flashmla"),
     [
+        (0, None, False),
         (16, 64, True),
         (32, 64, True),
         (64, 64, True),

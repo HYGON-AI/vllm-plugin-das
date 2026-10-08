@@ -27,7 +27,7 @@ def _flashmla_prefill_padded_heads(num_heads: int) -> int | None:
     """Return the sparse-prefill kernel width for a TP-local Q layout."""
     if 0 < num_heads <= 64:
         return 64
-    if num_heads <= 128:
+    if 64 < num_heads <= 128:
         return 128
     return None
 
