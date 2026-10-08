@@ -52,7 +52,7 @@ def _maybe_init_ep_custom_allreduce(communicator, unique_name: str) -> None:
     """Give the EP group a custom all-reduce for VLLM_HCU_EP_FUSED_COMBINE.
 
     Upstream restricts custom all-reduce to the TP group; the fused MoE
-    combine (moe_runner._ep_fused_combine_output) all-reduces over EP instead.
+    combine (moe_runner._ep_fused_all_reduce) all-reduces over EP instead.
     """
     if os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") != "1":
         return
