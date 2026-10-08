@@ -5,6 +5,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -31,6 +32,10 @@ from vllm_hcu.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
+from vllm_hcu.v1.attention.backends.swa_decode import (
+    can_use_swa_decode_fp8_d192,
+    swa_decode_fp8_d192,
+)
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_ar,
@@ -101,6 +106,12 @@ def _split_kv_cache(
 
 if TYPE_CHECKING:
     from vllm_hcu.v1.pcp_manager import PCPPlan
+
+
+# Sliding-window decode (q_len <= 4) on the FP8 D192 cache through the Triton
+# split-KV kernel instead of the cutlass HG prefix kernel (~4x faster, more
+# accurate). VLLM_HCU_SWA_DECODE=0 restores the cutlass path.
+_SWA_DECODE_ENABLED = os.environ.get("VLLM_HCU_SWA_DECODE", "1") == "1"
 
 
 def _get_flash_attn_mode() -> str:
@@ -1030,6 +1041,34 @@ class FlashAttentionImpl(AttentionImpl):
                             self.sinks,
                         )
                     ):
+                        if (
+                            _SWA_DECODE_ENABLED
+                            and layer._q_scale_float == 1.0
+                            and can_use_swa_decode_fp8_d192(
+                                query,
+                                key_cache,
+                                max_seqlen_q,
+                                attn_metadata.causal,
+                                sliding_window_size,
+                                self.sinks,
+                            )
+                        ):
+                            logger.info_once(
+                                "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 (triton split-KV)",
+                                scope="local",
+                            )
+                            swa_decode_fp8_d192(
+                                query[:num_actual_tokens],
+                                key_cache,
+                                value_cache,
+                                output[:num_actual_tokens],
+                                cu_seqlens_q,
+                                seqused_k,
+                                block_table,
+                                self.scale,
+                                sliding_window_size[0],
+                            )
+                            return output
                         logger.info_once(
                             "[HCU FLASH_ATTN PATH] paged_fp8_d192 (HG prefix)",
                             scope="local",
