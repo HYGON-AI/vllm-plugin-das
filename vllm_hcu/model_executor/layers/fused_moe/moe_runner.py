@@ -5,6 +5,7 @@
 """HCU-owned v0.25.1 MoE runner with pre-quantized input support."""
 
 import inspect
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -15,8 +16,10 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
+    get_dp_group,
     get_ep_group,
     get_pcp_group,
+    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -60,6 +63,12 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Fold the naive DP combine (reduce-scatter over DP), the shared-expert add and
+# the TP all-reduce into one custom all-reduce over the EP group (see
+# MoERunner._ep_fused_combine_output).  Requires the EP group's custom
+# all-reduce, which CudaCommunicator creates under the same flag.
+_EP_FUSED_COMBINE = os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") == "1"
 
 
 def register_layer_for_moe_forward_op(
@@ -189,6 +198,9 @@ def _moe_forward_shared(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
+    if layer._ep_fused_combine:
+        # Already a fresh all-reduce output that aliases no input.
+        return shared_output, fused_output
     return shared_output, fused_output.clone()
 
 
@@ -324,6 +336,20 @@ class MoERunner(MoERunnerInterface):
                 mk_can_overlap_shared_experts=can_overlap,
                 is_multistream_safe=routed_input_is_quantized,
             )
+
+        # Static so the traced forward() branches on a plain bool; runtime
+        # conditions (custom AR availability, size) are checked in the op.
+        self._ep_fused_combine = (
+            _EP_FUSED_COMBINE
+            and shared_experts is not None
+            and moe_config.dp_size > 1
+            and moe_config.pcp_size == 1
+            and not moe_config.is_sequence_parallel
+            and not moe_config.skip_final_all_reduce
+            and routed_scaling_factor == 1.0
+            and routed_input_transform is None
+            and routed_output_transform is None
+        )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
@@ -842,6 +868,12 @@ class MoERunner(MoERunnerInterface):
 
         shared_output, fused_output = _unpack(result)
 
+        if self._ep_fused_combine:
+            # The op already combined, added shared output and all-reduced.
+            assert og_hidden_dim_pre_xform is None
+            assert og_hidden_dim_post_xform is None
+            return self._maybe_add_zero_expert_output(fused_output)
+
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
@@ -915,11 +947,56 @@ class MoERunner(MoERunnerInterface):
 
         return hidden_states, router_logits
 
+    def _ep_fused_combine_output(
+        self,
+        shared_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Final MoE output (combine + shared add + TP all-reduce).
+
+        With naive DP dispatch every EP rank holds routed partial sums for the
+        tokens of all DP ranks, laid out by DP rank.  Reduce-scatter over DP
+        followed by an all-reduce over TP equals an all-reduce over the whole
+        EP group (DP x TP) sliced to this DP rank's rows.  Adding the
+        TP-partial shared output into the own rows first folds the shared add
+        into the same collective: one custom all-reduce instead of NCCL
+        reduce-scatter + add + custom all-reduce.
+        """
+        ep = get_ep_group()
+        dp = get_dp_group()
+        ca = getattr(ep.device_communicator, "ca_comm", None)
+        sizes = get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank()
+        if (
+            self.do_naive_dispatch_combine
+            and not self._fused_output_is_reduced
+            and ca is not None
+            and not ca.disabled
+            and ep.world_size == dp.world_size * get_tensor_model_parallel_world_size()
+            and hidden_states.shape[0] == sum(sizes)
+            and ca.should_custom_ar(hidden_states)
+        ):
+            start = sum(sizes[: dp.rank_in_group])
+            end = start + sizes[dp.rank_in_group]
+            hidden_states[start:end] += shared_output
+            return ca.custom_all_reduce(hidden_states)[start:end]
+
+        # Unfused path, identical to forward()'s tail for this configuration.
+        if self.do_naive_dispatch_combine:
+            hidden_states = ep.combine(hidden_states, False)
+        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        return self._maybe_reduce_final_output(shared_output + hidden_states, None)
+
     def _maybe_combine(
         self,
         shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
+        if self._ep_fused_combine:
+            assert shared_output is not None
+            return shared_output, self._ep_fused_combine_output(
+                shared_output, hidden_states
+            )
+
         if self.do_naive_dispatch_combine:
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel

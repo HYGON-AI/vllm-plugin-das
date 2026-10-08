@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -44,6 +45,38 @@ def register(
         HCU_CUSTOM_ALLREDUCE_MODULE,
         targets=(CUSTOM_ALLREDUCE_MODULE, HCU_CUSTOM_ALLREDUCE_MODULE),
         late_policy="fail",
+    )
+
+
+def _maybe_init_ep_custom_allreduce(communicator, unique_name: str) -> None:
+    """Give the EP group a custom all-reduce for VLLM_HCU_EP_FUSED_COMBINE.
+
+    Upstream restricts custom all-reduce to the TP group; the fused MoE
+    combine (moe_runner._ep_fused_combine_output) all-reduces over EP instead.
+    """
+    if os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") != "1":
+        return
+    if unique_name.split(":")[0] != "ep" or communicator.world_size <= 1:
+        return
+    if communicator.ca_comm is not None:
+        return
+    from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+
+    if not _ENABLE_CUSTOM_ALL_REDUCE:
+        return
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
+    communicator.ca_comm = CustomAllreduce(
+        group=communicator.cpu_group, device=communicator.device
+    )
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "EP group '%s' custom all-reduce for fused MoE combine: %s",
+        unique_name,
+        "disabled" if communicator.ca_comm.disabled else "enabled",
     )
 
 
@@ -113,6 +146,7 @@ def apply_to_module(module: ModuleType) -> bool:
             tcp_store_group,
             use_all2all,
         )
+        _maybe_init_ep_custom_allreduce(self, unique_name)
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
