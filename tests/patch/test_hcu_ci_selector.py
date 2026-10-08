@@ -377,6 +377,143 @@ def test_environment_lock_allows_compatible_hip_prefix(
         )
 
 
+@pytest.fixture
+def dtk_environment_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
+    lock = json.loads(
+        (REPOSITORY / ".github/workflows/configs/hcu-runner-environment.json")
+        .read_text(encoding="utf-8")
+    )
+    runtime_root = tmp_path / "dtk"
+    version_file = runtime_root / lock["rocm"]["version_file"]
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text("26.04\n", encoding="utf-8")
+    monkeypatch.setenv(lock["rocm"]["environment"], str(runtime_root))
+    monkeypatch.setattr(
+        "hcu_ci_preflight.platform.python_version", lambda: lock["python"]
+    )
+    path = tmp_path / "environment.json"
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    return SimpleNamespace(
+        path=path,
+        lock=lock,
+        version_file=version_file,
+        runtime={
+            "versions": {
+                name: spec["version"] for name, spec in lock["distributions"].items()
+            },
+            "torch_hip": "6.3.26113",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "version",
+    (
+        "26.04",
+        "26.04.1",
+        "26.04.12",
+        "26.04.1.2",
+        "26.04-72cu-0911",
+        "26.04.1-72cu-0911",
+        "26.04.1+build.20261008",
+    ),
+)
+def test_environment_lock_accepts_dtk_release_line_and_reports_full_version(
+    dtk_environment_lock: SimpleNamespace,
+    version: str,
+) -> None:
+    env = dtk_environment_lock
+    env.version_file.write_text(f"  {version}  \n", encoding="utf-8")
+    report = _check_environment_lock(env.path, **env.runtime)
+    assert report["rocm"] == version
+
+
+@pytest.mark.parametrize(
+    "version",
+    (
+        "26.03.9",
+        "26.05",
+        "27.04.1",
+        "26.040",
+        "26.040.1",
+        "26.04foo",
+        "26.04.",
+        "26.04..1",
+        "26.04.x",
+        "26.04.1-",
+        "26.04.1+",
+        "26.04.1 build 123",
+        "unknown",
+        "",
+    ),
+)
+def test_environment_lock_rejects_other_or_malformed_dtk_versions(
+    dtk_environment_lock: SimpleNamespace,
+    version: str,
+) -> None:
+    env = dtk_environment_lock
+    env.version_file.write_text(f"{version}\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm drift"):
+        _check_environment_lock(env.path, **env.runtime)
+
+
+@pytest.mark.parametrize("match", (None, "exact"))
+def test_environment_lock_preserves_exact_dtk_matching(
+    dtk_environment_lock: SimpleNamespace,
+    match: str | None,
+) -> None:
+    env = dtk_environment_lock
+    env.lock["rocm"].pop("match", None)
+    if match is not None:
+        env.lock["rocm"]["match"] = match
+    env.path.write_text(json.dumps(env.lock), encoding="utf-8")
+    assert _check_environment_lock(env.path, **env.runtime)["rocm"] == "26.04"
+    env.version_file.write_text("26.04.1\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm drift"):
+        _check_environment_lock(env.path, **env.runtime)
+
+
+@pytest.mark.parametrize(
+    "specification",
+    (
+        {"match": "prefix"},
+        {"match": []},
+        {"match": "release_line", "version": "26"},
+        {"match": "release_line", "version": "26.04.1"},
+        {"match": "release_line", "version": "26.04|27.01"},
+    ),
+)
+def test_environment_lock_rejects_invalid_dtk_matching_rules(
+    dtk_environment_lock: SimpleNamespace,
+    specification: dict,
+) -> None:
+    env = dtk_environment_lock
+    env.lock["rocm"].update(specification)
+    env.path.write_text(json.dumps(env.lock), encoding="utf-8")
+    with pytest.raises(PreflightError, match="DTK/ROCm.*(match|release line)"):
+        _check_environment_lock(env.path, **env.runtime)
+
+
+@pytest.mark.parametrize("failure", ("missing_version_file", "missing_root"))
+def test_environment_lock_requires_readable_dtk_version(
+    dtk_environment_lock: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    env = dtk_environment_lock
+    if failure == "missing_version_file":
+        env.version_file.unlink()
+        message = "cannot read DTK/ROCm version"
+    else:
+        monkeypatch.delenv(env.lock["rocm"]["environment"])
+        message = "runner environment is missing"
+    with pytest.raises(PreflightError, match=message):
+        _check_environment_lock(env.path, **env.runtime)
+
+
 def test_evalscope_is_required_only_by_evalscope_jobs() -> None:
     config = _config()
     evalscope_jobs = {
