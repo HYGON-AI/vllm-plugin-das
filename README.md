@@ -2,30 +2,26 @@
 vLLM HCU Plugin
 </h3>
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 ---
 
 `vllm-plugin-das` provides HCU platform, model, and operator integration for
-[vLLM](https://github.com/vllm-project/vllm). This README describes the
-`v0.28.1-dev` branch and its HCU/OpenDAS vLLM `0.28.1` runtime contract.
+[vLLM](https://github.com/vllm-project/vllm). Use the repository branch that
+matches your HCU/OpenDAS vLLM deployment.
 
 ## Version Compatibility
 
-The source of truth is [vllm_hcu/version.py](vllm_hcu/version.py), with wheel
-version construction in [setup.py](setup.py).
+Package versions and integration revisions are maintained in
+[vllm_hcu/version.py](vllm_hcu/version.py), with wheel version construction in
+[setup.py](setup.py). Consult those files on the branch you are installing;
+this README intentionally does not duplicate their changing version numbers.
 
-| Item | Current source value |
-| --- | --- |
-| Plugin base version | `0.28.1rc1.dev491` |
-| Recorded HCU vLLM target build | `0.28.1rc1.dev491+g462fdb097.das.462fdb0.dtk2604` |
-| Recorded upstream vLLM revision | `58ad1f3b8973b23943107b51230d594050b42ec3` |
-| Recorded OpenDAS vLLM revision | `462fdb097c66b487ef4826e8009431c10fe88fb8` |
-
-The [compatibility gate](vllm_hcu/compatibility.py) requires the same PEP 440
-epoch and release tuple as the target: `0.28.1`. Pre-release, development,
-post-release, and local build suffixes are accepted, including `0.28.1`,
-`0.28.1rc1.dev491+das.vendor`, and `0.28.1+dtk2604.torch2110`. This is **not** a
-blanket `0.28.x` check: `0.25.1`, `0.28.0`, and `0.28.2` are rejected, as are
-missing or malformed versions.
+The [compatibility gate](vllm_hcu/compatibility.py) requires the installed vLLM
+package to have the same PEP 440 epoch and release tuple as
+`__vllm_target_version__`. Pre-release, development, post-release, and local
+build suffixes may differ. Missing packages, malformed versions, and different
+release lines are rejected before patch registration.
 
 The recorded revisions identify the integration baseline, not an exact wheel
 pin. Passing the version gate alone does not validate the PyTorch/DTK/operator
@@ -46,43 +42,54 @@ requirement for this branch; use the version contract above.
 ## Install
 
 Build and run on a Linux HCU system with the matching DTK toolchain, PyTorch,
-and HCU vLLM base package already installed. `setup.py` requires Python 3.10 or
-newer and imports PyTorch's extension build utilities; it does not provision
-the runtime dependencies for you.
+and HCU vLLM base package already installed. Use a Python version supported by
+[setup.py](setup.py), which imports PyTorch's extension build utilities and
+does not provision runtime dependencies for you.
 
-The checked-in [gfx938 validation record](docs/validation/v0281-gfx938-provenance.md)
-uses Python 3.10.12, DTK 26.04.1, a DTK 26.04 PyTorch 2.11.0 build, and an HCU
-vLLM `0.28.1` wheel. It also records exact wheel versions for reproducing that
-campaign. [docker/Dockerfile](docker/Dockerfile) describes the container build
-flow. Operator packages such as AITER, FlashMLA, DeepGEMM, LightOp, and DeepEP
+[docker/Dockerfile](docker/Dockerfile) describes the container build flow.
+Operator packages such as AITER, FlashMLA, DeepGEMM, LightOp, and DeepEP
 must match the chosen model/backend and runtime ABI; a generic PyPI stack is
 not a substitute for those HCU builds.
 
 The [CI environment lock](.github/workflows/configs/hcu-runner-environment.json)
-checks DTK using `match: release_line` with `version: 26.04`. This accepts
-`26.04`, numeric patch releases such as `26.04.1`, and `-`/`+` build suffixes
-such as `26.04.1-72cu-0911`; it does not accept other release lines or arbitrary
-strings starting with `26.04`. Preflight reports the full installed version.
+checks DTK using `match: release_line` against its configured major/minor
+release. Numeric patch releases and `-`/`+` build suffixes within that line are
+accepted; other release lines and malformed versions are rejected. Preflight
+reports the full installed version.
 Custom locks without `rocm.match` retain exact matching. Other dependency
 checks remain independent, and this CI policy does not prove binary ABI
 compatibility for every build in the series.
 
-In that prepared environment, build and install the plugin:
+From the root of the selected branch, build and install the plugin in that
+prepared environment:
 
 ```bash
-git clone --branch v0.28.1-dev https://github.com/HYGON-AI/vllm-plugin-das.git
-cd vllm-plugin-das
-python3 -m pip install ninja wheel setuptools
-export ROCM_PATH=/opt/dtk
-export MAX_JOBS=16
 python3 setup.py bdist_wheel
 python3 -m pip install --no-deps dist/vllm_hcu-*.whl
 ```
 
-Adjust `ROCM_PATH` to the DTK installation and `MAX_JOBS` to available build
-resources. Use a fresh checkout/dist directory, or select one specific wheel
-if multiple builds are present. `--no-deps` preserves the prepared runtime; it
-does not install or verify missing dependencies.
+Use a fresh checkout/dist directory, or select one specific wheel if multiple
+builds are present. `--no-deps` preserves the prepared runtime; it does not
+install or verify missing dependencies.
+
+### Optional Build Configuration
+
+These are environment preparation examples, not commands required on every
+installation. Install build tools only if your environment is missing them;
+set the DTK path when an explicit location is needed, and limit parallel
+compilation according to available resources:
+
+```bash
+# Only if the build tools are not already provided.
+python3 -m pip install ninja wheel setuptools
+# Only if the DTK path needs to be set explicitly; adjust to your installation.
+export ROCM_PATH=/opt/dtk
+# Optional build parallelism limit; this value is an example.
+export MAX_JOBS=16
+```
+
+`MAX_JOBS` defaults to the host CPU count. `ROCM_PATH` is also used to discover
+DTK metadata for the wheel version when it is set.
 
 `ADD_GIT_VERSION=1` is the default and includes the detected Git revision in
 the wheel's local version. Set `ADD_GIT_VERSION=0` to omit that revision; the
@@ -136,7 +143,7 @@ The following settings are not interchangeable:
 | `VLLM_PLUGINS` | Normally unset; an explicit HCU allow-list needs `hcu,hcu_model,hcu_ops`. |
 | `VLLM_USE_V2_MODEL_RUNNER` | Must resolve to V2; the HCU worker has no legacy-runner fallback. |
 | `VLLM_HCU_USE_CUSTOM_OPS` | Enabled by default; `0` disables optional HCU optimized paths governed by the master switch, not the entire plugin or all native dependencies. |
-| `VLLM_HCU_GLM53_GATE_UP_DEEPGEMM` | Explicit opt-in with `1` for GLM5Next shared-expert gate/up projection on gfx938; also requires the custom-op master and a matching DeepGEMM installation. Not enabled by default. |
+| `VLLM_HCU_GLM53_GATE_UP_DEEPGEMM` | Explicit opt-in with `1` for GLM5Next shared-expert gate/up projection, subject to the adapter's hardware and quantization checks; also requires the custom-op master and a matching DeepGEMM installation. Not enabled by default. |
 
 See [environment settings](vllm_hcu/platforms/envs.py) and the
 [GLM5Next adapter](vllm_hcu/patch/worker/core_fix/patch_glm5next_channel_fp8.py)
@@ -160,7 +167,7 @@ modified. `patch_report()` reports the process role, target symbols, patch
 status, failure details, and feature activation state.
 
 All three plugin entry points and both patch-application phases share one
-fail-closed compatibility gate using the `0.28.1` release-line contract above.
+fail-closed compatibility gate using the source-defined release-line contract.
 Incompatible installations are rejected before patch registration. The
 corresponding doctor check is named `vllm_compatible`.
 
@@ -174,18 +181,15 @@ Model registration or the presence of a YAML profile is not an accuracy pass.
 Use the exact checkpoint, quantization, hardware, backend, and topology in the
 profile and compare against the recorded evidence:
 
-- [gfx938 model matrix](tests/models/v0281_gfx938_humaneval16.yaml): profiles for
-  DeepSeek, GLM (including GLM-5.3 Channel-FP8), HY, Qwen, and MiniMax, with
-  profile-specific TP/DP/EP, MTP, and KV-cache settings.
+- [Model configurations](tests/models/): checkpoint-specific TP/DP/EP, MTP,
+  attention/MoE backend, and KV-cache settings.
 - [Model configuration guide](tests/models/README.md): profile selection and
   additional Kimi, DeepSeek-V4 DSpark, GLM PCP, and multimodal test routes.
-- [gfx938 validation provenance](docs/validation/v0281-gfx938-provenance.md):
-  frozen wheels, hardware, per-profile scores, known diagnostic failures,
-  and limits of the recorded validation campaign.
+- [Validation records](docs/validation/): frozen environments, hardware,
+  per-profile scores, diagnostic failures, and validation limits.
 
-For example, `glm53_channel_fp8_tp8` specifies TP8, `FLASHMLA_SPARSE`, AITER
-MoE, MTP3, and E4M3 KV cache. Its recorded HumanEval results do not establish
-accuracy for another quantization, DP topology, graph policy, or a newer build.
+Recorded results do not establish accuracy for another quantization, parallel
+topology, graph policy, or a newer build.
 Diagnostic profiles must not be counted as accepted accuracy runs, and the
 recorded results are not a fresh test of every subsequent branch commit.
 
@@ -199,7 +203,7 @@ flag by itself does not create a sandbox.
 ```text
 vllm_hcu/
 ├── __init__.py                  # three vLLM plugin entry points
-├── compatibility.py             # shared vLLM 0.28.1 release-line gate
+├── compatibility.py             # shared source-defined compatibility gate
 ├── doctor.py                    # read-only installation diagnostics
 ├── patch/
 │   ├── __init__.py              # public platform/Worker patch lifecycle API
@@ -255,11 +259,6 @@ Worker imports model runners and custom operators. Required incompatibilities
 are fail-closed and retained in the process-local patch registry; they do not
 fall back to source rewriting.
 
-See [Runtime patch architecture](docs/runtime_patch_architecture_v0251.md) for
-lifecycle, ownership, and module-replacement background. That document was
-written for the earlier `v0.25.1` migration; its version-specific details are
-historical, not the current branch's compatibility or validation contract.
-
 ## Development Guardrails
 
 Run the source-boundary and patch-coverage audits from the repository root:
@@ -277,11 +276,9 @@ python3 -m pip install -r requirements-test.txt
 python3 tools/run_patch_tests.py --suite contract --vllm-source /path/to/vllm-root
 ```
 
-`/path/to/vllm-root` must contain the matching `vllm/` package. Pass this
-explicitly: the test runner retains legacy `VLLM_V0251_SOURCE_ROOT` and
-`vllm_0251` fallback names; those names do not change the runtime version
-requirement. See [tests/README.md](tests/README.md) for suite selection. Portable
-contract checks do not replace HCU kernel, distributed, or model accuracy tests.
+`/path/to/vllm-root` must contain the matching `vllm/` package. See
+[tests/README.md](tests/README.md) for suite selection. Portable contract checks
+do not replace HCU kernel, distributed, or model accuracy tests.
 
 `tools/check_production_boundary.py` verifies that migration-only metadata,
 versioned private markers, and version-specific runtime module names do not
