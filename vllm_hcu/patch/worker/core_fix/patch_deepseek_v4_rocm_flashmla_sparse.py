@@ -70,7 +70,15 @@ def _require_flashmla_ready() -> None:
 
 @functools.cache
 def _require_flashmla_prefill_ready() -> None:
-    """Validate the compiled sparse-prefill entry point before model execution."""
+    """Validate the selected sparse-prefill provider before model execution."""
+    from vllm_hcu.platforms import envs as henvs
+
+    if not henvs.optional_custom_op_enabled():
+        from vllm_hcu.v1.attention.ops.flashmla import _resolve_sparse_mla_fwd
+
+        # Reuse the dispatcher's BoltOPs availability and signature checks.
+        _resolve_sparse_mla_fwd()
+        return
     _require_flashmla_sparse_kernel("prefill")
     if not torch.cuda.is_available():
         raise RuntimeError("DeepSeek-V4 FlashMLA prefill requires an available ROCm device")

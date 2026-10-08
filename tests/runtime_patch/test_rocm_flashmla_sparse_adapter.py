@@ -516,3 +516,74 @@ def test_adaptive_splits_reaches_native_decode(monkeypatch):
     q = torch.zeros(1, 32, 512, dtype=torch.bfloat16)
     Attention()._forward_decode(q, None, None, None, True, q.clone(), adaptive_splits=True)
     assert calls == [("adaptive_splits", True)]
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("boltops_available", [False, True])
+def test_prefill_readiness_uses_boltops_without_native_flashmla(
+    monkeypatch, heads, boltops_available
+):
+    import importlib.util
+    from pathlib import Path
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", True)
+    for name in ("flash_mla", "flash_mla.cuda", "flash_mla.flash_mla_interface"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+    calls = []
+
+    def boltops_kernel(
+        q, kv, indices, softmax_scale, d_v=512, attn_sink=None,
+        topk_length=None, config=None,
+    ):
+        calls.append((indices, topk_length, softmax_scale))
+        return torch.ones_like(q), None, None
+
+    boltops = ModuleType("boltops")
+    boltops.__path__ = []
+    monkeypatch.setitem(sys.modules, "boltops", boltops)
+    mla = ModuleType("boltops.mla")
+    if boltops_available:
+        mla.flash_mla_sparse_fwd = boltops_kernel
+    monkeypatch.setitem(sys.modules, "boltops.mla", mla)
+
+    # Execute the real dispatcher with only its external providers replaced.
+    name = "vllm_hcu.v1.attention.ops.flashmla"
+    source = Path(patch.__file__).parents[3] / "v1/attention/ops/flashmla.py"
+    spec = importlib.util.spec_from_file_location(name, source)
+    flashmla = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, flashmla)
+    spec.loader.exec_module(flashmla)
+    assert flashmla._is_flashmla_available()[0] is False
+
+    module, _, _, _ = _build_module(1, 2, [])
+    patch.apply_to_module(module)
+    q = torch.zeros(2, heads, 512, dtype=torch.bfloat16)
+    output = torch.zeros_like(q)
+    indices = torch.tensor([[0, 1, -1, -1], [0, 1, 2, -1]], dtype=torch.int32)
+    lengths = torch.tensor([2, 3], dtype=torch.int32)
+    args = (
+        q, torch.zeros(3, 1, 512, dtype=torch.bfloat16), indices, lengths,
+        0.125, 512, 448, 64, torch.zeros(heads), output,
+    )
+    patch._require_flashmla_prefill_ready.cache_clear()
+    try:
+        if boltops_available:
+            module.rocm_sparse_attn_prefill(*args)
+            assert torch.all(output == 1)
+            actual_indices, actual_lengths, scale = calls[0]
+            assert torch.equal(actual_indices, indices.unsqueeze(1))
+            assert actual_lengths is lengths
+            assert scale == 0.125
+            # Decode still requires the native extension, even with BoltOPs ready.
+            with pytest.raises(ModuleNotFoundError):
+                patch._require_flashmla_sparse_kernel("decode")
+        else:
+            with pytest.raises(RuntimeError, match="requires boltops.mla.flash_mla_sparse_fwd"):
+                module.rocm_sparse_attn_prefill(*args)
+            assert not calls
+    finally:
+        patch._require_flashmla_prefill_ready.cache_clear()
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
