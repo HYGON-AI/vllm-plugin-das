@@ -8,6 +8,7 @@
   "rocm": {
     "environment": "ROCM_PATH",
     "version_file": ".info/rocm_version",
+    "match": "release_line",
     "version": "26.04"
   },
   "distributions": {
