@@ -103,19 +103,26 @@ _SPARSE_MLA_PARAMETERS = (
 
 
 @functools.cache
-def _resolve_sparse_mla_fwd() -> Callable:
-    """Resolve the sparse MLA kernel once under the custom-op master gate."""
+def _resolve_sparse_mla_fwd(backend: str | None = None) -> Callable:
+    """Resolve an explicit provider, or retain the shared master-gate policy."""
     from vllm_hcu.platforms import envs as henvs
 
-    if henvs.optional_custom_op_enabled():
+    if backend not in (None, "flashmla", "boltops"):
+        raise ValueError(f"Unknown sparse MLA backend: {backend!r}")
+    if backend == "flashmla" or (
+        backend is None and henvs.optional_custom_op_enabled()
+    ):
         return _native_flash_mla_sparse_fwd
 
     try:
         from boltops.mla import flash_mla_sparse_fwd as boltops_sparse_mla_fwd
     except (AttributeError, ImportError) as exc:
+        context = (
+            "Sparse MLA backend=boltops" if backend == "boltops"
+            else "VLLM_HCU_USE_CUSTOM_OPS=0"
+        )
         raise RuntimeError(
-            "VLLM_HCU_USE_CUSTOM_OPS=0 requires "
-            "boltops.mla.flash_mla_sparse_fwd"
+            f"{context} requires boltops.mla.flash_mla_sparse_fwd"
         ) from exc
 
     parameters = signature(boltops_sparse_mla_fwd).parameters
@@ -130,7 +137,7 @@ def _resolve_sparse_mla_fwd() -> Callable:
             "audited BoltOPs 0.1.0 contract"
         )
     logger.info_once(
-        "VLLM_HCU_USE_CUSTOM_OPS=0: using BoltOPs Triton sparse MLA"
+        "Using BoltOPs Triton sparse MLA"
     )
     return boltops_sparse_mla_fwd
 
@@ -144,9 +151,11 @@ def flash_mla_sparse_fwd(
     attn_sink: torch.Tensor | None = None,
     topk_length: torch.Tensor | None = None,
     config: dict | None = None,
+    *,
+    backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch sparse MLA to native FlashMLA or the BoltOPs fallback."""
-    kernel = _resolve_sparse_mla_fwd()
+    kernel = _resolve_sparse_mla_fwd(backend)
     if kernel is _native_flash_mla_sparse_fwd:
         return kernel(
             q,

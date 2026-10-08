@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""FlashMLA sparse prefill/decode for native ROCm DeepSeek-V4."""
+"""Sparse prefill/decode for native ROCm DeepSeek-V4.
+
+Both paths require VLLM_HCU_USE_CUSTOM_OPS and their individual enable flags.
+VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND selects "flashmla" (default)
+or "boltops" for prefill only. Decode always requires native FlashMLA.
+Set these variables before starting the worker; providers are cached.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +45,18 @@ def _flashmla_prefill_enabled() -> bool:
     return henvs.optional_custom_op_enabled(
         henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL
     )
+
+
+def _prefill_backend() -> str:
+    from vllm_hcu.platforms import envs as henvs
+
+    backend = henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND
+    if backend not in ("flashmla", "boltops"):
+        raise ValueError(
+            "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND must be "
+            f"flashmla or boltops, got {backend!r}"
+        )
+    return backend
 
 
 def _flashmla_decode_supports_heads(num_heads: int) -> bool:
@@ -87,13 +105,11 @@ def _require_flashmla_ready() -> None:
 @functools.cache
 def _require_flashmla_prefill_ready() -> None:
     """Validate the selected sparse-prefill provider before model execution."""
-    from vllm_hcu.platforms import envs as henvs
-
-    if not henvs.optional_custom_op_enabled():
+    if _prefill_backend() == "boltops":
         from vllm_hcu.v1.attention.ops.flashmla import _resolve_sparse_mla_fwd
 
         # Reuse the dispatcher's BoltOPs availability and signature checks.
-        _resolve_sparse_mla_fwd()
+        _resolve_sparse_mla_fwd("boltops")
         return
     _require_flashmla_sparse_kernel("prefill")
     if not torch.cuda.is_available():
@@ -425,6 +441,7 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
             d_v=head_dim,
             attn_sink=attn_sink,
             topk_length=topk_length,
+            backend=_prefill_backend(),
         )
         output.copy_(chunk_output.to(output.dtype))
 

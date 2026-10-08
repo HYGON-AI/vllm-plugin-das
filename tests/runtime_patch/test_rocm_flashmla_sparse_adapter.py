@@ -17,6 +17,7 @@ from vllm_hcu.platforms import envs as henvs
 @pytest.fixture(autouse=True)
 def custom_ops_enabled(monkeypatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv("VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND", raising=False)
 
 
 def _build_module(ratio, batch, calls, local_heads=4, cache_dtype="fp8_ds_mla"):
@@ -525,9 +526,11 @@ def test_adaptive_splits_reaches_native_decode(monkeypatch):
 
 @pytest.mark.parametrize("heads", [64, 128])
 @pytest.mark.parametrize("already_patched", [False, True])
+@pytest.mark.parametrize("backend", ["flashmla", "boltops"])
 def test_master_disabled_retains_rocm_attention_and_metadata(
-    monkeypatch, heads, already_patched
+    monkeypatch, heads, already_patched, backend
 ):
+    monkeypatch.setenv("VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND", backend)
     calls = []
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", True)
@@ -578,3 +581,100 @@ def test_master_disabled_retains_rocm_attention_and_metadata(
     assert "ragged_swa" in calls and "ragged_mla" in calls
     assert "dense_swa" not in calls and "dense_mla" not in calls
     assert "aiter" in calls and "aiter_prefill_kernel" in calls
+
+
+@pytest.mark.parametrize("backend", ["flashmla", "boltops"])
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("available", [False, True])
+def test_explicit_prefill_provider(monkeypatch, backend, heads, available):
+    import importlib.util
+    from pathlib import Path
+
+    monkeypatch.setenv("VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND", backend)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", True)
+    calls = []
+
+    def kernel(
+        q, kv, indices, softmax_scale, d_v=512, attn_sink=None,
+        topk_length=None, config=None,
+    ):
+        calls.append((indices, topk_length, softmax_scale))
+        return torch.ones_like(q), None, None
+
+    # Make only the selected provider available; no implicit cross-provider fallback.
+    for name in (
+        "flash_mla", "flash_mla.cuda", "flash_mla.flash_mla_interface",
+        "boltops", "boltops.mla",
+    ):
+        monkeypatch.setitem(sys.modules, name, None)
+    if available and backend == "boltops":
+        boltops = ModuleType("boltops")
+        boltops.__path__ = []
+        mla = ModuleType("boltops.mla")
+        mla.flash_mla_sparse_fwd = kernel
+        monkeypatch.setitem(sys.modules, "boltops", boltops)
+        monkeypatch.setitem(sys.modules, "boltops.mla", mla)
+    if available and backend == "flashmla":
+        native = ModuleType("flash_mla")
+        native.__path__ = []
+        cuda = ModuleType("flash_mla.cuda")
+        cuda.sparse_prefill_fwd = kernel
+        interface = ModuleType("flash_mla.flash_mla_interface")
+        interface.flash_mla_cuda = cuda
+        interface.FlashMLASchedMeta = object
+        interface.flash_mla_sparse_fwd = kernel
+        interface.flash_mla_with_kvcache = kernel
+        interface.get_mla_metadata = lambda: (None, None)
+        monkeypatch.setitem(sys.modules, "flash_mla", native)
+        monkeypatch.setitem(sys.modules, "flash_mla.cuda", cuda)
+        monkeypatch.setitem(sys.modules, "flash_mla.flash_mla_interface", interface)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            torch.cuda, "get_device_properties",
+            lambda _: SimpleNamespace(gcnArchName="gfx938"),
+        )
+
+    name = "vllm_hcu.v1.attention.ops.flashmla"
+    source = Path(patch.__file__).parents[3] / "v1/attention/ops/flashmla.py"
+    spec = importlib.util.spec_from_file_location(name, source)
+    flashmla = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, flashmla)
+    spec.loader.exec_module(flashmla)
+    module, _, _, _ = _build_module(1, 2, [])
+    assert patch.apply_to_module(module)
+    q = torch.zeros(2, heads, 512, dtype=torch.bfloat16)
+    output = torch.zeros_like(q)
+    indices = torch.tensor([[0, 1, -1, -1], [0, 1, 2, -1]], dtype=torch.int32)
+    lengths = torch.tensor([2, 3], dtype=torch.int32)
+    args = (
+        q, torch.zeros(3, 1, 512, dtype=torch.bfloat16), indices, lengths,
+        0.125, 512, 448, 64, torch.zeros(heads), output,
+    )
+    patch._require_flashmla_prefill_ready.cache_clear()
+    try:
+        if available:
+            module.rocm_sparse_attn_prefill(*args)
+            assert torch.all(output == 1)
+            assert len(calls) == 1
+            actual_indices, actual_lengths, scale = calls[0]
+            assert torch.equal(actual_indices, indices.unsqueeze(1))
+            assert actual_lengths is lengths
+            assert scale == 0.125
+            if backend == "boltops":
+                with pytest.raises(RuntimeError, match="decode unavailable"):
+                    patch._require_flashmla_sparse_kernel("decode")
+        else:
+            with pytest.raises(RuntimeError):
+                module.rocm_sparse_attn_prefill(*args)
+            assert not calls
+    finally:
+        patch._require_flashmla_prefill_ready.cache_clear()
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+
+def test_invalid_prefill_backend(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND", "invalid")
+    with pytest.raises(ValueError, match="must be flashmla or boltops"):
+        patch._prefill_backend()
