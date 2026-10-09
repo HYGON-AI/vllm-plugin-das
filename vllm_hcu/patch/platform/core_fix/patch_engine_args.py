@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass as official_dataclass
@@ -19,6 +20,7 @@ from typing import Any
 
 from vllm_hcu.patch.config import (
     HcuFeatureConfig,
+    bind_hcu_eplb_config,
     get_hcu_config,
     normalize_hcu_moe_backend,
     set_hcu_config,
@@ -45,6 +47,12 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_custom_sp",
     "enable_multi_layers_mtp",
 )
+_HCU_EPLB_FIELDS = {
+    "expert_map_path": "expert_map_path",
+    "expert_map_record_path": "expert_map_record_path",
+    "disable_rearrange": "eplb_disable_rearrange",
+    "static_dispatch_policy": "eplb_static_dispatch_policy",
+}
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
@@ -92,6 +100,7 @@ def _require_engine_args_class(module: ModuleType, name: str) -> type:
         "attention_config",
         "moe_backend",
         "kernel_config",
+        "eplb_config",
         "speculative_config",
     }
     if not required.issubset(parameters):
@@ -115,6 +124,13 @@ def _normalise_constructor_kwargs(
         for name in _HCU_BOOLEAN_KWARGS
         if name in kwargs
     }
+    eplb_payload = kwargs.get("eplb_config")
+    if isinstance(eplb_payload, Mapping):
+        official_eplb = dict(eplb_payload)
+        for public_name, sidecar_name in _HCU_EPLB_FIELDS.items():
+            if public_name in official_eplb:
+                updates[sidecar_name] = official_eplb.pop(public_name)
+        kwargs["eplb_config"] = official_eplb
     # Bind after removing HCU-only keywords so positional official arguments
     # (especially additional_config) participate in normalization instead of
     # being overwritten by a default sidecar after construction.
@@ -521,21 +537,34 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(add_cli_args)
     def hcu_add_cli_args(parser):
         result = add_cli_args(parser)
-        for action in getattr(result, "_actions", ()):
-            if getattr(action, "dest", None) != "all2all_backend":
-                continue
-            choices = getattr(action, "choices", None)
-            if choices is None:
-                raise PatchCompatibilityError(
-                    "--all2all-backend CLI action has no audited choices"
-                )
-            if _DEEPEP_AUTO_BACKEND not in choices:
-                action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
-            break
-        else:
+        actions = {
+            getattr(action, "dest", None): action
+            for action in getattr(result, "_actions", ())
+        }
+        all2all_action = actions.get("all2all_backend")
+        if all2all_action is None:
             raise PatchCompatibilityError(
                 "EngineArgs.add_cli_args did not install --all2all-backend"
             )
+        choices = getattr(all2all_action, "choices", None)
+        if choices is None:
+            raise PatchCompatibilityError(
+                "--all2all-backend CLI action has no audited choices"
+            )
+        if _DEEPEP_AUTO_BACKEND not in choices:
+            all2all_action.choices = tuple(choices) + (_DEEPEP_AUTO_BACKEND,)
+
+        eplb_action = actions.get("eplb_config")
+        if eplb_action is None or not callable(getattr(eplb_action, "type", None)):
+            raise PatchCompatibilityError(
+                "EngineArgs.add_cli_args did not install an audited "
+                "--eplb-config converter"
+            )
+        # Upstream eagerly constructs EPLBConfig inside argparse.  Delay that
+        # validation so the wrapped EngineArgs constructor can first extract
+        # the HCU-owned offline fields and then pass only official fields to
+        # EPLBConfig.
+        eplb_action.type = json.loads
         return result
 
     setattr(engine_args, "_vllm_hcu_original_add_cli_args", add_cli_descriptor)
@@ -563,6 +592,7 @@ def apply_to_module(module: ModuleType) -> bool:
                     "VllmConfig did not retain normalized HCU field "
                     f"{name!r}: expected {expected!r}, got {resolved[name]!r}"
                 )
+        bind_hcu_eplb_config(config)
         return config
 
     setattr(engine_args, "_vllm_hcu_original_create_engine_config", create_engine_config)

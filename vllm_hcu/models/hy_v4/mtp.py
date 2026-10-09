@@ -34,6 +34,7 @@ from .model import (
     _normalize_hyv4_config,
     _rewrite_hyv4_weight_name,
 )
+from .moe import validate_hyv4_offline_eplb_mode
 
 
 def _make_mtp_layer_config(config, layer_idx: int):
@@ -270,6 +271,12 @@ class HYV4MultiTokenPredictor(nn.Module, MixtureOfExperts):
         if getattr(config, "num_nextn_predict_layers", 1) != 1:
             raise ValueError("HYV4 MTP requires exactly one checkpoint draft layer")
         self.config = config
+        self._vllm_hcu_offline_eplb_mode = (
+            validate_hyv4_offline_eplb_mode(
+                vllm_config,
+                enable_eplb=vllm_config.parallel_config.enable_eplb,
+            )
+        )
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = 1
         # Serialized names still follow the target's explicit format when the
@@ -400,6 +407,9 @@ class HYV4MTP(nn.Module, MixtureOfExperts, SupportsPP):
         super().__init__()
         self.model = HYV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"),
+        )
+        self._vllm_hcu_offline_eplb_mode = (
+            getattr(self.model, "_vllm_hcu_offline_eplb_mode", None)
         )
         self.config = self.model.config
         self.quant_config = self.model.quant_config
