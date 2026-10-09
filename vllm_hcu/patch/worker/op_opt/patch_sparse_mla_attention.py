@@ -85,9 +85,21 @@ def apply_to_module(module: ModuleType) -> bool:
             if kv_cache_dtype in {"bfloat16", "float16"}
             else kv_cache_dtype
         )
+        k_pe_cache = k_pe.squeeze(1)
+        if kv_cache_dtype == "fp8_ds_mla" and k_pe_cache.shape[-1] == 0:
+            # The packed DS FP8 MLA layout reserves 64 BF16 RoPE values.
+            # GLM5Next is a native NoPE model, so keep that reserved region
+            # zero without changing its attention math.
+            zero_pe = getattr(self, "_fp8_nope_pe_buffer", None)
+            if zero_pe is not None:
+                if kv_c_normed.shape[0] > zero_pe.shape[0]:
+                    raise RuntimeError("NoPE query exceeds preallocated RoPE buffer")
+                k_pe_cache = zero_pe[: kv_c_normed.shape[0]]
+            else:
+                k_pe_cache = kv_c_normed.new_zeros((kv_c_normed.shape[0], 64))
         op(
             kv_c_normed,
-            k_pe.squeeze(1),
+            k_pe_cache,
             kv_cache,
             slot_mapping.flatten(),
             operator_kv_cache_dtype,
@@ -96,8 +108,8 @@ def apply_to_module(module: ModuleType) -> bool:
         return None
 
     setattr(hcu_cache_update, _WRAPPER, True)
-    setattr(sparse, "_vllm_hcu_original_do_kv_cache_update", cache_update)
-    setattr(sparse, "do_kv_cache_update", hcu_cache_update)
+    sparse._vllm_hcu_original_do_kv_cache_update = cache_update
+    sparse.do_kv_cache_update = hcu_cache_update
     setattr(sparse_module, _MARKER, True)
     return True
 
@@ -106,4 +118,4 @@ def apply(module: ModuleType | None = None) -> bool:
     return apply_to_module(load_exact_module(TARGET_MODULE, module))
 
 
-__all__ = ["PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply_to_module"]
+__all__ = ["PATCH_ID", "TARGETS", "TARGET_MODULE", "apply", "apply_to_module"]
