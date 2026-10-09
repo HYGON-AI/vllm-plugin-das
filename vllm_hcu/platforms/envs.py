@@ -139,7 +139,8 @@ def indexer_kcache_layout() -> str:
     HCU Triton direct reader. ``normal`` writes token-major pages and decodes
     them with LightOp ``paged_mqa_logits``. The layout is part of the KV-cache
     contents, so every rank and every disaggregated prefill/decode peer must
-    use the same value.
+    use the same value. Disabling the HCU custom-op master switch always keeps
+    the official ``preshuffle`` layout.
     """
 
     raw = os.environ.get(INDEXER_KCACHE_LAYOUT_ENV, "preshuffle").strip().lower()
@@ -148,6 +149,8 @@ def indexer_kcache_layout() -> str:
             f"{INDEXER_KCACHE_LAYOUT_ENV} must be one of "
             f"{INDEXER_KCACHE_LAYOUTS}, got {raw!r}"
         )
+    if not custom_ops_enabled():
+        return "preshuffle"
     return raw
 
 

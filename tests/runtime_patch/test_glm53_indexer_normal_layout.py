@@ -97,6 +97,7 @@ def test_pinned_constexpr_rejects_unknown_argument() -> None:
     [(None, "preshuffle"), ("NORMAL", "normal"), (" preshuffle ", "preshuffle")],
 )
 def test_indexer_kcache_layout_env(monkeypatch, raw, expected) -> None:
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     if raw is None:
         monkeypatch.delenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, raising=False)
     else:
@@ -104,7 +105,17 @@ def test_indexer_kcache_layout_env(monkeypatch, raw, expected) -> None:
     assert henvs.indexer_kcache_layout() == expected
 
 
+@pytest.mark.parametrize("master", ["0", "false", "False"])
+def test_indexer_kcache_normal_layout_respects_custom_ops_master(
+    monkeypatch, master: str
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, "normal")
+    assert henvs.indexer_kcache_layout() == "preshuffle"
+
+
 def test_indexer_kcache_layout_env_rejects_unknown_value(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     monkeypatch.setenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, "shuffle")
     with pytest.raises(ValueError, match="shuffle"):
         henvs.indexer_kcache_layout()
@@ -126,9 +137,16 @@ def test_dispatcher_rejects_unknown_kcache_layout() -> None:
         )
 
 
-@pytest.mark.parametrize("layout", ["preshuffle", "normal"])
+@pytest.mark.parametrize(
+    ("layout", "custom_ops", "normal"),
+    [
+        ("preshuffle", "1", False),
+        ("normal", "1", True),
+        ("normal", "0", False),
+    ],
+)
 def test_glm5next_layout_env_selects_writers_and_decode_reader(
-    monkeypatch, layout: str
+    monkeypatch, layout: str, custom_ops: str, normal: bool
 ) -> None:
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
 
@@ -136,6 +154,7 @@ def test_glm5next_layout_env_selects_writers_and_decode_reader(
 
     logs = _record_layout_logs(monkeypatch)
     monkeypatch.setenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, layout)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
     monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: True)
     _restore_upstream_sparse(monkeypatch, upstream_sparse)
     calls = []
@@ -157,7 +176,6 @@ def test_glm5next_layout_env_selects_writers_and_decode_reader(
         torch.empty(0),
         16,
     )
-    normal = layout == "normal"
     assert ("kcache_layout" in calls[0]) is normal
     if normal:
         assert calls[0]["kcache_layout"] == "normal"
@@ -172,7 +190,8 @@ def test_glm5next_layout_env_selects_writers_and_decode_reader(
             assert pinned is normal
     assert len(logs) == 1
     assert logs[0][0] == "info"
-    assert f"layout: {layout} " in logs[0][1]
+    expected_layout = "normal" if normal else "preshuffle"
+    assert f"layout: {expected_layout} " in logs[0][1]
 
 
 def test_glm5next_normal_layout_is_ignored_off_gfx938(monkeypatch) -> None:
@@ -181,6 +200,7 @@ def test_glm5next_normal_layout_is_ignored_off_gfx938(monkeypatch) -> None:
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
 
     logs = _record_layout_logs(monkeypatch)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv(henvs.INDEXER_KCACHE_LAYOUT_ENV, "normal")
     monkeypatch.setattr(hcu_sparse, "on_gfx938", lambda: False)
     _restore_upstream_sparse(monkeypatch, upstream_sparse)
