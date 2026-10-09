@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from boltops.fused_moe.triton import moe_op as _moe_op
 from boltops.fused_moe.triton.moe_op import fused_moe as invoke_fused_moe_kernel
 from boltops.fused_moe.triton.moe_config_utils import try_get_optimal_moe_config
 from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
@@ -228,7 +229,9 @@ def lib_configs(w1, w2, topk, M):
     return c1, c2
 
 
-# Tuned for this path by bench_moe/tune_ep.py + select_ep.py:
+# Tuned for this path by bench_moe/tune_ep.py + select_ep.py; the Step5 decode entry (M=128)
+# by bench_moe/tune_real.py + tune_persist.py on captured routing (clumped, unlike tune_ep's
+# uniform random routing). A cfg with PERSISTENT_PROGRAMS runs the persistent kernel.
 # {"E=..,N=..,K=..,topk=..": {M: [gemm1_cfg, gemm2_cfg]}}, nearest M wins (same rule as boltops).
 # Shapes without an entry fall back to the library tables.
 EP_TABLE_PATH = os.environ.get(
@@ -249,6 +252,64 @@ def pick_configs(w1, w2, topk, M):
     if t:
         return t[min(t, key=lambda x: abs(x - M))]
     return lib_configs(w1, w2, topk, M)
+
+
+def _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
+                       sorted_w, expert_ids, nvalid, top_k, compute_type, c_sorted=False,
+                       a_sorted=False, bottom_a_use_mls_load=False, ck_topk=8, config=None):
+    """boltops' persistent fused_moe launch (fp8 per-channel, ck sorting) with its program
+    count taken from config["PERSISTENT_PROGRAMS"] instead of 2 x CUs.
+
+    The regular kernel's grid covers the static sorted-layout bound (~105 M-blocks at
+    M=128, EP8) while decode routing fills ~22, and the programs past nvalid only exit:
+    12 us of a 180 us GEMM1 and 30 us of a 110 us GEMM2. The persistent kernel strides
+    over the tiles below nvalid, so a program count near the usual valid tile count
+    keeps one tile per program without the exit-only tail.
+    """
+    cfg = dict(config)
+    nprog = cfg.pop("PERSISTENT_PROGRAMS")
+    for k in ("N_TILES_PER_CTA", "SPLIT_K"):
+        cfg.pop(k, None)
+    bk = cfg.pop("BLOCK_SIZE_K")
+    combine = cfg.pop("COMBINE_SCALE_LOAD", False)
+    cfg.setdefault("USE_MLS_LOAD", False)
+    lim = 2**32 - 1
+    EM = sorted_ids.size(0)
+    N = B.size(1)
+    grid = (min(nprog, triton.cdiv(EM, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])),)
+    _moe_op.fused_moe_persistent_kernel[grid](
+        A, B, C, topk_weights, nvalid, expert_ids, sorted_ids, sorted_w, A_scale, B_scale,
+        N, B.size(2), EM, topk_ids.numel(),
+        A.stride(0), A.stride(1), B.stride(0), B.stride(2), B.stride(1),
+        C.stride(-2), C.stride(-1),
+        A_scale.stride(0) if A_scale.ndim == 2 else 0,
+        A_scale.stride(1) if A_scale.ndim == 2 else 0,
+        B_scale.stride(0) if B_scale.ndim >= 2 else 0,
+        B_scale.stride(2) if B_scale.ndim == 3 else 0,
+        B_scale.stride(1) if B_scale.ndim >= 2 else 0,
+        A.size(0), 0, 0,
+        MUL_ROUTED_WEIGHT=False,
+        USE_ADDR_OFFSET_INT64_A=A.numel() * A.element_size() >= lim,
+        USE_ADDR_OFFSET_INT64_B=B.numel() * B.element_size() >= lim,
+        USE_ADDR_OFFSET_INT64_C=C.numel() * C.element_size() >= lim,
+        top_k=top_k, compute_type=compute_type, use_fp8_w8a8=True, use_int8_w8a8=False,
+        use_int8_w8a16=False, per_channel_quant=True, c_sorted=c_sorted, a_sorted=a_sorted,
+        bottom_a_use_mls_load=bottom_a_use_mls_load, ck_sorting=True, ck_topk=ck_topk,
+        NUM_SMS=nprog, NUM_XCDS=1, BLOCK_SIZE_K=bk, COMBINE_SCALE_LOAD=combine, **cfg)
+
+
+def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+          expert_ids, nvalid, top_k, compute_type, config, **kw):
+    if "PERSISTENT_PROGRAMS" in config:
+        kw.pop("scale_bias_with_routed_weight", None)  # only acts on a bias; there is none
+        _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
+                           sorted_w, expert_ids, nvalid, top_k, compute_type, config=config,
+                           **{k: v for k, v in kw.items() if k != "ck_sorting"})
+        return
+    invoke_fused_moe_kernel(A, B, C, A_scale, B_scale, None, topk_weights, topk_ids,
+                            sorted_ids, sorted_w, expert_ids, nvalid, False, top_k,
+                            compute_type=compute_type, use_fp8_w8a8=True,
+                            per_channel_quant=True, config=config, **kw)
 
 
 # Largest M per call; vLLM's MoE chunk size, so normally a single chunk.
@@ -298,20 +359,18 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
 
     dev = hidden_states.device
     cache1 = _carve(workspace13, (rows, N), out_dtype, dev)
-    invoke_fused_moe_kernel(a_q, w1, cache1, a_s, w1_scale, None, topk_weights, topk_ids,
-                            sorted_ids, sorted_w, expert_ids, nvalid, False, topk,
-                            compute_type=compute_type, use_fp8_w8a8=True, per_channel_quant=True,
-                            c_sorted=True, ck_sorting=True, ck_topk=topk, config=cfg1)
+    _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+          expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
+          ck_topk=topk)
     act_q, act_s = ep_swiglustep_quant(cache1, sorted_w, nvalid, rows,
                                        7.0 if gemm1_limit is None else gemm1_limit,
                                        q=_carve(workspace2, (rows, N // 2), FP8, dev))
     del cache1
     cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev)
-    invoke_fused_moe_kernel(act_q, w2, cache3, act_s, w2_scale, None, topk_weights, topk_ids,
-                            sorted_ids, sorted_w, expert_ids, nvalid, False, 1,
-                            compute_type=compute_type, use_fp8_w8a8=True, per_channel_quant=True,
-                            a_sorted=True, bottom_a_use_mls_load=use_mls, ck_sorting=True,
-                            ck_topk=topk, scale_bias_with_routed_weight=True, config=cfg2)
+    _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+          expert_ids, nvalid, 1, compute_type, cfg2, a_sorted=True,
+          bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
+          scale_bias_with_routed_weight=True)
     if out is None:
         out = torch.empty((M, K), dtype=out_dtype, device=dev)
     add = shared_add_provider(out) if shared_add_provider is not None else None

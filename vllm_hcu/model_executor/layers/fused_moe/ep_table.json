@@ -330,7 +330,7 @@
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 256,
-    "GROUP_SIZE_M": 1,
+    "GROUP_SIZE_M": 8,
     "COMBINE_SCALE_LOAD": false,
     "USE_MLS_LOAD": true,
     "schedule_hint": "none",
@@ -338,14 +338,15 @@
     "kpack": 1,
     "use_block_pingpong": false,
     "buffer_cache_swizzle": false,
-    "num_warps": 1,
-    "num_stages": 2
+    "num_warps": 2,
+    "num_stages": 1,
+    "PERSISTENT_PROGRAMS": 2048
    },
    {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 256,
-    "GROUP_SIZE_M": 1,
+    "GROUP_SIZE_M": 8,
     "COMBINE_SCALE_LOAD": false,
     "USE_MLS_LOAD": false,
     "schedule_hint": "none",
@@ -353,9 +354,10 @@
     "kpack": 1,
     "use_block_pingpong": false,
     "buffer_cache_swizzle": false,
-    "num_warps": 1,
+    "num_warps": 2,
     "num_stages": 1,
-    "bottom_a_use_mls_load": false
+    "bottom_a_use_mls_load": false,
+    "PERSISTENT_PROGRAMS": 1024
    }
   ],
   "192": [
