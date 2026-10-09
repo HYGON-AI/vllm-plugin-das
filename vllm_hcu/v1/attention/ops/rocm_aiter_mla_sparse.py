@@ -773,6 +773,7 @@ def rocm_fp8_paged_mqa_logits(
     max_model_len: int,
     *,
     force_aiter_triton: bool = False,
+    kcache_layout: str = "preshuffle",
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -784,13 +785,16 @@ def rocm_fp8_paged_mqa_logits(
             add singleton dimensions before the packed D+4 dimension. The last
             4 bytes per (block,pos) store the `float` dequant scale.
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
-        context_lens: Tensor of shape [B], dtype int32; effective context length
-            for each batch element.
+        context_lens: Tensor of shape [B] or [B, next_n], dtype int32;
+            effective context length per batch element or per query token.
         block_tables: Tensor of shape [B, max_blocks], dtype int32; maps logical
             block indices to physical blocks in the paged cache.
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
+        kcache_layout: Page layout of gfx938 caches with block_size > 1:
+            "preshuffle" (16x16 tiles) or "normal" (token-major). "normal"
+            is rejected on other platforms.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -798,11 +802,15 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
+    if kcache_layout not in henvs.INDEXER_KCACHE_LAYOUTS:
+        raise ValueError(f"Unsupported indexer K-cache layout: {kcache_layout!r}")
     batch_size, next_n = q_fp8.shape[:2]
     kv_cache_fp8 = _paged_mqa_cache_kernel_view(kv_cache_fp8)
     is_gfx938 = on_gfx938()
     if is_gfx938:
         kv_cache_fp8 = _indexer_cache_as_hipc_view(kv_cache_fp8)
+    elif kcache_layout == "normal":
+        raise ValueError("kcache_layout='normal' is only supported on gfx938")
     block_size = kv_cache_fp8.shape[1]
 
     if is_gfx938 and block_size not in (1, 16, 32, 64):
@@ -812,6 +820,31 @@ def rocm_fp8_paged_mqa_logits(
         if force_aiter_triton:
             raise RuntimeError(
                 "AITER paged-MQA does not support gfx938 preshuffled KPool pages"
+            )
+        if kcache_layout == "normal":
+            # LightOp paged_mqa_logits reads token-major pages only. It
+            # rejects next_n > 2 and ignores per-query [B, next_n] lengths,
+            # so each MTP verify token becomes its own batch row.
+            if next_n > 1:
+                if context_lens.ndim == 1:
+                    offsets = torch.arange(
+                        next_n, dtype=context_lens.dtype, device=context_lens.device
+                    )
+                    context_lens = (
+                        context_lens[:, None] - next_n + 1 + offsets
+                    ).clamp_min(0)
+                q_fp8 = q_fp8.reshape(batch_size * next_n, 1, *q_fp8.shape[2:])
+                block_tables = block_tables.repeat_interleave(next_n, dim=0)
+            context_lens = context_lens.reshape(batch_size * next_n).contiguous()
+            return _get_lightop_attention().paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights.float().contiguous(),
+                context_lens,
+                block_tables,
+                schedule_meta=None,
+                max_context_len=max_model_len,
+                clean_logits=False,
             )
         return gfx938_fp8_paged_mqa_logits(
             q_fp8,
@@ -879,6 +912,7 @@ def rocm_fp8_paged_mqa_logits(
         )
         return out_qk.sum(dim=0)
     elif is_gfx938 and block_size == 1:
+        # One-token pages are identical in both layouts.
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )

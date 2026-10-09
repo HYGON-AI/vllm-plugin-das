@@ -42,6 +42,8 @@ _GATE_DEEPGEMM_PATCH_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_applied"
 _GATE_DEEPGEMM_WRAPPER_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_wrapper"
 _GATE_DEEPGEMM_ENV = "VLLM_HCU_GLM53_GATE_UP_DEEPGEMM"
 _LOGGER = init_logger(__name__)
+# Under the configured "vllm" logger so the layout reaches the server log.
+_LAYOUT_LOGGER = init_logger("vllm.hcu.glm5next_indexer_kcache")
 
 # Channel-INT8 checkpoints quantize a few MLA/indexer projections that the
 # official FP8 checkpoint keeps in BF16, so they are intentionally absent from
@@ -560,6 +562,71 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
     return True
 
 
+# Official ROCm writers and prefill gather of the sparse-indexer K cache, with
+# the constexpr that selects 16x16 preshuffled pages and its token-major value.
+_NORMAL_LAYOUT_KPOOL_KERNELS = (
+    ("_kpool_softmax_rotate_write_cache_kernel", "PRESHUFFLE", False),
+    ("_kpool_decode_update_batched_kernel", "PRESHUFFLE", False),
+)
+_NORMAL_LAYOUT_SPARSE_KERNELS = (
+    ("_indexer_k_quant_and_cache_kernel", "LAYOUT", "NORMAL"),
+    ("_cp_gather_indexer_quant_cache_kernel", "LAYOUT", "NORMAL"),
+)
+
+
+class _PinnedConstexprKernel:
+    """Launch a Triton kernel with one constexpr argument pinned to a value."""
+
+    def __init__(self, kernel, name: str, value) -> None:
+        arg_names = list(getattr(kernel, "arg_names", ()))
+        if name not in arg_names:
+            raise PatchCompatibilityError(
+                f"Triton kernel {kernel!r} has no constexpr {name!r}"
+            )
+        self.kernel = kernel
+        self.name = name
+        self.value = value
+        self.index = arg_names.index(name)
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def run(*args, **kwargs):
+            if len(args) > self.index:
+                args = (*args[: self.index], self.value, *args[self.index + 1 :])
+            else:
+                kwargs[self.name] = self.value
+            return launch(*args, **kwargs)
+
+        return run
+
+    def __getattr__(self, attr):
+        return getattr(self.__dict__["kernel"], attr)
+
+
+def _install_normal_indexer_kcache_layout(
+    kpool: ModuleType, sparse: ModuleType
+) -> None:
+    """Write and gather token-major index-K pages for the LightOp decode reader."""
+    kpool_ops = vars(kpool).get("kpool_ops")
+    if not isinstance(kpool_ops, ModuleType):
+        raise PatchCompatibilityError(
+            f"required module {KPOOL_MODULE}.kpool_ops is missing"
+        )
+    for module, kernels in (
+        (kpool_ops, _NORMAL_LAYOUT_KPOOL_KERNELS),
+        (sparse, _NORMAL_LAYOUT_SPARSE_KERNELS),
+    ):
+        for attr, name, value in kernels:
+            kernel = vars(module).get(attr)
+            if kernel is None:
+                raise PatchCompatibilityError(
+                    f"required kernel {module.__name__}.{attr} is missing"
+                )
+            if not isinstance(kernel, _PinnedConstexprKernel):
+                setattr(module, attr, _PinnedConstexprKernel(kernel, name, value))
+
+
 def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
     from vllm_hcu.v1.attention.ops.lightop_kpool_topk_transform import (
         install_lightop_kpool_topk_transform,
@@ -601,7 +668,16 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
     # GLM5Next process; preserve the shared HCU fallback policy for all other
     # sparse models.
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+    from vllm_hcu.platforms import envs as henvs
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    normal_layout = henvs.indexer_kcache_layout() == "normal"
+    if normal_layout and not hcu_sparse.on_gfx938():
+        _LAYOUT_LOGGER.warning(
+            "%s=normal only applies to gfx938; keeping the official layout",
+            henvs.INDEXER_KCACHE_LAYOUT_ENV,
+        )
+        normal_layout = False
 
     def glm5next_fp8_mqa_logits(*args, **kwargs):
         return hcu_sparse.rocm_fp8_mqa_logits(
@@ -616,6 +692,8 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
         physical_page_size = hcu_sparse._indexer_cache_as_hipc_view(cache).shape[1]
         default_force_aiter = not hcu_sparse.on_gfx938() or physical_page_size == 1
         force_aiter = kwargs.pop("force_aiter_triton", default_force_aiter)
+        if normal_layout:
+            kwargs.setdefault("kcache_layout", "normal")
         return hcu_sparse.rocm_fp8_paged_mqa_logits(
             *args,
             **kwargs,
@@ -631,6 +709,15 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
         )
     upstream_sparse.rocm_fp8_mqa_logits = glm5next_fp8_mqa_logits
     upstream_sparse.rocm_fp8_paged_mqa_logits = glm5next_fp8_paged_mqa_logits
+    if normal_layout:
+        _install_normal_indexer_kcache_layout(kpool, upstream_sparse)
+    _LAYOUT_LOGGER.info(
+        "GLM5Next sparse-indexer K-cache layout: %s (%s). All ranks and "
+        "prefill/decode peers must use the same layout; a mismatch silently "
+        "degrades accuracy.",
+        "normal" if normal_layout else "preshuffle",
+        henvs.INDEXER_KCACHE_LAYOUT_ENV,
+    )
 
     @functools.wraps(original)
     def hcu_forward_hip(
