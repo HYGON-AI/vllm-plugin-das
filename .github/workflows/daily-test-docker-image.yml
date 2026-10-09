@@ -36,7 +36,7 @@ jobs:
     runs-on: bw1100
     container:
       image: ${{ inputs.docker_image || format('{0}/{1}/vllm:0.28.1rc1.dev490-latest', vars.HARBOR_SITE, vars.HARBOR_NAMESPACE) }}
-      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
+      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri --shm-size=1g
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
         - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
@@ -52,19 +52,49 @@ jobs:
       - name: 安装 CItest
         run: |
           PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
-          pip install citest[evalscope] cinotificate \
+          pip install --upgrade --no-cache-dir citest[evalscope] evalscope cinotificate \
             -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
             --trusted-host "${PYPI_HOST}"
+          mkdir -p "${GITHUB_WORKSPACE}/citest-output"
+          python3 -m pip list --format=json > "${GITHUB_WORKSPACE}/citest-output/evaluator-packages.json"
 
       - name: 运行 CItest
+        id: evaluate
+        continue-on-error: true
         run: |
           CItest --test_tool evalscope \
                  --case_conf docker/image-citest-conf-hcu.yaml \
                  --models_path /models \
                  --output_dir "${GITHUB_WORKSPACE}/citest-output"
 
-      - name: 飞书通知
+      # CItest may return zero after a model failed to start or a sandbox
+      # dataset was skipped. Check every configured model/dataset score.
+      - name: 校验模型测试结果完整性
+        if: always() && steps.evaluate.outcome != 'skipped'
+        env:
+          EVALUATION_OUTCOME: ${{ steps.evaluate.outcome }}
         run: |
+          python3 .github/scripts/model_ci/validate_daily_results.py \
+            --case-conf docker/image-citest-conf-hcu.yaml \
+            --output-dir "${GITHUB_WORKSPACE}/citest-output" \
+            --evaluation-outcome "$EVALUATION_OUTCOME"
+
+      - name: 展示模型测试完整性
+        if: always()
+        run: |
+          if [ -f citest-output/completeness.md ]; then
+            cat citest-output/completeness.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '模型测试未生成完整性报告，请检查前置步骤。' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 飞书通知
+        if: always() && steps.evaluate.outcome != 'skipped'
+        run: |
+          if [ ! -f "${GITHUB_WORKSPACE}/citest-output/notificate.json" ]; then
+            echo 'CItest 未生成通知文件，请查看 Actions 汇总和归档日志。'
+            exit 0
+          fi
           CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
                        --json_key docker_image_name \
                        --json_value "${{ env.TEST_IMAGE }}"
@@ -79,8 +109,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: citest-output-${{ github.run_id }}
+          name: citest-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: citest-output/**
+          retention-days: 30
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
