@@ -147,24 +147,76 @@ def ep_masked_moe_sum(cache3, out, topk_ids, expert_map, scale=1.0, add=None, ad
 shared_add_provider = None
 
 
-def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm):
+@triton.jit
+def _ep_sort_kernel(ids_ptr, w_ptr, emap_ptr, sids_ptr, sw_ptr, eids_ptr, nvalid_ptr, M,
+                    TOPK: tl.constexpr, LE_P: tl.constexpr, BM: tl.constexpr,
+                    BLOCK_R: tl.constexpr):
+    # Same layout as moe_sorting_fwd with a local expert mask, for small M: one
+    # program per local expert x. Every program histograms all routes to find
+    # where x's block starts, then writes x's routes (in route order), its
+    # padding rows and its expert_ids entries. Non-local routes go to bin LE_P.
+    x = tl.program_id(0)
+    r = tl.arange(0, BLOCK_R)
+    rm = r < M * TOPK
+    le = tl.load(emap_ptr + tl.load(ids_ptr + r, mask=rm, other=0), mask=rm, other=-1)
+    le = tl.where(le < 0, LE_P, le)
+    cnt = tl.histogram(le, 2 * LE_P)
+    xs = tl.arange(0, 2 * LE_P)
+    padded = tl.where(xs < LE_P, (cnt + BM - 1) // BM * BM, 0)
+    start = tl.sum(tl.where(xs < x, padded, 0), axis=0)
+    n = tl.sum(tl.where(xs == x, cnt, 0), axis=0)
+    npad = (n + BM - 1) // BM * BM
+    mine = le == x
+    pos = start + tl.cumsum(mine.to(tl.int32), axis=0) - 1
+    tok = r // TOPK
+    tl.store(sids_ptr + pos, tok | ((r - tok * TOPK) << 24), mask=mine)
+    tl.store(sw_ptr + pos, tl.load(w_ptr + r, mask=mine, other=0.0), mask=mine)
+    j = tl.arange(0, BM)
+    pm = n + j < npad
+    tl.store(sids_ptr + start + n + j, tl.zeros((BM,), tl.int32) + (M | (TOPK << 24)), mask=pm)
+    tl.store(sw_ptr + start + n + j, tl.zeros((BM,), tl.float32), mask=pm)
+    for b in range(start // BM, (start + npad) // BM):
+        tl.store(eids_ptr + b, x)
+    if x == 0:
+        tl.store(nvalid_ptr, tl.sum(padded, axis=0))
+
+
+# Largest M*topk sorted by _ep_sort_kernel (all routes live in one tile); above
+# it moe_sorting_fwd is used. At decode sizes the Triton sort takes 3-6 us vs
+# 13-27 us for the CK multi-phase sort plus its workspace memset.
+EP_SORT_MAX_ROUTES = int(os.environ.get("EP_FUSED_MOE_SORT_MAX_ROUTES", "2048"))
+
+
+def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm, expert_map=None):
     """moe_sorting_ck with buffers bounded by the *local* expert count.
 
     Only local experts occupy the sorted layout, so its length is at most
     M*topk + min(M*topk, local_E)*(bm-1) rounded up to bm; the GEMM grid is sized from
     sorted_ids.size(0), which in boltops is padded for all global experts.
     No moe_buf: the sorting kernel would only zero it, and nothing here reads it.
+    With expert_map and few routes, sorts with _ep_sort_kernel (same output).
     """
     dev = topk_ids.device
     M, topk = topk_ids.shape
     routes = M * topk
     full = routes + global_E * bm - topk
     bound = min(full, triton.cdiv(routes + min(routes, local_E) * (bm - 1), bm) * bm)
+    nvalid = torch.empty((1,), dtype=torch.int32, device=dev)
+    if (expert_map is not None and 0 < routes <= EP_SORT_MAX_ROUTES
+            and topk_ids.is_contiguous() and topk_weights.is_contiguous()):
+        sorted_ids = torch.empty((bound,), dtype=torch.int32, device=dev)
+        sorted_w = torch.empty((bound,), dtype=torch.float32, device=dev)
+        expert_ids = torch.empty((bound // bm,), dtype=torch.int32, device=dev)
+        _ep_sort_kernel[(local_E,)](
+            topk_ids, topk_weights, expert_map, sorted_ids, sorted_w, expert_ids, nvalid, M,
+            TOPK=topk, LE_P=triton.next_power_of_2(local_E), BM=bm,
+            BLOCK_R=triton.next_power_of_2(routes),
+            num_warps=1 if routes <= 256 else 8)
+        return sorted_ids, sorted_w, expert_ids, nvalid, bound
     sorted_ids = torch.empty((full,), dtype=torch.int32, device=dev)
     sorted_w = torch.empty((full,), dtype=torch.float32, device=dev)
     expert_ids = torch.empty((triton.cdiv(full, bm),), dtype=torch.int32, device=dev)
     tpe = torch.empty((global_E * 2,), dtype=torch.int32, device=dev)
-    nvalid = torch.empty((1,), dtype=torch.int32, device=dev)
     moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_w, expert_ids, tpe, nvalid,
                     None, global_E, bm, expert_mask)
     return sorted_ids[:bound], sorted_w, expert_ids, nvalid, bound
@@ -242,7 +294,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
         a_q, a_s = hidden_states, a1_scale.view(-1, 1) if a1_scale.numel() > 1 else a1_scale
 
     sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(
-        topk_ids, topk_weights, expert_mask, G, E, bm)
+        topk_ids, topk_weights, expert_mask, G, E, bm, expert_map)
 
     dev = hidden_states.device
     cache1 = _carve(workspace13, (rows, N), out_dtype, dev)
