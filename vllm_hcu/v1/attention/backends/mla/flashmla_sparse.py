@@ -17,7 +17,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        if (
+        self._vllm_hcu_fp8_mixed_batch_required = (
             self.use_fp8_kv_cache
             and kv_cache_spec.head_size == 512
             and getattr(
@@ -26,7 +26,8 @@ class HcuFlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
                 None,
             )
             == 0
-        ):
+        )
+        if self._vllm_hcu_fp8_mixed_batch_required:
             # GLM5Next has no RoPE. Use the packed FP8 path for both prefill
             # and decode so both phases use the kernel's 576-wide contract.
             self.fp8_use_mixed_batch = True

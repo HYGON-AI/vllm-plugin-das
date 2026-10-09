@@ -228,6 +228,9 @@ def apply_to_module(module: ModuleType) -> bool:
         if (
             not henvs.VLLM_HCU_USE_FP8_MIXED_BATCH
             and not _is_hyv4_dcp_dp4_config(vllm_config)
+            and not getattr(
+                self, "_vllm_hcu_fp8_mixed_batch_required", False
+            )
         ):
             if getattr(result, "fp8_use_mixed_batch", False):
                 result.fp8_extra_metadata = build_fp8_separate_prefill_decode(

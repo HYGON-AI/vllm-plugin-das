@@ -517,7 +517,11 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     assert calls[-1][-1] == 1
 
 
-def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
+@pytest.mark.parametrize("mixed_batch_enabled", [False, True])
+@pytest.mark.parametrize("mixed_batch_required", [False, True])
+def test_flashmla_sparse_reuses_official_phase_metadata(
+    monkeypatch, mixed_batch_enabled, mixed_batch_required
+):
     adapter = _adapter("patch_flashmla_sparse")
     helper_calls = []
 
@@ -571,7 +575,10 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     )
     monkeypatch.setattr(hcu_flashmla, "get_mla_metadata", lambda *a, **k: None)
     monkeypatch.setattr(
-        henvs, "VLLM_HCU_USE_FP8_MIXED_BATCH", False, raising=False
+        henvs,
+        "VLLM_HCU_USE_FP8_MIXED_BATCH",
+        mixed_batch_enabled,
+        raising=False,
     )
     module = _module(
         adapter.TARGET_MODULE,
@@ -583,6 +590,7 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
 
     assert adapter.apply_to_module(module)
     builder = object.__new__(FlashMLASparseMetadataBuilder)
+    builder._vllm_hcu_fp8_mixed_batch_required = mixed_batch_required
     builder.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=2,
@@ -592,10 +600,14 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     common = SimpleNamespace(num_actual_tokens=4)
     metadata = builder.build(0, common)
 
-    assert metadata.fp8_use_mixed_batch is False
-    assert helper_calls == [(builder, common, metadata)]
-    assert metadata.fp8_extra_metadata.num_decodes == 1
-    assert metadata.fp8_extra_metadata.num_prefills == 3
+    expected_mixed_batch = mixed_batch_enabled or mixed_batch_required
+    assert metadata.fp8_use_mixed_batch is expected_mixed_batch
+    if expected_mixed_batch:
+        assert helper_calls == []
+    else:
+        assert helper_calls == [(builder, common, metadata)]
+        assert metadata.fp8_extra_metadata.num_decodes == 1
+        assert metadata.fp8_extra_metadata.num_prefills == 3
 
 
 def test_flashmla_sparse_admits_hy4_dcp_at_mixed_batch_head_boundary(

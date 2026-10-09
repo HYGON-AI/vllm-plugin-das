@@ -32,6 +32,7 @@ def test_nope_fp8_metadata_uses_packed_mixed_batch(monkeypatch):
     )
 
     assert builder.fp8_use_mixed_batch is True
+    assert builder._vllm_hcu_fp8_mixed_batch_required is True
 
 
 def test_nope_query_is_zero_padded_for_ds_fp8_mla(monkeypatch):
