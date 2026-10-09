@@ -71,21 +71,9 @@ logger = init_logger(__name__)
 _EP_FUSED_COMBINE = os.environ.get("VLLM_HCU_EP_FUSED_COMBINE", "0") == "1"
 
 
-def _ep_fused_all_reduce(
-    hidden_states: torch.Tensor,
-    shared_output: torch.Tensor,
-) -> torch.Tensor | None:
-    """Combine + shared add + TP all-reduce as one EP custom all-reduce.
-
-    With naive DP dispatch every EP rank holds routed partial sums for the
-    tokens of all DP ranks, laid out by DP rank.  Reduce-scatter over DP
-    followed by an all-reduce over TP equals an all-reduce over the whole EP
-    group (DP x TP) sliced to this DP rank's rows.  Adding the TP-partial
-    shared output into the own rows first folds the shared add into the same
-    collective: one custom all-reduce instead of NCCL reduce-scatter + add +
-    custom all-reduce.  Returns None when the custom all-reduce cannot take
-    the tensor (e.g. large prefill chunks); ``hidden_states`` is then intact.
-    """
+def _ep_fused_rows(hidden_states: torch.Tensor) -> tuple[int, int] | None:
+    """This DP rank's rows of ``hidden_states`` if the EP custom all-reduce
+    can combine it (see _ep_fused_all_reduce), else None."""
     ep = get_ep_group()
     dp = get_dp_group()
     ca = getattr(ep.device_communicator, "ca_comm", None)
@@ -99,8 +87,32 @@ def _ep_fused_all_reduce(
     if hidden_states.shape[0] != sum(sizes) or not ca.should_custom_ar(hidden_states):
         return None
     start = sum(sizes[: dp.rank_in_group])
-    end = start + sizes[dp.rank_in_group]
-    hidden_states[start:end] += shared_output
+    return start, start + sizes[dp.rank_in_group]
+
+
+def _ep_fused_all_reduce(
+    hidden_states: torch.Tensor,
+    shared_output: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Combine + shared add + TP all-reduce as one EP custom all-reduce.
+
+    With naive DP dispatch every EP rank holds routed partial sums for the
+    tokens of all DP ranks, laid out by DP rank.  Reduce-scatter over DP
+    followed by an all-reduce over TP equals an all-reduce over the whole EP
+    group (DP x TP) sliced to this DP rank's rows.  Adding the TP-partial
+    shared output into the own rows first folds the shared add into the same
+    collective: one custom all-reduce instead of NCCL reduce-scatter + add +
+    custom all-reduce.  Returns None when the custom all-reduce cannot take
+    the tensor (e.g. large prefill chunks); ``hidden_states`` is then intact.
+    ``shared_output=None`` means it was already added into the own rows.
+    """
+    rows = _ep_fused_rows(hidden_states)
+    if rows is None:
+        return None
+    start, end = rows
+    if shared_output is not None:
+        hidden_states[start:end] += shared_output
+    ca = get_ep_group().device_communicator.ca_comm
     return ca.custom_all_reduce(hidden_states)[start:end]
 
 
@@ -111,10 +123,14 @@ class _EpFusedCombineState:
     def __init__(self) -> None:
         self.shared: torch.Tensor | None = None
         self.done = False
+        # (data_ptr, shape) of the expert output the shared output was
+        # already added into by the EP fused experts (shared_add below).
+        self.added_to: tuple[int, torch.Size] | None = None
 
     def arm(self, shared_experts: SharedExperts | None, shared_input) -> None:
         self.done = False
         self.shared = None
+        self.added_to = None
         # Only when the shared expert already ran inline on this stream; an
         # aux-stream output is not ready yet at finalize time.
         if (
@@ -125,12 +141,28 @@ class _EpFusedCombineState:
             # Peek without consuming; the runner still pops it as usual.
             self.shared = shared_experts._output[shared_experts._output_idx]
 
+    def shared_add(self, out: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+        """For the EP fused experts: (shared_output, row_start) to add into
+        the rows of ``out`` the finalize hook would add it to, else None.
+        Only when the hook is then guaranteed to take the fused path."""
+        if self.shared is None or self.added_to is not None:
+            return None
+        rows = _ep_fused_rows(out)
+        if rows is None:
+            return None
+        self.added_to = (out.data_ptr(), out.shape)
+        return self.shared, rows[0]
+
     def finalize_hook(self, out: torch.Tensor, output: torch.Tensor) -> bool:
         shared, self.shared = self.shared, None
         if shared is None:
             return False
+        if self.added_to is not None:
+            assert self.added_to == (out.data_ptr(), out.shape)
+            shared = None
         reduced = _ep_fused_all_reduce(out, shared)
         if reduced is None:
+            assert shared is not None
             return False
         output.copy_(reduced)
         self.done = True
@@ -138,6 +170,8 @@ class _EpFusedCombineState:
 
     def finish(self) -> bool:
         done, self.done, self.shared = self.done, False, None
+        assert done or self.added_to is None
+        self.added_to = None
         return done
 
 
@@ -146,6 +180,9 @@ if _EP_FUSED_COMBINE:
     from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
 
     naive_dp_ep.set_finalize_combine_hook(_EP_COMBINE.finalize_hook)
+    from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe
+
+    ep_fused_moe.shared_add_provider = _EP_COMBINE.shared_add
 
 
 def register_layer_for_moe_forward_op(

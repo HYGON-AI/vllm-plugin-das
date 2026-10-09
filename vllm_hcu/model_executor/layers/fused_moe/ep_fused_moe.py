@@ -81,8 +81,9 @@ def _ep_swiglustep_quant_kernel(
 
 @triton.jit
 def _ep_masked_moe_sum_kernel(
-    out_ptr, in_ptr, ids_ptr, emap_ptr, stride_ids,
+    out_ptr, in_ptr, ids_ptr, emap_ptr, stride_ids, add_ptr, stride_add, add_start, add_end,
     N: tl.constexpr, TOPK: tl.constexpr, SCALE: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_ADD: tl.constexpr,
 ):
     t = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -93,6 +94,9 @@ def _ep_masked_moe_sum_kernel(
             acc += tl.load(in_ptr + (t.to(tl.int64) * TOPK + k) * N + offs).to(tl.float32)
     if SCALE != 1.0:
         acc *= SCALE
+    if HAS_ADD:
+        if (t >= add_start) & (t < add_end):
+            acc += tl.load(add_ptr + (t - add_start).to(tl.int64) * stride_add + offs).to(tl.float32)
     tl.store(out_ptr + t.to(tl.int64) * N + offs, acc.to(out_ptr.dtype.element_ty))
 
 
@@ -120,13 +124,27 @@ def ep_swiglustep_quant(cache1, sorted_weights, nvalid, rows, limit=7.0, q=None)
     return q, scale
 
 
-def ep_masked_moe_sum(cache3, out, topk_ids, expert_map, scale=1.0):
+def ep_masked_moe_sum(cache3, out, topk_ids, expert_map, scale=1.0, add=None, add_start=0):
+    """out[t] = scale * sum of the local-expert routes of token t, plus
+    add[t - add_start] for the rows add covers."""
     M, topk, N = cache3.shape
     bn = SUM_CFG["BLOCK_N"]
     assert N % bn == 0 and topk_ids.stride(1) == 1
+    if add is not None:
+        assert add.shape[1] == N and add.stride(1) == 1
+        assert 0 <= add_start and add_start + add.shape[0] <= M
     _ep_masked_moe_sum_kernel[(M, N // bn)](
         out, cache3, topk_ids, expert_map, topk_ids.stride(0),
-        N=N, TOPK=topk, SCALE=float(scale), BLOCK_N=bn, num_warps=SUM_CFG["num_warps"])
+        out if add is None else add, 0 if add is None else add.stride(0),
+        add_start, add_start + (0 if add is None else add.shape[0]),
+        N=N, TOPK=topk, SCALE=float(scale), BLOCK_N=bn, HAS_ADD=add is not None,
+        num_warps=SUM_CFG["num_warps"])
+
+
+# Set by the MoE runner under VLLM_HCU_EP_FUSED_COMBINE: given the (M, K) output
+# buffer, returns (shared_output, row_start) when the running layer wants its
+# shared-expert output added into those rows, else None.
+shared_add_provider = None
 
 
 def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm):
@@ -244,7 +262,9 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                             ck_topk=topk, scale_bias_with_routed_weight=True, config=cfg2)
     if out is None:
         out = torch.empty((M, K), dtype=out_dtype, device=dev)
-    ep_masked_moe_sum(cache3, out, topk_ids, expert_map, routed_scaling_factor)
+    add = shared_add_provider(out) if shared_add_provider is not None else None
+    ep_masked_moe_sum(cache3, out, topk_ids, expert_map, routed_scaling_factor,
+                      *(add or ()))
     return out
 
 
