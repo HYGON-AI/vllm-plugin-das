@@ -8,6 +8,8 @@ import functools
 import os
 from types import ModuleType
 
+import torch
+
 from vllm_hcu.patch.config import get_hcu_config
 
 from vllm_hcu.patch.import_coordinator import (
@@ -80,6 +82,35 @@ def _maybe_init_ep_custom_allreduce(communicator, unique_name: str) -> None:
     )
 
 
+def _maybe_init_dp_ipc_all_gather(communicator, unique_name: str) -> None:
+    """IPC all-gather for the naive DP/EP MoE dispatch (VLLM_HCU_DP_CUSTOM_AG).
+
+    NCCL pays ~55 us per dispatch all-gather at decode sizes; the IPC kernel
+    takes ~15 us.  Used by ``hcu_all_gatherv`` when the gather fits.
+    """
+    communicator._hcu_ipc_ag = None
+    if os.environ.get("VLLM_HCU_DP_CUSTOM_AG", "0") != "1":
+        return
+    if unique_name.split(":")[0] != "dp" or communicator.world_size <= 1:
+        return
+    from vllm.distributed.parallel_state import in_the_same_node_as
+
+    if not all(in_the_same_node_as(communicator.cpu_group, source_rank=0)):
+        return
+    from vllm_hcu.distributed.device_communicators.ipc_all_gather import (
+        IpcAllGather,
+    )
+
+    communicator._hcu_ipc_ag = IpcAllGather(
+        communicator.cpu_group, communicator.device
+    )
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "DP group '%s' uses the IPC all-gather for MoE dispatch", unique_name
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     cuda = load_exact_module(TARGET_MODULE, module)
     if getattr(cuda, _MARKER, False):
@@ -147,6 +178,7 @@ def apply_to_module(module: ModuleType) -> bool:
             use_all2all,
         )
         _maybe_init_ep_custom_allreduce(self, unique_name)
+        _maybe_init_dp_ipc_all_gather(self, unique_name)
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
@@ -165,6 +197,25 @@ def apply_to_module(module: ModuleType) -> bool:
             self.cpu_group, tcp_store_group
         )
 
+    all_gatherv = require_callable(
+        communicator, "all_gatherv", f"{TARGET_MODULE}.CudaCommunicator.all_gatherv"
+    )
+
+    @functools.wraps(all_gatherv)
+    def hcu_all_gatherv(self, input_, dim=0, sizes=None):
+        # The path depends only on the global sizes and the tensor layout, so
+        # every rank takes the same one.
+        ag = getattr(self, "_hcu_ipc_ag", None)
+        if ag is not None and dim == 0:
+            tensors = [input_] if isinstance(input_, torch.Tensor) else list(input_)
+            if sizes is None:
+                sizes = [tensors[0].shape[0]] * self.world_size
+            if ag.can_gather(tensors, sizes):
+                outs = ag.gather(tensors, sizes)
+                return outs[0] if isinstance(input_, torch.Tensor) else outs
+        return all_gatherv(self, input_, dim, sizes)
+
+    setattr(communicator, "all_gatherv", hcu_all_gatherv)
     setattr(hcu_init, _WRAPPER, True)
     setattr(communicator, "_vllm_hcu_original_init", init)
     setattr(communicator, "__init__", hcu_init)
