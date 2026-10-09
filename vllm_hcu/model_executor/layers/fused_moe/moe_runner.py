@@ -153,20 +153,20 @@ class _EpFusedCombineState:
         self.added_to = (out.data_ptr(), out.shape)
         return self.shared, rows[0]
 
-    def finalize_hook(self, out: torch.Tensor, output: torch.Tensor) -> bool:
+    def finalize_hook(self, out: torch.Tensor) -> torch.Tensor | None:
         shared, self.shared = self.shared, None
         if shared is None:
-            return False
+            return None
         if self.added_to is not None:
             assert self.added_to == (out.data_ptr(), out.shape)
             shared = None
         reduced = _ep_fused_all_reduce(out, shared)
         if reduced is None:
             assert shared is not None
-            return False
-        output.copy_(reduced)
+            return None
         self.done = True
-        return True
+        # The finalize returns it as the MoE output: no copy into its buffer.
+        return reduced
 
     def finish(self) -> bool:
         done, self.done, self.shared = self.done, False, None
