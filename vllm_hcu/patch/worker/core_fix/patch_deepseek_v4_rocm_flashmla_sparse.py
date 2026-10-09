@@ -32,6 +32,10 @@ _PREFILL_MARKER = "_vllm_hcu_flashmla_sparse_prefill_applied"
 
 def _flashmla_prefill_padded_heads(num_heads: int) -> int | None:
     """Return the sparse-prefill kernel width for a TP-local Q layout."""
+    from vllm_hcu.platforms import envs as henvs
+
+    if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING:
+        return num_heads if num_heads in (64, 128) else None
     if 0 < num_heads <= 64:
         return 64
     if 64 < num_heads <= 128:
