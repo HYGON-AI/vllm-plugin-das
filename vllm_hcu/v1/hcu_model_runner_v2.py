@@ -19,6 +19,7 @@ from vllm_hcu.forward_context_runtime import (
     set_deepep_auto_request_phase,
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 
 
 def record_pp_spec_draft_index_stream(
@@ -74,12 +75,21 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
-        if pcp_size > 1 and len(kv_cache_config.kv_cache_groups) != 1:
+        if (
+            pcp_size > 1
+            and len(kv_cache_config.kv_cache_groups) != 1
+            and not is_glm53_pcp(self.vllm_config)
+        ):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
         from vllm_hcu.v1.kv_cache import use_hcu_flash_kv_cache_allocator
 
+        if is_glm53_pcp(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import install_glm53_pcp
+
+            # Install before upstream discovers backends and checks PCP support.
+            install_glm53_pcp(self)
         with use_hcu_flash_kv_cache_allocator(self):
             super().initialize_kv_cache(
                 kv_cache_config,
@@ -98,11 +108,23 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             batch_desc,
         )
         set_deepep_auto_request_phase(input_batch.is_prefilling_np)
+        if is_glm53_pcp(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import bind_glm53_pcp_batch
+
+            bind_glm53_pcp_batch(self.pcp_manager, input_batch)
         return input_batch
 
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
-        with deepep_auto_request_phase_scope():
+        scope = nullcontext()
+        dummy_scope = nullcontext()
+        if is_glm53_pcp(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import glm53_pcp_step_scope
+
+            scope = glm53_pcp_step_scope()
+            if kwargs.get("dummy_run", False):
+                dummy_scope = replicated_mtp_batch_scope()
+        with deepep_auto_request_phase_scope(), scope, dummy_scope:
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
@@ -115,7 +137,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # batch. Runtime MTP sampling restores the global PCP batch before
         # propose(), so shrinking this shared budget would under-profile the
         # replicated draft prefill even though it is safe for the target.
-        if pcp_size <= 1 or getattr(self, "speculator", None) is not None:
+        if (
+            pcp_size <= 1
+            or getattr(self, "speculator", None) is not None
+            # GLM5Next KDA and K-pool see the full, replicated token batch.
+            or is_glm53_pcp(self.vllm_config)
+        ):
             return super().profile_run()
 
         original_max = self.max_num_tokens
@@ -146,6 +173,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         return self.pcp_manager.prepare_attn(input_batch)
 
     def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
+        if is_glm53_pcp(self.vllm_config):
+            manager = self.pcp_manager
+            self.pcp_manager = None
+            try:
+                return super().prepare_dummy_attn(input_batch, valid_state_slots)
+            finally:
+                self.pcp_manager = manager
         if self.pcp_manager is None:
             return super().prepare_dummy_attn(input_batch, valid_state_slots)
         block_tables = self.block_tables.get_dummy_block_tables(

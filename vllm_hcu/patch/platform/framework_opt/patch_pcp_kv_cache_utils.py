@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import math
 from types import ModuleType
 
 from ._common import (
@@ -14,7 +13,6 @@ from ._common import (
     already_applied,
     load_exact_module,
     require_callable,
-    require_class,
 )
 
 
@@ -52,67 +50,15 @@ def apply_to_module(module: ModuleType) -> bool:
             f"signature {signature}"
         )
 
-    attention_spec = require_class(
-        kv_cache_utils,
-        "AttentionSpec",
-        f"{TARGET_MODULE}.AttentionSpec",
-    )
-    mamba_spec = require_class(
-        kv_cache_utils,
-        "MambaSpec",
-        f"{TARGET_MODULE}.MambaSpec",
-    )
-
     @functools.wraps(original)
     def hcu_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
-        parallel_config = vllm_config.parallel_config
-        pcp = parallel_config.prefill_context_parallel_size
-        if pcp == 1:
-            return original(kv_cache_config, vllm_config)
-
-        cache_config = vllm_config.cache_config
-        dcp = parallel_config.decode_context_parallel_size
-        groups = kv_cache_config.kv_cache_groups
-
-        if len(groups) <= 1:
-            block_size = cache_config.block_size * dcp
-            return block_size, block_size
-
-        group_block_sizes = [
-            group.kv_cache_spec.block_size * dcp
-            if isinstance(group.kv_cache_spec, attention_spec)
-            else group.kv_cache_spec.block_size
-            for group in groups
-        ]
-        scheduler_block_size = math.lcm(*group_block_sizes)
-
-        connector_enabled = vllm_config.kv_transfer_config is not None
-        if not (cache_config.enable_prefix_caching or connector_enabled):
-            return scheduler_block_size, scheduler_block_size
-
-        if any(
-            isinstance(group.kv_cache_spec, mamba_spec)
-            and group.kv_cache_spec.block_size != cache_config.block_size
-            for group in groups
-        ):
-            return scheduler_block_size, scheduler_block_size
-
-        requested = cache_config.hash_block_size
-        hash_block_size = (
-            requested
-            if requested is not None
-            else math.gcd(*group_block_sizes)
-        )
-        if any(
-            block_size % hash_block_size != 0
-            for block_size in group_block_sizes
-        ):
-            raise ValueError(
-                f"Invalid hash_block_size={hash_block_size}; all KV cache "
-                "group block sizes must be divisible by hash_block_size. "
-                f"Got group block sizes={group_block_sizes}."
-            )
-        return scheduler_block_size, hash_block_size
+        # Current vLLM already resolves cache ownership from DCP only and
+        # handles prefix_match_unit, prefix-cacheable groups, and Mamba align
+        # mode.  Reimplementing that policy here made this adapter depend on
+        # the removed CacheConfig.hash_block_size field.  Keep the wrapper as
+        # a stable plugin integration point, but delegate sizing to vLLM so
+        # PCP never carries a stale copy of the cache-layout algorithm.
+        return original(kv_cache_config, vllm_config)
 
     setattr(hcu_resolve_kv_cache_block_sizes, _WRAPPER, True)
     setattr(

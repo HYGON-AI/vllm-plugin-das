@@ -246,6 +246,37 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
         )
 
 
+def is_glm53_pcp(vllm_config: object) -> bool:
+    model = getattr(vllm_config, "model_config", None)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    return (
+        getattr(model, "architectures", None)
+        in (["Glm5NextForConditionalGeneration"], ["Glm5NextForCausalLM"])
+        and getattr(parallel, "prefill_context_parallel_size", 1) > 1
+    )
+
+
+def _require_glm53_pcp_contract(vllm_config: object) -> None:
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    topology = (
+        parallel.tensor_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.pipeline_parallel_size,
+    )
+    if topology != (1, 8, 1):
+        raise ValueError("GLM-5.3 PCP baseline requires TP1/PCP8/PP1.")
+    mm = getattr(model, "multimodal_config", None)
+    if model.is_multimodal_model and not getattr(mm, "language_model_only", False):
+        raise ValueError("GLM-5.3 PCP baseline requires --language-model-only.")
+    if not model.use_mla or not model.is_hybrid:
+        raise ValueError("GLM-5.3 PCP requires the MLA/KDA hybrid model.")
+    if vllm_config.speculative_config is not None:
+        raise ValueError("GLM-5.3 PCP baseline does not support MTP yet.")
+    if getattr(parallel, "enable_eplb", False):
+        raise ValueError("GLM-5.3 PCP baseline does not support EPLB.")
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -272,7 +303,10 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
-    if use_mla and not (is_glm52 or is_hy4):
+    is_glm53 = is_glm53_pcp(vllm_config)
+    if is_glm53:
+        _require_glm53_pcp_contract(vllm_config)
+    if use_mla and not (is_glm52 or is_hy4 or is_glm53):
         raise ValueError(
             "GLM-5.2 and HY V4 MLA PCP only support "
             "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
@@ -360,7 +394,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
         model_config, "is_multimodal_model", "ModelConfig"
-    ):
+    ) and not is_glm53:
         raise ValueError("HCU PCP does not support multimodal models.")
     if _require_hcu_pcp_attribute(
         cache_config, "kv_offloading_size", "CacheConfig"
