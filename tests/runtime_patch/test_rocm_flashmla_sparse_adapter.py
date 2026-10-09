@@ -14,6 +14,13 @@ from vllm_hcu.patch.worker.core_fix import patch_deepseek_v4_rocm_flashmla_spars
 from vllm_hcu.platforms import envs as henvs
 
 
+@pytest.fixture(autouse=True)
+def clear_prefill_head_padding_env(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING", raising=False
+    )
+
+
 def _build_module(ratio, batch, calls, local_heads=4):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -342,6 +349,7 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
     assert ("ragged_swa" in calls) is not uses_flashmla
 
 
+@pytest.mark.parametrize("padding_enabled", [True, False])
 @pytest.mark.parametrize(
     ("heads", "kernel_heads", "uses_flashmla"),
     [
@@ -356,8 +364,13 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
     ],
 )
 def test_prefill_pads_local_head_counts(
-    monkeypatch, heads, kernel_heads, uses_flashmla
+    monkeypatch, heads, kernel_heads, uses_flashmla, padding_enabled
 ):
+    monkeypatch.setenv(
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING",
+        "1" if padding_enabled else "0",
+    )
+    uses_flashmla = uses_flashmla and (padding_enabled or heads in (64, 128))
     calls = []
     kernel_args = {}
     flash = ModuleType("vllm_hcu.v1.attention.ops.flashmla")
@@ -412,6 +425,10 @@ def test_prefill_pads_local_head_counts(
             assert torch.count_nonzero(kernel_args["attn_sink"][heads:]) == 0
         expected = torch.arange(heads, dtype=output.dtype).view(1, heads, 1)
         torch.testing.assert_close(output, expected.expand_as(output))
+
+
+def test_prefill_head_padding_defaults_to_disabled():
+    assert not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING
 
 
 def test_guard_rejects_unavailable_flashmla(monkeypatch):
