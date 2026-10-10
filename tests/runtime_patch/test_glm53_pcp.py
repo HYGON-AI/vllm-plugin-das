@@ -37,8 +37,48 @@ def test_glm53_internal_language_model_revalidation():
     assert _validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize("tokens", [1, 2, 3])
+def test_glm53_builtin_mtp_contract(tokens):
+    assert _validate_hcu_pcp_scope(
+        _config(speculative=True, num_speculative_tokens=tokens)
+    ) is True
+
+
+def test_glm53_mtp_draft_config_is_revalidated_as_mla_pcp():
+    config = _config(
+        architecture="Glm5NextMTPModel",
+        hybrid=False,
+        multimodal=False,
+        speculative=True,
+        num_speculative_tokens=3,
+    )
+    config.model_config.multimodal_config = None
+    assert _validate_hcu_pcp_scope(config) is True
+
+
+def test_glm53_mtp_draft_rejects_non_mla_config():
+    config = _config(
+        architecture="Glm5NextMTPModel",
+        hybrid=False,
+        multimodal=False,
+        speculative=True,
+        use_mla=False,
+    )
+    config.model_config.multimodal_config = None
+    with pytest.raises(ValueError, match="built-in MLA draft layer"):
+        _validate_hcu_pcp_scope(config)
+
+
 @pytest.mark.parametrize("overrides", [
-    {"tp": 8}, {"pcp": 4}, {"speculative": True},
+    {"speculative_method": "ngram"}, {"num_speculative_tokens": 4},
+])
+def test_glm53_rejects_unsupported_speculation(overrides):
+    with pytest.raises(ValueError):
+        _validate_hcu_pcp_scope(_config(speculative=True, **overrides))
+
+
+@pytest.mark.parametrize("overrides", [
+    {"tp": 8}, {"pcp": 4},
     {"enforce_eager": False}, {"enable_expert_parallel": False},
 ])
 def test_glm53_rejects_unimplemented_modes(overrides):
@@ -51,6 +91,30 @@ def test_glm53_rejects_multimodal_inputs():
     config.model_config.multimodal_config.language_model_only = False
     with pytest.raises(ValueError, match="language-model-only"):
         _validate_hcu_pcp_scope(config)
+
+
+def test_glm53_replicated_mtp_skips_target_gather_and_localize():
+    from vllm_hcu.model_executor.layers.attention.pcp import replicated_mtp_batch_scope
+    from vllm_hcu.v1.glm53_pcp import _BATCH
+
+    def unexpected(*args):
+        raise AssertionError("replicated draft must not gather/localize target rows")
+
+    batch = SimpleNamespace(gather=unexpected, localize=unexpected)
+    hidden = torch.arange(12, dtype=torch.float32).view(6, 2)
+    positions = torch.arange(6)
+    expected = hidden + 1
+    kda = SimpleNamespace(_hcu_glm53_original_forward=lambda h, p: h + 1)
+    indexer = SimpleNamespace(
+        _hcu_glm53_original_forward=lambda h, q, p, r: h + 1
+    )
+    with glm53_pcp_step_scope():
+        _BATCH.set(batch)
+        with replicated_mtp_batch_scope():
+            torch.testing.assert_close(_kda_forward(kda, hidden, positions), expected)
+            torch.testing.assert_close(
+                _indexer_forward(indexer, hidden, hidden, positions, None), expected
+            )
 
 
 @pytest.mark.parametrize("length", [1, 2, 7, 16, 35, 65])

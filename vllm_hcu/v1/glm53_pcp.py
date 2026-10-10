@@ -13,6 +13,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm_hcu.model_executor.layers.attention.pcp import (
+    in_replicated_mtp_batch,
     logical_pcp_metadata_scope,
     replicated_mtp_batch_scope,
 )
@@ -46,6 +47,12 @@ _BATCH: ContextVar[Glm53PCPBatch | None] = ContextVar(
 )
 
 
+def _current_pcp_batch():
+    # Draft prefill/decode consumes globally restored rows. Never gather or
+    # localize them again using a target-model partition left in this context.
+    return None if in_replicated_mtp_batch() else _BATCH.get()
+
+
 @contextmanager
 def glm53_pcp_step_scope():
     token = _BATCH.set(None)
@@ -77,7 +84,7 @@ def _prepare_attn(
     attn_groups, kv_cache_config, for_capture=False, ubatch_idx=0,
 ):
     original = self._hcu_glm53_original_prepare_attn
-    batch = _BATCH.get()
+    batch = _current_pcp_batch()
     if batch is None:
         # Profiling uses replicated dummy inputs, with no real cache writes.
         with replicated_mtp_batch_scope(), logical_pcp_metadata_scope(1):
@@ -126,7 +133,7 @@ def _prepare_attn(
 def _preprocess_state(
     self, input_batch, block_tables, kv_cache_config, num_computed_tokens,
 ):
-    batch = _BATCH.get()
+    batch = _current_pcp_batch()
     if batch is not None:
         input_batch = batch.global_batch
         block_tables, _ = batch.manager.prepare_global_attn()
@@ -136,7 +143,7 @@ def _preprocess_state(
 
 
 def _kda_forward(self, hidden_states, positions):
-    batch = _BATCH.get()
+    batch = _current_pcp_batch()
     original = self._hcu_glm53_original_forward
     if batch is None:
         return original(hidden_states, positions)
@@ -150,7 +157,7 @@ def _kda_forward(self, hidden_states, positions):
 
 
 def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
-    batch = _BATCH.get()
+    batch = _current_pcp_batch()
     original = self._hcu_glm53_original_forward
     if batch is None:
         return original(hidden_states, qr, positions, rotary_emb)
@@ -217,6 +224,13 @@ def install_glm53_pcp(runner) -> None:
             layer.forward = MethodType(wrapper, layer)
     if not all(counts):
         raise RuntimeError(f"GLM5Next PCP expected KDA and K-pool layers: {counts}")
+    draft_model = getattr(getattr(runner, "speculator", None), "model", None)
+    if draft_model is not None:
+        # Draft layers also participate in the global backend compatibility
+        # check, but their forwards run on a replicated global MTP batch.
+        for layer in draft_model.modules():
+            if isinstance(layer, (Glm5NextLinearAttention, Glm5NextTailCache)):
+                _install_replicated_backend(layer)
     logger.info(
         "GLM5Next PCP eager baseline: %d replicated KDA layers, "
         "%d replicated K-pool indexers; MLA queries and MoE remain sharded",

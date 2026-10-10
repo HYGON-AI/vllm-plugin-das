@@ -256,6 +256,15 @@ def is_glm53_pcp(vllm_config: object) -> bool:
     )
 
 
+def _is_glm53_mtp_pcp(vllm_config: object) -> bool:
+    model = getattr(vllm_config, "model_config", None)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    return (
+        getattr(model, "architectures", None) == ["Glm5NextMTPModel"]
+        and getattr(parallel, "prefill_context_parallel_size", 1) > 1
+    )
+
+
 def _require_glm53_pcp_contract(vllm_config: object) -> None:
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
@@ -271,10 +280,26 @@ def _require_glm53_pcp_contract(vllm_config: object) -> None:
         raise ValueError("GLM-5.3 PCP baseline requires --language-model-only.")
     if not model.use_mla or not model.is_hybrid:
         raise ValueError("GLM-5.3 PCP requires the MLA/KDA hybrid model.")
-    if vllm_config.speculative_config is not None:
-        raise ValueError("GLM-5.3 PCP baseline does not support MTP yet.")
+    # Built-in MTP uses the restored global batch in the HCU V2 runner.
+    # The shared PCP contract below validates method='mtp' and 1..3 tokens.
     if getattr(parallel, "enable_eplb", False):
         raise ValueError("GLM-5.3 PCP baseline does not support EPLB.")
+
+
+def _require_glm53_mtp_pcp_contract(vllm_config: object) -> None:
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    topology = (
+        parallel.tensor_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.pipeline_parallel_size,
+    )
+    if topology != (1, 8, 1):
+        raise ValueError("GLM-5.3 MTP PCP requires TP1/PCP8/PP1.")
+    if not model.use_mla:
+        raise ValueError("GLM-5.3 MTP PCP requires the built-in MLA draft layer.")
+    if getattr(parallel, "enable_eplb", False):
+        raise ValueError("GLM-5.3 MTP PCP does not support EPLB.")
 
 
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
@@ -304,9 +329,12 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
     is_glm53 = is_glm53_pcp(vllm_config)
+    is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
     if is_glm53:
         _require_glm53_pcp_contract(vllm_config)
-    if use_mla and not (is_glm52 or is_hy4 or is_glm53):
+    if is_glm53_mtp:
+        _require_glm53_mtp_pcp_contract(vllm_config)
+    if use_mla and not (is_glm52 or is_hy4 or is_glm53 or is_glm53_mtp):
         raise ValueError(
             "GLM-5.2 and HY V4 MLA PCP only support "
             "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
