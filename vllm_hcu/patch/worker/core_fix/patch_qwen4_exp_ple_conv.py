@@ -355,8 +355,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 else self._hcu_prefetch_successor_rows_sentinel
             )
         else:
-            # PREFETCH=0 keeps the official PLE module. Preserve that path while
-            # satisfying the one stable custom-op schema with zero-sized tensors.
+            # Without prefetch workspaces, satisfy the one stable custom-op
+            # schema with zero-sized sentinel tensors.
             current_ids_buffer = input_ids.new_empty((0,), dtype=torch.int64)
             current_rows_buffer = output.new_empty((0,))
             successor_ids_buffer = input_ids.new_empty((0,), dtype=torch.int64)
