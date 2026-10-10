@@ -94,7 +94,7 @@ ARG TORCH_VERSION
 RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && pip install --no-cache-dir torch==${TORCH_VERSION} torchvision \
     && das-install triton==3.6.0 ${TORCH_TAG} \
-    && pip install --no-cache-dir flash_attn==2.8.4+dtk2604.torch2110.2609241509.g624d7b \
+    && das-install flash_attn ${TORCH_TAG} \
     && das-install lightop ${TORCH_TAG} \
     && das-install lmslim ${TORCH_TAG} \
     && das-install deepgemm ${TORCH_TAG} \
