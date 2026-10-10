@@ -72,7 +72,6 @@ def test_deepseek_v4_gate_matches_bf16_output_then_fp32(
     module, gate_class = _gate_module()
     monkeypatch.setattr(patch_gate_linear, "_get_model_type", lambda: "deepseek_v4")
     monkeypatch.setattr(henvs, "VLLM_USE_NN", nn_layout)
-    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT", True)
     assert patch_gate_linear.apply_to_module(module)
     assert not patch_gate_linear.apply_to_module(module)
     gate = gate_class()
@@ -90,15 +89,11 @@ def test_deepseek_v4_gate_matches_bf16_output_then_fp32(
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "model_type,enabled",
-    [("deepseek_v4", False), ("deepseek_v3", True), (None, True)],
-)
-def test_gate_preserves_direct_fp32_path(monkeypatch, model_type, enabled):
+@pytest.mark.parametrize("model_type", ["deepseek_v3", None])
+def test_gate_preserves_direct_fp32_path(monkeypatch, model_type):
     module, gate_class = _gate_module()
     monkeypatch.setattr(patch_gate_linear, "_get_model_type", lambda: model_type)
     monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT", enabled)
     patch_gate_linear.apply_to_module(module)
     gate = gate_class()
     gate.allow_cublas_router_gemm = True
@@ -119,7 +114,6 @@ def test_deepseek_v4_gate_preserves_ineligible_dispatch(monkeypatch):
     module, gate_class = _gate_module()
     monkeypatch.setattr(patch_gate_linear, "_get_model_type", lambda: "deepseek_v4")
     monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT", True)
     patch_gate_linear.apply_to_module(module)
     gate = gate_class()
     gate.allow_cublas_router_gemm = False
