@@ -849,6 +849,7 @@ def test_hcu_block_quant_group_shapes_and_sequence_parallel_contract(
     ) == ("official", False)
     parallel = module.FusedMoEParallelConfig()
     parallel.dp_size = 1
+    parallel.pcp_size = 1
     parallel.use_ep = True
     parallel.is_sequence_parallel = True
     assert parallel.use_all2all_kernels is True
@@ -935,6 +936,61 @@ def test_config_signature_drift_fails_before_mutation():
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         patch_config.apply_to_module(module)
     assert not hasattr(module, "_vllm_hcu_moe_config_applied")
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "pcp_size", "sp_size", "use_ep", "expected"),
+    [
+        # PCP shards the sequence, so MoE must exchange tokens through an
+        # all-to-all kernel instead of the PCP fallback collectives.
+        (1, 8, 1, True, True),
+        (1, 2, 1, True, True),
+        # Existing DP / SP behaviour must not change.
+        (8, 1, 1, True, True),
+        (1, 1, 8, True, True),
+        # EP disabled keeps every kernel path off.
+        (1, 8, 1, False, False),
+        (8, 1, 1, False, False),
+        # Single-rank MoE keeps the no-DPEP path.
+        (1, 1, 1, True, False),
+    ],
+)
+def test_pcp_joins_the_all2all_kernel_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
+    pcp_size: int,
+    sp_size: int,
+    use_ep: bool,
+    expected: bool,
+):
+    """PCP+EP must select the all-to-all kernels, not PCP NCCL fallback."""
+
+    module = _fake_config_module()
+    assert patch_config.apply_to_module(module) is True
+
+    parallel = module.FusedMoEParallelConfig()
+    parallel.dp_size = dp_size
+    parallel.pcp_size = pcp_size
+    parallel.is_sequence_parallel = sp_size > 1
+    parallel.use_ep = use_ep
+
+    assert parallel.use_all2all_kernels is expected
+
+
+def test_pcp_gate_tolerates_configs_without_pcp_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Older parallel-config objects without ``pcp_size`` must not break."""
+
+    module = _fake_config_module()
+    assert patch_config.apply_to_module(module) is True
+
+    parallel = module.FusedMoEParallelConfig()
+    parallel.dp_size = 1
+    parallel.is_sequence_parallel = False
+    parallel.use_ep = True
+
+    assert parallel.use_all2all_kernels is False
 
 
 def test_aiter_and_triton_expert_capability_contract(

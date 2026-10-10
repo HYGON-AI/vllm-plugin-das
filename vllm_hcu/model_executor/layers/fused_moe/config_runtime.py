@@ -136,8 +136,15 @@ def int8_w8a8_moe_quant_config(
 
 
 def use_all2all_kernels(parallel_config: object) -> bool:
+    # PCP shards the sequence across ranks, so MoE still needs a token
+    # exchange; an all-to-all kernel must serve it instead of the PCP
+    # fallback collectives. Keep this aligned with upstream's condition.
     return bool(
-        (parallel_config.dp_size > 1 or parallel_config.is_sequence_parallel)
+        (
+            parallel_config.dp_size > 1
+            or getattr(parallel_config, "pcp_size", 1) > 1
+            or parallel_config.is_sequence_parallel
+        )
         and parallel_config.use_ep
     )
 
