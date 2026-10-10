@@ -261,7 +261,6 @@ def apply_to_module(module: ModuleType) -> bool:
     ple = _load_ple_module(module)
     if not custom_ops_enabled():
         return False
-    _ensure_ngram_custom_op_registered()
     ple_class = require_class(
         ple, "Qwen4ExpPLELayer", f"{TARGET_MODULE}.Qwen4ExpPLELayer"
     )
@@ -328,6 +327,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 dilation=self.short_conv_dilation,
             )[..., : inputs_t.size(-1)]
             return functional.silu(output).squeeze(0).transpose(0, 1)
+
+    # Registration is process-global and cannot be rolled back. Validate the
+    # complete target ABI before exposing the custom op so a drifted vLLM
+    # module cannot leave a partially applied patch state behind.
+    _ensure_ngram_custom_op_registered()
 
     @functools.wraps(ngram_forward)
     def hcu_ngram_forward(self, input_ids, query_start_loc, ngram_context):

@@ -4,6 +4,7 @@
 import importlib
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as torch_functional
 
@@ -92,6 +93,28 @@ def test_fused_ple_keeps_short_conv_and_only_wraps_ngram():
     assert patch.apply_to_module(module) is False
     assert Qwen4ExpPLELayer._short_conv is original_short_conv
     assert getattr(Qwen4ExpNGramEmbedding.forward, patch._NGRAM_WRAPPER, False)
+
+
+def test_ngram_custom_op_is_not_registered_before_target_validation(monkeypatch):
+    calls = []
+    module, _, ngram_class = _target_module(calls)
+
+    def drifted_forward(self, input_ids, query_start_loc):
+        del self, input_ids, query_start_loc
+
+    ngram_class.forward = drifted_forward
+    monkeypatch.setattr(patch, "_NGRAM_OP_REGISTERED", False)
+    monkeypatch.setattr(
+        patch,
+        "direct_register_custom_op",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    with pytest.raises(patch.PatchCompatibilityError, match="incompatible signature"):
+        patch.apply_to_module(module)
+
+    assert calls == []
+    assert patch._NGRAM_OP_REGISTERED is False
 
 
 def test_qwen4_exp_ngram_dynamic_preprocessing_is_behind_custom_op(monkeypatch):
