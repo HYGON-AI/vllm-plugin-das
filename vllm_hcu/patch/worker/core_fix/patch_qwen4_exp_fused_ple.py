@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 from types import ModuleType
 
-from vllm.model_executor.models.utils import WeightsMapper
+from vllm_hcu.platforms.envs import custom_ops_enabled
 
 from ._common import (
     PatchCompatibilityError,
@@ -27,12 +27,19 @@ _ORIGINAL_MAPPER = "_vllm_hcu_original_qwen4_exp_mapper"
 _ORIGINAL_LLM_PACKED = "_vllm_hcu_original_qwen4_exp_llm_packed"
 _ORIGINAL_VL_PACKED = "_vllm_hcu_original_qwen4_exp_vl_packed"
 _KV_PACKED = ["key_proj", "value_proj"]
-_PLE_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_stacked={
-        "ple.key_proj": ("ple.kv_proj", 0),
-        "ple.value_proj": ("ple.kv_proj", 1),
-    }
-)
+
+
+def _ple_weights_mapper():
+    # Importing model utils pulls most of vLLM's model-loader graph. Keep it
+    # behind the target-model callback so worker patch registration stays lazy.
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    return WeightsMapper(
+        orig_to_new_stacked={
+            "ple.key_proj": ("ple.kv_proj", 0),
+            "ple.value_proj": ("ple.kv_proj", 1),
+        }
+    )
 
 
 def _require_mapping(owner: type, name: str, target: str):
@@ -44,7 +51,9 @@ def _require_mapping(owner: type, name: str, target: str):
     return value
 
 
-def _require_mapper(owner: type, name: str, target: str) -> WeightsMapper:
+def _require_mapper(owner: type, name: str, target: str):
+    from vllm.model_executor.models.utils import WeightsMapper
+
     value = getattr(owner, name, None)
     if not isinstance(value, WeightsMapper):
         raise PatchCompatibilityError(
@@ -84,6 +93,8 @@ def _has_fused_mappings(
 
 def apply_to_module(module: ModuleType) -> bool:
     owner = load_exact_module(TARGET_MODULE, module)
+    if not custom_ops_enabled():
+        return False
     decoder_class = require_class(
         owner,
         "Qwen4ExpDecoderLayer",
@@ -104,6 +115,15 @@ def apply_to_module(module: ModuleType) -> bool:
         "Qwen4ExpForConditionalGeneration",
         f"{TARGET_MODULE}.Qwen4ExpForConditionalGeneration",
     )
+    ple_class = require_class(
+        owner,
+        "Qwen4ExpPLELayer",
+        f"{TARGET_MODULE}.Qwen4ExpPLELayer",
+    )
+    if ple_class.__module__ != "vllm_hcu.models.qwen4_exp.amd.ple_layer":
+        raise PatchCompatibilityError(
+            "Qwen4Exp fused PLE model patch requires the HCU PLE replacement"
+        )
     current_forward = require_callable(
         decoder_class,
         "forward",
@@ -215,7 +235,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return hidden_states, mlp_out, injection
 
     setattr(hcu_decoder_forward, _FORWARD_WRAPPER, True)
-    fused_mapper = original_mapper | _PLE_WEIGHTS_MAPPER
+    fused_mapper = original_mapper | _ple_weights_mapper()
     fused_llm_packed = {**original_llm_packed, "kv_proj": _KV_PACKED.copy()}
     fused_vl_packed = {**original_vl_packed, "kv_proj": _KV_PACKED.copy()}
 

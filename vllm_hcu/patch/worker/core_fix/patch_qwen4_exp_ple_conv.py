@@ -12,7 +12,7 @@ from types import ModuleType
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm_hcu.models.qwen4_exp.common.ops.ple import ple_ngram_ids
+from vllm_hcu.platforms.envs import custom_ops_enabled
 
 from ._common import PatchCompatibilityError, require_class
 
@@ -22,6 +22,7 @@ PATCH_ID = "worker.core_fix.qwen4_exp.ple_depthwise_conv1d"
 _MARKER = "_vllm_hcu_qwen4_exp_ple_conv_applied"
 _WRAPPER = "_vllm_hcu_qwen4_exp_ple_fallback_wrapper"
 _NGRAM_WRAPPER = "_vllm_hcu_qwen4_exp_ple_ngram_wrapper"
+_NGRAM_OP_REGISTERED = False
 
 
 def _single_int(value) -> int | None:
@@ -142,6 +143,8 @@ def _run_fused_ngram_forward(
         ngram_ids = compute_ngram_ids(input_ids, query_start_loc, ngram_context)
     else:
         num_reqs = query_start_loc.numel() - 1
+        from vllm_hcu.models.qwen4_exp.common.ops.ple import ple_ngram_ids
+
         ngram_ids = ple_ngram_ids(
             input_ids.reshape(-1),
             query_start_loc,
@@ -202,16 +205,21 @@ def _hcu_qwen4_exp_ple_ngram(
     )
 
 
-direct_register_custom_op(
-    op_name="hcu_qwen4_exp_ple_ngram",
-    op_func=_hcu_qwen4_exp_ple_ngram,
-    mutates_args=[
-        "output",
-        "current_rows_buffer",
-        "successor_ids_buffer",
-        "successor_rows_buffer",
-    ],
-)
+def _ensure_ngram_custom_op_registered() -> None:
+    global _NGRAM_OP_REGISTERED
+    if _NGRAM_OP_REGISTERED:
+        return
+    direct_register_custom_op(
+        op_name="hcu_qwen4_exp_ple_ngram",
+        op_func=_hcu_qwen4_exp_ple_ngram,
+        mutates_args=[
+            "output",
+            "current_rows_buffer",
+            "successor_ids_buffer",
+            "successor_rows_buffer",
+        ],
+    )
+    _NGRAM_OP_REGISTERED = True
 
 
 def _run_ple_ngram_custom_op(
@@ -251,6 +259,9 @@ def _load_ple_module(module: ModuleType | None) -> ModuleType:
 
 def apply_to_module(module: ModuleType) -> bool:
     ple = _load_ple_module(module)
+    if not custom_ops_enabled():
+        return False
+    _ensure_ngram_custom_op_registered()
     ple_class = require_class(
         ple, "Qwen4ExpPLELayer", f"{TARGET_MODULE}.Qwen4ExpPLELayer"
     )

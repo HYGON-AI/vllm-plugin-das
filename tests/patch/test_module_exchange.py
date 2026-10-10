@@ -61,8 +61,8 @@ def test_all_exchange_registration_is_exact_lazy_and_idempotent(
     first = register_all_module_exchanges(coordinator)
     second = register_all_module_exchanges(coordinator)
 
-    assert len(first) == len(second) == 7
-    assert len(coordinator.registrations()) == 7
+    assert len(first) == len(second) == 8
+    assert len(coordinator.registrations()) == 8
     assert all(item.status == PatchStatus.ARMED.value for item in first)
     assert builtins.__import__ is original_import
     assert replacements_before == set()
@@ -99,23 +99,20 @@ def test_exchange_inventory_arms_dependencies_before_canonical_consumers():
     assert "vllm.model_executor.parameter" not in order
 
 
-def test_qwen4_exp_ple_exchange_is_strictly_opt_in_and_lazy(monkeypatch):
+def test_fused_ple_exchange_requires_custom_ops_master(monkeypatch):
     canonical = "vllm.models.qwen4_exp.amd.ple_layer"
     replacement = "vllm_hcu.models.qwen4_exp.amd.ple_layer"
     monkeypatch.delitem(sys.modules, canonical, raising=False)
     monkeypatch.delitem(sys.modules, replacement, raising=False)
     coordinator = ExactImportCoordinator(registry=PatchRegistry())
 
-    monkeypatch.delenv("VLLM_HCU_PLE_PREFETCH_STREAM", raising=False)
-    assert register_qwen4_exp_ple_exchange(coordinator) == ()
-    assert (canonical, replacement) not in module_exchange_names()
-
-    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
     assert register_qwen4_exp_ple_exchange(coordinator) == ()
     assert (canonical, replacement) not in module_exchange_names()
 
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv("VLLM_HCU_PLE_PREFETCH_STREAM", raising=False)
     registrations = register_qwen4_exp_ple_exchange(coordinator)
     assert len(registrations) == 1
     assert registrations[0].status == PatchStatus.ARMED.value
@@ -126,12 +123,40 @@ def test_qwen4_exp_ple_exchange_is_strictly_opt_in_and_lazy(monkeypatch):
 
 def test_qwen4_exp_ple_exchange_fails_if_canonical_was_imported(monkeypatch):
     canonical = "vllm.models.qwen4_exp.amd.ple_layer"
-    monkeypatch.setenv("VLLM_HCU_PLE_PREFETCH_STREAM", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv("VLLM_HCU_PLE_PREFETCH_STREAM", raising=False)
     monkeypatch.setitem(sys.modules, canonical, ModuleType(canonical))
     coordinator = ExactImportCoordinator(registry=PatchRegistry())
 
     with pytest.raises(LateModuleReplacementError, match="already imported"):
         register_qwen4_exp_ple_exchange(coordinator)
+
+
+@pytest.mark.parametrize(
+    ("custom_ops", "expected_mode"),
+    (("0", "fallback"), ("1", "fused")),
+)
+def test_fused_ple_logs_selected_mode_once(
+    monkeypatch,
+    caplog,
+    custom_ops,
+    expected_mode,
+):
+    import vllm_hcu.patch.module_exchange as exchange
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
+    monkeypatch.setattr(exchange, "_PLE_MODE_LOGGED", None)
+    caplog.set_level("INFO", logger=exchange.__name__)
+
+    exchange.module_exchange_names()
+    exchange.module_exchange_names()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "Qwen4Exp PLE mode selected" in record.getMessage()
+    ]
+    assert messages == [f"Qwen4Exp PLE mode selected: {expected_mode}"]
 
 
 def test_deep_gemm_replacement_preserves_v0251_warmup_helper():

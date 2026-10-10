@@ -6,13 +6,20 @@ import importlib
 import inspect
 from types import ModuleType
 
+import pytest
 import torch
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_fused_ple as patch
+from vllm_hcu.patch.worker.core_fix._common import PatchCompatibilityError
 
 
 def _target_module() -> tuple[ModuleType, type, type]:
+    class Qwen4ExpPLELayer:
+        pass
+
+    Qwen4ExpPLELayer.__module__ = "vllm_hcu.models.qwen4_exp.amd.ple_layer"
+
     class Qwen4ExpDecoderLayer:
         def forward(
             self,
@@ -49,6 +56,7 @@ def _target_module() -> tuple[ModuleType, type, type]:
             return hidden_states
 
     module = ModuleType(patch.TARGET_MODULE)
+    module.Qwen4ExpPLELayer = Qwen4ExpPLELayer
     module.Qwen4ExpDecoderLayer = Qwen4ExpDecoderLayer
     module.Qwen4ExpModel = Qwen4ExpModel
     module.Qwen4ExpForCausalLM = Qwen4ExpForCausalLM
@@ -150,3 +158,25 @@ def test_fused_ple_does_not_wrap_mtp_forward() -> None:
     assert patch.apply_to_module(module) is True
     assert patch.apply_to_module(module) is False
     assert mtp_cls.forward is original
+
+
+def test_fused_ple_patch_fails_closed_on_signature_drift() -> None:
+    module, decoder_cls, _ = _target_module()
+
+    def drifted_forward(
+        self,
+        hidden_states,
+        prev_block_output,
+        prev_injection,
+        positions,
+        *,
+        input_ids,
+        query_start_loc,
+    ):
+        del self, prev_block_output, prev_injection, positions
+        del input_ids, query_start_loc
+        return hidden_states, hidden_states, hidden_states
+
+    decoder_cls.forward = drifted_forward
+    with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch.apply_to_module(module)

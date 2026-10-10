@@ -164,6 +164,12 @@ def ple_prefetch_enabled() -> bool:
     )
 
 
+def fused_qwen4_exp_ple_enabled() -> bool:
+    """Select fused Qwen4Exp PLE under the custom-op master switch."""
+
+    return custom_ops_enabled()
+
+
 def fused_qwen3_rms_rope_enabled() -> bool:
     """Resolve Qwen3 fused Q/K RMSNorm plus RoPE under the master switch."""
 
