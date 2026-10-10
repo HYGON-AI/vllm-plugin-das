@@ -410,7 +410,11 @@ def maybe_gather_mla_latent_cache_inputs(
             metadata,
         )
     )
-    cache_k_pe = cache_k_pe_flat.view(-1, *k_pe.shape[1:])
+    # PCP8 can produce an empty local token slice during eager warmup. Do not
+    # ask reshape to infer the zero-sized leading dimension.
+    cache_k_pe = cache_k_pe_flat.view(
+        cache_k_pe_flat.shape[0], *k_pe.shape[1:]
+    )
     return cache_kv_c, cache_k_pe, cache_slot_mapping
 
 

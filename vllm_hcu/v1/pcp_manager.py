@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm_hcu.patch.platform.core_fix._common import PatchCompatibilityError
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
     _validate_hcu_pcp_scope,
+    is_glm53_pcp,
 )
 
 
@@ -83,7 +84,7 @@ class HcuPCPManager:
         vllm_config: object,
         supports_mm_inputs: bool,
     ) -> None:
-        if supports_mm_inputs:
+        if supports_mm_inputs and not is_glm53_pcp(vllm_config):
             raise ValueError("HCU PCP does not support multimodal inputs.")
         _validate_hcu_pcp_scope(vllm_config)
 
