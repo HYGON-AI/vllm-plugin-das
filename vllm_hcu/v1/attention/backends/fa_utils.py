@@ -22,7 +22,10 @@ import vllm_hcu.hcu_ops as hcu_ops
 
 
 _FLASH_ATTN_BUILDS_WITH_NATIVE_LONG_PREFILL_GATHER = frozenset(
-    {"2.8.4+dtk2604.torch2110.2609241509.g624d7b"}
+    {
+        "2.8.4+dtk2604.torch2110.2609241509.g624d7b",
+        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
+    }
 )
 
 
