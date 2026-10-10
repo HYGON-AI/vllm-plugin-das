@@ -28,7 +28,19 @@ TARGET_MODULE = "vllm.models.deepseek_v4.amd.rocm"
 PATCH_ID = "worker.core_fix.deepseek_v4_rocm.flashmla_sparse"
 _DECODE_MARKER = "_vllm_hcu_flashmla_sparse_decode_applied"
 _PREFILL_MARKER = "_vllm_hcu_flashmla_sparse_prefill_applied"
-_FLASHMLA_PREFILL_HEAD_COUNTS = (64, 128)
+
+
+def _flashmla_prefill_padded_heads(num_heads: int) -> int | None:
+    """Return the sparse-prefill kernel width for a TP-local Q layout."""
+    from vllm_hcu.platforms import envs as henvs
+
+    if not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING:
+        return num_heads if num_heads in (64, 128) else None
+    if 0 < num_heads <= 64:
+        return 64
+    if 64 < num_heads <= 128:
+        return 128
+    return None
 
 
 def _flashmla_decode_enabled() -> bool:
@@ -405,14 +417,17 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
         q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
         rope_head_dim, attn_sink, output, ragged_indices=None, ragged_indptr=None,
     ):
-        # Native ROCm uses unpadded local heads; sparse prefill supports 64/128.
+        # Sparse prefill kernels require 64/128 heads; pad TP-local queries.
+        padded_heads = (
+            _flashmla_prefill_padded_heads(q.shape[1]) if q.ndim == 3 else None
+        )
         if (
             not _flashmla_prefill_enabled()
             or indices is None or topk_length is None or attn_sink is None
             or (
                 q.ndim == 3
                 and (
-                    q.shape[1] not in _FLASHMLA_PREFILL_HEAD_COUNTS
+                    padded_heads is None
                     or q.shape[-1] != 512
                     or q.dtype != torch.bfloat16
                 )
@@ -433,6 +448,21 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
             raise ValueError("FlashMLA prefill requires one dense index row per query")
         if topk_length.shape != (q.shape[0],):
             raise ValueError("FlashMLA prefill requires one top-k length per query")
+        if attn_sink.ndim != 1 or attn_sink.shape[0] != q.shape[1]:
+            raise ValueError("FlashMLA prefill requires one attention sink per query head")
+
+        actual_heads = q.shape[1]
+        assert padded_heads is not None
+        if actual_heads != padded_heads:
+            q_padded = q.new_zeros((q.shape[0], padded_heads, q.shape[2]))
+            q_padded[:, :actual_heads].copy_(q)
+            q = q_padded
+
+            # Padded heads are discarded, but FlashMLA still requires the sink
+            # tensor to match h_q. Zero-fill mirrors SGLang's DSV4 TP padding.
+            sink_padded = attn_sink.new_zeros((padded_heads,))
+            sink_padded[:actual_heads].copy_(attn_sink)
+            attn_sink = sink_padded
         chunk_output, _, _ = flash_mla_sparse_fwd(
             q=q,
             kv=kv,
@@ -443,7 +473,7 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
             topk_length=topk_length,
             backend=_prefill_backend(),
         )
-        output.copy_(chunk_output.to(output.dtype))
+        output.copy_(chunk_output[:, :actual_heads].to(output.dtype))
 
     setattr(sparse_prefill, _PREFILL_MARKER, True)
     setattr(rocm, "rocm_sparse_attn_prefill", sparse_prefill)
