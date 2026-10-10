@@ -21,15 +21,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # DTK 基础镜像仓库地址 (Harbor 站点 + dtk 仓库路径)
-  DTK_BASE_REPO: ${{ vars.HARBOR_SITE }}/hcu/base/dtk
+  TORCH_VERSION: "2.11.0"
 
 jobs:
   compile:
     name: compile (dtk${{ matrix.dtk_tag }}-py${{ matrix.python_version }}-torch${{ matrix.torch_version }})
     # 直接使用预装 DTK 的基础镜像, CI 内不再安装 DTK; 换/加编译目标 = 改下面矩阵
     # image 按镜像总表固定格式拼接:
-    #   ${DTK_BASE_REPO}:<dtk_tag>-rockylinux8.6-py<python_version>
+    #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
+    # (container.image 不允许 env 上下文, 变量直接用 vars.HARBOR_SITE 内联)
     # pip 源按 dtk_tag 走对应 nightly 归档: ${PYPI_URL}/nightly/dtk<dtk_tag去点>/+simple/
     runs-on: self-hosted
     strategy:
@@ -39,11 +39,14 @@ jobs:
           - dtk_tag: "26.04"
             python_version: "3.10"
             torch_version: "2.11.0"
+          - dtk_tag: "26.04"
+            python_version: "3.12"
+            torch_version: "2.11.0"
           - dtk_tag: "26.10"
             python_version: "3.12"
             torch_version: "2.11.0"
     container:
-      image: ${{ env.DTK_BASE_REPO }}:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python_version }}
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python_version }}
       options: >-
         --volume /opt/hyhal:/opt/hyhal:ro
         --device /dev/kfd:/dev/kfd

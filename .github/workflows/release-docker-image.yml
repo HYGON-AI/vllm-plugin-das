@@ -41,8 +41,18 @@ jobs:
             os_tag: "ubuntu22.04"
             python_version: "3.10"
             torch_version: "2.11.0"
-            # AICC run 包 branch 段的 dtk 版本 token, 装该段下日期最新的包
-            dtk_branch: "dtk26042"
+            # AICC 大版本, 安装脚本 --major 装该版本中日期最新的包 (26.04 段为 1.0.0)
+            aicc_major: "1.0.0"
+            # blas cut 版本, 安装脚本按版本+os 拉归档最新包覆盖到 /opt/dtk
+            blas_cut_version: "26.04"
+          - dtk_tag: "26.10"
+            os_tag: "ubuntu22.04"
+            python_version: "3.12"
+            torch_version: "2.11.0"
+            # AICC 大版本, 安装脚本 --major 装该版本中日期最新的包 (26.10 段为 2.0.0)
+            aicc_major: "2.0.0"
+            # blas cut 版本, 安装脚本按版本+os 拉归档最新包覆盖到 /opt/dtk
+            blas_cut_version: "26.10"
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     env:
@@ -59,7 +69,9 @@ jobs:
           DTK_TAG_NO_DOT: ${{ matrix.dtk_tag }}
         run: |
           DTK_TAG_NO_DOT="${DTK_TAG_NO_DOT//./}"
+          # BUILD_TIME: 传给 Dockerfile 生成 /etc/image.info 的 built 段, 与产物 tag 时间段一致
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
+          echo "BUILD_TIME=${BUILD_TIME}" >> "$GITHUB_ENV"
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
           BASE_VERSION="${BASE_VERSION%%.dev*}"
           echo "IMAGE_TAG=vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_ENV"
@@ -74,11 +86,7 @@ jobs:
           password: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: 构建镜像
-        env:
-          # nightly 归档路径按 DTK 版本号拼接 (26.04.1 -> dtk26041)
-          DTK_TAG_NO_DOT: ${{ matrix.dtk_tag }}
         run: |
-          DTK_TAG_NO_DOT="${DTK_TAG_NO_DOT//./}"
           FULL_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           FULL_LATEST_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
           docker build \
@@ -87,13 +95,13 @@ jobs:
             -t "${FULL_TAG}" \
             -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
-            --build-arg "DTK_VERSION=${DTK_TAG_NO_DOT}" \
-            --build-arg "DTK_BRANCH=${{ matrix.dtk_branch }}" \
+            --build-arg "AICC_MAJOR=${{ matrix.aicc_major }}" \
+            --build-arg "BLAS_CUT_VERSION=${{ matrix.blas_cut_version }}" \
             --build-arg "PYPI_URL=${PYPI_URL}" \
             --build-arg "RESOURCE_SERVER_URL=${RESOURCE_SERVER_URL}" \
             --build-arg "VLLM_VERSION=${VLLM_VERSION}" \
             --build-arg "TORCH_VERSION=${TORCH_VERSION}" \
-            --build-arg "IMAGE_TAG=${FULL_TAG}" \
+            --build-arg "BUILD_TIME=${BUILD_TIME}" \
             -f docker/Dockerfile \
             .
 
