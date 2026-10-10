@@ -47,6 +47,7 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime
     DeepEPDeepGemmW4A8ContiguousExperts,
     DeepEPDeepGemmW4A8MaskedExperts,
 )
+from vllm_hcu.platforms import envs as henvs
 
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
@@ -613,7 +614,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        del topk_weights, global_num_experts, expert_map
+        del topk_weights, expert_map
         del a2_scale, apply_router_weight_on_input
         del workspace13
         if activation != MoEActivation.SILU:
@@ -641,6 +642,25 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
         local_num_experts, max_tokens, _ = hidden_states.shape
         _, _, N, K, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
+        expected_m = max_tokens
+        if not use_int8 and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+            # DeepGEMM uses expected_m as a tile-selection hint; masked_m
+            # still controls the rows computed for each expert. Match the
+            # per-step estimate used by SGLang instead of the LL buffer's
+            # maximum capacity, which selects unnecessarily large tiles for
+            # small decode batches. Adding global_num_experts intentionally
+            # preserves SGLang's one-row margin at exact multiples and yields
+            # one row for an empty rank.
+            expected_m = min(
+                max_tokens,
+                (
+                    topk_ids.size(0)
+                    * self.num_dispatchers
+                    * topk_ids.size(1)
+                    + global_num_experts
+                )
+                // global_num_experts,
+            )
         expert_num_tokens = expert_tokens_meta.expert_num_tokens.to(
             dtype=torch.int32
         ).contiguous()
@@ -657,7 +677,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             (self._deepgemm_w13, self._ensure_ll_weight_scale(self.w1_scale)),
             gateup_output,
             expert_num_tokens,
-            max_tokens,
+            expected_m,
         )
 
         if use_int8:
@@ -694,7 +714,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             (self._deepgemm_w2, self._ensure_ll_weight_scale(self.w2_scale)),
             out_view,
             expert_num_tokens,
-            max_tokens,
+            expected_m,
         )
 
     @staticmethod
