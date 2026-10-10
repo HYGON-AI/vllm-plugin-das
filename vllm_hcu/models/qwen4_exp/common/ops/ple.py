@@ -126,6 +126,8 @@ def _ple_ngram_ids(
 ) -> None:
     input_ids = input_ids.reshape(-1)
     num_tokens = input_ids.shape[0]
+    if num_tokens == 0:
+        return
     num_reqs = query_start_loc.numel() - 1
     ctx_len = ngram_context.shape[1]
     BLOCK_T = 8

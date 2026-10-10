@@ -66,6 +66,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
+from vllm_hcu.models.qwen4_exp.common.ops.ple import ple_ngram_ids
 from vllm_hcu.models.qwen4_exp.engram import cpu_offload_enabled
 from vllm_hcu.platforms import envs as hcu_envs
 
@@ -360,120 +361,41 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 tuple(ids_buffer.shape),
                 tuple(rows_buffer.shape),
             )
-        self.register_buffer(
-            "positions_buffer",
-            torch.arange(max_total_tokens, dtype=torch.int64),
-            persistent=False,
-        )
-        self.register_buffer(
-            "padded_buffer",
-            torch.full(
-                (max_num_reqs, max_total_tokens),
-                self.eos_token_id,
-                dtype=torch.int64,
-            ),
-            persistent=False,
-        )
-
-    @staticmethod
-    def _shift_precompute(
-        tokens: torch.Tensor, eos_token_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if tokens.dim() != 2:
-            raise ValueError("tokens must be a 2D tensor")
-        batch_size, seq_len = tokens.shape
-        positions = torch.arange(seq_len, device=tokens.device, dtype=torch.int64)
-        eos_positions = torch.where(tokens == eos_token_id, positions, -1)
-        previous_eos_inclusive = torch.cummax(eos_positions, dim=1).values
-        previous_eos = torch.cat(
-            [
-                eos_positions.new_full((batch_size, 1), -1),
-                previous_eos_inclusive[:, :-1],
-            ],
-            dim=1,
-        )
-        return positions, positions.unsqueeze(0) - previous_eos - 1
-
-    @staticmethod
-    def _shift_apply(
-        tokens: torch.Tensor,
-        positions: torch.Tensor,
-        position_in_segment: torch.Tensor,
-        shift: int,
-        eos_token_id: int,
-    ) -> torch.Tensor:
-        if shift == 0:
-            return tokens
-        source = positions - shift
-        gather_indices = source.clamp_min(0).unsqueeze(0).expand(tokens.shape[0], -1)
-        shifted = tokens.gather(1, gather_indices)
-        valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
-        return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
+        # Kept in the public constructor for vLLM 0.28.1 call compatibility;
+        # fused ID generation no longer allocates a [requests, tokens] workspace.
+        del max_num_reqs
 
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        input_ids = input_ids.reshape(-1).long()
-        query_start_loc = query_start_loc.long()
+        input_ids = input_ids.reshape(-1)
         num_reqs = query_start_loc.numel() - 1
         num_tokens = input_ids.shape[0]
-        if num_tokens > self.positions_buffer.numel():
+        if num_tokens > self.max_total_tokens:
             raise ValueError(
                 f"PLE received {num_tokens} tokens, but its workspace supports "
-                f"at most {self.positions_buffer.numel()}"
+                f"at most {self.max_total_tokens}"
             )
-        if num_reqs > self.padded_buffer.shape[0]:
+        if ngram_context.shape[0] < num_reqs:
             raise ValueError(
-                f"PLE received {num_reqs} requests, but its workspace supports "
-                f"at most {self.padded_buffer.shape[0]}"
+                f"PLE received {num_reqs} requests, but ngram_context has "
+                f"only {ngram_context.shape[0]} rows"
             )
-
-        positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
-        packed.fill_(self.eos_token_id)
-        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
-        request_indices.clamp_(max=num_reqs - 1)
-        columns = (positions - query_start_loc[request_indices]).clamp(
-            0, packed.shape[1] - 1
+        return ple_ngram_ids(
+            input_ids,
+            query_start_loc,
+            ngram_context[:num_reqs],
+            self.layer_multipliers,
+            self.ngram_heads_vocab_sizes,
+            self.ngram_heads_offsets,
+            self.eos_token_id,
+            self.heads_per_ngram,
+            output=output,
         )
-        packed[request_indices, columns] = input_ids
-        ngram_context = ngram_context[:num_reqs].to(
-            device=input_ids.device, dtype=torch.long
-        )
-
-        context = torch.cat([ngram_context, packed], dim=-1)
-        positions_2d, position_in_segment = self._shift_precompute(
-            context, self.eos_token_id
-        )
-        shifted = [context]
-        for shift in range(1, self.ngram_size):
-            shifted.append(
-                self._shift_apply(
-                    context,
-                    positions_2d,
-                    position_in_segment,
-                    shift,
-                    self.eos_token_id,
-                )
-            )
-        adjusted_columns = columns + self.ngram_size - 1
-        id_blocks = []
-        for ngram in range(2, self.ngram_size + 1):
-            start = (ngram - 2) * self.heads_per_ngram
-            end = start + self.heads_per_ngram
-            mixed = shifted[0] * self.layer_multipliers[0]
-            for index in range(1, ngram):
-                mixed = torch.bitwise_xor(
-                    mixed, shifted[index] * self.layer_multipliers[index]
-                )
-            sizes = self.ngram_heads_vocab_sizes[start:end]
-            offsets = self.ngram_heads_offsets[start:end]
-            ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
-            id_blocks.append(ids[request_indices, adjusted_columns])
-        return torch.cat(id_blocks, dim=-1)
 
     def prepare_prefetch(self) -> None:
         if not self._hcu_prefetch_enabled:
@@ -530,8 +452,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._hcu_prefetch_pending = True
         try:
             with torch.cuda.stream(side):
+                generated_ids = self._hcu_prefetch_ids_buffer[:num_tokens]
                 ngram_ids = self.compute_ngram_ids(
-                    input_ids, query_start_loc, ngram_context
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    output=generated_ids,
                 )
                 embedding = self.ngram_embedding
                 slot_size, _ = embedding._get_dp_gather_slot(num_tokens)

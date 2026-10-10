@@ -141,6 +141,25 @@ def test_ple_ngram_ids_matches_reference() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_ple_ngram_ids_accepts_empty_batch() -> None:
+    output = torch.empty((0, 2), dtype=torch.int64)
+
+    actual = fused_ple.ple_ngram_ids(
+        torch.empty(0, dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.empty((0, 2), dtype=torch.int32),
+        torch.tensor([11, 13, 17], dtype=torch.int64),
+        torch.tensor([19, 23], dtype=torch.int64),
+        torch.tensor([0, 19], dtype=torch.int64),
+        eos_token_id=2,
+        heads_per_ngram=1,
+        output=output,
+    )
+
+    assert actual is output
+    assert actual.shape == (0, 2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs an accelerator")
 @pytest.mark.parametrize("strided_kv", [False, True])
 def test_ple_gate_matches_reference(strided_kv: bool) -> None:

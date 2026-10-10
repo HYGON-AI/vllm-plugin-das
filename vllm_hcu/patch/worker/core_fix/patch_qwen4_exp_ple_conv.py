@@ -12,6 +12,7 @@ from types import ModuleType
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_hcu.models.qwen4_exp.common.ops.ple import ple_ngram_ids
 
 from ._common import PatchCompatibilityError, require_class
 
@@ -107,6 +108,53 @@ class _HcuFunctionalProxy:
         )
 
 
+def _run_ngram_embedding(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
+        ngram_ids,
+        output,
+        layer_name,
+    )
+
+
+def _run_fused_ngram_forward(
+    ngram,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    successor = getattr(ngram, "_hcu_prefetch_successor", None)
+    if successor is not None:
+        successor._start_prefetch_impl(input_ids, query_start_loc, ngram_context)
+
+    num_tokens = input_ids.reshape(-1).shape[0]
+    if getattr(ngram, "_hcu_prefetch_enabled", False):
+        output.copy_(ngram._consume_prefetched_impl(num_tokens))
+        return
+
+    compute_ngram_ids = getattr(ngram, "compute_ngram_ids", None)
+    if callable(compute_ngram_ids):
+        ngram_ids = compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+    else:
+        num_reqs = query_start_loc.numel() - 1
+        ngram_ids = ple_ngram_ids(
+            input_ids.reshape(-1),
+            query_start_loc,
+            ngram_context[:num_reqs],
+            ngram.layer_multipliers,
+            ngram.ngram_heads_vocab_sizes,
+            ngram.ngram_heads_offsets,
+            ngram.eos_token_id,
+            ngram.heads_per_ngram,
+        )
+    _run_ngram_embedding(ngram_ids, output, layer_name)
+
+
 def _hcu_qwen4_exp_ple_ngram(
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -120,8 +168,6 @@ def _hcu_qwen4_exp_ple_ngram(
 ) -> None:
     from vllm.forward_context import get_forward_context
 
-    ple = importlib.import_module(TARGET_MODULE)
-    original_forward = getattr(ple, "_vllm_hcu_original_ngram_forward")
     owner = get_forward_context().no_compile_layers[layer_name]
     ngram = owner.ple_embedding
     if hasattr(ngram, "_hcu_prefetch_ids_buffer"):
@@ -146,13 +192,14 @@ def _hcu_qwen4_exp_ple_ngram(
             raise RuntimeError(
                 f"PLE successor rows workspace mismatch for {layer_name}"
             )
-    result = original_forward(
+    _run_fused_ngram_forward(
         ngram,
         input_ids,
         query_start_loc,
         ngram_context,
+        output,
+        layer_name,
     )
-    output.copy_(result)
 
 
 direct_register_custom_op(
