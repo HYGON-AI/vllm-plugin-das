@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -232,9 +233,7 @@ def test_gfx938_profile_contract(
     diagnostic_profiles = {
         "deepseek_r1_0528_channel_int8_kvfp8_tp8",
         "deepseek_v4_flash_tp8",
-        "qwen2_57b_tp2",
         "qwen3_30b_int8_tp2",
-        "qwen36_27b_w8a8_tp2",
     }
     assert bool(
         config["evalscope"]["pass_criteria"].get("enforce_score", True)
@@ -300,6 +299,25 @@ def test_gfx938_profiles_have_unique_ports_and_owned_work_directories(
         ports.append(config["server"]["port"])
     assert len(work_dirs) == len(set(work_dirs)) == 24
     assert len(ports) == len(set(ports)) == 24
+
+
+def test_minimax_profile_uses_accepted_bf16_kv_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CONFIG_ENV, raising=False)
+    config = load_profiled_config(
+        DEFAULT_CONFIG,
+        CONFIG_ENV,
+        profile="minimax_m25_int8_tp4",
+    )
+    command, _, _ = server_command(config, model_env=MODEL_ENV)
+
+    assert config["server"]["environment"] == {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_KV_CACHE_LAYOUT": "HND",
+    }
+    assert "--kv-cache-dtype" not in command
+    assert config["evalscope"]["generation_config"]["max_tokens"] == 2048
 
 
 def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
@@ -442,6 +460,9 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
         DEFAULT_CONFIG, CONFIG_ENV, profile="hy4_preview_channel_fp8_tp8"
     )
     hy4_command, _, _ = server_command(hy4, model_env=MODEL_ENV)
+    assert hy4["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(hy4_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(hy4_command, "--block-size") == "64"
     assert json.loads(
         _option_value(hy4_command, "--default-chat-template-kwargs")
     ) == {"reasoning_effort": "no_think"}
@@ -477,6 +498,59 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
     assert "--generation-config" not in minimax_command
     assert "--speculative-config" not in minimax_command
 
+    qwen2 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen2_57b_tp2"
+    )
+    qwen2_command, _, _ = server_command(qwen2, model_env=MODEL_ENV)
+    assert qwen2["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(qwen2_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(qwen2_command, "--moe-backend") == "aiter"
+    assert "--speculative-config" not in qwen2_command
+
+    qwen3 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen3_8b_tp2"
+    )
+    qwen3_command, _, _ = server_command(qwen3, model_env=MODEL_ENV)
+    assert qwen3["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(qwen3_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert "--speculative-config" not in qwen3_command
+
+    qwen35 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen35_35b_tp2"
+    )
+    qwen35_command, _, _ = server_command(qwen35, model_env=MODEL_ENV)
+    assert qwen35["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert _option_value(qwen35_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(qwen35_command, "--mamba-cache-mode") == "align"
+    assert _option_value(qwen35_command, "--prefix-match-unit") == "64"
+    assert "--enable-mamba-fine-grained-prefix-cache" in qwen35_command
+
+    qwen35_w8a8 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen35_35b_w8a8_tp2"
+    )
+    qwen35_w8a8_command, _, _ = server_command(
+        qwen35_w8a8, model_env=MODEL_ENV
+    )
+    assert (
+        qwen35_w8a8["server"]["environment"]["VLLM_USE_V2_MODEL_RUNNER"]
+        == "1"
+    )
+    assert _option_value(qwen35_w8a8_command, "--mamba-cache-mode") == "align"
+    assert _option_value(qwen35_w8a8_command, "--prefix-match-unit") == "64"
+    assert "--enable-mamba-fine-grained-prefix-cache" in qwen35_w8a8_command
+
+    qwen36 = load_profiled_config(
+        DEFAULT_CONFIG, CONFIG_ENV, profile="qwen36_27b_w8a8_tp2"
+    )
+    qwen36_command, _, _ = server_command(qwen36, model_env=MODEL_ENV)
+    assert json.loads(
+        _option_value(qwen36_command, "--speculative-config")
+    ) == {"method": "mtp", "num_speculative_tokens": 3}
+    assert _option_value(qwen36_command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(qwen36_command, "--mamba-cache-mode") == "align"
+    assert _option_value(qwen36_command, "--prefix-match-unit") == "64"
+    assert "--enable-mamba-fine-grained-prefix-cache" in qwen36_command
+
     for profile in (
         "glm5_w8a8_tp8",
         "glm53_channel_fp8_tp8",
@@ -499,6 +573,74 @@ def test_gfx938_profile_specific_reasoning_and_mtp_contracts(
         fp8_kv_command, _, _ = server_command(fp8_kv, model_env=MODEL_ENV)
         assert _option_value(fp8_kv_command, "--max-model-len") == "8192"
         assert fp8_kv["server"]["prefix_probe"]["content_repeat"] == 64
+
+    qwen38_expectations = {
+        "qwen38_27b_int8_tp2": {
+            "kv_layout": "HND",
+            "quantization": None,
+            "fine_grained_prefix": True,
+        },
+        "qwen38_flash_next_fp8_tp4": {
+            "kv_layout": None,
+            "quantization": None,
+            "fine_grained_prefix": False,
+        },
+        "qwen38_flash_next_w4a8_tp4": {
+            "kv_layout": None,
+            "quantization": "slimquant_w4a8",
+            "fine_grained_prefix": False,
+        },
+    }
+    for profile, expected in qwen38_expectations.items():
+        config = load_profiled_config(DEFAULT_CONFIG, CONFIG_ENV, profile=profile)
+        command, _, _ = server_command(config, model_env=MODEL_ENV)
+        environment = config["server"]["environment"]
+        assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        assert environment.get("VLLM_KV_CACHE_LAYOUT") == expected["kv_layout"]
+        assert json.loads(_option_value(command, "--speculative-config")) == {
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+        }
+        assert _option_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+        assert _option_value(command, "--mamba-cache-mode") == "align"
+        assert _option_value(command, "--max-model-len") == "8192"
+        assert _option_value(command, "--max-num-batched-tokens") == "2048"
+        assert _option_value(command, "--max-num-seqs") == "8"
+        assert "--enable-prefix-caching" in command
+        if expected["quantization"] is None:
+            assert "--quantization" not in command
+        else:
+            assert (
+                _option_value(command, "--quantization")
+                == expected["quantization"]
+            )
+        if expected["fine_grained_prefix"]:
+            assert _option_value(command, "--prefix-match-unit") == "64"
+            assert "--enable-mamba-fine-grained-prefix-cache" in command
+        else:
+            assert "--prefix-match-unit" not in command
+            assert "--enable-mamba-fine-grained-prefix-cache" not in command
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "docs/validation/llm-models-2-hygon-v0281.md",
+        "docs/validation/v0281-gfx938-provenance.md",
+    ],
+)
+def test_documented_humaneval_clients_use_allowlisted_environments(
+    relative_path: str,
+) -> None:
+    document = (ROOT / relative_path).read_text(encoding="utf-8")
+    client_blocks = [
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", document, re.DOTALL)
+        if "tests.integration.server.evalscope_secure_cli eval" in block
+    ]
+
+    assert client_blocks
+    assert all("env -i" in block for block in client_blocks)
 
 
 def test_hy3_dp8_ep8_low_latency_contract() -> None:

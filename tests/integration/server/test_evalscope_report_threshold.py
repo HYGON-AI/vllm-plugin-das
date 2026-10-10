@@ -995,6 +995,29 @@ def test_humaneval_normalization_tolerates_ast_resource_failure(
         entry_point="candidate",
     ) == completion
 
+
+def test_humaneval_normalization_preserves_source_rejected_by_ast() -> None:
+    completion = "return 'embedded" + chr(0) + "null'"
+
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
+
+
+def test_humaneval_normalization_preserves_nested_entry_definition() -> None:
+    completion = (
+        "if True:\n"
+        "    def candidate(value):\n"
+        "        return value"
+    )
+
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == completion
+
+
 @pytest.mark.parametrize(
     ("completion", "expected"),
     [
@@ -1040,6 +1063,38 @@ def test_normalize_humaneval_completion_removes_fence_joined_to_definition() -> 
     assert evalscope_server._normalize_humaneval_completion(completion) == (
         "def candidate(value):\n    return value"
     )
+
+
+@pytest.mark.parametrize(
+    ("completion", "expected"),
+    [
+        ("return value", "    return value"),
+        (
+            "result = []\nfor value in values:\n"
+            "    result.append(value)\nreturn result",
+            "    result = []\n    for value in values:\n"
+            "        result.append(value)\n    return result",
+        ),
+        (
+            "if not values:\n        return None\n"
+            "    longest = values[0]\n    for value in values[1:]:\n"
+            "        if len(value) > len(longest):\n"
+            "            longest = value\n    return longest",
+            "    if not values:\n        return None\n"
+            "    longest = values[0]\n    for value in values[1:]:\n"
+            "        if len(value) > len(longest):\n"
+            "            longest = value\n    return longest",
+        ),
+    ],
+)
+def test_normalize_humaneval_completion_indents_unindented_function_body(
+    completion: str,
+    expected: str,
+) -> None:
+    assert evalscope_server._normalize_humaneval_completion(
+        completion,
+        entry_point="candidate",
+    ) == expected
 
 
 def test_exact_humaneval_criteria_accepts_both_metrics_and_artifact_counts(
