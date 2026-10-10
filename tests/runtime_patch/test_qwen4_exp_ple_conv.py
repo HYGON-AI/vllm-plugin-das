@@ -74,6 +74,26 @@ def test_qwen4_exp_ple_profile_fallback_uses_hcu_conv(monkeypatch):
     assert calls == [("hcu", (1, 4, 5), 9, 3)]
 
 
+def test_fused_ple_keeps_short_conv_and_only_wraps_ngram():
+    class Qwen4ExpPLELayer:
+        def _short_conv(self, inputs, residual, outer_residual):
+            return inputs, residual, outer_residual
+
+    class Qwen4ExpNGramEmbedding:
+        def forward(self, input_ids, query_start_loc, ngram_context):
+            return input_ids, query_start_loc, ngram_context
+
+    module = ModuleType(patch.REPLACEMENT_MODULE)
+    module.Qwen4ExpPLELayer = Qwen4ExpPLELayer
+    module.Qwen4ExpNGramEmbedding = Qwen4ExpNGramEmbedding
+    original_short_conv = Qwen4ExpPLELayer._short_conv
+
+    assert patch.apply_to_module(module) is True
+    assert patch.apply_to_module(module) is False
+    assert Qwen4ExpPLELayer._short_conv is original_short_conv
+    assert getattr(Qwen4ExpNGramEmbedding.forward, patch._NGRAM_WRAPPER, False)
+
+
 def test_qwen4_exp_ngram_dynamic_preprocessing_is_behind_custom_op(monkeypatch):
     calls = []
     module, _, ngram_class = _target_module(calls)

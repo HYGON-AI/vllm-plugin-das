@@ -311,7 +311,9 @@ def test_ple_conv_matches_reference(mode: str, state_layout: str) -> None:
         dtype=torch.bfloat16,
         generator=generator,
     )
-    conv_state = storage if state_layout == "channels_first" else storage.transpose(1, 2)
+    conv_state = (
+        storage if state_layout == "channels_first" else storage.transpose(1, 2)
+    )
     state_reference = conv_state.clone()
     weights = torch.randn(
         channels, kernel_size, device=device, dtype=torch.bfloat16,
@@ -378,4 +380,136 @@ def test_ple_conv_matches_reference(mode: str, state_layout: str) -> None:
     )
 
     torch.testing.assert_close(actual_output, expected_output, atol=2e-2, rtol=2e-2)
+    assert torch.equal(conv_state, expected_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs an accelerator")
+@pytest.mark.parametrize("state_layout", ["channels_first", "window_first"])
+def test_fused_conv_mixed_batch_state_and_residual(state_layout: str) -> None:
+    from types import SimpleNamespace
+
+    from vllm_hcu.models.qwen4_exp.amd.ple_layer import Qwen4ExpPLELayer
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(23)
+    channels, kernel_size, dilation, spec_query_len = 16, 3, 2, 2
+    state_len = (kernel_size - 1) * dilation
+    state_width = state_len + spec_query_len - 1
+    storage_shape = (
+        (8, channels, state_width)
+        if state_layout == "channels_first"
+        else (8, state_width, channels)
+    )
+    storage = torch.randn(
+        storage_shape,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    conv_state = (
+        storage if state_layout == "channels_first" else storage.transpose(1, 2)
+    )
+    expected_state = conv_state.clone()
+    weights = torch.randn(
+        channels,
+        kernel_size,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    inputs = torch.randn(
+        6, channels, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    residual = torch.randn(
+        inputs.shape, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    outer = torch.randn(
+        inputs.shape, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    actual = residual.clone()
+    expected = residual.clone()
+    spec_tokens = torch.tensor([0, 1, 5], dtype=torch.int64, device=device)
+    non_spec_tokens = torch.tensor([2, 3, 4], dtype=torch.int64, device=device)
+    metadata = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_prefill_tokens=2,
+        num_actual_tokens=6,
+        spec_sequence_masks=torch.tensor([True, False, False, True], device=device),
+        spec_token_indx=spec_tokens,
+        non_spec_token_indx=non_spec_tokens,
+        spec_state_indices_tensor=torch.tensor(
+            [1, 2], dtype=torch.int32, device=device
+        ),
+        spec_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32, device=device),
+        num_accepted_tokens=torch.tensor([1, 1], dtype=torch.int32, device=device),
+        spec_query_len=spec_query_len,
+        num_spec_decodes=2,
+        state_indices_tensor=torch.tensor([3, 4], dtype=torch.int32, device=device),
+        has_initial_states_d=torch.tensor([True], device=device),
+        query_start_loc_p=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        has_initial_states_p=torch.tensor([True], device=device),
+    )
+
+    spec_output, expected_state = _reference_conv(
+        inputs.index_select(0, spec_tokens),
+        residual.index_select(0, spec_tokens),
+        outer.index_select(0, spec_tokens),
+        expected_state,
+        weights,
+        metadata.spec_state_indices_tensor,
+        mode="spec",
+        dilation=dilation,
+        query_start_loc=metadata.spec_query_start_loc,
+        num_accepted_tokens=metadata.num_accepted_tokens,
+        has_initial_states=None,
+        spec_query_len=spec_query_len,
+    )
+    expected.index_copy_(0, spec_tokens, spec_output)
+    decode_output, expected_state = _reference_conv(
+        inputs[2:3],
+        residual[2:3],
+        outer[2:3],
+        expected_state,
+        weights,
+        metadata.state_indices_tensor[:1],
+        mode="decode",
+        dilation=dilation,
+        query_start_loc=None,
+        num_accepted_tokens=None,
+        has_initial_states=metadata.has_initial_states_d,
+        spec_query_len=1,
+    )
+    expected[2:3] = decode_output
+    prefill_output, expected_state = _reference_conv(
+        inputs[3:5],
+        residual[3:5],
+        outer[3:5],
+        expected_state,
+        weights,
+        metadata.state_indices_tensor[1:],
+        mode="prefill",
+        dilation=dilation,
+        query_start_loc=metadata.query_start_loc_p,
+        num_accepted_tokens=None,
+        has_initial_states=metadata.has_initial_states_p,
+        spec_query_len=1,
+    )
+    expected[3:5] = prefill_output
+
+    layer = object.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.short_conv_dilation = dilation
+    Qwen4ExpPLELayer._short_conv_dilated_dispatch(
+        layer,
+        inputs,
+        actual,
+        outer,
+        metadata,
+        conv_state,
+        weights,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     assert torch.equal(conv_state, expected_state)

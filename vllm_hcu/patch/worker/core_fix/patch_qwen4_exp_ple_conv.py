@@ -259,32 +259,27 @@ def apply_to_module(module: ModuleType) -> bool:
         "Qwen4ExpNGramEmbedding",
         f"{TARGET_MODULE}.Qwen4ExpNGramEmbedding",
     )
+    short_conv = getattr(ple_class, "_short_conv", None)
+    fused_short_conv = callable(short_conv) and tuple(
+        inspect.signature(short_conv).parameters
+    ) == ("self", "inputs", "residual", "outer_residual")
 
     if getattr(ple, _MARKER, False):
-        if not isinstance(getattr(ple, "F", None), _HcuFunctionalProxy) or not getattr(
-            ple_class._short_conv_fallback, _WRAPPER, False
-        ) or not getattr(
-            ngram_class.forward, _NGRAM_WRAPPER, False
-        ):
+        ngram_is_wrapped = getattr(ngram_class.forward, _NGRAM_WRAPPER, False)
+        fallback_is_wrapped = fused_short_conv or (
+            isinstance(getattr(ple, "F", None), _HcuFunctionalProxy)
+            and getattr(
+                getattr(ple_class, "_short_conv_fallback", None),
+                _WRAPPER,
+                False,
+            )
+        )
+        if not ngram_is_wrapped or not fallback_is_wrapped:
             raise PatchCompatibilityError(
                 f"required HCU patch marker for {TARGET_MODULE} is stale"
             )
         return False
 
-    functional = getattr(ple, "F", None)
-    if functional is None or not callable(getattr(functional, "conv1d", None)):
-        raise PatchCompatibilityError(
-            f"required target {TARGET_MODULE}.F.conv1d is missing"
-        )
-    fallback = getattr(ple_class, "_short_conv_fallback", None)
-    if not callable(fallback) or tuple(inspect.signature(fallback).parameters) != (
-        "self",
-        "inputs",
-    ):
-        raise PatchCompatibilityError(
-            f"required target {TARGET_MODULE}.Qwen4ExpPLELayer._short_conv_fallback "
-            "has incompatible signature"
-        )
     ngram_forward = getattr(ngram_class, "forward", None)
     if not callable(ngram_forward) or tuple(
         inspect.signature(ngram_forward).parameters
@@ -294,17 +289,34 @@ def apply_to_module(module: ModuleType) -> bool:
             "has incompatible signature"
         )
 
-    @functools.wraps(fallback)
-    def hcu_short_conv_fallback(self, inputs):
-        inputs_t = inputs.transpose(0, 1).unsqueeze(0)
-        output = _depthwise_conv1d(
-            inputs_t,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            padding=self.conv_state_len,
-            dilation=self.short_conv_dilation,
-        )[..., : inputs_t.size(-1)]
-        return functional.silu(output).squeeze(0).transpose(0, 1)
+    functional = fallback = hcu_short_conv_fallback = None
+    if not fused_short_conv:
+        functional = getattr(ple, "F", None)
+        if functional is None or not callable(getattr(functional, "conv1d", None)):
+            raise PatchCompatibilityError(
+                f"required target {TARGET_MODULE}.F.conv1d is missing"
+            )
+        fallback = getattr(ple_class, "_short_conv_fallback", None)
+        if not callable(fallback) or tuple(inspect.signature(fallback).parameters) != (
+            "self",
+            "inputs",
+        ):
+            raise PatchCompatibilityError(
+                f"required target {TARGET_MODULE}.Qwen4ExpPLELayer."
+                "_short_conv_fallback has incompatible signature"
+            )
+
+        @functools.wraps(fallback)
+        def hcu_short_conv_fallback(self, inputs):
+            inputs_t = inputs.transpose(0, 1).unsqueeze(0)
+            output = _depthwise_conv1d(
+                inputs_t,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                padding=self.conv_state_len,
+                dilation=self.short_conv_dilation,
+            )[..., : inputs_t.size(-1)]
+            return functional.silu(output).squeeze(0).transpose(0, 1)
 
     @functools.wraps(ngram_forward)
     def hcu_ngram_forward(self, input_ids, query_start_loc, ngram_context):
@@ -347,13 +359,15 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         return output
 
-    setattr(hcu_short_conv_fallback, _WRAPPER, True)
+    if hcu_short_conv_fallback is not None:
+        setattr(hcu_short_conv_fallback, _WRAPPER, True)
     setattr(hcu_ngram_forward, _NGRAM_WRAPPER, True)
-    setattr(ple, "_vllm_hcu_original_functional", functional)
-    setattr(ple, "_vllm_hcu_original_short_conv_fallback", fallback)
     setattr(ple, "_vllm_hcu_original_ngram_forward", ngram_forward)
-    setattr(ple, "F", _HcuFunctionalProxy(functional))
-    setattr(ple_class, "_short_conv_fallback", hcu_short_conv_fallback)
+    if not fused_short_conv:
+        setattr(ple, "_vllm_hcu_original_functional", functional)
+        setattr(ple, "_vllm_hcu_original_short_conv_fallback", fallback)
+        setattr(ple, "F", _HcuFunctionalProxy(functional))
+        setattr(ple_class, "_short_conv_fallback", hcu_short_conv_fallback)
     setattr(ngram_class, "forward", hcu_ngram_forward)
     setattr(ple, _MARKER, True)
     return True
