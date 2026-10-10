@@ -309,11 +309,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._hcu_prefetch_enabled = _prefetch_method_enabled(method)
         if self._hcu_prefetch_enabled:
             output_dtype = _prefetch_output_dtype(method, self.ngram_embedding)
+            workspace_tokens = (
+                max_total_tokens * self.ngram_embedding.etp_data_parallel_size
+            )
             ids_buffer = torch.empty(
-                (max_total_tokens, self.ngram_heads), dtype=torch.int64
+                (workspace_tokens, self.ngram_heads), dtype=torch.int64
             )
             rows_buffer = torch.empty(
-                (max_total_tokens, embedding_dim), dtype=output_dtype
+                (workspace_tokens, embedding_dim), dtype=output_dtype
             )
             self._hcu_prefetch_stream = torch.cuda.Stream()
             self._hcu_prefetch_event = torch.cuda.Event()
@@ -530,13 +533,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_ids = self.compute_ngram_ids(
                     input_ids, query_start_loc, ngram_context
                 )
-                if ngram_ids.shape[0] > self._hcu_prefetch_ids_buffer.shape[0]:
+                embedding = self.ngram_embedding
+                slot_size, _ = embedding._get_dp_gather_slot(num_tokens)
+                gathered_ids = embedding._gather_dp_ids(ngram_ids, slot_size)
+                gathered_num_tokens = gathered_ids.shape[0]
+                if gathered_num_tokens > self._hcu_prefetch_ids_buffer.shape[0]:
                     raise ValueError(
                         "PLE prefetch received "
-                        f"{ngram_ids.shape[0]} tokens, but its workspace supports "
+                        f"{gathered_num_tokens} gathered tokens, but its "
+                        "workspace supports "
                         f"at most {self._hcu_prefetch_ids_buffer.shape[0]}"
                     )
-                embedding = self.ngram_embedding
                 input_mask = None
                 if embedding.tp_size > 1:
                     from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -544,7 +551,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     )
 
                     local_ids, input_mask = get_masked_input_and_mask(
-                        ngram_ids,
+                        gathered_ids,
                         embedding.shard_indices.org_vocab_start_index,
                         embedding.shard_indices.org_vocab_end_index,
                         embedding.shard_indices.num_org_vocab_padding,
@@ -552,11 +559,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         embedding.shard_indices.added_vocab_end_index,
                     )
                 else:
-                    local_ids = ngram_ids
-                ids = self._hcu_prefetch_ids_buffer[:num_tokens]
+                    local_ids = gathered_ids
+                ids = self._hcu_prefetch_ids_buffer[:gathered_num_tokens]
                 ids.copy_(local_ids)
-                rows = self._hcu_prefetch_rows_buffer[:num_tokens].view(
-                    num_tokens, self.ngram_heads, self.head_dim
+                rows = self._hcu_prefetch_rows_buffer[:gathered_num_tokens].view(
+                    gathered_num_tokens, self.ngram_heads, self.head_dim
                 )
                 embedding.quant_method.prefetch_lookup_into(embedding, ids, rows)
                 if input_mask is not None:
@@ -575,10 +582,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         event = self._hcu_prefetch_event
         assert event is not None
         torch.cuda.current_stream().wait_event(event)
-        rows = self._hcu_prefetch_rows_buffer[:num_tokens]
+        embedding = self.ngram_embedding
+        slot_size, slot_offset = embedding._get_dp_gather_slot(num_tokens)
+        gathered_num_tokens = slot_size * embedding.etp_data_parallel_size
+        rows = self._hcu_prefetch_rows_buffer[:gathered_num_tokens]
         try:
-            return self.ngram_embedding.quant_method.finalize_prefetched(
-                self.ngram_embedding, rows
+            rows = embedding.quant_method.finalize_prefetched(embedding, rows)
+            return embedding._select_embeddings(
+                rows,
+                num_tokens,
+                slot_offset,
             )
         finally:
             self._hcu_prefetch_pending = False

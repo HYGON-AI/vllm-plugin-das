@@ -118,6 +118,49 @@ def test_incomplete_claimed_capability_fails_fast(ple_layer):
         ple_layer._prefetch_output_dtype(method, SimpleNamespace())
 
 
+def test_prefetch_workspace_covers_every_etp_dp_slot(monkeypatch, ple_layer):
+    class Embedding(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            del args, kwargs
+            self.quant_method = _capable_method()
+            self.params_dtype = torch.bfloat16
+            self.etp_data_parallel_size = 4
+
+    monkeypatch.setattr(ple_layer, "PLEVocabParallelEmbedding", Embedding)
+    monkeypatch.setattr(ple_layer, "_prefetch_method_enabled", lambda method: True)
+    monkeypatch.setattr(
+        ple_layer,
+        "_prefetch_output_dtype",
+        lambda method, layer: torch.bfloat16,
+    )
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    config = SimpleNamespace(
+        ngram_size=2,
+        heads_per_ngram=1,
+        eos_token_id=2,
+        vocab_size=32,
+        split_ngram_parts=4,
+        seed=1234,
+        ngram_vocab_size_base=17,
+        make_ngram_vocab_size_divisible_by=8,
+    )
+
+    owner = ple_layer.Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=4,
+        ple_dense_layer_id=0,
+        max_total_tokens=8,
+        max_num_reqs=2,
+        prefix="model.layers.1.ple.ple_embedding",
+        layer_name="model.layers.1.ple",
+    )
+
+    assert owner._hcu_prefetch_ids_buffer.shape == (32, 1)
+    assert owner._hcu_prefetch_rows_buffer.shape == (32, 4)
+
+
 def test_uva_lookup_into_buffer_matches_embedding():
     weight = torch.tensor([[1, -2, 3], [-4, 5, -6]], dtype=torch.int8)
     scale = torch.tensor([[0.5], [0.25]], dtype=torch.bfloat16)
@@ -135,7 +178,7 @@ def test_uva_lookup_into_buffer_matches_embedding():
     assert method.finalize_prefetched(layer, output.flatten(-2)) is not None
 
 
-def test_uva_finalize_reduces_over_tensor_parallel_group(monkeypatch):
+def test_uva_finalize_reduces_over_etp_group(monkeypatch):
     calls = []
 
     def all_reduce(rows):
@@ -143,9 +186,14 @@ def test_uva_finalize_reduces_over_tensor_parallel_group(monkeypatch):
         return rows + 7
 
     rows = torch.arange(12).reshape(2, 6)
-    layer = SimpleNamespace(tp_size=4)
+    group = SimpleNamespace(all_reduce=all_reduce)
+    layer = SimpleNamespace(tp_size=4, parallel_group=group)
     method = int8_patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
-    monkeypatch.setattr(int8_patch, "tensor_model_parallel_all_reduce", all_reduce)
+    monkeypatch.setattr(
+        int8_patch,
+        "tensor_model_parallel_all_reduce",
+        lambda unused: pytest.fail("cross-DP PLE must reduce over ETP, not TP"),
+    )
     result = method.finalize_prefetched(layer, rows)
 
     assert len(calls) == 1
@@ -204,7 +252,30 @@ def test_start_and_consume_use_side_stream_event_and_static_buffers(
             return rows.clone()
 
     ngram_ids = torch.tensor([[3, 4], [5, 6]], dtype=torch.long)
-    embedding = SimpleNamespace(tp_size=1, quant_method=Method())
+    gathered_ids = torch.tensor(
+        [[1, 2], [0, 0], [3, 4], [5, 6]], dtype=torch.long
+    )
+    shard_indices = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=10,
+        num_org_vocab_padding=0,
+        added_vocab_start_index=10,
+        added_vocab_end_index=10,
+    )
+
+    def select_embeddings(rows, local_num_tokens, slot_offset):
+        events.append(("select", local_num_tokens, slot_offset))
+        return rows.narrow(0, slot_offset, local_num_tokens)
+
+    embedding = SimpleNamespace(
+        tp_size=2,
+        etp_data_parallel_size=2,
+        quant_method=Method(),
+        shard_indices=shard_indices,
+        _get_dp_gather_slot=lambda local_num_tokens: (2, 2),
+        _gather_dp_ids=lambda ids, slot_size: gathered_ids,
+        _select_embeddings=select_embeddings,
+    )
     owner = SimpleNamespace(
         _hcu_prefetch_enabled=True,
         _hcu_prefetch_pending=False,
@@ -231,7 +302,7 @@ def test_start_and_consume_use_side_stream_event_and_static_buffers(
     )
     assert started is True
     assert owner._hcu_prefetch_pending is True
-    assert torch.equal(owner._hcu_prefetch_ids_buffer[:2], ngram_ids)
+    assert torch.equal(owner._hcu_prefetch_ids_buffer[:4], gathered_ids)
     with pytest.raises(RuntimeError, match="duplicate"):
         ple_layer.Qwen4ExpNGramEmbedding._start_prefetch_impl(
             owner,
@@ -250,7 +321,10 @@ def test_start_and_consume_use_side_stream_event_and_static_buffers(
         "record",
         "main-wait",
         "finalize",
+        "select",
     ]
+    assert events[-2] == ("finalize", torch.Size([4, 6]))
+    assert events[-1] == ("select", 2, 2)
     with pytest.raises(RuntimeError, match="miss"):
         ple_layer.Qwen4ExpNGramEmbedding._consume_prefetched_impl(owner, 2)
 

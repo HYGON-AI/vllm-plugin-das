@@ -31,7 +31,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    get_dp_group,
+    get_etp_group,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
@@ -276,7 +282,7 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
             + weight_scale.numel() * weight_scale.element_size()
         )
         logger.info_once(
-            "Qwen4Exp PLE INT8 UVA offload active: %.3f MiB per TP rank "
+            "Qwen4Exp PLE INT8 UVA offload active: %.3f MiB per ETP rank "
             "(weight=%s, weight_scale=%s, zero-copy device views)",
             offloaded_bytes / (1024**2),
             tuple(weight.shape),
@@ -318,6 +324,9 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
     ) -> torch.Tensor:
         if layer.tp_size == 1:
             return rows
+        parallel_group = getattr(layer, "parallel_group", None)
+        if parallel_group is not None:
+            return parallel_group.all_reduce(rows)
         return tensor_model_parallel_all_reduce(rows)
 
     @staticmethod
@@ -379,7 +388,7 @@ class HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod(QuantizeMethodBase):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         layer._hcu_uva_weight_view = None
         logger.info_once(
-            "Qwen4Exp PLE %s UVA offload active: %.3f MiB per TP rank",
+            "Qwen4Exp PLE %s UVA offload active: %.3f MiB per ETP rank",
             layer.weight.dtype,
             layer.weight.numel() * layer.weight.element_size() / (1024**2),
         )
@@ -421,6 +430,9 @@ class HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if layer.tp_size == 1:
             return rows
+        parallel_group = getattr(layer, "parallel_group", None)
+        if parallel_group is not None:
+            return parallel_group.all_reduce(rows)
         return tensor_model_parallel_all_reduce(rows)
 
 
@@ -435,13 +447,23 @@ def _make_storage_class(module: ModuleType, quant_config):
         def __init__(self, *args, **kwargs):
             prefix = kwargs.get("prefix", "")
             effective_quant_config = quant_config
+            vllm_config = None
             try:
                 from vllm.config import get_current_vllm_config
 
-                effective_quant_config = getattr(
-                    get_current_vllm_config(), "quant_config", None
-                ) or effective_quant_config
+                vllm_config = get_current_vllm_config()
+                effective_quant_config = (
+                    getattr(vllm_config, "quant_config", None)
+                    or effective_quant_config
+                )
             except (AssertionError, AttributeError, RuntimeError):
+                pass
+            try:
+                kwargs.setdefault("parallel_group", get_etp_group())
+            except AssertionError:
+                # CPU-only unit tests may construct the storage class before
+                # distributed groups are initialized. Model workers always
+                # initialize ETP before creating PLE layers.
                 pass
             use_int8 = _is_compressed_tensors_int8(
                 effective_quant_config, prefix
@@ -505,6 +527,30 @@ def _make_storage_class(module: ModuleType, quant_config):
                         )
                     kwargs["quant_method"] = HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod()
             super().__init__(*args, **kwargs)
+            try:
+                tp_size = get_tp_group().world_size
+            except AssertionError:
+                tp_size = self.tp_size
+            if self.tp_size % tp_size:
+                raise ValueError(
+                    "ETP size must be divisible by TP size, but got "
+                    f"ETP={self.tp_size} and TP={tp_size}"
+                )
+            self.etp_data_parallel_size = self.tp_size // tp_size
+            logger.info_once(
+                "Qwen4Exp PLE embedding parallelism: ETP=%d, TP=%d, "
+                "embedding DP=%d",
+                self.tp_size,
+                tp_size,
+                self.etp_data_parallel_size,
+            )
+            self.data_parallel_rank = int(
+                getattr(
+                    getattr(vllm_config, "parallel_config", None),
+                    "data_parallel_rank",
+                    0,
+                )
+            )
             if _should_prefetch_ple():
                 method = self.quant_method
                 if not _should_offload_ple_to_cpu():
@@ -520,6 +566,64 @@ def _make_storage_class(module: ModuleType, quant_config):
                         "and SlimQuant unquantized UVA; FP8 prefetch is future work.",
                         type(method).__name__,
                     )
+
+        def _get_dp_gather_slot(self, local_num_tokens: int) -> tuple[int, int]:
+            if self.etp_data_parallel_size == 1:
+                return local_num_tokens, 0
+            dp_metadata = get_forward_context().dp_metadata
+            if dp_metadata is None:
+                raise RuntimeError("ETP spanning DP requires DP token metadata")
+            group_start = (
+                self.data_parallel_rank // self.etp_data_parallel_size
+            ) * self.etp_data_parallel_size
+            group_end = group_start + self.etp_data_parallel_size
+            token_counts = dp_metadata.num_tokens_across_dp_cpu.tolist()
+            group_counts = token_counts[group_start:group_end]
+            if len(group_counts) != self.etp_data_parallel_size:
+                raise RuntimeError(
+                    "ETP DP token metadata does not cover the embedding group"
+                )
+            slot_size = max(group_counts)
+            return slot_size, get_dp_group().rank_in_group * slot_size
+
+        def _gather_dp_ids(
+            self,
+            ngram_ids: torch.Tensor,
+            slot_size: int,
+        ) -> torch.Tensor:
+            if self.etp_data_parallel_size == 1:
+                return ngram_ids
+            if ngram_ids.shape[0] > slot_size:
+                raise RuntimeError(
+                    "local PLE token count exceeds the DP metadata slot size"
+                )
+            if ngram_ids.shape[0] < slot_size:
+                padding = ngram_ids.new_zeros(
+                    slot_size - ngram_ids.shape[0], ngram_ids.shape[1]
+                )
+                ngram_ids = torch.cat((ngram_ids, padding), dim=0)
+            return get_dp_group().all_gather(ngram_ids, dim=0)
+
+        def _select_embeddings(
+            self,
+            embeddings: torch.Tensor,
+            local_num_tokens: int,
+            slot_offset: int,
+        ) -> torch.Tensor:
+            if self.etp_data_parallel_size == 1:
+                return embeddings
+            return embeddings.narrow(0, slot_offset, local_num_tokens)
+
+        def forward(self, input_: torch.Tensor) -> torch.Tensor:
+            local_num_tokens = input_.shape[0]
+            slot_size, slot_offset = self._get_dp_gather_slot(local_num_tokens)
+            gathered_input = self._gather_dp_ids(input_, slot_size)
+            embeddings = super().forward(gathered_input)
+            return self._select_embeddings(
+                embeddings,
+                local_num_tokens,
+                slot_offset,
+            )
 
     HcuPLEVocabParallelEmbedding.__name__ = "HcuPLEVocabParallelEmbedding"
     HcuPLEVocabParallelEmbedding.__qualname__ = "HcuPLEVocabParallelEmbedding"

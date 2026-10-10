@@ -86,13 +86,92 @@ def _int8_quant_config(prefix):
 
 
 def _storage_class(quant_config):
-    class BaseEmbedding:
+    class BaseEmbedding(torch.nn.Module):
         def __init__(self, *args, **kwargs):
+            super().__init__()
             del args
             self.quant_method = kwargs.get("quant_method")
+            self.parallel_group = kwargs.get("parallel_group")
+            self.tp_size = (
+                self.parallel_group.world_size
+                if self.parallel_group is not None
+                else 1
+            )
+
+        def forward(self, input_):
+            return input_ + 100
 
     module = SimpleNamespace(PLEVocabParallelEmbedding=BaseEmbedding)
     return patch._make_storage_class(module, quant_config)
+
+
+def test_ple_storage_shards_over_etp_group(monkeypatch):
+    etp_group = SimpleNamespace(world_size=4, rank_in_group=1)
+    tp_group = SimpleNamespace(world_size=1)
+    monkeypatch.setattr(patch, "get_etp_group", lambda: etp_group, raising=False)
+    monkeypatch.setattr(patch, "get_tp_group", lambda: tp_group, raising=False)
+    vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(embedding_across_dp=True, cpu_offload=False),
+        quant_config=None,
+        parallel_config=SimpleNamespace(data_parallel_rank=1),
+    )
+
+    with set_current_vllm_config(vllm_config):
+        embedding = _storage_class(None)(prefix="model.ple.ngram_embedding")
+
+    assert embedding.parallel_group is etp_group
+    assert embedding.tp_size == 4
+    assert embedding.etp_data_parallel_size == 4
+
+
+def test_ple_storage_gathers_uneven_dp_tokens_and_returns_local_rows(monkeypatch):
+    calls = []
+    gathered = torch.tensor(
+        [
+            [10, 11],
+            [12, 13],
+            [14, 15],
+            [20, 21],
+            [22, 23],
+            [0, 0],
+            [0, 0],
+            [0, 0],
+            [0, 0],
+            [30, 31],
+            [0, 0],
+            [0, 0],
+        ]
+    )
+
+    class DPGroup:
+        rank_in_group = 1
+
+        def all_gather(self, ids, dim):
+            calls.append((ids.clone(), dim))
+            assert dim == 0
+            assert torch.equal(ids, torch.tensor([[20, 21], [22, 23], [0, 0]]))
+            return gathered
+
+    monkeypatch.setattr(patch, "get_dp_group", lambda: DPGroup(), raising=False)
+    monkeypatch.setattr(
+        patch,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=SimpleNamespace(
+                num_tokens_across_dp_cpu=torch.tensor([3, 2, 0, 1])
+            )
+        ),
+        raising=False,
+    )
+    embedding = _storage_class(None)(prefix="model.ple.ngram_embedding")
+    embedding.tp_size = 4
+    embedding.etp_data_parallel_size = 4
+    embedding.data_parallel_rank = 1
+
+    result = embedding(torch.tensor([[20, 21], [22, 23]]))
+
+    assert len(calls) == 1
+    assert torch.equal(result, torch.tensor([[120, 121], [122, 123]]))
 
 
 def test_slimquant_unquantized_ple_honors_cpu_offload(monkeypatch):
