@@ -56,10 +56,10 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
 def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     """Validate and classify the SlimQuant W4A8 MoE execution route.
 
-    Pure TP remains owned by the quantization method's AITER/Triton path.
-    Once DeepEP or DP+EP metadata is present, only the synchronized
-    ``deepep_auto`` contract is supported; fixed DeepEP layouts must not fall
-    through to a TP kernel.
+    Pure TP and all-gather/reduce-scatter DP+EP remain owned by the
+    quantization method's AITER/Triton expert path.  ``deepep_auto`` selects
+    the synchronized HIPC DeepGEMM contract; fixed DeepEP layouts must not
+    fall through to the standard expert kernel.
     """
 
     parallel_config = getattr(moe_config, "moe_parallel_config", None)
@@ -80,12 +80,17 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         "deepep_high_throughput",
         "deepep_low_latency",
     }
+    supported_dp_ep_backends = {
+        "allgather_reducescatter",
+        "deepep_auto",
+    }
     if all2all_backend in fixed_deepep_backends or (
-        is_dp_ep and all2all_backend != "deepep_auto"
+        is_dp_ep and all2all_backend not in supported_dp_ep_backends
     ):
         raise ValueError(
-            "SlimQuant W4A8 DP+EP requires "
-            "all2all_backend='deepep_auto'; fixed or incompatible all-to-all "
+            "SlimQuant W4A8 DP+EP requires all2all_backend='deepep_auto' "
+            "or 'allgather_reducescatter'; fixed or "
+            "incompatible all-to-all "
             f"backend {all2all_backend!r} is unsupported"
         )
 

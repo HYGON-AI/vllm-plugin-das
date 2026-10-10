@@ -4717,6 +4717,65 @@ def test_slimquant_w4a8_deepep_auto_rejects_missing_clamp_lightop(
 
 
 @pytest.mark.hcu
+def test_slimquant_w4a8_agrs_dp_ep_uses_standard_aiter_route(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """AGRS owns communication while SlimQuant keeps the AITER experts."""
+
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda *_args: calls.append("prewarm") or None,
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prepare_vllm_w4a8_moe",
+        lambda *_args: calls.append("fallback"),
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "mark_aiter_moe_native_layout",
+        lambda *_args: calls.append("native_layout"),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        object(),
+        SimpleNamespace(
+            moe_backend="aiter",
+            moe_parallel_config=SimpleNamespace(
+                dp_size=4,
+                use_ep=True,
+                all2all_backend="allgather_reducescatter",
+                use_deepep_auto_kernels=False,
+            ),
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros((2, 8, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros((2, 4, 2), dtype=torch.int8), requires_grad=False
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 8, 1)), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((2, 4, 1)), requires_grad=False
+        ),
+        w13_input_scale=None,
+        w2_input_scale=None,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert calls == ["prewarm", "fallback", "native_layout"]
+    assert method.moe_kernel is None
+
+
+@pytest.mark.hcu
 @pytest.mark.parametrize(
     (
         "dp_size",
