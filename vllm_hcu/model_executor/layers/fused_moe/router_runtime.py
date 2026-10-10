@@ -190,7 +190,15 @@ def make_hcu_grouped_topk_router(base_class):
 
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 is_padding = get_forward_context().is_padding
-                if is_padding is not None:
+                # Fallback PCP gathers routing rows across ranks without
+                # gathering ForwardContext.is_padding.  A shorter mask is
+                # therefore local to this rank and must not be applied to the
+                # gathered rows.  Equal or longer masks retain the official
+                # prefix-slice behavior used by graph-padded local batches.
+                if (
+                    is_padding is not None
+                    and is_padding.shape[0] >= topk_ids.shape[0]
+                ):
                     padding = is_padding[: topk_ids.shape[0], None]
                     topk_ids = topk_ids.masked_fill(padding, -1)
                     topk_weights = topk_weights.masked_fill(padding, 0.0)
