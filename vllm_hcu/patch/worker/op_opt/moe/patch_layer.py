@@ -36,6 +36,44 @@ _GET_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_get_weights"
 _LOAD_WEIGHTS_MARKER = "_vllm_hcu_moe_layer_load_weights"
 
 
+def _adapt_kimi_runner_forward_entry(runner) -> None:
+    """Bridge Kimi's six-argument runner call to v0.28's ten-argument op."""
+
+    runner_type = type(runner)
+    if (
+        runner_type.__name__ != "ROCmLatentMoERunner"
+        or not runner_type.__module__.startswith("vllm.models.kimi_k3.amd.")
+        or getattr(runner, "_vllm_hcu_kimi_moe_entry_adapted", False)
+    ):
+        return
+    forward_entry = getattr(runner, "_forward_entry", None)
+    if forward_entry is None:
+        raise PatchCompatibilityError(
+            "Kimi ROCmLatentMoERunner has no _forward_entry callable"
+        )
+
+    @functools.wraps(forward_entry)
+    def hcu_kimi_forward_entry(*args, **kwargs):
+        if kwargs or len(args) != 6:
+            return forward_entry(*args, **kwargs)
+        hidden_states, router_logits, shared_input, input_ids, layer_name, hidden_dim = args
+        return forward_entry(
+            hidden_states,
+            router_logits,
+            shared_input,
+            input_ids,
+            None,  # quanted_hidden_states
+            None,  # scale
+            None,  # topk_weights
+            None,  # topk_ids
+            layer_name,
+            hidden_dim,
+        )
+
+    runner._forward_entry = hcu_kimi_forward_entry
+    runner._vllm_hcu_kimi_moe_entry_adapted = True
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     layer_module = load_exact_module(
@@ -179,7 +217,31 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
         runner = factory(*args, **kwargs)
+        _adapt_kimi_runner_forward_entry(runner)
         experts = runner.routed_experts
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        moe_config = getattr(experts, "moe_config", None)
+        activation_value = getattr(moe_config, "activation", None)
+        activation = getattr(activation_value, "value", activation_value)
+        is_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
+        # FusedMoEFactory may run after the current VllmConfig context has
+        # ended. v0.28.1 carries SiTU's explicit beta fields on FusedMoEConfig;
+        # preserve the exact SiTU route identity there as a fail-closed signal
+        # for the SlimQuant adapter and DeepEP HT scale owner.
+        if is_kimi_k3 or activation == "situ":
+            # The quant method is constructed from this same config object and
+            # weights are processed after the current-config context ends.
+            # Also tag the method's owner directly in case vLLM supplies a
+            # distinct config reference to the quantization wrapper.
+            if moe_config is not None:
+                setattr(moe_config, "_hcu_kimi_k3", True)
+            method_moe = getattr(experts.quant_method, "moe", None)
+            if method_moe is not None:
+                setattr(method_moe, "_hcu_kimi_k3", True)
         if type(experts.quant_method) is not official_unquantized_cls:
             return runner
         if bool(getattr(experts, "apply_router_weight_on_input", False)):

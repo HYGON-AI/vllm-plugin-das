@@ -1748,8 +1748,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.moe_quant_config = "official-config"
 
     class RoutedExperts:
-        def __init__(self, apply_router_weight_on_input=False):
-            self.moe_config = "moe-config"
+        def __init__(self, apply_router_weight_on_input=False, activation=None):
+            self.moe_config = SimpleNamespace(activation=activation)
             self.quant_method = UnquantizedFusedMoEMethod()
             self.local_num_experts = 2
             self._dsv4_channel_deepgemm_repacked = False
@@ -1779,8 +1779,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             yield "official-load"
 
     class Runner:
-        def __init__(self, apply_router_weight_on_input=False):
-            self.routed_experts = RoutedExperts(apply_router_weight_on_input)
+        def __init__(self, apply_router_weight_on_input=False, activation=None):
+            self.routed_experts = RoutedExperts(
+                apply_router_weight_on_input, activation
+            )
             self.replaced = None
 
         def _replace_quant_method(self, method):
@@ -1795,7 +1797,7 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     source = (
         "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
-        + "):\n    return Runner(apply_router_weight_on_input)\n"
+        + "):\n    return Runner(apply_router_weight_on_input, activation)\n"
     )
     exec(source, layer_module.__dict__)
     fused_moe_package = _module(
@@ -1855,6 +1857,40 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="qwen3")
+            )
+        ),
+    )
+    non_kimi_runner = fused_moe_package.FusedMoE()
+    assert not hasattr(non_kimi_runner.routed_experts.moe_config, "_hcu_kimi_k3")
+    situ_runner = fused_moe_package.FusedMoE(activation="situ")
+    assert situ_runner.routed_experts.moe_config._hcu_kimi_k3 is True
+    kimi_runner_type = type(
+        "ROCmLatentMoERunner",
+        (),
+        {"__module__": "vllm.models.kimi_k3.amd.latent_moe_runner"},
+    )
+    legacy_kimi_runner = kimi_runner_type()
+    legacy_kimi_runner._forward_entry = lambda *args: args
+    patch_layer._adapt_kimi_runner_forward_entry(legacy_kimi_runner)
+    assert legacy_kimi_runner._forward_entry(1, 2, 3, 4, 5, 6) == (
+        1, 2, 3, 4, None, None, None, None, 5, 6
+    )
+    assert legacy_kimi_runner._vllm_hcu_kimi_moe_entry_adapted is True
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="kimi_k3")
+            )
+        ),
+    )
+    kimi_runner = fused_moe_package.FusedMoE()
+    assert kimi_runner.routed_experts.moe_config._hcu_kimi_k3 is True
     router_weight_runner = fused_moe_package.FusedMoE(
         apply_router_weight_on_input=True
     )

@@ -166,6 +166,19 @@ register_hcu_ci(
         "roots"
     ),
 )
+register_hcu_ci(
+    job="integration-smoke-gfx938",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_kimi_k25_humaneval.py::"
+        "test_kimi_k25_humaneval_evalscope_server"
+    ),
+    est_time=14400,
+    disabled=(
+        "the Kimi-K2.5 checkpoint is configured at /model/kimi-K2.5 and is not "
+        "available in the configured CI model roots"
+    ),
+)
 
 register_hcu_ci(
     job="qwen35-smoke",

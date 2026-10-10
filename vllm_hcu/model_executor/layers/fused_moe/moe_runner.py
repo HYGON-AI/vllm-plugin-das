@@ -479,6 +479,7 @@ class MoERunner(MoERunnerInterface):
         self,
         states: torch.Tensor,
         trunc_size: int | None,
+        output_is_reduced: bool | None = None,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -489,8 +490,13 @@ class MoERunner(MoERunnerInterface):
         """
         # skip_final_all_reduce must not coexist with a pre-reduced fused
         # output. This should be enforced by MoE config initialization.
+        is_reduced = (
+            self._fused_output_is_reduced
+            if output_is_reduced is None
+            else output_is_reduced
+        )
         if self.moe_config.skip_final_all_reduce:
-            assert not self._fused_output_is_reduced, (
+            assert not is_reduced, (
                 "skip_final_all_reduce requires an un-reduced fused output"
             )
 
@@ -501,7 +507,7 @@ class MoERunner(MoERunnerInterface):
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
-            and not self._fused_output_is_reduced
+            and not is_reduced
         ):
             states = tensor_model_parallel_all_reduce(states)
 

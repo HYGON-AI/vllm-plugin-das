@@ -10,6 +10,7 @@ that no vLLM source file needs to be rewritten.
 from __future__ import annotations
 
 from collections.abc import Callable
+import math
 from typing import Any
 
 import torch
@@ -31,6 +32,40 @@ from vllm_hcu.platforms import envs as henvs
 
 class HcuCompressedTensorsMoeError(RuntimeError):
     """An explicitly selected HCU compressed-tensors MoE path is invalid."""
+
+
+def _slimquant_w4a8_activation(method: object) -> tuple[str, float | None, float | None]:
+    """Return an audited activation contract for generic and native Kimi MoE."""
+
+    moe = getattr(method, "moe", None)
+    activation = getattr(getattr(moe, "activation", None), "value", None)
+    if activation is None:
+        activation = "silu"
+    if not getattr(moe, "_hcu_kimi_k3", False):
+        if str(activation) != "silu":
+            raise HcuCompressedTensorsMoeError(
+                "SlimQuant W4A8 supports only silu activation outside Kimi-K3"
+            )
+        return "silu", None, None
+    if str(activation) != "situ":
+        raise HcuCompressedTensorsMoeError(
+            "Kimi-K3 SlimQuant W4A8 requires SiTU activation"
+        )
+    beta = getattr(moe, "activation_situ_beta", None)
+    beta = 1.0 if beta is None else float(beta)
+    linear_beta = getattr(moe, "activation_situ_linear_beta", None)
+    linear_beta = None if linear_beta is None else float(linear_beta)
+    if not math.isfinite(beta) or beta <= 0:
+        raise HcuCompressedTensorsMoeError(
+            "Kimi-K3 SiTU beta must be finite and positive"
+        )
+    if linear_beta is not None and (
+        not math.isfinite(linear_beta) or linear_beta <= 0
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "Kimi-K3 SiTU linear_beta must be finite and positive when set"
+        )
+    return "situ", beta, linear_beta
 
 
 def _required_tensor(owner: object, name: str) -> torch.Tensor:
@@ -710,14 +745,8 @@ def _slimquant_w4a8_metadata(
         raise HcuCompressedTensorsMoeError(
             "SlimQuant W4A8 logical hidden size does not match packed weights"
         )
-    activation = getattr(getattr(moe, "activation", None), "value", None)
-    if activation is None:
-        activation = "silu"
-    if str(activation) != "silu":
-        raise HcuCompressedTensorsMoeError(
-            "SlimQuant W4A8 supports only silu activation"
-        )
-    return w1, w2, logical_k, str(activation)
+    activation, _, _ = _slimquant_w4a8_activation(method)
+    return w1, w2, logical_k, activation
 
 
 def prewarm_aiter_w4a8_moe(
@@ -852,16 +881,10 @@ def apply_aiter_w4a8_moe(
                 "SlimQuant W4A8 Triton weight dimensions are inconsistent"
             )
         logical_k = int(w1.shape[2])
-        activation = str(
-            getattr(
-                getattr(getattr(method, "moe", None), "activation", None),
-                "value",
-                "silu",
-            )
-        )
+        activation, _, _ = _slimquant_w4a8_activation(method)
         if activation != "silu":
             raise HcuCompressedTensorsMoeError(
-                "SlimQuant W4A8 supports only silu activation"
+                "Kimi-K3 SiTU requires the AITER W4A8 MoE implementation"
             )
     else:
         w1, w2, logical_k, activation = _slimquant_w4a8_metadata(method, layer)
@@ -919,6 +942,10 @@ def apply_aiter_w4a8_moe(
     expert_mask = getattr(layer, "expert_mask", None)
     swiglu_limit = getattr(layer, "swiglu_limit", None) or None
     if aiter_config is None:
+        if activation != "silu":
+            raise HcuCompressedTensorsMoeError(
+                "AITER selected no W4A8 solution for Kimi-K3 SiTU"
+            )
         if installed_solution not in (None, "native"):
             raise HcuCompressedTensorsMoeError(
                 "AITER has no MOE_C solution for installed W4A8 weights"
@@ -981,6 +1008,7 @@ def apply_aiter_w4a8_moe(
         int(global_num_experts),
         expert_mask=expert_mask,
     )
+    _, situ_beta, situ_linear_beta = _slimquant_w4a8_activation(method)
     return execute_aiter_moe(
         aiter_config,
         hidden_states=hidden_states,
@@ -1000,7 +1028,10 @@ def apply_aiter_w4a8_moe(
         routed_scaling_factor=1.0,
         use_weight_shuffle=bool(getattr(aiter_config, "need_shuffle", False)),
         output_dtype=hidden_states.dtype,
-        gemm1_limit=swiglu_limit,
+        gemm1_alpha=situ_beta,
+        gemm1_limit=(
+            situ_linear_beta if activation == "situ" else swiglu_limit
+        ),
     )
 
 
