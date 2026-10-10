@@ -1549,12 +1549,16 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
+            # Keep async D2H counts in old-batch order, away from InputBatch
+            # row mutations that can happen before the accepted-token wait.
             mamba_utils.postprocess_mamba_align_gpu(
                 bufs=self._get_mamba_bufs(),
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
+                    self.num_accepted_tokens.cpu
+                    if self.use_async_scheduling
+                    else self.input_batch.num_accepted_tokens_cpu_tensor
                 ),
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
@@ -2047,10 +2051,13 @@ class GPUModelRunner(
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
                 new_mask = prev_idx < 0
+                accepted_tokens_cpu = (
+                    self.num_accepted_tokens.np
+                    if self.cache_config.mamba_cache_mode == "align"
+                    else self.input_batch.num_accepted_tokens_cpu
+                )
                 self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[
-                        np.where(new_mask, 0, prev_idx)
-                    ]
+                    accepted_tokens_cpu[np.where(new_mask, 0, prev_idx)]
                 )
                 self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
