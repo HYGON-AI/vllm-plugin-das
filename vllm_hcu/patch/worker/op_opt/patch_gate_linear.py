@@ -81,7 +81,6 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         if (
             self._vllm_hcu_deepseek_v4_gate
-            and henvs.VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT
             and self.allow_cublas_router_gemm
             and x.dtype == torch.bfloat16
             and self.weight.dtype == torch.bfloat16

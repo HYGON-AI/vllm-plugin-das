@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND: str = "flashmla"
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
-    VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_COMPRESSOR_TOKEN_THRESHOLD: int = 16384
@@ -407,11 +406,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to route DeepSeek V4 ROCm decode through the legacy fallback.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK":
         lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK", "False").lower() in
-                    ("true", "1")),
-
-    # Match v0.25.1 DeepSeek V4 gate GEMM: BF16 output, then FP32 logits.
-    "VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT":
-        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_MOE_GATE_BF16_OUTPUT", "True").lower() in
                     ("true", "1")),
 
     # Whether to use the local inverse-RoPE + BF16 einsum path for DeepSeek V4 ROCm WO_A.
