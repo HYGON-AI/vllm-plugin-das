@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
+import importlib
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as torch_functional
 
@@ -73,6 +75,48 @@ def test_qwen4_exp_ple_profile_fallback_uses_hcu_conv(monkeypatch):
     assert calls == [("hcu", (1, 4, 5), 9, 3)]
 
 
+def test_fused_ple_keeps_short_conv_and_only_wraps_ngram():
+    class Qwen4ExpPLELayer:
+        def _short_conv(self, inputs, residual, outer_residual):
+            return inputs, residual, outer_residual
+
+    class Qwen4ExpNGramEmbedding:
+        def forward(self, input_ids, query_start_loc, ngram_context):
+            return input_ids, query_start_loc, ngram_context
+
+    module = ModuleType(patch.REPLACEMENT_MODULE)
+    module.Qwen4ExpPLELayer = Qwen4ExpPLELayer
+    module.Qwen4ExpNGramEmbedding = Qwen4ExpNGramEmbedding
+    original_short_conv = Qwen4ExpPLELayer._short_conv
+
+    assert patch.apply_to_module(module) is True
+    assert patch.apply_to_module(module) is False
+    assert Qwen4ExpPLELayer._short_conv is original_short_conv
+    assert getattr(Qwen4ExpNGramEmbedding.forward, patch._NGRAM_WRAPPER, False)
+
+
+def test_ngram_custom_op_is_not_registered_before_target_validation(monkeypatch):
+    calls = []
+    module, _, ngram_class = _target_module(calls)
+
+    def drifted_forward(self, input_ids, query_start_loc):
+        del self, input_ids, query_start_loc
+
+    ngram_class.forward = drifted_forward
+    monkeypatch.setattr(patch, "_NGRAM_OP_REGISTERED", False)
+    monkeypatch.setattr(
+        patch,
+        "direct_register_custom_op",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    with pytest.raises(patch.PatchCompatibilityError, match="incompatible signature"):
+        patch.apply_to_module(module)
+
+    assert calls == []
+    assert patch._NGRAM_OP_REGISTERED is False
+
+
 def test_qwen4_exp_ngram_dynamic_preprocessing_is_behind_custom_op(monkeypatch):
     calls = []
     module, _, ngram_class = _target_module(calls)
@@ -119,3 +163,106 @@ def test_qwen4_exp_ngram_dynamic_preprocessing_is_behind_custom_op(monkeypatch):
     assert output.dtype == torch.bfloat16
     assert torch.all(output == 2)
     assert calls == [((5,), (2,), (1, 2), embedding.layer_name)]
+
+
+def test_fused_ngram_writes_requested_output_buffer(monkeypatch):
+    ple_layer = importlib.import_module("vllm_hcu.models.qwen4_exp.amd.ple_layer")
+    calls = []
+
+    def fused_ids(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        layer_multipliers,
+        ngram_heads_vocab_sizes,
+        ngram_heads_offsets,
+        eos_token_id,
+        heads_per_ngram,
+        output=None,
+    ):
+        calls.append(
+            (
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                layer_multipliers,
+                ngram_heads_vocab_sizes,
+                ngram_heads_offsets,
+                eos_token_id,
+                heads_per_ngram,
+                output,
+            )
+        )
+        assert output is not None
+        output.copy_(torch.tensor([[7, 8], [9, 10]], dtype=output.dtype))
+        return output
+
+    monkeypatch.setattr(ple_layer, "ple_ngram_ids", fused_ids, raising=False)
+    owner = SimpleNamespace(
+        max_total_tokens=4,
+        layer_multipliers=torch.tensor([11, 13, 17]),
+        ngram_heads_vocab_sizes=torch.tensor([19, 23]),
+        ngram_heads_offsets=torch.tensor([0, 19]),
+        eos_token_id=2,
+        heads_per_ngram=1,
+    )
+    input_ids = torch.tensor([3, 4], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
+    ngram_context = torch.tensor([[1, 2]], dtype=torch.int32)
+    output = torch.empty((2, 2), dtype=torch.int64)
+
+    actual = ple_layer.Qwen4ExpNGramEmbedding.compute_ngram_ids(
+        owner,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output=output,
+    )
+
+    assert actual is output
+    assert calls[0][-1] is output
+    assert calls[0][0].dtype == input_ids.dtype
+    assert calls[0][0].untyped_storage().data_ptr() == (
+        input_ids.untyped_storage().data_ptr()
+    )
+    assert torch.equal(actual, torch.tensor([[7, 8], [9, 10]]))
+
+
+def test_graph_break_adapter_delegates_to_fused_ngram_ids(monkeypatch):
+    calls = []
+    expected_ids = torch.tensor([[3, 4], [5, 6]], dtype=torch.long)
+
+    def compute_ngram_ids(input_ids, query_start_loc, ngram_context):
+        calls.append((input_ids, query_start_loc, ngram_context))
+        return expected_ids
+
+    def run_embedding(ngram_ids, output, layer_name):
+        assert ngram_ids is expected_ids
+        calls.append(layer_name)
+        output.fill_(12)
+
+    monkeypatch.setattr(patch, "_run_ngram_embedding", run_embedding)
+    owner = SimpleNamespace(
+        _hcu_prefetch_successor=None,
+        _hcu_prefetch_enabled=False,
+        compute_ngram_ids=compute_ngram_ids,
+    )
+    input_ids = torch.tensor([1, 2], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
+    ngram_context = torch.tensor([[7, 8]], dtype=torch.int32)
+    output = torch.empty((2, 8), dtype=torch.bfloat16)
+
+    patch._run_fused_ngram_forward(
+        owner,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output,
+        "language_model.model.layers.2.ple",
+    )
+
+    assert calls == [
+        (input_ids, query_start_loc, ngram_context),
+        "language_model.model.layers.2.ple",
+    ]
+    assert torch.all(output == 12)

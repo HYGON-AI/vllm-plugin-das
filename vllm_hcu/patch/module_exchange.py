@@ -11,10 +11,11 @@ is requested.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 
-from vllm_hcu.platforms.envs import ple_prefetch_enabled
+from vllm_hcu.platforms.envs import fused_qwen4_exp_ple_enabled
 
 from .import_coordinator import (
     IMPORT_COORDINATOR,
@@ -23,6 +24,8 @@ from .import_coordinator import (
 )
 
 _Entry = tuple[str, str, str]
+_LOGGER = logging.getLogger(__name__)
+_PLE_MODE_LOGGED: bool | None = None
 
 # (patch id, canonical vLLM module, HCU implementation module)
 _MODULAR_KERNEL: tuple[_Entry, ...] = (
@@ -77,7 +80,7 @@ _ATTENTION: tuple[_Entry, ...] = (
 
 _QWEN4_EXP_PLE: tuple[_Entry, ...] = (
     (
-        "module_exchange.qwen4_exp.ple_prefetch",
+        "module_exchange.qwen4_exp.fused_ple",
         "vllm.models.qwen4_exp.amd.ple_layer",
         "vllm_hcu.models.qwen4_exp.amd.ple_layer",
     ),
@@ -96,12 +99,23 @@ _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
 _HCU_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _ple_prefetch_requested() -> bool:
-    return ple_prefetch_enabled()
+def _fused_ple_requested() -> bool:
+    return fused_qwen4_exp_ple_enabled()
+
+
+def _log_ple_mode_once(enabled: bool) -> None:
+    global _PLE_MODE_LOGGED
+    if _PLE_MODE_LOGGED is not None:
+        return
+    _PLE_MODE_LOGGED = enabled
+    mode = "fused" if enabled else "fallback"
+    _LOGGER.info("Qwen4Exp PLE mode selected: %s", mode)
 
 
 def _enabled_groups() -> tuple[tuple[_Entry, ...], ...]:
-    if _ple_prefetch_requested():
+    enabled = _fused_ple_requested()
+    _log_ple_mode_once(enabled)
+    if enabled:
         return (*_ALL_GROUPS, _QWEN4_EXP_PLE)
     return _ALL_GROUPS
 
@@ -200,7 +214,9 @@ def register_attention_exchanges(
 def register_qwen4_exp_ple_exchange(
     coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
 ) -> tuple[ImportRegistration, ...]:
-    if not _ple_prefetch_requested():
+    enabled = _fused_ple_requested()
+    _log_ple_mode_once(enabled)
+    if not enabled:
         return ()
     return _register_entries(_QWEN4_EXP_PLE, coordinator)
 

@@ -304,6 +304,50 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
     }
 
 
+def test_custom_ops_zero_does_not_import_fused_ple_ops():
+    result = _run_fresh(
+        "import json,os,sys; "
+        "os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "from vllm_hcu.patch.worker import prepare_worker_patches; "
+        "apply_platform_patches(); prepare_worker_patches(); "
+        "names={'ops':'vllm_hcu.models.qwen4_exp.common.ops.ple',"
+        "'replacement':'vllm_hcu.models.qwen4_exp.amd.ple_layer'}; "
+        "print(json.dumps({key:value in sys.modules for key,value in names.items()}))"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "ops": False,
+        "replacement": False,
+    }
+
+
+def test_official_ple_fallback_remains_importable():
+    result = _run_fresh(
+        "import importlib,json,os,sys; "
+        "os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "from vllm_hcu.patch.worker import prepare_worker_patches; "
+        "apply_platform_patches(); prepare_worker_patches(); "
+        "module=importlib.import_module('vllm.models.qwen4_exp.amd.ple_layer'); "
+        "model=importlib.import_module('vllm.models.qwen4_exp.amd.model'); "
+        "print(json.dumps({'name':module.__name__,"
+        "'official':not hasattr(module,'_vllm_hcu_qwen4_exp_ple_conv_applied'),"
+        "'model_fused':hasattr(model,'_vllm_hcu_qwen4_exp_fused_ple_applied'),"
+        "'ops_loaded':'vllm_hcu.models.qwen4_exp.common.ops.ple' in sys.modules,"
+        "'replacement_loaded':'vllm_hcu.models.qwen4_exp.amd.ple_layer' in sys.modules}))",
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "name": "vllm.models.qwen4_exp.amd.ple_layer",
+        "official": True,
+        "model_fused": False,
+        "ops_loaded": False,
+        "replacement_loaded": False,
+    }
+
+
 def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
     expected_worker_patches = len(worker_dispatcher.worker_callback_names()) + len(
         worker_dispatcher.worker_module_exchange_names()
