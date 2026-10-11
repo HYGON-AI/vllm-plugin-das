@@ -755,6 +755,59 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     assert "execute_model" in adapter.__dict__
 
 
+def test_hcu_model_runner_v2_binds_router_while_worker_weight_pool_is_active(
+    monkeypatch,
+):
+    """The packed router copy must be allocated before the weights pool exits."""
+
+    upstream_name = "vllm.v1.worker.gpu.model_runner"
+    adapter_name = "vllm_hcu.v1.hcu_model_runner_v2"
+    upstream_module = ModuleType(upstream_name)
+    events: list[object] = []
+    pool_active = False
+    model = object()
+
+    class UpstreamGPUModelRunner:
+        def __init__(self, vllm_config, device):
+            del vllm_config, device
+            self.model = None
+
+        def load_model(self, load_dummy_weights=False):
+            assert pool_active
+            events.append(("upstream-load", load_dummy_weights))
+            self.model = model
+
+        def execute_model(self):
+            return None
+
+    upstream_module.GPUModelRunner = UpstreamGPUModelRunner
+    monkeypatch.setitem(sys.modules, upstream_name, upstream_module)
+    monkeypatch.delitem(sys.modules, adapter_name, raising=False)
+
+    from vllm_hcu.model_executor.layers.fused_moe import (
+        glm53_router_gemv as router_runtime,
+    )
+
+    def bind_router(loaded_model):
+        assert pool_active
+        assert loaded_model is model
+        events.append("bind-router")
+        return 42
+
+    monkeypatch.setattr(router_runtime, "bind_glm53_router_gates", bind_router)
+    adapter_module = importlib.import_module(adapter_name)
+    runner = adapter_module.HcuGPUModelRunnerV2(object(), object())
+
+    pool_active = True
+    try:
+        runner.load_model(load_dummy_weights=True)
+    finally:
+        pool_active = False
+
+    assert events == [("upstream-load", True), "bind-router"]
+    assert runner._vllm_hcu_num_router_gates == 42
+
+
 def test_worker_allocates_separate_dspark_workspace_lane(
     cpu_safe_hcu_worker_module,
 ):

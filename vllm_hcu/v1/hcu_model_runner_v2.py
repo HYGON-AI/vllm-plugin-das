@@ -58,6 +58,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if not hasattr(self, "pcp_manager"):
             self.pcp_manager = None
 
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        """Load and pack GLM router weights in the worker weights pool."""
+
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
+            bind_glm53_router_gates,
+        )
+
+        self._vllm_hcu_num_router_gates = bind_glm53_router_gates(
+            getattr(self, "model", None)
+        )
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
