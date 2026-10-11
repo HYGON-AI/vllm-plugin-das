@@ -2287,3 +2287,25 @@ def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() ->
     process.join(timeout=30)
     assert process.exitcode == 0
     assert queue.get(timeout=5) == enabled["hcu"]
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_qwen4_exp_hc_sp_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    def resolve(raw: str | None):
+        if raw is None:
+            monkeypatch.delenv("VLLM_HCU_QWEN4_EXP_HC_SP", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_HCU_QWEN4_EXP_HC_SP", raw)
+        config = _validation_config(HcuFeatureConfig())
+        return config, patch_vllm_config.validate_and_update_hcu_config(config)
+
+    config, feature_config = resolve(value)
+    assert feature_config.qwen4_exp_hc_sp is expected
+    assert get_hcu_config(config) == feature_config
+    off_key = _vllm_hash(resolve("0")[0].additional_config)
+    on_key = _vllm_hash(resolve("1")[0].additional_config)
+    assert off_key != on_key

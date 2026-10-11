@@ -554,7 +554,7 @@ def apply_to_module(module: ModuleType) -> bool:
         requested = feature_config.to_dict()
         resolved = resolved_config.to_dict()
         for name, expected in requested.items():
-            if name == "fused_qwen3_rms_rope" or (
+            if name in ("fused_qwen3_rms_rope", "qwen4_exp_hc_sp") or (
                 name == "hcu_flash_attn_mode" and expected is None
             ):
                 continue
