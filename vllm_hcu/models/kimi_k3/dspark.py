@@ -31,6 +31,39 @@ from vllm.model_executor.models.utils import (
 
 from vllm_hcu.models.deepseek_v2 import DeepseekV2MLAAttention
 from vllm_hcu.models.kimi_k3.amd.linear import KimiMLP
+from vllm_hcu.models.kimi_k3.role_separation import (
+    eager_all_gather,
+    eager_ar_scope,
+)
+
+
+def apply_lm_head_shard(logits_processor, lm_head, hidden_states):
+    """GEMM-only draft-logits projection (local vocab shard, no all_gather).
+
+    The source branch's runtime exposes ``LogitsProcessor._apply_head``
+    (its refactor split the GEMM out of the gathering ``_get_logits``).
+    The paired v0.25.1 wheel predates that refactor: its LogitsProcessor
+    only has ``_get_logits(hidden_states, lm_head, embedding_bias)``, which
+    appends ``_gather_logits`` — exactly the collective that must stay out
+    of the captured graph.  Dispatch on the runtime's own seam:
+    ``_apply_head`` when present, otherwise the raw quant-method GEMM that
+    ``_get_logits`` gathers around.  Both return the same local-shard
+    logits bit-for-bit.
+    """
+    apply_head = getattr(logits_processor, "_apply_head", None)
+    if callable(apply_head):
+        return apply_head(lm_head, hidden_states, None)
+    quant_apply = getattr(
+        getattr(lm_head, "quant_method", None), "apply", None
+    )
+    if callable(quant_apply):
+        # Paired v0.25.1: _get_logits = quant GEMM + _gather_logits; the
+        # GEMM alone is the shard projection.
+        return quant_apply(lm_head, hidden_states, bias=None)
+    raise RuntimeError(
+        "no shard-only logits seam: LogitsProcessor._apply_head and "
+        "lm_head.quant_method.apply are both unavailable"
+    )
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -290,15 +323,57 @@ class K3DSparkForCausalLM(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+        # Role separation (Kimi-K3, VLLM_ROLE_SEP): eager draft forwards
+        # (cg_mode == NONE, e.g. profile/dummy) route their TP all_reduces
+        # to the dedicated eager comm. The scope is a no-op during draft-
+        # graph capture, so captured ARs stay recorded on - and replayed
+        # from - the captured-role communicator.
+        with eager_ar_scope():
+            return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Full draft logits with the TP all_gather kept out of CUDA graphs.
+
+        The K3 DSpark lm_head is a TP-sharded ``VocabParallelEmbedding``, and
+        the paired v0.25.1 runtime collects shard logits through
+        ``LogitsProcessor._gather_logits`` under the platform's
+        ``use_all_gather()`` branch (HCUPlatform inherits the default True),
+        which dispatches through the c10d TP Communicator — here a
+        CAPTURED-role comm, because the target decode graph captures its own
+        logits gather on it.  The single-role constraint documented in
+        ``vllm_hcu/models/kimi_k3/role_separation.py`` therefore routes the
+        out-of-graph eager tail all_gather to the auxiliary eager
+        communicator, never to c10d.  Callers that sample
+        inside a captured graph must use ``compute_draft_logits_shard`` and
+        run this method's all_gather eagerly after the replay instead
+        (see the DSpark role-separation worker patch).
+        """
         if self.lm_head is None:
             raise RuntimeError("DSpark target LM head has not been attached")
         return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
+
+    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Vocab-shard projection only: the lm_head GEMM without the logits
+        all_gather. Pair with an explicit tensor_model_parallel_all_gather to
+        reproduce compute_draft_logits bit-for-bit (VLLM_ROLE_SEP keeps this
+        collective out of captured CUDA graphs).
+
+        Parity conditions, inherited from the source branch's identical
+        design: the replay tail's explicit all_gather(dim=-1) plus the
+        ``[..., :draft_vocab_size]`` trim reproduce ``compute_logits``
+        exactly when ``logit_scale == 1.0`` and ``soft_cap`` is unset —
+        both hold for the K3 DSpark draft config (this constructor passes
+        only vocab and scale).  A future draft config that sets either
+        must re-apply them in the replay tail before sampling.
+        """
+        if self.lm_head is None:
+            raise RuntimeError("DSpark target LM head has not been attached")
+        return apply_lm_head_shard(
+            self.logits_processor, self.lm_head, hidden_states
+        )
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
@@ -307,7 +382,28 @@ class K3DSparkForCausalLM(nn.Module):
         return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.bias(markov_embed, self.logits_processor)
+        """Vocab-size transition bias ([B, r] -> [B, V]), aux-routed.
+
+        The fork premise is a fully local GEMM (its Markov head is
+        unsharded); the runtime head is TP-sharded.  ParallelLMHead.forward
+        refuses direct calls on this runtime ("LMHead's weights should be
+        used in the sampler"), so the shard projection goes through the
+        same guard-free seam as compute_draft_logits_shard
+        (apply_lm_head_shard: LogitsProcessor._apply_head when present,
+        else the raw quant-method GEMM), and the vocab gather rides the
+        eager-only auxiliary communicator: the per-step Markov collectives
+        must never touch the engine c10d comm that also carries the
+        captured decode all_gather (captured-x-eager same-comm alternation
+        == the wedge signature convicted on 20261009 19:41).  Output
+        equals logits_processor(markov_w2, embed) minus the engine-comm
+        hop.
+        """
+        shard = apply_lm_head_shard(
+            self.logits_processor,
+            self.model.markov_head.markov_w2,
+            markov_embed,
+        )
+        return eager_all_gather(shard, dim=-1)[..., : self.config.vocab_size]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

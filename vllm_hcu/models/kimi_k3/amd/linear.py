@@ -18,6 +18,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm_hcu.models.kimi_k3.amd.ops.situ import SituAndMul
 from vllm_hcu.models.kimi_k3.amd.ops.state_shape import kda_state_shape
 from vllm_hcu.models.kimi_k3.amd.ops.eplb import kimi_eplb_options
+from vllm_hcu.models.kimi_k3.role_separation import eager_ar_scope
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
@@ -1227,9 +1228,16 @@ class KimiLinearForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
-        )
+        # Role separation (Kimi-K3, VLLM_ROLE_SEP): eager-phase TP
+        # all_reduces of this language-model forward go to the dedicated
+        # eager comm, so the TP comm only ever carries captured-graph ARs.
+        # Captures and torch.compile tracing inside the scope are no-ops
+        # (the scope defers), so captured/graphed behavior is unchanged and
+        # the auxiliary comm is never built during a capture.
+        with eager_ar_scope():
+            hidden_states = self.model(
+                input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            )
         return hidden_states
 
     @classmethod
