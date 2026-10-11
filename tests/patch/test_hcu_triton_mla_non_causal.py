@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+"""Regression: non-causal flattening must stay LOCAL to the forward call.
+
+Mutating the shared ``attn_metadata.decode`` rows re-flattens on every
+attention layer over the same metadata and aliases sibling requests onto the
+first request's KV blocks (bs>=2 draft acceptance collapse; serial immune).
+Fork 877e6996 parity: flatten with LOCAL variables only.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from vllm_hcu.v1.attention.backends.mla.triton_mla import (
+    HcuTritonMLABackend,
+    HcuTritonMLAMetadataBuilder,
+    HcuTritonMLAImpl,
+    flatten_non_causal_rows,
+)
+from vllm.model_executor.layers.attention.mla_attention import QueryLenSupport
+from vllm.v1.attention.backends.mla.triton_mla import (
+    TritonMLABackend,
+    TritonMLAMetadataBuilder,
+    TritonMLAImpl,
+)
+
+
+def test_backend_declares_non_causal_capability():
+    assert HcuTritonMLABackend.supports_non_causal() is True
+    assert TritonMLABackend.supports_non_causal() is not True
+
+
+def test_builder_opts_into_spec_aware_reorder_threshold():
+    assert (
+        HcuTritonMLAMetadataBuilder.query_len_support
+        is not QueryLenSupport.SINGLE_ONLY
+    )
+    assert HcuTritonMLAMetadataBuilder.supports_non_causal_multi_token_decode is True
+    assert issubclass(HcuTritonMLAMetadataBuilder, TritonMLAMetadataBuilder)
+
+
+def test_backend_wires_hcu_builder_and_impl():
+    assert HcuTritonMLABackend.get_builder_cls() is HcuTritonMLAMetadataBuilder
+    assert HcuTritonMLABackend.get_impl_cls() is HcuTritonMLAImpl
+    assert issubclass(HcuTritonMLAImpl, TritonMLAImpl)
+
+
+def test_flatten_maps_every_row_to_its_own_request():
+    block_table = torch.tensor([[5], [9]])
+    seq_lens = torch.tensor([10, 20])
+    bt, sl = flatten_non_causal_rows(block_table, seq_lens, 14, 2)
+    assert bt.shape[0] == 14 and sl.shape[0] == 14
+    # rows 0-6 (request 0's 7 draft tokens) -> request 0; rows 7-13 -> request 1
+    assert torch.equal(bt[:, 0], torch.tensor([5] * 7 + [9] * 7))
+    assert torch.equal(sl, torch.tensor([10] * 7 + [20] * 7))
+
+
+def test_flatten_is_noop_for_causal_single_token_rows():
+    block_table = torch.tensor([[5], [9]])
+    seq_lens = torch.tensor([10, 20])
+    bt, sl = flatten_non_causal_rows(block_table, seq_lens, 2, 2)
+    assert bt is block_table and sl is seq_lens
+
+
+def test_flatten_never_mutates_inputs():
+    block_table = torch.tensor([[5], [9]])
+    seq_lens = torch.tensor([10, 20])
+    bt_snapshot = block_table.clone()
+    sl_snapshot = seq_lens.clone()
+    for _ in range(3):
+        bt, sl = flatten_non_causal_rows(block_table, seq_lens, 14, 2)
+    # repeated "layers" over the same metadata get identical results and the
+    # original per-request rows stay intact
+    assert torch.equal(block_table, bt_snapshot)
+    assert torch.equal(seq_lens, sl_snapshot)
+    assert bt.shape[0] == 14 and sl.shape[0] == 14
+
+
+def test_impl_overrides_forward_with_local_flatten_source():
+    """The override must carry the fork's local-flatten implementation."""
+
+    import inspect
+
+    src = inspect.getsource(HcuTritonMLAImpl.forward_mqa)
+    assert "flatten_non_causal_rows" in src
+    # no attribute write-back on the shared metadata
+    banned = [ln for ln in src.splitlines() if "decode_meta." in ln and "=" in ln]
+    assert not banned, banned
