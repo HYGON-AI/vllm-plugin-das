@@ -324,15 +324,21 @@ def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
 
 
 def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
-    """Opt in to DeepGEMM only for GLM5Next shared-expert gate_up."""
+    """Use DeepGEMM for supported GLM5Next shared-expert gate_up kernels."""
+
     from vllm_hcu.platforms import envs as henvs
     from vllm_hcu.platforms.hcu import on_gfx938
 
-    if not henvs.optional_custom_op_enabled(
-        os.environ.get(_GATE_DEEPGEMM_ENV) == "1"
-    ) or not on_gfx938():
+    setting = os.environ.get(_GATE_DEEPGEMM_ENV, "1").lower()
+    if not henvs.optional_custom_op_enabled(setting in ("1", "true")):
         return False
-    from deepgemm import fp8_gemm
+    if not on_gfx938():
+        return False
+    try:
+        from deepgemm import fp8_gemm
+    except ImportError:
+        _LOGGER.info("GLM5Next shared gate_up keeps LightOp: DeepGEMM unavailable")
+        return False
 
     decoder_cls = vars(glm_model).get("Glm5NextDecoderLayer")
     if not isinstance(decoder_cls, type):
