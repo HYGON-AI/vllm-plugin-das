@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Collection
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -87,12 +88,39 @@ def glm53_router_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm.hcu_glm53_router_gemv(x, weight)
 
 
-def _bind_gate(gate: torch.nn.Module) -> bool:
+def _prefetch_offloaded_param_ids() -> frozenset[int]:
+    """Return parameters backed by PrefetchOffloader's reusable GPU slots."""
+
+    from vllm.model_executor.offloader import PrefetchOffloader, get_offloader
+
+    offloader = get_offloader()
+    if not isinstance(offloader, PrefetchOffloader):
+        return frozenset()
+
+    param_ids = set()
+    for module_offloader in offloader.module_offloaders:
+        param_offloaders = getattr(module_offloader, "_param_offloaders", {})
+        for param_offloader in param_offloaders.values():
+            if getattr(param_offloader, "_param_deleted", False):
+                continue
+            try:
+                param_ids.add(id(param_offloader._param))
+            except AttributeError:
+                # process_weights_after_loading may delete transient params.
+                continue
+    return frozenset(param_ids)
+
+
+def _bind_gate(
+    gate: torch.nn.Module,
+    prefetch_offloaded_param_ids: Collection[int] = (),
+) -> bool:
     weight = getattr(gate, "weight", None)
     if (
         not henvs.VLLM_USE_NN
         or not getattr(gate, "allow_cublas_router_gemm", False)
         or not isinstance(weight, torch.Tensor)
+        or id(weight) in prefetch_offloaded_param_ids
         or weight.shape != (_HIDDEN_SIZE, _NUM_EXPERTS)
         or weight.dtype != torch.bfloat16
         or weight.device.type != "cuda"
@@ -134,6 +162,7 @@ def bind_glm53_router_gates(model: torch.nn.Module | None) -> int:
 
     if model is None or not on_gfx938() or not henvs.glm53_router_gemv_enabled():
         return 0
+    prefetch_offloaded_param_ids = _prefetch_offloaded_param_ids()
     bound = 0
     for layer in model.modules():
         if type(layer).__name__ != "Glm5NextDecoderLayer":
@@ -142,7 +171,7 @@ def bind_glm53_router_gates(model: torch.nn.Module | None) -> int:
             continue
         gate = getattr(getattr(layer, "mlp", None), "gate", None)
         if gate is not None:
-            bound += _bind_gate(gate)
+            bound += _bind_gate(gate, prefetch_offloaded_param_ids)
     return bound
 
 
