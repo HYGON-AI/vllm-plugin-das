@@ -1,0 +1,38 @@
+From 8616a6ae16df6e75d3f662d0cdc866660589ca56 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 06:07:18 +0800
+Subject: [PATCH 12/24] compile cache: hash VLLM_HCU_* env vars
+
+compile_factors() only hashed env vars registered in vllm.envs, so
+out-of-tree platform switches that change the traced forward (e.g.
+VLLM_HCU_EP_FUSED_COMBINE, VLLM_HCU_EP_FUSED_MOE) shared one torch.compile
+cache entry. A server started with VLLM_HCU_EP_FUSED_COMBINE=0 loaded the
+graph traced with =1 (MoE output treated as already reduced: no shared add,
+no TP all-reduce) and produced garbage from the first token.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ envs.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/envs.py b/envs.py
+index 4faf39a..f3b8dc0 100644
+--- a/envs.py
++++ b/envs.py
+@@ -2476,6 +2476,13 @@ def compile_factors() -> dict[str, object]:
+ 
+         factors[factor] = normalize_value(raw)
+ 
++    # Out-of-tree platform switches (e.g. VLLM_HCU_EP_FUSED_COMBINE) are not
++    # registered above but can change what the model forward traces to; a
++    # cache entry compiled with one setting is wrong for the other.
++    for factor in sorted(os.environ):
++        if factor.startswith("VLLM_HCU_") and factor not in ignored_factors:
++            factors[factor] = os.environ[factor]
++
+     ray_noset_env_vars = [
+         # Refer to
+         # https://github.com/ray-project/ray/blob/c584b1ea97b00793d1def71eaf81537d70efba42/python/ray/_private/accelerators/nvidia_gpu.py#L11
+-- 
+2.34.1
+

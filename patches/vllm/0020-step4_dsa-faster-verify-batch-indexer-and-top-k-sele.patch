@@ -1,0 +1,338 @@
+From 3388faecdbc236b34508dc3f6ce8c4743457f37d Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Sat, 10 Oct 2026 18:52:44 +0800
+Subject: [PATCH 20/24] step4_dsa: faster verify-batch indexer and top-k
+ selection
+
+region_topk_ids: rows of <= 16384 regions use a register-resident selector
+that bisects the signed-ordered int32 key range (one block reduction per
+step, early exit on an exact count) and emits with one packed cumsum.
+Bit-identical to the radix kernel; 100 -> 52us at 64 rows x 8704.
+
+spec_indexer_logits: with 4 heads per group, an fp8 pool and a pre-rounded
+query, stack (token, head) into one fp8 x fp8 dot (16 rows for 4 tokens).
+Same products and head-sum order; only the dot's fp32 accumulation order
+differs. 99 -> 43us. VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT=0 disables.
+
+Step5 bs32 64k/4k MTP3: decode 1319-1333 -> 1375 tok/s; NLL 0.6499
+(baseline rerun 0.6508), top-1 agreement within run-to-run noise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ model_executor/layers/step4_dsa.py         | 151 +++++++++++++++++++++
+ model_executor/layers/step4_dsa_kernels.py |  95 +++++++++++++
+ 2 files changed, 246 insertions(+)
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index ee0e2f9..0bbc12c 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -166,6 +166,14 @@ _SPEC_INDEXER_PER_REQUEST = (
+     os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST", "1") == "1"
+ )
+ 
++# ...and with the request's (token, head) pairs stacked into one fp8 x fp8 dot
++# (_spec_indexer_stacked_kernel). Same products, summed over heads in the same
++# order, but the dot's internal fp32 accumulation order differs: not
++# bit-identical. "0" restores the per-head bf16 dots.
++_SPEC_INDEXER_FP8_DOT = (
++    os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT", "1") == "1"
++)
++
+ # Depth of the pinned staging ring used to upload the per-step pending rows.
+ # One buffer per vector is not enough: the upload is asynchronous, so the next
+ # step's host write can land in the buffer before the previous step's copy has
+@@ -1183,6 +1191,107 @@ def _spec_indexer_logits_kernel(
+     )
+ 
+ 
++@triton.jit
++def _spec_indexer_stacked_kernel(
++    index_q_ptr,
++    summary_ptr,
++    block_table_ptr,
++    weights_ptr,
++    out_ptr,
++    nscore_ptr,
++    query_start_loc_ptr,
++    num_tokens,
++    stride_q_tok,
++    stride_q_group,
++    stride_q_head,
++    stride_s_row,
++    stride_bt_req,
++    stride_w_tok,
++    stride_w_group,
++    stride_out_row,
++    weight_scale,
++    proxy_dim: tl.constexpr,
++    regions_per_page: tl.constexpr,
++    BLOCK_Q: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++) -> None:
++    """``_spec_indexer_logits_kernel`` with the heads stacked into the dot rows.
++
++    For 4 heads per group: row ``t * 4 + h`` of the single dot is token ``t``,
++    head ``h``, so a 4-token request fills one 16-row MFMA tile instead of four
++    quarter-full ones, and the dot runs fp8 x fp8 on the pool as stored. The
++    query is already e4m3-valued (``q_prerounded``), so its cast to fp8 here is
++    exact and every product is the same as in the bf16 dot; the per-head ReLU,
++    weight and the head sum ``(((0 + h0) + h1) + h2) + h3`` are kept as well.
++    Only the dot's internal fp32 summation order over ``proxy_dim`` differs
++    (~1e-5 relative). 99 -> 43us at 16 requests x 4 tokens, 8704 regions.
++    """
++    req = tl.program_id(0)
++    k_block = tl.program_id(1)
++    group = tl.program_id(2)
++
++    q_start = tl.load(query_start_loc_ptr + req)
++    q_len = tl.load(query_start_loc_ptr + req + 1) - q_start
++    queries = tl.arange(0, BLOCK_Q)
++    query_ok = queries < q_len
++    tokens = q_start + queries
++    nscore = tl.load(nscore_ptr + tokens, mask=query_ok, other=0)
++    widest = tl.max(nscore, axis=0)
++    if k_block * BLOCK_K >= widest:
++        return
++
++    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
++    dims = tl.arange(0, proxy_dim)
++    key_any = keys < widest
++    pages = tl.load(
++        block_table_ptr + req * stride_bt_req + keys // regions_per_page,
++        mask=key_any,
++        other=0,
++    ).to(tl.int64)
++    slots = pages * regions_per_page + keys % regions_per_page
++    key_tile = tl.load(
++        summary_ptr + slots[None, :] * stride_s_row + dims[:, None],
++        mask=key_any[None, :],
++        other=0.0,
++    )
++
++    heads = tl.arange(0, 4)
++    rows_ok = query_ok[:, None] & (heads[None, :] >= 0)
++    query_tile = tl.load(
++        index_q_ptr
++        + tokens[:, None, None] * stride_q_tok
++        + group * stride_q_group
++        + heads[None, :, None] * stride_q_head
++        + dims[None, None, :],
++        mask=rows_ok[:, :, None],
++        other=0.0,
++    )
++    query_tile = tl.reshape(query_tile, (BLOCK_Q * 4, proxy_dim))
++    query_tile = query_tile.to(summary_ptr.dtype.element_ty)
++    head_weight = tl.load(
++        weights_ptr + tokens[:, None] * stride_w_tok + group * stride_w_group + heads[None, :],
++        mask=rows_ok,
++        other=0.0,
++    ).to(tl.float32)
++    head_weight = head_weight * weight_scale
++    scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
++    scores = tl.maximum(scores, 0.0) * tl.reshape(head_weight, (BLOCK_Q * 4,))[:, None]
++    # [BLOCK_Q * 4, BLOCK_K] -> per-head [BLOCK_Q, BLOCK_K] slices.
++    scores = tl.permute(tl.reshape(scores, (BLOCK_Q, 4, BLOCK_K)), (0, 2, 1))
++    scores = tl.reshape(scores, (BLOCK_Q, BLOCK_K, 2, 2))
++    heads_02, heads_13 = tl.split(scores)
++    head0, head2 = tl.split(heads_02)
++    head1, head3 = tl.split(heads_13)
++    accumulator = (((0.0 + head0) + head1) + head2) + head3
++
++    rows = group * num_tokens + tokens
++    tl.store(
++        out_ptr + rows[:, None] * stride_out_row + keys[None, :],
++        accumulator,
++        mask=query_ok[:, None] & (keys[None, :] < nscore[:, None]),
++    )
++
++
+ def spec_indexer_logits(
+     index_q: torch.Tensor,
+     weights: torch.Tensor,
+@@ -1197,6 +1306,7 @@ def spec_indexer_logits(
+     block_k: int = 128,
+     weight_scale: float = 1.0,
+     q_prerounded: bool = False,
++    max_query: int | None = None,
+ ) -> None:
+     """``decode_indexer_logits`` for verify batches, one program per request.
+ 
+@@ -1217,6 +1327,9 @@ def spec_indexer_logits(
+         nscore: ``[num_tokens]`` int32, regions visible to each token.
+         out: ``[groups * num_tokens, width]`` float32, group-major; written
+             exactly where ``decode_indexer_logits`` writes it.
++        max_query: upper bound on any request's query length. When given
++            (with 4 heads per group, an fp8 pool and ``q_prerounded``), the
++            stacked fp8 kernel is used; see ``_spec_indexer_stacked_kernel``.
+     """
+     num_tokens, groups, heads_per_group, proxy_dim = index_q.shape
+     width = out.shape[1]
+@@ -1236,6 +1349,43 @@ def spec_indexer_logits(
+             f"{regions_per_page} regions the block table can address"
+         )
+ 
++    if (
++        _SPEC_INDEXER_FP8_DOT
++        and max_query is not None
++        and max_query <= SPEC_INDEXER_MAX_QUERY
++        and heads_per_group == 4
++        and q_prerounded
++        and summary.dtype == torch.float8_e4m3fn
++    ):
++        # 32-key blocks on one warp: the dot is tiny, so more, smaller programs
++        # keep more CUs busy (bk32/nw1 43us vs bk128/nw4 53us).
++        _spec_indexer_stacked_kernel[(num_reqs, triton.cdiv(width, 32), groups)](
++            index_q,
++            summary,
++            block_table,
++            weights,
++            out,
++            nscore,
++            query_start_loc,
++            num_tokens,
++            index_q.stride(0),
++            index_q.stride(1),
++            index_q.stride(2),
++            summary.stride(0),
++            block_table.stride(0),
++            weights.stride(0),
++            weights.stride(1),
++            out.stride(0),
++            float(weight_scale),
++            proxy_dim=proxy_dim,
++            regions_per_page=regions_per_page,
++            # >= 4 so the dot has >= 16 rows.
++            BLOCK_Q=max(4, triton.next_power_of_2(int(max_query))),
++            BLOCK_K=32,
++            num_warps=1,
++        )
++        return
++
+     quantized_q = index_q if q_prerounded else round_activations_e4m3(index_q)
+ 
+     _spec_indexer_logits_kernel[(num_reqs, triton.cdiv(width, block_k), groups)](
+@@ -4334,6 +4484,7 @@ class Step4Indexer:
+                 regions_per_page=state.regions_per_page,
+                 weight_scale=self.weight_prescale,
+                 q_prerounded=True,
++                max_query=state.spec_query_len,
+             )
+             return None, decode_logits, width
+ 
+diff --git a/model_executor/layers/step4_dsa_kernels.py b/model_executor/layers/step4_dsa_kernels.py
+index afd23dd..c2d2655 100644
+--- a/model_executor/layers/step4_dsa_kernels.py
++++ b/model_executor/layers/step4_dsa_kernels.py
+@@ -1003,6 +1003,86 @@ def _region_topk_ids_kernel(
+         ties_taken += tl.sum(tied.to(tl.int32))
+ 
+ 
++@triton.jit
++def _region_topk_ids_resident_kernel(
++    logits_ptr,
++    lengths_ptr,
++    out_ptr,
++    seq_regions,
++    stride_logits_row,
++    stride_out_row,
++    topk: tl.constexpr,
++    BLOCK_R: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++) -> None:
++    """:func:`_region_topk_ids_kernel` for a row that fits in one tile.
++
++    Same selection and output, bit for bit. The row is loaded once and kept in registers
++    as signed-ordered int32 keys (the :func:`_ordered_float_key` order shifted by
++    ``2**31``), and the threshold is found by bisecting the key range on
++    ``count(keys >= mid)``. Each step is one block reduction, against four histogram
++    passes plus a tiled emit in the radix kernel; the search also stops as soon as some
++    ``mid`` leaves exactly ``budget`` keys at or above it. The emit is a single cumsum
++    with the greater and tied counts packed into the two 16-bit halves of an int32, so
++    rows are limited to ``< 2**15`` regions. 100 -> 52us at 64 rows x 8704 regions.
++    """
++    row = tl.program_id(0)
++    visible = tl.load(lengths_ptr + row).to(tl.int32)
++    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
++
++    slots = tl.arange(0, BLOCK_TOPK)
++    tl.store(out_ptr + row * stride_out_row + slots, -1, mask=slots < topk)
++    if visible <= 0:
++        return
++
++    budget = tl.minimum(topk, visible)
++    regions = tl.arange(0, BLOCK_R)
++    live = regions < visible
++    scores = tl.load(
++        logits_ptr + row * stride_logits_row + regions, mask=live, other=0.0
++    )
++    bits = scores.to(tl.int32, bitcast=True)
++    keys = tl.where(scores < 0.0, bits ^ 0x7FFFFFFF, bits & 0x7FFFFFFF)
++    keys = tl.where(live, keys, -2147483648)
++
++    # Invariant: count(keys >= lo) >= budget > count(keys >= hi). The threshold is the
++    # largest such lo, which is itself a key.
++    lo = tl.min(tl.where(live, keys, 2147483647)).to(tl.int64)
++    hi = tl.max(keys).to(tl.int64) + 1
++    done = budget * 0
++    while (hi - lo > 1) & (done == 0):
++        mid = lo + (hi - lo) // 2
++        above = keys >= mid.to(tl.int32)
++        count = tl.sum(above.to(tl.int32))
++        if count == budget:
++            lo = tl.min(tl.where(above, keys, 2147483647)).to(tl.int64)
++            done = 1
++        elif count > budget:
++            lo = mid
++        else:
++            hi = mid
++    threshold = lo.to(tl.int32)
++
++    # Ascending region order, ties at the cut taken as a prefix -- as the tiled emit.
++    greater = live & (keys > threshold)
++    tied = live & (keys == threshold)
++    prefix = tl.cumsum(greater.to(tl.int32) | (tied.to(tl.int32) << 16), axis=0)
++    greater_incl = prefix & 0xFFFF
++    tied_incl = prefix >> 16
++    remaining = budget - tl.max(greater_incl)
++    selected = greater | (tied & (tied_incl <= remaining))
++    positions = greater_incl + tl.minimum(tied_incl, remaining) - 1
++    tl.store(
++        out_ptr + row * stride_out_row + positions,
++        regions,
++        mask=selected & (positions < topk),
++    )
++
++
++# Widest row the register-resident selector takes; wider rows use the tiled radix one.
++_RESIDENT_TOPK_MAX_REGIONS = 16384
++
++
+ def region_topk_ids(
+     logits: torch.Tensor,
+     lengths: torch.Tensor,
+@@ -1027,6 +1107,21 @@ def region_topk_ids(
+ 
+     rows, seq_regions = logits.shape
+     out = torch.empty((rows, int(topk)), device=logits.device, dtype=torch.int32)
++    if seq_regions <= _RESIDENT_TOPK_MAX_REGIONS:
++        _region_topk_ids_resident_kernel[(rows,)](
++            logits,
++            lengths,
++            out,
++            seq_regions,
++            logits.stride(0),
++            out.stride(0),
++            topk=int(topk),
++            # HCU: >= 2 for the same reason as below.
++            BLOCK_R=max(2, triton.next_power_of_2(seq_regions)),
++            BLOCK_TOPK=triton.next_power_of_2(int(topk)),
++            num_warps=8,
++        )
++        return out
+     _region_topk_ids_kernel[(rows,)](
+         logits,
+         lengths,
+-- 
+2.34.1
+

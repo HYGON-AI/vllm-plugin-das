@@ -1,0 +1,79 @@
+From fd4e9dbbb33714d2df105816675a05c044b1a7f1 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Sat, 10 Oct 2026 21:57:43 +0800
+Subject: [PATCH 21/24] step4_dsa: sort-free decode pack
+
+region_topk_ids already emits ascending logical ids, so _decode_pack_kernel
+compacts the surviving slots with a cumsum scatter instead of a tl.sort of
+1024 int64 words. The order is logical instead of physical-major: identical
+for a monotonic block table, otherwise only the attention accumulation order
+changes (fa_sparse_attention_decode_fp8 max |diff| 2.4e-4 on random tables).
+64 rows x topk 512: 14.4 -> 5.8 us per DSA layer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ model_executor/layers/step4_dsa_kernels.py | 32 +++++++++++-----------
+ 1 file changed, 16 insertions(+), 16 deletions(-)
+
+diff --git a/model_executor/layers/step4_dsa_kernels.py b/model_executor/layers/step4_dsa_kernels.py
+index c2d2655..66b3d78 100644
+--- a/model_executor/layers/step4_dsa_kernels.py
++++ b/model_executor/layers/step4_dsa_kernels.py
+@@ -1266,8 +1266,6 @@ import triton.language as tl
+ 
+ PREFILL_REGION_VALID_SHIFT = tl.constexpr(24)
+ DECODE_PHYS_SHIFT = tl.constexpr(32)
+-# Larger than any real packed word, so invalid slots sort to the tail.
+-DECODE_SORT_SENTINEL = tl.constexpr(1 << 62)
+ 
+ 
+ @triton.jit
+@@ -1371,11 +1369,12 @@ def _decode_pack_kernel(
+ ) -> None:
+     """Pack selected logical regions into the int64 decode word.
+ 
+-    One row fits in one tile, so the compaction is a sort rather than a scatter: invalid
+-    slots are mapped to a sentinel above every real word, and sorting by the packed value
+-    both drops them to the tail and produces the physical-major order the upstream
+-    converter emits. The current region is then written at the surviving count -- after the
+-    sort, so it stays last, which is also where the reference puts it.
++    Surviving slots are compacted with a cumsum scatter, keeping the selector's ascending
++    logical order. The upstream converter sorts into physical-major order instead; the two
++    coincide whenever the block table is monotonic, and otherwise differ only in the
++    attention's accumulation order. The sort cost 14.4 us vs 5.8 us here (64 rows, topk
++    512). The current region is then written at the surviving count, so it stays last,
++    which is also where the reference puts it.
+     """
+     row = tl.program_id(0)
+     request = tl.load(request_ptr + row).to(tl.int32)
+@@ -1398,17 +1397,18 @@ def _decode_pack_kernel(
+     packed = (safe_ids * region_size).to(tl.int64) | (
+         physical.to(tl.int64) << DECODE_PHYS_SHIFT
+     )
+-    packed = tl.where(live, packed, DECODE_SORT_SENTINEL)
+-    packed = tl.sort(packed, descending=False)
+-
+-    count = tl.sum(live.to(tl.int32))
++    live_i32 = live.to(tl.int32)
++    position = tl.cumsum(live_i32, axis=0) - 1
++    count = tl.sum(live_i32)
++    # Selected words land in [0, count), zeros in (count, topk]; slot ``count`` is left to
++    # the scalar store below. The three slot sets are disjoint, so there is no
++    # cross-thread race between the vector stores and the scalar one -- see
++    # :func:`_append_current_region_kernel`.
++    tl.store(out_ptr + row * stride_out_row + position, packed, mask=live)
+     tl.store(
+         out_ptr + row * stride_out_row + slots,
+-        tl.where(slots < count, packed, 0),
+-        # Slot ``count`` is left to the scalar store below. Overlapping the two would be a
+-        # cross-thread race between a vector store and a scalar one -- see
+-        # :func:`_append_current_region_kernel`.
+-        mask=(slots < topk + 1) & (slots != count),
++        tl.zeros_like(packed),
++        mask=(slots > count) & (slots < topk + 1),
+     )
+ 
+     current_region = tl.maximum((kv_seqlen - 1) // region_size, 0)
+-- 
+2.34.1
+

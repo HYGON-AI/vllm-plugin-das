@@ -1,0 +1,144 @@
+From 751f31ac7f54aea117e3b493650233851e7bf2a2 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Mon, 5 Oct 2026 16:51:45 +0800
+Subject: [PATCH 02/24] =?UTF-8?q?=E4=BF=AE=E6=94=B9step5=E6=A8=A1=E5=9E=8B?=
+ =?UTF-8?q?=E6=8E=A8=E7=90=86=E4=BC=9A=E6=8C=82=E7=9A=84=E4=B8=80=E4=B8=AA?=
+ =?UTF-8?q?bug?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ model_executor/layers/step4_dsa.py  | 40 +++++++++++++++++++++++++++++
+ model_executor/models/step5_text.py |  7 ++++-
+ transformers_utils/configs/step5.py | 32 +++++++++++++++++++++++
+ 3 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index 7fcce03..e26bb17 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -1021,6 +1021,16 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+         self.block_size = kv_cache_spec.block_size
+         self._state: Step4DSAState | None = None
++        # Builders are made by initialize_kv_cache, i.e. whenever a new KV
++        # cache is bound. 0.28's CUDA graph memory profiling binds a throwaway
++        # cache of a few blocks first and runs the DSA layers against it; a
++        # state still sized from that cache would keep a 32-row summary pool
++        # and a 32-region decode width, and the first long prefill would write
++        # off its end (a kernel VMFault). Drop it so the next forward sizes
++        # everything from the cache that is actually in use.
++        state = self._dsa_state()
++        if state is not None:
++            state.reset_allocation()
+ 
+     @classmethod
+     def get_cudagraph_support(
+@@ -2042,6 +2052,36 @@ class Step4DSAState:
+     def register_layer(self, slot: int) -> None:
+         self._registered.add(slot)
+ 
++    def reset_allocation(self) -> None:
++        """Forget everything sized from, or written against, the bound KV cache.
++
++        Called when a new KV cache is bound (see Step4DSAMetadataBuilder). The
++        next ensure_allocated() then sizes the summary pool and the decode
++        graph width from the new cache. Pending rows hold tokens of requests
++        that lived in the old cache, so they go too.
++        """
++        if self.summary is None:
++            return
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "Step-4 DSA: KV cache rebound during CUDA graph capture."
++            )
++        self.summary = None
++        self.pending_key = None
++        self.pending_z = None
++        self.regions_per_page = 0
++        self.block_size = 0
++        self.graph_regions = 0
++        self.pending = Step4PendingTable(self.max_pending)
++        self._buf = {}
++        self._host = {}
++        self._stage = 0
++        self._stage_ev = []
++        self._decode_logits = None
++        self._schedule_key = None
++        self._schedule = None
++        self._layers_done = 0
++
+     # -- allocation -------------------------------------------------------
+ 
+     def ensure_allocated(self, kv_cache: torch.Tensor, device: torch.device) -> None:
+diff --git a/model_executor/models/step5_text.py b/model_executor/models/step5_text.py
+index da4c09f..c07364b 100644
+--- a/model_executor/models/step5_text.py
++++ b/model_executor/models/step5_text.py
+@@ -588,7 +588,12 @@ class FusedMoEBlock(nn.Module):
+             intermediate_size=config.share_expert_dim,
+             hidden_act="silu",
+             reduce_results=reduce_results,
+-            quant_config=quant_config,
++            # The shared expert is bf16 in both checkpoints. Do not rely on the
++            # ignore list: hf_to_vllm_mapper renames it to ".moe.share_expert.",
++            # which the channel checkpoint's regex ("layers.N.share_expert.")
++            # does not match, so it would be built as fp8 and the bf16 weights
++            # cast into it with no scale.
++            quant_config=None,
+             prefix=f"{prefix}.share_expert",
+         )
+         custom_routing_function = functools.partial(
+diff --git a/transformers_utils/configs/step5.py b/transformers_utils/configs/step5.py
+index deefaa1..d4a911f 100644
+--- a/transformers_utils/configs/step5.py
++++ b/transformers_utils/configs/step5.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import Any
+ 
+ from transformers.configuration_utils import PretrainedConfig
+@@ -206,6 +207,37 @@ class Step5Config(PretrainedConfig):
+             tie_word_embeddings=tie_word_embeddings,
+             **kwargs,
+         )
++        self._register_dsa_splitting_op()
++
++    def _register_dsa_splitting_op(self) -> None:
++        """Make the DSA indexer op a compilation splitting op, process-wide.
++
++        The indexer (model_executor/layers/step4_dsa.py) is a custom op with a
++        Python body. Under piecewise cudagraphs an indexer that is not a
++        splitting op is captured and replays the warm-up region plan forever.
++        vLLM's in-tree indexer sits in ``CompilationConfig._attention_ops``;
++        this one is out of tree, so it adds itself here -- the config is parsed
++        in ``ModelConfig.__init__``, before ``VllmConfig.__post_init__``
++        resolves the splitting-op list. step4_dsa's ``_require_splitting_op``
++        fails loudly if this registration is missing.
++        """
++        sparse_config = getattr(self, "sparse_config", None) or {}
++        if isinstance(sparse_config, dict):
++            enabled = sparse_config.get("enabled", False)
++        else:
++            enabled = getattr(sparse_config, "enabled", False)
++        # Matches models/step5_text.py's DISABLE_DSA: the dense fallback has no
++        # indexer op in the graph to split on.
++        if not enabled or os.environ.get("VLLM_STEP5_DISABLE_DSA", "0") == "1":
++            return
++        # Deferred: vllm.config imports this module transitively.
++        from vllm.config.compilation import CompilationConfig
++
++        # Literal, not imported from step4_dsa (that would pull in torch and
++        # Triton during config resolution).
++        op = "vllm::step4_dsa_index"
++        if op not in CompilationConfig._attention_ops:
++            CompilationConfig._attention_ops.append(op)
+ 
+ 
+ class Step5VLConfig(PretrainedConfig):
+-- 
+2.34.1
+

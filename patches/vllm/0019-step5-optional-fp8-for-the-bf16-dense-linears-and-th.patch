@@ -1,0 +1,372 @@
+From c103a379e039acf03c66ad84585c2395c93e271b Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Sat, 10 Oct 2026 13:41:27 +0800
+Subject: [PATCH 19/24] step5: optional fp8 for the bf16 dense linears and the
+ layer 88-90 MoE
+
+VLLM_HCU_STEP5_FP8_DENSE=1: after loading, the attention qkvg/o and dense-MLP
+weights are quantized to fp8 e4m3 per output channel and run through LightOp's
+hipBLASLt channel-wise W8A8 GEMM with per-token activation scales (computed in
+torch ops so Inductor fuses them into the producer). N is padded to a multiple
+of 256 to avoid hipBLASLt's slow path. The shared expert, router, indexer,
+eh_proj and lm_head stay bf16.
+
+VLLM_HCU_STEP5_FP8_BF16_MOE=1: the bf16 routed experts of layers 88-90
+(compressed-tensors ignore entry) are quantized to fp8 per output channel while
+loading, so they use the same fp8 MoE path as the other layers.
+
+bs32 64k/4k, MTP3: decode 1248-1259 -> 1319-1333 tok/s, prefill 11240 ->
+11800 tok/s. Prompt NLL 0.6483 -> 0.6487-0.6489, top-1 agreement vs bf16
+96.8-96.9% (bf16 run-to-run 97.4%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ model_executor/models/step5_text.py  | 154 ++++++++++++++++++++++++++-
+ models/step5/nvidia/ops/fp8_dense.py |  95 +++++++++++++++++
+ 2 files changed, 247 insertions(+), 2 deletions(-)
+ create mode 100644 models/step5/nvidia/ops/fp8_dense.py
+
+diff --git a/model_executor/models/step5_text.py b/model_executor/models/step5_text.py
+index 42bbd52..8a2f2fa 100644
+--- a/model_executor/models/step5_text.py
++++ b/model_executor/models/step5_text.py
+@@ -14,7 +14,8 @@ The three deltas that matter:
+ * **``partial_rotary_factors`` is 1/3 on full-attention layers**, so the rotary
+   dim comes from ``get_rope`` rather than a ``head_dim // 2`` special case.
+ * **Only the MoE expert weights are fp8.** Every other weight in the checkpoint
+-  is bf16, so ``quant_config`` is handed to ``FusedMoE`` alone.
++  is bf16, so ``quant_config`` is handed to ``FusedMoE`` alone. (``FP8_DENSE``
++  and ``FP8_BF16_MOE`` quantize more of them at load time.)
+ 
+ Two fp8 checkpoint layouts load through this file unchanged:
+ 
+@@ -48,6 +49,7 @@ the whole causal history; past that it is a different (denser) model.
+ """
+ 
+ import os
++import re
+ import functools
+ import typing
+ from collections.abc import Callable, Iterable
+@@ -79,6 +81,7 @@ from vllm.model_executor.layers.fused_moe import (
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
++    LinearMethodBase,
+     MergedColumnParallelLinear,
+     QKVParallelLinear,
+     ReplicatedLinear,
+@@ -151,6 +154,63 @@ FUSED_ROUTER_SHARED = (
+     os.environ.get("VLLM_HCU_STEP5_FUSED_ROUTER_SHARED", "1") == "1"
+ )
+ 
++# After loading, store the bf16 attention (qkv/g/o) and dense-MLP weights as fp8
++# with one scale per output channel and run them as fp8 GEMMs with per-token
++# activation scales (ops/fp8_dense.py), the scheme of the fp8 MoE experts. The
++# shared expert (fused into the router kernel), router, indexer, eh_proj and
++# lm_head stay bf16.
++FP8_DENSE = os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
++
++# Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
++# load time, the scheme of the other layers' checkpoint experts, so they run the
++# same fp8 MoE path instead of the bf16 Triton experts. Channel (compressed-
++# tensors) checkpoint only.
++FP8_BF16_MOE = os.environ.get("VLLM_HCU_STEP5_FP8_BF16_MOE", "0") == "1"
++
++_PACKED_EXPERT_WEIGHT = re.compile(r"\.moe\.(gate|up|down)_proj\.weight$")
++
++
++def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
++    """FP8_BF16_MOE: drop the routed-expert entries from the compressed-tensors
++    ignore list, so layers 88-90 build the fp8 MoE method like the others."""
++    ignore = getattr(quant_config, "ignore", None)
++    if quant_config is None or quant_config.get_name() != "compressed-tensors":
++        raise ValueError(
++            "VLLM_HCU_STEP5_FP8_BF16_MOE needs the compressed-tensors (channel) "
++            "checkpoint"
++        )
++    kept = [t for t in ignore if "moe\\.experts" not in t]
++    if len(kept) != len(ignore):
++        logger.info_once("step5: quantizing the bf16 routed experts to fp8")
++    quant_config.ignore = kept
++
++
++def _quantize_bf16_experts(
++    weights: Iterable[tuple[str, torch.Tensor]],
++) -> Iterable[tuple[str, torch.Tensor]]:
++    """FP8_BF16_MOE: packed bf16 expert weights ``[E, out, in]`` -> fp8 plus a
++    ``weight_scale`` ``[E, out, 1]`` (absmax per output row), as in the
++    checkpoint's fp8 layers. Quantized on the GPU in expert chunks."""
++    dev = torch.device("cuda", torch.cuda.current_device())
++    for name, w in weights:
++        if not (
++            w.dtype == torch.bfloat16
++            and w.dim() == 3
++            and _PACKED_EXPERT_WEIGHT.search(name)
++        ):
++            yield name, w
++            continue
++        q = torch.empty(w.shape, dtype=torch.float8_e4m3fn, device=dev)
++        scale = torch.empty(*w.shape[:2], 1, dtype=torch.float32, device=dev)
++        for e0 in range(0, w.shape[0], 16):
++            x = w[e0 : e0 + 16].to(dev).float()
++            sc = (x.abs().amax(dim=-1, keepdim=True) / 448.0).clamp_min(1e-12)
++            q[e0 : e0 + 16] = (x / sc).clamp(-448.0, 448.0).to(q.dtype)
++            scale[e0 : e0 + 16] = sc
++            del x
++        yield name, q
++        yield name + "_scale", scale
++
+ 
+ def dsa_layer_indices(config: Any) -> list[int]:
+     """Loaded layer indices that run DSA, in order.
+@@ -299,6 +359,62 @@ def _fp32_gemma_rms_norm(hidden_size: int, eps: float) -> GemmaRMSNorm:
+     return norm
+ 
+ 
++class Step5FP8LinearMethod(LinearMethodBase):
++    """``FP8_DENSE``: a bf16 linear run as an fp8 GEMM (ops/fp8_dense.py).
++
++    Swapped in after the layer is built, so the layer is created and loaded as an
++    unquantized bf16 linear; process_weights_after_loading then replaces the
++    weight with fp8 + a per-output-channel scale and frees the bf16 copy. With
++    ``post`` the owner quantizes instead (the fused qkvg weight).
++    """
++
++    def __init__(self, post: Callable[[], None] | None = None):
++        self.post = post
++
++    def create_weights(self, *args, **kwargs):
++        raise NotImplementedError("swapped in after the layer is created")
++
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        if self.post is not None:
++            self.post()
++            return
++        from vllm.models.step5.nvidia.ops.fp8_dense import quantize_weight_fp8
++
++        w = layer.weight
++        k, n = layer.input_size_per_partition, layer.output_size_per_partition
++        if not _weight_is_kn(w, k, n):
++            w = w.t()
++        layer.fp8_wq, layer.fp8_ws = quantize_weight_fp8(w)
++        layer.fp8_n = n
++        _free_weight(layer.weight)
++
++    def apply(
++        self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        from vllm.models.step5.nvidia.ops.fp8_dense import fp8_linear
++
++        out = fp8_linear(x, layer.fp8_wq, layer.fp8_ws, layer.fp8_n)
++        return out if bias is None else out + bias
++
++
++def _weight_is_kn(w: torch.Tensor, k: int, n: int) -> bool:
++    """Whether a bf16 linear weight is stored ``[in, out]`` (HCU VLLM_USE_NN)."""
++    if k != n:
++        return tuple(w.shape) == (k, n)
++    from vllm_hcu.platforms import envs as henvs
++
++    return bool(henvs.VLLM_USE_NN)
++
++
++def _free_weight(p: Parameter) -> None:
++    p.data = torch.empty(0, dtype=p.dtype, device=p.device)
++
++
++def _use_fp8(*layers: nn.Module) -> None:
++    for layer in layers:
++        layer.quant_method = Step5FP8LinearMethod()
++
++
+ class Step5MLP(nn.Module):
+     """Dense FFN, used both for the four non-MoE layers and the shared expert."""
+ 
+@@ -479,6 +595,8 @@ class Step5Attention(nn.Module):
+         self.k_norm = _fp32_gemma_rms_norm(self.head_dim, rms_norm_eps)
+         self.use_head_wise_attn_gate = use_head_wise_attn_gate
+         self.register_buffer("qkvg_weight", None, persistent=False)
++        self.register_buffer("qkvg_wq", None, persistent=False)
++        self.register_buffer("qkvg_ws", None, persistent=False)
+         if use_head_wise_attn_gate:
+             self.g_proj = ColumnParallelLinear(
+                 hidden_size,
+@@ -488,6 +606,16 @@ class Step5Attention(nn.Module):
+                 prefix=f"{prefix}.g_proj",
+             )
+             self._maybe_fuse_qkvg()
++        if FP8_DENSE:
++            _use_fp8(self.o_proj)
++            if self.qkvg_weight is not None:
++                self.qkv_proj.quant_method = Step5FP8LinearMethod(
++                    post=self._quantize_qkvg
++                )
++            else:
++                _use_fp8(self.qkv_proj)
++                if use_head_wise_attn_gate:
++                    _use_fp8(self.g_proj)
+ 
+         self.use_rope = True
+         if use_rope_layers:
+@@ -567,12 +695,28 @@ class Step5Attention(nn.Module):
+         wg.data = fused[:, nq:]
+         self.register_buffer("qkvg_weight", fused, persistent=False)
+ 
++    def _quantize_qkvg(self) -> None:
++        from vllm.models.step5.nvidia.ops.fp8_dense import quantize_weight_fp8
++
++        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(self.qkvg_weight)
++        self.qkvg_weight = None
++        _free_weight(self.qkv_proj.weight)
++        _free_weight(self.g_proj.weight)
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        if self.qkvg_weight is not None:
++        if self.qkvg_wq is not None:
++            from vllm.models.step5.nvidia.ops.fp8_dense import fp8_linear
++
++            # N is padded; slice instead of split.
++            qkvg = fp8_linear(hidden_states, self.qkvg_wq, self.qkvg_ws)
++            nqkv = self.q_size + 2 * self.kv_size
++            qkv = qkvg[..., :nqkv]
++            extra_dims = qkvg[..., nqkv : nqkv + self.num_heads]
++        elif self.qkvg_weight is not None:
+             qkvg = torch.matmul(hidden_states, self.qkvg_weight)
+             qkv, extra_dims = qkvg.split(
+                 [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
+@@ -913,6 +1057,8 @@ class Step5DecoderLayer(nn.Module):
+                 reduce_results=True,
+                 prefix=f"{prefix}.mlp",
+             )
++            if FP8_DENSE:
++                _use_fp8(self.mlp.gate_up_proj, self.mlp.down_proj)
+         self.input_layernorm = _fp32_gemma_rms_norm(
+             config.hidden_size, config.rms_norm_eps
+         )
+@@ -1006,6 +1152,8 @@ class Step5Model(nn.Module):
+ 
+         self.moe_num_experts = config.moe_num_experts
+         self.skipped_dsa_weights = 0
++        if FP8_BF16_MOE:
++            _unignore_bf16_experts(vllm_config.quant_config)
+ 
+         # One Step4DSAState is shared by every DSA layer on this rank: the
+         # region bookkeeping it does is layer-independent, so the first layer of
+@@ -1170,6 +1318,8 @@ class Step5Model(nn.Module):
+         )
+ 
+         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]
++        if FP8_BF16_MOE:
++            weights = _quantize_bf16_experts(weights)
+ 
+         for name, loaded_weight in weights:
+             if name.startswith("model."):
+diff --git a/models/step5/nvidia/ops/fp8_dense.py b/models/step5/nvidia/ops/fp8_dense.py
+new file mode 100644
+index 0000000..6ad1b84
+--- /dev/null
++++ b/models/step5/nvidia/ops/fp8_dense.py
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Step5 dense linears in fp8: bf16 x [M, K] @ W -> bf16 [M, N] as an fp8 GEMM.
++
++The attention and dense-MLP weights are bf16 in the checkpoint. After loading
++they are quantized to fp8 e4m3 with one scale per output channel (symmetric
++absmax, the scheme of the checkpoint's fp8 MoE experts) and the bf16 copy is
++freed. Activations are quantized per token in plain torch ops, which Inductor
++fuses into the producer (the RMSNorm, the attention gate multiply), and the GEMM
++is LightOp's hipBLASLt channel-wise W8A8 kernel, the HCU scaled_mm backend.
++
++On gfx938 it beats the bf16 hipBLASLt GEMM at every decode and prefill size of
++these shapes (M=64: o_proj 29.5 -> 16.2 us, MLP down 39.5 -> 18.0 us; M>=2k:
++1.6-1.7x), except that N not divisible by 256 hits a ~70 us slow path, so N is
++padded to a multiple of 256 with zero rows and the caller drops the pad columns.
++"""
++
++import torch
++
++from vllm.utils.torch_utils import direct_register_custom_op
++
++FP8_MAX = 448.0
++N_ALIGN = 256
++
++
++@torch.no_grad()
++def quantize_weight_fp8(w_kn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """bf16 ``[K, N]`` -> (fp8 ``[Np, K]`` contiguous, fp32 scale ``[Np, 1]``).
++
++    Np is N rounded up to N_ALIGN; pad rows are zero with scale 1.
++    """
++    K, N = w_kn.shape
++    n_pad = -N % N_ALIGN
++    q = torch.zeros(N + n_pad, K, device=w_kn.device, dtype=torch.float8_e4m3fn)
++    scale = torch.ones(N + n_pad, 1, device=w_kn.device, dtype=torch.float32)
++    # Chunked over N so the fp32 temporaries stay small.
++    for n0 in range(0, N, 1024):
++        w = w_kn[:, n0 : n0 + 1024].t().float()
++        s = (w.abs().amax(dim=1, keepdim=True) / FP8_MAX).clamp_min(1e-12)
++        q[n0 : n0 + w.shape[0]] = (w / s).clamp(-FP8_MAX, FP8_MAX).to(q.dtype)
++        scale[n0 : n0 + w.shape[0]] = s
++    return q, scale
++
++
++def quant_per_token_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """bf16 ``[M, K]`` -> (fp8 ``[M, K]``, fp32 scale ``[M, 1]``), in torch ops so
++    that Inductor fuses it into whatever produced x."""
++    xf = x.float()
++    s = (xf.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp_min(1e-12)
++    return (xf / s).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn), s
++
++
++def _step5_fp8_gemm(
++    xq: torch.Tensor, xs: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor
++) -> torch.Tensor:
++    M, K = xq.shape
++    N = wq.shape[0]
++    if M == 0:
++        return torch.empty(0, N, device=xq.device, dtype=torch.bfloat16)
++    from lightop.gemm_ops import hipblaslt_w8a8_channelwise_gemm
++
++    status, out = hipblaslt_w8a8_channelwise_gemm(
++        xq, wq, xs, ws, M, N, K, "NT", torch.bfloat16, None
++    )
++    assert status is True, "hipblaslt_w8a8_channelwise_gemm failed"
++    return out.view(M, N)
++
++
++def _step5_fp8_gemm_fake(
++    xq: torch.Tensor, xs: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor
++) -> torch.Tensor:
++    return torch.empty(xq.shape[0], wq.shape[0], device=xq.device, dtype=torch.bfloat16)
++
++
++direct_register_custom_op(
++    op_name="step5_fp8_gemm",
++    op_func=_step5_fp8_gemm,
++    mutates_args=[],
++    fake_impl=_step5_fp8_gemm_fake,
++)
++
++
++def fp8_linear(
++    x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, n: int | None = None
++) -> torch.Tensor:
++    """``x [..., K]`` bf16 @ quantize_weight_fp8 output -> bf16 ``[..., N]``.
++
++    With ``n=None`` the pad columns are kept (for callers that split anyway).
++    """
++    lead = x.shape[:-1]
++    xq, xs = quant_per_token_fp8(x.reshape(-1, x.shape[-1]))
++    out = torch.ops.vllm.step5_fp8_gemm(xq, xs, wq, ws)
++    if n is not None and n != wq.shape[0]:
++        out = out[:, :n]
++    return out.view(*lead, out.shape[-1]) if out.is_contiguous() else out.reshape(*lead, out.shape[-1])
+-- 
+2.34.1
+

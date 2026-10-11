@@ -1,0 +1,46 @@
+From eee48e665fc029d5ae6fa29898913db4f277640c Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Thu, 8 Oct 2026 19:50:46 +0800
+Subject: [PATCH 07/24] step5 router: run the Triton router-bias top-k kernel
+ on HCU
+
+torch.version.cuda is None on ROCm/HCU, so router_bias_func always fell back to
+~10 eager torch ops inside the opaque moe_forward op (never fused by Inductor).
+The Triton kernel runs fine on HCU: 9.6 vs 93.5 us at M=64, 0.70 vs 4.04 ms at
+M=16384, identical routing (max weight diff 1.2e-7) and NaN-row handling.
+
+bs32 64k/4k: prefill 9199 -> 9983 tok/s, decode 758 -> 830.7 tok/s.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ models/step5/kernels.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/models/step5/kernels.py b/models/step5/kernels.py
+index 6fb1573..2f0b814 100644
+--- a/models/step5/kernels.py
++++ b/models/step5/kernels.py
+@@ -744,7 +744,10 @@ def router_bias_func(
+             f"got {indices_dtype}."
+         )
+ 
+-    if not gating_output.is_cuda or torch.version.cuda is None:
++    # The Triton kernel also runs on ROCm/HCU (is_cuda is True there) and is
++    # 7-10x faster than the eager fallback below, which runs inside the opaque
++    # moe_forward op and so never gets fused by Inductor.
++    if not gating_output.is_cuda:
+         if router_bias is None:
+             raise ValueError("Step5 router_bias must be provided.")
+         scores = gating_output.float().sigmoid()
+@@ -766,6 +769,8 @@ def router_bias_func(
+     router_bias_triton_func = importlib.import_module(
+         "vllm.models.step5.nvidia.ops.triton.router_bias"
+     ).router_bias_triton_func
++    if gating_output.stride(-1) != 1:
++        gating_output = gating_output.contiguous()
+     return router_bias_triton_func(
+         gating_output,
+         router_bias,
+-- 
+2.34.1
+

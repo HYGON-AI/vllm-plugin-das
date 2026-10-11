@@ -1,0 +1,733 @@
+From 68bf68d1423d418bc0a210a9f4fb7ce146d94c2c Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 04:01:25 +0800
+Subject: [PATCH 10/24] step4 DSA: fuse spec summaries, round q in norm_rope,
+ cache decode rows meta per step
+
+- fused spec summary/pending update kernel
+- cache indexer param casts; pass raw bf16 weights with in-kernel weight_scale
+- round index q to e4m3 in the norm_rope store (bit-identical) and skip the
+  separate rounding pass in all scoring paths (q_prerounded)
+- share decode_rows_meta across DSA layers within one forward step
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ model_executor/layers/step4_dsa.py         | 268 ++++++++++++++++++++-
+ model_executor/layers/step4_dsa_kernels.py | 101 +++++---
+ 2 files changed, 327 insertions(+), 42 deletions(-)
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index 493b9c1..ee0e2f9 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -60,8 +60,10 @@ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.step4_dsa_kernels import (
+     REGION_BLOCK_SIZE,
++    _NO_FP_FUSION,
+     build_rope_cache,
+     csa_compress_regions,
++    decode_rows_meta,
+     decode_sparse_meta,
+     indexer_logits,
+     indexer_norm_rope,
+@@ -654,6 +656,127 @@ def _store_live_summary_rows(
+     )
+ 
+ 
++@triton.jit
++def _spec_summaries_kernel(
++    tok_k_ptr,
++    tok_z_ptr,
++    pend_k_ptr,
++    pend_z_ptr,
++    summary_ptr,
++    query_start_loc_ptr,
++    head_ptr,
++    tail_ptr,
++    pending_in_ptr,
++    pending_out_ptr,
++    tail_reg_ptr,
++    counts_ptr,
++    slots_ptr,
++    live_ptr,
++    keep_rows_ptr,
++    num_tokens,
++    trash_row,
++    stride_tok,
++    stride_pend_row,
++    stride_pend_pos,
++    stride_summary_row,
++    NRM: tl.constexpr,
++    REGION: tl.constexpr,
++    PROXY_DIM: tl.constexpr,
++    BLOCK_T: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++) -> None:
++    """``_update_summaries_spec`` in one launch: one program per buffer region.
++
++    The unfused path materialises the per-request compression buffer (pending
++    head, then the request's query tokens scattered in at ``head``), compresses
++    it, stores the live summaries and writes the tail / keep rows back -- about
++    28 launches per layer, nearly all of them launch-bound. Here each program
++    gathers its own region of that buffer straight from ``pending`` and the
++    token rows, so nothing is materialised.
++
++    The compression arithmetic is ``_csa_compress_regions_kernel``'s, statement
++    for statement and at the same tile shape and launch options, so summaries
++    are bit-identical. The only cross-program hazard is a ``pending`` row read
++    as one request's head and written by another program; the schedule rules it
++    out (``Step4PendingTable.acquire`` never recycles a row touched this step),
++    and the one row a program may both read and write -- its own head row,
++    reused as tail or keep row -- is read before its values are stored.
++    """
++    g = tl.program_id(0)
++    req = g // NRM
++    j = g % NRM
++
++    head = tl.load(head_ptr + req)
++    q_start = tl.load(query_start_loc_ptr + req)
++    # Graph-padding requests may carry a stale, non-monotonic entry: their
++    # regions are dead (count 0, not live, trash rows), so only the loads have
++    # to stay in bounds.
++    q_len = tl.maximum(tl.load(query_start_loc_ptr + req + 1) - q_start, 0)
++
++    t = tl.arange(0, BLOCK_T)
++    dims = tl.arange(0, BLOCK_D)
++    t_ok = t < REGION
++    dim_ok = dims < PROXY_DIM
++    off = j * REGION + t
++    i = off - head
++    tok = (q_start + i).to(tl.int64)
++    from_tok = t_ok & (i >= 0) & (i < q_len) & (tok >= 0) & (tok < num_tokens)
++    from_pend = t_ok & (off < head)
++
++    p_in = tl.load(pending_in_ptr + req)
++    tok_offs = tok[:, None] * stride_tok + dims[None, :]
++    pend_offs = p_in * stride_pend_row + off[:, None] * stride_pend_pos + dims[None, :]
++    tok_mask = from_tok[:, None] & dim_ok[None, :]
++    pend_mask = from_pend[:, None] & dim_ok[None, :]
++    key = tl.where(
++        tok_mask,
++        tl.load(tok_k_ptr + tok_offs, mask=tok_mask, other=0.0),
++        tl.load(pend_k_ptr + pend_offs, mask=pend_mask, other=0.0),
++    )
++    zed = tl.where(
++        tok_mask,
++        tl.load(tok_z_ptr + tok_offs, mask=tok_mask, other=0.0),
++        tl.load(pend_z_ptr + pend_offs, mask=pend_mask, other=0.0),
++    )
++
++    if tl.load(live_ptr + g) != 0:
++        count = tl.load(counts_ptr + g)
++        mask = (t < count)[:, None] & dim_ok[None, :]
++        logits = tl.where(mask, zed, float("-inf")).to(tl.float32)
++        values = tl.where(mask, key, 0.0).to(tl.float32)
++        shift = tl.max(tl.where(mask, logits, float("-inf")))
++        weights = tl.where(mask, tl.exp(logits - shift), 0.0)
++        denominator = tl.sum(weights, axis=0)
++        numerator = tl.sum(weights * values, axis=0)
++        summary = tl.where(
++            denominator > 0.0, numerator / tl.maximum(denominator, 1e-20), 0.0
++        )
++        slot = tl.load(slots_ptr + g)
++        tl.store(
++            summary_ptr + slot * stride_summary_row + dims,
++            summary.to(tl.bfloat16).to(tl.float8e4nv),
++            mask=dim_ok,
++        )
++
++    row_offs = t[:, None] * stride_pend_pos + dims[None, :]
++    if g == tl.load(tail_reg_ptr + req):
++        p_out = tl.load(pending_out_ptr + req)
++        if p_out != trash_row:
++            tail_mask = (t < tl.load(tail_ptr + req))[:, None] & dim_ok[None, :]
++            tl.store(pend_k_ptr + p_out * stride_pend_row + row_offs, key, mask=tail_mask)
++            tl.store(pend_z_ptr + p_out * stride_pend_row + row_offs, zed, mask=tail_mask)
++    keep = tl.load(keep_rows_ptr + g)
++    if keep != trash_row:
++        row_mask = t_ok[:, None] & dim_ok[None, :]
++        tl.store(pend_k_ptr + keep * stride_pend_row + row_offs, key, mask=row_mask)
++        tl.store(pend_z_ptr + keep * stride_pend_row + row_offs, zed, mask=row_mask)
++
++
++# Fold _update_summaries_spec into _spec_summaries_kernel. Bit-identical; "0"
++# restores the unfused torch path.
++_SPEC_FUSED_SUMMARIES = os.environ.get("VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES", "1") == "1"
++
++
+ @triton.jit
+ def _store_kv_rows_kernel(
+     k_dst_ptr,
+@@ -879,6 +1002,7 @@ def decode_indexer_logits(
+     *,
+     regions_per_page: int,
+     block_k: int = 128,
++    q_prerounded: bool = False,
+ ) -> None:
+     """Score every decode request against its own key set, in one launch.
+ 
+@@ -921,7 +1045,8 @@ def decode_indexer_logits(
+             f"{regions_per_page} regions the block table can address"
+         )
+ 
+-    quantized_q = round_activations_e4m3(index_q)
++    # q_prerounded: index_q came from indexer_norm_rope(round_q=True).
++    quantized_q = index_q if q_prerounded else round_activations_e4m3(index_q)
+ 
+     _decode_indexer_logits_kernel[(num_reqs, triton.cdiv(width, block_k), groups)](
+         quantized_q,
+@@ -970,6 +1095,7 @@ def _spec_indexer_logits_kernel(
+     stride_w_tok,
+     stride_w_group,
+     stride_out_row,
++    weight_scale,
+     heads_per_group: tl.constexpr,
+     proxy_dim: tl.constexpr,
+     regions_per_page: tl.constexpr,
+@@ -989,6 +1115,14 @@ def _spec_indexer_logits_kernel(
+     sits in, and the per-head loop keeps the fp32 add order of ``accumulator``.
+     Each token still stops at its own ``nscore``; the tile is loaded up to the
+     widest of them.
++
++    ``weight_scale`` multiplies the widened head weight, so the caller can pass
++    the raw bf16 head-weight projection instead of launching the widening and
++    the prescale as separate kernels -- the same IEEE ops the torch path runs.
++    The query's e4m3 round trip is *not* done here: converting to fp8 in
++    software on every key block made the kernel 2.6x slower on gfx938. It is
++    done once, where the query is produced (``indexer_norm_rope``'s
++    ``round_q``).
+     """
+     req = tl.program_id(0)
+     k_block = tl.program_id(1)
+@@ -1037,6 +1171,7 @@ def _spec_indexer_logits_kernel(
+             mask=query_ok,
+             other=0.0,
+         ).to(tl.float32)
++        head_weight = head_weight * weight_scale
+         scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
+         accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
+ 
+@@ -1060,12 +1195,19 @@ def spec_indexer_logits(
+     num_reqs: int,
+     regions_per_page: int,
+     block_k: int = 128,
++    weight_scale: float = 1.0,
++    q_prerounded: bool = False,
+ ) -> None:
+     """``decode_indexer_logits`` for verify batches, one program per request.
+ 
+     Args:
+         index_q: ``[num_tokens, groups, heads_per_group, proxy_dim]``.
+-        weights: ``[num_tokens, groups, heads_per_group]``, prescale applied.
++        weights: ``[num_tokens, groups, heads_per_group]``, multiplied by
++            ``weight_scale`` (in fp32, after widening) inside the kernel.
++        q_prerounded: ``index_q`` already went through
++            ``round_activations_e4m3`` (``indexer_norm_rope(round_q=True)``),
++            so the separate round-trip pass is skipped. The rounding is
++            idempotent, so this only saves the launches.
+         summary: the fp8 region-summary pool, read in place.
+         block_table: ``[num_reqs, pages]``, one row per *request* (not the
+             per-token copy the per-token kernel takes).
+@@ -1094,7 +1236,7 @@ def spec_indexer_logits(
+             f"{regions_per_page} regions the block table can address"
+         )
+ 
+-    quantized_q = round_activations_e4m3(index_q)
++    quantized_q = index_q if q_prerounded else round_activations_e4m3(index_q)
+ 
+     _spec_indexer_logits_kernel[(num_reqs, triton.cdiv(width, block_k), groups)](
+         quantized_q,
+@@ -1113,6 +1255,7 @@ def spec_indexer_logits(
+         weights.stride(0),
+         weights.stride(1),
+         out.stride(0),
++        float(weight_scale),
+         heads_per_group=heads_per_group,
+         proxy_dim=proxy_dim,
+         regions_per_page=regions_per_page,
+@@ -1868,6 +2011,7 @@ def build_plan(
+     regions_per_page: int,
+     decode_seq_lens: torch.Tensor | None = None,
+     decode_table: torch.Tensor | None = None,
++    step_cache: dict | None = None,
+ ) -> Step4SparsePlan:
+     """Turn indexer scores into the two kernels' metadata.
+ 
+@@ -1880,6 +2024,10 @@ def build_plan(
+     (``[num_decode_tokens]`` lengths and ``[num_decode_tokens, pages]`` table):
+     each query token is selected for as a single-token decode at its own
+     position.
++
++    ``step_cache`` is a dict that lives for one forward step (see
++    ``Step4Indexer.run``); the decode rows' request/history vectors depend on
++    the step only, so the first layer builds them and the other 22 reuse them.
+     """
+     plan = Step4SparsePlan()
+     plan.md = attn_metadata
+@@ -1893,14 +2041,23 @@ def build_plan(
+         else:
+             seq_lens = attn_metadata.seq_lens[:nd].to(torch.int32)
+             table = attn_metadata.block_table[:nd]
++        rows_key = ("decode_rows", decode_logits.shape[0])
++        rows_meta = None if step_cache is None else step_cache.get(rows_key)
++        if rows_meta is None:
++            # group-major arange(num_reqs), the default, is what we want
++            rows_meta = decode_rows_meta(
++                seq_lens, decode_logits.shape[0], None, REGION_BLOCK_SIZE
++            )
++            if step_cache is not None:
++                step_cache[rows_key] = rows_meta
+         packed, counts = decode_sparse_meta(
+             decode_logits,
+             seq_lens,
+             table,
+-            None,  # group-major arange(num_reqs), the default, is what we want
+             topk=topk,
+             region_size=REGION_BLOCK_SIZE,
+             regions_per_page=regions_per_page,
++            rows_meta=rows_meta,
+         )
+         plan.decode = (packed, counts)
+ 
+@@ -2328,9 +2485,15 @@ class Step4DSAState:
+         # parallel would give a rank only some of the 23).
+         self._registered: set[int] = set()
+         self._layers_done = 0
++        self.first_slot = 0
++        # Layer-independent tensors derived during one forward. Reset by the
++        # first DSA layer of every forward -- eager, warmup or capture alike --
++        # so nothing outlives the step (or the graph) it was built in.
++        self.step_cache: dict = {}
+ 
+     def register_layer(self, slot: int) -> None:
+         self._registered.add(slot)
++        self.first_slot = min(self._registered)
+ 
+     def reset_allocation(self) -> None:
+         """Forget everything sized from, or written against, the bound KV cache.
+@@ -3629,6 +3792,8 @@ class Step4Indexer:
+         state = self.state
+         state.ensure_allocated(kv_cache, hidden_states.device)
+         sched = state.schedule(md)
++        if self.slot == state.first_slot:
++            state.step_cache = {}
+ 
+         num_tokens = md.num_actual_tokens
+         index_q, index_k, index_z, weights = self._project(
+@@ -3649,6 +3814,7 @@ class Step4Indexer:
+             regions_per_page=state.regions_per_page,
+             decode_seq_lens=sched.tok_seq if sched.spec else None,
+             decode_table=sched.tok_table if sched.spec else None,
++            step_cache=state.step_cache,
+         )
+         state.finish_layer()
+         return width
+@@ -3664,6 +3830,7 @@ class Step4Indexer:
+         index_q = owner.sparse_indexer_q(hidden_states)
+         index_k = owner.sparse_indexer_k(hidden_states)
+         index_z = owner.sparse_indexer_z(hidden_states)
++        q_norm_w, k_norm_w, k_norm_b, w_weight = self._cast_params(index_q.dtype)
+ 
+         cos, sin = self.state.rope_tables(
+             theta=self.rope_theta,
+@@ -3679,9 +3846,9 @@ class Step4Indexer:
+             index_q.contiguous(),
+             index_k.contiguous(),
+             index_z.contiguous(),
+-            owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype),
+-            owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype),
+-            owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype),
++            q_norm_w,
++            k_norm_w,
++            k_norm_b,
+             cos,
+             sin,
+             positions,
+@@ -3691,16 +3858,19 @@ class Step4Indexer:
+             rotary_dim=cos.shape[1],
+             eps=self.eps,
+             q_norm_weight_bias=1.0,
++            # Every scorer applies round_activations_e4m3 to q; doing it in the
++            # norm's store makes that idempotent pass skippable (q_prerounded).
++            round_q=True,
+         )
+ 
+         # Round the fp32 weight to the activation dtype *before* the GEMM and
+         # widen the result back to fp32 afterwards. Both boundaries are part of
+         # the deployed semantics: doing the GEMM in fp32 gives different scores.
+-        weights = F.linear(
+-            hidden_states, owner.sparse_indexer_w.weight.to(hidden_states.dtype)
+-        ).float()
+-        weights = weights.view(num_tokens, self.num_kv_groups, self.heads_per_group)
+-        weights = (weights * self.weight_prescale).contiguous()
++        # The widening and the prescale are left to the scorer (_prescaled, or
++        # folded into spec_indexer_logits), so the GEMM output is returned raw.
++        weights = F.linear(hidden_states, w_weight).view(
++            num_tokens, self.num_kv_groups, self.heads_per_group
++        )
+ 
+         return (
+             index_q.view(num_tokens, self.num_kv_groups, self.heads_per_group, proxy),
+@@ -3709,6 +3879,36 @@ class Step4Indexer:
+             weights,
+         )
+ 
++    def _cast_params(
++        self, dtype: torch.dtype
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        """The norm parameters and the fp32 head-weight matrix in ``dtype``.
++
++        Cast once and kept, rather than per call: four casts per layer per step
++        were four launches each, ~20 us of every DSA layer at decode. Keyed on
++        the source storage so a re-bound parameter is picked up; a cast made
++        during graph capture is not kept, since it lives in the graph's pool.
++        """
++        owner = self.owner
++        sources = (
++            owner.sparse_indexer_q_norm.weight,
++            owner.sparse_indexer_k_norm.weight,
++            owner.sparse_indexer_k_norm.bias,
++            owner.sparse_indexer_w.weight,
++        )
++        key = (dtype,) + tuple(t.data_ptr() for t in sources)
++        cached = getattr(self, "_param_cache", None)
++        if cached is not None and cached[0] == key:
++            return cached[1]
++        casts = tuple(t.to(dtype) for t in sources)
++        if not torch.cuda.is_current_stream_capturing():
++            self._param_cache = (key, casts)
++        return casts
++
++    def _prescaled(self, weights: torch.Tensor) -> torch.Tensor:
++        """Raw head weights from ``_project``, widened to fp32 and prescaled."""
++        return (weights.float() * self.weight_prescale).contiguous()
++
+     # -- stage 2: summaries -------------------------------------------------
+ 
+     def _update_summaries(
+@@ -3866,6 +4066,42 @@ class Step4Indexer:
+         pending_key = state.pending_key[self.slot]
+         pending_z = state.pending_z[self.slot]
+ 
++        if _SPEC_FUSED_SUMMARIES and sched.query_start_loc is not None:
++            if regions == 0:
++                return
++            summary = state.summary[self.slot]
++            _spec_summaries_kernel[(regions,)](
++                index_k,
++                index_z,
++                pending_key,
++                pending_z,
++                summary,
++                sched.query_start_loc,
++                sched.head,
++                sched.tail,
++                sched.pending_in,
++                sched.pending_out,
++                sched.tail_reg,
++                sched.counts,
++                sched.slots,
++                sched.live,
++                sched.keep_rows,
++                ndt,
++                state.pending_trash_row,
++                index_k.stride(0),
++                pending_key.stride(0),
++                pending_key.stride(1),
++                summary.stride(0),
++                NRM=nrm,
++                REGION=region,
++                PROXY_DIM=proxy,
++                BLOCK_T=triton.next_power_of_2(region),
++                BLOCK_D=triton.next_power_of_2(proxy),
++                num_warps=4,
++                **_NO_FP_FUSION,
++            )
++            return
++
+         positions = torch.arange(region, device=index_k.device)
+         head_mask = (positions[None, :] < sched.head[:, None]).unsqueeze(-1)
+         tail_mask = (positions[None, :] < sched.tail[:, None]).unsqueeze(-1)
+@@ -3939,6 +4175,7 @@ class Step4Indexer:
+ 
+         if sched.spec:
+             return self._score_spec(sched, index_q, weights)
++        weights = self._prescaled(weights)
+         if sched.decode:
+             return self._score_decode(md, sched, index_q, weights)
+ 
+@@ -3992,6 +4229,7 @@ class Step4Indexer:
+                     # The pool is e4m3, so the key-side rounding is the identity --
+                     # the same argument ``decode_indexer_logits`` already makes.
+                     quantize_keys=False,
++                    q_prerounded=True,
+                 )
+ 
+         return prefill_logits, decode_logits, max(width_decode, width_prefill)
+@@ -4045,6 +4283,7 @@ class Step4Indexer:
+             sched.nscore,
+             decode_logits,
+             regions_per_page=state.regions_per_page,
++            q_prerounded=True,
+         )
+         return None, decode_logits, width
+ 
+@@ -4093,17 +4332,20 @@ class Step4Indexer:
+                 decode_logits,
+                 num_reqs=sched.num_decodes,
+                 regions_per_page=state.regions_per_page,
++                weight_scale=self.weight_prescale,
++                q_prerounded=True,
+             )
+             return None, decode_logits, width
+ 
+         decode_indexer_logits(
+             index_q[:ndt].contiguous(),
+-            weights[:ndt].contiguous(),
++            self._prescaled(weights[:ndt]),
+             state.summary[self.slot],
+             sched.tok_table,
+             sched.tok_nscore,
+             decode_logits,
+             regions_per_page=state.regions_per_page,
++            q_prerounded=True,
+         )
+         return None, decode_logits, width
+ 
+diff --git a/model_executor/layers/step4_dsa_kernels.py b/model_executor/layers/step4_dsa_kernels.py
+index 3f0cc5c..afd23dd 100644
+--- a/model_executor/layers/step4_dsa_kernels.py
++++ b/model_executor/layers/step4_dsa_kernels.py
+@@ -159,6 +159,14 @@ def _affine_normalize(
+     return result
+ 
+ 
++@triton.jit
++def _store_value(value, dtype: tl.constexpr, ROUND_E4M3: tl.constexpr):
++    out = value.to(dtype)
++    if ROUND_E4M3:
++        out = out.to(tl.float8e4nv).to(dtype)
++    return out
++
++
+ @triton.jit
+ def _indexer_norm_rope_kernel(
+     x_ptr,
+@@ -177,11 +185,16 @@ def _indexer_norm_rope_kernel(
+     rotary_dim: tl.constexpr,
+     SUBTRACT_MEAN: tl.constexpr,
+     HAS_BIAS: tl.constexpr,
++    ROUND_E4M3: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+ ) -> None:
+     """Normalize one head of one token, then rotate its leading ``2 * rotary_dim`` dims.
+ 
++    ``ROUND_E4M3`` additionally applies ``round_activations_e4m3`` to what is
++    stored (output dtype -> e4m3 -> output dtype, the same conversions torch
++    runs), so a scorer that would round the result can skip its own pass.
++
+     ``SUBTRACT_MEAN`` selects LayerNorm over RMSNorm. The indexer needs both: q is
+     RMSNorm with a zero-centered weight, k is LayerNorm with a weight and a bias. They
+     differ by one reduction and are trivial to confuse, which would shift every key
+@@ -216,17 +229,21 @@ def _indexer_norm_rope_kernel(
+     # Dims past the rotated span keep the plain normalized value.
+     tl.store(
+         out_ptr + out_base + dims,
+-        _affine_normalize(
+-            values,
+-            mean,
+-            rstd,
+-            weight_ptr,
+-            bias_ptr,
+-            dims,
+-            dim_ok,
+-            weight_bias,
+-            HAS_BIAS=HAS_BIAS,
+-        ).to(out_ptr.dtype.element_ty),
++        _store_value(
++            _affine_normalize(
++                values,
++                mean,
++                rstd,
++                weight_ptr,
++                bias_ptr,
++                dims,
++                dim_ok,
++                weight_bias,
++                HAS_BIAS=HAS_BIAS,
++            ),
++            out_ptr.dtype.element_ty,
++            ROUND_E4M3,
++        ),
+         mask=dim_ok & (dims >= 2 * rotary_dim),
+     )
+ 
+@@ -260,12 +277,12 @@ def _indexer_norm_rope_kernel(
+     ).to(out_ptr.dtype.element_ty).to(tl.float32)
+     tl.store(
+         out_ptr + out_base + half,
+-        (real * cos - imaginary * sin).to(out_ptr.dtype.element_ty),
++        _store_value(real * cos - imaginary * sin, out_ptr.dtype.element_ty, ROUND_E4M3),
+         mask=half_ok,
+     )
+     tl.store(
+         out_ptr + out_base + rotary_dim + half,
+-        (real * sin + imaginary * cos).to(out_ptr.dtype.element_ty),
++        _store_value(real * sin + imaginary * cos, out_ptr.dtype.element_ty, ROUND_E4M3),
+         mask=half_ok,
+     )
+ 
+@@ -284,6 +301,7 @@ def _norm_rope(
+     eps: float,
+     weight_bias: float,
+     subtract_mean: bool,
++    round_e4m3: bool = False,
+ ) -> torch.Tensor:
+     out = torch.empty_like(x)
+     _indexer_norm_rope_kernel[(x.shape[0], num_heads)](
+@@ -303,6 +321,7 @@ def _norm_rope(
+         rotary_dim=rotary_dim,
+         SUBTRACT_MEAN=subtract_mean,
+         HAS_BIAS=bias is not None,
++        ROUND_E4M3=round_e4m3,
+         BLOCK_D=triton.next_power_of_2(head_dim),
+         BLOCK_R=triton.next_power_of_2(rotary_dim),
+     )
+@@ -326,6 +345,7 @@ def indexer_norm_rope(
+     rotary_dim: int,
+     eps: float = 1e-6,
+     q_norm_weight_bias: float = 1.0,
++    round_q: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Prepare the indexer's q/k/z from their fused projection.
+ 
+@@ -337,6 +357,7 @@ def indexer_norm_rope(
+         q_norm_weight_bias: ``1.0`` for a zero-centered RMSNorm weight (``x * (1 + w)``),
+             ``0.0`` otherwise. This follows the checkpoint's norm class, so it must be
+             threaded through from config rather than hardcoded.
++        round_q: return q already passed through ``round_activations_e4m3``.
+     """
+     return (
+         _norm_rope(
+@@ -352,6 +373,7 @@ def indexer_norm_rope(
+             eps=eps,
+             weight_bias=q_norm_weight_bias,
+             subtract_mean=False,
++            round_e4m3=round_q,
+         ),
+         _norm_rope(
+             index_k,
+@@ -629,6 +651,7 @@ def indexer_logits(
+     out_row_base: int = 0,
+     out_group_stride: int | None = None,
+     quantize_keys: bool = True,
++    q_prerounded: bool = False,
+ ) -> torch.Tensor:
+     """Weighted-ReLU indexer scores over proxy keys.
+ 
+@@ -652,6 +675,8 @@ def indexer_logits(
+             in bf16, so widening and re-rounding returns the same byte) and doing it
+             is a wasted pass over the key tile. It is not a tolerance knob: with
+             keys that are not already e4m3 this changes which regions get selected.
++        q_prerounded: the same argument for ``index_q``, when it came from
++            ``indexer_norm_rope(round_q=True)``.
+ 
+     Returns:
+         ``out`` when given, else a fresh ``[groups * seq_q, seq_k]`` float32 tensor,
+@@ -674,7 +699,7 @@ def indexer_logits(
+     if index_k.shape[2] != proxy_dim:
+         raise ValueError(f"proxy_dim mismatch: q={proxy_dim} k={index_k.shape[2]}")
+ 
+-    quantized_q = round_activations_e4m3(index_q)
++    quantized_q = index_q if q_prerounded else round_activations_e4m3(index_q)
+     quantized_k = round_activations_e4m3(index_k) if quantize_keys else index_k
+ 
+     if out is None:
+@@ -1411,6 +1436,31 @@ def prefill_sparse_meta(
+     return packed, counts
+ 
+ 
++def decode_rows_meta(
++    kv_seqlens: torch.Tensor,
++    rows: int,
++    request_indices: torch.Tensor | None = None,
++    region_size: int = REGION_BLOCK_SIZE,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``decode_sparse_meta``'s per-row ``(request_indices, history_lengths)``."""
++    num_reqs = int(kv_seqlens.shape[0])
++    if rows % num_reqs:
++        raise ValueError(f"{rows} score rows do not divide into {num_reqs} requests")
++
++    if request_indices is None:
++        request_indices = (
++            torch.arange(num_reqs, device=kv_seqlens.device, dtype=torch.int32)
++            .repeat(rows // num_reqs)
++            .contiguous()
++        )
++    # Decode's query position is the last token, so the history is everything strictly
++    # before the current region.
++    history_lengths = torch.div(
++        (kv_seqlens.to(torch.int32) - 1).clamp_min(0), region_size, rounding_mode="floor"
++    )[request_indices.to(torch.long)].contiguous()
++    return request_indices, history_lengths
++
++
+ def decode_sparse_meta(
+     logits: torch.Tensor,
+     kv_seqlens: torch.Tensor,
+@@ -1420,6 +1470,7 @@ def decode_sparse_meta(
+     topk: int,
+     region_size: int = REGION_BLOCK_SIZE,
+     regions_per_page: int,
++    rows_meta: tuple[torch.Tensor, torch.Tensor] | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Select regions and build decode sparse metadata.
+ 
+@@ -1431,6 +1482,9 @@ def decode_sparse_meta(
+         block_table: ``[num_reqs, pages]`` int32, logical page -> physical page.
+         request_indices: ``[rows]`` int32. Defaults to the group-major layout implied by
+             the row count, ``arange(num_reqs)`` tiled once per KV group.
++        rows_meta: ``decode_rows_meta``'s result for these lengths and this row
++            count, replacing ``request_indices``. It depends on neither the scores
++            nor the layer, so a caller scoring many layers builds it once.
+ 
+     Returns:
+         ``(packed [rows, topk + 1] int64, region_counts [rows] int32)``, ready for
+@@ -1441,21 +1495,9 @@ def decode_sparse_meta(
+     self-identifying -- the count is the only bound.
+     """
+     rows, _ = logits.shape
+-    num_reqs = int(kv_seqlens.shape[0])
+-    if rows % num_reqs:
+-        raise ValueError(f"{rows} score rows do not divide into {num_reqs} requests")
+-
+-    if request_indices is None:
+-        request_indices = (
+-            torch.arange(num_reqs, device=logits.device, dtype=torch.int32)
+-            .repeat(rows // num_reqs)
+-            .contiguous()
+-        )
+-    # Decode's query position is the last token, so the history is everything strictly
+-    # before the current region.
+-    history_lengths = torch.div(
+-        (kv_seqlens.to(torch.int32) - 1).clamp_min(0), region_size, rounding_mode="floor"
+-    )[request_indices.to(torch.long)].contiguous()
++    if rows_meta is None:
++        rows_meta = decode_rows_meta(kv_seqlens, rows, request_indices, region_size)
++    request_indices, history_lengths = rows_meta
+ 
+     ids = region_topk_ids(logits, history_lengths, topk=topk)
+ 
+@@ -5328,6 +5370,7 @@ __all__ = [
+     "region_topk_pack",
+     "prefill_sparse_meta",
+     "decode_sparse_meta",
++    "decode_rows_meta",
+     "sparse_attention_prefill",
+     "merge_split_states",
+     "sparse_attention_decode",
+-- 
+2.34.1
+

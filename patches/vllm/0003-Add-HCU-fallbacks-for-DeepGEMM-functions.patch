@@ -1,0 +1,56 @@
+From 2f911c4dc7d5175fa197d7d6576bb2b5a61a7f9a Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Mon, 5 Oct 2026 23:46:51 +0800
+Subject: [PATCH 03/24] Add HCU fallbacks for DeepGEMM functions
+
+- Add fallback for transform_sf_into_required_layout (identity transformation)
+- Add fallback for get_mk_alignment_for_contiguous_layout (default [16,16])
+- These allow Step5 fp8 model to partially load without DeepGEMM backend
+
+Issue: EP scatter expects specific scale format, current fallback insufficient
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ utils/deep_gemm.py | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/utils/deep_gemm.py b/utils/deep_gemm.py
+index 3fc70c0..0de2c0b 100644
+--- a/utils/deep_gemm.py
++++ b/utils/deep_gemm.py
+@@ -331,7 +331,13 @@ def set_num_sms(num_sms: int) -> None:
+ def get_mk_alignment_for_contiguous_layout() -> list[int]:
+     _lazy_init()
+     if _get_mk_alignment_for_contiguous_layout_impl is None:
+-        return _missing()
++        # HCU fallback: return a reasonable default alignment
++        # Common alignment for FP8 is 16 bytes
++        logger.info_once(
++            "DeepGEMM get_mk_alignment_for_contiguous_layout unavailable, "
++            "using default alignment [16, 16] for HCU platform"
++        )
++        return [16, 16]
+     mk_align_size = _get_mk_alignment_for_contiguous_layout_impl()
+     return [mk_align_size, mk_align_size]
+ 
+@@ -506,7 +512,16 @@ def fp8_m_grouped_gemm_nt_masked(*args, **kwargs):
+ def transform_sf_into_required_layout(*args, **kwargs):
+     _lazy_init()
+     if _transform_sf_into_required_layout_impl is None:
+-        return _missing(*args, **kwargs)
++        # HCU fallback: return the scale tensor as-is when DeepGEMM is unavailable
++        # This allows HCU custom kernels to work without DeepGEMM layout transformation
++        sf = kwargs.get('sf', args[0] if args else None)
++        if sf is None:
++            return _missing(*args, **kwargs)
++        logger.info_once(
++            "DeepGEMM transform_sf_into_required_layout unavailable, "
++            "using identity transformation for HCU platform"
++        )
++        return sf
+     return _transform_sf_into_required_layout_impl(
+         *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+     )
+-- 
+2.34.1
+

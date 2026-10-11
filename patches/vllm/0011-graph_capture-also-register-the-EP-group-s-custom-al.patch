@@ -1,0 +1,39 @@
+From 77fad476170ff6754a4fa9fab566384e02c6431a Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 04:18:51 +0800
+Subject: [PATCH 11/24] graph_capture: also register the EP group's custom
+ all-reduce graph buffers
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ distributed/parallel_state.py | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/distributed/parallel_state.py b/distributed/parallel_state.py
+index 92deff1..69c1289 100644
+--- a/distributed/parallel_state.py
++++ b/distributed/parallel_state.py
+@@ -1640,7 +1640,19 @@ def graph_capture(
+     context = graph_capture_context or GraphCaptureContext(
+         torch.cuda.Stream(device=device)
+     )
+-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
++    # The EP group only owns a custom all-reduce when a platform opts in
++    # (e.g. HCU fused MoE combine); its graph buffers must be registered too.
++    ep_ca_comm = getattr(
++        getattr(_EP, "device_communicator", None), "ca_comm", None
++    )
++    maybe_ep_ca_context = (
++        ep_ca_comm.capture() if ep_ca_comm is not None else nullcontext()
++    )
++    with (
++        get_tp_group().graph_capture(context),
++        get_pp_group().graph_capture(context),
++        maybe_ep_ca_context,
++    ):
+         yield context
+ 
+ 
+-- 
+2.34.1
+

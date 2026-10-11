@@ -1,0 +1,111 @@
+From 0d01a7eb64292537c8b8b78a8e7205a821938b84 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 21:12:45 +0800
+Subject: [PATCH 17/24] fused_moe: let finalize return the combined tensor
+ instead of copying into output
+
+The EP fused-combine finalize hook already produces the reduced (M, K) tensor;
+copying it into the preallocated output cost a DtoD memcpy per MoE layer
+(113 -> 25 Memcpy per decode step on Step5).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .../layers/fused_moe/modular_kernel.py        | 10 +++++++--
+ .../fused_moe/prepare_finalize/naive_dp_ep.py | 22 ++++++++++++-------
+ 2 files changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/model_executor/layers/fused_moe/modular_kernel.py b/model_executor/layers/fused_moe/modular_kernel.py
+index d7446a8..ee52136 100644
+--- a/model_executor/layers/fused_moe/modular_kernel.py
++++ b/model_executor/layers/fused_moe/modular_kernel.py
+@@ -366,11 +366,13 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
+         topk_ids: torch.Tensor,
+         apply_router_weight_on_input: bool,
+         weight_and_reduce_impl: TopKWeightAndReduce,
+-    ) -> None:
++    ) -> torch.Tensor | None:
+         """
+         Perform any combine plus apply weights and perform a reduction on the
+         fused experts output.
+         - output: The output tensor, written in place.  Must be (M, K) shape.
++          An implementation may instead return an (M, K) result tensor, which
++          the caller then uses in place of ``output``.
+         - fused_expert_output: The unweighted, unreduced output of the fused
+           experts, it will have (M, topk, K) shape.
+         - topk_weights: The weights to be applied to the fused_experts_output.
+@@ -1396,7 +1398,9 @@ class FusedMoEKernelModularImpl:
+         if not self.prepare_finalize.supports_async():
+             assert not dbo_enabled()
+ 
+-            self.prepare_finalize.finalize(
++            # A prepare/finalize may hand back the combined result instead of
++            # writing it into ``output`` (naive DP/EP with a combine hook).
++            combined = self.prepare_finalize.finalize(
+                 output,
+                 fused_out,
+                 topk_weights,
+@@ -1404,6 +1408,8 @@ class FusedMoEKernelModularImpl:
+                 apply_router_weight_on_input,
+                 self.fused_experts.finalize_weight_and_reduce_impl(),
+             )
++            if combined is not None:
++                return combined
+         else:
+             finalize_ret = self.prepare_finalize.finalize_async(
+                 output,
+diff --git a/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py b/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+index 17ed8a5..ba05883 100644
+--- a/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
++++ b/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+@@ -14,14 +14,14 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+ from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+ 
+-# Optional platform hook: ``hook(out, output) -> bool``.  When it returns True it
+-# has written the combined result into ``output`` itself (e.g. fused with the
+-# shared-expert add and the TP all-reduce) and the default combine is skipped.
+-_finalize_combine_hook: Callable[[torch.Tensor, torch.Tensor], bool] | None = None
++# Optional platform hook: ``hook(out) -> Tensor | None``.  A tensor is the
++# combined result (e.g. fused with the shared-expert add and the TP all-reduce);
++# finalize returns it in place of ``output`` and skips the default combine.
++_finalize_combine_hook: Callable[[torch.Tensor], torch.Tensor | None] | None = None
+ 
+ 
+ def set_finalize_combine_hook(
+-    hook: Callable[[torch.Tensor, torch.Tensor], bool] | None,
++    hook: Callable[[torch.Tensor], torch.Tensor | None] | None,
+ ) -> None:
+     global _finalize_combine_hook
+     _finalize_combine_hook = hook
+@@ -206,7 +206,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
+         topk_ids: torch.Tensor,
+         apply_router_weight_on_input: bool,
+         weight_and_reduce_impl: mk.TopKWeightAndReduce,
+-    ) -> None:
++    ) -> torch.Tensor | None:
++        """Combine into ``output``; or return the combined tensor, which the
++        caller then uses instead of ``output`` (saves a copy)."""
+         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+ 
+@@ -219,11 +221,15 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
+         )
+ 
+         hook = _finalize_combine_hook
+-        if hook is not None and not self.is_sequence_parallel and hook(out, output):
+-            return
++        if hook is not None and not self.is_sequence_parallel:
++            combined = hook(out)
++            if combined is not None:
++                assert combined.shape == output.shape and combined.dtype == output.dtype
++                return combined
+         output.copy_(
+             get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+         )
++        return None
+ 
+ 
+ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):
+-- 
+2.34.1
+

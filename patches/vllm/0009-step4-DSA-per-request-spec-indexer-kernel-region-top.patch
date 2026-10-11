@@ -1,0 +1,281 @@
+From 809979eb146b163172df3556d9c3e1deb2778856 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 02:28:31 +0800
+Subject: [PATCH 09/24] step4 DSA: per-request spec indexer kernel; region topk
+ num_warps=8
+
+Verify batches scored the indexer with one program per query token, using
+1 of 16 MMA rows and re-reading each request's keys per token. The new
+_spec_indexer_logits_kernel runs one program per (request, key block,
+group) with the request's tokens as dot rows, keeping the per-head
+accumulation order so output is bit-identical (368 -> ~100us/layer at
+bs16 x MTP3, 8.3k regions). VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST=0
+restores the per-token kernel.
+
+region_topk_ids: num_warps=8 (117 -> 104us at 64 rows).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ model_executor/layers/step4_dsa.py         | 203 +++++++++++++++++++++
+ model_executor/layers/step4_dsa_kernels.py |   3 +
+ 2 files changed, 206 insertions(+)
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index f551212..493b9c1 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -158,6 +158,12 @@ GRAPH_REGIONS_OVERRIDE = int(os.environ.get("VLLM_STEP4_DSA_GRAPH_REGIONS", "0")
+ # suspected mirror/device divergence, never for a timed run.
+ CHECK_SLOTS = os.environ.get("VLLM_STEP4_DSA_CHECK_SLOTS", "0") == "1"
+ 
++# Verify-batch indexer scores with one program per request (spec_indexer_logits)
++# instead of one per query token. Bit-identical; "0" restores the per-token kernel.
++_SPEC_INDEXER_PER_REQUEST = (
++    os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST", "1") == "1"
++)
++
+ # Depth of the pinned staging ring used to upload the per-step pending rows.
+ # One buffer per vector is not enough: the upload is asynchronous, so the next
+ # step's host write can land in the buffer before the previous step's copy has
+@@ -942,6 +948,181 @@ def decode_indexer_logits(
+     )
+ 
+ 
++# Query tokens per request the verify scorer below can hold: one dot row each.
++SPEC_INDEXER_MAX_QUERY = 16
++
++
++@triton.jit
++def _spec_indexer_logits_kernel(
++    index_q_ptr,
++    summary_ptr,
++    block_table_ptr,
++    weights_ptr,
++    out_ptr,
++    nscore_ptr,
++    query_start_loc_ptr,
++    num_tokens,
++    stride_q_tok,
++    stride_q_group,
++    stride_q_head,
++    stride_s_row,
++    stride_bt_req,
++    stride_w_tok,
++    stride_w_group,
++    stride_out_row,
++    heads_per_group: tl.constexpr,
++    proxy_dim: tl.constexpr,
++    regions_per_page: tl.constexpr,
++    query_dtype: tl.constexpr,
++    BLOCK_Q: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++) -> None:
++    """Speculative-verify form of ``_decode_indexer_logits_kernel``.
++
++    One program per (request, key block, group) instead of per query token:
++    the request's query tokens are the rows of the dot, so each key tile is
++    read from the summary pool once for all of them rather than once per token
++    (with 1 of 16 dot rows doing work). 3.7x faster at 16 requests x 4 tokens.
++
++    Bit-identical to the per-token kernel for the reason given there: every
++    output element is an independent dot over ``proxy_dim``, whichever row it
++    sits in, and the per-head loop keeps the fp32 add order of ``accumulator``.
++    Each token still stops at its own ``nscore``; the tile is loaded up to the
++    widest of them.
++    """
++    req = tl.program_id(0)
++    k_block = tl.program_id(1)
++    group = tl.program_id(2)
++
++    q_start = tl.load(query_start_loc_ptr + req)
++    q_len = tl.load(query_start_loc_ptr + req + 1) - q_start
++    queries = tl.arange(0, BLOCK_Q)
++    # Graph-padding requests have q_len 0 (or a stale, non-monotonic entry):
++    # no row is live and nothing is written.
++    query_ok = queries < q_len
++    tokens = q_start + queries
++    nscore = tl.load(nscore_ptr + tokens, mask=query_ok, other=0)
++    widest = tl.max(nscore, axis=0)
++    if k_block * BLOCK_K >= widest:
++        return
++
++    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
++    dims = tl.arange(0, proxy_dim)
++    key_any = keys < widest
++    pages = tl.load(
++        block_table_ptr + req * stride_bt_req + keys // regions_per_page,
++        mask=key_any,
++        other=0,
++    ).to(tl.int64)
++    slots = pages * regions_per_page + keys % regions_per_page
++    key_tile = tl.load(
++        summary_ptr + slots[None, :] * stride_s_row + dims[:, None],
++        mask=key_any[None, :],
++        other=0.0,
++    ).to(query_dtype)
++
++    accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
++    for head in tl.static_range(heads_per_group):
++        query_tile = tl.load(
++            index_q_ptr
++            + tokens[:, None] * stride_q_tok
++            + group * stride_q_group
++            + head * stride_q_head
++            + dims[None, :],
++            mask=query_ok[:, None],
++            other=0.0,
++        )
++        head_weight = tl.load(
++            weights_ptr + tokens * stride_w_tok + group * stride_w_group + head,
++            mask=query_ok,
++            other=0.0,
++        ).to(tl.float32)
++        scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
++        accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
++
++    rows = group * num_tokens + tokens
++    tl.store(
++        out_ptr + rows[:, None] * stride_out_row + keys[None, :],
++        accumulator,
++        mask=query_ok[:, None] & (keys[None, :] < nscore[:, None]),
++    )
++
++
++def spec_indexer_logits(
++    index_q: torch.Tensor,
++    weights: torch.Tensor,
++    summary: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    nscore: torch.Tensor,
++    out: torch.Tensor,
++    *,
++    num_reqs: int,
++    regions_per_page: int,
++    block_k: int = 128,
++) -> None:
++    """``decode_indexer_logits`` for verify batches, one program per request.
++
++    Args:
++        index_q: ``[num_tokens, groups, heads_per_group, proxy_dim]``.
++        weights: ``[num_tokens, groups, heads_per_group]``, prescale applied.
++        summary: the fp8 region-summary pool, read in place.
++        block_table: ``[num_reqs, pages]``, one row per *request* (not the
++            per-token copy the per-token kernel takes).
++        query_start_loc: ``[num_reqs + 1]`` int32; request ``r`` owns tokens
++            ``[query_start_loc[r], query_start_loc[r + 1])``, at most
++            ``SPEC_INDEXER_MAX_QUERY`` of them.
++        nscore: ``[num_tokens]`` int32, regions visible to each token.
++        out: ``[groups * num_tokens, width]`` float32, group-major; written
++            exactly where ``decode_indexer_logits`` writes it.
++    """
++    num_tokens, groups, heads_per_group, proxy_dim = index_q.shape
++    width = out.shape[1]
++    if summary.shape[-1] != proxy_dim:
++        raise ValueError(f"proxy_dim mismatch: q={proxy_dim} pool={summary.shape[-1]}")
++    if block_table.shape[0] < num_reqs or query_start_loc.shape[0] < num_reqs + 1:
++        raise ValueError(
++            f"block table / query_start_loc too short for {num_reqs} requests"
++        )
++    if out.shape[0] != groups * num_tokens:
++        raise ValueError(
++            f"out has {out.shape[0]} rows, expected {groups * num_tokens}"
++        )
++    if width > block_table.shape[1] * regions_per_page:
++        raise ValueError(
++            f"score width {width} exceeds the {block_table.shape[1]} pages x "
++            f"{regions_per_page} regions the block table can address"
++        )
++
++    quantized_q = round_activations_e4m3(index_q)
++
++    _spec_indexer_logits_kernel[(num_reqs, triton.cdiv(width, block_k), groups)](
++        quantized_q,
++        summary,
++        block_table,
++        weights,
++        out,
++        nscore,
++        query_start_loc,
++        num_tokens,
++        quantized_q.stride(0),
++        quantized_q.stride(1),
++        quantized_q.stride(2),
++        summary.stride(0),
++        block_table.stride(0),
++        weights.stride(0),
++        weights.stride(1),
++        out.stride(0),
++        heads_per_group=heads_per_group,
++        proxy_dim=proxy_dim,
++        regions_per_page=regions_per_page,
++        query_dtype=tl.bfloat16 if quantized_q.dtype is torch.bfloat16 else tl.float16,
++        BLOCK_Q=SPEC_INDEXER_MAX_QUERY,
++        BLOCK_K=block_k,
++        num_warps=4,
++    )
++
++
+ # --------------------------------------------------------------------------
+ # Metadata
+ # --------------------------------------------------------------------------
+@@ -2032,6 +2213,8 @@ class Step4DSASchedule:
+     tok_seq: torch.Tensor | None = None  # [ndt] int32, causal length per token
+     tok_nscore: torch.Tensor | None = None  # [ndt] int32, regions visible
+     tok_table: torch.Tensor | None = None  # [ndt, pages] int32, owner's table row
++    req_table: torch.Tensor | None = None  # [nd, pages] int32, md.block_table
++    query_start_loc: torch.Tensor | None = None  # [nd + 1] int32, md.query_start_loc
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -3151,6 +3334,8 @@ class Step4DSAState:
+             torch.index_select(md.block_table, 0, tok_req_d, out=sched.tok_table)
+         else:
+             sched.tok_table = md.block_table.index_select(0, tok_req_d)
++        sched.req_table = md.block_table
++        sched.query_start_loc = md.query_start_loc
+ 
+         sched.max_nscore = widest
+         if persistent:
+@@ -3893,6 +4078,24 @@ class Step4Indexer:
+         if width == 0:
+             return None, decode_logits, width
+ 
++        if (
++            _SPEC_INDEXER_PER_REQUEST
++            and state.spec_query_len <= SPEC_INDEXER_MAX_QUERY
++            and sched.req_table is not None
++        ):
++            spec_indexer_logits(
++                index_q[:ndt].contiguous(),
++                weights[:ndt].contiguous(),
++                state.summary[self.slot],
++                sched.req_table,
++                sched.query_start_loc,
++                sched.tok_nscore,
++                decode_logits,
++                num_reqs=sched.num_decodes,
++                regions_per_page=state.regions_per_page,
++            )
++            return None, decode_logits, width
++
+         decode_indexer_logits(
+             index_q[:ndt].contiguous(),
+             weights[:ndt].contiguous(),
+diff --git a/model_executor/layers/step4_dsa_kernels.py b/model_executor/layers/step4_dsa_kernels.py
+index f6ae252..3f0cc5c 100644
+--- a/model_executor/layers/step4_dsa_kernels.py
++++ b/model_executor/layers/step4_dsa_kernels.py
+@@ -1019,6 +1019,9 @@ def region_topk_ids(
+         # ``regions < visible`` -- so the extra lane is inert.
+         BLOCK_R=max(2, min(block_r, triton.next_power_of_2(seq_regions))),
+         BLOCK_TOPK=triton.next_power_of_2(int(topk)),
++        # One program per row and few rows at decode: wider programs finish the
++        # serial radix passes sooner (117 -> 104us at 64 rows x 8.3k regions).
++        num_warps=8,
+     )
+     return out
+ 
+-- 
+2.34.1
+

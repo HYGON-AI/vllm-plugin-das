@@ -1,0 +1,60 @@
+From a94334eccf1942f510bd70fa2b7ac2b787331d0b Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 06:07:18 +0800
+Subject: [PATCH 13/24] naive DP/EP finalize: optional platform combine hook
+
+set_finalize_combine_hook(hook) lets a platform replace the EP combine in
+MoEPrepareAndFinalizeNaiveDPEPModular.finalize; hook(out, output) returns
+True after writing the combined result itself. Used by vllm_hcu to fuse the
+DP reduce-scatter, shared-expert add and TP all-reduce into one EP custom
+all-reduce.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .../fused_moe/prepare_finalize/naive_dp_ep.py   | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py b/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+index 89f3843..17ed8a5 100644
+--- a/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
++++ b/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Callable
++
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+@@ -12,6 +14,18 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+ from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+ 
++# Optional platform hook: ``hook(out, output) -> bool``.  When it returns True it
++# has written the combined result into ``output`` itself (e.g. fused with the
++# shared-expert add and the TP all-reduce) and the default combine is skipped.
++_finalize_combine_hook: Callable[[torch.Tensor, torch.Tensor], bool] | None = None
++
++
++def set_finalize_combine_hook(
++    hook: Callable[[torch.Tensor, torch.Tensor], bool] | None,
++) -> None:
++    global _finalize_combine_hook
++    _finalize_combine_hook = hook
++
+ 
+ def _quantize_and_setup_dispatch(
+     a1: torch.Tensor,
+@@ -204,6 +218,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
+             apply_router_weight_on_input=apply_router_weight_on_input,
+         )
+ 
++        hook = _finalize_combine_hook
++        if hook is not None and not self.is_sequence_parallel and hook(out, output):
++            return
+         output.copy_(
+             get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+         )
+-- 
+2.34.1
+

@@ -1,0 +1,174 @@
+From 6a492a2e5da6d0dd74821176f8c8e17e445913af Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 14:16:48 +0800
+Subject: [PATCH 14/24] eplb: fix Step5 EPLB (MoE block unwrap, mixed-dtype
+ layers, skip metric); add touched-load and dump options
+
+- _propagate_shared_tensors: unwrap .experts for MoE blocks (Step5) so
+  layer eplb_state is found.
+- rearrange_expert_weights_inplace: per-(shape, dtype) buffers; Step5's
+  bf16 last MoE layers mismatched the fp8 buffer and hung the P2P transfer.
+- ROCm skip check: imbalance = sum of per-layer max / sum of per-layer
+  mean (layers sync at the combine), log the rearrange imbalance.
+- VLLM_EPLB_TOUCHED_LOAD=1 records touched experts instead of tokens
+  (token load is dominated by prefill); VLLM_EPLB_DUMP_PATH saves the
+  placement.
+
+On Step5 bs32 64k/4k neither online EPLB nor a statically applied
+placement improved decode (1084 vs 1088 tok/s): MTP3 decode touches
+nearly all experts on every rank.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ distributed/eplb/eplb_state.py        | 49 ++++++++++++++++++++++++---
+ distributed/eplb/rebalance_execute.py | 18 ++++++++--
+ 2 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/distributed/eplb/eplb_state.py b/distributed/eplb/eplb_state.py
+index 580477b..acd50da 100644
+--- a/distributed/eplb/eplb_state.py
++++ b/distributed/eplb/eplb_state.py
+@@ -26,6 +26,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
+ physical experts.
+ """
+ 
++import os
+ import threading
+ import time
+ from collections.abc import Sequence
+@@ -63,6 +64,12 @@ from .rebalance_execute import (
+ 
+ logger = init_logger(__name__)
+ 
++# Record whether an expert received any token in a step instead of how many.
++# Bandwidth-bound grouped-GEMM backends pay per touched expert, not per token,
++# so balancing touched counts balances their per-rank MoE time.
++_EPLB_TOUCHED_LOAD = os.environ.get("VLLM_EPLB_TOUCHED_LOAD", "0") == "1"
++_EPLB_DUMP_PATH = os.environ.get("VLLM_EPLB_DUMP_PATH", "")
++
+ 
+ def _compute_eplb_load_stats(
+     num_tokens_per_rank: torch.Tensor,
+@@ -617,9 +624,12 @@ class EplbState:
+             should_record = self._should_record_current_step(log_stats=log_stats)
+             for eplb_model_state in self.model_states.values():
+                 if should_record:
++                    load_pass = eplb_model_state.expert_load_pass
++                    if _EPLB_TOUCHED_LOAD:
++                        load_pass = load_pass > 0
+                     eplb_model_state.expert_load_window[
+                         self.expert_load_window_step
+-                    ].copy_(eplb_model_state.expert_load_pass)
++                    ].copy_(load_pass)
+                     eplb_model_state.expert_load_pass.zero_()
+ 
+             if should_record:
+@@ -706,9 +716,15 @@ class EplbState:
+         Must be called after :meth:`model.set_eplb_state` so that each
+         layer's ``eplb_state`` is already populated.
+         """
++        # Some models (e.g. Step5) list the MoE block, which wraps the runner
++        # holding ``eplb_state`` in ``.experts``.
++        layers = [
++            layer if hasattr(layer, "eplb_state") else getattr(layer, "experts", layer)
++            for layer in model.moe_layers
++        ]
+         layer_states = [
+             layer.eplb_state
+-            for layer in model.moe_layers
++            for layer in layers
+             if hasattr(layer, "eplb_state")
+             and isinstance(layer.eplb_state, EplbLayerState)
+         ]
+@@ -862,13 +878,18 @@ class EplbState:
+                             dim=1,
+                             index=mapping,
+                         )
++                        # Layers synchronize at the EP combine, so each layer
++                        # costs its slowest rank: compare per-layer maxima
++                        # (the inverse of the logged balancedness) rather than
++                        # loads summed over layers, which average out.
+                         loads_per_rank = loads_per_replica.reshape(
+                             logical_loads.shape[0], ep_size, -1
+-                        ).sum(dim=(0, 2))
+-                        mean_load = loads_per_rank.mean()
++                        ).sum(dim=2)
++                        mean_load = loads_per_rank.mean(dim=1).sum()
+                         if mean_load == 0:
+                             return 1.0
+-                        return (loads_per_rank.max() / mean_load).item()
++                        max_load = loads_per_rank.max(dim=1).values.sum()
++                        return (max_load / mean_load).item()
+ 
+                     current_imbalance = rank_load_imbalance(
+                         eplb_model_state.physical_to_logical_map
+@@ -887,6 +908,24 @@ class EplbState:
+                             current_imbalance,
+                             proposed_imbalance,
+                         )
++                    elif is_main_rank:
++                        logger.info(
++                            "[EPLB] Rearrange: imbalance %.4f -> %.4f",
++                            current_imbalance,
++                            proposed_imbalance,
++                        )
++
++                if _EPLB_DUMP_PATH and is_main_rank and not is_profile:
++                    # Saves the placement before the transfer so it can be
++                    # inspected or applied offline (e.g. at weight load).
++                    torch.save(
++                        {
++                            "physical_to_logical_map": new_physical_to_logical_map.cpu(),
++                            "load_window": global_expert_load_window.cpu(),
++                        },
++                        _EPLB_DUMP_PATH,
++                    )
++                    logger.info("[EPLB] Placement saved to %s", _EPLB_DUMP_PATH)
+ 
+                 if not skip_rearrange:
+                     # Update expert weights
+diff --git a/distributed/eplb/rebalance_execute.py b/distributed/eplb/rebalance_execute.py
+index cbd5132..b606988 100644
+--- a/distributed/eplb/rebalance_execute.py
++++ b/distributed/eplb/rebalance_execute.py
+@@ -597,13 +597,27 @@ def rearrange_expert_weights_inplace(
+         old_global_expert_indices_cpu = old_global_expert_indices.cpu().numpy()
+         new_global_expert_indices_cpu = new_global_expert_indices.cpu().numpy()
+ 
++    def _signature(tensors: Sequence[torch.Tensor]) -> list:
++        return [(t.shape, t.dtype) for t in tensors]
++
++    # Models may mix layer formats (e.g. Step5 keeps its last MoE layers in
++    # bf16 while the rest are fp8). The persistent buffer only matches the
++    # first layer; a mismatched recv buffer makes the P2P counts disagree and
++    # the transfer hangs, so give other formats their own temporary buffers.
++    buffers_by_signature = {repr(_signature(weights_buffer)): weights_buffer}
++
+     for layer_idx in range(num_moe_layers):
++        signature = repr(_signature(expert_weights[layer_idx]))
++        layer_buffer = buffers_by_signature.get(signature)
++        if layer_buffer is None:
++            layer_buffer = [torch.empty_like(w) for w in expert_weights[layer_idx]]
++            buffers_by_signature[signature] = layer_buffer
+         transfer_metadata = move_to_buffer(
+             num_local_experts=num_local_physical_experts,
+             old_indices=old_global_expert_indices_cpu[layer_idx],
+             new_indices=new_global_expert_indices_cpu[layer_idx],
+             expert_weights=expert_weights[layer_idx],
+-            expert_weights_buffers=weights_buffer,
++            expert_weights_buffers=layer_buffer,
+             cuda_stream=None,
+             ep_rank=ep_rank,
+             communicator=communicator,
+@@ -612,7 +626,7 @@ def rearrange_expert_weights_inplace(
+ 
+         move_from_buffer(
+             expert_weights=expert_weights[layer_idx],
+-            expert_weights_buffers=weights_buffer,
++            expert_weights_buffers=layer_buffer,
+             transfer_metadata=transfer_metadata,
+             new_indices=new_global_expert_indices_cpu[layer_idx],
+             ep_rank=ep_rank,
+-- 
+2.34.1
+

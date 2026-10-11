@@ -1,0 +1,788 @@
+From 76227f298f7969d74d258cfb43e595ff5bb845dc Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Wed, 7 Oct 2026 17:42:48 +0800
+Subject: [PATCH 05/24] =?UTF-8?q?=E8=A7=A3=E5=86=B3step5=E7=9A=84mtp3?=
+ =?UTF-8?q?=E5=B8=A6=E6=9D=A5=E7=9A=84=E7=A9=BA=E6=B3=A1=E9=97=AE=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ model_executor/layers/step4_dsa.py | 555 ++++++++++++++++++++++++++++-
+ v1/sample/rejection_sampler.py     |  25 +-
+ 2 files changed, 544 insertions(+), 36 deletions(-)
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index 8ea69d2..f551212 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -1002,13 +1002,22 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
+     # Step4DSAState.graph_regions. A prefill row still sizes its logits by its
+     # own query length, so mixed and prefill steps stay on the piecewise path
+     # where the op runs eagerly -- see _require_splitting_op.
++    #
++    # UNIFORM_BATCH rather than single-token: a speculative verify step (every
++    # request scoring 1 + num_speculative_tokens queries) is a decode step too,
++    # run one query token per row -- see Step4DSAState._spec_decode_schedule.
++    # At UNIFORM_SINGLE_TOKEN_DECODE vLLM downgrades the whole model to
++    # PIECEWISE as soon as spec decode is on, which put all attention calls
++    # and this op back on the host every step (and left the MTP drafter with
++    # no graph at all).
+     _cudagraph_support: ClassVar[AttentionCGSupport] = (
+-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
++        AttentionCGSupport.UNIFORM_BATCH
+     )
+ 
+-    # Pull single-token queries to the front so the batch splits cleanly into
+-    # the reference implementation's two paths: decode reads one query per
+-    # request, prefill reads a ragged run.
++    # Pull short queries to the front so the batch splits cleanly into the
++    # reference implementation's two paths: decode reads one query per token
++    # row, prefill reads a ragged run. Raised to 1 + num_speculative_tokens in
++    # __init__ so verify rows count as decodes.
+     reorder_batch_threshold: int = 1
+ 
+     def __init__(
+@@ -1021,6 +1030,7 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+         self.block_size = kv_cache_spec.block_size
+         self._state: Step4DSAState | None = None
++        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+         # Builders are made by initialize_kv_cache, i.e. whenever a new KV
+         # cache is bound. 0.28's CUDA graph memory profiling binds a throwaway
+         # cache of a few blocks first and runs the DSA layers against it; a
+@@ -1079,6 +1089,14 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
+         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+             split_decodes_and_prefills(m, decode_threshold=self.reorder_batch_threshold)
+         )
++        if num_decode_tokens > num_decodes and (num_prefills > 0 or DENSE_EQUIV):
++            # Multi-token decode rows only have a path of their own in a
++            # decode-only step. Next to a prefill (or under the dense bypass,
++            # whose decode branch assumes one query per row) they go through
++            # the general schedule as short prefill rows -- which is what every
++            # verify row was before the threshold was raised.
++            num_decodes, num_prefills = 0, num_decodes + num_prefills
++            num_decode_tokens, num_prefill_tokens = 0, m.num_actual_tokens
+         md = Step4DSAMetadata(
+             num_decodes=num_decodes,
+             num_prefills=num_prefills,
+@@ -1118,7 +1136,10 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
+             and num_prefills == 0
+             and num_decodes > 0
+         ):
+-            sched = state._decode_schedule(md, persistent=True)
++            if num_decode_tokens > num_decodes:
++                sched = state._spec_decode_schedule(md, persistent=True)
++            else:
++                sched = state._decode_schedule(md, persistent=True)
+             sched.builder_owned = True
+             md.schedule = sched
+             # Adopt it now, so that end_step() on the *next* build releases this
+@@ -1491,10 +1512,17 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
+         num_kv_groups = self.num_kv_heads
+         nd, ndt = attn_metadata.num_decodes, attn_metadata.num_decode_tokens
+ 
+-        # Decode rows come first (reorder_batch_threshold=1).
++        # Decode rows come first (reorder_batch_threshold). A verify step runs
++        # one row per query token rather than per request, with each row's own
++        # causal length -- see Step4DSAState._spec_decode_schedule.
+         if nd > 0:
+             packed, counts = plan.decode
+-            seq_lens_i32 = attn_metadata.seq_lens[:nd].to(torch.int32)
++            if plan.decode_seq_lens is not None:
++                rows = ndt
++                seq_lens_i32 = plan.decode_seq_lens
++            else:
++                rows = nd
++                seq_lens_i32 = attn_metadata.seq_lens[:nd].to(torch.int32)
+             if "decode" in FLASH_ATTN_DSA_STAGES:
+                 # flash-attention-cutlass's C++ entry point ignores num_splits
+                 # and always returns final merged state (see _flash_attn_decode),
+@@ -1533,7 +1561,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
+                     k_scale=k_scale,
+                     v_scale=v_scale,
+                     config=_boltops_decode_config(
+-                        nd,
++                        rows,
+                         self.num_heads,
+                         self.head_size,
+                         num_kv_groups,
+@@ -1545,7 +1573,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
+                     ),
+                 )
+             else:
+-                splits = _decode_num_splits(nd * num_kv_groups, packed.shape[1])
++                splits = _decode_num_splits(rows * num_kv_groups, packed.shape[1])
+                 out_d, lse_d = sparse_attention_decode(
+                     query[:ndt],
+                     k_flat,
+@@ -1638,6 +1666,10 @@ class Step4SparsePlan:
+ 
+     prefill: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+     decode: tuple[torch.Tensor, torch.Tensor] | None = None
++    # Per-row context lengths for ``decode`` when its rows are query tokens of
++    # a verify step rather than requests. None means one row per request, read
++    # from ``md.seq_lens``.
++    decode_seq_lens: torch.Tensor | None = None
+     # The metadata this plan was built from. The impl compares it by identity:
+     # the indexer and the attention layer are two separate ops in the compiled
+     # graph, and if anything ever reordered them the layer would silently attend
+@@ -1653,6 +1685,8 @@ def build_plan(
+     topk: int,
+     num_kv_groups: int,
+     regions_per_page: int,
++    decode_seq_lens: torch.Tensor | None = None,
++    decode_table: torch.Tensor | None = None,
+ ) -> Step4SparsePlan:
+     """Turn indexer scores into the two kernels' metadata.
+ 
+@@ -1660,6 +1694,11 @@ def build_plan(
+     speak vLLM's block table: they take ``[num_reqs, pages]`` logical->physical
+     maps plus a per-row request index, which is exactly what
+     ``CommonAttentionMetadata`` carries.
++
++    ``decode_seq_lens``/``decode_table`` are a verify step's per-token rows
++    (``[num_decode_tokens]`` lengths and ``[num_decode_tokens, pages]`` table):
++    each query token is selected for as a single-token decode at its own
++    position.
+     """
+     plan = Step4SparsePlan()
+     plan.md = attn_metadata
+@@ -1667,10 +1706,16 @@ def build_plan(
+     ndt = attn_metadata.num_decode_tokens
+ 
+     if nd > 0 and decode_logits is not None:
++        if decode_seq_lens is not None:
++            seq_lens, table = decode_seq_lens, decode_table
++            plan.decode_seq_lens = decode_seq_lens
++        else:
++            seq_lens = attn_metadata.seq_lens[:nd].to(torch.int32)
++            table = attn_metadata.block_table[:nd]
+         packed, counts = decode_sparse_meta(
+             decode_logits,
+-            attn_metadata.seq_lens[:nd].to(torch.int32),
+-            attn_metadata.block_table[:nd],
++            seq_lens,
++            table,
+             None,  # group-major arange(num_reqs), the default, is what we want
+             topk=topk,
+             region_size=REGION_BLOCK_SIZE,
+@@ -1969,6 +2014,25 @@ class Step4DSASchedule:
+     # eager behaviour.
+     graph_regions: int = 0
+ 
++    # -- speculative verify fast path --------------------------------------
++    # Set when every request scores up to spec_query_len query tokens (see
++    # Step4DSAState._spec_decode_schedule). A request then touches up to
++    # ``nrm`` consecutive regions, each given a fixed ``nrm * region_size``
++    # stride in the compression buffer; the region vectors
++    # (``starts``/``counts``/``slots``/``live``/``keep_rows``) are
++    # ``[num_decodes * nrm]``, the ``tok_*`` vectors are ``[num_tokens]``.
++    # ``head``/``tail``/``pending_in``/``pending_out`` keep their decode
++    # meanings, with the tail taken from region ``tail_reg``.
++    spec: bool = False
++    num_tokens: int = 0
++    nrm: int = 0
++    tail_reg: torch.Tensor | None = None  # [nd] int64, flat region of the tail
++    keep_rows: torch.Tensor | None = None  # [nd * nrm] int64, trash if not kept
++    tok_buf: torch.Tensor | None = None  # [ndt] int64, buffer row per token
++    tok_seq: torch.Tensor | None = None  # [ndt] int32, causal length per token
++    tok_nscore: torch.Tensor | None = None  # [ndt] int32, regions visible
++    tok_table: torch.Tensor | None = None  # [ndt, pages] int32, owner's table row
++
+ 
+ # --------------------------------------------------------------------------
+ # Model-side DSA state
+@@ -2061,6 +2125,17 @@ class Step4DSAState:
+         self._stage = 0
+         self._stage_ev: list[torch.cuda.Event] = []
+         self._decode_logits: torch.Tensor | None = None
++        # Persistent verify-step schedule (_spec_decode_schedule): one int64
++        # device vector holding every field at a fixed offset, refilled by one
++        # H2D copy per step from a pinned ring like the decode path's.
++        self._spec_layout: dict[str, tuple[int, int]] = {}
++        self._spec_raw: torch.Tensor | None = None
++        self._spec_i32: dict[str, torch.Tensor] = {}
++        self._spec_starts: torch.Tensor | None = None
++        self._spec_table: torch.Tensor | None = None
++        self._spec_host: list[torch.Tensor] = []
++        self._spec_ev: list[torch.cuda.Event] = []
++        self._spec_stage = 0
+ 
+         self._rope: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+         self._schedule_key: object | None = None
+@@ -2100,6 +2175,14 @@ class Step4DSAState:
+         self._stage = 0
+         self._stage_ev = []
+         self._decode_logits = None
++        self._spec_layout = {}
++        self._spec_raw = None
++        self._spec_i32 = {}
++        self._spec_starts = None
++        self._spec_table = None
++        self._spec_host = []
++        self._spec_ev = []
++        self._spec_stage = 0
+         self._schedule_key = None
+         self._schedule = None
+         self._layers_done = 0
+@@ -2235,8 +2318,10 @@ class Step4DSAState:
+             # Recorded once so the first _STAGING_DEPTH steps can wait on them
+             # uniformly instead of branching on "has this slot been used yet".
+             ev.record()
++        # A verify step scores one row per query token, not per request.
++        score_rows = nr * self.spec_query_len
+         self._decode_logits = torch.empty(
+-            (self.num_kv_groups * nr, self.graph_regions),
++            (self.num_kv_groups * score_rows, self.graph_regions),
+             dtype=torch.float32,
+             device=device,
+         )
+@@ -2353,7 +2438,9 @@ class Step4DSAState:
+             self._layers_done = 0
+             return md.schedule
+ 
+-        if md.num_prefills == 0 and md.num_decodes > 0:
++        if md.num_prefills == 0 and md.num_decode_tokens > md.num_decodes:
++            sched = self._spec_decode_schedule(md)
++        elif md.num_prefills == 0 and md.num_decodes > 0:
+             sched = self._decode_schedule(md)
+         else:
+             sched = self._general_schedule(md)
+@@ -2750,6 +2837,338 @@ class Step4DSAState:
+             sched.graph_regions = self.graph_regions
+         return sched
+ 
++    def _trim_graph_width(self, md: Step4DSAMetadata) -> None:
++        """Clip ``graph_regions`` to what the block table can address.
++
++        See the note in ``_decode_schedule``: vLLM sizes the table from
++        max_model_len, so in a server this is a no-op."""
++        cap = md.block_table.shape[1] * self.regions_per_page
++        if cap < self.graph_regions:
++            logger.info(
++                "step4 DSA: decode graph width trimmed %d -> %d regions, the "
++                "limit of a %d-page block table.",
++                self.graph_regions,
++                cap,
++                md.block_table.shape[1],
++            )
++            self.graph_regions = cap
++
++    @staticmethod
++    def _spec_fields(nr: int, nrm: int, tokens: int) -> dict[str, tuple[int, int]]:
++        """Offset and capacity of every field in the packed verify schedule."""
++        sizes = {
++            "head": nr,
++            "tail": nr,
++            "pending_in": nr,
++            "pending_out": nr,
++            "tail_reg": nr,
++            "counts": nr * nrm,
++            "slots": nr * nrm,
++            "live": nr * nrm,
++            "keep_rows": nr * nrm,
++            "tok_buf": tokens,
++            "tok_req": tokens,
++            "tok_seq": tokens,
++            "tok_nscore": tokens,
++        }
++        layout: dict[str, tuple[int, int]] = {}
++        off = 0
++        for name, n in sizes.items():
++            layout[name] = (off, n)
++            off += n
++        return layout
++
++    def _ensure_spec_buffers(self, md: Step4DSAMetadata, nrm: int, q_max: int) -> None:
++        """Allocate the persistent verify-schedule buffers, once, outside capture."""
++        pages = md.block_table.shape[1]
++        if self._spec_raw is not None:
++            if self._spec_table.shape[1] != pages:
++                raise RuntimeError(
++                    f"Step-4 DSA: block table width changed from "
++                    f"{self._spec_table.shape[1]} to {pages} pages after the "
++                    f"verify schedule buffers were allocated; captured graphs "
++                    f"still point at the old ones."
++                )
++            return
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "Step-4 DSA: verify schedule buffers are still unallocated at CUDA "
++                "graph capture time; the capture warmup must build one eagerly."
++            )
++        device = md.block_table.device
++        region = self.geometry.region_size
++        nr = self.max_num_reqs
++        tokens = nr * q_max
++        self._spec_layout = self._spec_fields(nr, nrm, tokens)
++        total = sum(n for _, n in self._spec_layout.values())
++        self._spec_raw = torch.zeros(total, dtype=torch.int64, device=device)
++        self._spec_i32 = {
++            name: torch.zeros(self._spec_layout[name][1], dtype=torch.int32, device=device)
++            for name in ("counts", "tok_seq", "tok_nscore")
++        }
++        self._spec_starts = (
++            torch.arange(nr * nrm, dtype=torch.int32, device=device) * region
++        )
++        self._spec_table = torch.zeros(
++            (tokens, pages), dtype=md.block_table.dtype, device=device
++        )
++        pin = torch.cuda.is_available()
++        self._spec_host = [
++            torch.zeros(total, dtype=torch.int64, pin_memory=pin)
++            for _ in range(_STAGING_DEPTH)
++        ]
++        self._spec_ev = (
++            [torch.cuda.Event() for _ in range(_STAGING_DEPTH)] if pin else []
++        )
++        for ev in self._spec_ev:
++            ev.record()
++        self._spec_stage = 0
++
++    def _spec_decode_schedule(
++        self, md: Step4DSAMetadata, *, persistent: bool = False
++    ) -> Step4DSASchedule:
++        """Fixed-shape schedule for a speculative verify step.
++
++        Every request scores up to ``Q = spec_query_len`` query tokens. Without
++        this path such a step goes through ``_general_schedule`` as Q-token
++        prefill rows: a Python loop per request in every one of the 23 layers,
++        one ``indexer_logits`` launch per request, the prefill selector's host
++        syncs, and -- because the backend could then only capture single-token
++        decode -- no CUDA graph for the whole model, nor for the MTP drafter.
++        That is what the decode trace's bubbles were.
++
++        Here each query token is a decode row of its own: token ``i`` of a
++        request whose cache held ``past`` tokens is scored and attended exactly
++        as a single-token decode at ``seq_len = past + i + 1`` would be, with
++        its own causal horizon, against a per-token copy of the request's
++        block-table row. That is the same selection the prefill path makes per
++        query position, so the result does not depend on which path ran.
++
++        Compression is the decode path's, widened: a request's tokens land at
++        ``head`` in a buffer of ``nrm`` regions (``nrm = ceil((R - 1 + Q) / R)``),
++        with a fixed per-request stride so every shape is a function of
++        ``num_decodes`` and ``num_decode_tokens`` alone. Pending bookkeeping,
++        including the rollback ``keep_rows``, is the general schedule's; see the
++        comment there.
++
++        ``persistent`` lands everything in buffers allocated once, so a captured
++        graph's replay reads this step's values.
++        """
++        region = self.geometry.region_size
++        rpp = self.regions_per_page
++        device = md.block_table.device
++        nd, ndt = md.num_decodes, md.num_decode_tokens
++        q_max = max(self.spec_query_len, 1)
++        nrm = -(-(region - 1 + q_max) // region)
++        trash = self.pending_trash_row
++
++        qsl = md.query_start_loc_cpu[: nd + 1].numpy().astype(np.int64, copy=False)
++        seq = md.seq_lens_cpu[:nd].numpy().astype(np.int64, copy=False)
++        # A non-monotonic query_start_loc would make np.repeat below raise and
++        # take the whole engine down. Clamp instead, so a stale/garbage row
++        # degrades into dead padding and is masked out by `alive` rather than
++        # killing the run.
++        qlen = np.maximum(np.diff(qsl), 0)
++        if nd and int(qlen.max()) > q_max:
++            raise RuntimeError(
++                f"Step-4 DSA: a verify row has {int(qlen.max())} query tokens, "
++                f"more than spec_query_len = {q_max}."
++            )
++        table = md.block_table_np
++        if table is None or table.shape[0] < nd:
++            table = md.block_table[:nd].to("cpu", non_blocking=False).numpy()
++
++        if persistent:
++            if nd > self.max_num_reqs or ndt > self.max_num_reqs * q_max:
++                raise RuntimeError(
++                    f"Step-4 DSA: verify batch of {nd} requests / {ndt} tokens "
++                    f"exceeds the persistent buffers ({self.max_num_reqs} x {q_max})."
++                )
++            self._trim_graph_width(md)
++            self._ensure_spec_buffers(md, nrm, q_max)
++            layout = self._spec_layout
++        else:
++            layout = self._spec_fields(nd, nrm, ndt)
++        total = sum(n for _, n in layout.values())
++        h = np.zeros(total, dtype=np.int64)
++
++        def field(name: str, n: int) -> np.ndarray:
++            off, _ = layout[name]
++            return h[off : off + n]
++
++        head = field("head", nd)
++        tail = field("tail", nd)
++        p_in = field("pending_in", nd)
++        p_out = field("pending_out", nd)
++        tail_reg = field("tail_reg", nd)
++        counts = field("counts", nd * nrm)
++        slots = field("slots", nd * nrm)
++        live = field("live", nd * nrm)
++        keep_rows = field("keep_rows", nd * nrm)
++        tok_buf = field("tok_buf", ndt)
++        tok_req = field("tok_req", ndt)
++        tok_seq = field("tok_seq", ndt)
++        tok_ns = field("tok_nscore", ndt)
++
++        p_in[:] = trash
++        p_out[:] = trash
++        keep_rows[:] = trash
++        reqs = np.arange(nd, dtype=np.int64)
++        tail_reg[:] = reqs * nrm
++
++        # Padded rows (CUDA-graph batch padding, dummy runs) are not requests:
++        # vLLM gives them qlen 0 and seq_len 0, and block 0 (NULL_BLOCK_ID) is
++        # never a real page. Masked exactly as in _decode_schedule.
++        past = seq - qlen
++        alive = (qlen > 0) & (seq > 0) & (past >= 0)
++        hd = np.where(alive, past % region, 0)
++        fr = np.where(alive, past // region, 0)
++        if nd:
++            page_idx = np.minimum(fr // rpp, table.shape[1] - 1)
++            page0 = table[reqs, page_idx].astype(np.int64, copy=False)
++            alive &= page0 > 0
++        hd = np.where(alive, hd, 0)
++
++        # Per-token rows. Tokens past the last request (graph padding) go to
++        # a scratch area at the end of the buffer with seq_len 0.
++        ntok = int(qsl[nd]) if nd else 0
++        r_of_t = np.repeat(reqs, qlen)
++        i_of_t = np.arange(ntok, dtype=np.int64) - qsl[r_of_t]
++        live_t = alive[r_of_t]
++        pos_t = past[r_of_t] + i_of_t
++        tok_req[:ntok] = r_of_t
++        tok_seq[:ntok] = np.where(live_t, pos_t + 1, 0)
++        tok_ns[:ntok] = np.where(live_t, pos_t // region, 0)
++        tok_buf[:ntok] = r_of_t * (nrm * region) + hd[r_of_t] + i_of_t
++        tok_buf[ntok:] = nd * nrm * region + np.arange(ntok, ndt, dtype=np.int64)
++        widest = int(tok_ns.max()) if ndt else 0
++
++        self.end_step()  # see the note in _general_schedule
++        self.pending.begin_step()
++        sched = Step4DSASchedule()
++        alive_rows = np.flatnonzero(alive).tolist()
++        reg_slots_of: dict[int, list[int]] = {}
++        for r in alive_rows:
++            first = int(fr[r])
++            nreg = -(-(int(hd[r]) + int(qlen[r])) // region)
++            pages = table[r]
++            reg_slots_of[r] = [
++                int(pages[(first + j) // rpp]) * rpp + (first + j) % rpp
++                for j in range(nreg)
++            ]
++        # Every head read first: get() touches its row for this step, so none of
++        # the acquire() calls below can recycle a row another request is about
++        # to resume from (a rolled-back request reads a retired row).
++        for r in alive_rows:
++            if hd[r]:
++                p_in[r] = self.pending.get(reg_slots_of[r][0])
++        for r in alive_rows:
++            q = int(qlen[r])
++            hr = int(hd[r])
++            nbuf = hr + q
++            reg_slots = reg_slots_of[r]
++            nreg = len(reg_slots)
++            base = r * nrm
++            for j in range(nreg):
++                slots[base + j] = reg_slots[j]
++                if nbuf >= (j + 1) * region:
++                    counts[base + j] = region
++                    live[base + j] = 1
++            head[r] = hr
++            if hr and nbuf >= region:
++                sched.completed_slots.append(reg_slots[0])
++            # Regions closed here may be reopened by a rejection; keep them
++            # recoverable exactly as _general_schedule does: written back whole
++            # and retired (not released) at step end.
++            if 1 < q <= self.spec_query_len:
++                for j in range(nreg):
++                    if nbuf - j * region < region:
++                        break
++                    if j == 0 and hr:
++                        keep_rows[base + j] = p_in[r]  # already in completed_slots
++                    else:
++                        keep_rows[base + j] = self.pending.acquire(reg_slots[j])
++                        sched.completed_slots.append(reg_slots[j])
++            t = nbuf % region
++            tail[r] = t
++            tail_reg[r] = base + nreg - 1
++            if t:
++                p_out[r] = self.pending.acquire(reg_slots[-1])
++
++        if persistent:
++            # Same pinned-ring discipline as _decode_schedule, for the same
++            # write-after-read reason.
++            stage = self._spec_stage
++            self._spec_stage = (stage + 1) % _STAGING_DEPTH
++            ev = self._spec_ev[stage] if self._spec_ev else None
++            if ev is not None:
++                ev.synchronize()
++            host = self._spec_host[stage]
++            host.numpy()[:] = h
++            raw = self._spec_raw
++            raw.copy_(host, non_blocking=ev is not None)
++            if ev is not None:
++                ev.record()
++        else:
++            raw = torch.from_numpy(h).to(device)
++
++        def dev(name: str, n: int) -> torch.Tensor:
++            off, _ = layout[name]
++            return raw[off : off + n]
++
++        def dev_i32(name: str, n: int) -> torch.Tensor:
++            if persistent:
++                out = self._spec_i32[name][:n]
++                out.copy_(dev(name, n))
++                return out
++            return dev(name, n).to(torch.int32)
++
++        sched.spec = True
++        sched.num_decodes = nd
++        sched.num_tokens = ndt
++        sched.nrm = nrm
++        sched.buf_len = nd * nrm * region + ndt
++        sched.starts = (
++            self._spec_starts[: nd * nrm]
++            if persistent
++            else torch.arange(nd * nrm, dtype=torch.int32, device=device) * region
++        )
++        sched.counts = dev_i32("counts", nd * nrm)
++        sched.slots = dev("slots", nd * nrm)
++        sched.live = dev("live", nd * nrm)
++        sched.keep_rows = dev("keep_rows", nd * nrm)
++        sched.head = dev("head", nd)
++        sched.tail = dev("tail", nd)
++        sched.pending_in = dev("pending_in", nd)
++        sched.pending_out = dev("pending_out", nd)
++        sched.tail_reg = dev("tail_reg", nd)
++        sched.tok_buf = dev("tok_buf", ndt)
++        sched.tok_seq = dev_i32("tok_seq", ndt)
++        sched.tok_nscore = dev_i32("tok_nscore", ndt)
++        tok_req_d = dev("tok_req", ndt)
++        if persistent:
++            sched.tok_table = self._spec_table[:ndt]
++            torch.index_select(md.block_table, 0, tok_req_d, out=sched.tok_table)
++        else:
++            sched.tok_table = md.block_table.index_select(0, tok_req_d)
++
++        sched.max_nscore = widest
++        if persistent:
++            if widest > self.graph_regions:
++                raise RuntimeError(
++                    f"Step-4 DSA: a request needs {widest} region scores but the "
++                    f"captured decode width is {self.graph_regions}. Raise "
++                    f"VLLM_STEP4_DSA_GRAPH_REGIONS or --max-model-len; the width "
++                    f"is a graph constant and cannot be grown per step."
++                )
++            if self.num_kv_groups * ndt > self._decode_logits.shape[0]:
++                raise RuntimeError(
++                    f"Step-4 DSA: {ndt} verify rows overflow the score pool "
++                    f"({self._decode_logits.shape[0]} group-major rows)."
++                )
++            sched.graph_regions = self.graph_regions
++        return sched
++
+     def finish_layer(self) -> None:
+         """Called by each DSA layer once it has consumed this step's schedule."""
+         self._layers_done += 1
+@@ -3043,6 +3462,8 @@ class Step4Indexer:
+             topk=topk,
+             num_kv_groups=self.num_kv_groups,
+             regions_per_page=state.regions_per_page,
++            decode_seq_lens=sched.tok_seq if sched.spec else None,
++            decode_table=sched.tok_table if sched.spec else None,
+         )
+         state.finish_layer()
+         return width
+@@ -3122,6 +3543,9 @@ class Step4Indexer:
+         the streaming result identical to the batched one rather than merely
+         close to it.
+         """
++        if sched.spec:
++            self._update_summaries_spec(sched, index_k, index_z)
++            return
+         if sched.decode:
+             self._update_summaries_decode(sched, index_k, index_z)
+             return
+@@ -3233,6 +3657,68 @@ class Step4Indexer:
+         pending_key[rows] = torch.where(tail_mask, buffer_key, pending_key[rows])
+         pending_z[rows] = torch.where(tail_mask, buffer_z, pending_z[rows])
+ 
++    # -- stage 2c: summaries, speculative verify fast path ------------------
++
++    def _update_summaries_spec(
++        self, sched: Step4DSASchedule, index_k: torch.Tensor, index_z: torch.Tensor
++    ) -> None:
++        """The decode fast path for ``Q``-token rows.
++
++        Each request owns ``nrm`` regions of buffer: region 0 starts with its
++        ``head`` pending tokens, and its query tokens are scattered in after
++        them through ``tok_buf``. Graph-padding tokens land in a scratch tail
++        past the last request. Closed regions are compressed and stored; the
++        trailing partial region goes back to pending, and regions a rejection
++        may reopen are copied whole into their ``keep_rows`` -- the general
++        path's three steps, with the request loop turned into a batch axis.
++        """
++        state = self.state
++        region = self.geometry.region_size
++        proxy = self.geometry.proxy_dim
++        nd, ndt, nrm = sched.num_decodes, sched.num_tokens, sched.nrm
++        span = nrm * region
++        regions = nd * nrm
++        pending_key = state.pending_key[self.slot]
++        pending_z = state.pending_z[self.slot]
++
++        positions = torch.arange(region, device=index_k.device)
++        head_mask = (positions[None, :] < sched.head[:, None]).unsqueeze(-1)
++        tail_mask = (positions[None, :] < sched.tail[:, None]).unsqueeze(-1)
++        zero = pending_key.new_zeros(())
++
++        flats = []
++        for pending, tokens in ((pending_key, index_k), (pending_z, index_z)):
++            buffer = tokens.new_zeros((regions * region + ndt, proxy))
++            per_req = buffer[: regions * region].view(nd, span, proxy)
++            per_req[:, :region] = torch.where(head_mask, pending[sched.pending_in], zero)
++            buffer.index_copy_(0, sched.tok_buf, tokens[:ndt, 0])
++            flats.append(buffer)
++        buffer_key, buffer_z = flats
++
++        _, summary_fp8 = csa_compress_regions(
++            buffer_key[: regions * region].unsqueeze(1),
++            buffer_z[: regions * region].unsqueeze(1),
++            sched.starts,
++            sched.counts,
++            region_size=region,
++        )
++        _store_live_summary_rows(
++            state.summary[self.slot],
++            summary_fp8,
++            sched.slots,
++            sched.live,
++        )
++
++        rows = sched.pending_out
++        for pending, buffer in ((pending_key, buffer_key), (pending_z, buffer_z)):
++            by_region = buffer[: regions * region].view(regions, region, proxy)
++            pending[rows] = torch.where(
++                tail_mask, by_region[sched.tail_reg], pending[rows]
++            )
++            # Rows not kept point at the trash row; their writes collide there
++            # harmlessly.
++            pending[sched.keep_rows] = by_region
++
+     # -- stage 3: scoring ---------------------------------------------------
+ 
+     def _score(
+@@ -3266,6 +3752,8 @@ class Step4Indexer:
+         device = index_q.device
+         summary = state.summary[self.slot]
+ 
++        if sched.spec:
++            return self._score_spec(sched, index_q, weights)
+         if sched.decode:
+             return self._score_decode(md, sched, index_q, weights)
+ 
+@@ -3375,6 +3863,47 @@ class Step4Indexer:
+         )
+         return None, decode_logits, width
+ 
++    def _score_spec(
++        self,
++        sched: Step4DSASchedule,
++        index_q: torch.Tensor,
++        weights: torch.Tensor,
++    ) -> tuple[None, torch.Tensor, int]:
++        """``_score_decode`` with one row per query token.
++
++        Each token scores against its own request's summaries through the
++        per-token block-table row, bounded by its own ``nscore`` -- which is
++        why a region the step's earlier tokens just closed is visible to the
++        later ones, exactly as on the prefill path.
++        """
++        state = self.state
++        ndt = sched.num_tokens
++        rows = self.num_kv_groups * ndt
++
++        if sched.graph_regions:
++            width = sched.graph_regions
++            decode_logits = state._decode_logits[:rows, :width]
++        else:
++            width = sched.max_nscore
++            decode_logits = torch.zeros(
++                (rows, max(width, 1)),
++                dtype=torch.float32,
++                device=index_q.device,
++            )
++        if width == 0:
++            return None, decode_logits, width
++
++        decode_indexer_logits(
++            index_q[:ndt].contiguous(),
++            weights[:ndt].contiguous(),
++            state.summary[self.slot],
++            sched.tok_table,
++            sched.tok_nscore,
++            decode_logits,
++            regions_per_page=state.regions_per_page,
++        )
++        return None, decode_logits, width
++
+ 
+ # ---------------------------------------------------------------------------
+ # The indexer as an opaque op
+diff --git a/v1/sample/rejection_sampler.py b/v1/sample/rejection_sampler.py
+index e6e6f4c..a1baf0a 100644
+--- a/v1/sample/rejection_sampler.py
++++ b/v1/sample/rejection_sampler.py
+@@ -379,14 +379,7 @@ class RejectionSampler(nn.Module):
+         spec_token_ids: list[list[int]] | None = None,
+     ) -> list[list[int]]:
+         if spec_token_ids is None:
+-            # 添加接受率统计日志
+-    total_draft = sum(num_draft_tokens)
+-    accepted_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item() - batch_size  # 减去bonus tokens
+-    if total_draft > 0:
+-        accept_rate = accepted_count / total_draft * 100
+-        logger.info(f"[MTP接受率] 总draft: {total_draft}, 接受: {accepted_count}, 接受率: {accept_rate:.1f}%")
+-    
+-    return output_token_ids
++            return output_token_ids
+ 
+         result = []
+         for out, spec in zip(output_token_ids, spec_token_ids):
+@@ -473,14 +466,7 @@ def rejection_sample(
+             SYNTHETIC_MODE=synthetic_mode,
+         )
+         if sampling_metadata.all_greedy:
+-            # 添加接受率统计日志
+-    total_draft = sum(num_draft_tokens)
+-    accepted_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item() - batch_size  # 减去bonus tokens
+-    if total_draft > 0:
+-        accept_rate = accepted_count / total_draft * 100
+-        logger.info(f"[MTP接受率] 总draft: {total_draft}, 接受: {accepted_count}, 接受率: {accept_rate:.1f}%")
+-    
+-    return output_token_ids
++            return output_token_ids
+ 
+     # Compute probability distribution from target logits.
+     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+@@ -518,13 +504,6 @@ def rejection_sample(
+         NO_DRAFT_PROBS=draft_probs is None,
+         SYNTHETIC_MODE=synthetic_mode,
+     )
+-    # 添加接受率统计日志
+-    total_draft = sum(num_draft_tokens)
+-    accepted_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item() - batch_size  # 减去bonus tokens
+-    if total_draft > 0:
+-        accept_rate = accepted_count / total_draft * 100
+-        logger.info(f"[MTP接受率] 总draft: {total_draft}, 接受: {accepted_count}, 接受率: {accept_rate:.1f}%")
+-    
+     return output_token_ids
+ 
+ 
+-- 
+2.34.1
+

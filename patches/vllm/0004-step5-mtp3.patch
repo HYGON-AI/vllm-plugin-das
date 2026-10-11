@@ -1,0 +1,934 @@
+From 1bed64dd04c65561aa0f1bd9fd57714bf53c12b2 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Wed, 7 Oct 2026 13:23:44 +0800
+Subject: [PATCH 04/24] =?UTF-8?q?=E5=AE=9E=E7=8E=B0step5=E6=A8=A1=E5=9E=8B?=
+ =?UTF-8?q?=E7=9A=84mtp3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ config/speculative.py                         |  13 +
+ model_executor/layers/step4_dsa.py            |  48 +-
+ model_executor/models/registry.py             |   1 +
+ model_executor/models/step5_mtp.py            | 423 ++++++++++++++++++
+ model_executor/models/step5_text.py           |   8 +
+ utils/deep_gemm.py                            |  59 ++-
+ v1/sample/rejection_sampler.py                |  25 +-
+ v1/worker/gpu/dp_utils.py                     |  20 +
+ v1/worker/gpu/spec_decode/eagle/utils.py      |  16 +
+ .../multi_module_mtp/speculator.py            |   7 +
+ v1/worker/gpu/spec_decode/speculator.py       |  13 +-
+ 11 files changed, 614 insertions(+), 19 deletions(-)
+ create mode 100644 model_executor/models/step5_mtp.py
+
+diff --git a/config/speculative.py b/config/speculative.py
+index f143835..3568ba3 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -57,6 +57,7 @@ MTPModelTypes = Literal[
+     "kimi_k3_mtp",
+     "pangu_ultra_moe_mtp",
+     "step3p5_mtp",
++    "step5_mtp",
+     "hy_v3_mtp",
+     "hy_v4_mtp",
+     "gemma4_mtp",
+@@ -948,6 +949,18 @@ class SpeculativeConfig:
+             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+             hf_config.update({"n_predict": n_predict, "architectures": ["Step3p5MTP"]})
+ 
++        if hf_config.model_type == "step5" or hf_config.architectures[0] == "Step5ForConditionalGeneration":
++            quantization_config = getattr(hf_config, "quantization_config", None)
++            hf_config = getattr(hf_config, "text_config", hf_config)
++            if (
++                quantization_config is not None
++                and getattr(hf_config, "quantization_config", None) is None
++            ):
++                hf_config.update({"quantization_config": quantization_config})
++            hf_config.model_type = "step5_mtp"
++            n_predict = getattr(hf_config, "num_nextn_predict_layers", 3)
++            hf_config.update({"n_predict": n_predict, "architectures": ["Step5MTP"]})
++
+         if initial_architecture == "MistralLarge3ForCausalLM":
+             hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
+ 
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index e26bb17..8ea69d2 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -1859,6 +1859,19 @@ class Step4PendingTable:
+             self._slot_of_row[row] = -1
+             self._touched[row] = -1
+ 
++    def retire(self, slot: int) -> None:
++        """Mark ``slot``'s row first in line for recycling, but keep it mapped.
++
++        Under speculative decoding a region can close on draft tokens that are
++        then rejected, rolling the request back into it. The row (re-filled with
++        the whole region by the closing step) must survive until that is known,
++        so it stays readable through get() and is only recycled -- oldest
++        retirement first, ahead of every live row -- when a row is needed.
++        """
++        row = self._row_of_slot.get(slot)
++        if row is not None:
++            self._touched[row] = self.step - (1 << 40)
++
+     def _free_row(self) -> int:
+         oldest_row, oldest_step = -1, self.step
+         for row in range(self.capacity):
+@@ -1906,6 +1919,10 @@ class _RequestPlan:
+     # whole width and letting it clip is both correct and simpler.
+     nscore: int
+     score_slots: torch.Tensor | None  # [nscore] int64 physical summary slots
++    # (pending row, buffer offset) of regions that closed this step on what may
++    # be draft tokens; the whole region is written back so a rollback into it
++    # can re-read its head. Empty without speculative decoding.
++    keep_rows: list[tuple[int, int]] = field(default_factory=list)
+ 
+ 
+ @dataclass
+@@ -2000,12 +2017,17 @@ class Step4DSAState:
+         dtype: torch.dtype,
+         max_num_reqs: int = 0,
+         max_model_len: int = 0,
++        spec_query_len: int = 1,
+     ) -> None:
+         self.num_layers = num_layers
+         self.geometry = geometry
+         self.dtype = dtype
+         self.pending = Step4PendingTable(max_pending)
+         self.max_pending = max_pending
++        # Longest query a speculative verify step can have (1 + drafts). A row
++        # no longer than this may be rolled back by rejection after the step,
++        # so the regions it closes are kept recoverable; 1 disables that.
++        self.spec_query_len = int(spec_query_len)
+         # One row past the allocator's capacity, never handed out by the table.
+         # The vectorized decode path writes every request's tail unconditionally
+         # and sends the requests that have no tail here, which keeps the scatter
+@@ -2412,6 +2434,23 @@ class Step4DSAState:
+             tail = nbuf % region
+             pending_out = self.pending.acquire(last_slot) if tail else -1
+ 
++            # A speculative verify step may close a region on draft tokens that
++            # are rejected afterwards; the next step then resumes inside it and
++            # needs its head again. Keep every region closed here recoverable:
++            # write it back whole and retire (not release) its row at step end.
++            keep_rows: list[tuple[int, int]] = []
++            if 1 < qlen <= self.spec_query_len:
++                for j in range(nregions):
++                    if nbuf - j * region < region:
++                        break
++                    slot = slots[len(slots) - nregions + j]
++                    if j == 0 and head:
++                        keep = pending_in  # already listed in completed_slots
++                    else:
++                        keep = self.pending.acquire(slot)
++                        sched.completed_slots.append(slot)
++                    keep_rows.append((keep, buf_off + j * region))
++
+             sched.requests.append(
+                 _RequestPlan(
+                     row=row,
+@@ -2425,6 +2464,7 @@ class Step4DSAState:
+                     tail=tail,
+                     nscore=(past + qlen - 1) // region,
+                     score_slots=None,
++                    keep_rows=keep_rows,
+                 )
+             )
+             buf_off += nbuf
+@@ -2726,8 +2766,11 @@ class Step4DSAState:
+         """Release pending rows for regions that closed."""
+         if self._schedule is None:
+             return
++        # With speculative decoding a closed region may be reopened by a
++        # rollback on the next step, so its row is only demoted, not freed.
++        drop = self.pending.retire if self.spec_query_len > 1 else self.pending.release
+         for slot in self._schedule.completed_slots:
+-            self.pending.release(slot)
++            drop(slot)
+         self._schedule.completed_slots.clear()
+ 
+ 
+@@ -3121,6 +3164,9 @@ class Step4Indexer:
+         )
+ 
+         for plan in sched.requests:
++            for row, off in plan.keep_rows:
++                pending_key[row] = buffer_key[off : off + self.geometry.region_size, 0]
++                pending_z[row] = buffer_z[off : off + self.geometry.region_size, 0]
+             if not plan.tail:
+                 continue
+             end = plan.buf_start + plan.head + plan.qlen
+diff --git a/model_executor/models/registry.py b/model_executor/models/registry.py
+index 1cc3855..92c9c6c 100644
+--- a/model_executor/models/registry.py
++++ b/model_executor/models/registry.py
+@@ -687,6 +687,7 @@ _SPECULATIVE_DECODING_MODELS = {
+     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
+     "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
+     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
++    "Step5MTP": ("step5_mtp", "Step5MTP"),
+     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
+     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
+     "InternS2MobiusMTP": ("interns2_mobius", "InternS2MobiusMTP"),
+diff --git a/model_executor/models/step5_mtp.py b/model_executor/models/step5_mtp.py
+new file mode 100644
+index 0000000..1806d2b
+--- /dev/null
++++ b/model_executor/models/step5_mtp.py
+@@ -0,0 +1,423 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Multi-token-prediction draft model for Step-5 with MoE support.
++
++Adapted from water18-0910 implementation for vLLM 0.28 compatibility.
++"""
++
++from collections.abc import Iterable
++
++import torch
++import torch.nn as nn
++from transformers import PretrainedConfig
++
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import VllmConfig
++from vllm.logger import init_logger
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.layers.layernorm import GemmaRMSNorm
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.model_executor.models.interfaces import MixtureOfExperts
++from vllm.model_executor.models.utils import (
++    get_spec_layer_idx_from_weight_name,
++    maybe_prefix,
++)
++from vllm.sequence import IntermediateTensors
++
++from .step5_text import Step5DecoderLayer
++
++logger = init_logger(__name__)
++
++
++# Packed modules mapping for Step5
++STEP5_PACKED_MODULES_MAPPING = {
++    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++    "qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
++    "qkv_indexer_proj": [
++        "q_proj",
++        "k_proj",
++        "v_proj",
++        "sparse_indexer_q",
++        "sparse_indexer_k",
++        "sparse_indexer_z",
++        "g_proj",
++    ],
++    "gate_up_proj": ["gate_proj", "up_proj"],
++}
++
++
++def _get_mtp_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
++    """Get the draft model config from speculative_config if available."""
++    speculative_config = vllm_config.speculative_config
++    if speculative_config is None or speculative_config.draft_model_config is None:
++        return vllm_config
++    # For vLLM 0.28, directly return vllm_config as it handles this internally
++    return vllm_config
++
++
++def _get_mtp_config(vllm_config: VllmConfig) -> PretrainedConfig:
++    """Extract the HF text config for MTP."""
++    hf_config = vllm_config.model_config.hf_config
++    # For Step5, extract text_config if it exists
++    if hasattr(hf_config, 'text_config'):
++        return hf_config.text_config
++    return hf_config
++
++
++def _fp32_gemma_rms_norm(hidden_size: int, eps: float) -> GemmaRMSNorm:
++    """Create a fp32 GemmaRMSNorm for Step5 MTP."""
++    return GemmaRMSNorm(hidden_size, eps)
++
++
++class Step5MTPSharedHead(nn.Module):
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        compute_dtype: torch.dtype,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.fp32_residual_connection = getattr(
++            config, "fp32_residual_connection", False
++        )
++        self.compute_dtype = compute_dtype
++        self.norm = _fp32_gemma_rms_norm(config.hidden_size, config.rms_norm_eps)
++        self.head = ParallelLMHead(
++            config.vocab_size,
++            config.hidden_size,
++            quant_config=quant_config,
++            prefix=f"{prefix}.head",
++        )
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        if self.fp32_residual_connection:
++            hidden_states = hidden_states.to(self.compute_dtype)
++        return self.norm(hidden_states)
++
++
++@support_torch_compile
++class Step5MultiTokenPredictorLayer(nn.Module):
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        prefix: str,
++    ) -> None:
++        super().__init__()
++        config = _get_mtp_config(vllm_config)
++        self.compute_dtype = vllm_config.model_config.dtype
++        self.fp32_residual_connection = getattr(
++            config, "fp32_residual_connection", False
++        )
++        quant_config = vllm_config.quant_config
++        self.enorm = _fp32_gemma_rms_norm(config.hidden_size, config.rms_norm_eps)
++        self.hnorm = _fp32_gemma_rms_norm(config.hidden_size, config.rms_norm_eps)
++        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
++        self.shared_head = Step5MTPSharedHead(
++            config=config,
++            compute_dtype=self.compute_dtype,
++            quant_config=quant_config,
++            prefix=f"{prefix}.shared_head",
++        )
++
++        # Step5DecoderLayer expects hf_config to be text_config directly
++        # Temporarily patch hf_config if it has text_config nested
++        hf_config = vllm_config.model_config.hf_config
++        original_hf_config = hf_config
++        if hasattr(hf_config, 'text_config'):
++            # Temporarily replace hf_config with text_config
++            vllm_config.model_config.hf_config = hf_config.text_config
++
++        # MTP layers use indices beyond the main model (92, 93, 94) but
++        # Step5DecoderLayer extracts layer_idx from prefix and accesses
++        # config.layer_types[layer_idx]. Map MTP layer indices to valid range
++        # by using the original prefix but it will be used for weight loading.
++        # For initialization, we need a unique prefix that extracts to a valid index.
++        # Extract the actual MTP layer index from the prefix
++        import re
++        match = re.search(r'layers\.(\d+)', prefix)
++        if match:
++            actual_idx = int(match.group(1))
++            # Map to valid range (0-91) using modulo, ensuring uniqueness
++            # Use (actual_idx - num_hidden_layers) % num_hidden_layers to cycle through
++            num_hidden_layers = getattr(config, 'num_hidden_layers', 92)
++            safe_idx = (actual_idx - num_hidden_layers) % num_hidden_layers if actual_idx >= num_hidden_layers else actual_idx
++            safe_prefix = f"{prefix.rsplit('.layers.', 1)[0]}.layers.{safe_idx}.mtp_block"
++        else:
++            safe_prefix = f"{prefix}.mtp_block"
++
++        self.mtp_block = Step5DecoderLayer(
++            vllm_config,
++            prefix=safe_prefix,
++        )
++
++        # Restore original hf_config
++        vllm_config.model_config.hf_config = original_hf_config
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        previous_hidden_states: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++        spec_step_index: int = 0,
++    ) -> torch.Tensor:
++        if inputs_embeds is None:
++            raise ValueError("inputs_embeds is required for Step5 MTP")
++        if self.fp32_residual_connection:
++            inputs_embeds = inputs_embeds.to(self.compute_dtype)
++            previous_hidden_states = previous_hidden_states.to(self.compute_dtype)
++        inputs_embeds = self.enorm(inputs_embeds)
++        previous_hidden_states = self.hnorm(previous_hidden_states)
++
++        hidden_states = self.eh_proj(
++            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
++        )
++        if self.fp32_residual_connection:
++            hidden_states = hidden_states.float()
++
++        hidden_states = self.mtp_block(positions=positions, hidden_states=hidden_states)
++        return hidden_states
++
++
++class Step5MultiTokenPredictor(nn.Module):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = _get_mtp_config(vllm_config)
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size,
++            config.hidden_size,
++        )
++        self.mtp_start_layer_idx = config.num_hidden_layers
++        self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 3)
++        if self.num_mtp_layers <= 0:
++            raise ValueError(
++                "Step5 MTP requires num_nextn_predict_layers > 0, got "
++                f"{self.num_mtp_layers}."
++            )
++        # Map exact layer index from weights
++        self.layers = torch.nn.ModuleDict(
++            {
++                str(idx): Step5MultiTokenPredictorLayer(
++                    vllm_config=vllm_config,
++                    prefix=f"{prefix}.layers.{idx}",
++                )
++                for idx in range(
++                    self.mtp_start_layer_idx,
++                    self.mtp_start_layer_idx + self.num_mtp_layers,
++                )
++            }
++        )
++
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++
++    def _layer(self, spec_step_idx: int) -> Step5MultiTokenPredictorLayer:
++        idx = spec_step_idx % self.num_mtp_layers
++        return self.layers[str(self.mtp_start_layer_idx + idx)]
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        previous_hidden_states: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        if inputs_embeds is None:
++            inputs_embeds = self.embed_tokens(input_ids)
++        return self._layer(spec_step_idx)(
++            input_ids,
++            positions,
++            previous_hidden_states,
++            inputs_embeds,
++            spec_step_idx,
++        )
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        shared_head = self._layer(spec_step_idx).shared_head
++        return self.logits_processor(shared_head.head, shared_head(hidden_states))
++
++    def get_top_tokens(
++        self,
++        hidden_states: torch.Tensor,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        shared_head = self._layer(spec_step_idx).shared_head
++        return self.logits_processor.get_top_tokens(
++            shared_head.head,
++            shared_head(hidden_states),
++        )
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.get_input_embeddings(input_ids)
++
++    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++
++class Step5MTP(nn.Module, MixtureOfExperts):
++    packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
++    _enable_weights_track_by_default = True
++    # Each MTP layer ships an independently trained shared_head.output (it
++    # differs from the target lm_head); load_eagle_model must not replace it.
++    has_own_mtp_heads = True
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        self.config = _get_mtp_config(vllm_config)
++        self.vllm_config = vllm_config
++        self.model = Step5MultiTokenPredictor(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
++        )
++        # Initialize MoE metadata (simplified for vLLM 0.28)
++        self.num_moe_layers = 0
++        self.num_expert_groups = 1
++        self.num_shared_experts = 0
++        self.num_logical_experts = 0
++        self.num_physical_experts = 0
++        self.num_local_physical_experts = 0
++        self.num_routed_experts = 0
++        self.num_redundant_experts = 0
++        self.is_dense_mtp = True
++        self.moe_layers = []
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.get_input_embeddings(input_ids)
++
++    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.get_input_embeddings(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        hidden_states = self.model(
++            input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
++        )
++        return hidden_states
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor | None:
++        return self.model.compute_logits(hidden_states, spec_step_idx)
++
++    def get_top_tokens(
++        self,
++        hidden_states: torch.Tensor,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        return self.model.get_top_tokens(hidden_states, spec_step_idx)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            # (param_name, shard_name, shard_id)
++            ("qkvg_proj", "q_proj", 0),
++            ("qkvg_proj", "k_proj", 1),
++            ("qkvg_proj", "v_proj", 2),
++            ("qkvg_proj", "g_proj", 3),
++            ("qkv_proj", "q_proj", "q"),
++            ("qkv_proj", "k_proj", "k"),
++            ("qkv_proj", "v_proj", "v"),
++            ("gate_up_proj", "gate_proj", 0),
++            ("gate_up_proj", "up_proj", 1),
++        ]
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++
++        for name, loaded_weight in weights:
++            if "rotary_emb.inv_freq" in name:
++                continue
++            if name.startswith("layers."):
++                name = f"model.{name}"
++            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
++            if "embed_tokens" not in name and spec_layer is None:
++                continue
++            name = self._rewrite_spec_layer_name(spec_layer, name)
++
++            for param_name, weight_name, shard_id in stacked_params_mapping:
++                if weight_name not in name:
++                    continue
++                if "experts" in name or "moe" in name:
++                    continue
++                replaced_name = name.replace(weight_name, param_name)
++                if replaced_name not in params_dict:
++                    continue
++                name = replaced_name
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++
++                param = params_dict[name]
++                weight_loader = param.weight_loader
++                weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                # Handle other weights
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++                if "tok_embeddings" in name:
++                    continue
++
++                if spec_layer is not None and ".transformer." in name:
++                    name = name.replace(".transformer.", ".")
++                if "shared_head" in name:
++                    name = name.replace("shared_head.output", "shared_head.head")
++                if "embed_tokens" in name:
++                    name = "model.embed_tokens.weight"
++                if name not in params_dict:
++                    logger.warning_once(
++                        "Skipping unexpected MTP checkpoint weight: %s", name
++                    )
++                    continue
++                param = params_dict[name]
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++
++        # Report embed_tokens as loaded
++        loaded_params.update(
++            name for name in params_dict if name.startswith("model.embed_tokens.")
++        )
++        return loaded_params
++
++    def _rewrite_spec_layer_name(self, spec_layer: int | None, name: str) -> str:
++        """
++        Rewrite the weight name to match the format of the original model.
++        Add .mtp_block for modules in transformer layer block for spec layer
++        """
++        if spec_layer is None:
++            return name
++
++        spec_layer_weight_names = [
++            "embed_tokens",
++            "enorm",
++            "hnorm",
++            "eh_proj",
++            "shared_head",
++        ]
++        spec_layer_weight = False
++        for weight_name in spec_layer_weight_names:
++            if weight_name in name:
++                spec_layer_weight = True
++                break
++        if not spec_layer_weight:
++            # Treat rest weights as weights for transformer layer block
++            name = name.replace(
++                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
++            )
++        return name
+diff --git a/model_executor/models/step5_text.py b/model_executor/models/step5_text.py
+index c07364b..156b07e 100644
+--- a/model_executor/models/step5_text.py
++++ b/model_executor/models/step5_text.py
+@@ -859,6 +859,14 @@ class Step5Model(nn.Module):
+                 # its addresses and its shapes survive a CUDA graph replay.
+                 max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
+                 max_model_len=vllm_config.model_config.max_model_len,
++                # MTP verify steps can be rolled back by rejection; DSA keeps
++                # the regions they close recoverable (see Step4PendingTable.retire).
++                spec_query_len=1
++                + (
++                    vllm_config.speculative_config.num_speculative_tokens
++                    if vllm_config.speculative_config is not None
++                    else 0
++                ),
+             )
+             logger.info(
+                 "step5: DSA enabled on %d of %d layers (%d...%d)",
+diff --git a/utils/deep_gemm.py b/utils/deep_gemm.py
+index 0de2c0b..d56c4ac 100644
+--- a/utils/deep_gemm.py
++++ b/utils/deep_gemm.py
+@@ -8,6 +8,7 @@ Users of vLLM should always import **only** these wrappers.
+ import contextlib
+ import functools
+ import importlib
++import inspect
+ import os
+ from collections.abc import Callable
+ from enum import Enum
+@@ -178,7 +179,8 @@ def _import_deep_gemm():
+ 
+     Prefers an externally installed ``deep_gemm`` package (so users can
+     pin a specific version), then falls back to the vendored copy bundled
+-    in the vLLM wheel.
++    in the vLLM wheel. On HCU/ROCm platforms, also tries ``deepgemm``
++    (without underscore) which is the HCU DeepGEMM package name.
+ 
+     Returns ``None`` when neither source is usable.
+     """
+@@ -205,6 +207,17 @@ def _import_deep_gemm():
+         # if JIT include files are missing (e.g. incomplete wheel).
+         logger.warning_once("Failed to import vendored deep_gemm: %s", e)
+ 
++    # 3. On HCU/ROCm, try deepgemm (without underscore) - HCU DeepGEMM package
++    if current_platform.is_rocm():
++        try:
++            module = importlib.import_module("deepgemm")
++            logger.info_once("Imported deepgemm module (HCU DeepGEMM) from site-packages")
++            return module
++        except ImportError:
++            logger.info_once("deepgemm (HCU) not found in site-packages")
++        except Exception as e:
++            logger.warning_once("Failed to import HCU deepgemm: %s", e)
++
+     return None
+ 
+ 
+@@ -386,7 +399,18 @@ def set_mk_alignment_for_contiguous_layout(value: int) -> None:
+     _lazy_init()
+     dg = _import_deep_gemm()
+     if dg is None:
+-        raise RuntimeError("DeepGEMM is not available")
++        logger.info_once(
++            "DeepGEMM set_mk_alignment_for_contiguous_layout unavailable, "
++            f"ignoring alignment value {value} for HCU platform"
++        )
++        return
++    # HCU deepgemm module doesn't have this function, skip it silently
++    if not hasattr(dg, 'set_mk_alignment_for_contiguous_layout'):
++        logger.debug_once(
++            f"HCU DeepGEMM: set_mk_alignment_for_contiguous_layout not available, "
++            f"using fixed alignment (value {value} ignored)"
++        )
++        return
+     dg.set_mk_alignment_for_contiguous_layout(value)
+ 
+ 
+@@ -482,31 +506,44 @@ def fp8_einsum(*args, **kwargs):
+     return _fp8_einsum_impl(*args, **kwargs)
+ 
+ 
++@functools.cache
++def _accepts_disable_ue8m0_cast(impl) -> bool:
++    """HCU deepgemm kernels have no UE8M0 scale path and reject the kwarg."""
++    try:
++        params = inspect.signature(impl).parameters
++    except (TypeError, ValueError):
++        # Native extension without introspectable signature: upstream DeepGEMM.
++        return True
++    return "disable_ue8m0_cast" in params or any(
++        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
++    )
++
++
++def _call_with_ue8m0_flag(impl, *args, **kwargs):
++    if _accepts_disable_ue8m0_cast(impl):
++        kwargs["disable_ue8m0_cast"] = not is_deep_gemm_e8m0_used()
++    return impl(*args, **kwargs)
++
++
+ def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
+     _lazy_init()
+     if _grouped_impl is None:
+         return _missing(*args, **kwargs)
+-    return _grouped_impl(
+-        *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+-    )
++    return _call_with_ue8m0_flag(_grouped_impl, *args, **kwargs)
+ 
+ 
+ def m_grouped_fp8_fp4_gemm_nt_contiguous(*args, **kwargs):
+     _lazy_init()
+     if _grouped_fp4_impl is None:
+         return _missing(*args, **kwargs)
+-    return _grouped_fp4_impl(
+-        *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+-    )
++    return _call_with_ue8m0_flag(_grouped_fp4_impl, *args, **kwargs)
+ 
+ 
+ def fp8_m_grouped_gemm_nt_masked(*args, **kwargs):
+     _lazy_init()
+     if _grouped_masked_impl is None:
+         return _missing(*args, **kwargs)
+-    return _grouped_masked_impl(
+-        *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+-    )
++    return _call_with_ue8m0_flag(_grouped_masked_impl, *args, **kwargs)
+ 
+ 
+ def transform_sf_into_required_layout(*args, **kwargs):
+diff --git a/v1/sample/rejection_sampler.py b/v1/sample/rejection_sampler.py
+index a1baf0a..e6e6f4c 100644
+--- a/v1/sample/rejection_sampler.py
++++ b/v1/sample/rejection_sampler.py
+@@ -379,7 +379,14 @@ class RejectionSampler(nn.Module):
+         spec_token_ids: list[list[int]] | None = None,
+     ) -> list[list[int]]:
+         if spec_token_ids is None:
+-            return output_token_ids
++            # 添加接受率统计日志
++    total_draft = sum(num_draft_tokens)
++    accepted_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item() - batch_size  # 减去bonus tokens
++    if total_draft > 0:
++        accept_rate = accepted_count / total_draft * 100
++        logger.info(f"[MTP接受率] 总draft: {total_draft}, 接受: {accepted_count}, 接受率: {accept_rate:.1f}%")
++    
++    return output_token_ids
+ 
+         result = []
+         for out, spec in zip(output_token_ids, spec_token_ids):
+@@ -466,7 +473,14 @@ def rejection_sample(
+             SYNTHETIC_MODE=synthetic_mode,
+         )
+         if sampling_metadata.all_greedy:
+-            return output_token_ids
++            # 添加接受率统计日志
++    total_draft = sum(num_draft_tokens)
++    accepted_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item() - batch_size  # 减去bonus tokens
++    if total_draft > 0:
++        accept_rate = accepted_count / total_draft * 100
++        logger.info(f"[MTP接受率] 总draft: {total_draft}, 接受: {accepted_count}, 接受率: {accept_rate:.1f}%")
++    
++    return output_token_ids
+ 
+     # Compute probability distribution from target logits.
+     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+@@ -504,6 +518,13 @@ def rejection_sample(
+         NO_DRAFT_PROBS=draft_probs is None,
+         SYNTHETIC_MODE=synthetic_mode,
+     )
++    # 添加接受率统计日志
++    total_draft = sum(num_draft_tokens)
++    accepted_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item() - batch_size  # 减去bonus tokens
++    if total_draft > 0:
++        accept_rate = accepted_count / total_draft * 100
++        logger.info(f"[MTP接受率] 总draft: {total_draft}, 接受: {accepted_count}, 接受率: {accept_rate:.1f}%")
++    
+     return output_token_ids
+ 
+ 
+diff --git a/v1/worker/gpu/dp_utils.py b/v1/worker/gpu/dp_utils.py
+index dddf630..c6bdb2e 100644
+--- a/v1/worker/gpu/dp_utils.py
++++ b/v1/worker/gpu/dp_utils.py
+@@ -257,6 +257,26 @@ def dispatch_cg_and_sync_dp(
+     if dp_size == 1:
+         return batch_desc, None
+ 
++    # FIX: Check if dp_sync matches the current batch before reusing.
++    # If dp_sync comes from a different batch (e.g., switching between
++    # real batch and dummy batch), reset it to None and perform a new sync.
++    # This prevents the assertion error: "reusing a DP sync taken over a different batch"
++    # Reference: vLLM 0.21 did not have dp_sync reuse, always performed fresh sync.
++    if dp_sync is not None:
++        # Check token count mismatch
++        token_mismatch = dp_sync.num_tokens_across_dp[dp_rank] != num_tokens
++
++        # Check uniform_token_count mismatch
++        uniform_mismatch = (
++            dp_sync.uniform_token_count is not None
++            and uniform_token_count is not None
++            and uniform_token_count != dp_sync.uniform_token_count
++        )
++
++        if token_mismatch or uniform_mismatch:
++            # Mismatch detected - reset dp_sync and perform fresh sync
++            dp_sync = None
++
+     if dp_sync is not None:
+         assert dp_sync.num_tokens_across_dp[dp_rank] == num_tokens, (
+             "reusing a DP sync taken over a different batch"
+diff --git a/v1/worker/gpu/spec_decode/eagle/utils.py b/v1/worker/gpu/spec_decode/eagle/utils.py
+index 05f771a..509ed4d 100644
+--- a/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -26,6 +26,18 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
+     return torch.equal(w, target.weight)
+ 
+ 
++def _should_share_mtp_head(eagle: nn.Module, head: nn.Module, target) -> bool:
++    """Share an MTP layer's shared_head.head unless the draft declares its own
++    trained per-layer heads and this one is loaded (no NaN) and distinct."""
++
++    w = getattr(head, "weight", None)
++    if not isinstance(w, torch.Tensor):
++        return True
++    if getattr(eagle, "has_own_mtp_heads", False) and torch.isnan(w).any():
++        return True
++    return _should_share(eagle, "has_own_mtp_heads", head, target)
++
++
+ def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
+     """The target's lm_head — from get_language_model() for
+     *ForConditionalGeneration targets, else the top-level module."""
+@@ -119,12 +131,16 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+ 
+         # MTP layers route logits through layer.shared_head.head, not
+         # eagle_model.lm_head, so the per-layer copies need fixing up too.
++        # Drafts declaring has_own_mtp_heads (e.g. Step5 multi-layer MTP) keep
++        # each independently trained head; missing/duplicate ones are shared.
+         layers = getattr(draft_inner, "layers", None)
+         if layers is not None:
+             items = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+             for layer in items:
+                 sh = getattr(layer, "shared_head", None)
+                 if sh is not None and hasattr(sh, "head"):
++                    if not _should_share_mtp_head(eagle_model, sh.head, target_lm_head):
++                        continue
+                     del sh.head
+                     sh.head = target_lm_head
+ 
+diff --git a/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py b/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+index 90572c0..a442493 100644
+--- a/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
++++ b/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+@@ -383,6 +383,10 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+         # The output hidden state at position P (= positions) and the token id
+         # at P+1 are used to draft the token at P+2. Sampling keys a draw by the
+         # position before the sampled token, so the net adjustment is +1.
++        # sampling position. Each MTP layer internally knows which future token
++        # it predicts via spec_step_idx. The original 0.28 code incremented
++        # sample_src_positions in the loop, causing position/slot mismatch
++        # and 0% acceptance for later draft positions.
+         sample_src_positions = positions + 1
+         idx_mapping = self.idx_mapping[:num_reqs]
+ 
+@@ -427,6 +431,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+                 self.seeds,
+                 self.current_draft_step,
+                 self.draft_logits,
++                spec_step_idx=step,
+             )
+ 
+             self.draft_tokens[:num_reqs, step] = draft_tokens
+@@ -454,6 +459,8 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+                 )
+                 # Advance the draft sampling key.
+                 sample_src_positions += 1
++                # All draft steps use the same sampling position, matching
++                # vLLM 0.21 where positions are constant across the draft loop.
+ 
+ 
+ @triton.jit
+diff --git a/v1/worker/gpu/spec_decode/speculator.py b/v1/worker/gpu/spec_decode/speculator.py
+index ecf36ce..94c7fbc 100644
+--- a/v1/worker/gpu/spec_decode/speculator.py
++++ b/v1/worker/gpu/spec_decode/speculator.py
+@@ -356,10 +356,10 @@ class DraftModelSpeculator(BaseSpeculator):
+             "(communication: O(2*tp_size) vs O(vocab_size))."
+         )
+ 
+-    def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
++    def _greedy_sample_draft(self, hidden_states: torch.Tensor, spec_step_idx: int = 0) -> torch.Tensor:
+         if self.use_local_argmax_reduction:
+-            return self.model.get_top_tokens(hidden_states)
+-        logits = self.model.compute_logits(hidden_states)
++            return self.model.get_top_tokens(hidden_states, spec_step_idx)
++        logits = self.model.compute_logits(hidden_states, spec_step_idx)
+         return logits.argmax(dim=-1)
+ 
+     def sample_draft(
+@@ -371,9 +371,12 @@ class DraftModelSpeculator(BaseSpeculator):
+         seeds: torch.Tensor,
+         draft_step: torch.Tensor,
+         draft_logits: torch.Tensor | None,
++        spec_step_idx: int = 0,
+     ) -> torch.Tensor:
++        # spec_step_idx selects the MTP module's own shared_head (norm + lm
++        # head); it must be a Python int so it stays graph-capture safe.
+         if draft_logits is not None:
+-            logits = self.model.compute_logits(hidden_states)
++            logits = self.model.compute_logits(hidden_states, spec_step_idx)
+             return gumbel_sample(
+                 logits,
+                 idx_mapping,
+@@ -386,7 +389,7 @@ class DraftModelSpeculator(BaseSpeculator):
+                 logits_cache_col=draft_step,
+                 use_fp64=self.use_fp64_gumbel,
+             )
+-        return self._greedy_sample_draft(hidden_states)
++        return self._greedy_sample_draft(hidden_states, spec_step_idx)
+ 
+     def _copy_request_inputs(
+         self,
+-- 
+2.34.1
+

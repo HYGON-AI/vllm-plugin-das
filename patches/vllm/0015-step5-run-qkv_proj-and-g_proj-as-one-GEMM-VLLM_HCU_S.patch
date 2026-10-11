@@ -1,0 +1,100 @@
+From b8ac9c5fe88034ff36a68d234310eb4989bad5a4 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Fri, 9 Oct 2026 15:16:18 +0800
+Subject: [PATCH 15/24] step5: run qkv_proj and g_proj as one GEMM
+ (VLLM_HCU_STEP5_FUSE_QKVG, default on)
+
+Both weights become column views of one [hidden, qkv + heads] buffer, so the
+loaders fill it in place. Removes the g_proj GEMM + PostGSU (~11us/layer).
+bs32 64k/4k decode 1087.66 -> 1094.57 tok/s, ITL 82.69 -> 82.23 ms.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ model_executor/models/step5_text.py | 38 +++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/model_executor/models/step5_text.py b/model_executor/models/step5_text.py
+index 273d75a..db8d57d 100644
+--- a/model_executor/models/step5_text.py
++++ b/model_executor/models/step5_text.py
+@@ -133,6 +133,12 @@ _DSA_INDEXER_SUBSTRINGS = (
+ # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
+ DISABLE_DSA = os.environ.get("VLLM_STEP5_DISABLE_DSA", "0") == "1"
+ 
++# Run qkv_proj and g_proj as one GEMM. Both weights become column views of one
++# [hidden, qkv + heads] buffer, so the loaders fill it in place and no
++# post-load step is needed (AutoWeightsLoader may call load_weights twice).
++# Only valid for the HCU [in, out] weight layout (VLLM_USE_NN).
++FUSE_QKVG = os.environ.get("VLLM_HCU_STEP5_FUSE_QKVG", "1") == "1"
++
+ 
+ def dsa_layer_indices(config: Any) -> list[int]:
+     """Loaded layer indices that run DSA, in order.
+@@ -362,6 +368,7 @@ class Step5Attention(nn.Module):
+         self.q_norm = _fp32_gemma_rms_norm(self.head_dim, rms_norm_eps)
+         self.k_norm = _fp32_gemma_rms_norm(self.head_dim, rms_norm_eps)
+         self.use_head_wise_attn_gate = use_head_wise_attn_gate
++        self.register_buffer("qkvg_weight", None, persistent=False)
+         if use_head_wise_attn_gate:
+             self.g_proj = ColumnParallelLinear(
+                 hidden_size,
+@@ -370,6 +377,7 @@ class Step5Attention(nn.Module):
+                 quant_config=None,
+                 prefix=f"{prefix}.g_proj",
+             )
++            self._maybe_fuse_qkvg()
+ 
+         self.use_rope = True
+         if use_rope_layers:
+@@ -431,12 +439,37 @@ class Step5Attention(nn.Module):
+             int(self.head_dim * self.partial_rotary_factor),
+         )
+ 
++    def _maybe_fuse_qkvg(self) -> None:
++        if not FUSE_QKVG:
++            return
++        try:
++            from vllm_hcu.platforms import envs as henvs
++        except ImportError:
++            return
++        wq, wg = self.qkv_proj.weight, self.g_proj.weight
++        if not henvs.VLLM_USE_NN or wq.dim() != 2 or wq.shape[0] != wg.shape[0]:
++            return
++        nq = wq.shape[1]
++        fused = torch.empty(
++            wq.shape[0], nq + wg.shape[1], dtype=wq.dtype, device=wq.device
++        )
++        wq.data = fused[:, :nq]
++        wg.data = fused[:, nq:]
++        self.register_buffer("qkvg_weight", fused, persistent=False)
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        qkv, _ = self.qkv_proj(hidden_states)
++        if self.qkvg_weight is not None:
++            qkvg = torch.matmul(hidden_states, self.qkvg_weight)
++            qkv, extra_dims = qkvg.split(
++                [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
++            )
++        else:
++            qkv, _ = self.qkv_proj(hidden_states)
++            extra_dims = None
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+         q_by_head = self.q_norm(q_by_head.contiguous())
+@@ -453,7 +486,8 @@ class Step5Attention(nn.Module):
+             self.indexer.forward(hidden_states, positions)
+         attn_output = self.attn(q, k, v)
+         if self.use_head_wise_attn_gate:
+-            extra_dims, _ = self.g_proj(hidden_states)
++            if extra_dims is None:
++                extra_dims, _ = self.g_proj(hidden_states)
+             output = (
+                 attn_output.view(*attn_output.shape[:-1], self.num_heads, self.head_dim)
+                 * extra_dims.unsqueeze(-1).sigmoid()
+-- 
+2.34.1
+

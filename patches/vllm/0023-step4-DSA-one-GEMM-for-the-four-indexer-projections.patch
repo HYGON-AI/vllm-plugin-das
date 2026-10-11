@@ -1,0 +1,226 @@
+From daa2b876a8bb987a36c6d7f89281b779812977f8 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Sun, 11 Oct 2026 10:59:19 +0800
+Subject: [PATCH 23/24] step4 DSA: one GEMM for the four indexer projections
+
+Stack the q/k/z/w indexer weights into one [1540, hidden] matrix (built once,
+outside graph capture; q/k/z re-pointed at its rows, w cast to the activation
+dtype as before) and slice the outputs as column views. The norm/rope, summary
+and spec scorer kernels take the row strides, so no copies are added.
+
+Idea from a colleague's TP4 branch (vllm-plugin-das). Decode profile, bs32
+64k/4k MTP3: indexer projections 964 -> 731 us/step (3 hipBLASLt kernels per
+DSA layer -> 1), step 64.17 -> 63.92 ms. Prompt NLL 0.6511 vs 0.6501 baseline,
+within the 0.6498-0.6512 run-to-run spread. STEP5_DSA_MERGED_PROJ=0 restores
+the separate GEMMs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ model_executor/layers/step4_dsa.py         | 85 +++++++++++++++++++---
+ model_executor/layers/step4_dsa_kernels.py | 10 ++-
+ 2 files changed, 81 insertions(+), 14 deletions(-)
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index 0bbc12c..cb28528 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -684,6 +684,7 @@ def _spec_summaries_kernel(
+     num_tokens,
+     trash_row,
+     stride_tok,
++    stride_tok_z,
+     stride_pend_row,
+     stride_pend_pos,
+     stride_summary_row,
+@@ -743,7 +744,11 @@ def _spec_summaries_kernel(
+     )
+     zed = tl.where(
+         tok_mask,
+-        tl.load(tok_z_ptr + tok_offs, mask=tok_mask, other=0.0),
++        tl.load(
++            tok_z_ptr + tok[:, None] * stride_tok_z + dims[None, :],
++            mask=tok_mask,
++            other=0.0,
++        ),
+         tl.load(pend_z_ptr + pend_offs, mask=pend_mask, other=0.0),
+     )
+ 
+@@ -784,6 +789,9 @@ def _spec_summaries_kernel(
+ # restores the unfused torch path.
+ _SPEC_FUSED_SUMMARIES = os.environ.get("VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES", "1") == "1"
+ 
++# One GEMM for the four indexer projections (Step4Indexer._merged_projection).
++_MERGED_PROJ = os.environ.get("STEP5_DSA_MERGED_PROJ", "1") == "1"
++
+ 
+ @triton.jit
+ def _store_kv_rows_kernel(
+@@ -3977,10 +3985,21 @@ class Step4Indexer:
+         owner = self.owner
+         proxy = self.geometry.proxy_dim
+ 
+-        index_q = owner.sparse_indexer_q(hidden_states)
+-        index_k = owner.sparse_indexer_k(hidden_states)
+-        index_z = owner.sparse_indexer_z(hidden_states)
+-        q_norm_w, k_norm_w, k_norm_b, w_weight = self._cast_params(index_q.dtype)
++        q_norm_w, k_norm_w, k_norm_b, w_weight = self._cast_params(hidden_states.dtype)
++        merged = self._merged_projection(hidden_states.dtype)
++        if merged is not None:
++            # One GEMM for q | k | z | w; the outputs are column views of it.
++            nq = self.num_heads * proxy
++            out = F.linear(hidden_states, merged)
++            index_q = out[:, :nq]
++            index_k = out[:, nq : nq + proxy]
++            index_z = out[:, nq + proxy : nq + 2 * proxy]
++            raw_weights = out[:, nq + 2 * proxy :]
++        else:
++            index_q = owner.sparse_indexer_q(hidden_states).contiguous()
++            index_k = owner.sparse_indexer_k(hidden_states).contiguous()
++            index_z = owner.sparse_indexer_z(hidden_states).contiguous()
++            raw_weights = None
+ 
+         cos, sin = self.state.rope_tables(
+             theta=self.rope_theta,
+@@ -3993,9 +4012,9 @@ class Step4Indexer:
+         # rotation and index_z is returned untouched -- it is a per-dimension
+         # softmax logit, not a key.
+         index_q, index_k, index_z = indexer_norm_rope(
+-            index_q.contiguous(),
+-            index_k.contiguous(),
+-            index_z.contiguous(),
++            index_q,
++            index_k,
++            index_z,
+             q_norm_w,
+             k_norm_w,
+             k_norm_b,
+@@ -4011,6 +4030,8 @@ class Step4Indexer:
+             # Every scorer applies round_activations_e4m3 to q; doing it in the
+             # norm's store makes that idempotent pass skippable (q_prerounded).
+             round_q=True,
++            # Row-strided z is fine: the summary kernels take its row stride.
++            contiguous_z=merged is None,
+         )
+ 
+         # Round the fp32 weight to the activation dtype *before* the GEMM and
+@@ -4018,9 +4039,9 @@ class Step4Indexer:
+         # the deployed semantics: doing the GEMM in fp32 gives different scores.
+         # The widening and the prescale are left to the scorer (_prescaled, or
+         # folded into spec_indexer_logits), so the GEMM output is returned raw.
+-        weights = F.linear(hidden_states, w_weight).view(
+-            num_tokens, self.num_kv_groups, self.heads_per_group
+-        )
++        if raw_weights is None:
++            raw_weights = F.linear(hidden_states, w_weight)
++        weights = raw_weights.view(num_tokens, self.num_kv_groups, self.heads_per_group)
+ 
+         return (
+             index_q.view(num_tokens, self.num_kv_groups, self.heads_per_group, proxy),
+@@ -4029,6 +4050,44 @@ class Step4Indexer:
+             weights,
+         )
+ 
++    def _merged_projection(self, dtype: torch.dtype) -> torch.Tensor | None:
++        """``[q; k; z; w]`` weights stacked into one ``[N, hidden]`` matrix, or None.
++
++        Four decode-sized GEMMs cost ~35 us per DSA layer at M=64 and one GEMM over
++        the stacked weight ~24 us. Built once, outside graph capture: q/k/z are
++        re-pointed at their rows of it (no extra memory) and w is its activation-
++        dtype cast, the rounding boundary _project already applies to it. The
++        merged GEMM's rounding matches the separate GEMMs except for a few 1-ulp
++        differences. STEP5_DSA_MERGED_PROJ=0 keeps the separate GEMMs.
++        """
++        merged = getattr(self, "_merged_w", None)
++        if merged is not None and merged.dtype == dtype:
++            return merged
++        owner = self.owner
++        q, k, z = (
++            owner.sparse_indexer_q.weight,
++            owner.sparse_indexer_k.weight,
++            owner.sparse_indexer_z.weight,
++        )
++        if (
++            not _MERGED_PROJ
++            or torch.cuda.is_current_stream_capturing()
++            or q.dtype != dtype
++            or not (k.dtype == z.dtype == dtype)
++        ):
++            return None
++        w = owner.sparse_indexer_w.weight
++        rows = [q.shape[0], k.shape[0], z.shape[0], w.shape[0]]
++        merged = torch.empty(sum(rows), q.shape[1], dtype=dtype, device=q.device)
++        parts = merged.split(rows)
++        for dst, src in zip(parts, (q, k, z, w)):
++            dst.copy_(src.detach())
++        for param, view in zip((q, k, z), parts):
++            param.data = view
++        self._merged_w = merged
++        logger.info_once("DSA indexer: q/k/z/w projections merged into one GEMM")
++        return merged
++
+     def _cast_params(
+         self, dtype: torch.dtype
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+@@ -4239,6 +4298,7 @@ class Step4Indexer:
+                 ndt,
+                 state.pending_trash_row,
+                 index_k.stride(0),
++                index_z.stride(0),
+                 pending_key.stride(0),
+                 pending_key.stride(1),
+                 summary.stride(0),
+@@ -4474,7 +4534,8 @@ class Step4Indexer:
+         ):
+             spec_indexer_logits(
+                 index_q[:ndt].contiguous(),
+-                weights[:ndt].contiguous(),
++                # Row-strided under the merged projection; the kernels take strides.
++                weights[:ndt],
+                 state.summary[self.slot],
+                 sched.req_table,
+                 sched.query_start_loc,
+diff --git a/model_executor/layers/step4_dsa_kernels.py b/model_executor/layers/step4_dsa_kernels.py
+index 66b3d78..9ec7ba4 100644
+--- a/model_executor/layers/step4_dsa_kernels.py
++++ b/model_executor/layers/step4_dsa_kernels.py
+@@ -303,7 +303,7 @@ def _norm_rope(
+     subtract_mean: bool,
+     round_e4m3: bool = False,
+ ) -> torch.Tensor:
+-    out = torch.empty_like(x)
++    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+     _indexer_norm_rope_kernel[(x.shape[0], num_heads)](
+         x,
+         out,
+@@ -346,6 +346,7 @@ def indexer_norm_rope(
+     eps: float = 1e-6,
+     q_norm_weight_bias: float = 1.0,
+     round_q: bool = False,
++    contiguous_z: bool = True,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Prepare the indexer's q/k/z from their fused projection.
+ 
+@@ -358,6 +359,11 @@ def indexer_norm_rope(
+             ``0.0`` otherwise. This follows the checkpoint's norm class, so it must be
+             threaded through from config rather than hardcoded.
+         round_q: return q already passed through ``round_activations_e4m3``.
++        contiguous_z: copy a row-strided index_z; ``False`` returns it as is,
++            for consumers that take its row stride.
++
++    index_q and index_k may be row-strided (column slices of one projection);
++    the normalised outputs are contiguous either way.
+     """
+     return (
+         _norm_rope(
+@@ -389,7 +395,7 @@ def indexer_norm_rope(
+             weight_bias=0.0,
+             subtract_mean=True,
+         ),
+-        index_z.contiguous(),
++        index_z.contiguous() if contiguous_z else index_z,
+     )
+ 
+ 
+-- 
+2.34.1
+

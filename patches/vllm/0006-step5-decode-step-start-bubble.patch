@@ -1,0 +1,265 @@
+From 637c774e667a6aa95acc04eb207d26b34784ea68 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Wed, 7 Oct 2026 23:34:25 +0800
+Subject: [PATCH 06/24] =?UTF-8?q?=E8=A7=A3=E5=86=B3step5=E6=AF=8F=E4=B8=AA?=
+ =?UTF-8?q?decode=20step=E5=BC=80=E5=A4=B4=E7=9A=84=E7=A9=BA=E6=B3=A1?=
+ =?UTF-8?q?=E9=97=AE=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DSA 构建 attention 元数据时读取 seq_lens_cpu / block_table 会触发 D2H 同步，
+需等待上一步 MTP drafter 全部完成，导致每个 step 开头约 2.5 ms 空闲。
+
+- InputBatch / build_attn_metadata / CommonAttentionMetadata 增加
+  seq_lens_cpu、num_computed_tokens_cpu、block_table_np 主机侧数据透传
+- BlockTables 增加可选的 numpy 主机镜像
+- execute_model 中 inputs_embeds 提前到 model_state.prepare_attn 之前，
+  使其 host 开销与上一步 GPU 计算重叠
+
+decode step 104 -> 99 ms，GPU 忙碌占比 95.9% -> 99.8%，64k x 8 256.7 s -> 250.9 s。
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ v1/attention/backend.py               |  6 +++
+ v1/worker/gpu/attn_utils.py           | 16 +++++++
+ v1/worker/gpu/block_table.py          | 29 ++++++++++++
+ v1/worker/gpu/input_batch.py          |  8 ++++
+ v1/worker/gpu/model_runner.py         | 65 ++++++++++++++-------------
+ v1/worker/gpu/model_states/default.py |  3 ++
+ 6 files changed, 96 insertions(+), 31 deletions(-)
+
+diff --git a/v1/attention/backend.py b/v1/attention/backend.py
+index f6ff832..9e49ce1 100644
+--- a/v1/attention/backend.py
++++ b/v1/attention/backend.py
+@@ -452,6 +452,11 @@ class CommonAttentionMetadata:
+     at the current decode run's last full-state write. write_pos counts from
+     here, so a preemption-resumed request re-anchors past the prompt boundary."""
+ 
++    block_table_np: np.ndarray | None = None
++    """(batch_size, max_num_blocks) host mirror of block_table_tensor, when the
++    runner keeps one. Entries past a row's allocated blocks are stale; padded
++    rows are zero. Lets host-scheduling builders avoid a block table D2H."""
++
+     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
+     _seq_lens_cpu: torch.Tensor | None = None
+     _num_computed_tokens_cpu: torch.Tensor | None = None
+@@ -567,6 +572,7 @@ class CommonAttentionMetadata:
+             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
++            block_table_np=maybe_slice_reqs(self.block_table_np),
+         )
+ 
+ 
+diff --git a/v1/worker/gpu/attn_utils.py b/v1/worker/gpu/attn_utils.py
+index 05949c2..f1ed9df 100644
+--- a/v1/worker/gpu/attn_utils.py
++++ b/v1/worker/gpu/attn_utils.py
+@@ -278,8 +278,19 @@ def build_attn_metadata(
+     causal: bool | torch.Tensor | Mapping[int, bool] = True,
+     rswa_prefix_lens: torch.Tensor | None = None,
+     ubatch_idx: int = 0,
++    seq_lens_cpu: torch.Tensor | None = None,
++    num_computed_tokens_cpu: torch.Tensor | None = None,
++    block_tables_np: Sequence[Any] | None = None,
+ ) -> dict[str, Any]:
+     seq_lens = seq_lens[:num_reqs]
++    # Exact host mirrors (see InputBatch.seq_lens_cpu); never used for capture,
++    # where the dummy batch has none.
++    if for_cudagraph_capture:
++        seq_lens_cpu = num_computed_tokens_cpu = block_tables_np = None
++    if seq_lens_cpu is not None:
++        seq_lens_cpu = seq_lens_cpu[:num_reqs]
++    if num_computed_tokens_cpu is not None:
++        num_computed_tokens_cpu = num_computed_tokens_cpu[:num_reqs]
+     if dcp_local_seq_lens is not None:
+         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
+     if seq_lens_cpu_upper_bound is not None:
+@@ -322,6 +333,11 @@ def build_attn_metadata(
+             is_prefilling=group_is_prefilling,
+             mm_req_doc_ranges=mm_req_doc_ranges,
+             rswa_prefix_lens=rswa_prefix_lens,
++            _seq_lens_cpu=seq_lens_cpu,
++            _num_computed_tokens_cpu=num_computed_tokens_cpu,
++            block_table_np=(
++                block_tables_np[i][:num_reqs] if block_tables_np is not None else None
++            ),
+             **common_attn_metadata_extra_kwargs,
+         )
+ 
+diff --git a/v1/worker/gpu/block_table.py b/v1/worker/gpu/block_table.py
+index c01895e..226e7a4 100644
+--- a/v1/worker/gpu/block_table.py
++++ b/v1/worker/gpu/block_table.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Iterable
+ 
++import numpy as np
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
+@@ -57,6 +58,9 @@ class BlockTables:
+                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
+             )
+             self.block_tables.append(block_table)
++        # Optional host mirror of the block tables, enabled by the runner when
++        # an attention backend schedules on the host (see gather_block_tables_np).
++        self.block_tables_np: list[np.ndarray] | None = None
+ 
+         self.num_blocks = UvaBackedTensor(
+             (self.num_kv_cache_groups, self.max_num_reqs),
+@@ -130,8 +134,33 @@ class BlockTables:
+                     f"row capacity ({end} > {row_capacity})"
+                 )
+             self.block_tables[i].stage_write(req_index, start, block_ids)
++            if self.block_tables_np is not None:
++                self.block_tables_np[i][req_index, start:end] = block_ids
+             self.num_blocks.np[i, req_index] = end
+ 
++    def enable_host_mirror(self) -> None:
++        if self.block_tables_np is None:
++            self.block_tables_np = [
++                np.zeros(tuple(b.gpu.shape), dtype=np.int32) for b in self.block_tables
++            ]
++
++    def gather_block_tables_np(
++        self, idx_mapping_np: np.ndarray, num_reqs_padded: int
++    ) -> tuple[np.ndarray, ...]:
++        """Host counterpart of gather_block_tables: same rows, padded rows zero.
++
++        Must be called after this step's append_block_ids (as the device gather
++        is), and the result is the data the device tables hold for this step.
++        """
++        assert self.block_tables_np is not None
++        num_reqs = idx_mapping_np.shape[0]
++        out = []
++        for table in self.block_tables_np:
++            gathered = np.zeros((num_reqs_padded, table.shape[1]), dtype=table.dtype)
++            np.take(table, idx_mapping_np, axis=0, out=gathered[:num_reqs])
++            out.append(gathered)
++        return tuple(out)
++
+     def apply_staged_writes(self) -> None:
+         if self.num_kv_cache_groups == 0:
+             return
+diff --git a/v1/worker/gpu/input_batch.py b/v1/worker/gpu/input_batch.py
+index 2a38c3d..3e77ea4 100644
+--- a/v1/worker/gpu/input_batch.py
++++ b/v1/worker/gpu/input_batch.py
+@@ -109,6 +109,14 @@ class InputBatch:
+     # stays valid for every replay the graph serves.
+     max_query_len: int | None = None
+ 
++    # Exact host copies of seq_lens / num_computed_tokens ([num_reqs_padded],
++    # padded rows zero) and of the gathered block tables, when the runner keeps
++    # a host mirror. They let host-scheduling attention builders skip the
++    # seq_lens D2H, which waits for the whole previous step (drafter included).
++    seq_lens_cpu: torch.Tensor | None = None
++    num_computed_tokens_cpu: torch.Tensor | None = None
++    block_tables_np: tuple[np.ndarray, ...] | None = None
++
+     @classmethod
+     def make_dummy(
+         cls,
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index 7dec923..6401b65 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -1695,6 +1695,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 block_tables = None
+                 slot_mappings = None
+ 
++        # Embeddings do not read the attention metadata. Building them first
++        # lets their host work overlap the previous step on the device, ahead
++        # of metadata builders that may wait for it (exact seq_lens).
++        input_ids = input_batch.input_ids
++        inputs_embeds = None
++        ec_connector_output = None
++        if self.uses_inputs_embeds and self.is_first_pp_rank:
++            # Prepare inputs_embeds (MM encoder outputs and/or prompt_embeds
++            # overlay). Only first PP rank prepares them.
++            if dummy_run:
++                # Obtain embeddings of correct shape for compiled model.
++                inputs_embeds = self.model_state.dummy_inputs_embeds(
++                    input_batch.num_tokens_after_padding
++                )
++            else:
++                scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
++                if self.supports_mm_inputs and self.lora_config is not None:
++                    set_active_mm_loras(
++                        model=self.model,
++                        lora_manager=self.lora_manager,
++                        encoder_cache=self.encoder_cache,
++                        req_id_to_index=self.req_states.req_id_to_index,
++                        lora_state=self.lora_state,
++                        scheduled_encoder_inputs=scheduled_encoder_inputs,
++                    )
++                with self.ec_connector.maybe_get_output(
++                    scheduler_output
++                ) as ec_connector_output:
++                    inputs_embeds = self.model_state.prepare_inputs_embeds(
++                        scheduled_encoder_inputs, input_batch, self.req_states
++                    )
++            if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
++                input_ids = None
++
+         attn_metadata = None
+         slot_mappings_by_layer = None
+         ubatch_state: UBatchState | None = None
+@@ -1731,37 +1765,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+             )
+ 
+-        input_ids = input_batch.input_ids
+-        inputs_embeds = None
+-        ec_connector_output = None
+-        if self.uses_inputs_embeds and self.is_first_pp_rank:
+-            # Prepare inputs_embeds (MM encoder outputs and/or prompt_embeds
+-            # overlay). Only first PP rank prepares them.
+-            if dummy_run:
+-                # Obtain embeddings of correct shape for compiled model.
+-                inputs_embeds = self.model_state.dummy_inputs_embeds(
+-                    input_batch.num_tokens_after_padding
+-                )
+-            else:
+-                scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+-                if self.supports_mm_inputs and self.lora_config is not None:
+-                    set_active_mm_loras(
+-                        model=self.model,
+-                        lora_manager=self.lora_manager,
+-                        encoder_cache=self.encoder_cache,
+-                        req_id_to_index=self.req_states.req_id_to_index,
+-                        lora_state=self.lora_state,
+-                        scheduled_encoder_inputs=scheduled_encoder_inputs,
+-                    )
+-                with self.ec_connector.maybe_get_output(
+-                    scheduler_output
+-                ) as ec_connector_output:
+-                    inputs_embeds = self.model_state.prepare_inputs_embeds(
+-                        scheduled_encoder_inputs, input_batch, self.req_states
+-                    )
+-            if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
+-                input_ids = None
+-
+         model_inputs = {
+             "input_ids": input_ids,
+             "positions": input_batch.positions,
+diff --git a/v1/worker/gpu/model_states/default.py b/v1/worker/gpu/model_states/default.py
+index 7d42745..54e08ba 100644
+--- a/v1/worker/gpu/model_states/default.py
++++ b/v1/worker/gpu/model_states/default.py
+@@ -226,5 +226,8 @@ class DefaultModelState(ModelState):
+             for_cudagraph_capture=for_capture,
+             rswa_prefix_lens=input_batch.prompt_lens,
+             ubatch_idx=ubatch_idx,
++            seq_lens_cpu=input_batch.seq_lens_cpu,
++            num_computed_tokens_cpu=input_batch.num_computed_tokens_cpu,
++            block_tables_np=input_batch.block_tables_np,
+         )
+         return attn_metadata
+-- 
+2.34.1
+
