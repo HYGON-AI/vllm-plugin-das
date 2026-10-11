@@ -203,17 +203,7 @@ def can_use_swa_decode_fp8_d192(
     )
 
 
-def swa_decode_fp8_d192(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    seqused_k: torch.Tensor,
-    block_table: torch.Tensor,
-    softmax_scale: float,
-    window_left: int,
-) -> torch.Tensor:
+def _swa_split(q, k, v, cu_seqlens_q, seqused_k, block_table, softmax_scale, window_left):
     num_heads = q.shape[1]
     num_kv_heads = k.shape[2]
     group = num_heads // num_kv_heads
@@ -237,6 +227,25 @@ def swa_decode_fp8_d192(
         BLOCK_N=_BLOCK_N, CHUNK=_CHUNK, PAGE=k.shape[1], NUM_SPLITS=num_splits,
         num_warps=4, num_stages=1,
     )
+    return m_ws, l_ws, o_ws, group, ql_max, num_splits
+
+
+def swa_decode_fp8_d192(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    softmax_scale: float,
+    window_left: int,
+) -> torch.Tensor:
+    num_heads = q.shape[1]
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    m_ws, l_ws, o_ws, group, ql_max, num_splits = _swa_split(
+        q, k, v, cu_seqlens_q, seqused_k, block_table, softmax_scale, window_left
+    )
     _swa_combine_kernel[(num_seqs, ql_max, num_heads)](
         m_ws, l_ws, o_ws, out, cu_seqlens_q,
         out.stride(0), out.stride(1),
@@ -245,3 +254,162 @@ def swa_decode_fp8_d192(
         num_warps=1,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Step5 attention epilogue: out * sigmoid(gate[head]) -> per-token fp8 for the
+# o_proj W8A8 GEMM. Same arithmetic as the Inductor kernels it replaces
+# (fp32, no rounding between gate and quant; scale = max(amax / 448, 1e-12)).
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _gate_quant_store(x, t, gate_ptr, stride_gt, xq_ptr, xs_ptr,
+                      NH: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+    # x: [NH, BD] fp32 (bf16-representable), columns >= D are zero.
+    offs_h = tl.arange(0, NH)
+    offs_d = tl.arange(0, BD)
+    d_ok = offs_d < D
+    g = tl.load(gate_ptr + t.to(tl.int64) * stride_gt + offs_h).to(tl.float32)
+    x = x * tl.sigmoid(g)[:, None]
+    amax = tl.max(tl.max(tl.abs(x), axis=1), axis=0)
+    # 1/448 rounded to fp32, as Inductor folds the division.
+    scale = tl.maximum(amax * 0.002232142857142857, 1e-12)
+    xq = tl.minimum(tl.maximum(x / scale, -448.0), 448.0).to(tl.float8e4nv)
+    dst = xq_ptr + t.to(tl.int64) * (NH * D) + offs_h[:, None] * D + offs_d[None, :]
+    tl.store(dst, xq, mask=d_ok[None, :])
+    tl.store(xs_ptr + t, scale)
+
+
+@triton.jit
+def _zero_row(t, xq_ptr, xs_ptr, NH: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+    offs_h = tl.arange(0, NH)
+    offs_d = tl.arange(0, BD)
+    dst = xq_ptr + t.to(tl.int64) * (NH * D) + offs_h[:, None] * D + offs_d[None, :]
+    tl.store(dst, tl.zeros([NH, BD], tl.float32).to(tl.float8e4nv),
+             mask=(offs_d < D)[None, :])
+    tl.store(xs_ptr + t, 1.0)
+
+
+@triton.jit
+def _swa_combine_gate_quant_kernel(
+    m_ws, l_ws, o_ws,
+    cu_seqlens_q, num_seqs,
+    gate_ptr, stride_gt,
+    xq_ptr, xs_ptr,
+    NH: tl.constexpr,
+    GROUP: tl.constexpr,
+    QL_MAX: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    SEQS_P2: tl.constexpr,
+):
+    # One program per token row (all heads): merge the split partials (single
+    # pass, online rescaling, so all split loads are issued up front), round to
+    # bf16 as the bf16 attention output would be, then gate + quantize the row.
+    # Rows past the last request (cudagraph padding) get zeros.
+    BLOCK_M: tl.constexpr = QL_MAX * GROUP
+    t = tl.program_id(0)
+    offs_r = tl.arange(0, SEQS_P2)
+    ends = tl.load(cu_seqlens_q + 1 + offs_r, mask=offs_r < num_seqs, other=2147483647)
+    done = ends <= t
+    r = tl.sum(done.to(tl.int32), axis=0)
+    if r >= num_seqs:
+        _zero_row(t, xq_ptr, xs_ptr, NH, 192, 256)
+        return
+    # Start of request r = end of the last finished one (no dependent load).
+    tok = t - tl.max(tl.where(done, ends, 0), axis=0)
+    offs_h = tl.arange(0, NH)
+    offs_d = tl.arange(0, 256)
+    d_ok = offs_d < 192
+    num_kv_heads: tl.constexpr = NH // GROUP
+    base = ((r * num_kv_heads + offs_h // GROUP) * NUM_SPLITS) * BLOCK_M + tok * GROUP + offs_h % GROUP
+    m_run = tl.full([NH], float("-inf"), tl.float32)
+    l_sum = tl.zeros([NH], tl.float32)
+    acc = tl.zeros([NH, 256], tl.float32)
+    for s in tl.static_range(NUM_SPLITS):
+        idx = base + s * BLOCK_M
+        m = tl.load(m_ws + idx)
+        l = tl.load(l_ws + idx)
+        o = tl.load(o_ws + idx[:, None] * 192 + offs_d[None, :], mask=d_ok[None, :], other=0.0)
+        m_new = tl.maximum(m_run, m)
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        a = tl.exp2(m_run - m_safe)
+        w = l * tl.exp2(m - m_safe)
+        acc = acc * a[:, None] + w[:, None] * o.to(tl.float32)
+        l_sum = l_sum * a + w
+        m_run = m_new
+    acc = acc / tl.where(l_sum > 0, l_sum, 1.0)[:, None]
+    x = acc.to(tl.bfloat16).to(tl.float32)
+    _gate_quant_store(x, t, gate_ptr, stride_gt, xq_ptr, xs_ptr, NH, 192, 256)
+
+
+@triton.jit
+def _gate_quant_kernel(
+    x_ptr, stride_xt, num_valid,
+    gate_ptr, stride_gt,
+    xq_ptr, xs_ptr,
+    NH: tl.constexpr,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+):
+    t = tl.program_id(0)
+    if t >= num_valid:
+        _zero_row(t, xq_ptr, xs_ptr, NH, D, BD)
+        return
+    offs_h = tl.arange(0, NH)
+    offs_d = tl.arange(0, BD)
+    x = tl.load(x_ptr + t.to(tl.int64) * stride_xt + offs_h[:, None] * D + offs_d[None, :],
+                mask=(offs_d < D)[None, :], other=0.0).to(tl.float32)
+    _gate_quant_store(x, t, gate_ptr, stride_gt, xq_ptr, xs_ptr, NH, D, BD)
+
+
+def gate_quant_fp8(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    num_valid: int | None = None,
+    num_warps: int = 4,
+) -> None:
+    """x bf16 [T, NH * D], gate [T, NH] (row-strided) -> xq fp8 [T, NH * D],
+    xs fp32 [T, 1]. Rows >= num_valid are written as zeros (scale 1)."""
+    num_tokens = xq.shape[0]
+    if num_tokens == 0:
+        return
+    nh = gate.shape[-1]
+    d = x.shape[-1] // nh
+    _gate_quant_kernel[(num_tokens,)](
+        x, x.stride(0), num_tokens if num_valid is None else num_valid,
+        gate, gate.stride(0), xq, xs,
+        NH=nh, D=d, BD=triton.next_power_of_2(d),
+        num_warps=num_warps,
+    )
+
+
+def swa_decode_fp8_d192_gate_quant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    softmax_scale: float,
+    window_left: int,
+    gate: torch.Tensor,
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    num_warps: int = 8,
+) -> None:
+    """swa_decode_fp8_d192 whose combine also applies the per-head sigmoid
+    gate and quantizes each token row to fp8 (xq [T, NH * 192], xs [T, 1])."""
+    num_heads = q.shape[1]
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    m_ws, l_ws, o_ws, group, ql_max, num_splits = _swa_split(
+        q, k, v, cu_seqlens_q, seqused_k, block_table, softmax_scale, window_left
+    )
+    _swa_combine_gate_quant_kernel[(xq.shape[0],)](
+        m_ws, l_ws, o_ws, cu_seqlens_q, num_seqs,
+        gate, gate.stride(0), xq, xs,
+        NH=num_heads, GROUP=group, QL_MAX=ql_max, NUM_SPLITS=num_splits,
+        SEQS_P2=max(triton.next_power_of_2(num_seqs), 2),
+        num_warps=num_warps,
+    )

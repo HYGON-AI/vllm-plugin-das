@@ -35,6 +35,7 @@ from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 from vllm_hcu.v1.attention.backends.swa_decode import (
     can_use_swa_decode_fp8_d192,
     swa_decode_fp8_d192,
+    swa_decode_fp8_d192_gate_quant,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.dcp import (
@@ -1174,6 +1175,83 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def forward_swa_gate_quant(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        gate: torch.Tensor,
+        xq: torch.Tensor,
+        xs: torch.Tensor,
+    ) -> bool:
+        """Sliding decode with the Step5 epilogue fused into the split combine:
+        writes sigmoid(gate)-scaled, per-token fp8 output (xq, xs) instead of
+        the bf16 attention output. Only where forward() would take the
+        swa_decode_fp8_d192 path; returns False otherwise (nothing written)."""
+        if (
+            attn_metadata.use_cascade
+            or self.dcp_world_size > 1
+            or self.attn_type != AttentionType.DECODER
+            or not _SWA_DECODE_ENABLED
+            or _get_flash_attn_mode() != "cutlass"
+            or layer._q_scale_float != 1.0
+            or layer._k_scale_float != 1.0
+            or layer._v_scale_float != 1.0
+            or not is_quantized_kv_cache(self.kv_cache_dtype)
+        ):
+            return False
+        key_cache, value_cache = _split_kv_cache(kv_cache, query.shape[-1])
+        key_cache = canonicalize_singleton_dim_strides(key_cache)
+        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        dtype = HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+            self.kv_cache_dtype
+        )
+        key_cache = key_cache.view(dtype)
+        value_cache = value_cache.view(dtype)
+        sliding_window_size = _get_native_sliding_window(
+            attn_metadata.sliding_window,
+            self.sliding_window,
+            attn_metadata.causal,
+        )
+        if not (
+            can_use_paged_fp8_d192_fwd(
+                key_cache,
+                value_cache,
+                gate,  # only its dtype is checked: the bf16 output it replaces
+                self.alibi_slopes,
+                self.logits_soft_cap,
+                self.sinks,
+            )
+            and can_use_swa_decode_fp8_d192(
+                query,
+                key_cache,
+                attn_metadata.max_query_len,
+                attn_metadata.causal,
+                sliding_window_size,
+                self.sinks,
+            )
+        ):
+            return False
+        logger.info_once(
+            "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 + gate/fp8 quant epilogue",
+            scope="local",
+        )
+        swa_decode_fp8_d192_gate_quant(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.query_start_loc,
+            attn_metadata.seq_lens,
+            attn_metadata.block_table,
+            self.scale,
+            sliding_window_size[0],
+            gate,
+            xq,
+            xs,
+        )
+        return True
 
     def do_kv_cache_update(
         self,
