@@ -22,10 +22,11 @@ _FEATURE_FIELDS = (
     "enable_multi_layers_mtp",
     "deepep_auto",
     "fused_qwen3_rms_rope",
+    "qwen4_exp_hc_sp",
     "moe_backend",
     "hcu_flash_attn_mode",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
+_BOOLEAN_FIELDS = _FEATURE_FIELDS[:7]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _DEEP_GEMM_BACKEND = "deep_gemm"
@@ -72,6 +73,9 @@ class HcuFeatureConfig:
     # cache partitioning. Platform validation refreshes it from the process
     # environment before vLLM computes its config hash.
     fused_qwen3_rms_rope: bool = True
+    # Qwen4Exp HC sequence parallelism (VLLM_HCU_QWEN4_EXP_HC_SP), resolved
+    # the same way: it changes the traced graph, so it must partition caches.
+    qwen4_exp_hc_sp: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
 

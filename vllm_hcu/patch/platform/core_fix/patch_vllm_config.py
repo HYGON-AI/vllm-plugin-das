@@ -441,6 +441,7 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # the exact same master-and-child result before VllmConfig.compute_hash
         # so feature-off and feature-on AOT graphs cannot share a cache entry.
         "fused_qwen3_rms_rope": hcu_envs.fused_qwen3_rms_rope_enabled(),
+        "qwen4_exp_hc_sp": hcu_envs.VLLM_HCU_QWEN4_EXP_HC_SP,
     }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache

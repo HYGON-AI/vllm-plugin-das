@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
+    VLLM_HCU_QWEN4_EXP_HC_SP: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -560,6 +561,14 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
+    # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel
+    # MoE is active (DP>1, TP>1, EP). Off by default: on HCU the replicated
+    # layout is faster because all-reduce uses the AITER custom kernel.
+    "VLLM_HCU_QWEN4_EXP_HC_SP":
+        lambda: (os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "False").lower() in
+                    ("true", "1")),
 
     # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
     # (official 16x16 tiles, HCU Triton decode reader) or "normal"
