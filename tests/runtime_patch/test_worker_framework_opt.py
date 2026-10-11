@@ -553,6 +553,9 @@ def test_base_communicator_reads_custom_sp_sidecar_and_uses_torch_collective(
 
 def test_cuda_communicator_registers_exact_exchange_and_marks_stale_removal_obsolete():
     class CudaCommunicator:
+        def all_gatherv(self, input_, dim=0, sizes=None):
+            return input_
+
         def __init__(
             self,
             cpu_group,
@@ -601,6 +604,9 @@ def test_cuda_communicator_replaces_normalized_ll_manager_for_auto(
     )
 
     class CudaCommunicator:
+        def all_gatherv(self, input_, dim=0, sizes=None):
+            return input_
+
         def __init__(
             self,
             cpu_group,
@@ -640,6 +646,9 @@ def test_cuda_communicator_auto_ignores_non_ep_collective_groups(
     )
 
     class CudaCommunicator:
+        def all_gatherv(self, input_, dim=0, sizes=None):
+            return input_
+
         def __init__(
             self,
             cpu_group,

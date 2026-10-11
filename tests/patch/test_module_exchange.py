@@ -237,10 +237,26 @@ def test_deep_gemm_replacements_preserve_v0251_surface_and_signatures(
             for node in target_node.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
+        target_method_names = {node.name for node in target_methods}
         replacement_methods = [
             node
             for node in replacement_node.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        # HCU may add private helpers; the target's methods must stay intact.
+        helper_names = [
+            node.name
+            for node in replacement_methods
+            if node.name not in target_method_names
+        ]
+        assert all(
+            name.startswith("_") and not name.endswith("__")
+            for name in helper_names
+        ), f"{target_node.name}: non-private additions {helper_names}"
+        replacement_methods = [
+            node
+            for node in replacement_methods
+            if node.name in target_method_names
         ]
         assert [node.name for node in replacement_methods] == [
             node.name for node in target_methods

@@ -2957,13 +2957,15 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
         None,
         None,
     ) == tensors
+    # Channel-FP8 DEEPGEMM weights already in the Marlin 6D layout pass through.
+    packed = tuple(SimpleNamespace(dim=lambda: 6) for _ in range(4))
     assert module.convert_to_fp8_moe_kernel_format(
         module.Fp8MoeBackend.DEEPGEMM,
         SimpleNamespace(weight_block_size=None),
-        *tensors,
+        *packed,
         None,
         None,
-    ) == tensors
+    ) == packed
     assert module.convert_to_fp8_moe_kernel_format(
         module.Fp8MoeBackend.AITER,
         SimpleNamespace(weight_block_size=None),
@@ -5574,6 +5576,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
                 raise AssertionError("preselected routing must bypass router")
 
         runner = object.__new__(runner_module.MoERunner)
+        runner._ep_fused_combine = False
         runner.routed_experts = SimpleNamespace(quant_method=QuantMethod())
         runner._shared_experts = None
         runner.router = Router()
@@ -5649,6 +5652,7 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
 
         pcp_group = PCPGroup()
         runner = object.__new__(runner_module.MoERunner)
+        runner._ep_fused_combine = False
         runner.moe_config = SimpleNamespace(
             pcp_size=2,
             dp_size=1,
