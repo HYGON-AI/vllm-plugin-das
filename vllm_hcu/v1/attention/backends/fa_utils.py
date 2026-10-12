@@ -15,34 +15,44 @@ from flash_attn import (
     varlen_fwd_unified as _varlen_fwd_unified,
     vllm_flash_attn_varlen_func,
 )
+from packaging.specifiers import SpecifierSet
+from packaging.version import InvalidVersion, Version
 from torch import Tensor
 from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 
 import vllm_hcu.hcu_ops as hcu_ops
 
 
-# flash_attn 2.8.4 vendor builds carry the native long-prefill gather.
-_FLASH_ATTN_NATIVE_LONG_PREFILL_GATHER_VERSION = "2.8.4"
+# This range describes the Python/native API line exercised by the plugin. It
+# does not attest that a particular vendor artifact contains the native
+# long-prefill gather workspace fix; deployment images must validate that
+# binary capability separately.
+_FLASH_ATTN_COMPATIBLE_VERSIONS = SpecifierSet(">=2.8.4,<2.9")
 
 
-def _require_native_long_prefill_gather() -> None:
+def _require_compatible_flash_attn() -> None:
     try:
         actual = importlib_metadata.version("flash_attn")
     except importlib_metadata.PackageNotFoundError:
         actual = None
-    # Compare the public version only; any local build tag (+...) is accepted.
-    if actual is None or actual.split("+", 1)[0] != (
-        _FLASH_ATTN_NATIVE_LONG_PREFILL_GATHER_VERSION
-    ):
+
+    try:
+        parsed = None if actual is None else Version(actual)
+    except InvalidVersion as exc:
         raise RuntimeError(
-            "HCU requires a flash_attn build with the native long-prefill "
-            "gather fix; supported builds: "
-            f"{_FLASH_ATTN_NATIVE_LONG_PREFILL_GATHER_VERSION}; "
-            f"found {actual!r}. Rebuild the image with a supported vendor wheel."
+            f"Invalid flash_attn distribution version: {actual!r}"
+        ) from exc
+
+    if parsed is None or parsed not in _FLASH_ATTN_COMPATIBLE_VERSIONS:
+        raise RuntimeError(
+            "HCU requires a compatible flash_attn release "
+            f"({_FLASH_ATTN_COMPATIBLE_VERSIONS}); found {actual!r}. "
+            "The deployed vendor wheel must separately be validated for "
+            "native long-prefill gather."
         )
 
 
-_require_native_long_prefill_gather()
+_require_compatible_flash_attn()
 
 
 def _flash_attn_layout() -> str:
