@@ -27,7 +27,9 @@ import vllm_hcu.hcu_ops as hcu_ops
 # does not attest that a particular vendor artifact contains the native
 # long-prefill gather workspace fix; deployment images must validate that
 # binary capability separately.
-_FLASH_ATTN_COMPATIBLE_VERSIONS = SpecifierSet(">=2.8.4,<2.9")
+_FLASH_ATTN_COMPATIBLE_VERSIONS = SpecifierSet(
+    ">=2.8.4,<2.9", prereleases=False
+)
 
 
 def _require_compatible_flash_attn() -> None:

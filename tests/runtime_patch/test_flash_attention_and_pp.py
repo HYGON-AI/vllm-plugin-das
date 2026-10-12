@@ -250,6 +250,9 @@ def test_hcu_fa_boundary_accepts_compatible_2_8_release(
         "2.8.3+dtk2604.torch2110.2609241509.g624d7b",
         "2.8.4rc1",
         "2.8.4.dev1+dtk2604",
+        "2.8.4.post1.dev1",
+        "2.8.5rc1",
+        "2.8.5.dev1",
         "2.9.0+dtk2604",
     ],
 )
