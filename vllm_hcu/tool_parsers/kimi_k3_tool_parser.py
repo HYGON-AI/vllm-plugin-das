@@ -139,6 +139,13 @@ class KimiK3ToolParser(ToolParser):
         # streaming state
         self._sent_content_idx = 0
         self._sent_tool_call_count = 0
+        # Stream-end flush + delegation bookkeeping (review 2026-10-12):
+        # _hcu_last_text  -> accumulated text for finish_streaming();
+        # _hcu_last_extract -> (raw model_output, info) so the delegating
+        # no-tool-call branch can pass through the CLEANED content (upstream
+        # discards it; fork 877e6996 keeps it).
+        self._hcu_last_text: str | None = None
+        self._hcu_last_extract: tuple[str, ExtractedToolCallInformation] | None = None
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -323,6 +330,13 @@ class KimiK3ToolParser(ToolParser):
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest
     ) -> ExtractedToolCallInformation:
+        info = self._extract_tool_calls_impl(model_output, request)
+        self._hcu_last_extract = (model_output, info)
+        return info
+
+    def _extract_tool_calls_impl(
+        self, model_output: str, request: ChatCompletionRequest
+    ) -> ExtractedToolCallInformation:
         m_open = self._tools_open_re.search(model_output)
         if m_open is None:
             # no tools channel -> content is the response channel (unwrapped)
@@ -373,6 +387,11 @@ class KimiK3ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        # Track the accumulated text; the platform patch wraps the
+        # delegating parse_delta to call finish_streaming() on the
+        # finished=True turn (review 2026-10-12 P2 #5).
+        self._hcu_last_text = current_text
+
         # Conservative streaming: stream unwrapped response-channel text, then
         # buffer tool calls and emit each call once its block closes.
         content = self._extract_response_content(current_text)
@@ -405,3 +424,42 @@ class KimiK3ToolParser(ToolParser):
         ]
         self._sent_tool_call_count = len(calls)
         return DeltaMessage(content=content, tool_calls=deltas)
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        """Release response text held back as a partial-tag prefix.
+
+        Called by the delegating parser at stream end (``finished=True``
+        routes through the wrapped ``parse_delta``).  A literal trailing
+        ``<`` is held only because it may grow into a channel marker; at
+        end-of-stream it is literal and must be emitted (review 2026-10-12,
+        P2 #5: ``'1 '`` + ``finished=True`` dropped the ``<``).  The flush
+        window is EXACTLY the streaming window: it starts at the response
+        body (the ``<|open|>response<|sep|>`` open marker is markup when the
+        model generated it, comment rounds 2/N3) and stops at the first
+        structural marker (``<|close|>response<|sep|>``,
+        ``<|open|>tools<|sep|>``) -- everything from there on is markup,
+        never content.
+        """
+
+        text = self._hcu_last_text
+        if text is None:
+            return None
+        m_open = self._response_open_re.search(text)
+        body_start = m_open.end() if m_open is not None else 0
+        start = max(self._sent_content_idx, body_start)
+        m_tools = self._tools_open_re.search(text, body_start)
+        m_rclose = self._response_close_re.search(text, body_start)
+        candidates = [
+            position
+            for position in (
+                m_tools.start() if m_tools is not None else -1,
+                m_rclose.start() if m_rclose is not None else -1,
+            )
+            if position != -1
+        ]
+        limit = min(candidates) if candidates else len(text)
+        if limit <= start:
+            return None
+        held = text[start:limit]
+        self._sent_content_idx = limit
+        return DeltaMessage(content=held) if held else None

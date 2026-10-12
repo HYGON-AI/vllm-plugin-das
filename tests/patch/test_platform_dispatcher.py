@@ -115,6 +115,14 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "vllm.tool_parsers",
         ),
         (
+            "platform.core_fix.kimi_k3_delegating_content_pass",
+            "vllm.parser.abstract_parser",
+        ),
+        (
+            "platform.core_fix.kimi_k3_structural_tag",
+            "vllm.tool_parsers.structural_tag_registry",
+        ),
+        (
             "platform.core_fix.hy_v3_reasoning_parser",
             "vllm.reasoning.hy_v3_reasoning_parser",
         ),
@@ -310,9 +318,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 61,
+        "count": 63,
         "replacements": 11,
-        "callbacks": 50,
+        "callbacks": 52,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

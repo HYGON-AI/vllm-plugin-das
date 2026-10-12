@@ -83,6 +83,7 @@ def test_ported_parser_module_exposes_the_wheel_contract() -> None:
         "adjust_request",
         "extract_tool_calls",
         "extract_tool_calls_streaming",
+        "finish_streaming",
     ):
         assert callable(getattr(parser_class, method)), method
 

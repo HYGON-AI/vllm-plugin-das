@@ -278,11 +278,6 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
-    target="tests/patch/test_kimi_dspark_role_separation.py",
-    est_time=60,
-)
-register_hcu_ci(
-    job="contract-hcu-gfx936",
     target="tests/patch/test_kimi_k3_dspark_speculative_arch.py",
     est_time=60,
 )
@@ -294,6 +289,21 @@ register_hcu_ci(
 register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/patch/test_hcu_triton_mla_non_causal.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/patch/test_dspark_non_causal_stamp.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/patch/test_kimi_k3_review_fixes.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/patch/test_kimi_k3_structural_tag.py",
     est_time=60,
 )
 register_hcu_ci(

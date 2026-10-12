@@ -14,11 +14,15 @@ spec-aware reorder threshold so multi-token decode blocks are admitted, and a
 per-token flattening of the decode rows in ``forward_mqa``.  This module
 ports those three pieces onto the wheel (0.25.1) builder/impl classes.
 
-Known deviation from the fork: the wheel ``MLACommonMetadata`` carries no
-``causal`` flag, so the forward flattening keys on the decode metadata's
-row counts alone.  On this platform an HCU causal MLA group selects
-FLASHMLA first (highest priority), so this backend only reaches multi-token
-decode rows for non-causal draft groups in supported deployments.
+Known deviation from the fork, RESOLVED with an origin stamp: the wheel
+``MLACommonMetadata`` carries no ``causal`` flag, so the producer-side patch
+``patch_dspark_non_causal_stamp`` stamps draft-built metadata objects with
+``NON_CAUSAL_DRAFT_STAMP`` (fork parity for the ``causal`` field).  Only
+stamped (non-causal draft) batches are flattened; unstamped multi-token
+batches -- i.e. causal speculative verify routed to this backend -- are
+expanded with exact per-row causal lengths instead, so an early query never
+reads the KV of tokens committed after its own position (review 2026-10-12
+P1).  Row counts alone decide nothing about semantics anymore.
 
 Fork parity note (measured 2026-10-10): the flattened rows must stay LOCAL
 to the forward call exactly as in the fork -- the shared ``attn_metadata``
@@ -51,6 +55,52 @@ from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
 )
+
+# Producer-side stamp: ``patch_dspark_non_causal_stamp`` sets this attribute
+# on every per-group metadata object built for the speculative draft step
+# (fork ``causal=False`` semantics).  Defined in the dependency-free
+# ``_stamps`` leaf module (the worker patch layer imports it without torch)
+# and re-exported here for the forward path.
+from vllm_hcu.v1.attention.backends.mla._stamps import (
+    NON_CAUSAL_DRAFT_STAMP,
+)
+
+
+def expand_causal_rows(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_decode_tokens: int,
+    num_decodes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token rows with EXACT causal lengths for verify batches.
+
+    A causal multi-token batch routes here when the scheduler packs
+    ``num_decode_tokens == num_decodes * q`` query tokens for speculative
+    verification.  Query row ``i`` of a request (token order 0..q-1) may read
+    the committed prefix up to and including its own token: with ``q`` rows
+    per request and ``s = seq_lens[req]`` (all ``q`` tokens already written
+    to the KV cache by the common MLA pre-write), lengths are
+    ``s - q + 1, ..., s - 1, s``.  Full-``s`` rows for every query -- the
+    non-causal shape -- would let early queries read future tokens and poison
+    the logits (review 2026-10-12 P1 repro: prefix 2 + 2 queries -> [3, 4],
+    not [4, 4]).  Single-token batches pass through untouched.
+    """
+
+    if num_decodes <= 0 or num_decode_tokens <= num_decodes:
+        return block_table, seq_lens
+    query_len = num_decode_tokens // num_decodes
+    if query_len <= 1:
+        return block_table, seq_lens
+    num_reqs = seq_lens.shape[0]
+    inner = torch.arange(query_len, device=seq_lens.device, dtype=seq_lens.dtype)
+    offsets = (query_len - 1) - inner  # 0 per-token shift, oldest row first
+    causal_lens = (
+        seq_lens.repeat_interleave(query_len) - offsets.repeat(num_reqs)
+    ).clamp_min(0)  # padded tail requests carry len 0/1, never negative
+    return (
+        block_table.repeat_interleave(query_len, dim=0),
+        causal_lens,
+    )
 
 
 def flatten_non_causal_rows(
@@ -176,14 +226,27 @@ class HcuTritonMLAImpl(TritonMLAImpl):
         kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
-        # [fork 877e6996 forward_mqa, verbatim] Non-causal DSpark block:
-        # flatten to one decode row per query token, LOCAL variables only.
-        block_table, seq_lens = flatten_non_causal_rows(
-            attn_metadata.decode.block_table,
-            attn_metadata.decode.seq_lens,
-            attn_metadata.num_decode_tokens,
-            attn_metadata.num_decodes,
-        )
+        # Row semantics keyed on the producer stamp, NOT row counts:
+        #  - stamped -> non-causal DSpark draft block, fork-parity flatten;
+        #  - unstamped -> causal batch (plain decode or spec verify):
+        #    single-token rows pass through, uniform multi-token verify rows
+        #    get exact per-row causal lengths.
+        if getattr(
+            attn_metadata, NON_CAUSAL_DRAFT_STAMP, False
+        ):
+            block_table, seq_lens = flatten_non_causal_rows(
+                attn_metadata.decode.block_table,
+                attn_metadata.decode.seq_lens,
+                attn_metadata.num_decode_tokens,
+                attn_metadata.num_decodes,
+            )
+        else:
+            block_table, seq_lens = expand_causal_rows(
+                attn_metadata.decode.block_table,
+                attn_metadata.decode.seq_lens,
+                attn_metadata.num_decode_tokens,
+                attn_metadata.num_decodes,
+            )
 
         # Run MQA — always pass layer scales. When KV cache is
         # BF16 the kernel's `if dtype.is_fp8()` check is a no-op.
