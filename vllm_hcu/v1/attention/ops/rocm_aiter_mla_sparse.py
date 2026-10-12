@@ -1135,8 +1135,11 @@ def _sparse_mla_topk_backend() -> str:
 
 
 def _use_lightop_sparse_mla_topk() -> bool:
-    """True only for the old top_k_per_row_* path."""
-    return _sparse_mla_topk_backend() == "per_row"
+    """Prefill uses LightOp top_k_per_row_prefill unless backend is torch.
+
+    The ragged backend only replaces the decode selector.
+    """
+    return _sparse_mla_topk_backend() in ("per_row", "ragged")
 
 
 def _get_lightop_zero_i32(device: torch.device, n: int) -> torch.Tensor:
