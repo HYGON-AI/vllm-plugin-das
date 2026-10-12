@@ -41,7 +41,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
-    VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_SPARSE_MLA_TOPK_BACKEND: str = "ragged"
+    VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
@@ -300,9 +301,20 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_TOPK", "True").lower() in
                     ("true", "1")),
 
-    # If set, use LightOp top_k_per_row kernels for sparse MLA prefill/decode indices.
-    "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK":
-        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
+    # Sparse-MLA top-k backend:
+    #   ragged  - decode: lightop.op.fast_topk_transform_ragged_interface;
+    #             prefill: torch (default)
+    #   per_row - lightop.attention.top_k_per_row_* for prefill and decode
+    #             (decode emits OOB indices on long contexts)
+    #   torch   - torch.topk
+    "VLLM_HCU_SPARSE_MLA_TOPK_BACKEND":
+        lambda: os.getenv("VLLM_HCU_SPARSE_MLA_TOPK_BACKEND", "ragged").lower(),
+
+    # Store DSA index-K via lightop fuse_act_quant_and_store_index_k_cache
+    # (planar pages) to match lightop.paged_mqa_logits. Requires
+    # --block-size 64.
+    "VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE":
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE", "True").lower() in
                     ("true", "1")),
 
     # If use AITER MHC impl, please set True

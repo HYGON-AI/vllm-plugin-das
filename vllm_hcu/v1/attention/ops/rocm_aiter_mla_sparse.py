@@ -213,6 +213,56 @@ def _indexer_k_quant_and_cache_kernel(
     tl.store(dst_scale_ptr, scale)
 
 
+def indexer_k_quant_and_cache_lightop(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim + 4] uint8
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Quantize index-K to FP8 and store it via LightOp.
+
+    LightOp writes a *planar* page layout (all K bytes, then all scales),
+    which is what lightop.paged_mqa_logits reads; block_size must be 64.
+    """
+    from lightop import kvcache as lightop_kvcache
+
+    if k.dim() != 2:
+        k = k.view(-1, k.shape[-1])
+    num_blocks, block_size, packed = kv_cache.shape
+    head_dim = k.shape[-1]
+    if packed != head_dim + 4:
+        raise RuntimeError(
+            f"LightOp index-K store expects packed={head_dim + 4}, got {packed}"
+        )
+    if int(block_size) != 64:
+        raise RuntimeError(
+            f"LightOp index-K store requires block_size=64 "
+            f"(--block-size 64), got block_size={block_size}"
+        )
+    # LightOp expects [num_blocks, block_size * (head_dim + 4)]
+    write_buffer = kv_cache.view(num_blocks, block_size * packed)
+    loc = slot_mapping.contiguous()
+    if loc.dtype != torch.int64:
+        loc = loc.to(torch.int64)
+    # LightOp store VMFaults on loc<0 or loc>=num_slots, and padded capture rows
+    # carry -1. Redirect them to slot 0 (vLLM's reserved null block) on device:
+    # any host sync here is illegal during cudagraph capture.
+    max_slot = num_blocks * block_size
+    valid = (loc >= 0) & (loc < max_slot)
+    loc = torch.where(valid, loc, torch.zeros_like(loc))
+    key = k if k.dtype == torch.bfloat16 else k.to(torch.bfloat16)
+    # Args: key, buffer, loc, block_size, eps, use_ue8m0, is_e4m3fn (not fnuz)
+    is_e4m3fn = current_platform.fp8_dtype() == torch.float8_e4m3fn
+    lightop_kvcache.fuse_act_quant_and_store_index_k_cache(
+        key.contiguous(),
+        write_buffer,
+        loc.contiguous(),
+        int(block_size),
+        1e-5,
+        False,
+        bool(is_e4m3fn),
+    )
+
+
 def indexer_k_quant_and_cache_triton(
     k: torch.Tensor,
     kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim + 4]
@@ -320,7 +370,14 @@ def cp_gather_indexer_k_quant_cache_triton(
     token_to_seq: torch.Tensor,
     block_tile_size: int = 16,
     head_tile_size: int = 16,
+    layout: str = "SHUFFLE",
 ):
+    """Gather FP8+scale from indexer pages.
+
+    ``layout`` must match the store path:
+      - ``SHUFFLE``: legacy aiter/triton tiled store
+      - ``LINEAR``: LightOp planar store (all K then all scales)
+    """
     num_tokens = k_fp8.size(0)
     block_size = k_cache.size(1)
     block_table_stride = block_table.stride(0)
@@ -345,7 +402,7 @@ def cp_gather_indexer_k_quant_cache_triton(
         block_table_stride,
         k_cache_value.stride(0),
         k_cache_scale.stride(0),
-        "SHUFFLE",
+        layout,
         head_dim,
         block_tile_size,
         head_tile_size,
@@ -1055,11 +1112,43 @@ def _decode_row_ends_from_seq_lens(
     return torch.clamp(flat_seq_lens[:num_rows], min=0)
 
 
+_LIGHTOP_ZERO_I32: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _sparse_mla_topk_backend() -> str:
+    """Sparse-MLA top-k backend: ``ragged`` | ``per_row`` | ``torch``."""
+    backend = henvs.VLLM_HCU_SPARSE_MLA_TOPK_BACKEND
+    if backend == "torch" or not henvs.VLLM_HCU_USE_CUSTOM_OPS:
+        return "torch"
+    return backend
+
+
 def _use_lightop_sparse_mla_topk() -> bool:
-    return (
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK
-    )
+    """True only for the old top_k_per_row_* path."""
+    return _sparse_mla_topk_backend() == "per_row"
+
+
+def _get_lightop_zero_i32(device: torch.device, n: int) -> torch.Tensor:
+    """Cached int32 zeros for LightOp top-k; must be allocated before graph capture."""
+    if n <= 0:
+        return torch.zeros(0, dtype=torch.int32, device=device)
+    if device.type != "cuda":
+        return torch.zeros(n, dtype=torch.int32, device=device)
+    cap = 1 << (n - 1).bit_length()
+    key = (int(device.index), cap)
+    buf = _LIGHTOP_ZERO_I32.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Warm up LightOp ragged top-k zero offsets before graph capture"
+            )
+        # Blocking H2D so any later stream / graph replay sees zeros.
+        with torch.cuda.device(device):
+            buf = torch.zeros(cap, dtype=torch.int32, device="cpu").to(
+                device=device, non_blocking=False
+            )
+        _LIGHTOP_ZERO_I32[key] = buf
+    return buf[:n]
 
 
 def _lightop_topk_indices_prefill(
@@ -1136,6 +1225,61 @@ def _lightop_topk_indices_decode(
         logits.stride(1),
         topk_tokens,
     )
+
+
+def _lightop_ragged_topk_indices_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """Decode top-k via lightop.op.fast_topk_transform_ragged_interface.
+
+      - zero offsets => window-relative logical IDs (padding stays -1)
+      - zero row_starts (top_k_per_row_decode hard-codes start=1)
+      - lengths from seq_lens (per speculative row when next_n > 1)
+    """
+    from lightop import op as lightop_op
+
+    num_rows = int(logits.shape[0])
+    if num_rows == 0 or topk_tokens <= 0:
+        return
+
+    lengths = (
+        _decode_row_ends_from_seq_lens(seq_lens, next_n, num_rows)
+        .to(device=logits.device, dtype=torch.int32)
+        .reshape(-1)[:num_rows]
+        .contiguous()
+    )
+    score = logits
+    if score.dtype != torch.float32:
+        score = score.float()
+    if score.dim() != 2 or score.shape[0] != num_rows:
+        raise RuntimeError(
+            f"ragged topk expects [rows, cols] logits, got {tuple(logits.shape)}"
+        )
+    if score.stride(1) != 1:
+        score = score.contiguous()
+
+    # Same buffer for offsets + row_starts (both read-only zeros).
+    zeros = _get_lightop_zero_i32(score.device, num_rows)
+    need_tmp = not (
+        topk_indices.dtype == torch.int32
+        and topk_indices.shape[0] == num_rows
+        and topk_indices.shape[-1] == topk_tokens
+        and topk_indices.is_contiguous()
+    )
+    topk_out = (
+        torch.empty((num_rows, topk_tokens), dtype=torch.int32, device=score.device)
+        if need_tmp
+        else topk_indices
+    )
+    lightop_op.fast_topk_transform_ragged_interface(
+        score, lengths, topk_out, zeros, zeros
+    )
+    if topk_out is not topk_indices:
+        topk_indices[:, :topk_tokens].copy_(topk_out)
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
@@ -1245,6 +1389,14 @@ def rocm_aiter_sparse_attn_indexer_native(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
+    # Decode scores via lightop.paged_mqa_logits, which reads planar pages
+    # (page_size=64). The triton store writes SHUFFLE pages, so pairing the
+    # two silently corrupts top-k selection once context exceeds topk_tokens.
+    use_lightop_index_k_store = bool(
+        current_platform.is_rocm()
+        and use_fp8_cache
+        and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE
+    )
     if not skip_k_cache_insert:
         if not current_platform.is_rocm():
             ops.indexer_k_quant_and_cache(
@@ -1254,6 +1406,8 @@ def rocm_aiter_sparse_attn_indexer_native(
                 quant_block_size,
                 scale_fmt,
             )
+        elif use_lightop_index_k_store:
+            indexer_k_quant_and_cache_lightop(k, kv_cache, slot_mapping)
         elif use_fp8_cache:
             indexer_k_quant_and_cache_triton(
                 k,
@@ -1300,6 +1454,7 @@ def rocm_aiter_sparse_attn_indexer_native(
                     chunk.block_table,
                     chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
+                    layout="LINEAR" if use_lightop_index_k_store else "SHUFFLE",
                 )
             else:
                 cp_gather_indexer_k_bf16_cache_triton(
@@ -1369,10 +1524,10 @@ def rocm_aiter_sparse_attn_indexer_native(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
-        use_lightop_sparse_mla_topk = _use_lightop_sparse_mla_topk()
+        topk_backend = _sparse_mla_topk_backend()
         seq_lens = (
             decode_metadata.seq_lens[:batch_size]
-            if use_lightop_sparse_mla_topk
+            if topk_backend in ("per_row", "ragged")
             else decode_metadata.seq_lens
         )
 
@@ -1402,8 +1557,12 @@ def rocm_aiter_sparse_attn_indexer_native(
             decode_metadata.requires_padding,
         )
 
-        if use_lightop_sparse_mla_topk:
+        if topk_backend == "per_row":
             _lightop_topk_indices_decode(
+                logits, seq_lens, next_n, topk_indices, topk_tokens
+            )
+        elif topk_backend == "ragged":
+            _lightop_ragged_topk_indices_decode(
                 logits, seq_lens, next_n, topk_indices, topk_tokens
             )
         else:
