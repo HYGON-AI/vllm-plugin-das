@@ -21,6 +21,23 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _persistent_filesystem_state(path: Path) -> tuple[object, ...]:
+    metadata = path.lstat()
+    content = path.readlink() if path.is_symlink() else _sha256(path)
+    return (
+        metadata.st_mode,
+        metadata.st_ino,
+        metadata.st_dev,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        content,
+    )
+
+
 def test_doctor_detects_markers_and_hcu_symlinks_without_mutating(tmp_path):
     package = tmp_path / "vllm"
     package.mkdir()
@@ -33,7 +50,10 @@ def test_doctor_detects_markers_and_hcu_symlinks_without_mutating(tmp_path):
     hcu_target.write_text("value = 2\n", encoding="utf-8")
     link = package / "linked.py"
     link.symlink_to(hcu_target)
-    before = {path: path.lstat() for path in (clean, patched, hcu_target, link)}
+    before = {
+        path: _persistent_filesystem_state(path)
+        for path in (clean, patched, hcu_target, link)
+    }
 
     checks = {item.check: item for item in doctor._source_integrity_checks(package)}
 
@@ -41,7 +61,7 @@ def test_doctor_detects_markers_and_hcu_symlinks_without_mutating(tmp_path):
     assert "patched.py" in checks["no_source_patch_markers"].detail
     assert not checks["no_hcu_source_symlinks"].ok
     assert "linked.py" in checks["no_hcu_source_symlinks"].detail
-    assert {path: path.lstat() for path in before} == before
+    assert {path: _persistent_filesystem_state(path) for path in before} == before
 
 
 def test_doctor_reuses_runtime_compatibility_check_name_and_detail(
