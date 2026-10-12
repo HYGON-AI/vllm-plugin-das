@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from packaging.version import InvalidVersion, Version
+
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 DEFAULT_ENVIRONMENT_LOCK = (
@@ -36,9 +38,9 @@ def _version_specification(value: object, *, name: str) -> dict[str, str]:
         raise PreflightError(f"{name} must be a version string or mapping")
     match = value.get("match")
     version = value.get("version")
-    if match not in {"exact", "prefix"} or not isinstance(version, str):
+    if match not in {"exact", "prefix", "release"} or not isinstance(version, str):
         raise PreflightError(
-            f"{name} must declare match=exact|prefix and a version string"
+            f"{name} must declare match=exact|prefix|release and a version string"
         )
     return {"match": match, "version": version}
 
@@ -46,6 +48,13 @@ def _version_specification(value: object, *, name: str) -> dict[str, str]:
 def _matches_version(actual: str | None, specification: dict[str, str]) -> bool:
     if actual is None:
         return False
+    if specification["match"] == "release":
+        try:
+            return Version(actual).release == Version(
+                specification["version"]
+            ).release
+        except InvalidVersion:
+            return False
     if specification["match"] == "prefix":
         expected = specification["version"]
         if not actual.startswith(expected):

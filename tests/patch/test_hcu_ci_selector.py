@@ -460,8 +460,8 @@ def test_v0281_runner_lock_matches_audited_runtime(
     }
     assert lock["distributions"] == {
         "torch": {"match": "prefix", "version": "2.11.0+"},
-        "vllm": {"match": "prefix", "version": "0.28.1"},
-        "vllm-hcu": {"match": "prefix", "version": "0.28.1"},
+        "vllm": {"match": "release", "version": "0.28.1"},
+        "vllm-hcu": {"match": "release", "version": "0.28.1"},
         "aiter": {"match": "prefix", "version": "0.1."},
         "pytest": {"match": "exact", "version": "9.1.1"},
     }
@@ -487,10 +487,32 @@ def test_v0281_runner_lock_matches_audited_runtime(
     )
     assert report["rocm"] == "26.04.1"
 
+    for distribution, compatible_version in (
+        ("vllm", "0.28.1"),
+        ("vllm", "0.28.1rc2"),
+        ("vllm", "0.28.1.dev2"),
+        ("vllm", "0.28.1.post1"),
+        ("vllm", "0.28.1+dtk2604"),
+        ("vllm-hcu", "0.28.1rc2+das.test"),
+        ("vllm-hcu", "0.28.1.dev2+das.test"),
+        ("vllm-hcu", "0.28.1.post1+das.test"),
+    ):
+        compatible = dict(versions, **{distribution: compatible_version})
+        _check_environment_lock(
+            lock_path,
+            versions=compatible,
+            torch_hip="6.3.26113",
+        )
+
     for distribution, incompatible_version in (
         ("vllm", "0.25.1+das.legacy"),
         ("vllm", "0.28.10+future"),
+        ("vllm", "0.28.1.0"),
+        ("vllm", "0.28.1.1"),
+        ("vllm", "0.28.1.1rc1+dtk2604"),
         ("vllm-hcu", "0.28.10rc1+future"),
+        ("vllm-hcu", "0.28.1.1"),
+        ("vllm-hcu", "0.28.1.1rc1+dtk2604"),
     ):
         incompatible = dict(versions, **{distribution: incompatible_version})
         with pytest.raises(

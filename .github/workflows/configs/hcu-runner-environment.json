@@ -17,11 +17,11 @@
       "version": "2.11.0+"
     },
     "vllm": {
-      "match": "prefix",
+      "match": "release",
       "version": "0.28.1"
     },
     "vllm-hcu": {
-      "match": "prefix",
+      "match": "release",
       "version": "0.28.1"
     },
     "aiter": {
