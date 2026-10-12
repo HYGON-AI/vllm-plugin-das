@@ -21,12 +21,8 @@ from vllm_hcu.v1.attention.kv_cache_layout import get_kv_cache_layout
 import vllm_hcu.hcu_ops as hcu_ops
 
 
-_FLASH_ATTN_BUILDS_WITH_NATIVE_LONG_PREFILL_GATHER = frozenset(
-    {
-        "2.8.4+dtk2604.torch2110.2609241509.g624d7b",
-        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
-    }
-)
+# DTK 26.04 builds of flash_attn 2.8.4 carry the native long-prefill gather.
+_FLASH_ATTN_NATIVE_LONG_PREFILL_GATHER_PREFIX = "2.8.4+dtk2604"
 
 
 def _require_native_long_prefill_gather() -> None:
@@ -34,11 +30,13 @@ def _require_native_long_prefill_gather() -> None:
         actual = importlib_metadata.version("flash_attn")
     except importlib_metadata.PackageNotFoundError:
         actual = None
-    if actual not in _FLASH_ATTN_BUILDS_WITH_NATIVE_LONG_PREFILL_GATHER:
+    if actual is None or not actual.startswith(
+        _FLASH_ATTN_NATIVE_LONG_PREFILL_GATHER_PREFIX
+    ):
         raise RuntimeError(
             "HCU requires a flash_attn build with the native long-prefill "
             "gather fix; supported builds: "
-            f"{sorted(_FLASH_ATTN_BUILDS_WITH_NATIVE_LONG_PREFILL_GATHER)}; "
+            f"{_FLASH_ATTN_NATIVE_LONG_PREFILL_GATHER_PREFIX}*; "
             f"found {actual!r}. Rebuild the image with a supported vendor wheel."
         )
 

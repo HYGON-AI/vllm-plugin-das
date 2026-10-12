@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
-    VLLM_HCU_QWEN4_EXP_HC_SP: bool = False
+    VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -113,6 +113,14 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     """
 
     return custom_ops_enabled() and bool(feature_enabled)
+
+
+def qwen4_exp_hc_sp_enabled() -> bool:
+    """Resolve Qwen4Exp HC sequence parallelism under the master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "True"))
+    )
 
 
 def glm53_router_gemv_enabled() -> bool:
@@ -583,11 +591,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
     # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel
-    # MoE is active (DP>1, TP>1, EP). Off by default: on HCU the replicated
-    # layout is faster because all-reduce uses the AITER custom kernel.
+    # MoE is active (DP>1, TP>1, EP). On by default, gated by
+    # VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_QWEN4_EXP_HC_SP":
-        lambda: (os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "False").lower() in
-                    ("true", "1")),
+        qwen4_exp_hc_sp_enabled,
 
     # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
     # (official 16x16 tiles, HCU Triton decode reader) or "normal"

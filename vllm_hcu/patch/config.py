@@ -75,7 +75,7 @@ class HcuFeatureConfig:
     fused_qwen3_rms_rope: bool = True
     # Qwen4Exp HC sequence parallelism (VLLM_HCU_QWEN4_EXP_HC_SP), resolved
     # the same way: it changes the traced graph, so it must partition caches.
-    qwen4_exp_hc_sp: bool = False
+    qwen4_exp_hc_sp: bool = True
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
 

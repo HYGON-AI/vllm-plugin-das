@@ -4,9 +4,10 @@
 
 ``use_sequence_parallel_moe`` (DP>1, TP>1, EP, AGRS-class backends) makes the
 AMD Qwen4Exp constructors raise.  This patch always removes those guards; the
-MoE block then shards TP-replicated tokens itself.  With
-``VLLM_HCU_QWEN4_EXP_HC_SP=1`` it additionally ports the HC sequence-parallel
-layout of upstream vLLM PR #56322 to the AMD model:
+MoE block then shards TP-replicated tokens itself.  Unless disabled with
+``VLLM_HCU_QWEN4_EXP_HC_SP=0`` (or ``VLLM_HCU_USE_CUSTOM_OPS=0``), it also
+ports the HC sequence-parallel layout of upstream vLLM PR #56322 to the AMD
+model:
 
 * the embedding is sharded across TP ranks right after lookup, so every HC
   mix/combine runs on the local ``ceil(T / tp)`` rows only;
