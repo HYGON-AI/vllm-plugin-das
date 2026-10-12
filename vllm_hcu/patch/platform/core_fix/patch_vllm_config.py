@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import os
 from types import ModuleType
 from typing import Any
@@ -15,6 +16,8 @@ from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_conf
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
+
+_LOGGER = logging.getLogger(__name__)
 
 TARGET_MODULE = "vllm.config.vllm"
 PATCH_ID = "platform.core_fix.hcu_config.vllm"
@@ -462,6 +465,35 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     return True
 
 
+def _resolve_qwen4_exp_hc_sp(vllm_config: object, requested: bool) -> bool:
+    """Fall back to the replicated HC layout where HC SP is unsupported.
+
+    LoRA's per-token adapter metadata covers the full batch, not the local HC
+    SP shard, and the compiler sequence-parallel pass rewrites the same TP
+    reduction boundaries. HC SP is on by default, so fall back instead of
+    rejecting the configuration.
+    """
+    if not requested:
+        return False
+    blockers = []
+    if getattr(vllm_config, "lora_config", None) is not None:
+        blockers.append("LoRA")
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    pass_config = getattr(compilation_config, "pass_config", None)
+    if getattr(pass_config, "enable_sp", False):
+        blockers.append("compilation pass_config.enable_sp")
+    if not blockers:
+        return True
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if getattr(parallel_config, "use_sequence_parallel_moe", False):
+        _LOGGER.warning(
+            "Qwen4Exp HC sequence parallelism is incompatible with %s; "
+            "using the replicated HC layout",
+            " and ".join(blockers),
+        )
+    return False
+
+
 def _validate_dspark_pd_scope(vllm_config: object) -> None:
     """Allow only the validated DeepSeek-V4 Mooncake DSpark P/D path."""
 
@@ -503,7 +535,9 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # the exact same master-and-child result before VllmConfig.compute_hash
         # so feature-off and feature-on AOT graphs cannot share a cache entry.
         "fused_qwen3_rms_rope": hcu_envs.fused_qwen3_rms_rope_enabled(),
-        "qwen4_exp_hc_sp": hcu_envs.qwen4_exp_hc_sp_enabled(),
+        "qwen4_exp_hc_sp": _resolve_qwen4_exp_hc_sp(
+            vllm_config, hcu_envs.qwen4_exp_hc_sp_enabled()
+        ),
     }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache
