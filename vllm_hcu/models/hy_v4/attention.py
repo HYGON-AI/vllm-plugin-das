@@ -56,6 +56,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
+from vllm_hcu.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from .fp8_kv_dequant import LightOpKVReuseState
 
@@ -919,6 +920,7 @@ class HYV4MLAAttention(nn.Module):
         layer_idx: int = 0,
         lightop_kv_reuse_state: LightOpKVReuseState | None = None,
         gate_a2a_stream: torch.cuda.Stream | None = None,
+        gate_proj_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1187,6 +1189,15 @@ class HYV4MLAAttention(nn.Module):
         )
         self.mla_attn._hcu_dcp_a2a_overlap_done_event = self.gate_a2a_done_event
 
+        # PCP+EP g_proj parallel stream (distinct from DCP A2A overlap).
+        self.gate_proj_stream = gate_proj_stream
+        self.gate_proj_start_event = (
+            torch.cuda.Event() if gate_proj_stream is not None else None
+        )
+        self.gate_proj_done_event = (
+            torch.cuda.Event() if gate_proj_stream is not None else None
+        )
+
     def _resolve_sink_backend(
         self, kv_cache_dtype: str
     ) -> type[AttentionBackend]:
@@ -1251,25 +1262,75 @@ class HYV4MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q_c = None
-        if self.q_lora_rank is not None:
-            assert self.q_a_proj is not None
-            assert self.q_a_layernorm is not None
-            assert self.q_b_proj is not None
-            q_c = self.q_a_proj(hidden_states)[0]
-            q_c = self.q_a_layernorm(q_c)
-            q_proj_layer = self.q_b_proj
-            q = q_proj_layer(q_c)[0]
-        else:
-            assert self.q_proj is not None
-            q_proj_layer = self.q_proj
-            q = q_proj_layer(hidden_states)[0]
+        # PCP+EP g_proj parallel path: overlap Q/KV projections with g_proj.
+        # When gate_proj_stream is set AND gate_a2a_stream is NOT set, we
+        # parallelize g_proj with the Q/KV projection GEMMs before attention.
+        # PCP+EP g_proj parallel path: launch g_proj on aux stream FIRST,
+        # before Q/KV projections on the main stream, to give the longer
+        # g_proj GEMM maximum lead time.  The join is deferred until after
+        # attention completes.
+        _gate_parallel_deferred: torch.Tensor | None = None
+        _gate_done_event: torch.cuda.Event | None = None
+        if (
+            self.gate_proj_stream is not None
+            and self.gated_mla
+            and self.linear_gate is not None
+            and self.gate_a2a_stream is None
+        ):
+            # PCP+EP g_proj parallel path: launch g_proj on aux stream FIRST,
+            # before Q/KV projections on the main stream, to give the longer
+            # g_proj GEMM maximum lead time.  The join is deferred until after
+            # attention completes.
+            assert self.gate_proj_start_event is not None
+            assert self.gate_proj_done_event is not None
+            current_stream = torch.cuda.current_stream()
+            self.gate_proj_start_event.record(current_stream)
+            with torch.cuda.stream(self.gate_proj_stream):
+                self.gate_proj_stream.wait_event(self.gate_proj_start_event)
+                _gate_parallel = self.linear_gate(hidden_states)[0]
+                self.gate_proj_done_event.record(self.gate_proj_stream)
 
-        assert self.kv_a_proj_with_mqa is not None
-        kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            # Q/KV projections run on the main stream while g_proj runs on aux.
+            q_c = None
+            if self.q_lora_rank is not None:
+                assert self.q_a_proj is not None
+                assert self.q_a_layernorm is not None
+                assert self.q_b_proj is not None
+                q_c = self.q_a_proj(hidden_states)[0]
+                q_c = self.q_a_layernorm(q_c)
+                q_proj_layer = self.q_b_proj
+                q = q_proj_layer(q_c)[0]
+            else:
+                assert self.q_proj is not None
+                q_proj_layer = self.q_proj
+                q = q_proj_layer(hidden_states)[0]
+            assert self.kv_a_proj_with_mqa is not None
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            # Defer the join: wait for g_proj only after attention finishes.
+            _gate_parallel_deferred = _gate_parallel
+        else:
+            # Serial path: Q/KV projections only (gate computed later or in A2A).
+            q_c = None
+            if self.q_lora_rank is not None:
+                assert self.q_a_proj is not None
+                assert self.q_a_layernorm is not None
+                assert self.q_b_proj is not None
+                q_c = self.q_a_proj(hidden_states)[0]
+                q_c = self.q_a_layernorm(q_c)
+                q_proj_layer = self.q_b_proj
+                q = q_proj_layer(q_c)[0]
+            else:
+                assert self.q_proj is not None
+                q_proj_layer = self.q_proj
+                q = q_proj_layer(hidden_states)[0]
+
+            assert self.kv_a_proj_with_mqa is not None
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
+        q_proj_layer = self.q_b_proj if self.q_b_proj is not None else self.q_proj
         q_heads = self.num_local_heads
         if self.dcp_q_replicate:
             q_heads *= q_proj_layer.group_size
@@ -1309,11 +1370,26 @@ class HYV4MLAAttention(nn.Module):
             q_dcp_replicated,
         )
 
+        # Apply gate: three paths - PCP+EP parallel, DCP A2A overlap, or serial.
         if (
+            self.gate_proj_stream is not None
+            and self.gated_mla
+            and self.linear_gate is not None
+            and self.gate_a2a_stream is None
+        ):
+            # PCP+EP parallel path: join aux stream now (attention has finished,
+            # maximizing the overlap window), then apply the gate.
+            assert self.gate_proj_done_event is not None
+            torch.cuda.current_stream().wait_event(self.gate_proj_done_event)
+            gate_score = _gate_parallel_deferred
+            gate_score.record_stream(torch.cuda.current_stream())
+            self._apply_gate_in_place(attn_out, gate_score)
+        elif (
             self.gated_mla
             and self.linear_gate is not None
             and self.gate_a2a_stream is None
         ):
+            # Serial path: compute gate after attention.
             gate_score = self.linear_gate(hidden_states)[0]
             if self.config.gating_type == "headwise":
                 gate_score = gate_score.unsqueeze(-1)

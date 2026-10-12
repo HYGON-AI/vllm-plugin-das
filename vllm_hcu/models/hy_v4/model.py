@@ -106,6 +106,21 @@ def enable_hyv4_gate_a2a_overlap(vllm_config: VllmConfig) -> bool:
     )
 
 
+def enable_hyv4_gate_proj_parallel(vllm_config: VllmConfig) -> bool:
+    """Return whether HY V4 may overlap g_proj with Q/KV projections in PCP+EP.
+
+    This is distinct from DCP A2A overlap: here we parallelize g_proj with the
+    attention path's Q/KV projections when prefill_context_parallel > 1 and
+    expert_parallel is enabled, using an auxiliary CUDA stream.
+    """
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        henvs.VLLM_HCU_ENABLE_HYV4_GATE_PROJ_PARALLEL
+        and parallel_config.prefill_context_parallel_size > 1
+        and parallel_config.enable_expert_parallel
+    )
+
+
 def _is_modelopt_layer_excluded(
     quant_config: QuantizationConfig | None,
     prefix: str,
@@ -363,6 +378,7 @@ class HYV4DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         lightop_kv_reuse_state: LightOpKVReuseState | None = None,
         gate_a2a_stream: torch.cuda.Stream | None = None,
+        gate_proj_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -390,6 +406,7 @@ class HYV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             lightop_kv_reuse_state=lightop_kv_reuse_state,
             gate_a2a_stream=gate_a2a_stream,
+            gate_proj_stream=gate_proj_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
@@ -516,6 +533,15 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         if self.gate_a2a_stream is not None:
             logger.info("HY V4 gated-MLA g_proj/DCP A2A overlap enabled")
 
+        self.gate_proj_stream = (
+            torch.cuda.Stream()
+            if getattr(config, "gated_mla", False)
+            and enable_hyv4_gate_proj_parallel(vllm_config)
+            else None
+        )
+        if self.gate_proj_stream is not None:
+            logger.info("HY V4 gated-MLA g_proj/projection parallel (PCP+EP) enabled")
+
         if get_pp_group().is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
@@ -538,6 +564,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 topk_indices_buffer=self.topk_indices_buffer,
                 lightop_kv_reuse_state=self.lightop_kv_reuse_state,
                 gate_a2a_stream=self.gate_a2a_stream,
+                gate_proj_stream=self.gate_proj_stream,
             ),
             prefix=f"{prefix}.layers",
         )

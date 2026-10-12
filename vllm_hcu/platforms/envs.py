@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
     VLLM_HCU_HYV4_FP8_KV_DEQUANT: bool = False
     VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP: bool = False
+    VLLM_HCU_ENABLE_HYV4_GATE_PROJ_PARALLEL: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
@@ -366,6 +367,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP":
         lambda: (os.environ.get(
             "VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP", "False"
+        ).lower() in ("true", "1")),
+
+    # Overlap HY V4 gated-MLA g_proj with Q/KV projections in PCP+EP.
+    "VLLM_HCU_ENABLE_HYV4_GATE_PROJ_PARALLEL":
+        lambda: (os.environ.get(
+            "VLLM_HCU_ENABLE_HYV4_GATE_PROJ_PARALLEL", "False"
         ).lower() in ("true", "1")),
 
     # Whether to use the local inverse-RoPE + BF16 einsum path for DeepSeek V4 ROCm WO_A.
