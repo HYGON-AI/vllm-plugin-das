@@ -4,7 +4,6 @@
 """CPU connector regressions and opt-in native HCU cache read-back checks."""
 
 import importlib.util
-import os
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -236,13 +235,14 @@ def test_native_writer_slots_chunking_and_isolation(monkeypatch, layout):
     assert torch.all(cache[[0, 2]] == 123)
 
 
-@pytest.mark.skipif(
-    os.getenv("RUN_HCU_CACHE_TESTS") != "1", reason="opt-in native HCU kernel test"
-)
 @pytest.mark.hcu
 @pytest.mark.parametrize("std", [0.0, 0.1])
 def test_native_packed_readback(std):
     # Real ops + independent byte-layout decoding, on an explicitly released HCU.
+    if not torch.cuda.is_available():
+        pytest.skip("a live HCU/ROCm device is required")
+    if not hasattr(torch.cuda.get_device_properties(0), "gcnArchName"):
+        pytest.skip("the active device is not an HCU/ROCm device")
     import vllm._C_stable_libtorch  # noqa: F401
     from vllm import _custom_ops as ops
 

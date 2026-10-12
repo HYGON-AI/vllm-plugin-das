@@ -57,7 +57,7 @@ These caches are synthetic. Generated text and accuracy scores are not meaningfu
 Validation:
 
 ```bash
-python3 -m pytest tests/kv_connector/test_decode_bench_connector.py
+python3 -m pytest -m 'not hcu' tests/kv_connector/test_decode_bench_connector.py
 # Only on a released HCU:
-RUN_HCU_CACHE_TESTS=1 python3 -m pytest tests/kv_connector/test_decode_bench_connector.py
+python3 -m pytest -m hcu tests/kv_connector/test_decode_bench_connector.py
 ```
