@@ -39,24 +39,45 @@ def main():
                 q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
                 kv = torch.randn(width, 1, 512, device="cuda", dtype=torch.bfloat16)
                 sink = torch.randn(heads, device="cuda", dtype=torch.float32)
-                indices = torch.arange(width, device="cuda", dtype=torch.int32).repeat(tokens, 1)
                 lengths = 17 + torch.arange(tokens, device="cuda", dtype=torch.int32) % (width - 16)
                 lengths[-1] = width
-                indices[:, 5] = -1  # Interior holes must be masked by both kernels.
-                indices.masked_fill_(
-                    torch.arange(width, device="cuda")[None, :] >= lengths[:, None], -1
-                )
-                expected = torch.empty_like(q)
-                actual = torch.empty_like(q)
-                args = (q, kv, indices, lengths, 512 ** -0.5, 512, 448, 64, sink)
-                rocm_sparse_attn_prefill(*args, expected)
-                adapter(*args, actual)
-                torch.cuda.synchronize()
-                assert torch.isfinite(expected).all() and torch.isfinite(actual).all()
-                error = (actual.float() - expected.float()).abs()
-                max_error, mean_error = error.max().item(), error.mean().item()
-                print(name, heads, tokens, max_error, mean_error, flush=True)
-                assert max_error <= 0.015625, (name, heads, tokens, max_error, mean_error)
+                for index_case in ("internal_hole", "valid_tail"):
+                    indices = torch.arange(
+                        width, device="cuda", dtype=torch.int32
+                    ).repeat(tokens, 1)
+                    if index_case == "internal_hole":
+                        # Isolate negative-index masking: the valid prefix has
+                        # an interior hole and the length-excluded tail is -1.
+                        indices[:, 5] = -1
+                        indices.masked_fill_(
+                            torch.arange(width, device="cuda")[None, :]
+                            >= lengths[:, None],
+                            -1,
+                        )
+                    # In valid_tail, every tail entry remains a legal KV index.
+                    # A kernel that ignores topk_length cannot pass this case by
+                    # relying on negative-index masking.
+                    expected = torch.empty_like(q)
+                    actual = torch.empty_like(q)
+                    args = (
+                        q, kv, indices, lengths, 512 ** -0.5,
+                        512, 448, 64, sink,
+                    )
+                    rocm_sparse_attn_prefill(*args, expected)
+                    adapter(*args, actual)
+                    torch.cuda.synchronize()
+                    assert torch.isfinite(expected).all()
+                    assert torch.isfinite(actual).all()
+                    error = (actual.float() - expected.float()).abs()
+                    max_error = error.max().item()
+                    mean_error = error.mean().item()
+                    print(
+                        name, index_case, heads, tokens,
+                        max_error, mean_error, flush=True,
+                    )
+                    assert max_error <= 0.015625, (
+                        name, index_case, heads, tokens, max_error, mean_error,
+                    )
     print("PREFILL PADDING CHECKS PASSED", flush=True)
 
 
