@@ -1322,6 +1322,17 @@ def rocm_aiter_sparse_attn_indexer_fake(
         dtype=scratch_dtype,
         device=scratch_device,
     )
+    # fast_topk_transform_ragged_fused returns its own [rows, topk] tensor
+    # alongside the padded scratch above.
+    if (
+        _sparse_mla_topk_backend() == "ragged"
+        and topk_tokens == _LIGHTOP_RAGGED_TOPK_TOKENS
+    ):
+        _ragged_topk = torch.empty(
+            (hidden_states.shape[0], topk_tokens),
+            dtype=torch.int32,
+            device=scratch_device,
+        )
     return topk_indices_buffer
 
 
