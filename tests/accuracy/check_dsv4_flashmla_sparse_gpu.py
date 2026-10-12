@@ -171,6 +171,10 @@ def run_case(
     lengths = torch.linspace(
         max(1, width // 4), width, num_q, device=DEVICE, dtype=torch.float32,
     ).to(torch.int32)
+    # Keep a hole inside every valid top-k prefix. Both AITER and the adapter
+    # must treat -1 as an invalid gathered-KV slot rather than reading KV[-1].
+    rows = torch.arange(num_q, device=DEVICE)
+    indices[rows, lengths.to(torch.int64) // 2] = -1
     sink = torch.randn(heads, device=DEVICE, dtype=torch.float32)
     reference = torch.empty(num_q, heads, D_V, device=DEVICE, dtype=torch.bfloat16)
     aiter_prefill(
@@ -221,7 +225,9 @@ assert sparse_patch.apply_to_module(dsv4_rocm)
 adapter_prefill = dsv4_rocm.rocm_sparse_attn_prefill
 
 for provider in ("flashmla", "boltops"):
-    for local_heads in (8, 16, 32):
+    # 64/128 exercise native kernel widths; 8/16/32 and 96 exercise padding
+    # to 64 and 128 respectively.
+    for local_heads in (8, 16, 32, 64, 96, 128):
         for tokens in (17, 257):
             run_case(provider, "swa_only", local_heads, tokens, 0, 128)
             run_case(provider, "c4a", local_heads, tokens, 64, 128)
