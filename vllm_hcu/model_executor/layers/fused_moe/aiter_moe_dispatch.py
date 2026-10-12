@@ -119,6 +119,33 @@ def _solution_token(config: object) -> str:
     return str(solution).rsplit(".", 1)[-1].upper()
 
 
+def aiter_moe_config_supports_expert_map(config: object) -> bool:
+    """Return whether an AITER config routes global IDs through expert_map.
+
+    MOE_C encodes its sorting route in the ten-millions digit of MODE.  A
+    value of one selects ``moe_align``, which consumes the expert map; zero
+    selects CK sorting, which leaves global expert IDs for the GEMM kernel.
+    Unknown MOE_C metadata is rejected so expert-parallel callers fail safe.
+    """
+
+    if _solution_token(config) != "MOE_C":
+        return True
+    config_values = getattr(config, "config", None)
+    if not isinstance(config_values, dict):
+        return False
+
+    mode_value = config_values.get("MODE")
+    try:
+        mode = int(mode_value)
+    except (TypeError, ValueError):
+        mode = None
+    if mode is not None and 10_000_000 <= mode < 30_000_000:
+        return (mode // 1_000_000) % 10 == 1
+
+    sorting_method = str(config_values.get("SORTING_METHOD", "")).lower()
+    return sorting_method == "moe_align"
+
+
 def aiter_moe_weight_layout_signature(config: object) -> tuple[Any, ...]:
     """Return the physical weight-layout contract selected by AITER."""
 

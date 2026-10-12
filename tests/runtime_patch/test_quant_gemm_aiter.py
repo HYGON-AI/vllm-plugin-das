@@ -216,6 +216,62 @@ def test_aiter_dispatch_selector_passes_problem_without_forcing_solution(
     assert "device" not in captured
 
 
+@pytest.mark.parametrize(
+    ("solution_type", "config_values", "expected"),
+    [
+        ("moe_c", {"MODE": 10202101}, False),
+        ("moe_c", {"MODE": 11106104}, True),
+        ("moe_c", {"SORTING_METHOD": "ck_sorting"}, False),
+        ("moe_c", {"SORTING_METHOD": "moe_align"}, True),
+        ("moe_c", {}, False),
+        ("asm", {}, True),
+        ("triton", {}, True),
+    ],
+)
+def test_aiter_moe_expert_map_contract(
+    solution_type: str,
+    config_values: dict[str, object],
+    expected: bool,
+):
+    config = SimpleNamespace(
+        solution_type=solution_type,
+        config=config_values,
+    )
+
+    assert (
+        aiter_moe_dispatch.aiter_moe_config_supports_expert_map(config)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "local_num_experts", "global_num_experts", "allowed"),
+    [
+        (10202101, 72, 288, False),
+        (11106104, 72, 288, True),
+        (10202101, 72, 72, True),
+    ],
+)
+def test_quantized_aiter_ep_config_guard(
+    mode: int,
+    local_num_experts: int,
+    global_num_experts: int,
+    allowed: bool,
+):
+    config = SimpleNamespace(
+        solution_type="moe_c",
+        config={"MODE": mode},
+    )
+
+    selected = compressed_tensors_moe_runtime._aiter_config_for_expert_parallel(
+        config,
+        local_num_experts=local_num_experts,
+        global_num_experts=global_num_experts,
+    )
+
+    assert (selected is config) is allowed
+
+
 def test_aiter_dispatch_can_pin_asm_shuffle_solution(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -5096,6 +5152,152 @@ def test_w8a8_prewarm_replaces_raw_weights_with_selected_layout(
     torch.testing.assert_close(layer.w2_weight, torch.full_like(layer.w2_weight, 4))
 
 
+@pytest.mark.parametrize("mode", [10001102, 11106104])
+def test_w8a8_ep_moec_prewarm_preserves_native_runtime_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={"MODE": mode},
+    )
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    selected_ms: list[int] = []
+
+    def get_config(**kwargs):
+        selected_ms.append(kwargs["M"])
+        return True, config
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe_shfl_weight=lambda *_args: pytest.fail(
+                "EP MOE_C weights must stay canonical across runtime shapes"
+            ),
+        ),
+    )
+    layer = _fp8_moe_layer()
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        block_shape=None,
+    )
+
+    selected = compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=12,
+        ),
+        quant_config,
+    )
+
+    assert selected is None
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "native"
+    assert layer.w13_weight.is_shuffled is False
+    assert layer.w2_weight.is_shuffled is False
+    assert selected_ms == [1]
+
+    expected = torch.full((4, 4), 7.0)
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *_args, **_kwargs: expected,
+    )
+    layer.global_num_experts = 12
+    actual = compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+        SimpleNamespace(moe=object()),
+        layer,
+        torch.ones((4, 4)),
+        torch.ones((4, 2)),
+        torch.zeros((4, 2), dtype=torch.int64),
+        None,
+        None,
+    )
+
+    assert actual is expected
+    assert selected_ms == [1]
+
+
+@pytest.mark.parametrize(
+    ("mode", "global_num_experts"),
+    [
+        (11106104, 3),
+        (10001102, 3),
+    ],
+)
+def test_w8a8_non_ep_moec_prewarm_preserves_selected_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+    global_num_experts: int,
+):
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        need_shuffle_scale=False,
+        config={"MODE": mode},
+    )
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    shuffle_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def shuffle_weights(w1, w2, _config):
+        shuffle_calls.append((w1, w2))
+        return w1.clone(), w2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_kwargs: (True, config),
+            aiter_moe_shfl_weight=shuffle_weights,
+        ),
+    )
+    layer = _fp8_moe_layer()
+
+    selected = compressed_tensors_moe_runtime.prewarm_aiter_quantized_moe(
+        layer,
+        SimpleNamespace(
+            experts_per_token=2,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=global_num_experts,
+        ),
+        SimpleNamespace(
+            use_fp8_w8a8=True,
+            use_int8_w8a8=False,
+            block_shape=None,
+        ),
+    )
+
+    assert selected is config
+    assert len(shuffle_calls) == 1
+    assert layer.w13_weight._hcu_aiter_moe_solution_type == "moe_c"
+    assert layer.w2_weight._hcu_aiter_moe_solution_type == "moe_c"
+
+
 def test_w8a8_padded_layout_keeps_original_logical_problem_dimensions(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -7096,6 +7298,7 @@ def test_quantized_aiter_runtime_converts_only_asm_ep_map_to_binary_mask(
             quant_type=kwargs["quant_type"],
             solution_type=solution_type,
             need_shuffle=False,
+            config={"MODE": 11106104},
         )
 
     def aiter_moe(**kwargs):

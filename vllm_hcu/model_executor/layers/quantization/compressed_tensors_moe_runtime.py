@@ -17,6 +17,7 @@ from vllm.model_executor.utils import replace_parameter
 
 from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
     AiterMoeProblem,
+    aiter_moe_config_supports_expert_map,
     aiter_moe_weight_layout_signature,
     aiter_expert_map_for_solution,
     execute_aiter_moe,
@@ -379,6 +380,37 @@ def _installed_weight_solution(
     return first
 
 
+def _aiter_config_for_expert_parallel(
+    config: object | None,
+    *,
+    local_num_experts: int,
+    global_num_experts: int,
+    permanent_layout: bool = False,
+) -> object | None:
+    """Reject configs that cannot safely retain EP fallback semantics."""
+
+    if config is None:
+        return None
+    expert_parallel = (
+        isinstance(global_num_experts, int)
+        and not isinstance(global_num_experts, bool)
+        and global_num_experts > local_num_experts
+    )
+    if not expert_parallel:
+        return config
+    # MOE_C selection is M-dependent.  Even when M=1 selects moe_align, a
+    # later shape can select CK sorting within the same solution.  Installing
+    # the M=1 layout would discard canonical weights and make that later route
+    # unable to fall back safely.
+    if permanent_layout and _enum_token(
+        getattr(config, "solution_type", None)
+    ) == "MOE_C":
+        return None
+    if not aiter_moe_config_supports_expert_map(config):
+        return None
+    return config
+
+
 def _weights_for_selected_config(
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -489,6 +521,16 @@ def prewarm_aiter_quantized_moe(
         use_shuffle=bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE),
     )
     config = prewarm_aiter_moe_config(problem, cache_owner=w1)
+    config = _aiter_config_for_expert_parallel(
+        config,
+        local_num_experts=logical_shape[0],
+        global_num_experts=getattr(
+            vllm_moe_config,
+            "num_experts",
+            logical_shape[0],
+        ),
+        permanent_layout=True,
+    )
     if config is not None:
         install_aiter_moe_weight_layout(
             layer,
@@ -1124,6 +1166,11 @@ def apply_aiter_quantized_moe(
         )
     )
     global_num_experts = getattr(vllm_moe_config, "num_experts", w1.shape[0])
+    aiter_config = _aiter_config_for_expert_parallel(
+        aiter_config,
+        local_num_experts=logical_e,
+        global_num_experts=global_num_experts,
+    )
     native_expert_map, expert_mask = resolve_aiter_expert_maps(
         expert_map,
         int(global_num_experts),
@@ -1327,6 +1374,11 @@ def apply_aiter_w8a8_fp8_moe(
     w1_scale = _required_tensor(layer, "w13_weight_scale")
     w2_scale = _required_tensor(layer, "w2_weight_scale")
     global_num_experts = getattr(layer, "global_num_experts", -1)
+    moe_config = _aiter_config_for_expert_parallel(
+        moe_config,
+        local_num_experts=logical_e,
+        global_num_experts=global_num_experts,
+    )
     expert_map = getattr(layer, "_expert_map", None)
     expert_mask = getattr(layer, "expert_mask", None)
     if moe_config is None:
