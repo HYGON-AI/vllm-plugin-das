@@ -223,7 +223,9 @@ def indexer_k_quant_and_cache_lightop(
     LightOp writes a *planar* page layout (all K bytes, then all scales),
     which is what lightop.paged_mqa_logits reads; block_size must be 64.
     """
-    from lightop import kvcache as lightop_kvcache
+    # LightOp 0.6 exposes this kernel only from lightop.kvcache, not from a
+    # public category; tests/patch/test_lightop_api_boundary.py allowlists it.
+    from lightop.kvcache import fuse_act_quant_and_store_index_k_cache
 
     if k.dim() != 2:
         k = k.view(-1, k.shape[-1])
@@ -252,7 +254,7 @@ def indexer_k_quant_and_cache_lightop(
     key = k if k.dtype == torch.bfloat16 else k.to(torch.bfloat16)
     # Args: key, buffer, loc, block_size, eps, use_ue8m0, is_e4m3fn (not fnuz)
     is_e4m3fn = current_platform.fp8_dtype() == torch.float8_e4m3fn
-    lightop_kvcache.fuse_act_quant_and_store_index_k_cache(
+    fuse_act_quant_and_store_index_k_cache(
         key.contiguous(),
         write_buffer,
         loc.contiguous(),
@@ -758,6 +760,13 @@ def paged_mqa_logits_module():
     return None
 
 
+def _uses_aiter_paged_mqa_logits() -> bool:
+    """Whether rocm_fp8_paged_mqa_logits takes the AITER branch."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    return rocm_aiter_ops.is_enabled() and paged_mqa_logits_module() is not None
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -1113,6 +1122,8 @@ def _decode_row_ends_from_seq_lens(
 
 
 _LIGHTOP_ZERO_I32: dict[tuple[int, int], torch.Tensor] = {}
+# lightop.attention.fast_topk_transform_ragged_fused asserts topk == 2048.
+_LIGHTOP_RAGGED_TOPK_TOKENS = 2048
 
 
 def _sparse_mla_topk_backend() -> str:
@@ -1234,14 +1245,12 @@ def _lightop_ragged_topk_indices_decode(
     topk_indices: torch.Tensor,
     topk_tokens: int,
 ) -> None:
-    """Decode top-k via lightop.op.fast_topk_transform_ragged_interface.
+    """Decode top-k via lightop.attention.fast_topk_transform_ragged_fused.
 
       - zero offsets => window-relative logical IDs (padding stays -1)
       - zero row_starts (top_k_per_row_decode hard-codes start=1)
       - lengths from seq_lens (per speculative row when next_n > 1)
     """
-    from lightop import op as lightop_op
-
     num_rows = int(logits.shape[0])
     if num_rows == 0 or topk_tokens <= 0:
         return
@@ -1264,22 +1273,10 @@ def _lightop_ragged_topk_indices_decode(
 
     # Same buffer for offsets + row_starts (both read-only zeros).
     zeros = _get_lightop_zero_i32(score.device, num_rows)
-    need_tmp = not (
-        topk_indices.dtype == torch.int32
-        and topk_indices.shape[0] == num_rows
-        and topk_indices.shape[-1] == topk_tokens
-        and topk_indices.is_contiguous()
+    topk_out = _get_lightop_attention().fast_topk_transform_ragged_fused(
+        score, lengths, zeros, topk_tokens, zeros
     )
-    topk_out = (
-        torch.empty((num_rows, topk_tokens), dtype=torch.int32, device=score.device)
-        if need_tmp
-        else topk_indices
-    )
-    lightop_op.fast_topk_transform_ragged_interface(
-        score, lengths, topk_out, zeros, zeros
-    )
-    if topk_out is not topk_indices:
-        topk_indices[:, :topk_tokens].copy_(topk_out)
+    topk_indices[:, :topk_tokens].copy_(topk_out)
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
@@ -1389,13 +1386,17 @@ def rocm_aiter_sparse_attn_indexer_native(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
-    # Decode scores via lightop.paged_mqa_logits, which reads planar pages
-    # (page_size=64). The triton store writes SHUFFLE pages, so pairing the
-    # two silently corrupts top-k selection once context exceeds topk_tokens.
+    # lightop.paged_mqa_logits reads planar pages (page_size=64) while the
+    # triton store writes SHUFFLE pages; pairing the two silently corrupts
+    # top-k once context exceeds topk_tokens. Only switch to the planar
+    # writer when this function owns the cache write (PCP and DeepSeek V4
+    # write SHUFFLE pages elsewhere) and decode reads via LightOp, not AITER.
     use_lightop_index_k_store = bool(
         current_platform.is_rocm()
         and use_fp8_cache
         and henvs.VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE
+        and not skip_k_cache_insert
+        and not _uses_aiter_paged_mqa_logits()
     )
     if not skip_k_cache_insert:
         if not current_platform.is_rocm():
@@ -1525,6 +1526,11 @@ def rocm_aiter_sparse_attn_indexer_native(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
         topk_backend = _sparse_mla_topk_backend()
+        if (
+            topk_backend == "ragged"
+            and topk_tokens != _LIGHTOP_RAGGED_TOPK_TOKENS
+        ):
+            topk_backend = "per_row"
         seq_lens = (
             decode_metadata.seq_lens[:batch_size]
             if topk_backend in ("per_row", "ragged")

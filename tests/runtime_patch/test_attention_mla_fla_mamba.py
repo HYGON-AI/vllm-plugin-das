@@ -2162,13 +2162,21 @@ def test_sparse_indexer_padded_decode_scratch_preserves_prefill_row():
 
 
 @pytest.mark.parametrize("skip_cache_insert", [False, True])
+@pytest.mark.parametrize("lightop_store_env", ["0", "1"])
+@pytest.mark.parametrize("aiter_reader", [False, True])
 def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
-    monkeypatch, skip_cache_insert,
+    monkeypatch, skip_cache_insert, lightop_store_env, aiter_reader,
 ):
-    """Legacy triton store keeps the shuffled packed FP8 layout on gfx936."""
+    """The planar LightOp store is used only when this op owns the cache write
+    and decode reads it via LightOp; otherwise keep the SHUFFLE layout."""
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
 
-    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE", lightop_store_env)
+    monkeypatch.setattr(sparse, "_uses_aiter_paged_mqa_logits", lambda: aiter_reader)
+    use_lightop_store = (
+        lightop_store_env == "1" and not skip_cache_insert and not aiter_reader
+    )
+    expected_layout = "LINEAR" if use_lightop_store else "SHUFFLE"
     events = []
     monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
 
@@ -2217,9 +2225,18 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
         assert slots.tolist() == [0]
         assert block_size == 1
         assert scale_fmt == "ue8m0"
+        assert not use_lightop_store
+        events.append("insert")
+
+    def lightop_insert(k, cache, slots):
+        assert k.shape == (1, 1)
+        assert cache.dtype is torch.uint8
+        assert slots.tolist() == [0]
+        assert use_lightop_store
         events.append("insert")
 
     monkeypatch.setattr(sparse, "indexer_k_quant_and_cache_triton", insert)
+    monkeypatch.setattr(sparse, "indexer_k_quant_and_cache_lightop", lightop_insert)
     from vllm import _custom_ops as ops
 
     monkeypatch.setattr(
@@ -2236,7 +2253,7 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
         assert block_table is chunk.block_table
         assert cu_seq_lens is chunk.cu_seq_lens
         assert token_to_seq is chunk.token_to_seq
-        assert layout == "SHUFFLE"
+        assert layout == expected_layout
         k_fp8.zero_()
         k_scale.zero_()
         events.append("gather")
@@ -2287,6 +2304,39 @@ def test_sparse_indexer_gfx936_packed_cache_uses_quantized_triton_path(
     if not skip_cache_insert:
         expected.insert(0, "insert")
     assert events == expected
+
+
+def test_lightop_ragged_topk_decode_uses_public_attention_export(monkeypatch):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    calls = []
+
+    def fast_topk_transform_ragged_fused(score, lengths, offsets, topk, row_starts):
+        calls.append((score, lengths, offsets, topk, row_starts))
+        return torch.arange(score.shape[0] * topk, dtype=torch.int32).view(-1, topk)
+
+    monkeypatch.setattr(
+        sparse,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(
+            fast_topk_transform_ragged_fused=fast_topk_transform_ragged_fused
+        ),
+    )
+    logits = torch.zeros((2, 8), dtype=torch.bfloat16)
+    topk_indices = torch.full((2, 3), -1, dtype=torch.int32)
+
+    sparse._lightop_ragged_topk_indices_decode(
+        logits, torch.tensor([5, 7], dtype=torch.int32), 1, topk_indices, 3
+    )
+
+    assert len(calls) == 1
+    score, lengths, offsets, topk, row_starts = calls[0]
+    assert score.dtype is torch.float32
+    assert lengths.tolist() == [5, 7]
+    assert offsets.tolist() == [0, 0]
+    assert row_starts.tolist() == [0, 0]
+    assert topk == 3
+    assert topk_indices.tolist() == [[0, 1, 2], [3, 4, 5]]
 
 
 def test_sparse_indexer_gfx936_packed_cache_uses_quantized_decode_logits(

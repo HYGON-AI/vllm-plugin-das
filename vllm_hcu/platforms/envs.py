@@ -302,8 +302,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                     ("true", "1")),
 
     # Sparse-MLA top-k backend:
-    #   ragged  - decode: lightop.op.fast_topk_transform_ragged_interface;
-    #             prefill: torch (default)
+    #   ragged  - decode: lightop.attention.fast_topk_transform_ragged_fused
+    #             (topk == 2048 only, otherwise per_row); prefill: torch (default)
     #   per_row - lightop.attention.top_k_per_row_* for prefill and decode
     #             (decode emits OOB indices on long contexts)
     #   torch   - torch.topk
@@ -312,7 +312,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Store DSA index-K via lightop fuse_act_quant_and_store_index_k_cache
     # (planar pages) to match lightop.paged_mqa_logits. Requires
-    # --block-size 64.
+    # --block-size 64. Ignored when the cache is written elsewhere (PCP,
+    # DeepSeek V4) or decode uses the AITER paged MQA reader.
     "VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_INDEXER_K_CACHE", "True").lower() in
                     ("true", "1")),
