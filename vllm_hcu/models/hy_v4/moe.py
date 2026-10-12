@@ -11,7 +11,11 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_ep_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
@@ -20,6 +24,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm_hcu.model_executor.layers.attention.pcp import in_replicated_mtp_batch
 from vllm_hcu.models.hy_v4.attention import linear_gate_pcp_shard_enabled
 
@@ -57,6 +62,7 @@ class HYV4FeedForward(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
@@ -68,6 +74,7 @@ class HYV4FeedForward(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -76,6 +83,7 @@ class HYV4FeedForward(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
@@ -111,6 +119,9 @@ class HYV4MoEFused(nn.Module):
                 raise NotImplementedError("HYV4 EPLB requires Task 7 static direct loading")
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.is_sequence_parallel = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
         self.ep_group = get_ep_group().device_group
         if vllm_config.parallel_config.enable_expert_parallel:
             self.ep_rank = get_ep_group().rank_in_group
@@ -167,6 +178,8 @@ class HYV4MoEFused(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.shared_experts",
                 reduce_results=False,
+                # SP ranks handle different tokens, requiring full weights.
+                disable_tp=self.is_sequence_parallel,
             )
         else:
             self.shared_experts = None
@@ -200,6 +213,7 @@ class HYV4MoEFused(nn.Module):
             shared_experts=self.shared_experts,
             swiglu_limit=swiglu_limit,
             router_logits_dtype=torch.float32,
+            is_sequence_parallel=self.is_sequence_parallel,
         )
         self.prefix = prefix
         if swiglu_limit is not None:
@@ -211,6 +225,10 @@ class HYV4MoEFused(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens = hidden_states.shape[0]
+        if self.is_sequence_parallel:
+            # Dispatch each TP-replicated token once across the EP group.
+            hidden_states = sequence_parallel_chunk(hidden_states)
         # LINEAR_GATE_PCP_SHARD + MTP restore can inflate MoE workspace.
         # Chunk only when VLLM_HCU_HYV4_MOE_CHUNK_SIZE is set.
         chunk_size = _hyv4_moe_chunk_size()
@@ -235,6 +253,13 @@ class HYV4MoEFused(nn.Module):
                     hidden_states=chunk,
                     router_logits=router_logits,
                 )
+
+        if self.is_sequence_parallel:
+            final_hidden_states = tensor_model_parallel_all_gather(
+                final_hidden_states.contiguous(), 0
+            )
+            # Remove padding introduced for batches not divisible by TP size.
+            final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.view(original_shape)
 
