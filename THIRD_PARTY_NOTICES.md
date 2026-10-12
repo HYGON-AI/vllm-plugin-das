@@ -115,3 +115,13 @@ The following plugin files map to vLLM upstream paths and were reviewed under th
 | `vllm_hcu/v1/executor/multiproc_executor.py` | `vllm/v1/executor/multiproc_executor.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/v1/spec_decode/__init__.py` | `vllm/v1/spec_decode/__init__.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
 | `vllm_hcu/version.py` | `vllm/version.py` | vLLM copyright retained; HYGON modification notice retained. HYGON contribution copyright retained for substantive plugin changes. |
+
+## DecodeBenchConnector backport
+
+`vllm_hcu/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py`
+adapts the FP8 sampling and startup-fill behavior from vLLM PR #58472,
+commit `7a9406690ebe2fc47236a81cf7ec33188c6565e2`
+([upstream](https://github.com/vllm-project/vllm/pull/58472)), under Apache-2.0.
+The original vLLM contributor copyright is retained. HCU changes add native
+packed MLA/indexer cache filling, rank-specific random streams, bounded
+temporary allocations, and compatibility with the vLLM 0.25.1 connector API.
